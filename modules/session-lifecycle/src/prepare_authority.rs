@@ -61,11 +61,24 @@ pub struct ControlPolicy {
     pub owner_provider: String,
     pub owner_service: String,
     pub owner_method: MethodRef,
+    pub status_method: MethodRef,
     pub argument_schema: SchemaRef,
     pub output_capability: String,
     pub output_schema: SchemaRef,
     pub max_access: ResourceAccess,
+    #[serde(default)]
+    pub domain_scope: DomainScope,
     pub mutation_domains: BTreeSet<String>,
+}
+
+/// Resource scope derives exact domains from the authenticated selected output;
+/// it does not permit a prefix, wildcard, or caller-selected domain.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainScope {
+    #[default]
+    Static,
+    Resource,
 }
 
 /// Constructed by the coordinator from the frozen installed graph and its
@@ -98,11 +111,14 @@ pub struct FinalizePolicy {
     pub owner_provider: String,
     pub owner_service: String,
     pub method: MethodRef,
+    pub status_method: MethodRef,
     pub output_capability: String,
     pub output_schema: SchemaRef,
     pub capture_provider: String,
     pub selector_schema: String,
     pub required_access: ResourceAccess,
+    #[serde(default)]
+    pub domain_scope: DomainScope,
     pub mutation_domains: BTreeSet<String>,
 }
 
@@ -195,6 +211,36 @@ fn valid_schema(schema: &SchemaRef) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn valid_status_method(method: &MethodRef, owner_service: &str) -> bool {
+    method.service == owner_service
+        && method.interface_major == 2
+        && method.schema_revision != 0
+        && valid_id(&method.method)
+        && !method.method.contains('/')
+}
+
+fn domains_allowed(
+    scope: DomainScope,
+    configured: &BTreeSet<String>,
+    observed: &BTreeSet<String>,
+    exact: bool,
+) -> bool {
+    if observed.is_empty() {
+        return false;
+    }
+    match scope {
+        DomainScope::Static => {
+            !configured.is_empty()
+                && if exact {
+                    configured == observed
+                } else {
+                    observed.is_subset(configured)
+                }
+        }
+        DomainScope::Resource => configured.is_empty(),
+    }
+}
+
 fn output_in_scope(context: &ControlContext) -> bool {
     output_matches_target(&context.output, &context.target, context.parent_generation)
 }
@@ -219,6 +265,17 @@ fn output_matches_target(
         ) => a == c && b == d && parent_generation == Some(*g),
         (origin, target) => origin == target,
     }
+}
+
+fn output_observations_match(output: &ResourceOutput, snapshot: &PlanningSnapshot) -> bool {
+    amaterasu_extension_api::validate_resource_output(output).is_ok()
+        && output.domain_observations.iter().all(|observation| {
+            snapshot.domains.get(&observation.domain)
+                == Some(&DomainState {
+                    revision: observation.revision,
+                    borrowers: observation.borrowers.clone(),
+                })
+        })
 }
 
 fn validate_finalize_binding(
@@ -247,6 +304,7 @@ fn validate_finalize_binding(
         || !valid_id(&policy.method.method)
         || policy.method.service != policy.owner_service
         || policy.method.interface_major != 2
+        || !valid_status_method(&policy.status_method, &policy.owner_service)
         || policy.method.schema_revision == 0
         || !valid_id(&policy.output_capability)
         || !valid_schema(&policy.output_schema)
@@ -260,6 +318,7 @@ fn validate_finalize_binding(
             !output_matches_target(&result.output, &context.target, context.parent_generation)
         })
         || !output_matches_target(&context.output, &context.target, context.parent_generation)
+        || !output_observations_match(&context.output, snapshot)
         || context.output.producer != policy.owner_provider
         || context.output.producer_service != policy.owner_service
         || context.output.capability != policy.output_capability
@@ -267,7 +326,12 @@ fn validate_finalize_binding(
         || resource.provider != policy.owner_provider
         || domains.is_empty()
         || domains.len() != resource.mutation_domains.len()
-        || domains != policy.mutation_domains
+        || !domains_allowed(
+            policy.domain_scope,
+            &policy.mutation_domains,
+            &domains,
+            true,
+        )
         || planned.incarnation.as_deref() != Some(&resource.incarnation)
         || planned.expected_revision != Some(resource.revision)
         || planned.execution_domain != resource.execution_domain
@@ -340,6 +404,7 @@ fn validate_control_binding(
         || !valid_id(&policy.owner_method.method)
         || policy.owner_method.interface_major == 0
         || policy.owner_method.schema_revision == 0
+        || !valid_status_method(&policy.status_method, &policy.owner_service)
         || !valid_id(&request.transition_id)
         || !valid_id(&request.operation_id)
         || !valid_id(&proposal.proposal_id)
@@ -364,6 +429,7 @@ fn validate_control_binding(
         || !proposal.arguments.is_object()
         || output.output_id != proposal.output_id
         || !output_in_scope(context)
+        || !output_observations_match(output, snapshot)
         || output.producer != policy.owner_provider
         || output.producer_service != policy.owner_service
         || output.capability != policy.output_capability
@@ -373,7 +439,12 @@ fn validate_control_binding(
         || domains.len() != proposal.mutation_domains.len()
         || domains.is_empty()
         || domains != resource.mutation_domains.iter().cloned().collect()
-        || !domains.is_subset(&policy.mutation_domains)
+        || !domains_allowed(
+            policy.domain_scope,
+            &policy.mutation_domains,
+            &domains,
+            false,
+        )
         || access_level(&proposal.access) > access_level(&policy.max_access)
         || admission
             .plan
@@ -446,10 +517,23 @@ fn validate_selection(selection: &ProviderSelection) -> ModuleResult<()> {
     if let Some(method) = &participant.binding_validate_method {
         methods.push(method);
     }
-    if !valid_id(&participant.provider) || selection.approvals.len() != methods.len() {
+    if !valid_id(&participant.provider) || selection.approvals.len() > MAX_PROVIDERS {
         return Err("invalid installed selection".into());
     }
-    for method in methods {
+    for method in &methods {
+        if selection
+            .approvals
+            .iter()
+            .filter(|entry| &entry.method == *method)
+            .count()
+            != 1
+        {
+            return Err("missing or duplicate method approval".into());
+        }
+    }
+    let mut approved_methods = BTreeSet::new();
+    for entry in &selection.approvals {
+        let method = &entry.method;
         if method.schema_revision == 0
             || method.interface_major == 0
             || !valid_id(&method.service)
@@ -457,15 +541,15 @@ fn validate_selection(selection: &ProviderSelection) -> ModuleResult<()> {
         {
             return Err("invalid installed method".into());
         }
-        let matches: Vec<_> = selection
-            .approvals
-            .iter()
-            .filter(|entry| &entry.method == method)
-            .collect();
-        if matches.len() != 1 {
-            return Err("missing or duplicate method approval".into());
+        if !approved_methods.insert((
+            &method.service,
+            &method.method,
+            method.interface_major,
+            method.interface_minor,
+        )) {
+            return Err("duplicate method approval".into());
         }
-        let approval = &matches[0].broker_approval;
+        let approval = &entry.broker_approval;
         let approved_method = &approval["method"];
         if approval["provider"].as_str() != Some(&participant.provider)
             || approved_method["service"].as_str() != Some(&method.service)
@@ -1723,6 +1807,53 @@ mod tests {
     }
 
     #[test]
+    fn resource_domain_policy_never_accepts_a_configured_wildcard() {
+        let domain: BTreeSet<String> = ["provider_session:epoch".into()].into();
+        let other: BTreeSet<String> = ["other".into()].into();
+        assert!(domains_allowed(
+            DomainScope::Resource,
+            &BTreeSet::new(),
+            &domain,
+            false
+        ));
+        assert!(!domains_allowed(
+            DomainScope::Resource,
+            &other,
+            &domain,
+            false
+        ));
+        assert!(!domains_allowed(
+            DomainScope::Resource,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            false
+        ));
+        assert!(!domains_allowed(
+            DomainScope::Static,
+            &other,
+            &domain,
+            false
+        ));
+    }
+
+    #[test]
+    fn additional_method_approvals_are_individually_verified_and_unique() {
+        let mut selection = selection();
+        let method = method("control");
+        let approval = MethodApproval {
+            method: method.clone(),
+            broker_approval: json!({"provider":"display", "method":{"service":method.service,"method":method.method,"interface_major":method.interface_major,"interface_minor":method.interface_minor}}),
+        };
+        selection.approvals.push(approval.clone());
+        assert!(validate_selection(&selection).is_ok());
+        selection.approvals.push(approval);
+        assert!(validate_selection(&selection).is_err());
+        selection.approvals.pop();
+        selection.approvals.last_mut().unwrap().broker_approval["provider"] = json!("foreign");
+        assert!(validate_selection(&selection).is_err());
+    }
+
+    #[test]
     fn control_permit_fences_forgery_replay_and_uncertain_effect() {
         let mut selected = selection();
         selected.participant.depends_on.push("owner".into());
@@ -1737,9 +1868,9 @@ mod tests {
         let proposal = json!({"proposal_id":"proposal", "output_id":"output-id", "owner_provider":"owner", "owner_service":"display/2", "target":target, "resource":resource, "method":method, "argument_schema":schema, "arguments":{"width":1920}, "access":"exclusive", "mutation_domains":["topology"]});
         plan.control_proposals
             .push(serde_json::from_value(proposal.clone()).unwrap());
-        let context: ControlContext = serde_json::from_value(json!({
-            "policy":{"dependent_provider":"display", "owner_provider":"owner", "owner_service":"display/2", "owner_method":method, "argument_schema":schema, "output_capability":"display", "output_schema":schema, "max_access":"exclusive", "mutation_domains":["topology"]},
-            "output":{"output_id":"output-id", "capability":"display", "schema":schema, "producer":"owner", "producer_service":"display/2", "origin":target, "resource":resource, "data":{}},
+        let mut context: ControlContext = serde_json::from_value(json!({
+            "policy":{"dependent_provider":"display", "owner_provider":"owner", "owner_service":"display/2", "owner_method":method, "status_method":{"service":"display/2","method":"status","interface_major":2,"interface_minor":0,"schema_revision":2}, "argument_schema":schema, "output_capability":"display", "output_schema":schema, "max_access":"exclusive", "mutation_domains":["topology"]},
+            "output":{"output_id":"output-id", "capability":"display", "schema":schema, "producer":"owner", "producer_service":"display/2", "origin":target, "resource":resource, "domain_observations":[{"domain":"topology","revision":4,"borrowers":{"stream":1},"complete":true}], "data":{}},
             "target":target, "transition_id":"transition", "parent_generation":null
         })).unwrap();
         let mut state = AuthorityState::default();
@@ -1775,6 +1906,20 @@ mod tests {
         let id = authority.admit_plan(&selected.participant, &plan).unwrap();
         let mut request: ResourceControlRequest = serde_json::from_value(json!({"version":2,"transition_id":"transition","operation_id":"operation","provider_sequence":1,"target":target,"proposal":proposal,"admission_id":id,"permit_id":"","remaining_ms":1000})).unwrap();
         let validate = |_: &SchemaRef, _: &Value| Ok(());
+        context.policy.domain_scope = DomainScope::Resource;
+        context.policy.mutation_domains.clear();
+        let mut stale_observation = context.clone();
+        stale_observation.output.domain_observations[0].revision += 1;
+        assert!(
+            authority
+                .issue_control_permit(
+                    &selected.participant,
+                    &stale_observation,
+                    &mut request,
+                    validate
+                )
+                .is_err()
+        );
         authority
             .issue_control_permit(&selected.participant, &context, &mut request, validate)
             .unwrap();
@@ -1888,7 +2033,7 @@ mod tests {
         let target = json!({"kind":"stream","host_epoch":"host","session_id":"session","stream_id":"stream","generation":2});
         let schema = json!({"id":"schema","major":1,"minor":0,"digest":"a".repeat(64)});
         let output = json!({"output_id":"output-id","capability":"display","schema":schema,"producer":"display","producer_service":"display/2","origin":target,"resource":{"provider":"display","resource_id":"output","incarnation":"native","revision":2,"execution_domain":"seat","mutation_domain":"topology","mutation_domains":["topology"]},"domain_observations":[{"domain":"topology","revision":4,"borrowers":{"stream":1},"complete":true}],"data":{}});
-        let context: FinalizeContext = serde_json::from_value(json!({"policy":{"owner_provider":"display","owner_service":"display/2","method":{"service":"display/2","method":"finalize","interface_major":2,"interface_minor":0,"schema_revision":2},"output_capability":"display","output_schema":schema,"capture_provider":"capture","selector_schema":"selector","required_access":"exclusive","mutation_domains":["topology"]},"output":output,"control_results":[],"target":target,"transition_id":"transition","parent_generation":1})).unwrap();
+        let context: FinalizeContext = serde_json::from_value(json!({"policy":{"owner_provider":"display","owner_service":"display/2","method":{"service":"display/2","method":"finalize","interface_major":2,"interface_minor":0,"schema_revision":2},"status_method":{"service":"display/2","method":"status","interface_major":2,"interface_minor":0,"schema_revision":2},"output_capability":"display","output_schema":schema,"capture_provider":"capture","selector_schema":"selector","required_access":"exclusive","mutation_domains":["topology"]},"output":output,"control_results":[],"target":target,"transition_id":"transition","parent_generation":1})).unwrap();
         let mut authority = CoordinatorPrepareAuthority::new(
             AuthorityState::default(),
             vec![selected.clone()],
