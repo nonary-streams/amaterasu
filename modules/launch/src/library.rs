@@ -12,6 +12,32 @@ pub struct Route {
     pub service: String,
     pub callers: BTreeSet<String>,
     pub executors: BTreeMap<String, String>,
+    /// Policies are selected by the library-local application ID, never by an
+    /// executor response. They are supplied by trusted startup composition.
+    #[serde(default)]
+    pub application_policies: BTreeMap<String, ApplicationPolicy>,
+    #[serde(default)]
+    pub require_application_policy: bool,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApplicationPolicy {
+    pub revision: String,
+    #[serde(default)]
+    pub working_directory: Option<String>,
+    #[serde(default = "default_exit_timeout_seconds")]
+    pub exit_timeout_seconds: u64,
+    #[serde(default)]
+    pub preparation: Vec<crate::protocol::PreparationStep>,
+}
+
+fn default_exit_timeout_seconds() -> u64 {
+    10
+}
+
+fn valid_revision(revision: &str) -> bool {
+    !revision.trim().is_empty() && revision.len() <= 128 && !revision.chars().any(char::is_control)
 }
 
 pub fn validate_routes(routes: &BTreeMap<String, Route>) -> Result<(), &'static str> {
@@ -31,6 +57,23 @@ pub fn validate_routes(routes: &BTreeMap<String, Route>) -> Result<(), &'static 
                     !key(name)
                         || service.strip_suffix("/1").is_none_or(|name| !key(name))
                         || service == crate::SERVICE
+                })
+                || route.application_policies.len() > 256
+                || route.application_policies.iter().any(|(id, policy)| {
+                    ApplicationReference {
+                        library: name.clone(),
+                        id: id.clone(),
+                    }
+                    .validate()
+                    .is_err()
+                        || !valid_revision(&policy.revision)
+                        || policy
+                            .working_directory
+                            .as_deref()
+                            .is_some_and(|path| !crate::protocol::valid_native_path(path))
+                        || !(1..=crate::protocol::MAX_EXIT_TIMEOUT_SECONDS)
+                            .contains(&policy.exit_timeout_seconds)
+                        || !crate::protocol::valid_preparation(&policy.preparation)
                 })
         })
     {
@@ -110,6 +153,29 @@ pub fn resolve_target(
     reply
         .target
         .validate_for(&selection.application.id, &selection.revision)?;
+    let policy = route.application_policies.get(&selection.application.id);
+    if route.require_application_policy && policy.is_none() {
+        return Err("application_policy_unavailable");
+    }
+    if policy.is_some_and(|policy| policy.revision != selection.revision) {
+        return Err("application_policy_revision_conflict");
+    }
+    let preparation = match policy {
+        Some(policy) => crate::protocol::merge_preparation_plan(
+            &[],
+            &[],
+            policy
+                .preparation
+                .iter()
+                .cloned()
+                .map(crate::protocol::PlannedPreparationStep::Structured)
+                .collect(),
+            vec![],
+            false,
+            policy.working_directory.as_deref(),
+        )?,
+        None => vec![],
+    };
     let service = route
         .executors
         .get(&reply.target.executor)
@@ -123,9 +189,9 @@ pub fn resolve_target(
         crate::protocol::LaunchTarget::Provider {
             provider: reply.target.executor,
             application_id: reply.target.application_id,
-            exit_timeout_seconds: 10,
-            working_directory: None,
-            preparation: vec![],
+            exit_timeout_seconds: policy.map_or(10, |policy| policy.exit_timeout_seconds),
+            working_directory: policy.and_then(|policy| policy.working_directory.clone()),
+            preparation,
         },
         service.clone(),
         resource,
@@ -153,6 +219,8 @@ mod tests {
             service: "selected.library/2".into(),
             callers: ["consumer".into()].into(),
             executors: BTreeMap::from([("runner".into(), "selected.executor/1".into())]),
+            application_policies: BTreeMap::new(),
+            require_application_policy: false,
         }
     }
 
@@ -239,5 +307,66 @@ mod tests {
             .insert("runner".into(), "another.executor/1".into());
         let (_, _, independent) = resolve_target(&selection("a"), &other, reply("a")).unwrap();
         assert_ne!(first, independent);
+    }
+
+    #[test]
+    fn selected_policy_is_revision_bound_and_never_comes_from_library_reply() {
+        let mut route = route();
+        route.require_application_policy = true;
+        let policy: ApplicationPolicy = serde_json::from_value(json!({
+            "revision":"v1",
+            "working_directory":std::env::temp_dir(),
+            "exit_timeout_seconds":20,
+            "preparation":[{"run":{"executable":std::env::current_exe().unwrap()},
+                "undo":{"executable":std::env::current_exe().unwrap()}}]
+        }))
+        .unwrap();
+        route.application_policies.insert("opaque".into(), policy);
+        assert!(validate_routes(&BTreeMap::from([("games".into(), route.clone())])).is_ok());
+        let (target, _, _) = resolve_target(&selection("opaque"), &route, reply("opaque")).unwrap();
+        let crate::protocol::LaunchTarget::Provider {
+            preparation,
+            working_directory,
+            exit_timeout_seconds,
+            ..
+        } = target
+        else {
+            panic!("expected provider");
+        };
+        assert_eq!(exit_timeout_seconds, 20);
+        let [crate::protocol::PlannedPreparationStep::Structured(step)] = preparation.as_slice()
+        else {
+            panic!("expected the configured preparation");
+        };
+        assert_eq!(step.run.cwd, working_directory);
+        assert_eq!(step.undo.as_ref().unwrap().cwd, working_directory);
+
+        assert_eq!(
+            resolve_target(&selection("other"), &route, reply("other")).unwrap_err(),
+            "application_policy_unavailable"
+        );
+        route
+            .application_policies
+            .get_mut("opaque")
+            .unwrap()
+            .revision = "changed".into();
+        assert_eq!(
+            resolve_target(&selection("opaque"), &route, reply("opaque")).unwrap_err(),
+            "application_policy_revision_conflict"
+        );
+        let mut injected = reply("opaque");
+        injected["target"]["preparation"] = json!([]);
+        assert!(resolve_target(&selection("opaque"), &route, injected).is_err());
+    }
+
+    #[test]
+    fn invalid_preparation_settings_fail_before_service_start() {
+        let mut route = route();
+        let policy: ApplicationPolicy = serde_json::from_value(json!({
+            "revision":"v1", "preparation":[{"run":{"executable":"relative"}}]
+        }))
+        .unwrap();
+        route.application_policies.insert("opaque".into(), policy);
+        assert!(validate_routes(&BTreeMap::from([("games".into(), route)])).is_err());
     }
 }
