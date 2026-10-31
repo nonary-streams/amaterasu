@@ -46,7 +46,7 @@ pub(super) fn resolve_historical_control_chain(
         return Err("historical_root_mismatch".into());
     }
     if root.state == super::composition::OutputState::Released
-        && !journal.session_releases.has_valid_released(
+        && !journal.session_releases.has_valid_owner_completion(
             journal,
             &root.output.origin,
             &root.output.producer,

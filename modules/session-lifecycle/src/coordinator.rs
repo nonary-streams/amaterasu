@@ -8,6 +8,7 @@ mod action_endpoints;
 mod action_release_proof;
 mod action_target;
 mod application;
+mod composed_release_proof;
 #[allow(dead_code)] // Admission and control remain disabled until schema verification is wired.
 mod composition;
 #[allow(dead_code)] // Controls stay gated until sequencing is qualified.
@@ -447,6 +448,8 @@ struct Journal {
     #[serde(default)]
     stream_releases: stream_release::StreamReleaseBook,
     #[serde(default)]
+    composed_releases: composed_release_proof::ComposedReleaseBook,
+    #[serde(default)]
     session_releases: session_release::SessionReleaseBook,
     #[serde(default)]
     session_prepare_evidence: session_prepare_evidence::SessionPrepareEvidence,
@@ -458,6 +461,24 @@ struct Journal {
 }
 
 impl Journal {
+    fn verified_released_output(
+        &self,
+        target: &LifecycleTarget,
+    ) -> Option<(&str, &amaterasu_extension_api::ResourceOutput)> {
+        let standalone = self
+            .stream_releases
+            .released_output_for_target(target)
+            .filter(|_| self.stream_releases.has_valid_released(self, target));
+        let composed = self
+            .composed_releases
+            .released_output_for_target(target)
+            .filter(|_| self.composed_releases.has_valid_release(self, target));
+        match (standalone, composed) {
+            (Some(value), None) | (None, Some(value)) => Some(value),
+            _ => None,
+        }
+    }
+
     fn references_admission(&self, id: &str) -> bool {
         self.action_dispositions.values().any(|marker| {
             marker.root_admission_id == id
@@ -472,7 +493,8 @@ impl Journal {
                                     || snapshot.stream_admissions.contains_key(id)
                             })
                     })
-        }) || self.session_prepare_evidence.references_admission(id)
+        }) || self.composed_releases.references_admission(id)
+            || self.session_prepare_evidence.references_admission(id)
             || self.session_releases.references_admission(id)
             || self.stream_releases.references_admission(id)
             || self
@@ -711,15 +733,9 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                     .last();
                 let prior_release_valid = match (&stage.prior_release_admission, previous) {
                     (None, None) => true,
-                    (Some(admission), Some(previous)) => {
-                        journal
-                            .stream_releases
-                            .released_output_for_target(&previous.target)
-                            .is_some_and(|(id, output)| id == admission && output == &stage.before)
-                            && journal
-                                .stream_releases
-                                .has_valid_released(journal, &previous.target)
-                    }
+                    (Some(admission), Some(previous)) => journal
+                        .verified_released_output(&previous.target)
+                        .is_some_and(|(id, output)| id == admission && output == &stage.before),
                     _ => false,
                 };
                 let Ok((epoch, session_id, Some(stream_id), generation)) =
@@ -763,6 +779,7 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
         || !journal.session_prepare_evidence.validate(journal)
         || !journal.session_releases.validate(journal)
         || !journal.stream_releases.validate(journal)
+        || !journal.composed_releases.validate(journal)
         || !journal.finalize_results.validate_structure()
         || journal.finalize_results.records().any(|item| {
             let request = &item.request;
@@ -1002,6 +1019,7 @@ impl Coordinator {
             control_settlements: Default::default(),
             finalize_results: Default::default(),
             stream_releases: Default::default(),
+            composed_releases: Default::default(),
             session_releases: Default::default(),
             session_prepare_evidence: Default::default(),
             action_dispositions: Default::default(),

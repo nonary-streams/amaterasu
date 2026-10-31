@@ -964,15 +964,8 @@ pub(super) fn standalone_stream_input(
             && stage.after.output_id == input.output.output_id
             && stage.after.origin == input.output.origin
     }) {
-        if !journal
-            .stream_releases
-            .has_valid_released(journal, &previous.target)
-        {
-            return Err("prior_stream_release_unverified".into());
-        }
         journal
-            .stream_releases
-            .released_output_for_target(&previous.target)
+            .verified_released_output(&previous.target)
             .map(|(_, output)| output.clone())
             .ok_or("prior_stream_release_readback_missing")?
     } else {

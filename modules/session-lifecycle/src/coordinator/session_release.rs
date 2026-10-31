@@ -19,6 +19,17 @@ pub(super) struct SessionReleaseProof {
 #[serde(deny_unknown_fields)]
 pub(super) struct SessionReleaseBook {
     proofs: Vec<SessionReleaseProof>,
+    #[serde(default)]
+    noop_proofs: Vec<NoopReleaseProof>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NoopReleaseProof {
+    target: LifecycleTarget,
+    transition_id: String,
+    provider: String,
+    callback: composition::ProducerCallbackProof,
 }
 impl SessionReleaseBook {
     pub fn has_valid_released(
@@ -32,8 +43,33 @@ impl SessionReleaseBook {
         })
     }
 
+    /// Direct terminal owner evidence only. Full book validation separately checks
+    /// stream lineage and dependent cleanup; this avoids cyclic history checks.
+    pub fn has_valid_owner_completion(
+        &self,
+        journal: &Journal,
+        target: &LifecycleTarget,
+        provider: &str,
+    ) -> bool {
+        let mut matches = self
+            .proofs
+            .iter()
+            .filter(|proof| &proof.target == target && proof.provider == provider);
+        let Some(proof) = matches.next() else {
+            return false;
+        };
+        matches.next().is_none() && valid_owner_completion(journal, proof)
+    }
+
     pub fn validate(&self, journal: &Journal) -> bool {
         self.proofs.len() <= MAX_RELEASES
+            && self.noop_proofs.len() <= MAX_RELEASES
+            && self.noop_proofs.iter().enumerate().all(|(index, proof)| {
+                valid_noop_proof(journal, proof)
+                    && !self.noop_proofs[..index]
+                        .iter()
+                        .any(|old| old.target == proof.target && old.provider == proof.provider)
+            })
             && self.proofs.iter().enumerate().all(|(index, proof)| {
                 validate_proof(journal, proof)
                     && !self.proofs[..index]
@@ -42,10 +78,13 @@ impl SessionReleaseBook {
             })
     }
     pub fn references_admission(&self, id: &str) -> bool {
-        self.proofs.iter().any(|proof| {
-            proof.root_admission_id == id
-                || proof.callback.request.admission_id.as_deref() == Some(id)
-        })
+        self.noop_proofs
+            .iter()
+            .any(|proof| proof.callback.request.admission_id.as_deref() == Some(id))
+            || self.proofs.iter().any(|proof| {
+                proof.root_admission_id == id
+                    || proof.callback.request.admission_id.as_deref() == Some(id)
+            })
     }
 }
 
@@ -63,7 +102,7 @@ fn session_lineage_closed(journal: &Journal, target: &LifecycleTarget, provider:
         return false;
     }
     let stream_closed =
-        |target: &LifecycleTarget| journal.stream_releases.has_valid_released(journal, target);
+        |target: &LifecycleTarget| journal.verified_released_output(target).is_some();
     if session.streams.iter().any(|(id, stream)| {
         let target = LifecycleTarget::Stream {
             host_epoch: epoch.into(),
@@ -90,12 +129,111 @@ fn session_lineage_closed(journal: &Journal, target: &LifecycleTarget, provider:
     if journal.control_settlements.records().any(|record| {
         operations::target_parts(&record.settlement.request.target)
             .is_ok_and(|(_, id, _, _)| id == session_id)
+            && !stream_closed(&record.settlement.request.target)
     }) {
         return false;
     }
-    session.provider_graph.as_ref().is_some_and(|graph| {
-        graph.order == [provider] && graph.dependencies.get(provider).is_some_and(Vec::is_empty)
-    })
+    session
+        .provider_graph
+        .as_ref()
+        .is_some_and(|graph| valid_release_graph(graph, provider))
+}
+
+// Only the qualified single owner or one explicit no-op dependent is supported.
+fn valid_release_graph(graph: &ProviderGraph, owner: &str) -> bool {
+    if graph.dependencies.len() != graph.order.len()
+        || graph.order.first().map(String::as_str) != Some(owner)
+        || graph
+            .dependencies
+            .get(owner)
+            .is_none_or(|deps| !deps.is_empty())
+    {
+        return false;
+    }
+    match graph.order.as_slice() {
+        [_] => true,
+        [_, dependent] => {
+            dependent != owner
+                && graph
+                    .dependencies
+                    .get(dependent)
+                    .is_some_and(|deps| deps == &[owner])
+        }
+        _ => false,
+    }
+}
+
+fn valid_noop_proof(journal: &Journal, proof: &NoopReleaseProof) -> bool {
+    let Ok((_, session_id, None, _)) = operations::target_parts(&proof.target) else {
+        return false;
+    };
+    let Some(session) = journal.sessions.get(session_id) else {
+        return false;
+    };
+    let Some(graph) = &session.provider_graph else {
+        return false;
+    };
+    let [owner, dependent] = graph.order.as_slice() else {
+        return false;
+    };
+    let Some(id) = proof.callback.request.admission_id.as_deref() else {
+        return false;
+    };
+    let Some(admission) = journal
+        .authority
+        .settled
+        .get(id)
+        .or_else(|| journal.authority.admissions.get(id))
+    else {
+        return false;
+    };
+    let plan = &admission.plan;
+    let crate::provider_dispatch::DispatchState::Completed { payload } =
+        &proof.callback.terminal.state
+    else {
+        return false;
+    };
+    let Ok(response) = serde_json::from_value::<ProviderResponse>(payload.clone()) else {
+        return false;
+    };
+    valid_release_graph(graph, owner)
+        && dependent == &proof.provider
+        && session_lineage_closed(journal, &proof.target, owner)
+        && session_prepare_evidence::all_dependent_session_prepares_noop(
+            journal,
+            &proof.target,
+            graph,
+            owner,
+        )
+        && admission.provider == proof.provider
+        && admission.selection.participant == proof.callback.participant
+        && proof.callback.request.version == amaterasu_extension_api::COMPOSITION_VERSION
+        && proof.callback.request.operation
+            == amaterasu_extension_api::ProviderOperation::LifecycleCallback
+        && proof.callback.request.phase == LifecyclePhase::SessionRelease
+        && proof.callback.request.dependency_inputs.is_empty()
+        && proof.callback.request.control_results.is_empty()
+        && proof.callback.request.target == proof.target
+        && proof.callback.request.transition_id == proof.transition_id
+        && proof.callback.request.approved_plan.as_ref() == Some(plan)
+        && session.admission_ids.contains(id)
+        && session.admission_targets.get(id) == Some(&proof.target)
+        && session.admission_phases.get(id) == Some(&LifecyclePhase::SessionRelease)
+        && journal.admission_transitions.get(id) == Some(&proof.transition_id)
+        && plan.resources.is_empty()
+        && plan.mutation_domains.is_empty()
+        && plan.obligations.is_empty()
+        && plan.control_proposals.is_empty()
+        && plan.candidate_constraint.is_none()
+        && plan.affected_consumers.is_empty()
+        && plan.consumer_change == amaterasu_extension_api::ConsumerChange::Live
+        && matches!(&response, ProviderResponse::Cleanup { outcomes, outputs } if outcomes.is_empty() && outputs.is_empty())
+        && composition::callback_approvals_valid(
+            &proof.callback,
+            &admission.selection.approvals,
+            &proof.provider,
+        )
+        && composition::valid_callback_proof(&proof.callback, &response)
 }
 
 fn valid_root_provenance(journal: &Journal, root: &composition::StoredOutput) -> bool {
@@ -123,6 +261,30 @@ fn valid_root_provenance(journal: &Journal, root: &composition::StoredOutput) ->
 }
 
 fn validate_proof(journal: &Journal, proof: &SessionReleaseProof) -> bool {
+    let Ok((_, session_id, None, _)) = operations::target_parts(&proof.target) else {
+        return false;
+    };
+    let Some(session) = journal.sessions.get(session_id) else {
+        return false;
+    };
+    session_lineage_closed(journal, &proof.target, &proof.provider)
+        && session
+            .provider_graph
+            .as_ref()
+            .is_some_and(|graph| match graph.order.as_slice() {
+                [_] => true,
+                [_, dependent] => journal.session_releases.noop_proofs.iter().any(|item| {
+                    item.target == proof.target
+                        && item.provider == *dependent
+                        && item.transition_id == proof.transition_id
+                        && valid_noop_proof(journal, item)
+                }),
+                _ => false,
+            })
+        && valid_owner_completion(journal, proof)
+}
+
+fn valid_owner_completion(journal: &Journal, proof: &SessionReleaseProof) -> bool {
     let Ok((_, session_id, None, _)) = operations::target_parts(&proof.target) else {
         return false;
     };
@@ -158,8 +320,7 @@ fn validate_proof(journal: &Journal, proof: &SessionReleaseProof) -> bool {
     let ProviderResponse::Cleanup { outcomes, .. } = &response else {
         return false;
     };
-    session_lineage_closed(journal, &proof.target, &proof.provider)
-        && root.state == composition::OutputState::Released
+    root.state == composition::OutputState::Released
         && valid_root_provenance(journal, root)
         && proof.callback.participant == admission.selection.participant
         && admission.provider == proof.provider
@@ -206,41 +367,128 @@ pub(super) fn validate_session_release_preflight(
     work: &Work,
     provider: &str,
 ) -> ModuleResult<()> {
-    if work.phase != LifecyclePhase::SessionRelease
-        || !session_lineage_closed(journal, &work.target, provider)
-    {
-        return Err("session_lineage_not_retired".into());
-    }
     let (_, session_id, None, _) = operations::target_parts(&work.target)? else {
         return Err("session_target_required".into());
     };
     let session = journal.sessions.get(session_id).ok_or("unknown_session")?;
-    if session.phase != SessionPhase::Ending {
-        return Err("session_not_ending".into());
-    }
     let graph = work
         .provider_graph
         .as_ref()
         .ok_or("provider_graph_missing")?;
-    if work.providers != [provider]
+    let owner = graph.order.first().ok_or("provider_graph_missing")?;
+    if work.phase != LifecyclePhase::SessionRelease
+        || !session_lineage_closed(journal, &work.target, owner)
+        || serde_json::to_value(&session.provider_graph).ok()
+            != serde_json::to_value(Some(graph)).ok()
+        || work.providers != graph.order.iter().rev().cloned().collect::<Vec<_>>()
+        || work.providers.get(work.index).map(String::as_str) != Some(provider)
         || work.cleanup_blocked(provider)
-        || graph.order != [provider]
-        || graph
-            .dependencies
-            .get(provider)
-            .is_none_or(|deps| !deps.is_empty())
     {
-        return Err("standalone_release_required".into());
+        return Err("session_lineage_not_retired".into());
+    }
+    if session.phase != SessionPhase::Ending {
+        return Err("session_not_ending".into());
     }
     let mut roots = journal.composition.records().filter(|record| {
         record.output.origin == work.target
-            && record.output.producer == provider
+            && record.output.producer == *owner
             && record.state == composition::OutputState::Retained
     });
     let root = roots.next().ok_or("session_root_missing_or_ambiguous")?;
     if roots.next().is_some() || !valid_root_provenance(journal, root) {
         return Err("session_root_missing_or_ambiguous".into());
     }
+    if graph.order.len() == 2 {
+        if !session_prepare_evidence::all_dependent_session_prepares_noop(
+            journal,
+            &work.target,
+            graph,
+            owner,
+        ) {
+            return Err("dependent_session_prepare_unproven".into());
+        }
+        if provider != owner
+            && work
+                .states
+                .get(provider)
+                .and_then(|state| state.plan.as_ref())
+                .is_some_and(|plan| {
+                    !plan.resources.is_empty()
+                        || !plan.mutation_domains.is_empty()
+                        || !plan.obligations.is_empty()
+                        || !plan.control_proposals.is_empty()
+                        || plan.candidate_constraint.is_some()
+                        || !plan.affected_consumers.is_empty()
+                        || plan.consumer_change != amaterasu_extension_api::ConsumerChange::Live
+                })
+        {
+            return Err("dependent_session_release_not_noop".into());
+        }
+        if provider == owner
+            && !journal.session_releases.noop_proofs.iter().any(|proof| {
+                proof.target == work.target
+                    && proof.provider == graph.order[1]
+                    && proof.transition_id == work.transition_id
+                    && valid_noop_proof(journal, proof)
+            })
+        {
+            return Err("dependent_session_release_unproven".into());
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn record_noop_session_release(
+    journal: &mut Journal,
+    work: &Work,
+    provider: &str,
+    state: &PrepareState,
+) -> ModuleResult<()> {
+    validate_session_release_preflight(journal, work, provider)?;
+    let graph = work
+        .provider_graph
+        .as_ref()
+        .ok_or("provider_graph_missing")?;
+    if graph.order.len() != 2
+        || graph.order[1] != provider
+        || state.phase != PreparePhase::CleanupSettled
+        || state.provider != provider
+        || state.request.target != work.target
+        || state.request.transition_id != work.transition_id
+        || !journal.receipts.values().any(|receipt| {
+            receipt.work.as_ref().is_some_and(|saved| {
+                serde_json::to_value(saved).ok() == serde_json::to_value(work).ok()
+            })
+        })
+    {
+        return Err("session_noop_release_context_mismatch".into());
+    }
+    let proof = NoopReleaseProof {
+        target: work.target.clone(),
+        transition_id: work.transition_id.clone(),
+        provider: provider.into(),
+        callback: composition::ProducerCallbackProof {
+            participant: state.participant.clone(),
+            request: state.request.clone(),
+            terminal: state
+                .terminal_dispatch
+                .clone()
+                .ok_or("cleanup_terminal_proof_missing")?,
+            pending_receipt: state.pending_receipt.clone(),
+            pending_dispatch: state.pending_dispatch.clone(),
+        },
+    };
+    if journal.session_releases.noop_proofs.len() >= MAX_RELEASES
+        || journal
+            .session_releases
+            .noop_proofs
+            .iter()
+            .any(|old| old.target == proof.target && old.provider == proof.provider)
+        || !valid_noop_proof(journal, &proof)
+    {
+        return Err("invalid_session_noop_release_proof".into());
+    }
+    journal.session_releases.noop_proofs.push(proof);
     Ok(())
 }
 
@@ -307,11 +555,17 @@ pub(super) fn record_session_release_proof(
     )
     .map_err(str::to_owned)?;
     let previous = std::mem::replace(&mut journal.composition, next);
-    if !validate_proof(journal, &proof) {
+    journal.session_releases.proofs.push(proof);
+    if !journal
+        .session_releases
+        .proofs
+        .last()
+        .is_some_and(|candidate| validate_proof(journal, candidate))
+    {
+        journal.session_releases.proofs.pop();
         journal.composition = previous;
         return Err("invalid_session_release_proof".into());
     }
-    journal.session_releases.proofs.push(proof);
     Ok(())
 }
 
@@ -878,6 +1132,136 @@ mod tests {
     }
 
     #[test]
+    fn dependent_noop_proof_precedes_owner_release() {
+        let (mut journal, mut work, root_state) = complete_fixture();
+        let graph = ProviderGraph {
+            order: vec!["owner".into(), "settings".into()],
+            dependencies: BTreeMap::from([
+                ("owner".into(), vec![]),
+                ("settings".into(), vec!["owner".into()]),
+            ]),
+        };
+        journal.sessions.get_mut("session").unwrap().provider_graph = Some(graph.clone());
+        work.provider_graph = Some(graph);
+        work.providers = vec!["settings".into(), "owner".into()];
+        work.index = 0;
+        let mut participant = root_state.participant.clone();
+        participant.provider = "settings".into();
+        for method in [
+            &mut participant.plan_method,
+            &mut participant.callback_method,
+            &mut participant.status_method,
+        ] {
+            method.service = "settings/2".into();
+        }
+        let broker = json!({"provider":"settings","method":{"service":"settings/2","method":"callback","interface_major":2,"interface_minor":0}});
+        let mut selection = journal.authority.settled["root"].selection.clone();
+        selection.participant = participant.clone();
+        selection.approvals[0].method = participant.callback_method.clone();
+        selection.approvals[0].broker_approval = broker.clone();
+        let plan: amaterasu_extension_api::ResourcePlan = serde_json::from_value(json!({"plan_id":"noop","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]})).unwrap();
+        let mut state = root_state.clone();
+        state.provider = "settings".into();
+        state.participant = participant;
+        state.plan = Some(plan.clone());
+        state.request.approved_plan = Some(plan.clone());
+        state.request.admission_id = Some("settings-prepare".into());
+        state.admission_id = Some("settings-prepare".into());
+        state.request.transition_id = "settings-prepare-transition".into();
+        state.request.operation_id = "settings-prepare-call".into();
+        state.request.phase = LifecyclePhase::SessionPrepare;
+        state.phase = PreparePhase::Prepared;
+        state.response = Some(
+            serde_json::from_value(
+                json!({"status":"prepared","candidate":null,"obligations":[],"outputs":[]}),
+            )
+            .unwrap(),
+        );
+        let terminal = state.terminal_dispatch.as_mut().unwrap();
+        terminal.call.service = "settings/2".into();
+        terminal.call.approval = broker.clone();
+        terminal.call.operation_id = state.request.operation_id.clone();
+        terminal.call.arguments = serde_json::to_value(&state.request).unwrap();
+        terminal.state = crate::provider_dispatch::DispatchState::Completed {
+            payload: serde_json::to_value(state.response.as_ref().unwrap()).unwrap(),
+        };
+        for (id, phase, transition) in [
+            (
+                "settings-prepare",
+                LifecyclePhase::SessionPrepare,
+                "settings-prepare-transition",
+            ),
+            (
+                "settings-release",
+                LifecyclePhase::SessionRelease,
+                "release",
+            ),
+        ] {
+            journal.authority.settled.insert(
+                id.into(),
+                crate::prepare_authority::Admission {
+                    provider: "settings".into(),
+                    selection: selection.clone(),
+                    plan: plan.clone(),
+                    rights: vec![],
+                },
+            );
+            let session = journal.sessions.get_mut("session").unwrap();
+            session.admission_ids.insert(id.into());
+            session
+                .admission_targets
+                .insert(id.into(), work.target.clone());
+            session.admission_phases.insert(id.into(), phase);
+            journal
+                .admission_transitions
+                .insert(id.into(), transition.into());
+        }
+        let mut prepare_work = work.clone();
+        prepare_work.phase = LifecyclePhase::SessionPrepare;
+        prepare_work.transition_id = "settings-prepare-transition".into();
+        prepare_work.states.insert("settings".into(), state.clone());
+        journal.receipts.get_mut("receipt").unwrap().work = Some(prepare_work.clone());
+        session_prepare_evidence::record(&mut journal, &prepare_work, "settings", &state).unwrap();
+        state.request.phase = LifecyclePhase::SessionRelease;
+        state.request.transition_id = work.transition_id.clone();
+        state.request.operation_id = "settings-release-call".into();
+        state.request.admission_id = Some("settings-release".into());
+        state.admission_id = Some("settings-release".into());
+        state.phase = PreparePhase::CleanupSettled;
+        state.response = Some(
+            serde_json::from_value(json!({"status":"cleanup","outcomes":[],"outputs":[]})).unwrap(),
+        );
+        let terminal = state.terminal_dispatch.as_mut().unwrap();
+        terminal.call.operation_id = state.request.operation_id.clone();
+        terminal.call.arguments = serde_json::to_value(&state.request).unwrap();
+        terminal.state = crate::provider_dispatch::DispatchState::Completed {
+            payload: serde_json::to_value(state.response.as_ref().unwrap()).unwrap(),
+        };
+        journal.receipts.get_mut("receipt").unwrap().work = Some(work.clone());
+        assert!(validate_session_release_preflight(&journal, &work, "settings").is_ok());
+        let mut owner_work = work.clone();
+        owner_work.index = 1;
+        assert_eq!(
+            validate_session_release_preflight(&journal, &owner_work, "owner").unwrap_err(),
+            "dependent_session_release_unproven"
+        );
+        let before = serde_json::to_value(&journal).unwrap();
+        let mut invalid = state.clone();
+        invalid.terminal_dispatch.as_mut().unwrap().call.approval["provider"] = json!("foreign");
+        assert!(record_noop_session_release(&mut journal, &work, "settings", &invalid).is_err());
+        assert_eq!(serde_json::to_value(&journal).unwrap(), before);
+        record_noop_session_release(&mut journal, &work, "settings", &state).unwrap();
+        assert!(journal.session_releases.validate(&journal));
+        assert!(validate_session_release_preflight(&journal, &owner_work, "owner").is_ok());
+        journal.receipts.get_mut("receipt").unwrap().work = Some(owner_work.clone());
+        record_session_release_proof(&mut journal, &owner_work, "owner", &root_state).unwrap();
+        assert!(journal.session_releases.validate(&journal));
+        let restored: Journal =
+            serde_json::from_value(serde_json::to_value(journal).unwrap()).unwrap();
+        assert!(restored.session_releases.validate(&restored));
+    }
+
+    #[test]
     fn exact_session_and_application_retirement_gate_lineage() {
         let (mut journal, work) = fixture();
         assert!(session_lineage_closed(&journal, &work.target, "owner"));
@@ -940,7 +1324,7 @@ mod tests {
             .insert("foreign".into(), vec![]);
         assert_eq!(
             validate_session_release_preflight(&journal, &work, "owner").unwrap_err(),
-            "standalone_release_required"
+            "session_lineage_not_retired"
         );
         work.provider_graph
             .as_mut()
@@ -950,7 +1334,7 @@ mod tests {
         work.providers.push("foreign".into());
         assert_eq!(
             validate_session_release_preflight(&journal, &work, "owner").unwrap_err(),
-            "standalone_release_required"
+            "session_lineage_not_retired"
         );
     }
 }

@@ -1038,15 +1038,8 @@ pub(super) fn collect_verified_outputs(
                 .find(|old| same_key(&old.after, output))
             {
                 let (id, released) = journal
-                    .stream_releases
-                    .released_output_for_target(&previous.target)
+                    .verified_released_output(&previous.target)
                     .ok_or("prior_stream_release_readback_missing")?;
-                if !journal
-                    .stream_releases
-                    .has_valid_released(journal, &previous.target)
-                {
-                    return Err("prior_stream_release_unverified".into());
-                }
                 (Some(id.to_owned()), released.clone())
             } else {
                 (None, root.output.clone())
