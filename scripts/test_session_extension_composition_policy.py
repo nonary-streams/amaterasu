@@ -100,10 +100,10 @@ class CompositionPolicyTest(unittest.TestCase):
         base = {"policy": {"principals": {identity: {"call": []} for identity in identities},
                            "settings": {legacy.NVHTTP: {"streaming": {"capture": {}}}},
                            "api_methods": []}}
-        lifecycle = {"operation_grants": {check.OWNER: ["verify_action_effect", "check_action_effect"]}}
+        lifecycle = {"operation_grants": {check.OWNER: ["lookup_control_baseline", "verify_action_effect", "check_action_effect"]}}
         with self.assertRaisesRegex(ValueError, "owner action operation grants"):
             policy.build_bootstrap(base, self.selected, entries, lifecycle, True)
-        lifecycle["operation_grants"][check.OWNER] = sorted(policy.ACTION_OWNER_OPERATIONS)
+        lifecycle["operation_grants"][check.OWNER] = sorted(policy.ACTION_OWNER_OPERATIONS | policy.CORE_OWNER_OPERATIONS)
         with self.assertRaisesRegex(ValueError, "action-service operation grants"):
             policy.build_bootstrap(base, self.selected, entries, lifecycle, True)
         lifecycle["operation_grants"][legacy.ACTIONS] = sorted(policy.ACTION_COORDINATOR_OPERATIONS)
@@ -140,7 +140,9 @@ class CompositionPolicyTest(unittest.TestCase):
                            "api_methods": []}}
         before = copy.deepcopy(base)
         entries = policy.provider_entries(self.selected)
-        lifecycle = {"journal_path": "/new-root/data/journal.json", "operation_grants": {}}
+        lifecycle = {"journal_path": "/new-root/data/journal.json", "operation_grants": {check.OWNER: ["lookup_control_baseline"]}}
+        with self.assertRaisesRegex(ValueError, "baseline lookup"):
+            policy.build_bootstrap(base, self.selected, entries, {"operation_grants": {}})
         assembled, calls = policy.build_bootstrap(base, self.selected, entries, lifecycle)
         self.assertEqual(base, before)
         settings = assembled["policy"]["settings"]
@@ -164,17 +166,17 @@ class CompositionPolicyTest(unittest.TestCase):
         entries = policy.provider_entries(self.selected)
         base["policy"]["api_methods"].append(copy.deepcopy(entries["api_methods"][0]))
         with self.assertRaisesRegex(ValueError, "approval conflicts"):
-            policy.build_bootstrap(base, self.selected, entries, {})
+            policy.build_bootstrap(base, self.selected, entries, {"operation_grants": {check.OWNER: ["lookup_control_baseline"]}})
         base["policy"]["api_methods"] = []
         with self.assertRaisesRegex(ValueError, "must not override"):
             policy.build_bootstrap(base, self.selected, entries, {"participants": []})
         base["policy"]["settings"][legacy.NVHTTP]["streaming"]["capture"]["capture_provider"] = "kms"
         with self.assertRaisesRegex(ValueError, "capture selection conflicts"):
-            policy.build_bootstrap(base, self.selected, entries, {})
+            policy.build_bootstrap(base, self.selected, entries, {"operation_grants": {check.OWNER: ["lookup_control_baseline"]}})
         base["policy"]["settings"][legacy.NVHTTP]["streaming"]["capture"]["capture_provider"] = "pipewire"
         base["policy"]["settings"][legacy.NVHTTP]["session_lifecycle_required"] = False
         with self.assertRaisesRegex(ValueError, "lifecycle configuration conflicts"):
-            policy.build_bootstrap(base, self.selected, entries, {})
+            policy.build_bootstrap(base, self.selected, entries, {"operation_grants": {check.OWNER: ["lookup_control_baseline"]}})
 
     def test_resource_scoped_graph_pins_owner_methods_and_schema_bytes(self):
         target, control = b'{"target":true}\n', b'{"control":true}\n'

@@ -14,6 +14,7 @@ import prepare_session_extension_profile as legacy
 ACTION_OWNER_OPERATIONS = {"describe_action_target", "inspect_action_effect",
                            "verify_action_effect", "check_action_effect"}
 ACTION_COORDINATOR_OPERATIONS = {"rebind_action_plan", "cancel_action"}
+CORE_OWNER_OPERATIONS = {"lookup_control_baseline"}
 
 
 def method_ref(provider: str, name: str) -> dict:
@@ -180,6 +181,8 @@ def build_bootstrap(base: dict, selected: list[dict], entries: dict, lifecycle_s
     if entries["input_actions"] != expected_actions or bool(entries["action_grants"]) != enable_action:
         raise ValueError("action authorization does not match the profile selection")
     owner_operations = lifecycle.get("operation_grants", {}).get(check.OWNER, [])
+    if not CORE_OWNER_OPERATIONS <= set(owner_operations):
+        raise ValueError("owner baseline lookup operation grant is missing")
     if enable_action and not ACTION_OWNER_OPERATIONS <= set(owner_operations):
         raise ValueError("owner action operation grants are incomplete")
     action_operations = lifecycle.get("operation_grants", {}).get(legacy.ACTIONS, [])

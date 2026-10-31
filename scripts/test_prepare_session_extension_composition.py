@@ -57,7 +57,7 @@ class PrepareCompositionTest(unittest.TestCase):
                         self.assertTrue(Path(arguments[i + 1]).is_file())
                         self.assertTrue(Path(arguments[i + 2]).is_file())
                 return ""
-            with mock.patch.object(prepare.legacy, "run", side_effect=run), mock.patch.object(prepare, "validated_runtime_configuration", return_value={"journal_path": str(root / "data/session-lifecycle/journal.json"), "operation_grants": {}}):
+            with mock.patch.object(prepare.legacy, "run", side_effect=run), mock.patch.object(prepare, "validated_runtime_configuration", return_value={"journal_path": str(root / "data/session-lifecycle/journal.json"), "operation_grants": {check.OWNER: ["lookup_control_baseline"]}}):
                 prepare.pack_profile(Path("release"), root, directory, package, 1, inputs, [],
                                      enable_virtual_display=True)
             self.assertEqual([call[1] for call in calls], ["init-linux-session", "pack-linux-session-extensions", "verify"])
