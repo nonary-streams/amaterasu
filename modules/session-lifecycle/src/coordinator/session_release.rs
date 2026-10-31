@@ -467,6 +467,167 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_dispatches_owner_cleanup_and_persists_release() {
+        let (mut journal, mut work, mut state) = complete_fixture();
+        let directory = std::env::temp_dir().join(format!(
+            "amaterasu-session-release-{}",
+            amaterasu_storage::random_identifier().unwrap()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut coordinator = Coordinator::open(&directory.join("journal")).unwrap();
+        coordinator.configured = true;
+        coordinator
+            .settings
+            .participants
+            .push(state.participant.clone());
+        coordinator.settings.consumer_requirements = state.request.consumer_requirements.clone();
+        coordinator
+            .settings
+            .finalize_policies
+            .push(super::super::finalize_selection::tests::fixture().policy);
+        let mut admission = journal
+            .authority
+            .settled
+            .remove("release-admission")
+            .unwrap();
+        admission.plan.resources[0].incarnation = Some("native".into());
+        let cleanup = admission.plan.obligations[0].cleanup_method.clone();
+        admission.selection.cleanup_methods.push(cleanup);
+        state.request.approved_plan = Some(admission.plan.clone());
+        state.request.dependency_inputs =
+            vec![journal.composition.records().next().unwrap().output.clone()];
+        state.request.resource_generation = Some(1);
+        state.plan = Some(admission.plan.clone());
+        state.phase = PreparePhase::Callback;
+        state.response = None;
+        state.terminal_dispatch = None;
+        work.states.insert("owner".into(), state.clone());
+        journal
+            .authority
+            .snapshot
+            .resources
+            .entry("owner".into())
+            .or_default()
+            .insert(
+                "display".into(),
+                crate::planning::ResourceRef {
+                    provider: "owner".into(),
+                    resource_id: "display".into(),
+                    incarnation: "native".into(),
+                    revision: 2,
+                    execution_domain: "seat".into(),
+                    mutation_domains: Default::default(),
+                },
+            );
+        coordinator
+            .selections
+            .insert("owner".into(), admission.selection.clone());
+        journal
+            .authority
+            .admissions
+            .insert("release-admission".into(), admission);
+        journal
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .resource_generations
+            .insert("owner".into(), 1);
+        journal
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .provider_settings
+            .insert(
+                "owner".into(),
+                settings_snapshot::FrozenSettings {
+                    settings: json!({}),
+                    revision: "revision".into(),
+                },
+            );
+        let key = receipt_key("transport", "client", "end");
+        journal.receipts.clear();
+        journal.receipts.insert(
+            key.clone(),
+            Receipt {
+                caller: "transport".into(),
+                initiator: "client".into(),
+                request: json!({"operation_id":"end"}),
+                response: json!({"status":"pending","operation_id":"end"}),
+                work: Some(work),
+                wait_target: None,
+            },
+        );
+        journal.authority.sequences.insert("owner".into(), 1);
+        coordinator.shared.borrow_mut().value = journal;
+        {
+            use crate::prepare_driver::PrepareAuthority;
+            let work = coordinator.shared.borrow().value.receipts[&key]
+                .work
+                .clone()
+                .unwrap();
+            let mut authority = coordinator.authority_for_work(&work).unwrap();
+            authority
+                .validate_rights(
+                    &state.participant,
+                    state.plan.as_ref().unwrap(),
+                    "release-admission",
+                )
+                .unwrap();
+        }
+        let mut submitted = 0;
+        let mut send = |command| -> ModuleResult<Response> {
+            match command {
+                Command::QueryApiApproval { .. } => Ok(Response::Result {
+                    payload: json!({"provider":"owner","method":{"service":"owner/2","method":"callback","interface_major":2,"interface_minor":0}}),
+                }),
+                Command::CallApi { payload, .. } => {
+                    assert_eq!(payload["phase"], "session.release");
+                    assert_eq!(payload["resource_generation"], 1);
+                    assert_eq!(payload["dependency_inputs"][0]["output_id"], "output");
+                    submitted += 1;
+                    Ok(Response::Accepted { id: 1 })
+                }
+                Command::TakeResult { .. } => Ok(Response::Result {
+                    payload: json!({"status":"cleanup","outcomes":[{"obligation_id":"cleanup","state":"released","reason":null}],"outputs":[]}),
+                }),
+                Command::ReleaseResult { .. } => Ok(Response::Ok),
+                other => panic!("unexpected broker command: {other:?}"),
+            }
+        };
+        for _ in 0..16 {
+            coordinator.advance_work(&mut send).unwrap();
+        }
+        let shared = coordinator.shared.borrow();
+        assert_eq!(
+            submitted, 1,
+            "receipt: {}",
+            shared.value.receipts[&key].response
+        );
+        assert_eq!(shared.value.receipts[&key].response["status"], "succeeded");
+        assert!(shared.value.session_releases.validate(&shared.value));
+        assert_eq!(
+            shared.value.composition.records().next().unwrap().state,
+            composition::OutputState::Released
+        );
+        drop(shared);
+        drop(coordinator);
+        let restored: Journal =
+            serde_json::from_slice(&std::fs::read(directory.join("journal")).unwrap()).unwrap();
+        assert!(restored.session_releases.validate(&restored));
+        assert_eq!(
+            restored.composition.records().next().unwrap().state,
+            composition::OutputState::Released
+        );
+        validate_journal(&restored).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn exact_completed_cleanup_atomically_releases_root_and_retains_proof() {
         let (mut journal, work, state) = complete_fixture();
         assert!(validate_session_release_preflight(&journal, &work, "owner").is_ok());
