@@ -146,8 +146,16 @@ pub(super) fn verified_marker_at<'a>(
         journal,
         &marker.cleanup_work,
         proof,
-    ) || !action_release_proof::validate_owner_release(journal, &marker.cleanup_work, owner)
-    {
+    ) {
+        return None;
+    }
+    // The stream cleanup preceded this action's authenticated removal. Verify
+    // that historical proof in a private pre-release view of the exact root;
+    // the real journal remains Released and the terminal action proof below is
+    // still mandatory before this marker can be accepted.
+    let mut historical = journal.clone();
+    historical.composition = journal.composition.historical_pre_release_view(root)?;
+    if !action_release_proof::validate_owner_release(&historical, &marker.cleanup_work, owner) {
         return None;
     }
     let completed = action_dispatch_proof::validate_dispatch_proof(

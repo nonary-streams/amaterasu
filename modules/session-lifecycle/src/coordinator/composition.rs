@@ -325,6 +325,22 @@ impl CompositionBook {
             })
     }
 
+    /// Build an isolated pre-release view for historical proof verification.
+    /// This clone is never persisted and cannot confer live effect authority.
+    pub(super) fn historical_pre_release_view(&self, released: &StoredOutput) -> Option<Self> {
+        if released.state != OutputState::Released {
+            return None;
+        }
+        let mut book = self.clone();
+        let mut matches = book.outputs.iter_mut().filter(|item| *item == released);
+        let root = matches.next()?;
+        root.state = OutputState::Retained;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(book)
+    }
+
     pub fn records(&self) -> impl Iterator<Item = &StoredOutput> {
         self.outputs.iter()
     }
@@ -1618,6 +1634,25 @@ mod tests {
             .unwrap();
         assert!(book.outputs.is_empty());
         assert!(book.stage_anchors.is_empty());
+    }
+
+    #[test]
+    fn historical_pre_release_view_is_exact_and_never_mutates_source() {
+        let mut released = record();
+        released.state = OutputState::Released;
+        let book = CompositionBook {
+            outputs: vec![released.clone()],
+            ..Default::default()
+        };
+        let view = book.historical_pre_release_view(&released).unwrap();
+        assert_eq!(book.records().next().unwrap().state, OutputState::Released);
+        assert_eq!(view.records().next().unwrap().state, OutputState::Retained);
+        let mut changed = released.clone();
+        changed.output.resource.revision += 1;
+        assert!(book.historical_pre_release_view(&changed).is_none());
+        changed = released.clone();
+        changed.state = OutputState::Retained;
+        assert!(book.historical_pre_release_view(&changed).is_none());
     }
 
     #[test]
