@@ -37,6 +37,19 @@ The command never stages,
 activates, installs, starts, or restarts the host, and it does not change desktop
 or network configuration. Both root and package paths must be new.
 
+To verify an assembled set in a disposable root, run:
+
+```sh
+python3 scripts/test_session_extension_profile.py \
+  /absolute/path/to/amaterasu-release /absolute/path/to/amaterasu \
+  /absolute/path/to/amaterasu-artifacts /absolute/path/to/amaterasu-display-settings \
+  /absolute/path/to/libamaterasu_display_settings.so
+```
+
+This starts a temporary worker with loopback listeners and capture, input, and
+display effects disabled. It checks registry discovery and host settings
+persistence, then removes its temporary root.
+
 Bootstrap policy is trusted local operator configuration; it is not covered by
 the component-set signature. The signed manifest binds each selected component,
 its bytes, dependencies, and requested routing grants. The installed policy and
