@@ -242,6 +242,9 @@ impl Coordinator {
                 json!({"status":"succeeded","operation_id":operation_id,"action_id":action_id,"target":canonical,"reservation_id":reservation_id,"source":owner})
             }
             "authorize_action" => {
+                if action_transfer_in_progress(&journal) {
+                    return rejection("action_transition_in_progress");
+                }
                 let Some(source) =
                     serde_json::from_value::<Principal>(payload["source"].clone()).ok()
                 else {
@@ -431,6 +434,9 @@ impl Coordinator {
                         rejection("operation_id_conflict")
                     };
                 }
+                if action_transfer_in_progress(&journal) {
+                    return rejection("action_transition_in_progress");
+                }
                 let Ok((provider, _method, _plan)) =
                     journal.actions.execution_for_permit(caller, token)
                 else {
@@ -570,6 +576,9 @@ impl Coordinator {
                     return rejection("action_binding_mismatch");
                 }
                 if operation == "consume_action_permit" {
+                    if action_transfer_in_progress(&journal) {
+                        return rejection("action_transition_in_progress");
+                    }
                     let Some((target, owner)) = canonical_target(&journal, &binding.target) else {
                         return rejection("target_not_active");
                     };
@@ -691,6 +700,15 @@ impl Coordinator {
             _ => rejection("unsupported_operation"),
         }
     }
+}
+
+fn action_transfer_in_progress(journal: &super::Journal) -> bool {
+    journal.receipts.values().any(|receipt| {
+        receipt
+            .work
+            .as_ref()
+            .is_some_and(|work| work.action_transfer.is_some())
+    })
 }
 
 /// Resolve the single stream that the action will retire; preparing or
@@ -1325,6 +1343,12 @@ mod tests {
         assert_eq!(
             coordinator.action_operation(&service, "service", &request)["status"],
             "pending"
+        );
+        let mut competing = auth.clone();
+        competing["operation_id"] = json!("competing");
+        assert_eq!(
+            coordinator.action_operation(&service, "service", &competing)["reason"],
+            "action_transition_in_progress"
         );
         coordinator
             .advance_work(&mut |_| panic!("no provider call before retirement"))
