@@ -38,6 +38,12 @@ impl VideoProfile {
             && (99..=127).contains(&self.payload_type)
             && !self.encoding_name.is_empty()
             && self.encoding_name.len() <= 32
+            // Moonlight searches for the AV1 marker as a substring rather than
+            // parsing an rtpmap token. Reserve suffixes as well as exact codec
+            // names so an extension cannot advertise a legacy codec by accident.
+            && !["AV1", "H264", "H265", "HEVC"]
+                .iter()
+                .any(|reserved| self.encoding_name.ends_with(reserved))
             && self
                 .encoding_name
                 .bytes()

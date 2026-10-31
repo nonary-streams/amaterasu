@@ -19,7 +19,9 @@ current controller explicitly rejects any extension action because the generic
 encoded-packet and framing path does not exist. Existing constructors and the
 standard codec enum retain their behavior.
 
-DESCRIBE emits a marker only for an admitted offer. ANNOUNCE chooses the exact
+DESCRIBE emits a marker only for an admitted offer. Extension encoding names
+are uppercase and cannot end in AV1, H264, H265 or HEVC: legacy clients may
+search SDP text for a marker rather than parsing an exact codec token. ANNOUNCE chooses the exact
 wire selector and carries a distinct `NegotiatedVideoFormat::Extension` through
 `Action::ExtensionAnnounce`; it is never converted to H.264 or another legacy
 format. Common bounds and encryption/control checks still apply. Only 8-bit SDR

@@ -290,3 +290,46 @@ fn invalid_offers_fail_before_advertisement() {
     };
     assert!(machine(duplicate.clone(), duplicate).is_err());
 }
+
+#[test]
+fn extension_markers_cannot_claim_disabled_legacy_codecs() {
+    for name in [
+        "AV1",
+        "EXAMPLEAV1",
+        "H264",
+        "EXAMPLEH264",
+        "H265",
+        "EXAMPLEH265",
+        "HEVC",
+        "EXAMPLEHEVC",
+        "av1",
+        "Av1",
+    ] {
+        let offer = VideoProfileSnapshot {
+            profiles: vec![profile(3, 99, name)],
+        };
+        assert!(
+            machine(offer.clone(), offer).is_err(),
+            "accepted marker {name}"
+        );
+    }
+    let offer = VideoProfileSnapshot {
+        profiles: vec![profile(3, 99, "AV1-EXAMPLE")],
+    };
+    let mut negotiation = machine(offer.clone(), offer).unwrap();
+    let target = "rtspenc://127.0.0.1:48010/launch";
+    negotiation
+        .handle(7, &request(Method::Options, target, 1, false))
+        .unwrap();
+    let mut describe = request(Method::Describe, target, 2, false);
+    describe
+        .headers
+        .push(("accept".into(), "application/sdp".into()));
+    let Step::Reply(reply) = negotiation.handle(7, &describe).unwrap() else {
+        panic!()
+    };
+    let description = String::from_utf8(reply).unwrap();
+    assert!(description.contains("a=rtpmap:99 AV1-EXAMPLE/90000"));
+    assert!(!description.contains("AV1/90000"));
+    assert!(!description.contains("sprop-parameter-sets=AAAAAU"));
+}
