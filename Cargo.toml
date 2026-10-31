@@ -32,6 +32,7 @@ members = [
     "fixtures/input-probe",
     "modules/state",
     "modules/session",
+    "modules/session-lifecycle",
     "modules/configuration",
     "modules/host-configuration",
     "modules/catalog",
