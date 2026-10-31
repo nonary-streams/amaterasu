@@ -2452,7 +2452,8 @@ mod tests {
         assert_eq!(described["resource_generation"], 7);
         assert_eq!(described["settings_revision"], "session-rev");
         assert_eq!(described["streams"], json!([]));
-        // A released historical root must not mask the one current root.
+        // A fabricated historical root without its action closure proof must
+        // fence metadata even when a current root is available.
         let mut with_tombstone = paused.clone();
         let mut history = serde_json::to_value(&with_tombstone.composition).unwrap();
         let mut old = history["outputs"][0].clone();
@@ -2462,9 +2463,8 @@ mod tests {
         with_tombstone.composition = serde_json::from_value(history).unwrap();
         save(&coordinator.shared, with_tombstone).unwrap();
         let current = coordinator.describe_action_target("display", &v2);
-        assert_eq!(current["status"], "succeeded", "{current}");
-        assert_eq!(current["owner_output"]["output_id"], "owned");
-        assert_eq!(current["resource_generation"], 7);
+        assert_eq!(current["status"], "rejected", "{current}");
+        assert_eq!(current["reason"], "provider_metadata_unavailable");
         let mut stale_cursor = paused.clone();
         stale_cursor
             .sessions
