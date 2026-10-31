@@ -16,7 +16,9 @@ def selection(provider, revision, methods):
     component = {"id": provider, "runtime": False, "requires": {"amaterasu.runtime": "0.1.0"},
                  "requested": {"provide": [service], "call": []}}
     approvals = [{"provider": provider, "callers": ["untrusted"], "method": {
-        "service": service, "method": name, "interface_major": 2, "interface_minor": 0}}
+        "service": service, "method": name, "interface_major": 2, "interface_minor": 0, "privilege": "user",
+        "request": {"required": {}, "optional": {}, "allow_extra": False},
+        "response": {"required": {}, "optional": {}, "allow_extra": False}}}
         for name in sorted(methods)]
     return {"descriptor": descriptor, "descriptor_digest": "a" * 64,
             "component": component, "approvals": approvals}

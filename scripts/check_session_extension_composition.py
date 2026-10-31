@@ -24,6 +24,22 @@ DISPLAY_METHODS = {"settings_validate", "resource_plan", "lifecycle_callback", "
 OWNER_METHODS = {"settings_validate", "resource_plan", "lifecycle_callback", "lifecycle_status",
                  "binding_validate", "resource_control", "resource_finalize", "resource_status",
                  "action_plan", "action_execute", "action_status"}
+FIELD_KINDS = {"any", "null", "boolean", "integer", "number", "string", "array", "object"}
+
+
+def check_method_schema(method: dict) -> None:
+    if set(method) != {"service", "method", "interface_major", "interface_minor", "request", "response", "privilege"} or method["privilege"] != "user":
+        raise ValueError("invalid method approval shape or privilege")
+    for name in ("request", "response"):
+        schema = method[name]
+        if not isinstance(schema, dict) or set(schema) != {"required", "optional", "allow_extra"} or type(schema["allow_extra"]) is not bool:
+            raise ValueError("invalid API method schema")
+        required, optional = schema["required"], schema["optional"]
+        if not isinstance(required, dict) or not isinstance(optional, dict) or len(required) + len(optional) > 64 or set(required) & set(optional):
+            raise ValueError("invalid API method schema fields")
+        for field, kind in list(required.items()) + list(optional.items()):
+            if not isinstance(field, str) or not field or len(field) > 128 or not all(c in "abcdefghijklmnopqrstuvwxyz0123456789._-" for c in field) or kind not in FIELD_KINDS:
+                raise ValueError("invalid API method schema field")
 
 
 def file_digest(path: Path) -> str:
@@ -65,6 +81,7 @@ def check_provider(descriptor: dict, component: dict, approvals: list, provider:
         method = approval.get("method")
         if not isinstance(method, dict) or method.get("service") != service or method.get("interface_major") != 2 or method.get("interface_minor") != 0:
             raise ValueError("approval does not select v2")
+        check_method_schema(method)
         names.append(method.get("method"))
     if len(names) != len(methods) or set(names) != methods:
         raise ValueError("provider method approvals are incomplete, duplicated or unexpected")

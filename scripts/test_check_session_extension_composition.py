@@ -20,7 +20,9 @@ class CompositionPreflightTest(unittest.TestCase):
         self.component = {"id": self.provider, "runtime": False, "requires": {"amaterasu.runtime": "0.1.0"},
                           "requested": {"provide": [service], "call": []}}
         self.approvals = [{"provider": self.provider, "method": {"service": service, "method": name,
-                          "interface_major": 2, "interface_minor": 0}} for name in sorted(check.OWNER_METHODS)]
+                          "interface_major": 2, "interface_minor": 0, "privilege": "user",
+                          "request": {"required": {}, "optional": {}, "allow_extra": False},
+                          "response": {"required": {}, "optional": {}, "allow_extra": False}}} for name in sorted(check.OWNER_METHODS)]
 
     def check(self):
         check.check_provider(self.descriptor, self.component, self.approvals,
@@ -68,6 +70,11 @@ class CompositionPreflightTest(unittest.TestCase):
             schema.write_bytes(b"{}")
             with self.assertRaisesRegex(ValueError, "unexpected schema bytes"):
                 check.check_schema(schema, digest)
+
+    def test_malformed_approval_schema_fails(self):
+        self.approvals[0]["method"]["request"]["required"]["value"] = "wrong"
+        with self.assertRaisesRegex(ValueError, "schema field"):
+            self.check()
 
 
 if __name__ == "__main__":
