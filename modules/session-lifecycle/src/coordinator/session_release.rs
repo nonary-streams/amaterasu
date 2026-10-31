@@ -939,6 +939,10 @@ pub(in crate::coordinator) mod tests {
     }
 
     pub(in crate::coordinator) fn complete_fixture() -> (Journal, Work, PrepareState) {
+        complete_fixture_with_domain(false)
+    }
+
+    fn complete_fixture_with_domain(with_domain: bool) -> (Journal, Work, PrepareState) {
         use crate::prepare_authority::{Admission, MethodApproval, ProviderSelection};
         use crate::provider_dispatch::{DispatchRecord, DispatchState, ProviderCall};
         let (mut journal, work) = fixture();
@@ -957,8 +961,36 @@ pub(in crate::coordinator) mod tests {
             approved_control_bindings: Vec::new(),
         };
         let obligation = json!({"obligation_id":"cleanup","provider":"owner","resource_id":"display","mutation_domain":null,"cleanup_method":{"service":"owner/2","method":"cleanup","interface_major":2,"interface_minor":0,"schema_revision":1},"payload":{},"depends_on":[]});
-        let plan: amaterasu_extension_api::ResourcePlan = serde_json::from_value(json!({"plan_id":"plan","revision":1,"resources":[{"provider":"owner","resource_id":"display","incarnation":null,"expected_revision":2,"execution_domain":"seat","mutation_domains":[],"access":"exclusive"}],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[obligation],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]})).unwrap();
-        let output: amaterasu_extension_api::ResourceOutput = serde_json::from_value(json!({"output_id":"output","capability":"screen","schema":{"id":"screen/2","major":1,"minor":0,"digest":"a".repeat(64)},"producer":"owner","producer_service":"owner/2","origin":work.target,"resource":{"provider":"owner","resource_id":"display","incarnation":"native","revision":2,"execution_domain":"seat","mutation_domain":null,"mutation_domains":[]},"data":{}})).unwrap();
+        let domains = if with_domain {
+            json!(["shared"])
+        } else {
+            json!([])
+        };
+        let observations = if with_domain {
+            json!([{"domain":"shared","revision":1,"borrowers":{},"complete":true}])
+        } else {
+            json!([])
+        };
+        let plan_domains = if with_domain {
+            json!([{"domain":"shared","expected_revision":1,"borrowers":{},"access":"exclusive"}])
+        } else {
+            json!([])
+        };
+        let plan: amaterasu_extension_api::ResourcePlan = serde_json::from_value(json!({"plan_id":"plan","revision":1,"resources":[{"provider":"owner","resource_id":"display","incarnation":null,"expected_revision":2,"execution_domain":"seat","mutation_domains":domains,"access":"exclusive"}],"mutation_domains":plan_domains,"required_capabilities":[],"constraints":{},"obligations":[obligation],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]})).unwrap();
+        let output: amaterasu_extension_api::ResourceOutput = serde_json::from_value(json!({"output_id":"output","capability":"screen","schema":{"id":"screen/2","major":1,"minor":0,"digest":"a".repeat(64)},"producer":"owner","producer_service":"owner/2","origin":work.target,"resource":{"provider":"owner","resource_id":"display","incarnation":"native","revision":2,"execution_domain":"seat","mutation_domain":null,"mutation_domains":domains},"domain_observations":observations,"data":{}})).unwrap();
+        if with_domain {
+            journal
+                .authority
+                .domain_owners
+                .insert("shared".into(), "owner".into());
+            journal.authority.snapshot.domains.insert(
+                "shared".into(),
+                crate::planning::DomainState {
+                    revision: 1,
+                    borrowers: BTreeMap::new(),
+                },
+            );
+        }
         let request = |phase,
                        admission,
                        transition,
@@ -2071,7 +2103,7 @@ pub(in crate::coordinator) mod tests {
 
     #[test]
     fn session_prepare_closure_requires_exact_authenticated_set() {
-        let (mut journal, work, mut state) = complete_fixture();
+        let (mut journal, work, mut state) = complete_fixture_with_domain(true);
         let mut release_state = state.clone();
         release_state.request.provider_sequence = 2;
         release_state.last_sequence = 2;
@@ -2260,6 +2292,144 @@ pub(in crate::coordinator) mod tests {
                 .ended_session_history
                 .end_response(&reloaded, &end_key, &end_request),
             Some(end_response)
+        );
+        // Both retained terminal proof and compact certificate expose only
+        // the previously owned domain to the exact new owner plan.
+        let new_target = LifecycleTarget::Session {
+            host_epoch: "epoch".into(),
+            session_id: "next".into(),
+            generation: 1,
+        };
+        let mut new_session = journal.sessions["session"].clone();
+        new_session.id = "next".into();
+        new_session.phase = SessionPhase::Preparing;
+        new_session.admission_ids.clear();
+        new_session.admission_targets.clear();
+        new_session.admission_phases.clear();
+        new_session.obligations.clear();
+        let mut new_state = state.clone();
+        new_state.request.target = new_target.clone();
+        new_state.request.transition_id = "next-transition".into();
+        new_state.request.operation_id = "next-plan".into();
+        new_state.request.operation = amaterasu_extension_api::ProviderOperation::ResourcePlan;
+        new_state.request.admission_id = None;
+        new_state.request.approved_plan = None;
+        new_state.request.plan_revision = None;
+        new_state.phase = PreparePhase::Plan;
+        new_state.admission_id = None;
+        new_state.plan = None;
+        new_state.response = None;
+        new_state.terminal_dispatch = None;
+        let mut dispatch = proof.terminal.clone();
+        dispatch.call.arguments = serde_json::to_value(&new_state.request).unwrap();
+        dispatch.call.operation_id = "next-plan".into();
+        dispatch.state = crate::provider_dispatch::DispatchState::OutcomeUnknown;
+        new_state.dispatch = Some(dispatch);
+        let mut new_work = prepare.clone();
+        new_work.target = new_target;
+        new_work.transition_id = "next-transition".into();
+        new_work.states.insert("owner".into(), new_state);
+        let add_new = |journal: &mut Journal| {
+            journal.sessions.insert("next".into(), new_session.clone());
+            journal.receipts.insert(
+                "next".into(),
+                Receipt {
+                    caller: "transport".into(),
+                    initiator: "client".into(),
+                    request: json!({}),
+                    response: json!({"status":"pending"}),
+                    work: Some(new_work.clone()),
+                    wait_target: None,
+                },
+            );
+        };
+        let mut retained = journal.clone();
+        add_new(&mut retained);
+        assert!(
+            super::provider_observations::new_session_domains(
+                &retained,
+                &retained.sessions["next"],
+                "owner"
+            )
+            .unwrap()
+            .contains_key("shared")
+        );
+        let mut compact = retired.clone();
+        add_new(&mut compact);
+        assert!(
+            super::provider_observations::new_session_domains(
+                &compact,
+                &compact.sessions["next"],
+                "owner"
+            )
+            .unwrap()
+            .contains_key("shared")
+        );
+        let mut locked = compact.clone();
+        locked
+            .authority
+            .domain_locks
+            .insert("shared".into(), "foreign".into());
+        assert!(
+            super::provider_observations::new_session_domains(
+                &locked,
+                &locked.sessions["next"],
+                "owner"
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let mut active = compact.clone();
+        active
+            .authority
+            .admissions
+            .insert("still-live".into(), cert.root_admission.clone());
+        assert!(
+            super::provider_observations::new_session_domains(
+                &active,
+                &active.sessions["next"],
+                "owner"
+            )
+            .unwrap()
+            .is_empty()
+        );
+        let mut wrong_owner = compact.clone();
+        wrong_owner
+            .authority
+            .domain_owners
+            .insert("shared".into(), "foreign".into());
+        assert!(
+            super::provider_observations::new_session_domains(
+                &wrong_owner,
+                &wrong_owner.sessions["next"],
+                "owner"
+            )
+            .is_err()
+        );
+        let mut forged_plan = compact.clone();
+        forged_plan
+            .receipts
+            .get_mut("next")
+            .unwrap()
+            .work
+            .as_mut()
+            .unwrap()
+            .states
+            .get_mut("owner")
+            .unwrap()
+            .dispatch
+            .as_mut()
+            .unwrap()
+            .call
+            .arguments["operation_id"] = json!("forged");
+        assert!(
+            super::provider_observations::new_session_domains(
+                &forged_plan,
+                &forged_plan.sessions["next"],
+                "owner"
+            )
+            .unwrap()
+            .is_empty()
         );
         assert!(retired.sessions.is_empty());
         assert!(retention::session_expired(&retired, &work.target));
