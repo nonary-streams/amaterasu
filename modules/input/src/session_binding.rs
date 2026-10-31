@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 const MAX_BINDINGS: usize = 128;
-const LIFECYCLE: &str = "amaterasu.session-lifecycle/1";
+const LIFECYCLE_SERVICE: &str = "amaterasu.session-lifecycle/1";
+const LIFECYCLE_PRINCIPAL: &str = "amaterasu.session-lifecycle";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -235,7 +236,7 @@ impl Bindings {
         token: &str,
         target: &LifecycleTarget,
     ) -> Result<(&str, &str, u64), &'static str> {
-        if caller != LIFECYCLE {
+        if caller != LIFECYCLE_PRINCIPAL {
             return Err("permission_denied");
         }
         let entry = self.entries.get(token).ok_or("binding_unknown")?;
@@ -257,7 +258,7 @@ impl Bindings {
         token: &str,
         target: LifecycleTarget,
     ) -> Result<(String, Option<String>), &'static str> {
-        if caller != LIFECYCLE || !valid_text(operation_id) || !valid_target(&target) {
+        if caller != LIFECYCLE_PRINCIPAL || !valid_text(operation_id) || !valid_target(&target) {
             return Err("permission_denied");
         }
         if self.entries.iter().any(|(other, entry)| {
@@ -390,7 +391,7 @@ impl AcquireJob {
             .saturating_duration_since(Instant::now())
             .as_millis() as u64;
         match send(Command::Request {
-            service: LIFECYCLE.into(),
+            service: LIFECYCLE_SERVICE.into(),
             payload: json!({"operation":"validate_input_binding","operation_id":self.operation_id,"token":self.token,"input_boot_epoch":self.input_boot_epoch}),
             timeout_ms: timeout_ms.max(1),
             operation_id: self.operation_id.clone(),
@@ -469,6 +470,20 @@ mod tests {
                 .authorize_batch("owner", "lease", Some("token"))
                 .is_ok()
         );
+        assert_eq!(
+            bindings.status(LIFECYCLE_PRINCIPAL, "token", &target()),
+            Ok(("owner", "lease", 1))
+        );
+        assert!(
+            bindings
+                .status(LIFECYCLE_SERVICE, "token", &target())
+                .is_err()
+        );
+        assert!(
+            bindings
+                .revoke(LIFECYCLE_SERVICE, "forged", "token", target())
+                .is_err()
+        );
         assert!(bindings.authorize_batch("owner", "lease", None).is_err());
         assert!(
             bindings
@@ -487,7 +502,7 @@ mod tests {
         );
         assert_eq!(
             bindings
-                .revoke(LIFECYCLE, "revoke", "token", target())
+                .revoke(LIFECYCLE_PRINCIPAL, "revoke", "token", target())
                 .unwrap(),
             ("owner".into(), Some("lease".into()))
         );
@@ -498,12 +513,12 @@ mod tests {
         );
         assert!(
             bindings
-                .revoke(LIFECYCLE, "revoke", "token", target())
+                .revoke(LIFECYCLE_PRINCIPAL, "revoke", "token", target())
                 .is_ok()
         );
         assert!(
             bindings
-                .revoke(LIFECYCLE, "other", "token", target())
+                .revoke(LIFECYCLE_PRINCIPAL, "other", "token", target())
                 .is_err()
         );
         assert!(bindings.authorize_batch("owner", "legacy", None).is_ok());
@@ -558,7 +573,7 @@ mod tests {
             Err("sequence_conflict")
         );
         bindings
-            .revoke(LIFECYCLE, "revoke", "token", target())
+            .revoke(LIFECYCLE_PRINCIPAL, "revoke", "token", target())
             .unwrap();
         assert!(
             bindings
@@ -577,11 +592,13 @@ mod tests {
         let mut bindings = Bindings::default();
         assert!(
             bindings
-                .revoke(LIFECYCLE, "r", "unknown", target())
+                .revoke(LIFECYCLE_PRINCIPAL, "r", "unknown", target())
                 .is_err()
         );
         bindings.begin_acquire("token", "owner").unwrap();
-        bindings.revoke(LIFECYCLE, "r", "token", target()).unwrap();
+        bindings
+            .revoke(LIFECYCLE_PRINCIPAL, "r", "token", target())
+            .unwrap();
         assert!(
             bindings
                 .bind(
