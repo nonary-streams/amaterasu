@@ -87,8 +87,8 @@ impl Harness {
                     "consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["example/1"]},
                     "trusted_callers": ["transport", "other-transport"],
                     "operation_grants": {
-                        "transport": ["prepare", "lookup", "snapshot", "describe_resource_control", "verify_resource_control", "validate_resource_control", "verify_control_settlement"],
-                        "other-transport": ["prepare", "lookup", "snapshot", "describe_resource_control", "verify_resource_control", "validate_resource_control", "verify_control_settlement"]
+                        "transport": ["prepare", "lookup", "snapshot", "describe_resource_control", "verify_resource_control", "validate_resource_control", "verify_control_settlement", "describe_resource_finalize", "verify_resource_finalize", "validate_resource_finalize"],
+                        "other-transport": ["prepare", "lookup", "snapshot", "describe_resource_control", "verify_resource_control", "validate_resource_control", "verify_control_settlement", "describe_resource_finalize", "verify_resource_finalize", "validate_resource_finalize"]
                     }
                 }
             }
@@ -271,6 +271,18 @@ fn control_routes_reject_unadmitted_and_foreign_callers_through_broker() {
         let response = harness.call(caller, settlement.clone());
         assert_eq!(response["status"], "rejected");
         assert_eq!(response["reason"], "resource_control_not_authorized");
+    }
+    let finalize = json!({"version":2,"transition_id":"transition","operation_id":"finalize","provider_sequence":2,"target":target,"output":output,"control_results":[],"admission_id":"missing","permit_id":"missing","remaining_ms":5000});
+    for operation in [
+        "describe_resource_finalize",
+        "verify_resource_finalize",
+        "validate_resource_finalize",
+    ] {
+        for caller in ["transport", "other-transport"] {
+            let response = harness.call(caller, json!({"operation":operation,"request":finalize}));
+            assert_eq!(response["status"], "rejected");
+            assert_eq!(response["reason"], "resource_finalize_not_authorized");
+        }
     }
 }
 
