@@ -118,12 +118,19 @@ fn attach_admitted_generations(
                 || permit.context.policy != result.selection.policy
                 || permit.context.output != result.request.output
                 || permit.context.control_results != result.request.control_results
+                || permit.context.parent_generation != result.selection.parent_generation
+                || journal.composition.finalize_selection(
+                    &result.request.target,
+                    &result.request.transition_id,
+                    &admission.provider,
+                    &result.selection.input.output.output_id,
+                ) != Some(&result.selection)
                 || result.plan != admission.plan
                 || !journal.authority.output_admissions.contains(id)
-                || result
-                    .plan_approval
-                    .as_ref()
-                    .is_none_or(|approval| !admission.selection.approvals.contains(approval))
+                || result.plan_approval.as_ref().is_none_or(|approval| {
+                    !admission.selection.approvals.contains(approval)
+                        || approval.method != admission.selection.participant.plan_method
+                })
             {
                 return Err("finalize_admission_unproven".into());
             }
