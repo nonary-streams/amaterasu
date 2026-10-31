@@ -329,6 +329,7 @@ dependencies = [
  "amaterasu-configuration-schema",
  "amaterasu-extension-api",
  "amaterasu-module-sdk",
+ "amaterasu-runtime",
  "getrandom 0.3.4",
  "serde",
  "serde_json",
