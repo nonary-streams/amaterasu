@@ -202,8 +202,12 @@ impl Fixture {
         std::fs::create_dir(&root).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let state_root = root.join("owner-state");
+        std::fs::create_dir(&state_root).unwrap();
+        std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut configuration = read_configuration("AMATERASU_COMPOSITION_CONFIG");
         configuration["settings"][COORDINATOR]["journal_path"] = json!(root.join("journal.json"));
+        configuration["host_context"] = json!({"schema":1,"state_root":state_root});
         let participants = configuration["settings"][COORDINATOR]["participants"]
             .as_array()
             .expect("participants");
