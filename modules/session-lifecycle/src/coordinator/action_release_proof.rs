@@ -50,6 +50,59 @@ fn complete_provider_order(graph: &ProviderGraph, providers: &[String], owner: &
         })
 }
 
+fn session_dependents_noop(
+    journal: &Journal,
+    session: &SessionRecord,
+    snapshot: &ActionReleaseSnapshot,
+    owner: &str,
+) -> bool {
+    let graph = &snapshot.session_graph;
+    let reverse: Vec<_> = graph.order.iter().rev().cloned().collect();
+    if !complete_provider_order(graph, &reverse, owner)
+        || !super::session_prepare_evidence::all_dependent_session_prepares_noop(
+            journal,
+            &snapshot.session_target,
+            graph,
+            owner,
+        )
+    {
+        return false;
+    }
+    let mut affected = BTreeSet::from([owner.to_owned()]);
+    for provider in &graph.order {
+        if graph.dependencies[provider]
+            .iter()
+            .any(|dependency| affected.contains(dependency))
+        {
+            affected.insert(provider.clone());
+        }
+    }
+    affected.remove(owner);
+    for provider in affected {
+        let Some((id, transition)) = super::session_prepare_evidence::admission_for(
+            journal,
+            &snapshot.session_target,
+            &provider,
+        ) else {
+            return false;
+        };
+        let Some(frozen) = snapshot.session_admissions.get(id) else {
+            return false;
+        };
+        if frozen.admission.provider != provider
+            || frozen.transition_id != transition
+            || journal.authority.settled.get(id) != Some(&frozen.admission)
+            || session
+                .obligations
+                .iter()
+                .any(|obligation| obligation.provider == provider)
+        {
+            return false;
+        }
+    }
+    true
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ActionReleaseProof {
@@ -97,9 +150,6 @@ pub(super) fn validate_graph_callbacks(
     let Some(work_graph) = &work.provider_graph else {
         return false;
     };
-    let Some(session_graph) = &session.provider_graph else {
-        return false;
-    };
     let Ok((owner, _, _)) = journal
         .actions
         .execution_for_permit(&transfer.service, &transfer.permit)
@@ -137,8 +187,9 @@ pub(super) fn validate_graph_callbacks(
         || transfer.binding.source != session.owner
         || super::action_endpoints::capture_action_snapshot(journal, &work.target).ok().as_ref() != Some(snapshot)
         || !target_matches
-        // Stream cleanup does not prove session-scoped dependent restoration.
-        || !super::action_endpoints::graph_proves_no_dependents(&session_graph.order, &session_graph.dependencies, &owner)
+        // Stream cleanup does not prove session-scoped dependent restoration;
+        // each selected dependent must have authentic frozen no-op evidence.
+        || !session_dependents_noop(journal, session, snapshot, &owner)
     {
         return false;
     }
@@ -172,7 +223,7 @@ pub(super) fn validate_graph_callbacks(
         let Ok(response) = serde_json::from_value::<ProviderResponse>(payload.clone()) else {
             return false;
         };
-        let ProviderResponse::Cleanup { outcomes } = &response else {
+        let ProviderResponse::Cleanup { outcomes, .. } = &response else {
             return false;
         };
         if &admission.provider != provider
@@ -227,6 +278,94 @@ pub(super) fn validate_graph_callbacks(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn dependent_session_noop_requires_authenticated_evidence() {
+        let root = std::env::temp_dir().join(format!(
+            "action-noop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let coordinator = Coordinator::open(&root.join("journal")).unwrap();
+        let mut journal = coordinator.shared.borrow().value.clone();
+        let epoch = journal.host_epoch.clone();
+        let target = LifecycleTarget::Session {
+            host_epoch: epoch.clone(),
+            session_id: "session".into(),
+            generation: 1,
+        };
+        let mut graph = ProviderGraph {
+            order: vec!["owner".into()],
+            dependencies: BTreeMap::from([("owner".into(), vec![])]),
+        };
+        let session = SessionRecord {
+            provider_graph: Some(graph.clone()),
+            host_epoch: epoch.clone(),
+            id: "session".into(),
+            generation: 1,
+            phase: SessionPhase::Ready,
+            owner: crate::action_authority::Principal {
+                caller: "transport".into(),
+                initiator: "user".into(),
+            },
+            delegates: Default::default(),
+            application_ref: json!({}),
+            settings_revision: "revision".into(),
+            application_retired: false,
+            streams: Default::default(),
+            obligations: vec![],
+            required_consumers: None,
+            application: None,
+            application_operation_id: None,
+            admission_ids: Default::default(),
+            admission_targets: Default::default(),
+            admission_phases: Default::default(),
+            provider_settings: Default::default(),
+        };
+        journal.sessions.insert("session".into(), session);
+        let mut snapshot = ActionReleaseSnapshot {
+            session_target: target,
+            stream_target: LifecycleTarget::Stream {
+                host_epoch: epoch,
+                session_id: "session".into(),
+                stream_id: "stream".into(),
+                generation: 1,
+            },
+            session_graph: graph.clone(),
+            stream_graph: graph.clone(),
+            session_admissions: Default::default(),
+            stream_admissions: Default::default(),
+        };
+        assert!(session_dependents_noop(
+            &journal,
+            &journal.sessions["session"],
+            &snapshot,
+            "owner"
+        ));
+        graph.order.push("settings".into());
+        graph
+            .dependencies
+            .insert("settings".into(), vec!["owner".into()]);
+        snapshot.session_graph = graph.clone();
+        journal.sessions.get_mut("session").unwrap().provider_graph = Some(graph);
+        assert!(!session_dependents_noop(
+            &journal,
+            &journal.sessions["session"],
+            &snapshot,
+            "owner"
+        ));
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn owner_only_or_malformed_graph_never_proves_composed_cleanup() {

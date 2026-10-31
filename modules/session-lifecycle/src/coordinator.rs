@@ -1,5 +1,7 @@
 //! Durable lifecycle authority; native work advances outside request handlers.
 mod action_endpoints;
+#[allow(dead_code)] // Action replan remains fenced until all proof writers are wired.
+mod action_release_proof;
 mod action_target;
 mod application;
 #[allow(dead_code)] // Admission and control remain disabled until schema verification is wired.
