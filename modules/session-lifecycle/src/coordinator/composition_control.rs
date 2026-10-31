@@ -116,6 +116,7 @@ impl Coordinator {
                 LifecycleTarget::Session {
                     generation: parent, ..
                 } => {
+                    super::resource_generation::current_root_generation(&journal, &input)?;
                     if *parent != session.generation {
                         return Err("dependency_parent_stale".into());
                     }

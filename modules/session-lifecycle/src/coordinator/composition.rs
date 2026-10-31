@@ -1533,6 +1533,48 @@ mod tests {
     }
 
     #[test]
+    fn released_roots_do_not_shadow_new_output_across_repeated_removal() {
+        let mut book = CompositionBook::default();
+        let first = record();
+        book.record(first.clone(), &selection(), &target(), &|_| true)
+            .unwrap();
+        book.set_state("screen", "output", &target(), OutputState::Released)
+            .unwrap();
+        let mut second = record();
+        second.output.output_id = "output-2".into();
+        second.output.resource.incarnation = "native-2".into();
+        second.admission_id = "admission-2".into();
+        second.transition_id = "transition-2".into();
+        book.record(second.clone(), &selection(), &target(), &|_| true)
+            .unwrap();
+        assert_eq!(
+            book.inputs(&target(), &[selection()]).unwrap(),
+            vec![second.clone()]
+        );
+        assert!(book.get("screen", "output", &target()).is_none());
+        assert_eq!(
+            book.records()
+                .find(|item| item.output.output_id == "output")
+                .unwrap()
+                .state,
+            OutputState::Released
+        );
+        book.set_state("screen", "output-2", &target(), OutputState::Released)
+            .unwrap();
+        assert!(book.inputs(&target(), &[selection()]).is_err());
+        assert!(
+            book.set_state("screen", "output", &target(), OutputState::Retained)
+                .is_err()
+        );
+        assert_eq!(
+            book.records()
+                .filter(|item| item.state == OutputState::Released)
+                .count(),
+            2
+        );
+    }
+
+    #[test]
     fn rejects_forged_output_conflicts_and_unvalidated_schema() {
         let mut book = CompositionBook::default();
         assert!(
