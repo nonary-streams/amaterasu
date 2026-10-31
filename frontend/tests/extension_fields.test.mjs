@@ -130,3 +130,17 @@ test("creating a shortcut requires an explicit trigger and action", () => {
     trigger: { platform: "linux_evdev", code: 30 }, modifiers: [],
   });
 });
+
+test("nullable keybinding does not save a zero-code schema template", () => {
+  const { extensionKeybindingSettingEditor } = editorEnvironment();
+  const sentinel = { id: "remove", enabled: false, source: "session_input", context: "active", target: "current_stream", propagation: "consume_trigger", action_id: "example/remove", arguments: {}, trigger: { platform: "linux_evdev", code: 0 }, modifiers: [] };
+  const definition = { type: "nullable", default: null, inner: { type: "object", default: sentinel, fields: {} } };
+  const editor = extensionKeybindingSettingEditor(definition, null);
+  assert.equal(editor.value(), null);
+  editor.node.children[2].click();
+  assert.throws(() => editor.value(), /Complete the binding/);
+  const invalid = extensionKeybindingSettingEditor(definition, sentinel);
+  assert.throws(() => invalid.value(), /supported key code/);
+  const zeroModifier = { ...sentinel, trigger: { platform: "linux_evdev", code: 30 }, modifiers: [{ platform: "linux_evdev", code: 0 }] };
+  assert.throws(() => extensionKeybindingSettingEditor(definition, zeroModifier).value(), /supported key code/);
+});

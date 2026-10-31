@@ -278,4 +278,14 @@ namespace Amaterasu {
     return { node: group, value: () => editor ? editor.value() : null };
   }
 
+  /** Choose the editor from the declared schema; never instantiate a nullable
+   * shortcut's inner default as a configured binding. */
+  export function extensionKeybindingSettingEditor(definition: ExtensionFieldDefinition, value: unknown): ExtensionFieldEditor {
+    if (definition.type === "nullable") {
+      if (!definition.inner) throw new Error("Invalid nullable setting.");
+      return optionalExtensionKeybindingEditor(value);
+    }
+    return extensionKeybindingEditor(value);
+  }
+
 }

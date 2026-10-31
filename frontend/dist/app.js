@@ -16093,6 +16093,15 @@ var Amaterasu;
         return { node: group, value: () => editor ? editor.value() : null };
     }
     Amaterasu.optionalExtensionKeybindingEditor = optionalExtensionKeybindingEditor;
+    function extensionKeybindingSettingEditor(definition, value) {
+        if (definition.type === "nullable") {
+            if (!definition.inner)
+                throw new Error("Invalid nullable setting.");
+            return optionalExtensionKeybindingEditor(value);
+        }
+        return extensionKeybindingEditor(value);
+    }
+    Amaterasu.extensionKeybindingSettingEditor = extensionKeybindingSettingEditor;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
@@ -16242,9 +16251,7 @@ var Amaterasu;
                         if (option.presentation != null && option.presentation !== "keybinding")
                             throw new Error("Unsupported extension setting presentation.");
                         const editor = option.presentation === "keybinding"
-                            ? option.definition.type === "nullable" && option.definition.inner
-                                ? Amaterasu.optionalExtensionKeybindingEditor(editorValue)
-                                : Amaterasu.extensionKeybindingEditor(editorValue)
+                            ? Amaterasu.extensionKeybindingSettingEditor(option.definition, editorValue)
                             : Amaterasu.extensionFieldEditor(option.definition, editorValue);
                         const inherit = Amaterasu.input("", "", "checkbox");
                         inherit.checked = !isOverride;

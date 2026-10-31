@@ -58,9 +58,7 @@ namespace Amaterasu {
             if (option.presentation != null && option.presentation !== "keybinding")
               throw new Error("Unsupported extension setting presentation.");
             const editor = option.presentation === "keybinding"
-              ? option.definition.type === "nullable" && option.definition.inner
-                ? optionalExtensionKeybindingEditor(editorValue)
-                : extensionKeybindingEditor(editorValue)
+              ? extensionKeybindingSettingEditor(option.definition, editorValue)
               : extensionFieldEditor(option.definition, editorValue);
             const inherit = input("", "", "checkbox");
             inherit.checked = !isOverride;
