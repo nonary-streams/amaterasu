@@ -627,4 +627,44 @@ mod tests {
         assert_eq!(record.call.arguments["provider_sequence"], 1);
         assert_eq!(record.call.arguments["receipt_id"], "receipt");
     }
+    #[test]
+    fn status_completion_requires_retained_original_pending_receipt() {
+        let mut job = ControlDispatch::new(fixture()).unwrap();
+        job.state.phase = ControlPhase::Status {
+            receipt_id: "receipt".into(),
+        };
+        job.state.pending_proof = Some(DispatchRecord {
+            call: job.state.effect_call.clone(),
+            state: DispatchState::Completed {
+                payload: json!({"status":"pending","receipt_id":"receipt"}),
+            },
+        });
+        let mut status_call = job.state.status_selection.clone();
+        status_call.operation_id = "poll".into();
+        status_call.arguments = serde_json::to_value(ProviderStatusRequest {
+            provider_sequence: job.state.request.provider_sequence,
+            operation_id: job.state.request.operation_id.clone(),
+            transition_id: job.state.request.transition_id.clone(),
+            receipt_id: "receipt".into(),
+        })
+        .unwrap();
+        let payload = json!({"status":"applied","output":job.state.dependency,"candidate":null});
+        job.state.dispatch = Some(DispatchRecord {
+            call: status_call,
+            state: DispatchState::Completed {
+                payload: payload.clone(),
+            },
+        });
+        let mut journal = Journal::default();
+        let mut validate =
+            |_: &ResourceControlRequest, _: &ResourceOutput, _: &ConfirmedControl| Ok(());
+        job.settle(payload, &mut journal, &mut validate).unwrap();
+        let state = journal.states.last().unwrap().clone();
+        assert!(ControlDispatch::new(state.clone()).is_ok());
+        let mut forged = state;
+        forged.pending_proof.as_mut().unwrap().state = DispatchState::Completed {
+            payload: json!({"status":"pending","receipt_id":"other"}),
+        };
+        assert!(ControlDispatch::new(forged).is_err());
+    }
 }
