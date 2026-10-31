@@ -70,6 +70,16 @@ pub(super) fn selected_root_obligations(
     root: &composition::StoredOutput,
     ids: &[String],
 ) -> Option<Vec<amaterasu_extension_api::ResourceObligation>> {
+    selected_root_obligations_for_transfer(journal, root, ids, None)
+}
+
+/// The only permitted duplicate is the exact already authenticated transfer admission.
+pub(super) fn selected_root_obligations_for_transfer(
+    journal: &Journal,
+    root: &composition::StoredOutput,
+    ids: &[String],
+    transfer_admission: Option<&str>,
+) -> Option<Vec<amaterasu_extension_api::ResourceObligation>> {
     if ids.len() > 128 || !ids.windows(2).all(|pair| pair[0] < pair[1]) {
         return None;
     }
@@ -110,11 +120,17 @@ pub(super) fn selected_root_obligations(
                         .get(other)
                         .or_else(|| journal.authority.settled.get(other))
                         .is_none_or(|admission| {
-                            admission
+                            let duplicates: Vec<_> = admission
                                 .plan
                                 .obligations
                                 .iter()
-                                .any(|value| value.obligation_id == *id)
+                                .filter(|value| value.obligation_id == *id)
+                                .collect();
+                            !duplicates.is_empty()
+                                && !(transfer_admission == Some(other.as_str())
+                                    && admission.provider == root.output.producer
+                                    && duplicates.len() == 1
+                                    && duplicates[0] == item)
                         })
                 })
         {
@@ -132,7 +148,18 @@ pub(super) fn released_root_obligations(
     marker: &ReleasedActionMarker,
 ) -> Option<Vec<amaterasu_extension_api::ResourceObligation>> {
     let disposition = marker.plan.resource_disposition.as_deref()?;
-    let selected = selected_root_obligations(journal, root, &disposition.cleanup_obligation_ids)?;
+    let transfer_admission = marker
+        .cleanup_work
+        .action_transfer
+        .as_ref()?
+        .admission_id
+        .as_deref()?;
+    let selected = selected_root_obligations_for_transfer(
+        journal,
+        root,
+        &disposition.cleanup_obligation_ids,
+        Some(transfer_admission),
+    )?;
     let completed = action_dispatch_proof::validate_dispatch_proof(
         &marker.dispatch_proof,
         &marker.binding,
@@ -316,7 +343,18 @@ pub(super) fn verified_marker_at<'a>(
     }
     let result = completed.resource_disposition?;
     let disposition = marker.plan.resource_disposition.as_deref()?;
-    selected_root_obligations(journal, root, &disposition.cleanup_obligation_ids)?;
+    let transfer_admission = marker
+        .cleanup_work
+        .action_transfer
+        .as_ref()?
+        .admission_id
+        .as_deref()?;
+    selected_root_obligations_for_transfer(
+        journal,
+        root,
+        &disposition.cleanup_obligation_ids,
+        Some(transfer_admission),
+    )?;
     if completed.status != ActionProviderCompletionStatus::Succeeded
         || result.state != ActionResourceDispositionState::Released
         || result.output_id != marker.output_id

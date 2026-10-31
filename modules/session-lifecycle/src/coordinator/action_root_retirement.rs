@@ -77,6 +77,9 @@ pub(super) fn retire_one(
         .closed_actions
         .discharged_obligations(admission, transition, owner, generation)
         .ok_or("action_cleanup_certificate_missing")?;
+    let closed_transfer = journal
+        .closed_actions
+        .closed_transfer_admission(&root, generation);
     if root.plan.obligations.iter().any(|obligation| {
         !discharged.contains(obligation)
             || session
@@ -100,11 +103,15 @@ pub(super) fn retire_one(
                         .get(id)
                         .or_else(|| journal.authority.settled.get(id))
                         .is_none_or(|other| {
-                            other
-                                .plan
-                                .obligations
-                                .iter()
-                                .any(|item| item.obligation_id == obligation.obligation_id)
+                            let duplicates: Vec<_> = other.plan.obligations.iter().filter(|item| item.obligation_id == obligation.obligation_id).collect();
+                            !duplicates.is_empty() && !(closed_transfer == Some(id.as_str())
+                                && !journal.authority.admissions.contains_key(id)
+                                && other.provider == owner
+                                && session.admission_phases.get(id) == Some(&LifecyclePhase::StreamRelease)
+                                && session.admission_targets.get(id).is_some_and(|target| matches!(target,
+                                    LifecycleTarget::Stream { host_epoch, session_id: child_session, .. }
+                                        if host_epoch == &session.host_epoch && child_session == session_id))
+                                && duplicates.len() == 1 && duplicates[0] == obligation)
                         })
                 })
     }) || journal.authority.admissions.contains_key(admission)

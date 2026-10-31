@@ -204,6 +204,30 @@ impl ClosedActionBook {
             && record.original_obligations.as_ref() == Some(&root.plan.obligations)
     }
 
+    /// Exact action transfer admission authenticated by the terminal marker.
+    pub(super) fn closed_transfer_admission(
+        &self,
+        root: &composition::StoredOutput,
+        generation: u64,
+    ) -> Option<&str> {
+        if !self.certifies_cleanup_plan(root, generation) {
+            return None;
+        }
+        let mut records = self.records.iter().filter(|record| {
+            record.retired_admission == root.admission_id
+                && record.retired_transition == root.transition_id
+                && record.owner == root.output.producer
+                && record.resource_generation == generation
+                && record.retired_root == root.output
+        });
+        let record = records.next()?;
+        if records.next().is_some() {
+            return None;
+        }
+        let id = record.cleanup_transfer_admission.as_deref()?;
+        record.closed_admissions.contains(id).then_some(id)
+    }
+
     /// Exact admission IDs covered by fully verified action cleanup.
     pub(super) fn closed_admissions(
         &self,
@@ -320,6 +344,8 @@ pub(super) struct ClosedActionCertificate {
     retired_admission: String,
     retired_transition: String,
     closed_admissions: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cleanup_transfer_admission: Option<String>,
     retired_root: amaterasu_extension_api::ResourceOutput,
     /// None is legacy evidence and cannot establish complete root cleanup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -467,6 +493,10 @@ impl ClosedActionCertificate {
             && valid_id(&self.retired_admission)
             && valid_id(&self.retired_transition)
             && self.closed_admissions.len() <= 128
+            && self
+                .cleanup_transfer_admission
+                .as_ref()
+                .is_none_or(|id| valid_id(id) && self.closed_admissions.contains(id))
             && self.closed_admissions.contains(&self.retired_admission)
             && self.closed_admissions.iter().all(|id| valid_id(id))
             && self.original_obligations.as_ref().is_none_or(|original| {
@@ -615,6 +645,7 @@ impl ClosedActionCertificate {
             resource_generation: generation,
             retired_admission: old_root.admission_id.clone(),
             retired_transition: old_root.transition_id.clone(),
+            cleanup_transfer_admission: transfer.admission_id.clone(),
             closed_admissions,
             retired_root: old_root.output.clone(),
             original_obligations: Some(old_root.plan.obligations.clone()),
@@ -665,6 +696,7 @@ mod tests {
             retired_admission: "retired".into(),
             retired_transition: "prepare".into(),
             closed_admissions: BTreeSet::from(["retired".into()]),
+            cleanup_transfer_admission: None,
             original_obligations: Some(Vec::new()),
             discharged_obligations: Vec::new(),
             retired_root: serde_json::from_value(json!({"output_id":"output","capability":"screen","schema":{"id":"screen","major":1,"minor":0,"digest":"a".repeat(64)},"producer":"owner","producer_service":"owner/2","origin":{"kind":"session","host_epoch":"epoch","session_id":"session","generation":1},"resource":{"provider":"owner","resource_id":"display","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":null,"mutation_domains":[]},"data":{}})).unwrap(),
@@ -983,6 +1015,117 @@ mod tests {
             );
             assert_eq!(serde_json::to_value(&denied).unwrap(), before);
         }
+        let transfer_admission = journal.authority.settled.get("root").unwrap().clone();
+        journal
+            .authority
+            .settled
+            .insert("transfer".into(), transfer_admission);
+        let session = journal.sessions.get_mut("session").unwrap();
+        session.admission_ids.insert("transfer".into());
+        session.admission_targets.insert("transfer".into(), serde_json::from_value(json!({"kind":"stream", "host_epoch":"epoch", "session_id":"session", "stream_id":"stream", "generation":2})).unwrap());
+        session
+            .admission_phases
+            .insert("transfer".into(), LifecyclePhase::StreamRelease);
+        journal
+            .admission_transitions
+            .insert("transfer".into(), "release".into());
+        journal.closed_actions.records[0]
+            .closed_admissions
+            .insert("transfer".into());
+        journal.closed_actions.records[0].cleanup_transfer_admission = Some("transfer".into());
+        let ids = vec!["old-obligation".into()];
+        assert!(
+            action_disposition::selected_root_obligations_for_transfer(&journal, &root, &ids, None)
+                .is_none()
+        );
+        assert!(
+            action_disposition::selected_root_obligations_for_transfer(
+                &journal,
+                &root,
+                &ids,
+                Some("foreign")
+            )
+            .is_none()
+        );
+        assert_eq!(
+            action_disposition::selected_root_obligations_for_transfer(
+                &journal,
+                &root,
+                &ids,
+                Some("transfer")
+            ),
+            Some(vec![obligation.clone()])
+        );
+        let mut wrong_tuple = journal.clone();
+        wrong_tuple
+            .authority
+            .settled
+            .get_mut("transfer")
+            .unwrap()
+            .plan
+            .obligations[0]
+            .payload = json!({"forged":true});
+        assert!(
+            action_disposition::selected_root_obligations_for_transfer(
+                &wrong_tuple,
+                &root,
+                &ids,
+                Some("transfer")
+            )
+            .is_none()
+        );
+        let mut wrong_owner = journal.clone();
+        wrong_owner
+            .authority
+            .settled
+            .get_mut("transfer")
+            .unwrap()
+            .provider = "foreign".into();
+        assert!(
+            action_disposition::selected_root_obligations_for_transfer(
+                &wrong_owner,
+                &root,
+                &ids,
+                Some("transfer")
+            )
+            .is_none()
+        );
+        let mut duplicate = journal.clone();
+        duplicate
+            .authority
+            .settled
+            .get_mut("transfer")
+            .unwrap()
+            .plan
+            .obligations
+            .push(obligation.clone());
+        assert!(
+            action_disposition::selected_root_obligations_for_transfer(
+                &duplicate,
+                &root,
+                &ids,
+                Some("transfer")
+            )
+            .is_none()
+        );
+        let mut live = journal.clone();
+        let admission = live.authority.settled.remove("transfer").unwrap();
+        live.authority
+            .admissions
+            .insert("transfer".into(), admission);
+        let snapshot = serde_json::to_value(&live).unwrap();
+        assert!(
+            action_root_retirement::retire_one(&mut live, "root", "prepare", "owner", 7).is_err()
+        );
+        assert_eq!(serde_json::to_value(&live).unwrap(), snapshot);
+        let mut unclosed = journal.clone();
+        unclosed.closed_actions.records[0].cleanup_transfer_admission = None;
+        let snapshot = serde_json::to_value(&unclosed).unwrap();
+        assert!(
+            action_root_retirement::retire_one(&mut unclosed, "root", "prepare", "owner", 7)
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(&unclosed).unwrap(), snapshot);
         let before = serde_json::to_value(&journal).unwrap();
         assert!(
             action_root_retirement::retire_one(&mut journal, "root", "wrong", "owner", 7).is_err()

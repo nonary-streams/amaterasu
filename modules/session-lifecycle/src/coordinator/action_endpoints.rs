@@ -1581,10 +1581,34 @@ pub(super) fn rebind_root_current(
     {
         return false;
     }
-    if super::action_disposition::selected_root_obligations(
+    let mut matching_transfers = journal.receipts.values().filter_map(|receipt| {
+        let work = receipt.work.as_ref()?;
+        let transfer = work.action_transfer.as_ref()?;
+        if &work.target != target
+            || transfer.stage != super::ActionTransferStage::Rebound
+            || !super::action_release_proof::validate_rebound_stage(
+                journal, receipt, work, transfer,
+            )
+        {
+            return None;
+        }
+        let (owner, _, frozen_plan) = journal
+            .actions
+            .execution_for_permit(&transfer.service, &transfer.permit)
+            .ok()?;
+        (owner == provider && frozen_plan == *plan)
+            .then_some(transfer.admission_id.as_deref())
+            .flatten()
+    });
+    let transfer = matching_transfers.next();
+    if matching_transfers.next().is_some() {
+        return false;
+    }
+    if super::action_disposition::selected_root_obligations_for_transfer(
         journal,
         root,
         &disposition.cleanup_obligation_ids,
+        transfer,
     )
     .is_none()
     {
