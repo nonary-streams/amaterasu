@@ -34,6 +34,7 @@ members = [
     "modules/session",
     "modules/session-lifecycle",
     "modules/extension-actions",
+    "modules/extension-registry",
     "modules/configuration",
     "modules/host-configuration",
     "modules/catalog",

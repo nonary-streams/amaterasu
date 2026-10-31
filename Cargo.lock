@@ -353,6 +353,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "amaterasu-extension-registry"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-configuration-schema",
+ "amaterasu-contracts",
+ "amaterasu-extension-api",
+ "amaterasu-module-sdk",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "amaterasu-frame-limiter"
 version = "0.1.0"
 dependencies = [
