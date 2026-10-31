@@ -332,6 +332,8 @@ fn valid_owner_completion(journal: &Journal, proof: &SessionReleaseProof) -> boo
         && proof.callback.request.target == proof.target
         && proof.callback.request.transition_id == proof.transition_id
         && proof.callback.request.approved_plan.as_ref() == Some(&admission.plan)
+        && proof.callback.request.dependency_inputs == [root.output.clone()]
+        && proof.callback.request.control_results.is_empty()
         && session.admission_ids.contains(release_id)
         && session.admission_targets.get(release_id) == Some(&proof.target)
         && session.admission_phases.get(release_id) == Some(&LifecyclePhase::SessionRelease)
@@ -683,12 +685,13 @@ mod tests {
                 .admission_transitions
                 .insert(id.into(), transition.into());
         }
-        let release_request = request(
+        let mut release_request = request(
             "session.release",
             "release-admission",
             "release",
             "release-call",
         );
+        release_request.dependency_inputs = vec![output];
         let response = json!({"status":"cleanup","outcomes":[{"obligation_id":"cleanup","state":"released","reason":null}],"outputs":[]});
         let release_terminal = terminal(&release_request, response.clone());
         let state = PrepareState {
@@ -1161,6 +1164,7 @@ mod tests {
         let plan: amaterasu_extension_api::ResourcePlan = serde_json::from_value(json!({"plan_id":"noop","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]})).unwrap();
         let mut state = root_state.clone();
         state.provider = "settings".into();
+        state.request.dependency_inputs.clear();
         state.participant = participant;
         state.plan = Some(plan.clone());
         state.request.approved_plan = Some(plan.clone());
@@ -1450,6 +1454,16 @@ mod tests {
             "owner"
         ));
         assert!(!altered.session_releases.validate(&altered));
+        let mut substituted = journal.clone();
+        let callback = &mut substituted.session_releases.proofs[0].callback;
+        callback.request.dependency_inputs[0].data = json!({"substituted":true});
+        callback.terminal.call.arguments = serde_json::to_value(&callback.request).unwrap();
+        assert!(!substituted.session_releases.has_valid_owner_completion(
+            &substituted,
+            &owner_work.target,
+            "owner"
+        ));
+        assert!(!substituted.session_releases.validate(&substituted));
         let restored: Journal =
             serde_json::from_value(serde_json::to_value(journal).unwrap()).unwrap();
         assert!(restored.session_releases.validate(&restored));
