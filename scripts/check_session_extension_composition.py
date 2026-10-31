@@ -22,7 +22,8 @@ TARGET_DIGEST = "ededc620113268bcae3990d492deeef039c5e9c5ff28067a676dd992fe6324c
 CONTROL_DIGEST = "c2c3ce866277cb29bbd9fbd947899917538d46b1020df3197fbd264159607d87"
 DISPLAY_METHODS = {"settings_validate", "resource_plan", "lifecycle_callback", "lifecycle_status"}
 OWNER_METHODS = {"settings_validate", "resource_plan", "lifecycle_callback", "lifecycle_status",
-                 "binding_validate", "resource_control", "resource_finalize", "resource_status"}
+                 "binding_validate", "resource_control", "resource_control_settle",
+                 "resource_finalize", "resource_status"}
 ACTION_METHODS = {"action_plan", "action_execute", "action_status"}
 PROVIDER_CALLS = {
     DISPLAY: {"amaterasu.session-lifecycle/1"},
