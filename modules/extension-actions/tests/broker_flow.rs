@@ -54,6 +54,8 @@ struct Harness {
     lifecycle_hangs: bool,
     observed_delegated_registry: bool,
     observed_delegated_plan: bool,
+    mutation_action: bool,
+    expansive_plan: bool,
 }
 impl Harness {
     fn new() -> Self {
@@ -69,7 +71,7 @@ impl Harness {
         let schema = json!({"required":{},"optional":{},"allow_extra":true});
         let plan = json!({"service":PROVIDER,"method":"action_plan","interface_major":1,"interface_minor":0,"request":schema,"response":schema,"privilege":"user"});
         let execute = json!({"service":PROVIDER,"method":"action_execute","interface_major":1,"interface_minor":0,"request":schema,"response":schema,"privilege":"user"});
-        let settings = json!({"grants":[{"principal":"management","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["session_mutation"]}]});
+        let settings = json!({"grants":[{"principal":"management","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["read_only","session_mutation"]}]});
         let config = serde_json::from_value(json!({"principals":{
             ACTIONS:{"provide":[ACTION_SERVICE],"call":calls},
             "management":{"call":[ACTION_SERVICE,REGISTRY,PROVIDER]},
@@ -130,6 +132,8 @@ impl Harness {
             lifecycle_hangs: false,
             observed_delegated_registry: false,
             observed_delegated_plan: false,
+            mutation_action: false,
+            expansive_plan: false,
         };
         let host = abi::HostApi {
             header: abi::AbiHeader::of::<abi::HostApi>(),
@@ -217,7 +221,12 @@ impl Harness {
                         caller == ACTIONS && initiator == "management";
                     let plan = json!({"service":PROVIDER,"method":"action_plan","interface_major":1,"interface_minor":0,"schema_revision":1});
                     let execute = json!({"service":PROVIDER,"method":"action_execute","interface_major":1,"interface_minor":0,"schema_revision":1});
-                    json!({"ok":true,"provider":"provider","revision":1,"action":{"id":"example/action","label":"Example","description":"Example","execution":"session_mutation","arguments":{},"allowed_targets":["session"],"required_capabilities":[],"plan":plan,"execute":execute,"status":null}})
+                    let execution = if self.mutation_action {
+                        "session_mutation"
+                    } else {
+                        "read_only"
+                    };
+                    json!({"ok":true,"provider":"provider","revision":1,"action":{"id":"example/action","label":"Example","description":"Example","execution":execution,"arguments":{},"allowed_targets":["session"],"required_capabilities":[],"plan":plan,"execute":execute,"status":null}})
                 }
                 "lifecycle" => {
                     assert_eq!(caller, ACTIONS);
@@ -257,7 +266,12 @@ impl Harness {
                         "action_plan" => {
                             self.observed_delegated_plan =
                                 caller == ACTIONS && initiator == "management";
-                            json!({"status":"planned","operation_id":arguments["operation_id"],"action_id":arguments["action_id"],"target":arguments["target"],"plan":{"mutation_domains":[]}})
+                            let required = if self.expansive_plan {
+                                json!(["example/extra"])
+                            } else {
+                                json!([])
+                            };
+                            json!({"status":"planned","operation_id":arguments["operation_id"],"action_id":arguments["action_id"],"target":arguments["target"],"plan":{"plan_id":"p1","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":required,"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]}})
                         }
                         "action_execute" => {
                             assert_eq!(caller, ACTIONS);
@@ -332,13 +346,17 @@ impl Harness {
         }
         panic!("request stalled");
     }
-    fn invoke_action(&mut self) -> String {
+    fn submit_action(&mut self) -> (String, Value) {
         for _ in 0..12 {
             self.pump();
         }
         let open = self.call(json!({"operation":"open_epoch","operation_id":"open.1"}));
         let epoch = open["epoch"].as_str().unwrap().to_owned();
         let receipt=self.call(json!({"operation":"invoke","epoch":epoch,"sequence":1,"operation_id":format!("{epoch}:1"),"action_id":"example/action","target":{"kind":"session","host_epoch":"h","session_id":"s","expected_generation":1},"arguments":{},"expected_settings_revision":null}));
+        (epoch, receipt)
+    }
+    fn invoke_action(&mut self) -> String {
+        let (epoch, receipt) = self.submit_action();
         assert_eq!(receipt["status"], "queued");
         epoch
     }
@@ -354,7 +372,7 @@ impl Drop for Harness {
 }
 
 #[test]
-fn granted_action_persists_running_before_provider_execution() {
+fn permitted_read_only_action_persists_running_before_provider_invocation() {
     let mut harness = Harness::new();
     let epoch = harness.invoke_action();
     for _ in 0..500 {
@@ -424,5 +442,26 @@ fn restart_fences_admitted_action_without_replaying_effect() {
     let record = &harness.state[&format!("epoch/{epoch}")]["receipts"]["1"];
     assert_eq!(record["receipt"]["status"], "recovery_required");
     assert_eq!(record["dispatch"]["stage"]["phase"], "recovery_required");
+    assert_eq!(harness.effects, 0);
+}
+
+#[test]
+fn mutation_action_is_rejected_before_lifecycle_or_provider_invocation() {
+    let mut harness = Harness::new();
+    harness.mutation_action = true;
+    let (_, receipt) = harness.submit_action();
+    assert_eq!(receipt["code"], "mutation_unavailable");
+    assert!(harness.observed_delegated_plan);
+    assert_eq!(harness.authorizations, 0);
+    assert_eq!(harness.effects, 0);
+}
+#[test]
+fn provider_cannot_expand_descriptor_capabilities() {
+    let mut harness = Harness::new();
+    harness.expansive_plan = true;
+    let (_, receipt) = harness.submit_action();
+    assert_eq!(receipt["code"], "invalid_plan");
+    assert!(harness.observed_delegated_plan);
+    assert_eq!(harness.authorizations, 0);
     assert_eq!(harness.effects, 0);
 }

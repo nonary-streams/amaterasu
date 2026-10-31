@@ -515,7 +515,7 @@ mod tests {
             "initiator".into(),
         )
         .unwrap();
-        before.accept_plan(json!({})).unwrap();
+        before.accept_plan(json!({"plan_id":"p1","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]})).unwrap();
         let Stage::AwaitingPermit { digest, .. } = &before.stage else {
             panic!()
         };
