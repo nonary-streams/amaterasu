@@ -2,6 +2,8 @@
 // private debugger endpoint and coordinates native-host/session administration.
 import { createHash } from "node:crypto";
 import { createInterface } from "node:readline";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const check = (condition, message) => { if (!condition) throw new Error(message); };
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -632,6 +634,48 @@ async function initial(options) {
     const card = document.querySelector('.client-settings-card');
     return card && card.textContent.includes('Browser test device');
   })()`, "native paired-device editor");
+  const probePermissions = (expectation) => {
+    const script = fileURLToPath(new URL("../../scripts/test_browser_permission_wire.py", import.meta.url));
+    const result = spawnSync("python3", [script, options.nvhttp_origin, expectation], { encoding: "utf8", timeout: 30000 });
+    check(result.status === 0, `paired TLS ${expectation} probe failed: ${result.stderr}`);
+  };
+  await wait(devices, "!!document.querySelector('input[name=permission_mode_enabled]')", "native permission mode editor");
+  probePermissions("allowed");
+  check(await evaluate(devices, `(() => {
+    const mode = document.querySelector('input[name=permission_mode_enabled]');
+    return !mode.checked && !document.querySelector('input[name^=list_apps_]');
+  })()`), "client permissions were exposed while mode was disabled");
+  await evaluate(devices, `(() => {
+    document.querySelector('input[name=permission_mode_enabled]').click();
+    [...document.querySelectorAll('button')].find(button => button.textContent.trim() === 'Save permission mode').click();
+  })()`);
+  await wait(devices, "!!document.querySelector('input[name^=list_apps_]:not(:disabled)')", "enabled client permission controls");
+  await evaluate(devices, `(() => {
+    for (const prefix of ['list_apps_', 'view_streams_', 'launch_apps_']) {
+      const control = document.querySelector('input[name^=' + prefix + ']');
+      if (control.checked) control.click();
+    }
+    [...document.querySelectorAll('button')].find(button => button.textContent.trim() === 'Save permissions').click();
+  })()`);
+  await wait(devices, `(() => {
+    const inputs = [...document.querySelectorAll('input[name^=list_apps_],input[name^=view_streams_],input[name^=launch_apps_]')];
+    return inputs.length === 3 && inputs.every(input => !input.checked && !input.disabled) && document.body.textContent.includes('Effective listing: denied.');
+  })()`, "client permission revocation readback");
+  const revokedPermissions = await evaluate(devices, `(async () => {
+    const response = await fetch('/v1/pairing/list_clients', {method:'POST',credentials:'same-origin',
+      headers:{'Content-Type':'application/json','X-Amaterasu-CSRF':'1'},body:'{}'});
+    const state = await response.json(); return {enabled:state.permission_mode_enabled,permissions:state.clients[0].permissions};
+  })()`);
+  check(revokedPermissions.enabled && !revokedPermissions.permissions.list_apps &&
+    !revokedPermissions.permissions.view_streams && !revokedPermissions.permissions.launch_apps &&
+    revokedPermissions.permissions.terminate_streams, "native permission revocation did not preserve termination grant");
+  probePermissions("denied");
+  await evaluate(devices, `(() => {
+    document.querySelector('input[name=permission_mode_enabled]').click();
+    [...document.querySelectorAll('button')].find(button => button.textContent.trim() === 'Save permission mode').click();
+  })()`);
+  await wait(devices, "!!document.querySelector('input[name=permission_mode_enabled]:not(:checked):not(:disabled)') && !document.querySelector('input[name^=list_apps_]')", "disabled client permission mode readback");
+  probePermissions("allowed");
   const revision = await evaluate(devices, `(async () => {
     const response = await fetch('/v1/pairing/list_clients', {method:'POST', credentials:'same-origin',
       headers:{'Content-Type':'application/json','X-Amaterasu-CSRF':'1'}, body:'{}'});

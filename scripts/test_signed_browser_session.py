@@ -91,7 +91,9 @@ def configure_host(harness):
         "tls_certificate_path": "__AMATERASU_WORKER_STATE_ROOT__/management-tls/" + files["cert"].name,
         "tls_private_key_path": "__AMATERASU_WORKER_STATE_ROOT__/management-tls/" + files["key"].name,
     })
-    bootstrap["policy"]["settings"]["amaterasu.nvhttp"]["enabled"] = False
+    bootstrap["policy"]["settings"]["amaterasu.nvhttp"] = {
+        "enabled": True, "http_bind": "127.0.0.1:0", "https_bind": "127.0.0.1:0",
+    }
     # The isolated browser fixture seeds its own pairing identity; management
     # HTTPS still uses the independent loopback certificate above.
     bootstrap["policy"]["settings"]["amaterasu.pairing"]["host_configuration"] = False
@@ -402,7 +404,7 @@ def worker_ready(console):
     while time.monotonic() < deadline:
         if any(line.startswith("Development worker ready: pid=") for line in console.errors):
             return
-        assert console.process.poll() is None, "signed host stopped before native worker readiness"
+        assert console.process.poll() is None, "signed host stopped before native worker readiness: " + "".join(console.errors)
         time.sleep(0.05)
     raise AssertionError("signed native worker readiness deadline expired")
 
@@ -474,6 +476,9 @@ def exercise(directory, executable):
             "certificate_pem": (WORKSPACE / "modules/pairing/tests/fixtures/client-cert.pem").read_text(),
         })
         assert imported.get("ok"), "private paired-device fixture could not be imported"
+        from test_nvhttp import wait_for
+        nvhttp = wait_for(console, "amaterasu.nvhttp/1", {"action": "status"}, lambda value: value.get("tls_ready"))
+        nvhttp_origin = "https://" + nvhttp["https_address"]
         # Independently verify the host's actual certificate and loopback IP SAN.
         context = ssl.create_default_context(cafile=str(certificate))
         with socket.create_connection(("127.0.0.1", int(origin.rsplit(":", 1)[1])), timeout=4) as raw:
@@ -497,7 +502,7 @@ def exercise(directory, executable):
         saved = driver.phase("initial", debugger=debugger, origin=origin, rejected_origin=probe.origin,
             profile=str(browser.profile), spki=spki,
             username="browser-administrator", password="private-browser-test-password",
-            download_directory=str(download_directory))
+            download_directory=str(download_directory), nvhttp_origin=nvhttp_origin)
         bundle = download_directory / "amaterasu-support-logs.zip"
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline and (not bundle.exists() or list(download_directory.glob("*.crdownload"))):
@@ -598,7 +603,7 @@ def main():
         run("npm", "--prefix", WORKSPACE / "frontend", "run", "build")
     with tempfile.TemporaryDirectory(prefix="amaterasu-signed-browser-") as temporary:
         exercise(Path(temporary), executable)
-    print("Passed: actual Chromium with signed native HTTPS/frontend, remembered UI login/reload and cold-process restoration from the persistent cookie, HttpOnly cookie secrecy, exact CSRF checks, native refresh/revocation, scoped token creation/use/revocation, session-only administration and peer-session revocation after refresh, UI CAS/stale editor, host restart and peer signout; SPKI-key exception negative control and owned browser abort cleanup.")
+    print("Passed: actual Chromium with signed native HTTPS/frontend, remembered UI login/reload and cold-process restoration from the persistent cookie, HttpOnly cookie secrecy, exact CSRF checks, native refresh/revocation, scoped token creation/use/revocation, session-only administration and peer-session revocation after refresh, UI CAS/stale editor, client permission mode and grant changes with paired TLS list/launch denial and restoration, host restart and peer signout; SPKI-key exception negative control and owned browser abort cleanup.")
     print("Unqualified: installed CA/service TLS provisioning, physical remote browsers, Windows/macOS and game-visible streaming.")
 
 
