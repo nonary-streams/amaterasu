@@ -291,6 +291,37 @@ fn refresh_rejects_other_session_domains_and_duplicates_atomically() {
 }
 
 #[test]
+fn finalize_refresh_context_without_pending_stage_is_rejected() {
+    let mut fixture = Fixture::new();
+    let mut payload = fixture.payload(json!([{"domain":"shared","revision":2,"borrowers":{}}]));
+    payload["provider_request"] = json!({});
+    assert_eq!(
+        fixture
+            .coordinator
+            .refresh_provider_observations(
+                "provider-a",
+                "provider-a",
+                payload,
+                "unexpected-context".into()
+            )
+            .unwrap_err(),
+        "unexpected_finalize_refresh_context"
+    );
+    assert_eq!(
+        fixture
+            .coordinator
+            .shared
+            .borrow()
+            .value
+            .authority
+            .snapshot
+            .domains["shared"]
+            .revision,
+        1
+    );
+}
+
+#[test]
 fn three_large_admissions_are_sent_once_with_provenance() {
     let fixture = Fixture::new();
     let mut journal = fixture.coordinator.shared.borrow().value.clone();
@@ -325,4 +356,67 @@ fn three_large_admissions_are_sent_once_with_provenance() {
                 == 3000
     }));
     assert!(serde_json::to_vec(&value).unwrap().len() < 16 * 1024);
+}
+
+#[test]
+fn v2_plan_refresh_requires_exact_active_request_before_native_observation_is_saved() {
+    let mut fixture = Fixture::new();
+    let epoch = fixture.coordinator.shared.borrow().value.host_epoch.clone();
+    let target =
+        json!({"kind":"session","host_epoch":epoch,"session_id":"session-a","generation":1});
+    let request = json!({"version":2,"provider_sequence":3,"operation":"resource_plan","transition_id":"transition","operation_id":"plan-op","target":target,"phase":"session.prepare","settings_revision":"initial","settings":{},"intent":null,"reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector"]},"remaining_ms":5000,"plan_revision":null,"admission_id":null,"approved_plan":null});
+    let participant =
+        serde_json::to_value(&fixture.coordinator.selections["provider-a"].participant).unwrap();
+    let state = json!({"provider":"provider-a","participant":participant,"request":request,"phase":"plan","plan":null,"admission_id":null,"pending_receipt":null,"status_polls":0,"last_sequence":3,"dispatch":null,"response":null});
+    let work = json!({"phase":"session.prepare","target":target,"intent":null,"reason":null,"video":null,"transition_id":"transition","providers":["provider-a"],"index":0,"states":{"provider-a":state},"candidate":null,"waiting_retirement":false});
+    {
+        let mut shared = fixture.coordinator.shared.borrow_mut();
+        shared.value.sessions.get_mut("session-a").unwrap().phase = SessionPhase::Preparing;
+        shared.value.receipts.insert("plan".into(), serde_json::from_value(json!({"caller":"transport","initiator":"client","request":{},"response":{"status":"pending"},"work":work})).unwrap());
+    }
+    let mut payload = fixture.payload(json!([{"domain":"shared","revision":2,"borrowers":{}}]));
+    assert_eq!(
+        fixture
+            .coordinator
+            .refresh_provider_observations(
+                "provider-a",
+                "provider-a",
+                payload.clone(),
+                "missing".into()
+            )
+            .unwrap_err(),
+        "finalize_refresh_context_required"
+    );
+    payload["provider_request"] = request.clone();
+    payload["provider_request"]["provider_sequence"] = json!(4);
+    assert_eq!(
+        fixture
+            .coordinator
+            .refresh_provider_observations(
+                "provider-a",
+                "provider-a",
+                payload.clone(),
+                "forged".into()
+            )
+            .unwrap_err(),
+        "finalize_refresh_mismatch"
+    );
+    payload["provider_request"] = request;
+    let result = fixture
+        .coordinator
+        .refresh_provider_observations("provider-a", "provider-a", payload, "exact".into())
+        .unwrap();
+    assert_eq!(result["status"], "succeeded");
+    assert_eq!(
+        fixture
+            .coordinator
+            .shared
+            .borrow()
+            .value
+            .authority
+            .snapshot
+            .domains["shared"]
+            .revision,
+        2
+    );
 }

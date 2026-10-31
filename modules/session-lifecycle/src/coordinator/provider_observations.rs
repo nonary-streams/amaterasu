@@ -214,8 +214,86 @@ impl Coordinator {
         let target: LifecycleTarget =
             serde_json::from_value(payload.get("target").cloned().ok_or("target_required")?)
                 .map_err(|_| "invalid_target")?;
+        if serde_json::to_vec(&payload)
+            .map_err(|_| "invalid_observation_batch")?
+            .len()
+            > MAX_RESPONSE_BYTES
+        {
+            return Err("observation_batch_too_large".into());
+        }
         let (epoch, session_id, stream_id, generation) = super::operations::target_parts(&target)?;
         let mut next = self.shared.borrow().value.clone();
+        let mut active_plans = Vec::new();
+        for receipt in next
+            .receipts
+            .values()
+            .filter(|receipt| receipt.response["status"] == "pending")
+        {
+            let Some(work) = &receipt.work else {
+                continue;
+            };
+            if work.target != target {
+                continue;
+            }
+            let normal = work.states.get(caller).filter(|state| {
+                state.request.version == amaterasu_extension_api::COMPOSITION_VERSION
+                    && state.request.operation
+                        == amaterasu_extension_api::ProviderOperation::ResourcePlan
+            });
+            let finalize = work
+                .composition_progress
+                .as_ref()
+                .and_then(|progress| progress.finalize.as_ref())
+                .filter(|finalize| finalize.selection.policy.owner_provider == caller)
+                .map(|finalize| &finalize.owner_plan);
+            for state in normal.into_iter().chain(finalize) {
+                if state.provider == caller
+                    && state.request.target == work.target
+                    && state.request.transition_id == work.transition_id
+                    && matches!(
+                        state.phase,
+                        crate::prepare_driver::PreparePhase::Plan
+                            | crate::prepare_driver::PreparePhase::PlanStatus
+                    )
+                {
+                    active_plans.push(state);
+                }
+            }
+        }
+        if active_plans.len() > 1 {
+            return Err("ambiguous_provider_refresh".into());
+        }
+        let nested = active_plans.first().copied();
+        match (nested, payload.get("provider_request")) {
+            (Some(expected), Some(value)) => {
+                let supplied: amaterasu_extension_api::ProviderRequest =
+                    serde_json::from_value(value.clone())
+                        .map_err(|_| "invalid_finalize_refresh")?;
+                if supplied != expected.request
+                    || !matches!(
+                        supplied.operation,
+                        amaterasu_extension_api::ProviderOperation::ResourcePlan
+                            | amaterasu_extension_api::ProviderOperation::ResourceFinalizePlan
+                    )
+                    || supplied.version != amaterasu_extension_api::COMPOSITION_VERSION
+                    || self.selections.get(caller).is_none_or(|selected| {
+                        !selected.approvals.iter().any(|approval| {
+                            approval.method == expected.participant.plan_method
+                                && approval.broker_approval["provider"].as_str() == Some(caller)
+                        })
+                    })
+                {
+                    return Err("finalize_refresh_mismatch".into());
+                }
+                let verification = json!({"host_epoch":epoch,"provider_sequence":supplied.provider_sequence,"operation_id":supplied.operation_id,"transition_id":supplied.transition_id,"target":supplied.target,"fingerprint":super::security::fingerprint(&supplied)?});
+                if self.verify_provider(caller, &verification)["status"] != "succeeded" {
+                    return Err("finalize_refresh_not_authorized".into());
+                }
+            }
+            (Some(_), None) => return Err("finalize_refresh_context_required".into()),
+            (None, Some(_)) => return Err("unexpected_finalize_refresh_context".into()),
+            (None, None) => {}
+        }
         let session = next.sessions.get(session_id).ok_or("unknown_session")?;
         if epoch != next.host_epoch || epoch != session.host_epoch {
             return Err("stale_host_epoch".into());

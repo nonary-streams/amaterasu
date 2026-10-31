@@ -23,7 +23,9 @@ pub(super) struct RevocationJob {
     operation_id: String,
 }
 
-fn fingerprint(request: &amaterasu_extension_api::ProviderRequest) -> ModuleResult<String> {
+pub(super) fn fingerprint(
+    request: &amaterasu_extension_api::ProviderRequest,
+) -> ModuleResult<String> {
     let bytes = serde_json::to_vec(request).map_err(|e| e.to_string())?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
@@ -119,6 +121,10 @@ impl Coordinator {
                             || !selected
                                 .approvals
                                 .contains(&selection.finalize_status_approval)
+                            || !selected.approvals.iter().any(|approval| {
+                                approval.method == state.participant.plan_method
+                                    && approval.broker_approval["provider"].as_str() == Some(caller)
+                            })
                     })
                 {
                     continue;
