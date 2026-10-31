@@ -186,6 +186,14 @@ not evicted during the process lifetime. Restart creates a fresh epoch and rejec
 all old epoch IDs, so old unknown operations remain unconfirmed. The observer
 array defaults to empty.
 
+An active exported launch owner can authorize a distinct frame-limiter snapshot
+for a new RTSP operation with `authorize_stream_snapshot`. The operation ID is
+bound to that snapshot, exact retries are allowed, and conflicting reuse is
+rejected. Without a fresh authoritative global-settings read, only the requested
+stream FPS, client display refresh, and implied Lossless Scaling target may
+change; other limiter settings must match the immutable launch snapshot. RTSP
+must supply the same operation ID when verifying an authorized resume snapshot.
+
 The application environment is cleared, then populated with this trusted startup
 map. Host variables are not inherited implicitly. Supply OS/application-required
 variables explicitly; Windows Python and some native applications may require

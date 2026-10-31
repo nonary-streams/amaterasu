@@ -90,10 +90,18 @@ pub enum Operation {
     },
     VerifyFrameLimiterSnapshot {
         application_operation_id: String,
+        #[serde(default)]
+        rtsp_operation_id: Option<String>,
         app_id: String,
         catalog_revision: u64,
         frame_limiter_settings: BTreeMap<String, Value>,
         frame_limiter_executable_path: String,
+    },
+    AuthorizeStreamSnapshot {
+        launch_id: u64,
+        application_operation_id: String,
+        rtsp_operation_id: String,
+        frame_limiter_settings: BTreeMap<String, Value>,
     },
     Lookup {
         operation_id: String,
@@ -166,8 +174,25 @@ impl Operation {
             Self::VerifyFrameLimiterSnapshot {
                 application_operation_id,
                 app_id,
+                rtsp_operation_id,
                 ..
-            } if !valid_operation_id(application_operation_id) || !valid_app_id(app_id) => {
+            } if !valid_operation_id(application_operation_id)
+                || !valid_app_id(app_id)
+                || rtsp_operation_id
+                    .as_ref()
+                    .is_some_and(|id| !valid_operation_id(id)) =>
+            {
+                return Err("invalid_request");
+            }
+            Self::AuthorizeStreamSnapshot {
+                launch_id,
+                application_operation_id,
+                rtsp_operation_id,
+                ..
+            } if *launch_id == 0
+                || !valid_operation_id(application_operation_id)
+                || !valid_operation_id(rtsp_operation_id) =>
+            {
                 return Err("invalid_request");
             }
             Self::PrepareDisplayAdmission {

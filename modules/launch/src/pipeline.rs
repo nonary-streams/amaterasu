@@ -339,6 +339,45 @@ fn snapshot_matches_application_policy(
     }
     true
 }
+
+/// Only the negotiated stream cadence and its derived limiter target may
+/// differ without a fresh authoritative global-settings read.
+fn valid_resumed_stream_snapshot(
+    record: &crate::records::Record,
+    candidate: &BTreeMap<String, Value>,
+) -> bool {
+    let Some(original) = record.frame_limiter_settings.as_ref() else {
+        return false;
+    };
+    if !valid_frame_limiter_snapshot(candidate) {
+        return false;
+    }
+    if original.iter().any(|(key, value)| {
+        !matches!(
+            key.as_str(),
+            "requested_stream_fps_millihz"
+                | "client_display_mode_override_millihz"
+                | "lossless_scaling_limit_millihz"
+        ) && candidate.get(key) != Some(value)
+    }) {
+        return false;
+    }
+    let expected_lossless = if original
+        .get("game_frame_generation_mode")
+        .and_then(Value::as_str)
+        == Some("lossless-scaling")
+        && record
+            .config_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.lossless_scaling_target_fps)
+            .is_none()
+    {
+        candidate.get("requested_stream_fps_millihz")
+    } else {
+        original.get("lossless_scaling_limit_millihz")
+    };
+    candidate.get("lossless_scaling_limit_millihz") == expected_lossless
+}
 pub struct Pipeline {
     records: Records,
     job: Option<Workflow>,
@@ -674,7 +713,8 @@ impl Pipeline {
             Ok(
                 operation @ (Operation::PrepareDisplayAdmission { .. }
                 | Operation::VerifyDisplayAdmission { .. }
-                | Operation::VerifyFrameLimiterSnapshot { .. }),
+                | Operation::VerifyFrameLimiterSnapshot { .. }
+                | Operation::AuthorizeStreamSnapshot { .. }),
             ) => {
                 self.receive(id, &caller, &initiator, remaining_ms, operation, send)?;
             }
@@ -1076,6 +1116,7 @@ impl Pipeline {
             }
             Operation::VerifyFrameLimiterSnapshot {
                 application_operation_id,
+                rtsp_operation_id,
                 app_id,
                 catalog_revision,
                 frame_limiter_settings,
@@ -1092,26 +1133,68 @@ impl Pipeline {
                             && record.operation_id == application_operation_id
                             && record.app_id == app_id
                             && record.catalog_revision == Some(catalog_revision)
-                            && record.frame_limiter_settings.as_ref()
+                            && (record.frame_limiter_settings.as_ref()
                                 == Some(&frame_limiter_settings)
+                                || rtsp_operation_id
+                                    .as_ref()
+                                    .and_then(|id| record.stream_limiter_snapshots.get(id))
+                                    == Some(&frame_limiter_settings))
                             && record.executable_path.as_deref()
                                 == Some(frame_limiter_executable_path.as_str())
                     });
                 if !verified {
                     return complete(send, request, error("frame_limiter_snapshot_denied"));
                 }
+                let mut response = serde_json::json!({
+                    "ok":true,
+                    "verified":true,
+                    "application_operation_id":application_operation_id,
+                    "app_id":app_id,
+                    "catalog_revision":catalog_revision,
+                    "frame_limiter_settings":frame_limiter_settings,
+                    "frame_limiter_executable_path":frame_limiter_executable_path,
+                });
+                if let Some(rtsp_operation_id) = rtsp_operation_id {
+                    response["rtsp_operation_id"] = serde_json::json!(rtsp_operation_id);
+                }
+                complete(send, request, response)
+            }
+            Operation::AuthorizeStreamSnapshot {
+                launch_id,
+                application_operation_id,
+                rtsp_operation_id,
+                frame_limiter_settings,
+            } => {
+                let Ok(record) = self.records.owned(caller, launch_id) else {
+                    return complete(send, request, error("stream_snapshot_denied"));
+                };
+                if caller != "amaterasu.nvhttp"
+                    || record.state != State::Active
+                    || record.operation_id != application_operation_id
+                    || !valid_resumed_stream_snapshot(record, &frame_limiter_settings)
+                    || record
+                        .stream_limiter_snapshots
+                        .get(&rtsp_operation_id)
+                        .is_some_and(|existing| existing != &frame_limiter_settings)
+                    || (!record
+                        .stream_limiter_snapshots
+                        .contains_key(&rtsp_operation_id)
+                        && record.stream_limiter_snapshots.len() >= 16)
+                {
+                    return complete(send, request, error("stream_snapshot_denied"));
+                }
+                let record = self
+                    .records
+                    .values
+                    .get_mut(&launch_id)
+                    .expect("verified owned record");
+                record
+                    .stream_limiter_snapshots
+                    .insert(rtsp_operation_id.clone(), frame_limiter_settings.clone());
                 complete(
                     send,
                     request,
-                    serde_json::json!({
-                        "ok":true,
-                        "verified":true,
-                        "application_operation_id":application_operation_id,
-                        "app_id":app_id,
-                        "catalog_revision":catalog_revision,
-                        "frame_limiter_settings":frame_limiter_settings,
-                        "frame_limiter_executable_path":frame_limiter_executable_path,
-                    }),
+                    serde_json::json!({"ok":true,"application_operation_id":application_operation_id,"rtsp_operation_id":rtsp_operation_id,"frame_limiter_settings":frame_limiter_settings}),
                 )
             }
             Operation::Lookup { operation_id } => {

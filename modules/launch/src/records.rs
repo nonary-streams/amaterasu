@@ -74,6 +74,8 @@ pub struct Record {
     pub executable_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame_limiter_settings: Option<BTreeMap<String, Value>>,
+    #[serde(skip)]
+    pub stream_limiter_snapshots: BTreeMap<String, BTreeMap<String, Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_frame_limiter_overrides: Option<BTreeMap<String, Value>>,
     pub application_display_overrides: BTreeMap<String, Value>,
@@ -279,6 +281,7 @@ impl Records {
                 application_display_settings: None,
                 executable_path: None,
                 frame_limiter_settings: None,
+                stream_limiter_snapshots: BTreeMap::new(),
                 client_frame_limiter_overrides: None,
                 application_display_overrides: BTreeMap::new(),
                 display_admission: None,
