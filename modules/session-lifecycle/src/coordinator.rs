@@ -463,11 +463,11 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                     .plan
                     .control_proposals
                     .contains(&item.request.proposal)
-                || item.confirmed.schema != selection.input.output.schema
-                || item.confirmed.origin != selection.input.output.origin
+                || item.confirmed.output.schema != selection.input.output.schema
+                || item.confirmed.output.origin != selection.input.output.origin
                 || !catalog.is_ok_and(|catalog| {
                     catalog
-                        .validate(&item.confirmed.schema, &item.confirmed.data)
+                        .validate(&item.confirmed.output.schema, &item.confirmed.output.data)
                         .is_ok()
                 })
         })

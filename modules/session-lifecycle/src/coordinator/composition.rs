@@ -8,8 +8,8 @@ use crate::adapter::SchemaDocument;
 use crate::prepare_authority::{Admission, ControlPermit};
 use crate::prepare_authority::{ControlPolicy, FinalizePolicy, MethodApproval};
 use amaterasu_extension_api::{
-    LifecycleTarget, ResourceAccess, ResourceControlRequest, ResourceObligation, ResourceOutput,
-    ResourcePlan, SchemaRef,
+    ConfirmedControl, LifecycleTarget, ResourceAccess, ResourceControlRequest,
+    ResourceControlResponse, ResourceObligation, ResourceOutput, ResourcePlan, SchemaRef,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -45,7 +45,9 @@ pub struct StoredOutput {
 pub struct ObligationRefinement {
     pub request: ResourceControlRequest,
     pub original: ResourceObligation,
-    pub confirmed: ResourceOutput,
+    pub confirmed: ConfirmedControl,
+    pub owner_result: ResourceControlResponse,
+    pub owner_receipt_id: Option<String>,
 }
 
 /// Frozen installed selection, broker approvals and exact upstream provenance.
@@ -251,9 +253,9 @@ impl CompositionBook {
             || permit.request != item.request
             || permit.context.target != item.request.target
             || permit.context.transition_id != item.request.transition_id
-            || permit.context.output.schema != item.confirmed.schema
-            || permit.context.output.origin != item.confirmed.origin
-            || permit.context.output.capability != item.confirmed.capability
+            || permit.context.output.schema != item.confirmed.output.schema
+            || permit.context.output.origin != item.confirmed.output.origin
+            || permit.context.output.capability != item.confirmed.output.capability
             || admission.provider != permit.context.policy.dependent_provider
             || !admission.plan.obligations.contains(&item.original)
             || !admission
@@ -469,13 +471,20 @@ fn same_key(a: &ResourceOutput, b: &ResourceOutput) -> bool {
 fn valid_refinement_shape(item: &ObligationRefinement) -> bool {
     let request = &item.request;
     let proposal = &request.proposal;
-    let output = &item.confirmed;
+    let output = &item.confirmed.output;
     valid_text(&request.operation_id)
         && valid_text(&request.transition_id)
         && valid_text(&request.admission_id)
         && valid_text(&request.permit_id)
         && request.provider_sequence > 0
         && request.target == proposal.target
+        && item.confirmed.proposal_id == proposal.proposal_id
+        && item
+            .owner_receipt_id
+            .as_ref()
+            .is_none_or(|id| valid_text(id))
+        && matches!(&item.owner_result, ResourceControlResponse::Applied { output, candidate }
+            if output.as_ref() == &item.confirmed.output && candidate.as_deref() == item.confirmed.candidate.as_ref())
         && valid_text(&item.original.obligation_id)
         && valid_text(&item.original.provider)
         && item.original.payload.is_object()
@@ -801,13 +810,22 @@ mod tests {
         let item = ObligationRefinement {
             request,
             original: original.clone(),
-            confirmed: input,
+            confirmed: ConfirmedControl {
+                proposal_id: "proposal".into(),
+                output: input.clone(),
+                candidate: None,
+            },
+            owner_result: ResourceControlResponse::Applied {
+                output: Box::new(input),
+                candidate: None,
+            },
+            owner_receipt_id: Some("receipt".into()),
         };
         assert!(valid_refinement_shape(&item));
         assert_eq!(item.original, original);
         assert_eq!(item.original.payload, json!({"output_id":"output"}));
         let mut forged = item;
-        forged.confirmed.resource.incarnation = "replacement".into();
+        forged.confirmed.output.resource.incarnation = "replacement".into();
         assert!(!valid_refinement_shape(&forged));
     }
 }
