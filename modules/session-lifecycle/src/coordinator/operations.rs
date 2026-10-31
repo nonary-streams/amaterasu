@@ -29,6 +29,22 @@ fn require_unused_stream_id(session: &SessionRecord, stream_id: &str) -> ModuleR
     }
     Ok(())
 }
+fn optionally_retire_closed_history(
+    journal: &mut Journal,
+    retire: impl FnOnce(&mut Journal) -> ModuleResult<()>,
+) -> ModuleResult<()> {
+    let mut candidate = journal.clone();
+    match retire(&mut candidate) {
+        Ok(()) => *journal = candidate,
+        Err(error)
+            if error == "closed_stream_history_in_use"
+                || error == "closed_stream_history_not_ready"
+                || error == "control_replay_fence_capacity" => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
 pub(super) fn checked_target<'a>(
     journal: &'a Journal,
     target: &LifecycleTarget,
@@ -281,8 +297,18 @@ impl Coordinator {
                 serde_json::from_value(payload.get("target").cloned().ok_or("target_required")?)
                     .map_err(|_| "invalid_target")?;
             checked_target(&next, &target, caller, initiator)?;
+            let end_after_retirement = operation == "end_session"
+                && matches!(&target, LifecycleTarget::Session { session_id, .. }
+                    if next.sessions.get(session_id).is_some_and(|session|
+                        session.streams.values().all(|stream| stream.phase == StreamPhase::Retired)));
             if matches!(operation, "prepare_stream" | "resume_stream") {
                 self.prepare_stream_history(&mut next, &target)?;
+            } else if end_after_retirement {
+                // Keep all source records if live references or finite
+                // capacity prevent optional history reclamation.
+                optionally_retire_closed_history(&mut next, |candidate| {
+                    self.prepare_stream_history(candidate, &target)
+                })?;
             }
             let (session, stream_id) = checked_target(&next, &target, caller, initiator)?;
             let session_id = session.id.clone();
@@ -605,6 +631,40 @@ impl Coordinator {
 #[cfg(test)]
 mod reprepare_tests {
     use super::*;
+
+    #[test]
+    fn optional_history_retirement_preserves_source_when_pinned() {
+        let mut journal: Journal = serde_json::from_value(json!({
+            "version":3,"host_epoch":"epoch","receipts":{},"sessions":{}
+        }))
+        .unwrap();
+        for reason in [
+            "closed_stream_history_in_use",
+            "closed_stream_history_not_ready",
+            "control_replay_fence_capacity",
+        ] {
+            optionally_retire_closed_history(&mut journal, |candidate| {
+                candidate.host_epoch = "partial".into();
+                Err(reason.into())
+            })
+            .unwrap();
+            assert_eq!(journal.host_epoch, "epoch");
+        }
+        assert!(
+            optionally_retire_closed_history(&mut journal, |candidate| {
+                candidate.host_epoch = "partial".into();
+                Err("corrupt_history".into())
+            })
+            .is_err()
+        );
+        assert_eq!(journal.host_epoch, "epoch");
+        optionally_retire_closed_history(&mut journal, |candidate| {
+            candidate.host_epoch = "committed".into();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(journal.host_epoch, "committed");
+    }
 
     #[test]
     fn existing_stream_identifier_cannot_be_replaced() {
