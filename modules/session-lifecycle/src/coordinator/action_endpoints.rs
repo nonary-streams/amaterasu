@@ -629,6 +629,7 @@ impl Coordinator {
                 let response = json!({"status":"pending","operation_id":binding.operation_id,"target":binding.target,"plan_digest":binding.plan_digest});
                 let work = super::Work {
                     composition_progress: None,
+                    compacted_release: false,
                     owner_observations: Default::default(),
                     reprepare: None,
                     phase: amaterasu_extension_api::LifecyclePhase::StreamRelease,

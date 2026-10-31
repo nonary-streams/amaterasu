@@ -2032,6 +2032,11 @@ impl Coordinator {
             .ok_or("action_cleanup_proof_unavailable")?;
         let receipt = next.receipts.get_mut(key).ok_or("unknown_transition")?;
         let saved = receipt.work.as_mut().ok_or("action_transition_missing")?;
+        if serde_json::to_value(&*saved).map_err(|_| "action_transition_invalid")?
+            != serde_json::to_value(work).map_err(|_| "action_transition_invalid")?
+        {
+            return Err("action_transition_changed".into());
+        }
         let saved_transfer = saved
             .action_transfer
             .as_mut()
@@ -2044,6 +2049,12 @@ impl Coordinator {
         }
         saved_transfer.release_proof = Some(proof);
         saved_transfer.stage = ActionTransferStage::ReplanRequired;
+        // The exact completed callbacks and control progress are retained by
+        // the graph proof written in this same journal transaction. Recovery
+        // revalidates that proof before using this compact reference.
+        saved.composition_progress = None;
+        saved.states.clear();
+        saved.compacted_release = true;
         receipt.response = json!({"status":"replan_required","operation_id":transfer.binding.operation_id,"target":transfer.binding.target,"plan_digest":transfer.binding.plan_digest,"transition_id":work.transition_id});
         let receipt = next.receipts.get(key).ok_or("unknown_transition")?;
         let saved = receipt.work.as_ref().ok_or("action_transition_missing")?;
@@ -2648,6 +2659,7 @@ impl Coordinator {
                 let receipt = next.receipts.get_mut(key).unwrap();
                 receipt.work = Some(Work {
                     composition_progress: None,
+                    compacted_release: false,
                     owner_observations: Default::default(),
                     reprepare: None,
                     phase,
@@ -3042,6 +3054,7 @@ mod dependency_cleanup_tests {
     fn work() -> Work {
         Work {
             composition_progress: None,
+            compacted_release: false,
             owner_observations: Default::default(),
             reprepare: None,
             phase: LifecyclePhase::SessionRelease,

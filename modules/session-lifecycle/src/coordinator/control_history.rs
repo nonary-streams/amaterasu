@@ -6,7 +6,7 @@ use amaterasu_extension_api::{ResourceControlRequest, ResourceControlResponse, R
 // A closed graph records the Work before the action advances to replan.
 // Only that independently verifiable action transition may differ; every
 // cleanup callback, control, target, graph and other Work field remains exact.
-fn matching_release_work(journal: &Journal, live: &Work, closed: &Work) -> bool {
+pub(super) fn matching_release_work(journal: &Journal, live: &Work, closed: &Work) -> bool {
     if serde_json::to_value(live).ok() == serde_json::to_value(closed).ok() {
         return true;
     }
@@ -37,6 +37,16 @@ fn matching_release_work(journal: &Journal, live: &Work, closed: &Work) -> bool 
     }
     let mut normalized = live.clone();
     normalized.action_transfer = closed.action_transfer.clone();
+    // Compacted action work refers to the verified closed graph for these
+    // fields. All other fields and the separately verified transfer stay exact.
+    if normalized.compacted_release {
+        if normalized.composition_progress.is_some() || !normalized.states.is_empty() {
+            return false;
+        }
+        normalized.compacted_release = false;
+        normalized.composition_progress = closed.composition_progress.clone();
+        normalized.states = closed.states.clone();
+    }
     serde_json::to_value(normalized).ok() == serde_json::to_value(closed).ok()
 }
 
@@ -114,7 +124,11 @@ pub(super) fn authenticated_input(
         return None;
     }
     let work = if let Some(work) = live {
-        Some(work)
+        if work.compacted_release {
+            closed_release
+        } else {
+            Some(work)
+        }
     } else if let Some(work) = closed_release {
         Some(work)
     } else if let Some(record) = historical_record {
@@ -464,6 +478,81 @@ pub(super) fn authenticated_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a real completed action candidate in AMATERASU_ACTION_RELEASE_JOURNAL"]
+    fn compacted_action_work_reloads_only_with_exact_release_proof() {
+        let path = std::env::var("AMATERASU_ACTION_RELEASE_JOURNAL").unwrap();
+        let mut journal: Journal = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        validate_journal(&journal).unwrap();
+        let before = serde_json::to_vec(&journal).unwrap().len();
+        let key = journal
+            .receipts
+            .iter()
+            .find(|(_, receipt)| {
+                receipt
+                    .work
+                    .as_ref()
+                    .and_then(|work| work.action_transfer.as_ref())
+                    .is_some_and(|t| t.stage == ActionTransferStage::ReplanRequired)
+            })
+            .unwrap()
+            .0
+            .clone();
+        let work = journal.receipts[&key].work.as_ref().unwrap();
+        let closed = journal
+            .composed_releases
+            .verified_work_for(&journal, &work.target, &work.transition_id)
+            .unwrap();
+        assert!(matching_release_work(&journal, work, closed));
+        let compact = journal
+            .receipts
+            .get_mut(&key)
+            .unwrap()
+            .work
+            .as_mut()
+            .unwrap();
+        compact.composition_progress = None;
+        compact.states.clear();
+        compact.compacted_release = true;
+        validate_journal(&journal).unwrap();
+        let after = serde_json::to_vec(&journal).unwrap().len();
+        eprintln!(
+            "journal bytes: {before} -> {after}, saved {}",
+            before - after
+        );
+        let reloaded: Journal =
+            serde_json::from_slice(&serde_json::to_vec(&journal).unwrap()).unwrap();
+        validate_journal(&reloaded).unwrap();
+        let mut without_proof = reloaded.clone();
+        let saved = without_proof.receipts[&key].work.as_ref().unwrap();
+        let target = saved.target.clone();
+        let transition = saved.transition_id.clone();
+        without_proof
+            .composed_releases
+            .remove_exact(&target, &transition)
+            .unwrap();
+        assert!(validate_journal(&without_proof).is_err());
+        let mut without_reference = reloaded;
+        without_reference
+            .receipts
+            .get_mut(&key)
+            .unwrap()
+            .work
+            .as_mut()
+            .unwrap()
+            .compacted_release = false;
+        assert!(validate_journal(&without_reference).is_err());
+        let compact = journal
+            .receipts
+            .get_mut(&key)
+            .unwrap()
+            .work
+            .as_mut()
+            .unwrap();
+        compact.transition_id = "forged".into();
+        assert!(validate_journal(&journal).is_err());
+    }
 
     #[test]
     fn action_release_transition_requires_exact_binding_and_verified_proof() {

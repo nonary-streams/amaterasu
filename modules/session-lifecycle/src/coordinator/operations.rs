@@ -167,6 +167,7 @@ impl Coordinator {
         }
         Ok(Work {
             composition_progress: None,
+            compacted_release: false,
             owner_observations: Default::default(),
             reprepare: None,
             phase,

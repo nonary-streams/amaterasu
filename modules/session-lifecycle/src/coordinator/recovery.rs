@@ -176,6 +176,7 @@ mod tests {
         };
         let work = Work {
             composition_progress: None,
+            compacted_release: false,
             owner_observations: Default::default(),
             reprepare: None,
             phase: LifecyclePhase::StreamPrepare,

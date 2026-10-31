@@ -118,6 +118,8 @@ struct Work {
     /// Inert until composition sequencing and owner verification are installed.
     #[serde(default)]
     composition_progress: Option<composition_progress::CompositionProgress>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    compacted_release: bool,
     #[serde(default)]
     owner_observations: BTreeMap<String, plan_observation::PlanObservationState>,
     #[serde(default)]
@@ -145,6 +147,10 @@ struct Work {
     action_transfer: Option<ActionTransfer>,
     #[serde(default)]
     recovery_authorized_epoch: Option<String>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 /// Frozen child work is resumed only after a new producer root is proved.
@@ -582,24 +588,45 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
             receipt.work.as_ref().is_some_and(|work| {
                 !work.reprepare_authorized(journal)
                     || !observation_scheduler::validate_work_observations(journal, work)
-                    || work.action_transfer.as_ref().is_some_and(|transfer| {
-                        transfer.snapshot.as_ref().is_some_and(|snapshot| {
-                            !action_endpoints::action_snapshot_matches(
-                                journal, receipt, work, transfer, snapshot,
+                    || (work.compacted_release
+                        && work.action_transfer.as_ref().is_none_or(|transfer| {
+                            !matches!(
+                                transfer.stage,
+                                ActionTransferStage::ReplanRequired | ActionTransferStage::Rebound
                             )
-                        }) || match transfer.stage {
-                            ActionTransferStage::CleanupPending => transfer.release_proof.is_some(),
-                            ActionTransferStage::ReplanRequired => {
-                                !action_release_proof::validate_replan_stage(
-                                    journal, receipt, work, transfer,
+                        }))
+                    || work.action_transfer.as_ref().is_some_and(|transfer| {
+                        (matches!(
+                            transfer.stage,
+                            ActionTransferStage::ReplanRequired | ActionTransferStage::Rebound
+                        ) && (work.compacted_release
+                            || journal.composed_releases.contains_target(&work.target))
+                            && !journal
+                                .composed_releases
+                                .verified_work_for(journal, &work.target, &work.transition_id)
+                                .is_some_and(|closed| {
+                                    control_history::matching_release_work(journal, work, closed)
+                                }))
+                            || transfer.snapshot.as_ref().is_some_and(|snapshot| {
+                                !action_endpoints::action_snapshot_matches(
+                                    journal, receipt, work, transfer, snapshot,
                                 )
+                            })
+                            || match transfer.stage {
+                                ActionTransferStage::CleanupPending => {
+                                    transfer.release_proof.is_some()
+                                }
+                                ActionTransferStage::ReplanRequired => {
+                                    !action_release_proof::validate_replan_stage(
+                                        journal, receipt, work, transfer,
+                                    )
+                                }
+                                ActionTransferStage::Rebound => {
+                                    !action_release_proof::validate_rebound_stage(
+                                        journal, receipt, work, transfer,
+                                    )
+                                }
                             }
-                            ActionTransferStage::Rebound => {
-                                !action_release_proof::validate_rebound_stage(
-                                    journal, receipt, work, transfer,
-                                )
-                            }
-                        }
                     })
             })
         })
