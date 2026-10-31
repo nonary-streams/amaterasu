@@ -35,6 +35,8 @@ mod geometry;
 pub use geometry::*;
 mod transport;
 pub use transport::*;
+mod video_framing;
+pub use video_framing::*;
 
 pub const INTERFACE_MAJOR: u32 = 1;
 pub const INTERFACE_MINOR: u32 = 0;

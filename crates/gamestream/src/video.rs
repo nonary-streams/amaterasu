@@ -46,6 +46,7 @@ pub enum VideoError {
     UnsupportedEncryption,
     InvalidAnnexB,
     InvalidAv1,
+    InvalidPlan,
     AccessUnitTooLarge,
     TooManyPackets,
 }

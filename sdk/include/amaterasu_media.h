@@ -639,6 +639,71 @@ typedef struct {
     AmaterasuStatus (*send)(void *context, uint64_t stream, const AmaterasuControlMessage *message);
     AmaterasuStatus (*receive)(void *context, uint64_t stream, AmaterasuControlMessageSink sink);
 } AmaterasuControlTransportApi;
+/* Negotiated video unit/framing contracts are separate from legacy VideoApi
+ * and MediaTransportApi. Codec IDs match the encoder-provider triple; zero is
+ * invalid. Buffers are borrowed synchronously and BUSY consumes nothing. */
+#define AMATERASU_NEGOTIATED_VIDEO_CONTRACT "amaterasu.video-unit.native/1"
+#define AMATERASU_NEGOTIATED_VIDEO_TRANSPORT_CONTRACT "amaterasu.video-unit-transport.native/1"
+#define AMATERASU_VIDEO_FRAMING_CONTRACT "amaterasu.video-framing.native/1"
+#define AMATERASU_VIDEO_UNIT_VERSION 1u
+#define AMATERASU_VIDEO_UNIT_KEYFRAME 1u
+#define AMATERASU_VIDEO_UNIT_DISCONTINUITY 2u
+#define AMATERASU_VIDEO_UNIT_END_OF_STREAM 4u
+#define AMATERASU_VIDEO_FRAME_MAX_BLOCKS 4u
+#define AMATERASU_VIDEO_FRAME_MAX_DATAGRAMS 2048u
+#define AMATERASU_VIDEO_FRAME_RECORD_START 1u
+#define AMATERASU_VIDEO_FRAME_CRITICAL_PREFIX 2u
+typedef struct { uint64_t namespace_id, value, schema; } AmaterasuVideoFormatId;
+typedef struct {
+    uint32_t size, version;
+    uint64_t stream, generation, offer_id;
+    AmaterasuVideoFormatId codec, framing;
+    uint64_t access_unit_id, submission_id, source_id, config_generation, timestamp_us;
+    AmaterasuFrameClockMetadata clock;
+    uint32_t flags, reserved;
+    AmaterasuBorrowedBytes data;
+} AmaterasuNegotiatedVideoUnit;
+typedef struct {
+    void *context;
+    AmaterasuStatus (*write)(void *, const AmaterasuNegotiatedVideoUnit *);
+} AmaterasuNegotiatedVideoUnitSink;
+typedef struct {
+    AmaterasuNativeInterface base;
+    AmaterasuStatus (*receive)(void *, uint64_t, AmaterasuNegotiatedVideoUnitSink);
+} AmaterasuNegotiatedVideoApi;
+typedef struct {
+    AmaterasuNativeInterface base;
+    AmaterasuStatus (*submit)(void *, uint64_t, const AmaterasuNegotiatedVideoUnit *);
+    AmaterasuStatus (*drain)(void *, uint64_t);
+} AmaterasuNegotiatedVideoTransportApi;
+typedef struct {
+    uint32_t first_data_shard, data_shards, parity_shards, percentage;
+} AmaterasuVideoFecBlock;
+typedef struct {
+    uint32_t size, version, packet_size, crypto_overhead, network_overhead;
+    uint32_t allowed_extensions, max_datagrams, max_queue_bytes;
+    uint32_t min_parity_shards, max_fec_percentage;
+    uint64_t max_wire_bytes;
+} AmaterasuVideoFramingLimits;
+typedef struct {
+    uint32_t size, version;
+    AmaterasuBorrowedBytes framed_bytes, record_starts;
+    uint32_t critical_prefix_shards, block_count;
+    AmaterasuVideoFecBlock blocks[AMATERASU_VIDEO_FRAME_MAX_BLOCKS];
+} AmaterasuVideoFramePlan;
+typedef struct {
+    void *context;
+    AmaterasuStatus (*write)(void *, const AmaterasuVideoFramePlan *);
+} AmaterasuVideoFramePlanSink;
+/* The host validates plan bounds and negotiated flags, then owns FEC,
+ * sequence numbers, encryption and network delivery. The plan callback
+ * must not retain pointers or commit rate state; retry after BUSY is safe. */
+typedef struct {
+    AmaterasuNativeInterface base;
+    AmaterasuStatus (*plan)(void *, uint64_t, const AmaterasuNegotiatedVideoUnit *,
+                            const AmaterasuVideoFramingLimits *, AmaterasuVideoFramePlanSink);
+} AmaterasuVideoFramingApi;
+
 /* HDR metadata is tied to a completed capture presentation. Fields: RGB xy,
  * white xy (1/50000), max nits, min 1/10000 nit, MaxCLL and MaxFALL. */
 typedef struct { uint32_t enabled; uint16_t fields[12]; uint32_t reserved; } AmaterasuHdrMetadata;

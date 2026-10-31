@@ -100,3 +100,15 @@ _Static_assert(offsetof(AmaterasuControlMessage, sequence) == 32, "control seque
 _Static_assert(sizeof(AmaterasuControlTransportApi) == 48, "control API layout");
 _Static_assert(offsetof(AmaterasuControlTransportApi, send) == 32, "control send layout");
 _Static_assert(offsetof(AmaterasuControlTransportApi, receive) == 40, "control receive layout");
+#if UINTPTR_MAX == UINT64_MAX
+_Static_assert(sizeof(AmaterasuVideoFormatId) == 24, "video format ID layout");
+_Static_assert(sizeof(AmaterasuNegotiatedVideoUnit) == 176, "video unit layout");
+_Static_assert(offsetof(AmaterasuNegotiatedVideoUnit, clock) == 120, "video unit clock offset");
+_Static_assert(offsetof(AmaterasuNegotiatedVideoUnit, data) == 160, "video unit data offset");
+_Static_assert(sizeof(AmaterasuNegotiatedVideoApi) == 40, "video unit table layout");
+_Static_assert(sizeof(AmaterasuNegotiatedVideoTransportApi) == 48, "video transport table layout");
+_Static_assert(sizeof(AmaterasuVideoFramingApi) == 40, "video framing table layout");
+_Static_assert(sizeof(AmaterasuVideoFecBlock) == 16, "video FEC plan block layout");
+_Static_assert(sizeof(AmaterasuVideoFramingLimits) == 48, "video framing limits layout");
+_Static_assert(sizeof(AmaterasuVideoFramePlan) == 112, "video frame plan layout");
+#endif

@@ -19,6 +19,7 @@ pub mod service;
 pub mod state;
 pub mod transport;
 pub mod video;
+pub mod video_framing;
 pub mod virtual_display;
 pub mod virtual_display_service;
 pub use native::NativeBinding;

@@ -29,6 +29,7 @@ pub struct Stream {
     pub audio_local: SocketAddr,
     pub delivery: Delivery,
     video: VideoPacketizer,
+    planned_selection: Option<PlannedVideoSelection>,
     video_format_locked: bool,
     video_codec: Option<VideoCodec>,
     audio: AudioPacketizer,
@@ -43,6 +44,22 @@ pub struct Stream {
     pending_video: Option<PendingVideo>,
     next_frame_index: Option<u32>,
     pub discarded_audio_fec_shards: u64,
+}
+
+/// Trusted composition must prove the selected end-to-end path.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub struct PlannedVideoSelection {
+    pub stream: u64,
+    pub generation: u64,
+    pub offer_id: u64,
+    pub codec: EncoderFormatId,
+    pub framing: EncoderFormatId,
+    pub source_id: u64,
+    pub config_generation: u64,
+    pub clock_epoch: [u8; 16],
+    pub clock_origin_us: u64,
+    pub limits: VideoFramingLimits,
 }
 
 struct PendingVideo {
@@ -108,6 +125,7 @@ impl Stream {
             audio_local,
             delivery,
             video,
+            planned_selection: None,
             video_format_locked: false,
             video_codec,
             audio,
@@ -192,7 +210,11 @@ impl Stream {
         format: amaterasu_module_sdk::VideoStreamFormat,
     ) -> TransportResult<()> {
         validate_video_stream_format(format)?;
-        if self.video_sequence.is_some() || self.pending_video.is_some() || self.video_ended {
+        if self.planned_selection.is_some()
+            || self.video_sequence.is_some()
+            || self.pending_video.is_some()
+            || self.video_ended
+        {
             return Err("video_format_already_in_use");
         }
         let codec = match format.codec {
@@ -219,6 +241,9 @@ impl Stream {
     /// # Safety
     /// The packet and its initialized immutable bytes live through this call.
     pub unsafe fn submit_video(&mut self, packet: &EncodedPacket) -> Status {
+        if self.planned_selection.is_some() {
+            return MEDIA_UNSUPPORTED;
+        }
         if self.delivery.failure.is_some() {
             return MEDIA_BACKEND_ERROR;
         }
@@ -385,6 +410,141 @@ impl Stream {
         self.delivery.push_video(frame_index, datagrams);
         self.video_sequence = Some(sequence);
         self.video_timestamp = Some(timestamp_us);
+        self.next_frame_index = frame_index.checked_add(1);
+        STATUS_OK
+    }
+
+    /// Install a profile only after trusted composition verifies the complete chain.
+    #[allow(dead_code)]
+    pub fn configure_planned_video(
+        &mut self,
+        selection: PlannedVideoSelection,
+    ) -> TransportResult<()> {
+        let limits = selection.limits;
+        let expected_crypto = if self.video_sealer.is_some() {
+            VIDEO_PREFIX_BYTES as u32
+        } else {
+            0
+        };
+        let min_network = if self.peer.is_ipv6() { 48 } else { 28 };
+        if self.planned_selection.is_some()
+            || self.video_format_locked
+            || self.video_sequence.is_some()
+            || self.video_ended
+            || self.pending_video.is_some()
+            || selection.stream == 0
+            || selection.generation == 0
+            || selection.offer_id == 0
+            || selection.source_id == 0
+            || selection.config_generation == 0
+            || selection.clock_epoch == [0; 16]
+            || selection.clock_origin_us == 0
+            || limits.size as usize != size_of::<VideoFramingLimits>()
+            || limits.version != 1
+            || limits.packet_size as usize != self.video_settings.packet_size
+            || limits.crypto_overhead != expected_crypto
+            || limits.network_overhead < min_network
+            || limits.max_datagrams as usize > MAX_DATAGRAMS
+            || limits.max_queue_bytes as usize > MAX_QUEUE_BYTES
+            || limits.min_parity_shards < u32::from(self.video_settings.min_parity_shards)
+        {
+            return Err("invalid_planned_video_selection");
+        }
+        self.planned_selection = Some(selection);
+        Ok(())
+    }
+
+    /// Admit a unit and the result of the selected, authorized framer.
+    ///
+    /// # Safety
+    /// Caller binds the plan to this exact unit and selected framer. Unit and
+    /// plan buffers stay initialized and immutable until this call returns.
+    #[allow(dead_code)]
+    pub unsafe fn submit_planned_video(
+        &mut self,
+        unit: &NegotiatedVideoUnit,
+        plan: &VideoFramePlan,
+    ) -> Status {
+        if self.delivery.failure.is_some() {
+            return MEDIA_BACKEND_ERROR;
+        }
+        if !self.delivery.ready() {
+            return MEDIA_BUSY;
+        }
+        if self.video_ended {
+            return MEDIA_CLOSED;
+        }
+        let Some(selection) = self.planned_selection else {
+            return MEDIA_UNSUPPORTED;
+        };
+        if unit
+            .validate_for(
+                selection.stream,
+                selection.generation,
+                selection.offer_id,
+                selection.codec,
+                selection.framing,
+            )
+            .is_err()
+            || unit.source_id != selection.source_id
+            || unit.config_generation != selection.config_generation
+            || unit.clock.epoch_id != selection.clock_epoch
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        if unit.flags == VIDEO_UNIT_END_OF_STREAM {
+            self.video_ended = true;
+            return STATUS_OK;
+        }
+        if self
+            .video_sequence
+            .is_some_and(|previous| unit.access_unit_id <= previous)
+            || self
+                .video_timestamp
+                .is_some_and(|previous| unit.timestamp_us < previous)
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let Some(host_time) = selection.clock_origin_us.checked_add(unit.timestamp_us) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        let Some(frame_index) = self.next_frame_index else {
+            return self.fail("video_index_exhausted");
+        };
+        // SAFETY: caller guarantees immutable plan storage until the call returns.
+        let reservation = match unsafe { plan.validate(&selection.limits) } {
+            Ok(value) => value,
+            Err(_) => return STATUS_INVALID_ARGUMENT,
+        };
+        if !self.delivery.can_queue(
+            reservation.datagrams as usize,
+            reservation.queue_bytes as usize,
+        ) {
+            return MEDIA_BUSY;
+        }
+        let timestamp = (u128::from(unit.timestamp_us) * 90_000 / 1_000_000) as u32;
+        let latency = host_processing_latency_tenths_ms(host_time, host_monotonic_micros());
+        // SAFETY: caller guarantees plan storage remains live and immutable.
+        let datagrams = match unsafe {
+            self.video.packetize_external_plan(
+                plan,
+                &selection.limits,
+                unit.flags & VIDEO_UNIT_KEYFRAME != 0,
+                frame_index,
+                timestamp,
+                latency,
+            )
+        } {
+            Ok(value) => value,
+            Err(_) => return STATUS_INVALID_ARGUMENT,
+        };
+        let datagrams = match self.seal_video(frame_index, datagrams) {
+            Ok(value) => value,
+            Err(code) => return self.fail(code),
+        };
+        self.delivery.push_video(frame_index, datagrams);
+        self.video_sequence = Some(unit.access_unit_id);
+        self.video_timestamp = Some(unit.timestamp_us);
         self.next_frame_index = frame_index.checked_add(1);
         STATUS_OK
     }
@@ -583,5 +743,7 @@ fn ciphers(request: &Open) -> TransportResult<(Option<VideoSealer>, Option<Audio
     Ok((video_sealer, audio_sealer))
 }
 
+#[cfg(test)]
+mod planned_tests;
 #[cfg(test)]
 pub(crate) mod tests;

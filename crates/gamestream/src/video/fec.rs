@@ -109,6 +109,97 @@ pub(super) fn reservation(
 }
 
 impl VideoPacketizer {
+    /// Packetize an externally framed access unit using a bounded, independently
+    /// checked plan. Codec-specific framing is already selected by the session;
+    /// this method owns all GameStream headers, FEC and stream indices.
+    ///
+    /// # Safety
+    /// The plan byte buffers must remain initialized and immutable through this
+    /// call. The caller must independently authorize and match the selected codec,
+    /// framing, client features, session, unit and framing provider.
+    pub unsafe fn packetize_external_plan(
+        &mut self,
+        plan: &amaterasu_media::VideoFramePlan,
+        limits: &amaterasu_media::VideoFramingLimits,
+        keyframe: bool,
+        frame_index: u32,
+        timestamp: u32,
+        latency: u16,
+    ) -> Result<Vec<Vec<u8>>, VideoError> {
+        if limits.packet_size as usize != self.config.packet_size
+            || limits.min_parity_shards < u32::from(self.config.min_parity_shards)
+            || plan.block_count > u32::from(self.config.max_fec_blocks)
+        {
+            return Err(VideoError::InvalidPlan);
+        }
+        // SAFETY: caller guarantees plan buffer lifetime for this call.
+        let reservation = unsafe { plan.validate(limits) }.map_err(|_| VideoError::InvalidPlan)?;
+        // SAFETY: validation checked shape and caller guarantees the live buffers.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(plan.framed_bytes.ptr, plan.framed_bytes.len) };
+        let starts = if plan.record_starts.len == 0 {
+            &[]
+        } else {
+            // SAFETY: validation checked shape and caller guarantees the live buffer.
+            unsafe { std::slice::from_raw_parts(plan.record_starts.ptr, plan.record_starts.len) }
+        };
+        let total_bytes = bytes.len() + FRAME_BYTES;
+        let mut frame = Vec::with_capacity(total_bytes);
+        let mut header = short_frame_header(
+            keyframe,
+            ((total_bytes - 1) % self.payload_bytes + 1) as u16,
+            latency,
+        );
+        header[6..8].copy_from_slice(&(plan.critical_prefix_shards as u16).to_le_bytes());
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(bytes);
+        let mut packets = Vec::with_capacity(reservation.datagrams as usize);
+        let mut offset = 0usize;
+        let mut first_data = 0usize;
+        for (index, supplied) in plan.blocks[..plan.block_count as usize].iter().enumerate() {
+            let block = Block {
+                data_shards: supplied.data_shards as usize,
+                parity_shards: supplied.parity_shards as usize,
+                percentage: supplied.percentage as u8,
+            };
+            let first_stream_index =
+                self.stream_index.wrapping_add(packets.len() as u32) & STREAM_INDEX_MASK;
+            let block_bits = ((plan.block_count as usize - 1) << 6 | index << 4) as u8;
+            let mut shards = self.data_shards(
+                &frame,
+                &mut offset,
+                &block,
+                first_stream_index,
+                frame_index,
+                block_bits,
+            );
+            if !starts.is_empty() {
+                for (local, shard) in shards.iter_mut().enumerate() {
+                    if starts[first_data + local] != 0 {
+                        shard[25] |= 0x80;
+                    }
+                }
+            }
+            first_data += block.data_shards;
+            append_parity(&mut shards, block.parity_shards);
+            for (shard_index, shard) in shards.iter_mut().enumerate() {
+                stamp_transport_header(
+                    shard,
+                    first_stream_index.wrapping_add(shard_index as u32),
+                    frame_index,
+                    timestamp,
+                    block_bits,
+                    &block,
+                    shard_index,
+                );
+            }
+            packets.extend(shards);
+        }
+        self.stream_index =
+            self.stream_index.wrapping_add(packets.len() as u32) & STREAM_INDEX_MASK;
+        Ok(packets)
+    }
+
     pub(super) fn packetize_with_fec(
         &mut self,
         access_unit: &[u8],

@@ -403,7 +403,9 @@ name = "amaterasu-gamestream"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "amaterasu-abi",
  "amaterasu-contracts",
+ "amaterasu-media",
  "cbc",
  "ring",
  "serde",
@@ -582,6 +584,7 @@ dependencies = [
  "amaterasu-module-sdk",
  "amaterasu-network-policy",
  "amaterasu-network-sockets",
+ "amaterasu-runtime",
  "getrandom 0.3.4",
  "serde",
  "serde_json",

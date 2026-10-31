@@ -942,3 +942,134 @@ fn large_four_k_frame_does_not_fail_a_single_fec_block_stream() {
     );
     assert_eq!(stream.next_frame_index, Some(3));
 }
+
+#[test]
+fn planned_video_is_checked_before_actual_udp_delivery() {
+    use amaterasu_module_sdk::abi::BorrowedBytes;
+    let (video, audio) = receivers();
+    let mut request = request(&video, &audio, false);
+    request.video.fec_percentage = 0;
+    request.video.min_parity_shards = 0;
+    request.video.max_fec_blocks = 4;
+    let mut stream = Stream::open("owner", &request).unwrap();
+    let codec = EncoderFormatId {
+        namespace_id: 42,
+        value: 3,
+        schema: 1,
+    };
+    let framing = EncoderFormatId {
+        namespace_id: 42,
+        value: 4,
+        schema: 1,
+    };
+    let limits = VideoFramingLimits {
+        size: size_of::<VideoFramingLimits>() as u32,
+        version: 1,
+        packet_size: 1024,
+        crypto_overhead: 0,
+        network_overhead: 28,
+        allowed_extensions: 0,
+        max_datagrams: 64,
+        max_queue_bytes: 64 * 1024,
+        min_parity_shards: 0,
+        max_fec_percentage: 0,
+        max_wire_bytes: 64 * 1024,
+    };
+    let selection = PlannedVideoSelection {
+        stream: 5,
+        generation: 7,
+        offer_id: 9,
+        codec,
+        framing,
+        source_id: 6,
+        config_generation: 8,
+        clock_epoch: [1; 16],
+        clock_origin_us: host_monotonic_micros().max(1),
+        limits,
+    };
+    stream.configure_planned_video(selection).unwrap();
+    let bytes = [1, 2, 3, 4];
+    let unit = NegotiatedVideoUnit {
+        size: size_of::<NegotiatedVideoUnit>() as u32,
+        version: VIDEO_UNIT_VERSION,
+        stream: 5,
+        generation: 7,
+        offer_id: 9,
+        codec,
+        framing,
+        access_unit_id: 1,
+        submission_id: 1,
+        source_id: 6,
+        config_generation: 8,
+        timestamp_us: 0,
+        clock: FrameClockMetadata {
+            version: 1,
+            size: size_of::<FrameClockMetadata>() as u32,
+            domain: FRAME_CLOCK_STREAM_RELATIVE,
+            reserved: 0,
+            epoch_id: [1; 16],
+        },
+        flags: VIDEO_UNIT_KEYFRAME,
+        reserved: 0,
+        data: BorrowedBytes::new(&bytes),
+    };
+    let mut blocks = [VideoFecBlock::default(); VIDEO_FRAME_MAX_BLOCKS];
+    blocks[0] = VideoFecBlock {
+        first_data_shard: 0,
+        data_shards: 1,
+        parity_shards: 0,
+        percentage: 0,
+    };
+    let mut plan = VideoFramePlan {
+        size: size_of::<VideoFramePlan>() as u32,
+        version: 1,
+        framed_bytes: BorrowedBytes::new(&bytes),
+        record_starts: BorrowedBytes::new(&[]),
+        critical_prefix_shards: 0,
+        block_count: 1,
+        blocks,
+    };
+    let mut wrong = unit;
+    wrong.offer_id += 1;
+    assert_eq!(
+        unsafe { stream.submit_planned_video(&wrong, &plan) },
+        STATUS_INVALID_ARGUMENT
+    );
+    plan.blocks[0].first_data_shard = 1;
+    assert_eq!(
+        unsafe { stream.submit_planned_video(&unit, &plan) },
+        STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(stream.delivery.queued(), 0);
+    assert_eq!(stream.next_frame_index, Some(1));
+    plan.blocks[0].first_data_shard = 0;
+    assert_eq!(
+        unsafe { stream.submit_planned_video(&unit, &plan) },
+        STATUS_OK
+    );
+    assert_eq!(
+        unsafe { stream.submit_planned_video(&unit, &plan) },
+        STATUS_INVALID_ARGUMENT
+    );
+    stream.delivery.tick();
+    let packet = receive(&video);
+    assert_eq!(&packet[2..4], &[0, 0]);
+    assert_eq!(&packet[20..24], &1u32.to_le_bytes());
+    assert_eq!(&packet[40..44], &bytes);
+    assert_eq!(
+        unsafe { stream.submit_video(&video_packet(&bytes, 2)) },
+        MEDIA_UNSUPPORTED
+    );
+    stream
+        .delivery
+        .push_video(0, vec![vec![0; MAX_QUEUE_BYTES]]);
+    let mut next = unit;
+    next.access_unit_id = 2;
+    next.timestamp_us = 1;
+    assert_eq!(
+        unsafe { stream.submit_planned_video(&next, &plan) },
+        MEDIA_BUSY
+    );
+    assert_eq!(stream.next_frame_index, Some(2));
+    assert_eq!(stream.video_sequence, Some(1));
+}

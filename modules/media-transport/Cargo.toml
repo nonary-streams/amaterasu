@@ -17,6 +17,7 @@ serde_json.workspace = true
 getrandom = "0.3"
 
 [dev-dependencies]
+amaterasu-runtime = { path = "../../crates/runtime" }
 amaterasu-network-policy = { path = "../../crates/network-policy", features = ["test-support"] }
 
 amaterasu-network-sockets.workspace = true
