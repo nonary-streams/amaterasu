@@ -403,6 +403,53 @@ fn valid_root_provenance(journal: &Journal, root: &composition::StoredOutput) ->
         && composition::validate_callback_provenance(root, admission)
 }
 
+/// Resolve the latest authenticated stream-release readback for an exact root.
+/// This is called only from full validation or before dispatch. The direct owner
+/// completion verifier deliberately avoids this lookup to prevent proof cycles.
+pub(super) fn session_release_input(
+    journal: &Journal,
+    root: &composition::StoredOutput,
+) -> ModuleResult<amaterasu_extension_api::ResourceOutput> {
+    if !journal.composition.records().any(|record| record == root)
+        || !valid_root_provenance(journal, root)
+    {
+        return Err("session_root_provenance_invalid".into());
+    }
+    select_release_input(root, journal.composition.staged_outputs().rev(), |target| {
+        journal
+            .verified_released_output(target)
+            .map(|(_, output)| output.clone())
+    })
+}
+
+fn select_release_input<'a>(
+    root: &composition::StoredOutput,
+    stages: impl Iterator<Item = &'a composition::StagedOutputRefinement>,
+    released: impl Fn(&LifecycleTarget) -> Option<amaterasu_extension_api::ResourceOutput>,
+) -> ModuleResult<amaterasu_extension_api::ResourceOutput> {
+    let matching: Vec<_> = stages
+        .filter(|stage| {
+            stage.after.producer == root.output.producer
+                && stage.after.output_id == root.output.output_id
+                && stage.after.origin == root.output.origin
+        })
+        .collect();
+    if matching.iter().enumerate().any(|(index, stage)| {
+        matching[..index]
+            .iter()
+            .any(|old| old.target == stage.target)
+    }) {
+        return Err("session_release_stage_ambiguous".into());
+    }
+    let Some(stage) = matching.first() else {
+        return Ok(root.output.clone());
+    };
+    let output = released(&stage.target).ok_or("prior_stream_release_readback_missing")?;
+    amaterasu_extension_api::validate_output_refinement(&root.output, &output)
+        .map_err(|_| "session_release_readback_mismatch")?;
+    Ok(output)
+}
+
 fn validate_proof(journal: &Journal, proof: &SessionReleaseProof) -> bool {
     let Ok((_, session_id, None, _)) = operations::target_parts(&proof.target) else {
         return false;
@@ -425,6 +472,16 @@ fn validate_proof(journal: &Journal, proof: &SessionReleaseProof) -> bool {
                 _ => false,
             })
         && valid_owner_completion(journal, proof)
+        && journal
+            .composition
+            .records()
+            .find(|root| {
+                root.admission_id == proof.root_admission_id
+                    && root.output.origin == proof.target
+                    && root.output.producer == proof.provider
+            })
+            .and_then(|root| session_release_input(journal, root).ok())
+            .is_some_and(|input| proof.callback.request.dependency_inputs == [input])
 }
 
 fn valid_owner_completion(journal: &Journal, proof: &SessionReleaseProof) -> bool {
@@ -475,7 +532,7 @@ fn valid_owner_completion(journal: &Journal, proof: &SessionReleaseProof) -> boo
         && proof.callback.request.target == proof.target
         && proof.callback.request.transition_id == proof.transition_id
         && proof.callback.request.approved_plan.as_ref() == Some(&admission.plan)
-        && proof.callback.request.dependency_inputs == [root.output.clone()]
+        && matches!(proof.callback.request.dependency_inputs.as_slice(), [input] if amaterasu_extension_api::validate_output_refinement(&root.output, input).is_ok())
         && proof
             .callback
             .request
@@ -1634,11 +1691,8 @@ mod tests {
         let callback = &mut substituted.session_releases.proofs[0].callback;
         callback.request.dependency_inputs[0].data = json!({"substituted":true});
         callback.terminal.call.arguments = serde_json::to_value(&callback.request).unwrap();
-        assert!(!substituted.session_releases.has_valid_owner_completion(
-            &substituted,
-            &owner_work.target,
-            "owner"
-        ));
+        // Direct completion checks immutable root identity; full proof also
+        // resolves the exact latest authenticated readback and rejects this.
         assert!(!substituted.session_releases.validate(&substituted));
         let mut wrong_generation = journal.clone();
         let callback = &mut wrong_generation.session_releases.proofs[0].callback;
@@ -1697,6 +1751,60 @@ mod tests {
         let restored: Journal =
             serde_json::from_value(serde_json::to_value(journal).unwrap()).unwrap();
         assert!(restored.session_releases.validate(&restored));
+    }
+
+    #[test]
+    fn session_release_uses_newest_proven_readback_and_fences_missing() {
+        let (journal, _, _) = complete_fixture();
+        let root = journal.composition.records().next().unwrap().clone();
+        let stage = |id: &str, revision| {
+            let mut after = root.output.clone();
+            after.resource.revision = revision;
+            composition::StagedOutputRefinement {
+                target: LifecycleTarget::Stream {
+                    host_epoch: "epoch".into(),
+                    session_id: "session".into(),
+                    stream_id: id.into(),
+                    generation: 1,
+                },
+                parent_generation: 1,
+                prior_release_admission: None,
+                admission_id: format!("admission-{id}"),
+                transition_id: format!("transition-{id}"),
+                plan: root.plan.clone(),
+                before: root.output.clone(),
+                after,
+                callback_proof: root.callback_proof.clone().unwrap(),
+            }
+        };
+        let stages = [stage("old", 3), stage("new", 4)];
+        let mut released = root.output.clone();
+        released.resource.revision = 5;
+        let selected = select_release_input(&root, stages.iter().rev(), |target| {
+            (target == &stages[1].target).then(|| released.clone())
+        })
+        .unwrap();
+        assert_eq!(selected, released);
+        assert_eq!(
+            select_release_input(&root, stages.iter().rev(), |target| {
+                (target == &stages[0].target).then(|| root.output.clone())
+            })
+            .unwrap_err(),
+            "prior_stream_release_readback_missing"
+        );
+        let duplicate = [stages[1].clone(), stages[1].clone()];
+        assert_eq!(
+            select_release_input(&root, duplicate.iter(), |_| Some(released.clone())).unwrap_err(),
+            "session_release_stage_ambiguous"
+        );
+        let mut foreign = released;
+        foreign.resource.incarnation = "foreign".into();
+        assert_eq!(
+            select_release_input(&root, stages.iter().rev(), |_| Some(foreign.clone()))
+                .unwrap_err(),
+            "session_release_readback_mismatch"
+        );
+        assert_eq!(session_release_input(&journal, &root).unwrap(), root.output);
     }
 
     #[test]
