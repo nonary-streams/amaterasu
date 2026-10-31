@@ -11,7 +11,8 @@
 
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
-    fs, io,
+    fs::{self, File, OpenOptions},
+    io,
     path::{Path, PathBuf},
 };
 
@@ -25,6 +26,7 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub struct LifecycleStore {
     path: PathBuf,
     poisoned: bool,
+    _lock: File,
 }
 
 impl LifecycleStore {
@@ -46,9 +48,11 @@ impl LifecycleStore {
             ));
         }
         validate_parent(parent)?;
+        let lock = acquire_lock(&path)?;
         Ok(Self {
             path,
             poisoned: false,
+            _lock: lock,
         })
     }
 
@@ -90,6 +94,41 @@ impl LifecycleStore {
         }
         result
     }
+}
+
+fn acquire_lock(path: &Path) -> io::Result<File> {
+    let mut lock_name = path.file_name().expect("validated filename").to_os_string();
+    lock_name.push(".lock");
+    let lock_path = path.with_file_name(lock_name);
+    validate_file(&lock_path)?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&lock_path)?;
+    if !validate_file(&lock_path)? {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "journal lock disappeared",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file.metadata()?;
+        let current = fs::symlink_metadata(&lock_path)?;
+        if opened.dev() != current.dev() || opened.ino() != current.ino() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "journal lock changed",
+            ));
+        }
+    }
+    file.try_lock().map_err(io::Error::other)?;
+    Ok(file)
 }
 
 fn validate_parent(parent: &Path) -> io::Result<()> {
@@ -196,6 +235,8 @@ mod tests {
                 ..state
             })
             .unwrap();
+        assert!(LifecycleStore::new(path.clone()).is_err());
+        drop(store);
         let reopened = LifecycleStore::new(path.clone()).unwrap();
         assert_eq!(reopened.load::<State>().unwrap().unwrap().revision, 2);
         fs::write(&path, b"{").unwrap();
@@ -203,6 +244,7 @@ mod tests {
             reopened.load::<State>().unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+        drop(reopened);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -215,6 +257,7 @@ mod tests {
         assert!(store.replace(&1).is_err());
         fs::remove_dir(&path).unwrap();
         assert!(store.replace(&2).is_err());
+        drop(store);
         assert!(
             LifecycleStore::new(path)
                 .unwrap()
@@ -241,6 +284,30 @@ mod tests {
         assert!(store.replace(&2).is_err());
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_unsafe_lock_without_changing_it() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let root = test_dir();
+        let path = root.join("journal.json");
+        let lock = root.join("journal.json.lock");
+        let target = root.join("other");
+        fs::write(&target, b"keep").unwrap();
+        symlink(&target, &lock).unwrap();
+        assert!(LifecycleStore::new(path.clone()).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"keep");
+        fs::remove_file(&lock).unwrap();
+        fs::write(&lock, b"").unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(LifecycleStore::new(path).is_err());
+        assert_eq!(
+            fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
             0o640
         );
         fs::remove_dir_all(root).unwrap();
