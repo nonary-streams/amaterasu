@@ -873,7 +873,7 @@ impl Coordinator {
 
     /// Read-only proof of an already acknowledged exact tuple. It grants no
     /// mutation authority and does not require the original Work to be pending.
-    fn verify_historical_settlement(
+    pub(super) fn verify_historical_settlement(
         &self,
         caller: &str,
         tuple: &ResourceControlSettlementRequest,
@@ -1364,13 +1364,13 @@ mod tests {
         let session =
             json!({"kind":"session","host_epoch":epoch,"session_id":"session","generation":1});
         let target = json!({"kind":"stream","host_epoch":epoch,"session_id":"session","stream_id":"stream","generation":1});
-        let document = r#"{"$id":"example.schema/1","$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false}"#;
+        let document = r#"{"$id":"example.schema/1","$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"operation":{"type":"string"}},"additionalProperties":false}"#;
         let schema = json!({"id":"example.schema/1","major":1,"minor":0,"digest":format!("{:x}", Sha256::digest(document.as_bytes()))});
         let resource = json!({"provider":"owner","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":"domain","mutation_domains":["domain"]});
         let output = json!({"output_id":"out","capability":"display","schema":schema,"producer":"owner","producer_service":"owner/2","origin":session,"resource":resource,"domain_observations":[{"domain":"domain","revision":1,"borrowers":{},"complete":true}],"data":{}});
         let method = |name: &str| json!({"service":"owner/2","method":name,"interface_major":2,"interface_minor":0,"schema_revision":1});
         let approval = |name: &str| json!({"method":method(name),"broker_approval":{"provider":"owner","method":{"service":"owner/2","method":name,"interface_major":2,"interface_minor":0}}});
-        let proposal = json!({"proposal_id":"proposal","output_id":"out","owner_provider":"owner","owner_service":"owner/2","target":target,"resource":resource,"method":method("control"),"argument_schema":schema,"arguments":{},"access":"exclusive","mutation_domains":["domain"]});
+        let proposal = json!({"proposal_id":"proposal","output_id":"out","owner_provider":"owner","owner_service":"owner/2","target":target,"resource":resource,"method":method("control"),"argument_schema":schema,"arguments":{"operation":"configure"},"access":"exclusive","mutation_domains":["domain"]});
         let source_plan = json!({"plan_id":"source","revision":1,"resources":[{"provider":"owner","resource_id":"output","incarnation":"native","expected_revision":1,"execution_domain":"seat","mutation_domains":["domain"],"access":"read"}],"mutation_domains":[{"domain":"domain","expected_revision":1,"borrowers":{},"access":"read"}],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]});
         let participant = |name: &str| json!({"provider":name,"plan_method":method("plan"),"callback_method":method("callback"),"status_method":method("status"),"capabilities":[],"cleanup_methods":[],"settings_revision":"one","settings":{}});
         let source_request = json!({"version":2,"provider_sequence":1,"operation":"lifecycle_callback","transition_id":"source-transition","operation_id":"source-op","target":session,"resource_generation":7,"phase":"session.prepare","settings_revision":"one","settings":{},"intent":null,"reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector"]},"remaining_ms":1000,"plan_revision":1,"admission_id":"source","approved_plan":source_plan});
@@ -1441,6 +1441,91 @@ mod tests {
         envelope["operation"] = json!("verify_control_settlement");
         let valid = coordinator.verify_control_settlement("owner", envelope.clone());
         assert_eq!(valid["status"], "valid", "{valid}");
+        let mut installed_selection: crate::prepare_authority::ProviderSelection =
+            serde_json::from_value(selection("owner")).unwrap();
+        installed_selection.approvals.extend(
+            ["control", "status", "settle"]
+                .into_iter()
+                .map(|name| serde_json::from_value(approval(name)).unwrap()),
+        );
+        coordinator
+            .settings
+            .participants
+            .push(installed_selection.participant.clone());
+        coordinator
+            .selections
+            .insert("owner".into(), installed_selection);
+        let original: ResourceControlSettlementRequest =
+            serde_json::from_value(tuple.clone()).unwrap();
+        let request_digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&original.request).unwrap())
+        );
+        coordinator
+            .shared
+            .borrow_mut()
+            .value
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .resource_generations
+            .insert("owner".into(), 7);
+        let lookup = json!({"operation":"lookup_control_baseline", "session_target":session,
+            "resource_generation":7, "root_output":output, "operation_id":"effect",
+            "request_digest":request_digest});
+        let found = coordinator.lookup_control_baseline("owner", lookup.clone());
+        assert_eq!(found["status"], "valid", "{found}");
+        assert_eq!(
+            found["settlement"],
+            serde_json::to_value(&original).unwrap()
+        );
+        assert_eq!(
+            coordinator.lookup_control_baseline("other", lookup.clone())["status"],
+            "rejected"
+        );
+        let selected = coordinator.selections.remove("owner").unwrap();
+        assert_eq!(
+            coordinator.lookup_control_baseline("owner", lookup.clone())["status"],
+            "rejected"
+        );
+        let mut changed = selected.clone();
+        changed
+            .approvals
+            .retain(|entry| entry.method.method != "settle");
+        coordinator.selections.insert("owner".into(), changed);
+        assert_eq!(
+            coordinator.lookup_control_baseline("owner", lookup.clone())["status"],
+            "rejected"
+        );
+        coordinator.selections.insert("owner".into(), selected);
+        for (field, value) in [
+            ("resource_generation", json!(9)),
+            ("request_digest", json!("b".repeat(64))),
+            ("operation_id", json!("other")),
+        ] {
+            let mut mismatched = lookup.clone();
+            mismatched[field] = value;
+            assert_eq!(
+                coordinator.lookup_control_baseline("owner", mismatched)["status"],
+                "rejected"
+            );
+        }
+        let mut mismatched = lookup;
+        mismatched["root_output"]["resource"]["incarnation"] = json!("other");
+        assert_eq!(
+            coordinator.lookup_control_baseline("owner", mismatched)["status"],
+            "rejected"
+        );
+        coordinator
+            .shared
+            .borrow_mut()
+            .value
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .resource_generations
+            .insert("owner".into(), 8);
+        assert_eq!(coordinator.lookup_control_baseline("owner", json!({"operation":"lookup_control_baseline", "session_target":session, "resource_generation":7, "root_output":output, "operation_id":"effect", "request_digest":request_digest}))["status"], "rejected");
         assert_eq!(valid["root_output"], output);
         assert_eq!(valid["resource_generation"], 7);
         assert_eq!(

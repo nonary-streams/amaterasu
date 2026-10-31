@@ -23,6 +23,7 @@ mod composition_progress;
 #[allow(dead_code)] // Release remains gated until provider and proof hooks are wired.
 mod composition_release;
 mod control_backend;
+mod control_baseline;
 #[allow(dead_code)] // Control dispatch remains gated until coordinator sequencing is wired.
 mod control_dispatch;
 mod control_endpoints;
@@ -1139,6 +1140,9 @@ impl Coordinator {
             "describe_resource_control" | "verify_resource_control" | "validate_resource_control"
         ) {
             return self.control_operation(caller, payload);
+        }
+        if operation == "lookup_control_baseline" {
+            return self.lookup_control_baseline(caller, payload);
         }
         if operation == "verify_control_settlement" {
             return self.verify_control_settlement(caller, payload);
