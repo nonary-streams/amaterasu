@@ -31,6 +31,117 @@ impl AuthorityJournal for AuthorityWriter {
         save(&self.0, next)
     }
 }
+
+/// Commits a prepared output, obligations, participant progress and authority
+/// transition in one durable journal replacement.
+struct WorkFinishWriter {
+    shared: Shared,
+    key: String,
+    provider: String,
+    state: PrepareState,
+    settings: LifecycleSettings,
+    selections: BTreeMap<String, ProviderSelection>,
+}
+impl AuthorityJournal for WorkFinishWriter {
+    fn persist(&mut self, authority: &AuthorityState) -> ModuleResult<()> {
+        let mut next = self.shared.borrow().value.clone();
+        let work = next
+            .receipts
+            .get(&self.key)
+            .and_then(|receipt| receipt.work.clone())
+            .ok_or("unknown_transition")?;
+        composition::collect_verified_outputs(
+            &mut next,
+            &self.settings,
+            &self.selections,
+            &work,
+            &self.provider,
+            &self.state,
+        )?;
+        apply_participant(&mut next, &self.key, &self.provider, &self.state, true)?;
+        let admission_id = self
+            .state
+            .admission_id
+            .as_deref()
+            .ok_or("admission_missing")?;
+        if !authority.settled.contains_key(admission_id) {
+            return Err("output_admission_not_retained".into());
+        }
+        next.authority = authority.clone();
+        validate_journal(&next).map_err(|_| "invalid_composition_journal".to_owned())?;
+        save(&self.shared, next)
+    }
+}
+fn apply_participant(
+    next: &mut Journal,
+    key: &str,
+    provider: &str,
+    state: &PrepareState,
+    allow_composition: bool,
+) -> ModuleResult<()> {
+    let work = next
+        .receipts
+        .get_mut(key)
+        .and_then(|r| r.work.as_mut())
+        .ok_or("unknown_transition")?;
+    if let Some(ProviderResponse::Prepared {
+        candidate,
+        obligations,
+        outputs,
+    }) = &state.response
+    {
+        if (!allow_composition && (state.request.version != 1 || !outputs.is_empty()))
+            || (allow_composition && (state.request.version != 2 || outputs.len() != 1))
+        {
+            return Err("composition_response_not_supported".into());
+        }
+        if let Some(candidate) = candidate {
+            if work.candidate.as_ref().is_some_and(|old| old != candidate) {
+                return Err("participants_disagree_on_capture".into());
+            }
+            work.candidate = Some(candidate.clone());
+        }
+        let (_, id, _, _) = super::operations::target_parts(&work.target)?;
+        let session = next.sessions.get_mut(id).ok_or("unknown_session")?;
+        for obligation in obligations {
+            if let Some(old) = session
+                .obligations
+                .iter()
+                .find(|o| o.obligation_id == obligation.obligation_id)
+            {
+                if old != obligation {
+                    return Err("obligation_identity_conflict".into());
+                }
+            } else {
+                session.obligations.push(obligation.clone());
+            }
+        }
+    }
+    if matches!(
+        &state.response,
+        Some(ProviderResponse::Cleanup { outcomes }) if outcomes.iter().any(|outcome|
+            outcome.state == amaterasu_extension_api::CleanupState::DeferredRestoration)
+    ) {
+        // Runtime retirement is complete, but restoration still depends on
+        // this provider's prerequisites remaining available.
+        work.cleanup_blockers.insert(provider.into());
+    }
+    work.states.insert(provider.into(), state.clone());
+    work.index += 1;
+    for session in next.sessions.values_mut() {
+        session.admission_ids.retain(|id| {
+            next.authority.admissions.contains_key(id) || next.authority.settled.contains_key(id)
+        });
+        session
+            .admission_targets
+            .retain(|id, _| session.admission_ids.contains(id));
+        session
+            .admission_phases
+            .retain(|id, _| session.admission_ids.contains(id));
+    }
+    Ok(())
+}
+
 /// Atomically bind an admission to its exact target. Reusing an admission ID
 /// for a different session or generation is never an ownership transfer.
 fn record_admission(
@@ -376,6 +487,8 @@ impl Coordinator {
         for policy in &self.settings.control_policies {
             add_policy_method(&policy.owner_provider, &policy.owner_method)?;
             add_policy_method(&policy.owner_provider, &policy.status_method)?;
+            add_policy_method(&policy.owner_provider, &policy.settlement_method)?;
+            add_policy_method(&policy.owner_provider, &policy.settlement_status_method)?;
         }
         for policy in &self.settings.finalize_policies {
             add_policy_method(&policy.owner_provider, &policy.method)?;
@@ -425,6 +538,15 @@ impl Coordinator {
         &self,
         work: &Work,
     ) -> ModuleResult<CoordinatorPrepareAuthority<AuthorityWriter>> {
+        let selections = self.work_selections(work)?;
+        CoordinatorPrepareAuthority::new(
+            self.shared.borrow().value.authority.clone(),
+            selections,
+            AuthorityWriter(self.shared.clone()),
+        )
+    }
+
+    fn work_selections(&self, work: &Work) -> ModuleResult<Vec<ProviderSelection>> {
         let journal = &self.shared.borrow().value;
         let (_, session_id, _, _) = super::operations::target_parts(&work.target)?;
         let session = journal.sessions.get(session_id).ok_or("unknown_session")?;
@@ -459,11 +581,7 @@ impl Coordinator {
                     .map(|(id, _)| id.clone()),
             );
         }
-        CoordinatorPrepareAuthority::new(
-            journal.authority.clone(),
-            selections,
-            AuthorityWriter(self.shared.clone()),
-        )
+        Ok(selections)
     }
 
     pub(super) fn advance_work(
@@ -671,6 +789,53 @@ impl Coordinator {
                 state.phase,
                 PreparePhase::Prepared | PreparePhase::CleanupSettled
             ) {
+                if let Some(ProviderResponse::Prepared { outputs, .. }) = &state.response
+                    && !outputs.is_empty()
+                {
+                    // The current authority supports one materialized output per
+                    // admission. Never partially publish a multi-output result.
+                    if outputs.len() != 1 {
+                        self.fail_work(&key, "multiple_outputs_not_supported")?;
+                        self.drivers.remove(&runtime_key);
+                        continue;
+                    }
+                    let output = &outputs[0];
+                    let resource = crate::planning::ResourceRef {
+                        provider: output.resource.provider.clone(),
+                        resource_id: output.resource.resource_id.clone(),
+                        incarnation: output.resource.incarnation.clone(),
+                        revision: output.resource.revision,
+                        execution_domain: output.resource.execution_domain.clone(),
+                        mutation_domains: output
+                            .resource
+                            .mutation_domains
+                            .iter()
+                            .cloned()
+                            .chain(output.resource.mutation_domain.iter().cloned())
+                            .collect(),
+                    };
+                    let writer = WorkFinishWriter {
+                        shared: self.shared.clone(),
+                        key: key.clone(),
+                        provider: provider.clone(),
+                        state: state.clone(),
+                        settings: self.settings.clone(),
+                        selections: self.selections.clone(),
+                    };
+                    let mut finish = CoordinatorPrepareAuthority::new(
+                        self.shared.borrow().value.authority.clone(),
+                        self.work_selections(&work)?,
+                        writer,
+                    )?;
+                    let admission = state.admission_id.as_deref().ok_or("admission_missing")?;
+                    if let Err(reason) =
+                        finish.finish_admission_with_output(provider, admission, resource)
+                    {
+                        self.fail_work(&key, &reason)?;
+                    }
+                    self.drivers.remove(&runtime_key);
+                    continue;
+                }
                 let fully_released = match &state.response {
                     Some(ProviderResponse::Cleanup { outcomes }) => outcomes
                         .iter()
@@ -989,65 +1154,7 @@ impl Coordinator {
         state: &PrepareState,
     ) -> ModuleResult<()> {
         let mut next = self.shared.borrow().value.clone();
-        let work = next
-            .receipts
-            .get_mut(key)
-            .and_then(|r| r.work.as_mut())
-            .ok_or("unknown_transition")?;
-        if let Some(ProviderResponse::Prepared {
-            candidate,
-            obligations,
-            outputs,
-        }) = &state.response
-        {
-            if state.request.version != 1 || !outputs.is_empty() {
-                return Err("composition_response_not_supported".into());
-            }
-            if let Some(candidate) = candidate {
-                if work.candidate.as_ref().is_some_and(|old| old != candidate) {
-                    return Err("participants_disagree_on_capture".into());
-                }
-                work.candidate = Some(candidate.clone());
-            }
-            let (_, id, _, _) = super::operations::target_parts(&work.target)?;
-            let session = next.sessions.get_mut(id).ok_or("unknown_session")?;
-            for obligation in obligations {
-                if let Some(old) = session
-                    .obligations
-                    .iter()
-                    .find(|o| o.obligation_id == obligation.obligation_id)
-                {
-                    if old != obligation {
-                        return Err("obligation_identity_conflict".into());
-                    }
-                } else {
-                    session.obligations.push(obligation.clone());
-                }
-            }
-        }
-        if matches!(
-            &state.response,
-            Some(ProviderResponse::Cleanup { outcomes }) if outcomes.iter().any(|outcome|
-                outcome.state == amaterasu_extension_api::CleanupState::DeferredRestoration)
-        ) {
-            // Runtime retirement is complete, but restoration still depends on
-            // this provider's prerequisites remaining available.
-            work.cleanup_blockers.insert(provider.into());
-        }
-        work.states.insert(provider.into(), state.clone());
-        work.index += 1;
-        for session in next.sessions.values_mut() {
-            session.admission_ids.retain(|id| {
-                next.authority.admissions.contains_key(id)
-                    || next.authority.settled.contains_key(id)
-            });
-            session
-                .admission_targets
-                .retain(|id, _| session.admission_ids.contains(id));
-            session
-                .admission_phases
-                .retain(|id, _| session.admission_ids.contains(id));
-        }
+        apply_participant(&mut next, key, provider, state, false)?;
         save(&self.shared, next)
     }
 
@@ -1684,3 +1791,147 @@ mod dependency_cleanup_tests {
 #[cfg(test)]
 #[path = "cleanup_dispatch_tests.rs"]
 mod cleanup_dispatch_tests;
+
+#[cfg(test)]
+mod output_finish_tests {
+    use super::*;
+    use sha2::{Digest, Sha256};
+
+    fn exercise_output_finish(mode: u8) {
+        let dir =
+            std::env::temp_dir().join(format!("lifecycle-output-finish-{}", identifier().unwrap()));
+        std::fs::create_dir(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let coordinator = Coordinator::open(&dir.join("journal.json")).unwrap();
+        let epoch = coordinator.shared.borrow().value.host_epoch.clone();
+        let target =
+            json!({"kind":"session","host_epoch":epoch,"session_id":"session","generation":1});
+        let method = json!({"service":"screen/2","method":"callback","interface_major":2,"interface_minor":1,"schema_revision":1});
+        let participant: crate::adapter::ParticipantSettings = serde_json::from_value(json!({"provider":"screen","depends_on":[],"plan_method":method,"callback_method":method,"status_method":method,"capabilities":[],"cleanup_methods":[],"settings_revision":"revision","settings":{}})).unwrap();
+        let approval: MethodApproval = serde_json::from_value(
+            json!({"method":method,"broker_approval":{"provider":"screen","method":method}}),
+        )
+        .unwrap();
+        let selected = ProviderSelection {
+            participant: participant.clone(),
+            approvals: vec![approval],
+            capabilities: Default::default(),
+            cleanup_methods: vec![],
+            authorized_borrowers: Default::default(),
+        };
+        let document = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"output/1","type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]}"#;
+        let schema = json!({"id":"output/1","major":1,"minor":0,"digest":format!("{:x}",Sha256::digest(document.as_bytes()))});
+        let plan = json!({"plan_id":"plan","revision":1,"resources":[{"provider":"screen","resource_id":"output","incarnation":"native","expected_revision":1,"execution_domain":"seat","mutation_domains":[],"access":"read"}],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]});
+        let output = json!({"output_id":"screen-output","capability":"screen/output","schema":schema,"producer":"screen","producer_service":"screen/2","origin":target,"resource":{"provider":"screen","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":null,"mutation_domains":[]},"data":{"ok":if mode == 2 { json!("bad") } else { json!(true) }}});
+        let request = json!({"provider_sequence":1,"operation":"lifecycle_callback","version":2,"transition_id":"transition","operation_id":"callback","target":target,"phase":"session.prepare","settings_revision":"revision","settings":{},"intent":null,"reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector/1"]},"remaining_ms":1000,"plan_revision":1,"admission_id":"admission","approved_plan":plan});
+        let state: PrepareState = serde_json::from_value(json!({"provider":"screen","participant":participant,"request":request,"phase":"prepared","plan":plan,"admission_id":"admission","pending_receipt":null,"status_polls":0,"last_sequence":1,"dispatch":null,"response":{"status":"prepared","candidate":null,"obligations":[],"outputs":[output]}})).unwrap();
+        let mut settings = LifecycleSettings::default();
+        settings
+            .schema_documents
+            .push(serde_json::from_value(json!({"reference":schema,"document":document})).unwrap());
+        settings.finalize_policies.push(serde_json::from_value(json!({"owner_provider":"screen","owner_service":"screen/2","method":method,"status_method":method,"output_capability":"screen/output","output_schema":schema,"capture_provider":"capture","selector_schema":"selector/1","required_access":"read","mutation_domains":[]})).unwrap());
+        let mut next = coordinator.shared.borrow().value.clone();
+        let mut session: SessionRecord = serde_json::from_value(json!({"host_epoch":epoch,"id":"session","generation":1,"phase":"preparing","owner":{"caller":"transport","initiator":"client"},"delegates":[],"application_ref":null,"settings_revision":"revision","application_retired":false,"streams":{},"admission_ids":["admission"],"admission_targets":{"admission":target},"admission_phases":{"admission":"session.prepare"}})).unwrap();
+        session.provider_graph = Some(
+            serde_json::from_value(json!({"order":["screen"],"dependencies":{"screen":[]}}))
+                .unwrap(),
+        );
+        next.sessions.insert("session".into(), session);
+        next.admission_transitions
+            .insert("admission".into(), "transition".into());
+        let admission = crate::prepare_authority::Admission {
+            provider: "screen".into(),
+            selection: selected.clone(),
+            plan: serde_json::from_value(plan).unwrap(),
+            rights: vec![],
+        };
+        next.authority
+            .admissions
+            .insert("admission".into(), admission.clone());
+        let work: Work = serde_json::from_value(json!({"phase":"session.prepare","target":target,"intent":null,"reason":null,"video":null,"transition_id":"transition","providers":["screen"],"provider_graph":{"order":["screen"],"dependencies":{"screen":[]}},"index":0,"states":{"screen":state},"candidate":null,"waiting_retirement":false})).unwrap();
+        let key = receipt_key("transport", "client", "operation");
+        next.receipts.insert(
+            key.clone(),
+            Receipt {
+                caller: "transport".into(),
+                initiator: "client".into(),
+                request: json!({"operation_id":"operation"}),
+                response: json!({"operation_id":"operation","status":"pending"}),
+                work: Some(work),
+                wait_target: None,
+            },
+        );
+        save(&coordinator.shared, next.clone()).unwrap();
+        let mut resulting_authority = next.authority.clone();
+        resulting_authority.admissions.remove("admission");
+        resulting_authority
+            .settled
+            .insert("admission".into(), admission);
+        resulting_authority
+            .output_admissions
+            .insert("admission".into());
+        let mut writer = WorkFinishWriter {
+            shared: coordinator.shared.clone(),
+            key: key.clone(),
+            provider: "screen".into(),
+            state,
+            settings,
+            selections: [("screen".into(), selected)].into(),
+        };
+        if mode == 1 {
+            let before = std::fs::read(dir.join("journal.json")).unwrap();
+            let moved = dir.with_extension("moved");
+            std::fs::rename(&dir, &moved).unwrap();
+            assert!(writer.persist(&resulting_authority).is_err());
+            assert_eq!(std::fs::read(moved.join("journal.json")).unwrap(), before);
+            assert_eq!(
+                coordinator.shared.borrow().value.receipts[&key]
+                    .work
+                    .as_ref()
+                    .unwrap()
+                    .index,
+                0
+            );
+            std::fs::rename(&moved, &dir).unwrap();
+        } else if mode == 2 {
+            let before = std::fs::read(dir.join("journal.json")).unwrap();
+            assert!(writer.persist(&resulting_authority).is_err());
+            assert_eq!(std::fs::read(dir.join("journal.json")).unwrap(), before);
+            assert_eq!(
+                coordinator.shared.borrow().value.receipts[&key]
+                    .work
+                    .as_ref()
+                    .unwrap()
+                    .index,
+                0
+            );
+        } else {
+            writer.persist(&resulting_authority).unwrap();
+            let journal = &coordinator.shared.borrow().value;
+            assert_eq!(journal.receipts[&key].work.as_ref().unwrap().index, 1);
+            assert!(journal.authority.settled.contains_key("admission"));
+            assert!(journal.authority.output_admissions.contains("admission"));
+            assert_eq!(journal.composition.records().count(), 1);
+        }
+        drop(writer);
+        drop(coordinator);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn output_and_progress_commit_together() {
+        exercise_output_finish(0);
+    }
+    #[test]
+    fn failed_save_publishes_neither_output_nor_progress() {
+        exercise_output_finish(1);
+    }
+    #[test]
+    fn invalid_schema_publishes_neither_output_nor_progress() {
+        exercise_output_finish(2);
+    }
+}

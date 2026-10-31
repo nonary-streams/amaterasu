@@ -62,6 +62,8 @@ pub struct CompositionSelectionSnapshot {
     pub finalize_policy: FinalizePolicy,
     pub control_approval: MethodApproval,
     pub control_status_approval: MethodApproval,
+    pub settlement_approval: MethodApproval,
+    pub settlement_status_approval: MethodApproval,
     pub finalize_approval: MethodApproval,
     pub finalize_status_approval: MethodApproval,
     pub schema_documents: Vec<SchemaDocument>,
@@ -100,6 +102,16 @@ impl CompositionSelectionSnapshot {
                 &self.control_status_approval,
                 &policy.owner_provider,
                 &policy.status_method,
+            )
+            || !approval_matches(
+                &self.settlement_approval,
+                &policy.owner_provider,
+                &policy.settlement_method,
+            )
+            || !approval_matches(
+                &self.settlement_status_approval,
+                &policy.owner_provider,
+                &policy.settlement_status_method,
             )
             || !approval_matches(
                 &self.finalize_status_approval,
@@ -515,6 +527,142 @@ fn same_selection(a: &CompositionSelectionSnapshot, b: &CompositionSelectionSnap
         && a.control_policy.dependent_provider == b.control_policy.dependent_provider
         && same_key(&a.input.output, &b.input.output)
 }
+
+/// Collect only an authenticated driver's completed v2 callback. The caller
+/// owns the coordinator journal lock and persists the resulting journal in the
+/// same transaction as the participant's obligations and progress. This does
+/// not activate v2 dispatch, finalization, or downstream execution.
+pub(super) fn collect_verified_outputs(
+    journal: &mut super::Journal,
+    settings: &crate::adapter::LifecycleSettings,
+    selections: &std::collections::BTreeMap<String, crate::prepare_authority::ProviderSelection>,
+    work: &super::Work,
+    provider: &str,
+    state: &crate::prepare_driver::PrepareState,
+) -> Result<(), String> {
+    use crate::prepare_driver::PreparePhase;
+    use amaterasu_extension_api::{
+        COMPOSITION_VERSION, LifecyclePhase, ProviderOperation, ProviderResponse,
+    };
+    let response = state.response.as_ref().ok_or("provider_response_missing")?;
+    let ProviderResponse::Prepared { outputs, .. } = response else {
+        return Err("provider_response_invalid".into());
+    };
+    if state.phase != PreparePhase::Prepared
+        || state.provider != provider
+        || state.request.version != COMPOSITION_VERSION
+        || state.request.operation != ProviderOperation::LifecycleCallback
+        || !matches!(
+            work.phase,
+            LifecyclePhase::SessionPrepare | LifecyclePhase::StreamPrepare
+        )
+        || state.request.phase != work.phase
+        || state.request.target != work.target
+        || state.request.transition_id != work.transition_id
+        || state.request.admission_id != state.admission_id
+    {
+        return Err("provider_output_context_invalid".into());
+    }
+    amaterasu_extension_api::validate_provider_response(&state.request, response)?;
+    let persisted = journal.receipts.values().any(|receipt| {
+        receipt.work.as_ref().is_some_and(|saved| {
+            saved.target == work.target
+                && saved.transition_id == work.transition_id
+                && saved.states.get(provider).is_some_and(|saved_state| {
+                    serde_json::to_value(saved_state).ok() == serde_json::to_value(state).ok()
+                })
+        })
+    });
+    if !persisted {
+        return Err("provider_result_not_journaled".into());
+    }
+    let selected = selections.get(provider).ok_or("provider_not_selected")?;
+    if selected.participant.provider != provider
+        || state.participant.provider != provider
+        || selected.participant.callback_method != state.participant.callback_method
+        || !selected.approvals.iter().any(|entry| {
+            entry.method == state.participant.callback_method && approval_is_valid(entry, provider)
+        })
+    {
+        return Err("provider_approval_mismatch".into());
+    }
+    let admission_id = state.admission_id.as_deref().ok_or("admission_missing")?;
+    let admission = journal
+        .authority
+        .admissions
+        .get(admission_id)
+        .or_else(|| journal.authority.settled.get(admission_id))
+        .ok_or("admission_missing")?;
+    let plan = state.plan.as_ref().ok_or("plan_missing")?;
+    if admission.provider != provider
+        || &admission.plan != plan
+        || state.request.approved_plan.as_ref() != Some(plan)
+        || journal
+            .admission_transitions
+            .get(admission_id)
+            .map(String::as_str)
+            != Some(work.transition_id.as_str())
+    {
+        return Err("admission_provenance_mismatch".into());
+    }
+    let (_, session_id, _, _) = super::operations::target_parts(&work.target)?;
+    let session = journal.sessions.get(session_id).ok_or("unknown_session")?;
+    if session.admission_targets.get(admission_id) != Some(&work.target)
+        || session.admission_phases.get(admission_id) != Some(&work.phase)
+    {
+        return Err("admission_target_mismatch".into());
+    }
+    let graph = work
+        .provider_graph
+        .as_ref()
+        .ok_or("provider_graph_missing")?;
+    if !graph.order.iter().any(|id| id == provider) {
+        return Err("provider_graph_mismatch".into());
+    }
+    let catalog = settings.schema_catalog()?;
+    let mut next = journal.composition.clone();
+    for output in outputs {
+        let control_selected = settings.control_policies.iter().any(|policy| {
+            policy.owner_provider == provider
+                && policy.owner_service == output.producer_service
+                && policy.output_capability == output.capability
+                && policy.output_schema == output.schema
+                && graph
+                    .dependencies
+                    .get(&policy.dependent_provider)
+                    .is_some_and(|deps| deps.iter().any(|id| id == provider))
+        });
+        let finalize_selected = settings.finalize_policies.iter().any(|policy| {
+            policy.owner_provider == provider
+                && policy.owner_service == output.producer_service
+                && policy.output_capability == output.capability
+                && policy.output_schema == output.schema
+        });
+        if !control_selected && !finalize_selected {
+            return Err("output_not_selected".into());
+        }
+        let output_selection = OutputSelection {
+            producer: provider.into(),
+            service: output.producer_service.clone(),
+            capability: output.capability.clone(),
+            schema: output.schema.clone(),
+        };
+        let record = StoredOutput {
+            output: output.clone(),
+            admission_id: admission_id.into(),
+            transition_id: work.transition_id.clone(),
+            plan: plan.clone(),
+            state: OutputState::Retained,
+        };
+        next.record(record, &output_selection, &work.target, &|value| {
+            amaterasu_extension_api::validate_resource_output(value).is_ok()
+                && catalog.validate(&value.schema, &value.data).is_ok()
+        })
+        .map_err(str::to_owned)?;
+    }
+    journal.composition = next;
+    Ok(())
+}
 fn valid_text(value: &str) -> bool {
     !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
 }
@@ -548,6 +696,7 @@ fn valid_stored(item: &StoredOutput) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         || output.resource.provider != output.producer
         || !output.data.is_object()
+        || amaterasu_extension_api::validate_resource_output(output).is_err()
         || !serde_json::to_vec(output).is_ok_and(|v| v.len() <= MAX_BYTES)
         || amaterasu_extension_api::validate_resource_plan(&item.plan).is_err()
     {
@@ -654,7 +803,7 @@ mod tests {
         }
     }
     fn output() -> ResourceOutput {
-        serde_json::from_value(json!({"output_id":"output", "capability":"screen", "schema":{"id":"screen/1","major":1,"minor":0,"digest":"a".repeat(64)}, "producer":"screen", "producer_service":"screen/1", "origin":target(), "resource":{"provider":"screen","resource_id":"display","incarnation":"native","revision":2,"execution_domain":"seat","mutation_domain":null,"mutation_domains":[]},"data":{"desired":true,"observed":false}})).unwrap()
+        serde_json::from_value(json!({"output_id":"output", "capability":"screen", "schema":{"id":"screen/2","major":1,"minor":0,"digest":"a".repeat(64)}, "producer":"screen", "producer_service":"screen/2", "origin":target(), "resource":{"provider":"screen","resource_id":"display","incarnation":"native","revision":2,"execution_domain":"seat","mutation_domain":null,"mutation_domains":[]},"data":{"desired":true,"observed":false}})).unwrap()
     }
     fn record() -> StoredOutput {
         let plan: ResourcePlan = serde_json::from_value(json!({"plan_id":"plan", "revision":1, "resources":[{"provider":"screen","resource_id":"display","incarnation":null,"expected_revision":1,"execution_domain":"seat","mutation_domains":[],"access":"exclusive"}],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]})).unwrap();
@@ -753,20 +902,20 @@ mod tests {
     #[test]
     fn selection_pins_output_schemas_and_broker_approvals() {
         use sha2::{Digest, Sha256};
-        let document = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"screen/1","type":"object"}"#;
+        let document = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"screen/2","type":"object"}"#;
         let mut stored = record();
         stored.output.schema.digest = format!("{:x}", Sha256::digest(document.as_bytes()));
         let schema = stored.output.schema.clone();
-        let method = json!({"service":"screen/1","method":"control","interface_major":1,"interface_minor":0,"schema_revision":1});
-        let status = json!({"service":"screen/1","method":"status","interface_major":1,"interface_minor":0,"schema_revision":1});
+        let method = json!({"service":"screen/2","method":"control","interface_major":1,"interface_minor":0,"schema_revision":1});
+        let status = json!({"service":"screen/2","method":"status","interface_major":1,"interface_minor":0,"schema_revision":1});
         let approval = |m: &Value| {
             serde_json::from_value::<MethodApproval>(
                 json!({"method":m,"broker_approval":{"provider":"screen","method":m}}),
             )
             .unwrap()
         };
-        let policy: ControlPolicy = serde_json::from_value(json!({"dependent_provider":"settings","owner_provider":"screen","owner_service":"screen/1","owner_method":method,"status_method":status,"argument_schema":schema,"output_capability":"screen","output_schema":schema,"max_access":"exclusive","mutation_domains":[]})).unwrap();
-        let finalize: FinalizePolicy = serde_json::from_value(json!({"owner_provider":"screen","owner_service":"screen/1","method":method,"status_method":status,"output_capability":"screen","output_schema":schema,"capture_provider":"capture","selector_schema":"selector/1","required_access":"exclusive","mutation_domains":[]})).unwrap();
+        let policy: ControlPolicy = serde_json::from_value(json!({"dependent_provider":"settings","owner_provider":"screen","owner_service":"screen/2","owner_method":method,"status_method":status,"settlement_method":method,"settlement_status_method":status,"argument_schema":schema,"output_capability":"screen","output_schema":schema,"max_access":"exclusive","mutation_domains":[]})).unwrap();
+        let finalize: FinalizePolicy = serde_json::from_value(json!({"owner_provider":"screen","owner_service":"screen/2","method":method,"status_method":status,"output_capability":"screen","output_schema":schema,"capture_provider":"capture","selector_schema":"selector/1","required_access":"exclusive","mutation_domains":[]})).unwrap();
         let snapshot = CompositionSelectionSnapshot {
             target: target(),
             transition_id: "consumer-transition".into(),
@@ -775,6 +924,8 @@ mod tests {
             finalize_policy: finalize,
             control_approval: approval(&method),
             control_status_approval: approval(&status),
+            settlement_approval: approval(&method),
+            settlement_status_approval: approval(&status),
             finalize_approval: approval(&method),
             finalize_status_approval: approval(&status),
             schema_documents: vec![SchemaDocument {
@@ -824,7 +975,7 @@ mod tests {
     fn refinement_keeps_original_obligation_and_rejects_foreign_native_resource() {
         let original: ResourceObligation = serde_json::from_value(json!({"obligation_id":"restore","provider":"settings","resource_id":"display","mutation_domain":null,"depends_on":[],"cleanup_method":{"service":"settings/1","method":"restore","interface_major":1,"interface_minor":0,"schema_revision":1},"payload":{"output_id":"output"}})).unwrap();
         let input = output();
-        let request: ResourceControlRequest = serde_json::from_value(json!({"version":1,"transition_id":"transition","operation_id":"operation","provider_sequence":1,"target":target(),"proposal":{"proposal_id":"proposal","output_id":"output","owner_provider":"screen","owner_service":"screen/1","target":target(),"resource":input.resource,"method":{"service":"screen/1","method":"control","interface_major":1,"interface_minor":0,"schema_revision":1},"argument_schema":input.schema,"arguments":{},"access":"exclusive","mutation_domains":[]},"admission_id":"admission","permit_id":"permit","remaining_ms":1000})).unwrap();
+        let request: ResourceControlRequest = serde_json::from_value(json!({"version":1,"transition_id":"transition","operation_id":"operation","provider_sequence":1,"target":target(),"proposal":{"proposal_id":"proposal","output_id":"output","owner_provider":"screen","owner_service":"screen/2","target":target(),"resource":input.resource,"method":{"service":"screen/2","method":"control","interface_major":1,"interface_minor":0,"schema_revision":1},"argument_schema":input.schema,"arguments":{},"access":"exclusive","mutation_domains":[]},"admission_id":"admission","permit_id":"permit","remaining_ms":1000})).unwrap();
         let item = ObligationRefinement {
             request,
             original: original.clone(),
