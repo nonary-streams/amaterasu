@@ -18,6 +18,7 @@ fn selection() -> ProviderSelection {
         approvals,
         capabilities: BTreeSet::new(),
         authorized_borrowers: BTreeSet::new(),
+        approved_control_bindings: Vec::new(),
     }
 }
 

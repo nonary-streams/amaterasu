@@ -1439,6 +1439,7 @@ mod tests {
             capabilities: Default::default(),
             cleanup_methods: vec![],
             authorized_borrowers: Default::default(),
+            approved_control_bindings: Vec::new(),
         };
         coordinator.settings.participants.push(participant);
         coordinator.selections.insert("display".into(), selected);
@@ -1777,6 +1778,7 @@ mod tests {
             capabilities: Default::default(),
             cleanup_methods: vec![],
             authorized_borrowers: Default::default(),
+            approved_control_bindings: Vec::new(),
         };
         let session_target = amaterasu_extension_api::LifecycleTarget::Session {
             host_epoch: epoch.clone(),

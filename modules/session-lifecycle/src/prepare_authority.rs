@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::adapter::{MethodSettings, ParticipantSettings};
-use crate::plan_validation::{AdmissionContext, validate_effect_plan};
+use crate::plan_validation::{AdmissionContext, ApprovedControlBinding, validate_effect_plan};
 use crate::planning::{Access, DomainState, PlanningSnapshot, ResourceRef};
 use crate::prepare_driver::PrepareAuthority;
 use crate::provider_dispatch::ProviderCall;
@@ -33,6 +33,8 @@ pub struct ProviderSelection {
     pub capabilities: BTreeSet<String>,
     pub cleanup_methods: Vec<MethodRef>,
     pub authorized_borrowers: BTreeSet<String>,
+    #[serde(default)]
+    pub approved_control_bindings: Vec<ApprovedControlBinding>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -715,7 +717,7 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
             validate_selection(&admission.selection)?;
             let context = AdmissionContext {
                 provider: &admission.provider,
-                approved_control_bindings: &[],
+                approved_control_bindings: &admission.selection.approved_control_bindings,
                 snapshot: &state.snapshot,
                 complete: true,
                 approved_capabilities: &admission.selection.capabilities,
@@ -1929,7 +1931,7 @@ impl<J: AuthorityJournal> PrepareAuthority for CoordinatorPrepareAuthority<J> {
         }
         let context = AdmissionContext {
             provider: &participant.provider,
-            approved_control_bindings: &[],
+            approved_control_bindings: &selection.approved_control_bindings,
             snapshot: &next.snapshot,
             complete: true,
             approved_capabilities: &selection.capabilities,
@@ -1983,7 +1985,7 @@ impl<J: AuthorityJournal> PrepareAuthority for CoordinatorPrepareAuthority<J> {
         }
         let context = AdmissionContext {
             provider: &participant.provider,
-            approved_control_bindings: &[],
+            approved_control_bindings: &selection.approved_control_bindings,
             snapshot: &self.state.snapshot,
             complete: true,
             approved_capabilities: &selection.capabilities,
@@ -2058,6 +2060,7 @@ mod tests {
                 schema_revision: 2,
             }],
             authorized_borrowers: ["stream".into()].into(),
+            approved_control_bindings: Vec::new(),
         }
     }
     fn plan() -> ResourcePlan {
@@ -2157,7 +2160,6 @@ mod tests {
         selected.participant.depends_on.push("owner".into());
         let mut plan = plan();
         plan.resources[0].provider = "owner".into();
-        plan.obligations[0].provider = "owner".into();
         let target =
             json!({"kind":"session", "host_epoch":"host", "session_id":"session", "generation":1});
         let schema = json!({"id":"schema", "major":1, "minor":0, "digest":"a".repeat(64)});
@@ -2171,6 +2173,13 @@ mod tests {
             "output":{"output_id":"output-id", "capability":"display", "schema":schema, "producer":"owner", "producer_service":"display/2", "origin":target, "resource":resource, "domain_observations":[{"domain":"topology","revision":4,"borrowers":{"stream":1},"complete":true}], "data":{}},
             "target":target, "transition_id":"transition", "parent_generation":null
         })).unwrap();
+        selected
+            .approved_control_bindings
+            .push(ApprovedControlBinding {
+                policy: context.policy.clone(),
+                output: context.output.clone(),
+                target: context.target.clone(),
+            });
         let mut state = AuthorityState::default();
         state.sequences.insert("owner".into(), 1);
         state
@@ -2198,10 +2207,39 @@ mod tests {
             )]
             .into(),
         );
+        let mut unbound = selected.clone();
+        unbound.approved_control_bindings.clear();
+        let mut unbound_authority = CoordinatorPrepareAuthority::new(
+            state.clone(),
+            vec![unbound.clone()],
+            Journal::default(),
+        )
+        .unwrap();
+        assert!(
+            unbound_authority
+                .admit_plan(&unbound.participant, &plan)
+                .is_err()
+        );
         let mut authority =
             CoordinatorPrepareAuthority::new(state, vec![selected.clone()], Journal::default())
                 .unwrap();
         let id = authority.admit_plan(&selected.participant, &plan).unwrap();
+        let mut changed = selected.clone();
+        changed.approved_control_bindings[0]
+            .output
+            .resource
+            .revision += 1;
+        let mut changed_authority = CoordinatorPrepareAuthority::new(
+            authority.state.clone(),
+            vec![changed.clone()],
+            Journal::default(),
+        )
+        .unwrap();
+        assert!(
+            changed_authority
+                .validate_rights(&changed.participant, &plan, &id)
+                .is_err()
+        );
         let mut request: ResourceControlRequest = serde_json::from_value(json!({"version":2,"transition_id":"transition","operation_id":"operation","provider_sequence":1,"target":target,"proposal":proposal,"admission_id":id,"permit_id":"","remaining_ms":1000})).unwrap();
         let validate = |_: &SchemaRef, _: &Value| Ok(());
         context.policy.domain_scope = DomainScope::Resource;

@@ -636,6 +636,7 @@ impl Coordinator {
                     capabilities: participant.capabilities.clone(),
                     cleanup_methods: participant.cleanup_methods.clone(),
                     authorized_borrowers: BTreeSet::new(),
+                    approved_control_bindings: Vec::new(),
                 });
             selection.approvals.push(MethodApproval {
                 method: method.clone(),
@@ -671,6 +672,74 @@ impl Coordinator {
                 selected.participant.settings_revision = snapshot.revision.clone();
             }
             let provider = &selected.participant.provider;
+            selected.approved_control_bindings.clear();
+            if let Some(progress) = &work.composition_progress {
+                for frozen in progress
+                    .selections
+                    .iter()
+                    .filter(|item| item.control_policy.dependent_provider == *provider)
+                {
+                    let policy = &frozen.control_policy;
+                    let owner = &policy.owner_provider;
+                    let graph = work
+                        .provider_graph
+                        .as_ref()
+                        .ok_or("provider_graph_missing")?;
+                    if frozen.target != work.target
+                        || frozen.transition_id != work.transition_id
+                        || !frozen.validate_structure()
+                        || !graph
+                            .dependencies
+                            .get(provider)
+                            .is_some_and(|deps| deps.contains(owner))
+                        || !self.settings.control_policies.contains(policy)
+                        || journal.composition.selection(
+                            &work.target,
+                            &work.transition_id,
+                            provider,
+                            owner,
+                            &frozen.input.output.output_id,
+                        ) != Some(frozen)
+                    {
+                        return Err("control_selection_changed".into());
+                    }
+                    let owner_selection = self
+                        .selections
+                        .get(owner)
+                        .ok_or("control_owner_unavailable")?;
+                    if !owner_selection.approvals.contains(&frozen.control_approval)
+                        || !owner_selection
+                            .approvals
+                            .contains(&frozen.control_status_approval)
+                        || !owner_selection
+                            .approvals
+                            .contains(&frozen.settlement_approval)
+                    {
+                        return Err("control_approval_changed".into());
+                    }
+                    let output = match &frozen.input.output.origin {
+                        LifecycleTarget::Session { .. } => journal
+                            .composition
+                            .staged_for(&work.target, owner, &frozen.input.output.output_id)
+                            .map_err(str::to_owned)?
+                            .after
+                            .clone(),
+                        _ => frozen.input.output.clone(),
+                    };
+                    if let Some(state) = work.states.get(provider)
+                        && !state.request.dependency_inputs.contains(&output)
+                    {
+                        return Err("control_input_changed".into());
+                    }
+                    selected.approved_control_bindings.push(
+                        crate::plan_validation::ApprovedControlBinding {
+                            policy: policy.clone(),
+                            output,
+                            target: work.target.clone(),
+                        },
+                    );
+                }
+            }
             let consumers_retired = session.streams.values().all(|stream| {
                 stream.binding_owner != *provider
                     || stream.phase == StreamPhase::Retired
@@ -2353,6 +2422,7 @@ mod output_finish_tests {
             capabilities: Default::default(),
             cleanup_methods: vec![],
             authorized_borrowers: Default::default(),
+            approved_control_bindings: Vec::new(),
         };
         let document = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"output/1","type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]}"#;
         let schema = json!({"id":"output/1","major":1,"minor":0,"digest":format!("{:x}",Sha256::digest(document.as_bytes()))});

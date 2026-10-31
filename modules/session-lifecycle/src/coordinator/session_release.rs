@@ -347,6 +347,7 @@ mod tests {
             capabilities: BTreeSet::new(),
             cleanup_methods: vec![],
             authorized_borrowers: BTreeSet::new(),
+            approved_control_bindings: Vec::new(),
         };
         let obligation = json!({"obligation_id":"cleanup","provider":"owner","resource_id":"display","mutation_domain":null,"cleanup_method":{"service":"owner/2","method":"cleanup","interface_major":2,"interface_minor":0,"schema_revision":1},"payload":{},"depends_on":[]});
         let plan: amaterasu_extension_api::ResourcePlan = serde_json::from_value(json!({"plan_id":"plan","revision":1,"resources":[{"provider":"owner","resource_id":"display","incarnation":null,"expected_revision":2,"execution_domain":"seat","mutation_domains":[],"access":"exclusive"}],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[obligation],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]})).unwrap();

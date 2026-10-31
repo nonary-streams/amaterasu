@@ -15,6 +15,7 @@ fn selection(provider: &str) -> ProviderSelection {
         capabilities: BTreeSet::new(),
         cleanup_methods: vec![],
         authorized_borrowers: BTreeSet::new(),
+        approved_control_bindings: Vec::new(),
     }
 }
 
