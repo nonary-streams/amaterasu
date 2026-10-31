@@ -63,6 +63,11 @@ its bytes, dependencies, and requested routing grants. The installed policy and
 signed requests are intersected, so both must permit a service call. Native
 modules are trusted in-process code; routing grants are not a sandbox.
 
+The implemented capture binding is limited to Linux KDE/KWin with PipeWire and
+SDR. The preparer selects PipeWire explicitly. Windows, HDR, and other capture
+providers are not supported by this lifecycle binding. Explicit KMS output or
+virtual-screen capture options are rejected by the preparer.
+
 This profile is an integration candidate. A verified signature and successful
 startup do not prove end-to-end session lifecycle, action execution, live capture,
 platform display changes, or recovery. The current display provider starts with

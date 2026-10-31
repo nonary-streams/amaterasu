@@ -122,6 +122,8 @@ def prepare(bootstrap: dict, root: Path, descriptor: dict, descriptor_digest: st
     settings[ACTIONS] = {"input_service": INPUT, "grants": []}
     settings.setdefault("amaterasu.launch", {})["retirement_observers"] = [LIFECYCLE]
     settings[NVHTTP]["session_lifecycle_required"] = True
+    # The implemented binding adapter supports PipeWire/KWin SDR only.
+    settings[NVHTTP]["streaming"]["capture"]["capture_provider"] = "pipewire"
     return calls
 
 
@@ -144,6 +146,9 @@ def main() -> None:
     template = examples / "component-linux.json"
     component = json.loads(template.read_text())
     options = args.linux_options[1:] if args.linux_options[:1] == ["--"] else args.linux_options
+    if any(option == "--capture-output" or option.startswith("--capture-output=")
+           or option == "--enable-virtual-screen-capture" for option in options):
+        parser.error("session-extension capture currently requires PipeWire; KMS output and virtual-screen capture selection are unsupported")
     run(args.publisher, "init-linux-session", args.root, *options)
     bootstrap_path = args.root / "bootstrap.json"
     bootstrap = json.loads(bootstrap_path.read_text())
