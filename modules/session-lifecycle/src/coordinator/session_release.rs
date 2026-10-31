@@ -1941,6 +1941,95 @@ mod tests {
     }
 
     #[test]
+    fn session_prepare_closure_requires_exact_authenticated_set() {
+        let (mut journal, work, mut state) = complete_fixture();
+        let release_state = state.clone();
+        let root = journal.composition.records().next().unwrap().clone();
+        let proof = root.callback_proof.unwrap();
+        state.request = proof.request.clone();
+        state.participant = proof.participant.clone();
+        state.phase = PreparePhase::Prepared;
+        state.admission_id = Some(root.admission_id.clone());
+        state.plan = Some(root.plan.clone());
+        state.terminal_dispatch = Some(proof.terminal.clone());
+        state.response = match &proof.terminal.state {
+            crate::provider_dispatch::DispatchState::Completed { payload } => {
+                Some(serde_json::from_value(payload.clone()).unwrap())
+            }
+            _ => panic!("missing completed prepare"),
+        };
+        let mut prepare = work.clone();
+        prepare.phase = LifecyclePhase::SessionPrepare;
+        prepare.transition_id = root.transition_id;
+        prepare.states.insert("owner".into(), state.clone());
+        journal.receipts.get_mut("receipt").unwrap().work = Some(prepare.clone());
+        session_prepare_evidence::record(&mut journal, &prepare, "owner", &state).unwrap();
+        assert!(
+            session_prepare_evidence::validated_closed_prepares(&journal, &work.target).is_err()
+        );
+        journal.receipts.get_mut("receipt").unwrap().work = Some(work.clone());
+        record_session_release_proof(&mut journal, &work, "owner", &release_state).unwrap();
+        journal.sessions.get_mut("session").unwrap().phase = SessionPhase::Ended;
+        let session = journal.sessions.get_mut("session").unwrap();
+        session.application_ref = json!({"kind":"desktop"});
+        session.application_retirement_proof =
+            Some(application::ApplicationRetirementProof::Desktop {
+                target: work.target.clone(),
+            });
+        journal.receipts.clear();
+        assert!(super::session_closure::preflight(&journal, &work.target).is_ok());
+        let mut legacy = journal.clone();
+        legacy
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .application_retirement_proof = None;
+        assert!(super::session_closure::preflight(&legacy, &work.target).is_err());
+        let mut pending = journal.clone();
+        let key = receipt_key("transport", "client", "unsettled");
+        pending.receipts.insert(
+            key,
+            Receipt {
+                caller: "transport".into(),
+                initiator: "client".into(),
+                request: json!({"operation_id":"unsettled","target":work.target}),
+                response: json!({"operation_id":"unsettled","status":"recovery_required"}),
+                work: None,
+                wait_target: None,
+            },
+        );
+        assert!(super::session_closure::preflight(&pending, &work.target).is_err());
+        let mut external = journal.clone();
+        external.authority.settled.insert(
+            "external".into(),
+            external.authority.settled["root"].clone(),
+        );
+        assert_eq!(
+            super::session_closure::preflight(&external, &work.target).unwrap_err(),
+            "session_root_has_external_reference"
+        );
+        let evidence =
+            session_prepare_evidence::validated_closed_prepares(&journal, &work.target).unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence[0].admission_id, "root");
+        let mut wrong = evidence.clone();
+        wrong[0].transition_id = "foreign".into();
+        let before = serde_json::to_value(&journal).unwrap();
+        assert!(
+            session_prepare_evidence::retire_closed_prepares(&mut journal, &work.target, &wrong)
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(&journal).unwrap(), before);
+        session_prepare_evidence::retire_closed_prepares(&mut journal, &work.target, &evidence)
+            .unwrap();
+        assert!(
+            !journal
+                .session_prepare_evidence
+                .references_admission("root")
+        );
+    }
+
+    #[test]
     fn exact_session_and_application_retirement_gate_lineage() {
         let (mut journal, work) = fixture();
         assert!(session_lineage_closed(&journal, &work.target, "owner"));

@@ -36,6 +36,114 @@ impl SessionPrepareEvidence {
     }
 }
 
+/// Exact, authenticated prepare references retained until session closure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ClosedPrepareEvidence {
+    pub provider: String,
+    pub admission_id: String,
+    pub transition_id: String,
+}
+
+/// Resolve the complete session prepare set. This is a historical proof only;
+/// callers must separately verify terminal release and all inbound references.
+#[allow(dead_code, reason = "used by the ended-session closure transaction")]
+pub(super) fn validated_closed_prepares(
+    journal: &Journal,
+    target: &LifecycleTarget,
+) -> ModuleResult<Vec<ClosedPrepareEvidence>> {
+    let (epoch, session_id, stream, generation) = operations::target_parts(target)?;
+    let session = journal.sessions.get(session_id).ok_or("unknown_session")?;
+    let graph = session
+        .provider_graph
+        .as_ref()
+        .ok_or("provider_graph_missing")?;
+    if stream.is_some()
+        || session.host_epoch != epoch
+        || session.generation != generation
+        || session.phase != SessionPhase::Ended
+        || !journal.session_prepare_evidence.validate(journal)
+    {
+        return Err("invalid_ended_session_prepares".into());
+    }
+    let mut result = Vec::new();
+    for id in &session.admission_ids {
+        if session.admission_targets.get(id) != Some(target)
+            || session.admission_phases.get(id) != Some(&LifecyclePhase::SessionPrepare)
+        {
+            continue;
+        }
+        let admission = journal
+            .authority
+            .settled
+            .get(id)
+            .ok_or("unsettled_session_prepare")?;
+        let mut records = journal
+            .session_prepare_evidence
+            .records
+            .iter()
+            .filter(|record| &record.admission_id == id && &record.target == target);
+        let record = records.next().ok_or("session_prepare_evidence_missing")?;
+        if records.next().is_some()
+            || !valid_record(journal, record)
+            || !graph.order.contains(&admission.provider)
+        {
+            return Err("invalid_session_prepare_evidence".into());
+        }
+        result.push(ClosedPrepareEvidence {
+            provider: admission.provider.clone(),
+            admission_id: id.clone(),
+            transition_id: record.transition_id.clone(),
+        });
+    }
+    if graph
+        .order
+        .iter()
+        .any(|provider| !result.iter().any(|record| &record.provider == provider))
+        || journal
+            .session_prepare_evidence
+            .records
+            .iter()
+            .filter(|record| &record.target == target)
+            .count()
+            != result.len()
+    {
+        return Err("incomplete_session_prepare_evidence".into());
+    }
+    let unique_providers: BTreeSet<_> = result.iter().map(|item| &item.provider).collect();
+    let unique_graph: BTreeSet<_> = graph.order.iter().collect();
+    if unique_providers.len() != result.len() || unique_graph.len() != graph.order.len() {
+        return Err("owner_generation_lineage_not_compactable".into());
+    }
+    if result
+        .iter()
+        .map(|item| &item.transition_id)
+        .collect::<BTreeSet<_>>()
+        .len()
+        != 1
+    {
+        return Err("session_prepare_transition_ambiguous".into());
+    }
+    result.sort_by(|a, b| a.admission_id.cmp(&b.admission_id));
+    Ok(result)
+}
+
+/// Called only on a private journal clone in the atomic terminal transaction.
+#[allow(dead_code, reason = "used by the ended-session closure transaction")]
+pub(super) fn retire_closed_prepares(
+    journal: &mut Journal,
+    target: &LifecycleTarget,
+    expected: &[ClosedPrepareEvidence],
+) -> ModuleResult<()> {
+    if validated_closed_prepares(journal, target)? != expected {
+        return Err("session_prepare_closure_changed".into());
+    }
+    journal
+        .session_prepare_evidence
+        .records
+        .retain(|record| &record.target != target);
+    Ok(())
+}
+
 fn valid_record(journal: &Journal, record: &Evidence) -> bool {
     let Ok((epoch, session_id, None, generation)) = operations::target_parts(&record.target) else {
         return false;

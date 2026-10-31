@@ -49,6 +49,7 @@ mod recovery;
 mod resource_generation;
 mod retention;
 mod security;
+mod session_closure;
 mod session_prepare_evidence;
 #[allow(dead_code)]
 mod session_release;
