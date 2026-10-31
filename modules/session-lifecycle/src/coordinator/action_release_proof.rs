@@ -324,6 +324,70 @@ fn validate_graph_callbacks_inner(
     true
 }
 
+/// Require exactly one independently verified release proof for the frozen
+/// owner, target and transition. Composed and standalone books may not overlap.
+pub(super) fn validate_owner_release(journal: &Journal, work: &Work, owner: &str) -> bool {
+    let standalone =
+        journal
+            .stream_releases
+            .has_released_for(&work.target, owner, &work.transition_id)
+            && journal
+                .stream_releases
+                .has_valid_released(journal, &work.target);
+    let composed = journal
+        .composed_releases
+        .verified_work_for(journal, &work.target, &work.transition_id)
+        .is_some_and(|released| {
+            released.provider_graph == work.provider_graph
+                && released.providers == work.providers
+                && released
+                    .provider_graph
+                    .as_ref()
+                    .is_some_and(|graph| graph.dependencies.get(owner).is_some_and(Vec::is_empty))
+        });
+    standalone ^ composed
+}
+
+/// Construct the action's retained callback proof exclusively from the exact
+/// verified graph release; callers must persist it with ReplanRequired.
+pub(super) fn proof_from_composed_release(
+    journal: &Journal,
+    work: &Work,
+) -> Option<ActionReleaseProof> {
+    let transfer = work.action_transfer.as_ref()?;
+    let snapshot = transfer.snapshot.as_ref()?;
+    let released =
+        journal
+            .composed_releases
+            .verified_work_for(journal, &work.target, &work.transition_id)?;
+    if released.provider_graph != work.provider_graph
+        || released.providers != work.providers
+        || released.index != work.providers.len()
+    {
+        return None;
+    }
+    let callbacks = work
+        .providers
+        .iter()
+        .map(|provider| {
+            let state = released.states.get(provider)?;
+            Some(super::composition::ProducerCallbackProof {
+                participant: state.participant.clone(),
+                request: state.request.clone(),
+                terminal: state.terminal_dispatch.clone()?,
+                pending_receipt: state.pending_receipt.clone(),
+                pending_dispatch: state.pending_dispatch.clone(),
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(ActionReleaseProof {
+        target: work.target.clone(),
+        transition_id: work.transition_id.clone(),
+        original_admissions: snapshot.stream_admissions.keys().cloned().collect(),
+        callbacks,
+    })
+}
+
 /// Replan can only be journaled after every graph callback and the owner's
 /// authenticated released-output finalization have been retained. The caller
 /// must separately check the current host epoch before granting live access.
@@ -351,12 +415,7 @@ pub(super) fn validate_replan_stage(
         && receipt.response["plan_digest"].as_str() == Some(transfer.binding.plan_digest.as_str())
         && receipt.response["transition_id"].as_str() == Some(work.transition_id.as_str())
         && validate_graph_callbacks(journal, work, proof)
-        && journal
-            .stream_releases
-            .has_released_for(&work.target, &owner, &work.transition_id)
-        && journal
-            .stream_releases
-            .has_valid_released(journal, &work.target)
+        && validate_owner_release(journal, work, &owner)
 }
 
 /// Rebound reservations retain all cleanup evidence and their exact new rights.
@@ -393,18 +452,24 @@ pub(super) fn validate_rebound_stage(
             .iter()
             .all(|(domain, _)| journal.authority.domain_locks.get(domain) == Some(id))
         && validate_graph_callbacks(journal, work, proof)
-        && journal
-            .stream_releases
-            .has_released_for(&work.target, &owner, &work.transition_id)
-        && journal
-            .stream_releases
-            .has_valid_released(journal, &work.target)
+        && validate_owner_release(journal, work, &owner)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn graph_action_release_requires_exact_verified_work() {
+        let journal: Journal = serde_json::from_value(
+            json!({"version":3,"host_epoch":"epoch","receipts":{},"sessions":{}}),
+        )
+        .unwrap();
+        let work: Work = serde_json::from_value(json!({"phase":"stream.release","target":{"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1},"intent":null,"reason":null,"video":null,"transition_id":"transition","providers":[],"index":0,"states":{},"candidate":null,"waiting_retirement":false})).unwrap();
+        assert!(!validate_owner_release(&journal, &work, "owner"));
+        assert!(proof_from_composed_release(&journal, &work).is_none());
+    }
 
     #[test]
     fn dependent_session_noop_requires_authenticated_evidence() {

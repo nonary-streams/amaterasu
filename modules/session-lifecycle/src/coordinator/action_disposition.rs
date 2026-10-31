@@ -110,13 +110,7 @@ pub(super) fn verified_marker_at<'a>(
         journal,
         &marker.cleanup_work,
         proof,
-    ) || !journal.stream_releases.has_released_for(
-        &marker.cleanup_work.target,
-        owner,
-        &marker.cleanup_work.transition_id,
-    ) || !journal
-        .stream_releases
-        .has_valid_released(journal, &marker.cleanup_work.target)
+    ) || !action_release_proof::validate_owner_release(journal, &marker.cleanup_work, owner)
     {
         return None;
     }
