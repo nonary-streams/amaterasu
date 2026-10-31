@@ -1063,7 +1063,7 @@ pub(super) fn approval_matches_call(
         && approval.method.interface_minor == call.interface_minor
 }
 
-fn valid_callback_proof(
+pub(super) fn valid_callback_proof(
     proof: &ProducerCallbackProof,
     response: &amaterasu_extension_api::ProviderResponse,
 ) -> bool {

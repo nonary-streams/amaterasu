@@ -32,6 +32,8 @@ mod settings_snapshot;
 #[allow(dead_code)] // Settlement dispatch is gated until composition sequencing is wired.
 mod settlement_dispatch;
 mod stage_backend;
+#[allow(dead_code)]
+mod stream_release;
 
 use crate::adapter::LifecycleSettings;
 use crate::prepare_authority::{AuthorityState, ProviderSelection};
@@ -289,6 +291,8 @@ struct Journal {
     control_settlements: control_settlement::ControlSettlementBook,
     #[serde(default)]
     finalize_results: finalize_result::FinalizeResultBook,
+    #[serde(default)]
+    stream_releases: stream_release::StreamReleaseBook,
     /// Immutable producing transition of each retained admission.
     #[serde(default)]
     admission_transitions: BTreeMap<String, String>,
@@ -296,9 +300,11 @@ struct Journal {
 
 impl Journal {
     fn references_admission(&self, id: &str) -> bool {
-        self.finalize_results
-            .records()
-            .any(|item| item.request.admission_id == id)
+        self.stream_releases.references_admission(id)
+            || self
+                .finalize_results
+                .records()
+                .any(|item| item.request.admission_id == id)
             || self.composition.references_admission(id)
             || self
                 .control_settlements
@@ -505,6 +511,7 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                         )
                 })
         })
+        || !journal.stream_releases.validate(journal)
         || !journal.finalize_results.validate_structure()
         || journal.finalize_results.records().any(|item| {
             let request = &item.request;
@@ -739,6 +746,7 @@ impl Coordinator {
             composition: Default::default(),
             control_settlements: Default::default(),
             finalize_results: Default::default(),
+            stream_releases: Default::default(),
             admission_transitions: Default::default(),
         });
         validate_journal(&journal)?;

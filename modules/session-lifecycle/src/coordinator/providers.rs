@@ -72,6 +72,37 @@ impl AuthorityJournal for WorkFinishWriter {
         save(&self.shared, next)
     }
 }
+/// Atomically persist terminal cleanup evidence with participant progress.
+struct StreamReleaseWriter {
+    shared: Shared,
+    key: String,
+    provider: String,
+    state: PrepareState,
+}
+impl AuthorityJournal for StreamReleaseWriter {
+    fn persist(&mut self, authority: &AuthorityState) -> ModuleResult<()> {
+        let mut next = self.shared.borrow().value.clone();
+        let work = next
+            .receipts
+            .get(&self.key)
+            .and_then(|receipt| receipt.work.clone())
+            .ok_or("unknown_transition")?;
+        super::stream_release::record_release_proof(&mut next, &work, &self.provider, &self.state)?;
+        let admission = self
+            .state
+            .admission_id
+            .as_deref()
+            .ok_or("admission_missing")?;
+        if !authority.settled.contains_key(admission) {
+            return Err("release_admission_not_retained".into());
+        }
+        next.authority = authority.clone();
+        apply_participant(&mut next, &self.key, &self.provider, &self.state, false)?;
+        validate_journal(&next).map_err(|_| "invalid_release_journal")?;
+        save(&self.shared, next)
+    }
+}
+
 fn apply_participant(
     next: &mut Journal,
     key: &str,
@@ -627,6 +658,10 @@ impl Coordinator {
                 save(&self.shared, next)?;
             }
             if work.action_transfer.is_some() {
+                if !work.providers.is_empty() {
+                    self.fail_work(&key, "action_provider_cleanup_not_implemented")?;
+                    continue;
+                }
                 if let Err(reason) = self.complete_action_barrier(&key, &work) {
                     self.fail_work(&key, &reason)?;
                 }
@@ -731,7 +766,9 @@ impl Coordinator {
                     && participant.contract_version == amaterasu_extension_api::COMPOSITION_VERSION
             }) && !matches!(
                 work.phase,
-                LifecyclePhase::SessionPrepare | LifecyclePhase::StreamPrepare
+                LifecyclePhase::SessionPrepare
+                    | LifecyclePhase::StreamPrepare
+                    | LifecyclePhase::StreamRelease
             ) {
                 self.fail_work(&key, "composition_path_not_supported")?;
                 continue;
@@ -768,7 +805,9 @@ impl Coordinator {
                 == amaterasu_extension_api::COMPOSITION_VERSION
                 && matches!(
                     work.phase,
-                    LifecyclePhase::SessionPrepare | LifecyclePhase::StreamPrepare
+                    LifecyclePhase::SessionPrepare
+                        | LifecyclePhase::StreamPrepare
+                        | LifecyclePhase::StreamRelease
                 )
                 && work.provider_graph.as_ref().is_some_and(|graph| {
                     graph.order == [participant.provider.clone()]
@@ -788,6 +827,20 @@ impl Coordinator {
             if participant.contract_version != 1 && !standalone_v2 {
                 self.fail_work(&key, "composition_path_not_supported")?;
                 continue;
+            }
+            if standalone_v2 && work.phase == LifecyclePhase::StreamRelease {
+                let preflight = {
+                    let shared = self.shared.borrow();
+                    super::stream_release::validate_release_preflight(
+                        &shared.value,
+                        &work,
+                        provider,
+                    )
+                };
+                if let Err(reason) = preflight {
+                    self.cleanup_failure(&key, &reason)?;
+                    continue;
+                }
             }
             let runtime_key = format!("{key}/{}", work.index);
             let mut authority = match self.authority_for_work(&work) {
@@ -862,7 +915,12 @@ impl Coordinator {
                 work.states.insert(provider.clone(), state);
             }
             if !self.drivers.contains_key(&runtime_key) {
-                let driver = if standalone_v2 {
+                let driver = if standalone_v2 && work.phase == LifecyclePhase::StreamRelease {
+                    PrepareDriver::new_standalone_release(
+                        work.states[provider].clone(),
+                        &effective_settings,
+                    )?
+                } else if standalone_v2 {
                     PrepareDriver::new_standalone_prepare(
                         work.states[provider].clone(),
                         &effective_settings,
@@ -945,6 +1003,25 @@ impl Coordinator {
                         finish.finish_admission_with_output(provider, admission, resource)
                     {
                         self.fail_work(&key, &reason)?;
+                    }
+                    self.drivers.remove(&runtime_key);
+                    continue;
+                }
+                if standalone_v2 && work.phase == LifecyclePhase::StreamRelease {
+                    let admission = state.admission_id.as_deref().ok_or("admission_missing")?;
+                    let writer = StreamReleaseWriter {
+                        shared: self.shared.clone(),
+                        key: key.clone(),
+                        provider: provider.clone(),
+                        state: state.clone(),
+                    };
+                    let mut finish = CoordinatorPrepareAuthority::new(
+                        self.shared.borrow().value.authority.clone(),
+                        self.work_selections(&work)?,
+                        writer,
+                    )?;
+                    if let Err(reason) = finish.finish_admission_retained(provider, admission) {
+                        self.cleanup_failure(&key, &reason)?;
                     }
                     self.drivers.remove(&runtime_key);
                     continue;
@@ -1375,6 +1452,7 @@ impl Coordinator {
                         next.authority.admissions.contains_key(admission)
                             || next.authority.settled.contains_key(admission)
                             || next.composition.references_admission(admission)
+                            || next.stream_releases.references_admission(admission)
                             || next
                                 .finalize_results
                                 .records()
@@ -1653,6 +1731,7 @@ mod admission_target_tests {
             composition: Default::default(),
             control_settlements: Default::default(),
             finalize_results: Default::default(),
+            stream_releases: Default::default(),
             admission_transitions: Default::default(),
         };
         let target = LifecycleTarget::Stream {

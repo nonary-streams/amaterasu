@@ -108,7 +108,7 @@ impl PrepareDriver {
     /// Caller must durably reserve the operation and matching provider sequence
     /// before constructing this driver. No plan or effect is implied by creation.
     pub fn new(state: PrepareState, settings: &LifecycleSettings) -> ModuleResult<Self> {
-        Self::new_inner(state, settings, false, false)
+        Self::new_inner(state, settings, false, false, false)
     }
 
     /// Only the coordinator may call this after validating the pinned owner,
@@ -119,7 +119,7 @@ impl PrepareDriver {
         state: PrepareState,
         settings: &LifecycleSettings,
     ) -> ModuleResult<Self> {
-        Self::new_inner(state, settings, true, false)
+        Self::new_inner(state, settings, true, false, false)
     }
 
     /// Coordinator-only v2 producer prepare with no dependency controls. The
@@ -129,7 +129,16 @@ impl PrepareDriver {
         state: PrepareState,
         settings: &LifecycleSettings,
     ) -> ModuleResult<Self> {
-        Self::new_inner(state, settings, false, true)
+        Self::new_inner(state, settings, false, true, false)
+    }
+
+    /// Release requires the coordinator's exact consumer-retirement and
+    /// retained-lineage checks before this driver is constructed.
+    pub(crate) fn new_standalone_release(
+        state: PrepareState,
+        settings: &LifecycleSettings,
+    ) -> ModuleResult<Self> {
+        Self::new_inner(state, settings, false, false, true)
     }
 
     fn new_inner(
@@ -137,9 +146,13 @@ impl PrepareDriver {
         settings: &LifecycleSettings,
         finalize_plan: bool,
         standalone_prepare: bool,
+        standalone_release: bool,
     ) -> ModuleResult<Self> {
         // Regular v2 prepare/control remains fenced until all stages are wired.
-        if (!finalize_plan && !standalone_prepare && state.request.version != 1)
+        if (!finalize_plan
+            && !standalone_prepare
+            && !standalone_release
+            && state.request.version != 1)
             || (standalone_prepare
                 && (state.request.version != api::COMPOSITION_VERSION
                     || !state.request.control_results.is_empty()
@@ -166,6 +179,28 @@ impl PrepareDriver {
                             | PreparePhase::Rejected
                             | PreparePhase::RecoveryRequired
                     )))
+            || (standalone_release
+                && (state.request.version != api::COMPOSITION_VERSION
+                    || !state.request.dependency_inputs.is_empty()
+                    || !state.request.control_results.is_empty()
+                    || !matches!(
+                        state.request.operation,
+                        ProviderOperation::ResourcePlan | ProviderOperation::LifecycleCallback
+                    )
+                    || !matches!(
+                        state.request.phase,
+                        api::LifecyclePhase::SessionRelease | api::LifecyclePhase::StreamRelease
+                    )
+                    || !matches!(
+                        state.phase,
+                        PreparePhase::Plan
+                            | PreparePhase::PlanStatus
+                            | PreparePhase::Callback
+                            | PreparePhase::CallbackStatus
+                            | PreparePhase::CleanupSettled
+                            | PreparePhase::Rejected
+                            | PreparePhase::RecoveryRequired
+                    )))
             || (finalize_plan
                 && (state.request.version != api::COMPOSITION_VERSION
                     || state.request.operation != ProviderOperation::ResourceFinalizePlan
@@ -180,7 +215,7 @@ impl PrepareDriver {
         {
             return Err("provider composition is not supported".into());
         }
-        if (finalize_plan || standalone_prepare)
+        if (finalize_plan || standalone_prepare || standalone_release)
             && (state.participant.contract_version != api::COMPOSITION_VERSION
                 || state.participant.plan_method.interface_major != api::COMPOSITION_VERSION
                 || state.participant.callback_method.interface_major != api::COMPOSITION_VERSION
@@ -826,6 +861,27 @@ mod tests {
         assert!(PrepareDriver::new_standalone_prepare(state.clone(), &settings).is_ok());
         state.request.phase = api::LifecyclePhase::StreamPrepare;
         assert!(PrepareDriver::new_standalone_prepare(state, &settings).is_err());
+    }
+
+    #[test]
+    fn standalone_v2_release_rejects_prepare_phase() {
+        let (mut settings, mut state) = fixture();
+        let participant = &mut settings.participants[0];
+        participant.contract_version = api::COMPOSITION_VERSION;
+        participant.plan_method.interface_major = api::COMPOSITION_VERSION;
+        participant.callback_method.interface_major = api::COMPOSITION_VERSION;
+        participant.status_method.interface_major = api::COMPOSITION_VERSION;
+        participant
+            .binding_validate_method
+            .as_mut()
+            .unwrap()
+            .interface_major = api::COMPOSITION_VERSION;
+        state.participant = participant.clone();
+        state.request.version = api::COMPOSITION_VERSION;
+        state.request.phase = api::LifecyclePhase::StreamRelease;
+        assert!(PrepareDriver::new_standalone_release(state.clone(), &settings).is_ok());
+        state.request.phase = api::LifecyclePhase::StreamPrepare;
+        assert!(PrepareDriver::new_standalone_release(state, &settings).is_err());
     }
 
     #[test]

@@ -870,7 +870,7 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
         admission_id: &str,
         resource: Option<ResourceRef>,
     ) -> ModuleResult<()> {
-        self.finish_admission_inner(provider, admission_id, resource, false)
+        self.finish_admission_inner(provider, admission_id, resource, false, false)
     }
 
     /// The writer must atomically persist the authenticated output and work
@@ -881,7 +881,17 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
         admission_id: &str,
         resource: ResourceRef,
     ) -> ModuleResult<()> {
-        self.finish_admission_inner(provider, admission_id, Some(resource), true)
+        self.finish_admission_inner(provider, admission_id, Some(resource), true, true)
+    }
+
+    /// Retain the exact completed plan for a durable terminal evidence record.
+    /// The journal must atomically store that evidence with this transition.
+    pub fn finish_admission_retained(
+        &mut self,
+        provider: &str,
+        admission_id: &str,
+    ) -> ModuleResult<()> {
+        self.finish_admission_inner(provider, admission_id, None, false, true)
     }
 
     fn finish_admission_inner(
@@ -890,6 +900,7 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
         admission_id: &str,
         resource: Option<ResourceRef>,
         retain_output: bool,
+        retain_history: bool,
     ) -> ModuleResult<()> {
         if self.poisoned || !self.selections.contains_key(provider) {
             return Err("provider is not approved".into());
@@ -978,7 +989,7 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
         if retain_output {
             next.output_admissions.insert(admission_id.to_owned());
         }
-        if retain_output || !admission.plan.obligations.is_empty() {
+        if retain_history || !admission.plan.obligations.is_empty() {
             next.settled.insert(admission_id.to_owned(), admission);
         }
         self.persist(next)
@@ -2542,6 +2553,32 @@ mod tests {
         .unwrap();
         assert_eq!(restored.state.sequences["display"], 1);
         assert!(restored.state.domain_locks.contains_key("topology"));
+    }
+
+    #[test]
+    fn terminal_evidence_retains_admission_without_output_or_obligations() {
+        let selected = selection();
+        let mut authority = CoordinatorPrepareAuthority::new(
+            AuthorityState::default(),
+            vec![selected.clone()],
+            Journal::default(),
+        )
+        .unwrap();
+        let mut planned = plan();
+        planned.obligations.clear();
+        planned.resources[0].access = amaterasu_extension_api::ResourceAccess::Read;
+        planned.mutation_domains[0].access = amaterasu_extension_api::ResourceAccess::Read;
+        let admission = authority
+            .admit_plan(&selected.participant, &planned)
+            .unwrap();
+        let before = authority.journal.snapshots.len();
+        authority
+            .finish_admission_retained("display", &admission)
+            .unwrap();
+        assert_eq!(authority.journal.snapshots.len(), before + 1);
+        assert!(authority.state.settled.contains_key(&admission));
+        assert!(!authority.state.output_admissions.contains(&admission));
+        assert!(!authority.state.domain_locks.contains_key("topology"));
     }
 
     #[test]
