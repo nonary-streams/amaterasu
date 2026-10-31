@@ -56,12 +56,21 @@ struct Harness {
 }
 impl Harness {
     fn new() -> Self {
+        Self::with_lifecycle_grant(true)
+    }
+
+    fn with_lifecycle_grant(allowed: bool) -> Self {
+        let calls = if allowed {
+            vec![STATE, REGISTRY, LIFECYCLE, PROVIDER]
+        } else {
+            vec![STATE, REGISTRY, PROVIDER]
+        };
         let schema = json!({"required":{},"optional":{},"allow_extra":true});
         let plan = json!({"service":PROVIDER,"method":"action_plan","interface_major":1,"interface_minor":0,"request":schema,"response":schema,"privilege":"user"});
         let execute = json!({"service":PROVIDER,"method":"action_execute","interface_major":1,"interface_minor":0,"request":schema,"response":schema,"privilege":"user"});
         let settings = json!({"grants":[{"principal":"management","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["session_mutation"]}]});
         let config = serde_json::from_value(json!({"principals":{
-            ACTIONS:{"provide":[ACTION_SERVICE],"call":[STATE,REGISTRY,LIFECYCLE,PROVIDER]},
+            ACTIONS:{"provide":[ACTION_SERVICE],"call":calls},
             "management":{"call":[ACTION_SERVICE,REGISTRY,PROVIDER]},
             "state":{"provide":[STATE]}, "registry":{"provide":[REGISTRY]},
             "lifecycle":{"provide":[LIFECYCLE]}, "provider":{"provide":[PROVIDER]}
@@ -205,28 +214,38 @@ impl Harness {
                     let execute = json!({"service":PROVIDER,"method":"action_execute","interface_major":1,"interface_minor":0,"schema_revision":1});
                     json!({"ok":true,"provider":"provider","revision":1,"action":{"id":"example/action","label":"Example","description":"Example","execution":"session_mutation","arguments":{},"allowed_targets":["session"],"required_capabilities":[],"plan":plan,"execute":execute,"status":null}})
                 }
-                "lifecycle" => match payload["operation"].as_str().unwrap() {
-                    "authorize_action" if self.allow_authorize => {
-                        self.authorizations += 1;
-                        json!({"status":"succeeded","operation_id":payload["operation_id"],"target":payload["target"],"permit":"permit"})
+                "lifecycle" => {
+                    assert_eq!(caller, ACTIONS);
+                    assert_eq!(initiator, ACTIONS);
+                    if payload["operation"] == "authorize_action" {
+                        assert_eq!(
+                            payload["source"],
+                            json!({"caller":"management","initiator":"management"})
+                        );
                     }
-                    "consume_action_permit" if self.allow_authorize && !self.revoke_consume => {
-                        self.consumptions += 1;
-                        json!({"status":"succeeded","operation_id":payload["operation_id"],"target":payload["target"],"plan_digest":payload["plan_digest"]})
+                    match payload["operation"].as_str().unwrap() {
+                        "authorize_action" if self.allow_authorize => {
+                            self.authorizations += 1;
+                            json!({"status":"succeeded","operation_id":payload["operation_id"],"target":payload["target"],"permit":"permit"})
+                        }
+                        "consume_action_permit" if self.allow_authorize && !self.revoke_consume => {
+                            self.consumptions += 1;
+                            json!({"status":"succeeded","operation_id":payload["operation_id"],"target":payload["target"],"plan_digest":payload["plan_digest"]})
+                        }
+                        "complete_action" => {
+                            json!({"status":"succeeded","operation_id":payload["operation_id"]})
+                        }
+                        "authorize_action" => {
+                            self.authorizations += 1;
+                            json!({"status":"rejected"})
+                        }
+                        "consume_action_permit" => {
+                            self.consumptions += 1;
+                            json!({"status":"rejected"})
+                        }
+                        _ => json!({"status":"rejected"}),
                     }
-                    "complete_action" => {
-                        json!({"status":"succeeded","operation_id":payload["operation_id"]})
-                    }
-                    "authorize_action" => {
-                        self.authorizations += 1;
-                        json!({"status":"rejected"})
-                    }
-                    "consume_action_permit" => {
-                        self.consumptions += 1;
-                        json!({"status":"rejected"})
-                    }
-                    _ => json!({"status":"rejected"}),
-                },
+                }
                 "provider" => {
                     let arguments = &payload["arguments"];
                     match payload["method"].as_str().unwrap() {
@@ -355,4 +374,16 @@ fn denied_authorization_never_executes_provider() {
     assert_eq!(harness.effects, 0);
     assert_eq!(harness.authorizations, 1);
     assert_eq!(harness.consumptions, 0);
+}
+
+#[test]
+fn missing_lifecycle_grant_denies_authorization_and_effect() {
+    let mut harness = Harness::with_lifecycle_grant(false);
+    let _ = harness.invoke_action();
+    for _ in 0..500 {
+        harness.pump();
+    }
+    assert!(harness.observed_delegated_registry && harness.observed_delegated_plan);
+    assert_eq!(harness.authorizations, 0);
+    assert_eq!(harness.effects, 0);
 }
