@@ -90,6 +90,16 @@ pub(super) fn current_root_generation(journal: &Journal, root: &StoredOutput) ->
 /// Block stream admission until each released session root has been replaced by
 /// one authenticated newer incarnation at the current owner cursor.
 pub(super) fn released_root_requires_reprepare(journal: &Journal, session: &SessionRecord) -> bool {
+    released_root_requires_reprepare_except(journal, session, None)
+}
+
+/// An exact verified removal may enter its own reprepare before a replacement
+/// exists. Every older root for that owner must have independent closure proof.
+pub(super) fn released_root_requires_reprepare_except(
+    journal: &Journal,
+    session: &SessionRecord,
+    allowed: Option<(&str, u64)>,
+) -> bool {
     let origin = LifecycleTarget::Session {
         host_epoch: session.host_epoch.clone(),
         session_id: session.id.clone(),
@@ -106,6 +116,23 @@ pub(super) fn released_root_requires_reprepare(journal: &Journal, session: &Sess
         let Ok(old_generation) = historical_generation(journal, released) else {
             return true;
         };
+        if allowed.is_some_and(|(owner, generation)| {
+            owner == released.output.producer
+                && generation == *cursor
+                && old_generation <= generation
+                && super::action_disposition::resolved_at(
+                    journal,
+                    &session.id,
+                    owner,
+                    old_generation,
+                )
+                .is_some_and(|proof| {
+                    proof.root_admission_id == released.admission_id
+                        && proof.resource == released.output.resource
+                })
+        }) {
+            continue;
+        }
         if old_generation >= *cursor {
             return true;
         }
@@ -319,6 +346,11 @@ mod tests {
         assert!(released_root_requires_reprepare(
             &journal,
             &journal.sessions["session"]
+        ));
+        assert!(released_root_requires_reprepare_except(
+            &journal,
+            &journal.sessions["session"],
+            Some(("owner", 7)),
         ));
         journal
             .sessions

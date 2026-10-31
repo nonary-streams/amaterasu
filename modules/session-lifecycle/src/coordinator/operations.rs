@@ -315,10 +315,6 @@ impl Coordinator {
             response = json!({"status":"succeeded","target":target,"plan_revision":payload.get("plan_revision")});
             match operation {
                 "prepare_stream" | "resume_stream" => {
-                    if super::resource_generation::released_root_requires_reprepare(&next, session)
-                    {
-                        return Err("owner_resource_reprepare_required".into());
-                    }
                     if stream_id.is_some()
                         || !matches!(session.phase, SessionPhase::Ready | SessionPhase::Paused)
                     {
@@ -331,6 +327,15 @@ impl Coordinator {
                         return Err("application_not_bound".into());
                     }
                     let reprepare = required_reprepare(&next, &self.settings, session)?;
+                    if super::resource_generation::released_root_requires_reprepare_except(
+                        &next,
+                        session,
+                        reprepare
+                            .as_ref()
+                            .map(|(owner, generation, _)| (owner.as_str(), *generation)),
+                    ) {
+                        return Err("owner_resource_reprepare_required".into());
+                    }
                     let mut current =
                         self.new_work(LifecyclePhase::StreamPrepare, target.clone(), &payload)?;
                     if reprepare.is_some()
