@@ -63,7 +63,6 @@ pub struct ControlPolicy {
     pub owner_method: MethodRef,
     pub status_method: MethodRef,
     pub settlement_method: MethodRef,
-    pub settlement_status_method: MethodRef,
     pub argument_schema: SchemaRef,
     pub output_capability: String,
     pub output_schema: SchemaRef,
@@ -411,7 +410,6 @@ fn validate_control_binding(
         || policy.owner_method.schema_revision == 0
         || !valid_status_method(&policy.status_method, &policy.owner_service)
         || !valid_status_method(&policy.settlement_method, &policy.owner_service)
-        || !valid_status_method(&policy.settlement_status_method, &policy.owner_service)
         || !valid_id(&request.transition_id)
         || !valid_id(&request.operation_id)
         || !valid_id(&proposal.proposal_id)
@@ -1916,6 +1914,7 @@ mod tests {
     }
     fn selection() -> ProviderSelection {
         let participant = ParticipantSettings {
+            contract_version: 1,
             provider: "display".into(),
             depends_on: vec![],
             plan_method: method("plan"),
@@ -2055,7 +2054,7 @@ mod tests {
         plan.control_proposals
             .push(serde_json::from_value(proposal.clone()).unwrap());
         let mut context: ControlContext = serde_json::from_value(json!({
-            "policy":{"dependent_provider":"display", "owner_provider":"owner", "owner_service":"display/2", "owner_method":method, "status_method":{"service":"display/2","method":"status","interface_major":2,"interface_minor":0,"schema_revision":2}, "settlement_method":{"service":"display/2","method":"settle","interface_major":2,"interface_minor":0,"schema_revision":2}, "settlement_status_method":{"service":"display/2","method":"settle_status","interface_major":2,"interface_minor":0,"schema_revision":2}, "argument_schema":schema, "output_capability":"display", "output_schema":schema, "max_access":"exclusive", "mutation_domains":["topology"]},
+            "policy":{"dependent_provider":"display", "owner_provider":"owner", "owner_service":"display/2", "owner_method":method, "status_method":{"service":"display/2","method":"status","interface_major":2,"interface_minor":0,"schema_revision":2}, "settlement_method":{"service":"display/2","method":"settle","interface_major":2,"interface_minor":0,"schema_revision":2}, "argument_schema":schema, "output_capability":"display", "output_schema":schema, "max_access":"exclusive", "mutation_domains":["topology"]},
             "output":{"output_id":"output-id", "capability":"display", "schema":schema, "producer":"owner", "producer_service":"display/2", "origin":target, "resource":resource, "domain_observations":[{"domain":"topology","revision":4,"borrowers":{"stream":1},"complete":true}], "data":{}},
             "target":target, "transition_id":"transition", "parent_generation":null
         })).unwrap();
