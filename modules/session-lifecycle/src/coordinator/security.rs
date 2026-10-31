@@ -936,6 +936,59 @@ impl Coordinator {
     ) -> ModuleResult<Value> {
         let mut next = self.shared.borrow().value.clone();
         let operation = payload["operation"].as_str().ok_or("invalid_request")?;
+        if operation == "resolve_effect_sources" {
+            if caller != "amaterasu.nvhttp" || initiator != caller {
+                return Err("permission_denied".into());
+            }
+            if payload
+                .as_object()
+                .is_none_or(|fields| fields.len() != 2 || !fields.contains_key("target"))
+            {
+                return Err("invalid_request".into());
+            }
+            let target: LifecycleTarget =
+                serde_json::from_value(payload["target"].clone()).map_err(|_| "invalid_target")?;
+            let (session, stream) = operations::checked_target(&next, &target, caller, initiator)?;
+            if stream.is_some()
+                || !session.paired_source_attested
+                || session.owner.caller != caller
+                || session.owner.initiator != initiator
+                || !matches!(session.phase, SessionPhase::Ready | SessionPhase::Paused)
+            {
+                return Err("source_unavailable".into());
+            }
+            let mut sources = Vec::new();
+            for (token, binding) in &next.input_bindings {
+                if binding.session_id != session.id
+                    || binding.host_epoch != session.host_epoch
+                    || binding.host_epoch != next.host_epoch
+                    || next.revoked_inputs.contains(token)
+                    || next
+                        .inputs
+                        .validate_input_binding(&binding.input_consumer, token, binding)
+                        .is_err()
+                {
+                    continue;
+                }
+                let Some(stream) = session.streams.get(&binding.stream_id) else {
+                    continue;
+                };
+                if stream.phase != StreamPhase::Active || stream.generation != binding.generation {
+                    continue;
+                }
+                let (Some(id), Some(boot_epoch)) =
+                    (&binding.source_id, next.input_boot_epochs.get(token))
+                else {
+                    continue;
+                };
+                sources.push(
+                    json!({"source":{"version":1,"id":id,"generation":binding.generation},
+                    "target":target_for(binding),"input_consumer":binding.input_consumer,
+                    "input_boot_epoch":boot_epoch}),
+                );
+            }
+            return Ok(json!({"status":"succeeded","target":target,"sources":sources}));
+        }
         // Existing reservations must be able to drain after their generation is
         // fenced. Revocation closes new admission, not completion of owned work.
         if operation == "finish_input_action" || operation == "lookup_input_action" {

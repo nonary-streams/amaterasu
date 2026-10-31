@@ -1279,6 +1279,7 @@ impl Coordinator {
         if matches!(
             operation,
             "issue_input_binding"
+                | "resolve_effect_sources"
                 | "validate_input_binding"
                 | "reserve_input_action"
                 | "lookup_input_action"
