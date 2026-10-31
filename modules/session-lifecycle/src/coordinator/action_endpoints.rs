@@ -114,6 +114,32 @@ impl Coordinator {
         }
         let mut journal = self.shared.borrow().value.clone();
         match operation {
+            "cancel_input_reservation" => {
+                let (Some(operation_id), Some(action_id), Some(reservation_id)) = (
+                    payload["operation_id"].as_str(),
+                    payload["action_id"].as_str(),
+                    payload["reservation_id"].as_str(),
+                ) else {
+                    return rejection("invalid_reservation");
+                };
+                if journal
+                    .actions
+                    .has_operation(caller, operation_id, action_id)
+                {
+                    return rejection("action_outcome_unresolved");
+                }
+                if journal
+                    .inputs
+                    .cancel_transferred_reservation(reservation_id, caller, operation_id, action_id)
+                    .is_err()
+                {
+                    return rejection("reservation_not_cancelled");
+                }
+                if save(&self.shared, journal).is_err() {
+                    return json!({"status":"recovery_required","reason":"journal_write_failed"});
+                }
+                json!({"status":"succeeded","operation_id":operation_id,"action_id":action_id,"reservation_id":reservation_id})
+            }
             "consume_input_reservation" => {
                 let Some(reservation_id) = payload["reservation_id"].as_str() else {
                     return rejection("invalid_reservation");

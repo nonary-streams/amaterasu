@@ -325,6 +325,38 @@ impl InputAuthority {
         Ok(reservation.clone())
     }
 
+    /// Record a trusted action-service cancellation only when the caller has
+    /// independently established that no action permit was ever issued. This
+    /// does not claim that the input batch itself was undelivered.
+    pub fn cancel_transferred_reservation(
+        &mut self,
+        reservation_id: &str,
+        service: &str,
+        operation_id: &str,
+        action_id: &str,
+    ) -> Result<(), Error> {
+        let reservation = self
+            .reservations
+            .values_mut()
+            .find(|entry| entry.reservation_id == reservation_id)
+            .ok_or(Error::NotFound)?;
+        if reservation.transferred_to.as_deref() != Some(service)
+            || reservation.operation_id != operation_id
+            || reservation.action_id != action_id
+        {
+            return Err(Error::Unauthorized);
+        }
+        match reservation.outcome {
+            Outcome::Running => {
+                reservation.outcome = Outcome::Cancelled;
+                Ok(())
+            }
+            Outcome::Cancelled => Ok(()),
+            Outcome::RecoveryRequired => Err(Error::UnknownOutcome),
+            Outcome::Completed => Err(Error::Conflict),
+        }
+    }
+
     /// Fence the exact generation, excluding only an exact running reservation
     /// already transferred to the supplied authenticated action service.
     pub fn fence_except(
@@ -445,6 +477,65 @@ mod tests {
             allowed_actions: BTreeSet::from(["display".into()]),
         }
     }
+    #[test]
+    fn transferred_cancellation_is_owner_bound_and_idempotent() {
+        let mut authority = InputAuthority::default();
+        let active = binding();
+        let token = authority.issue_input_binding(&active).unwrap();
+        let ReservationResult::Admitted(reservation) = authority
+            .reserve_input_action("input", "client", "op", &token, "display", &active)
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(
+            authority
+                .cancel_transferred_reservation(
+                    &reservation.reservation_id,
+                    "actions",
+                    "op",
+                    "display"
+                )
+                .is_err()
+        );
+        authority
+            .transfer_reservation(&reservation.reservation_id, "actions", "op", "display")
+            .unwrap();
+        assert!(
+            authority
+                .cancel_transferred_reservation(
+                    &reservation.reservation_id,
+                    "other",
+                    "op",
+                    "display"
+                )
+                .is_err()
+        );
+        assert!(
+            authority
+                .cancel_transferred_reservation(
+                    &reservation.reservation_id,
+                    "actions",
+                    "op",
+                    "other"
+                )
+                .is_err()
+        );
+        authority
+            .cancel_transferred_reservation(&reservation.reservation_id, "actions", "op", "display")
+            .unwrap();
+        authority
+            .cancel_transferred_reservation(&reservation.reservation_id, "actions", "op", "display")
+            .unwrap();
+        assert_eq!(
+            authority
+                .resolve_reservation(&reservation.reservation_id)
+                .unwrap()
+                .outcome,
+            Outcome::Cancelled
+        );
+    }
+
     #[test]
     fn only_exact_transferred_input_reservation_is_exempted() {
         let mut authority = InputAuthority::default();

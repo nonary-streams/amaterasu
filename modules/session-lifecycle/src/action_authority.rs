@@ -728,6 +728,15 @@ impl ActionAuthority {
         Ok(blocked)
     }
 
+    /// Conservatively detects any prior permit for this action operation.
+    pub fn has_operation(&self, service: &str, operation_id: &str, action_id: &str) -> bool {
+        self.reservations.values().any(|entry| {
+            entry.action_service == service
+                && entry.binding.operation_id == operation_id
+                && entry.binding.action_id == action_id
+        })
+    }
+
     /// Any live or uncertain action for this logical target blocks retirement,
     /// including an action from a previous host epoch after restart.
     pub fn has_unresolved_session(&self, _host_epoch: &str, session_id: &str) -> bool {
@@ -824,6 +833,8 @@ mod tests {
         let token = authority
             .authorize_action("action-service", &binding, &canonical(&binding), 10, 20)
             .unwrap();
+        assert!(authority.has_operation("action-service", "op", "display/remove"));
+        assert!(!authority.has_operation("other", "op", "display/remove"));
         assert_eq!(
             authority.authorize_action("action-service", &binding, &canonical(&binding), 11, 20),
             Ok(token.clone())
