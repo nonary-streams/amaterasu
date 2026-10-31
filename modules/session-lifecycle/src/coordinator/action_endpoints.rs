@@ -489,6 +489,9 @@ impl Coordinator {
                     return rejection("action_provider_graph_missing");
                 };
                 let providers = provider_graph.order.iter().rev().cloned().collect();
+                let Ok(snapshot) = capture_action_snapshot(&journal, &target) else {
+                    return rejection("action_snapshot_unavailable");
+                };
                 let input_id = payload["input_reservation_id"].as_str().map(str::to_owned);
                 if let Some(input_id) = &input_id {
                     let Ok(reservation) = journal.inputs.resolve_running_reservation(input_id)
@@ -551,6 +554,7 @@ impl Coordinator {
                         binding,
                         input_reservation_id: input_id,
                         admission_id: None,
+                        snapshot: Some(snapshot),
                     }),
                 };
                 journal.receipts.insert(
@@ -713,6 +717,145 @@ fn action_transfer_in_progress(journal: &super::Journal) -> bool {
             .as_ref()
             .is_some_and(|work| work.action_transfer.is_some())
     })
+}
+
+pub(super) fn capture_action_snapshot(
+    journal: &super::Journal,
+    target: &amaterasu_extension_api::LifecycleTarget,
+) -> Result<super::ActionReleaseSnapshot, &'static str> {
+    use amaterasu_extension_api::{LifecyclePhase, LifecycleTarget};
+    let LifecycleTarget::Stream {
+        host_epoch,
+        session_id,
+        stream_id,
+        generation,
+    } = target
+    else {
+        return Err("stream_target_required");
+    };
+    let session = journal.sessions.get(session_id).ok_or("unknown_session")?;
+    let stream = session.streams.get(stream_id).ok_or("unknown_stream")?;
+    if host_epoch != &session.host_epoch || stream.generation != *generation {
+        return Err("stale_target");
+    }
+    let session_target = LifecycleTarget::Session {
+        host_epoch: host_epoch.clone(),
+        session_id: session_id.clone(),
+        generation: session.generation,
+    };
+    let mut session_admissions = BTreeMap::new();
+    let mut stream_admissions = BTreeMap::new();
+    for id in &session.admission_ids {
+        let original_target = session
+            .admission_targets
+            .get(id)
+            .ok_or("admission_target_missing")?;
+        let phase = session
+            .admission_phases
+            .get(id)
+            .ok_or("admission_phase_missing")?;
+        let destination =
+            if original_target == &session_target && *phase == LifecyclePhase::SessionPrepare {
+                &mut session_admissions
+            } else if original_target == target && *phase == LifecyclePhase::StreamPrepare {
+                &mut stream_admissions
+            } else {
+                continue;
+            };
+        let admission = journal
+            .authority
+            .settled
+            .get(id)
+            .ok_or("admission_not_settled")?;
+        let transition_id = journal
+            .admission_transitions
+            .get(id)
+            .filter(|id| super::valid_id(id))
+            .ok_or("admission_transition_missing")?;
+        destination.insert(
+            id.clone(),
+            super::ActionSnapshotAdmission {
+                admission: admission.clone(),
+                transition_id: transition_id.clone(),
+            },
+        );
+    }
+    let snapshot = super::ActionReleaseSnapshot {
+        session_target,
+        stream_target: target.clone(),
+        session_graph: session
+            .provider_graph
+            .clone()
+            .ok_or("session_graph_missing")?,
+        stream_graph: stream
+            .provider_graph
+            .clone()
+            .ok_or("stream_graph_missing")?,
+        session_admissions,
+        stream_admissions,
+    };
+    if serde_json::to_vec(&snapshot).map_or(true, |bytes| bytes.len() > 64 * 1024) {
+        return Err("action_snapshot_too_large");
+    }
+    Ok(snapshot)
+}
+
+pub(super) fn action_snapshot_matches(
+    journal: &super::Journal,
+    receipt: &super::Receipt,
+    work: &super::Work,
+    transfer: &super::ActionTransfer,
+    snapshot: &super::ActionReleaseSnapshot,
+) -> bool {
+    let amaterasu_extension_api::LifecycleTarget::Stream {
+        host_epoch,
+        session_id,
+        stream_id,
+        generation,
+    } = &work.target
+    else {
+        return false;
+    };
+    let Some(session) = journal.sessions.get(session_id) else {
+        return false;
+    };
+    let target_matches = match &transfer.binding.target {
+        ActionTarget::Session {
+            host_epoch: epoch,
+            session_id: id,
+            expected_generation,
+        } => epoch == host_epoch && id == session_id && *expected_generation == session.generation,
+        ActionTarget::Stream {
+            host_epoch: epoch,
+            session_id: id,
+            stream_id: stream,
+            expected_generation,
+        } => {
+            epoch == host_epoch
+                && id == session_id
+                && stream == stream_id
+                && expected_generation == generation
+        }
+        ActionTarget::Host { .. } => false,
+    };
+    target_matches
+        && transfer.binding.source == session.owner
+        && transfer.service == receipt.caller
+        && work.phase == amaterasu_extension_api::LifecyclePhase::StreamRelease
+        && work.provider_graph.as_ref() == Some(&snapshot.stream_graph)
+        && work
+            .providers
+            .iter()
+            .eq(snapshot.stream_graph.order.iter().rev())
+        && receipt.request["operation_id"].as_str() == Some(transfer.binding.operation_id.as_str())
+        && journal
+            .actions
+            .binding_for_permit(&transfer.service, &transfer.permit)
+            .ok()
+            .as_ref()
+            == Some(&transfer.binding)
+        && snapshot.stream_target == work.target
+        && capture_action_snapshot(journal, &work.target).ok().as_ref() == Some(snapshot)
 }
 
 /// Resolve the single stream that the action will retire; preparing or
@@ -1355,6 +1498,25 @@ mod tests {
             let work = journal.receipts[&key].work.as_ref().unwrap();
             assert_eq!(work.providers, vec!["display"]);
             assert_eq!(work.provider_graph.as_ref().unwrap().order, vec!["display"]);
+            assert!(super::super::validate_journal(journal).is_ok());
+            let mut tampered = journal.clone();
+            tampered
+                .receipts
+                .get_mut(&key)
+                .unwrap()
+                .work
+                .as_mut()
+                .unwrap()
+                .action_transfer
+                .as_mut()
+                .unwrap()
+                .snapshot
+                .as_mut()
+                .unwrap()
+                .stream_graph
+                .order
+                .clear();
+            assert!(super::super::validate_journal(&tampered).is_err());
         }
         let mut competing = auth.clone();
         competing["operation_id"] = json!("competing");
@@ -1659,6 +1821,31 @@ mod tests {
                 },
             );
         }
+        let frozen_graph = super::super::ProviderGraph {
+            order: vec!["display".into()],
+            dependencies: [("display".into(), vec![])].into(),
+        };
+        let session = scoped.sessions.get_mut("session").unwrap();
+        session.provider_graph = Some(frozen_graph.clone());
+        session.streams.get_mut("stream").unwrap().provider_graph = Some(frozen_graph);
+        scoped
+            .admission_transitions
+            .insert("session-admission".into(), "session-transition".into());
+        scoped
+            .admission_transitions
+            .insert("stream-admission".into(), "stream-transition".into());
+        let captured = capture_action_snapshot(&scoped, &stream_target).unwrap();
+        assert_eq!(
+            captured.session_admissions.keys().collect::<Vec<_>>(),
+            vec!["session-admission"]
+        );
+        assert_eq!(
+            captured.stream_admissions.keys().collect::<Vec<_>>(),
+            vec!["stream-admission"]
+        );
+        let mut missing_source = scoped.clone();
+        missing_source.authority.settled.remove("stream-admission");
+        assert!(capture_action_snapshot(&missing_source, &stream_target).is_err());
         assert_eq!(
             action_borrower_scope(&scoped, &stream_target, "display", &plan).unwrap(),
             ["session".into(), "stream".into()].into()

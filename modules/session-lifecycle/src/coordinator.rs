@@ -70,7 +70,7 @@ struct Receipt {
     wait_target: Option<LifecycleTarget>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProviderGraph {
     order: Vec<String>,
@@ -174,6 +174,27 @@ struct ActionTransfer {
     input_reservation_id: Option<String>,
     #[serde(default)]
     admission_id: Option<String>,
+    #[serde(default)]
+    snapshot: Option<ActionReleaseSnapshot>,
+}
+
+/// Immutable pre-cleanup lineage captured in the action-transfer transaction.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActionReleaseSnapshot {
+    session_target: LifecycleTarget,
+    stream_target: LifecycleTarget,
+    session_graph: ProviderGraph,
+    stream_graph: ProviderGraph,
+    session_admissions: BTreeMap<String, ActionSnapshotAdmission>,
+    stream_admissions: BTreeMap<String, ActionSnapshotAdmission>,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActionSnapshotAdmission {
+    admission: crate::prepare_authority::Admission,
+    transition_id: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -346,6 +367,17 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
         || !valid_id(&journal.host_epoch)
         || journal.receipts.len() > MAX_RECEIPTS
         || journal.sessions.len() > MAX_SESSIONS
+        || journal.receipts.values().any(|receipt| {
+            receipt.work.as_ref().is_some_and(|work| {
+                work.action_transfer.as_ref().is_some_and(|transfer| {
+                    transfer.snapshot.as_ref().is_some_and(|snapshot| {
+                        !action_endpoints::action_snapshot_matches(
+                            journal, receipt, work, transfer, snapshot,
+                        )
+                    })
+                })
+            })
+        })
         || !retention::validate(journal)
         || journal.admission_transitions.len() > 128
         || journal
