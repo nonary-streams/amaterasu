@@ -122,11 +122,11 @@ impl Dispatch {
         if self.stage != Stage::Planning {
             return Err("invalid_phase");
         }
-        let digest = self.validated_plan_digest(&plan)?;
+        let (plan, digest) = self.canonical_plan(&plan)?;
         self.stage = Stage::AwaitingPermit { plan, digest };
         Ok(())
     }
-    fn validated_plan_digest(&self, plan: &Value) -> Result<String, &'static str> {
+    fn canonical_plan(&self, plan: &Value) -> Result<(Value, String), &'static str> {
         let bytes = serde_json::to_vec(&plan).map_err(|_| "invalid_plan")?;
         if bytes.len() > 4_000 || !plan.is_object() {
             return Err("invalid_plan");
@@ -141,10 +141,16 @@ impl Dispatch {
         {
             return Err("capability_expansion");
         }
-        Ok(Sha256::digest(&bytes)
+        let canonical = serde_json::to_value(&typed).map_err(|_| "invalid_plan")?;
+        let bytes = serde_json::to_vec(&canonical).map_err(|_| "invalid_plan")?;
+        if bytes.len() > 4_000 {
+            return Err("invalid_plan");
+        }
+        let digest = Sha256::digest(&bytes)
             .iter()
             .map(|byte| format!("{byte:02x}"))
-            .collect())
+            .collect();
+        Ok((canonical, digest))
     }
     pub fn accept_permit(
         &mut self,
@@ -478,7 +484,7 @@ impl Dispatch {
                     return Err("invalid_reply");
                 }
                 let plan = reply.get("plan").cloned().ok_or("invalid_reply")?;
-                let digest = self.validated_plan_digest(&plan)?;
+                let (plan, digest) = self.canonical_plan(&plan)?;
                 self.stage = Stage::AwaitingRebind {
                     transition_id,
                     old_digest,
@@ -815,6 +821,22 @@ mod tests {
         assert_eq!(operation.stage, Stage::Planning);
     }
     #[test]
+    fn plan_digest_uses_canonical_typed_representation() {
+        let mut operation = fixture();
+        let mut plan = sample_plan();
+        plan["control_proposals"] = json!([]);
+        operation.accept_plan(plan).unwrap();
+        let Stage::AwaitingPermit { plan, digest } = &operation.stage else {
+            panic!()
+        };
+        assert!(plan.get("control_proposals").is_none());
+        let expected = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&sample_plan()).unwrap())
+        );
+        assert_eq!(*digest, expected);
+    }
+    #[test]
     fn mutation_waits_for_confirmed_transition_before_effect() {
         let mut operation = fixture();
         operation.descriptor.execution = ExecutionClass::SessionMutation;
@@ -859,10 +881,12 @@ mod tests {
         assert!(operation.begin_effect().is_err());
         let mut new_plan = sample_plan();
         new_plan["revision"] = json!(2);
+        new_plan["control_proposals"] = json!([]);
         operation.accept_reply(json!({"status":"planned","operation_id":"e:1","action_id":"example/action","target":target_json,"plan":new_plan})).unwrap();
-        let Stage::AwaitingRebind { digest, .. } = &operation.stage else {
+        let Stage::AwaitingRebind { digest, plan, .. } = &operation.stage else {
             panic!()
         };
+        assert!(plan.get("control_proposals").is_none());
         let digest = digest.clone();
         let serialized = serde_json::to_vec(&operation).unwrap();
         operation = serde_json::from_slice(&serialized).unwrap();
