@@ -90,12 +90,16 @@ that trailing padding; the short header also records the actual final payload
 length. Without FEC, one block of at most 1023 data packets is supported and its
 final packet is short.
 
-Input is bounded to 8 MiB; FEC output to four blocks of at most 255 UDP datagrams.
-Scalar parity work is additionally capped at 268,435,456 bytewise field
-multiply/XOR operations per call. `TooManyPackets`, `AccessUnitTooLarge`, or `FecWorkLimit`
-reports excess explicitly, with no partial output, consumed indices, disabled
-parity fallback, or silent truncation. At packet_size 1392 and 20% parity, four
-blocks allow 848 data shards. A local optimized smoke measurement, after table
+Input is bounded to 8 MiB. With parity, each block contains at most 255 UDP
+shards. If a frame exceeds the configured parity block capacity, that frame is
+sent without parity, using at most the negotiated block count and at most 1023
+data shards per block. The following frame uses the configured parity again.
+This avoids disconnecting a stream on a large keyframe; packet loss on a frame
+without parity requires receiver recovery. Scalar parity work is additionally
+capped at 268,435,456 bytewise field multiply/XOR operations per call.
+`TooManyPackets`, `AccessUnitTooLarge`, or `FecWorkLimit` still reports excess
+explicitly, without partial output, consumed indices, or silent truncation.
+At packet_size 1392 and 20% parity, four blocks allow 848 data shards with parity. A local optimized smoke measurement, after table
 initialization, averaged about 0.7/4.9/11.7 ms for 64 KiB/256 KiB/1 MiB access units
 (ten calls each). This is not a cross-platform throughput or latency guarantee;
 the managed transport must account for CPU work and pacing.

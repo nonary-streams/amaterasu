@@ -919,3 +919,26 @@ fn explicit_open_format_selects_hevc_and_rejects_hdr_before_binding() {
         Err("unsupported_video_format")
     ));
 }
+
+#[test]
+fn large_four_k_frame_does_not_fail_a_single_fec_block_stream() {
+    let (video, audio) = receivers();
+    let mut settings = request(&video, &audio, false);
+    settings.video.packet_size = 1360;
+    let mut stream = Stream::open("owner", &settings).unwrap();
+    let mut large = vec![0x55; 300_000];
+    large[..5].copy_from_slice(&[0, 0, 0, 1, 0x65]);
+    // SAFETY: both owned access units stay initialized through each submission.
+    assert_eq!(
+        unsafe { stream.submit_video(&video_packet(&large, 1)) },
+        STATUS_OK
+    );
+    assert_eq!(stream.state(), "sending");
+    assert!(stream.delivery.failure.is_none());
+    let ordinary = [0, 0, 0, 1, 0x65, 1];
+    assert_eq!(
+        unsafe { stream.submit_video(&video_packet(&ordinary, 2)) },
+        STATUS_OK
+    );
+    assert_eq!(stream.next_frame_index, Some(3));
+}

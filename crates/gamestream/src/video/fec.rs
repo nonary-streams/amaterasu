@@ -53,7 +53,7 @@ fn plan_blocks(data_shards: usize, config: VideoConfig) -> Result<Vec<Block>, Vi
     let maximum = largest_block(config).ok_or(VideoError::InvalidFec)?;
     let block_count = data_shards.div_ceil(maximum);
     if block_count > usize::from(config.max_fec_blocks) {
-        return Err(VideoError::TooManyPackets);
+        return plan_without_parity(data_shards, config.max_fec_blocks);
     }
     // Balance data across the blocks; only the final global shard is padded.
     let base = data_shards / block_count;
@@ -70,6 +70,26 @@ fn plan_blocks(data_shards: usize, config: VideoConfig) -> Result<Vec<Block>, Vi
         blocks.push(block);
     }
     Ok(blocks)
+}
+
+/// A large encoded frame must not terminate an otherwise healthy stream just
+/// because Reed-Solomon's 255-shard limit cannot fit its configured parity.
+/// The receiver also supports zero-parity blocks with ten-bit data counts.
+/// Keep the negotiated block limit and omit parity for this frame only.
+fn plan_without_parity(data_shards: usize, max_blocks: u8) -> Result<Vec<Block>, VideoError> {
+    let block_count = data_shards.div_ceil(MAX_PACKETS);
+    if block_count > usize::from(max_blocks) {
+        return Err(VideoError::TooManyPackets);
+    }
+    let base = data_shards / block_count;
+    let remainder = data_shards % block_count;
+    Ok((0..block_count)
+        .map(|index| Block {
+            data_shards: base + usize::from(index < remainder),
+            parity_shards: 0,
+            percentage: 0,
+        })
+        .collect())
 }
 
 pub(super) fn reservation(

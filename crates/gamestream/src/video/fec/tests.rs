@@ -153,10 +153,10 @@ fn malformed_hevc_nal_is_rejected_before_fec_consumes_packet_indices() {
 }
 
 #[test]
-fn oversized_or_unrepresentable_fec_never_falls_back_to_no_parity() {
+fn unrepresentable_frames_and_excessive_parity_work_remain_bounded() {
     let mut sender = VideoPacketizer::new(config()).unwrap();
     assert_eq!(
-        sender.packetize(&frame(849), false, 1, 0),
+        sender.packetize(&frame(4 * MAX_PACKETS + 1), false, 1, 0),
         Err(VideoError::TooManyPackets)
     );
     assert_eq!(sender.stream_index, 0);
@@ -330,10 +330,57 @@ fn negotiated_block_limit_prevents_legacy_multiblock_packets() {
     .unwrap();
     let packets = legacy.packetize(&frame(212), false, 1, 0).unwrap();
     assert!(packets.iter().all(|packet| packet[27] == 0));
+    let large = legacy.packetize(&frame(213), false, 2, 0).unwrap();
+    assert_eq!(large.len(), 213);
+    assert!(large.iter().all(|packet| packet[27] == 0));
+    assert!(large.iter().all(|packet| {
+        let info = u32::from_le_bytes(packet[28..32].try_into().unwrap());
+        (info >> 4) & 255 == 0
+    }));
     let next = legacy.stream_index;
     assert_eq!(
-        legacy.packetize(&frame(213), false, 2, 0),
+        legacy.packetize(&frame(MAX_PACKETS + 1), false, 3, 0),
         Err(VideoError::TooManyPackets)
     );
     assert_eq!(legacy.stream_index, next);
+}
+
+#[test]
+fn oversized_frames_roundtrip_without_parity_and_restore_it_for_the_next_frame() {
+    let mut sender = VideoPacketizer::new(config()).unwrap();
+    for data_count in [849, 1023, 1024, 4092] {
+        let original = frame(data_count);
+        let reservation = sender.reservation(original.len()).unwrap();
+        let packets = sender.packetize(&original, false, 7, 90000).unwrap();
+        assert_eq!(reservation.datagrams, data_count);
+        assert_eq!(
+            reservation.bytes,
+            packets.iter().map(Vec::len).sum::<usize>()
+        );
+        let mut recovered = Vec::new();
+        let mut offset = 0;
+        let blocks = data_count.div_ceil(MAX_PACKETS);
+        for block in 0..blocks {
+            let info = u32::from_le_bytes(packets[offset][28..32].try_into().unwrap());
+            let count = (info >> 22) as usize;
+            assert!((1..=MAX_PACKETS).contains(&count));
+            for (index, packet) in packets[offset..offset + count].iter().enumerate() {
+                assert_eq!(packet[27], (((blocks - 1) << 6) | (block << 4)) as u8);
+                let info = u32::from_le_bytes(packet[28..32].try_into().unwrap());
+                assert_eq!((info >> 4) & 255, 0);
+                assert_eq!((info >> 12) & 1023, index as u32);
+                assert_eq!((info >> 22) as usize, count);
+                assert_eq!(packet[24] & 4 != 0, index == 0);
+                assert_eq!(packet[24] & 2 != 0, index + 1 == count);
+                recovered.extend_from_slice(&packet[32..]);
+            }
+            offset += count;
+        }
+        assert_eq!(offset, packets.len());
+        assert_eq!(&recovered[8..], original);
+        let ordinary = sender.packetize(&frame(10), false, 8, 93000).unwrap();
+        assert_eq!(ordinary.len(), 12);
+        let info = u32::from_le_bytes(ordinary[0][28..32].try_into().unwrap());
+        assert_eq!((info >> 4) & 255, 20);
+    }
 }
