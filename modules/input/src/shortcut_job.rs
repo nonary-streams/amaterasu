@@ -6,6 +6,7 @@ use crate::{
     model::{Event, InputResult, Key},
     shortcut::{Disposition, Intent, Matcher},
     shortcut_bridge::StagedBatch,
+    shortcut_cache::Snapshot,
     shortcut_discovery::{CanonicalContext, DiscoveryJob},
     shortcut_dispatch::DispatchJob,
     shortcut_journal::{Admission, DispatchIntent, IntentPhase, Phase},
@@ -65,11 +66,13 @@ pub(crate) struct ShortcutJob {
     request: BatchRequest,
     fingerprint: Value,
     epoch: String,
-    sequence: u64,
+    journal_sequence: u64,
     step: Step,
     authority: Option<Authority>,
     expected_target: LifecycleTarget,
+    input_boot_epoch: String,
     discovery: Option<DiscoveryJob>,
+    cache_snapshot: Option<Snapshot>,
     matcher: Matcher,
     staged: Option<StagedBatch>,
     store: Option<ShortcutStore>,
@@ -92,6 +95,7 @@ impl ShortcutJob {
         payload: Value,
         expected_target: LifecycleTarget,
         deadline: Instant,
+        input_boot_epoch: String,
     ) -> Result<Self, String> {
         let request: BatchRequest =
             serde_json::from_value(payload.clone()).map_err(|_| "invalid shortcut batch")?;
@@ -128,13 +132,15 @@ impl ShortcutJob {
             caller,
             deadline,
             epoch: epoch.to_owned(),
-            sequence,
+            journal_sequence: 0,
             request,
             fingerprint: payload,
             step: Step::Validate,
             authority: None,
             expected_target,
+            input_boot_epoch,
             discovery: None,
+            cache_snapshot: None,
             matcher: Matcher::default(),
             staged: None,
             store: None,
@@ -150,6 +156,16 @@ impl ShortcutJob {
     }
     pub fn binding_identity(&self) -> (&str, &str) {
         (&self.request.lease, &self.request.input_binding)
+    }
+
+    pub fn take_cache_snapshot(&mut self) -> Option<Snapshot> {
+        self.cache_snapshot.take()
+    }
+    pub fn has_consumed_held(&self) -> bool {
+        self.matcher
+            .held_snapshot()
+            .iter()
+            .any(|(_, disposition)| *disposition == Disposition::Consume)
     }
 
     pub fn request_id(&self) -> u64 {
@@ -237,7 +253,7 @@ impl ShortcutJob {
                 return Some(
                     json!({"ok":true,"status":"delivered","epoch":epoch,"sequence":sequence,
                     "operation_id":operation_id,"reservation_id":reservation_id,"action_id":invoke.action_id,
-                    "target":invoke.target,"batch_epoch":journal.epoch,"batch_sequence":batch_sequence}),
+                    "target":invoke.target,"batch_epoch":journal.epoch,"batch_sequence":record.fingerprint.get("operation_id").and_then(Value::as_str).and_then(|id| id.rsplit_once(':')).and_then(|(_, seq)|seq.parse::<u64>().ok())?,"journal_sequence":batch_sequence}),
                 );
             }
         }
@@ -307,7 +323,7 @@ impl ShortcutJob {
                 controller
                     .authorize_batch_source(&self.caller, &self.request.lease, Instant::now())
                     .map_err(|_| "input lease unavailable")?;
-                let payload = json!({"operation":"validate_input_binding", "operation_id":format!("shortcut-validate-{}", self.request.operation_id), "token":self.request.input_binding});
+                let payload = json!({"operation":"validate_input_binding", "operation_id":format!("shortcut-validate-{}", self.request.operation_id), "token":self.request.input_binding, "input_boot_epoch":self.input_boot_epoch});
                 Step::ValidateWait(self.request(
                     send,
                     "amaterasu.session-lifecycle/1",
@@ -393,6 +409,14 @@ impl ShortcutJob {
                             })
                             .map(|entry| entry.binding)
                             .collect::<Vec<_>>();
+                        let discovery = self.discovery.as_ref().unwrap();
+                        self.cache_snapshot = Some(Snapshot {
+                            approval_revision: discovery
+                                .approval_revision()
+                                .ok_or("missing approval revision")?,
+                            settings_revisions: discovery.settings_revisions().clone(),
+                            bindings: bindings.clone(),
+                        });
                         self.matcher
                             .replace_approved_bindings(
                                 &bindings,
@@ -434,7 +458,10 @@ impl ShortcutJob {
                         self.dispatch = Some(DispatchJob::new(store, sequence, index)?);
                         Step::RecoverDispatch
                     } else {
-                        if let Some(existing) = journal.lookup(self.sequence) {
+                        if let Some(existing) = journal.receipts.values().find(|record| {
+                            record.fingerprint.get("operation_id")
+                                == Some(&json!(self.request.operation_id))
+                        }) {
                             if existing.fingerprint != self.fingerprint {
                                 return Err("shortcut operation conflict".into());
                             }
@@ -451,12 +478,10 @@ impl ShortcutJob {
                             }
                             return Err("shortcut receipt requires recovery".into());
                         }
-                        if self.sequence <= journal.retired_sequence {
-                            return Err("shortcut receipt expired".into());
-                        }
-                        if self.sequence != journal.next_sequence {
-                            return Err("shortcut sequence rejected".into());
-                        }
+                        // Source sequencing is enforced by the active binding. The
+                        // journal has its own sequence because fast-path mouse
+                        // batches do not create durable shortcut receipts.
+                        self.journal_sequence = journal.next_sequence;
                         if let Some((_, previous)) = journal.receipts.last_key_value() {
                             if previous.phase != Phase::Delivered
                                 || previous
@@ -471,6 +496,26 @@ impl ShortcutJob {
                                     .map_err(|_| "invalid held shortcut state")?;
                             self.matcher.recover_held(&held).map_err(str::to_owned)?;
                         }
+                        // Forwarded ownership can change on the keyboard fast path.
+                        // Consumed keys only exist in the durable matcher snapshot.
+                        let mut held = self
+                            .matcher
+                            .held_snapshot()
+                            .into_iter()
+                            .filter(|(_, disposition)| *disposition == Disposition::Consume)
+                            .collect::<Vec<_>>();
+                        held.extend(
+                            controller
+                                .shortcut_source_held_keys(
+                                    &self.caller,
+                                    &self.request.lease,
+                                    Instant::now(),
+                                )
+                                .map_err(|_| "input lease unavailable")?
+                                .into_iter()
+                                .map(|key| (key, Disposition::Forward)),
+                        );
+                        self.matcher.recover_held(&held).map_err(str::to_owned)?;
                         let authority = self.authority.as_ref().unwrap();
                         let target = serde_json::to_value(&authority.action_target)
                             .map_err(|_| "invalid target")?;
@@ -589,7 +634,7 @@ impl ShortcutJob {
                 self.armed = true;
                 let admission = self.staged.as_mut().unwrap().arm(
                     self.store.as_mut().unwrap(),
-                    self.sequence,
+                    self.journal_sequence,
                     self.fingerprint.clone(),
                     self.reservations.clone(),
                 )?;
@@ -617,7 +662,7 @@ impl ShortcutJob {
                     .unwrap()
                     .deliver(
                         self.store.as_ref().unwrap(),
-                        self.sequence,
+                        self.journal_sequence,
                         &mut self.matcher,
                         controller,
                         Instant::now(),
@@ -632,7 +677,7 @@ impl ShortcutJob {
                 self.store
                     .as_mut()
                     .unwrap()
-                    .finish(self.sequence, phase, Some(result.clone()))
+                    .finish(self.journal_sequence, phase, Some(result.clone()))
                     .map_err(|_| "shortcut delivery receipt unavailable")?;
                 self.delivery = Some(result);
                 Step::WaitDelivery
@@ -660,7 +705,7 @@ impl ShortcutJob {
                 if self.dispatch.is_none() {
                     self.dispatch = Some(DispatchJob::new(
                         self.store.as_ref().unwrap(),
-                        self.sequence,
+                        self.journal_sequence,
                         self.dispatch_index,
                     )?);
                 }
@@ -769,7 +814,7 @@ mod tests {
                             if payload["operation"] == "list" {
                                 json!({"ok":true,"revision":1,"items":if self.actionful {vec![crate::shortcut_discovery::tests::descriptor()]} else {vec![]},"next":null})
                             } else {
-                                json!({"ok":true,"effective":{"shortcut":{"value":crate::shortcut_discovery::tests::binding(),"source":null}}})
+                                json!({"ok":true,"revision":1,"effective":{"shortcut":{"value":crate::shortcut_discovery::tests::binding(),"source":null}}})
                             }
                         }
                         "amaterasu.extension-actions/1" => {
@@ -843,6 +888,7 @@ mod tests {
                 generation: 1,
             },
             now + Duration::from_secs(20),
+            "boot".into(),
         )
         .unwrap();
         let mut host = Host::default();
@@ -880,6 +926,7 @@ mod tests {
             payload,
             target,
             now + Duration::from_secs(20),
+            "boot".into(),
         )
         .unwrap();
         let mut duplicate_result = None;
@@ -928,6 +975,7 @@ mod tests {
             payload,
             target,
             now + Duration::from_secs(20),
+            "boot".into(),
         )
         .unwrap();
         let mut host = Host {

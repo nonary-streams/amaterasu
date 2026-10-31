@@ -8,7 +8,7 @@ use amaterasu_extension_api::{
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 const SERVICE: &str = "amaterasu.extension-registry/1";
@@ -41,6 +41,7 @@ struct Page {
 #[derive(Deserialize)]
 struct Settings {
     ok: bool,
+    revision: u64,
     effective: std::collections::BTreeMap<String, Effective>,
 }
 #[derive(Deserialize)]
@@ -72,6 +73,8 @@ pub(crate) struct DiscoveryJob {
     cursors: BTreeSet<String>,
     binding_ids: BTreeSet<String>,
     bindings: Vec<ApprovedBinding>,
+    approval_revision: Option<u64>,
+    settings_revisions: BTreeMap<String, u64>,
 }
 
 impl DiscoveryJob {
@@ -111,7 +114,16 @@ impl DiscoveryJob {
             cursors: BTreeSet::new(),
             binding_ids: BTreeSet::new(),
             bindings: Vec::new(),
+            approval_revision: None,
+            settings_revisions: BTreeMap::new(),
         })
+    }
+
+    pub fn approval_revision(&self) -> Option<u64> {
+        self.approval_revision
+    }
+    pub fn settings_revisions(&self) -> &BTreeMap<String, u64> {
+        &self.settings_revisions
     }
 
     /// Drive outside the input callback. A completed result is consumed once.
@@ -188,6 +200,7 @@ impl DiscoveryJob {
                 {
                     return Err("shortcut registry changed or denied discovery".into());
                 }
+                self.approval_revision = Some(page.revision);
                 for descriptor in page.items {
                     validate_descriptor(&descriptor)?;
                     if !self.providers.insert(descriptor.provider.clone())
@@ -225,6 +238,8 @@ impl DiscoveryJob {
                     .descriptors
                     .get(*index)
                     .ok_or("missing shortcut descriptor")?;
+                self.settings_revisions
+                    .insert(descriptor.provider.clone(), settings.revision);
                 for option in descriptor
                     .options
                     .iter()
@@ -373,7 +388,7 @@ pub(crate) mod tests {
                     assert_eq!(pending["input_binding"], "token");
                     assert!(pending["paired_client"].is_null());
                     Ok(Response::Result {
-                        payload: json!({"ok":true,"effective":{"shortcut":{"value":binding(),"source":null}}}),
+                        payload: json!({"ok":true,"revision":1,"effective":{"shortcut":{"value":binding(),"source":null}}}),
                     })
                 }
                 Command::ReleaseResult { .. } => Ok(Response::Ok),
@@ -433,8 +448,10 @@ pub(crate) mod tests {
                 value["target"] = json!("host");
             }
             assert!(
-                job.accept(json!({"ok":true,"effective":{"shortcut":{"value":value}}}))
-                    .is_err()
+                job.accept(
+                    json!({"ok":true,"revision":1,"effective":{"shortcut":{"value":value}}})
+                )
+                .is_err()
             );
         }
     }

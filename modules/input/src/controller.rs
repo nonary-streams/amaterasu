@@ -1179,6 +1179,24 @@ impl<B: Backend> Controller<B> {
         Ok(())
     }
 
+    /// Return source identities held by this exact lease, including remapped keys.
+    pub(crate) fn shortcut_source_held_keys(
+        &self,
+        caller: &str,
+        token: &str,
+        now: Instant,
+    ) -> InputResult<Vec<crate::model::Key>> {
+        self.authorize_batch_source(caller, token, now)?;
+        Ok(self
+            .pressed
+            .iter()
+            .filter_map(|entry| match entry {
+                Pressed::Key(key) => Some(key.clone()),
+                _ => None,
+            })
+            .collect())
+    }
+
     /// Shortcut matching obeys the same per-lease keyboard/device gate as native
     /// delivery; disabled input must never become an action through filtering.
     pub(crate) fn shortcut_event_enabled(&self, event: &Event) -> bool {

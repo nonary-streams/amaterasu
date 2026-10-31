@@ -33,12 +33,16 @@ pub(crate) struct Authority {
     pub target: LifecycleTarget,
     pub geometry_revision: u64,
     pub batch_epoch: String,
+    pub active: bool,
 }
 struct Binding {
     owner: String,
     lease: Option<String>,
     target: Option<LifecycleTarget>,
     geometry_revision: Option<u64>,
+    batch_epoch: Option<String>,
+    active: bool,
+    next_sequence: u64,
     revoked: bool,
     revoke_id: Option<String>,
 }
@@ -84,6 +88,9 @@ impl Bindings {
                 lease: None,
                 target: None,
                 geometry_revision: None,
+                batch_epoch: None,
+                active: false,
+                next_sequence: 1,
                 revoked: false,
                 revoke_id: None,
             },
@@ -107,10 +114,13 @@ impl Bindings {
         token: &str,
         owner: &str,
         lease: &str,
-        target: LifecycleTarget,
-        geometry_revision: u64,
+        authority: &Authority,
     ) -> Result<(), &'static str> {
-        if !valid_text(lease) || geometry_revision == 0 || !valid_target(&target) {
+        if !valid_text(lease)
+            || !valid_text(&authority.batch_epoch)
+            || authority.geometry_revision == 0
+            || !valid_target(&authority.target)
+        {
             return Err("invalid_binding");
         }
         let entry = self.entries.get_mut(token).ok_or("binding_unavailable")?;
@@ -118,8 +128,10 @@ impl Bindings {
             return Err("binding_unavailable");
         }
         entry.lease = Some(lease.into());
-        entry.target = Some(target);
-        entry.geometry_revision = Some(geometry_revision);
+        entry.target = Some(authority.target.clone());
+        entry.geometry_revision = Some(authority.geometry_revision);
+        entry.batch_epoch = Some(authority.batch_epoch.clone());
+        entry.active = authority.active;
         Ok(())
     }
     /// Reject bare legacy batches on bound leases and reject token/lease mismatch.
@@ -143,6 +155,67 @@ impl Bindings {
         } else {
             Ok(())
         }
+    }
+    /// A pending binding may be acquired but cannot deliver until lifecycle validates it active.
+    pub fn batch_active(
+        &self,
+        owner: &str,
+        lease: &str,
+        token: &str,
+    ) -> Result<bool, &'static str> {
+        self.authorize_batch(owner, lease, Some(token))?;
+        Ok(self.entries.get(token).ok_or("binding_unavailable")?.active)
+    }
+    pub fn activate(
+        &mut self,
+        owner: &str,
+        lease: &str,
+        token: &str,
+        authority: &Authority,
+    ) -> Result<(), &'static str> {
+        self.authorize_batch(owner, lease, Some(token))?;
+        let binding = self.entries.get_mut(token).ok_or("binding_unavailable")?;
+        if !authority.active
+            || binding.target.as_ref() != Some(&authority.target)
+            || binding.geometry_revision != Some(authority.geometry_revision)
+            || binding.batch_epoch.as_deref() != Some(authority.batch_epoch.as_str())
+        {
+            return Err("binding_stale");
+        }
+        binding.active = true;
+        Ok(())
+    }
+    /// Advance the source edge before native work. A lost response cannot be replayed.
+    pub fn admit_sequence(
+        &mut self,
+        owner: &str,
+        lease: &str,
+        token: &str,
+        operation_id: &str,
+    ) -> Result<(), &'static str> {
+        self.authorize_batch(owner, lease, Some(token))?;
+        let binding = self.entries.get_mut(token).ok_or("binding_unavailable")?;
+        if !binding.active {
+            return Err("binding_inactive");
+        }
+        let (epoch, suffix) = operation_id
+            .rsplit_once(':')
+            .ok_or("invalid_operation_id")?;
+        let sequence = suffix.parse::<u64>().map_err(|_| "invalid_operation_id")?;
+        if binding.batch_epoch.as_deref() != Some(epoch)
+            || sequence == 0
+            || suffix != sequence.to_string()
+        {
+            return Err("invalid_operation_id");
+        }
+        if sequence < binding.next_sequence {
+            return Err("receipt_expired");
+        }
+        if sequence != binding.next_sequence {
+            return Err("sequence_conflict");
+        }
+        binding.next_sequence = sequence.checked_add(1).ok_or("sequence_exhausted")?;
+        Ok(())
     }
     pub fn batch_target(
         &self,
@@ -219,6 +292,7 @@ pub(crate) struct AcquireJob {
     pub deadline: Instant,
     request: Option<u64>,
     operation_id: String,
+    input_boot_epoch: String,
 }
 impl AcquireJob {
     pub fn new(
@@ -227,7 +301,11 @@ impl AcquireJob {
         token: String,
         payload: Value,
         deadline: Instant,
+        input_boot_epoch: String,
     ) -> Result<Self, String> {
+        if !valid_text(&input_boot_epoch) {
+            return Err("invalid input boot epoch".into());
+        }
         let mut bytes = [0u8; 16];
         getrandom::fill(&mut bytes).map_err(|_| "random unavailable")?;
         let operation_id = format!(
@@ -242,6 +320,7 @@ impl AcquireJob {
             deadline,
             request: None,
             operation_id,
+            input_boot_epoch,
         })
     }
     pub fn cancel(&mut self, send: &mut impl FnMut(Command) -> ModuleResult<Response>) {
@@ -289,10 +368,15 @@ impl AcquireJob {
                     {
                         return Err("binding authorization denied".into());
                     }
+                    let active = payload
+                        .get("active")
+                        .and_then(Value::as_bool)
+                        .ok_or("missing binding active state")?;
                     Ok(Some(Authority {
                         target,
                         geometry_revision,
                         batch_epoch,
+                        active,
                     }))
                 }
                 _ => {
@@ -307,7 +391,7 @@ impl AcquireJob {
             .as_millis() as u64;
         match send(Command::Request {
             service: LIFECYCLE.into(),
-            payload: json!({"operation":"validate_input_binding","operation_id":self.operation_id,"token":self.token}),
+            payload: json!({"operation":"validate_input_binding","operation_id":self.operation_id,"token":self.token,"input_boot_epoch":self.input_boot_epoch}),
             timeout_ms: timeout_ms.max(1),
             operation_id: self.operation_id.clone(),
             parent: Some(self.parent),
@@ -318,6 +402,35 @@ impl AcquireJob {
             }
             _ => Err("binding validation unavailable".into()),
         }
+    }
+}
+
+/// One lightweight lifecycle validation used when the acquired generation is not yet active.
+pub(crate) struct BatchActivationJob(AcquireJob);
+impl BatchActivationJob {
+    pub fn new(
+        parent: u64,
+        token: String,
+        deadline: Instant,
+        input_boot_epoch: String,
+    ) -> Result<Self, String> {
+        Ok(Self(AcquireJob::new(
+            parent,
+            String::new(),
+            token,
+            Value::Null,
+            deadline,
+            input_boot_epoch,
+        )?))
+    }
+    pub fn advance(
+        &mut self,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+    ) -> Result<Option<Authority>, String> {
+        self.0.advance(send)
+    }
+    pub fn cancel(&mut self, send: &mut impl FnMut(Command) -> ModuleResult<Response>) {
+        self.0.cancel(send);
     }
 }
 
@@ -339,7 +452,17 @@ mod tests {
         let mut bindings = Bindings::default();
         bindings.begin_acquire("token", "owner").unwrap();
         bindings
-            .bind("token", "owner", "lease", target(), 1)
+            .bind(
+                "token",
+                "owner",
+                "lease",
+                &Authority {
+                    target: target(),
+                    geometry_revision: 1,
+                    batch_epoch: "epoch".into(),
+                    active: true,
+                },
+            )
             .unwrap();
         assert!(
             bindings
@@ -386,6 +509,70 @@ mod tests {
         assert!(bindings.authorize_batch("owner", "legacy", None).is_ok());
     }
     #[test]
+    fn active_validation_and_source_sequence_are_fenced_by_target_and_revoke() {
+        let mut bindings = Bindings::default();
+        bindings.begin_acquire("token", "owner").unwrap();
+        bindings
+            .bind(
+                "token",
+                "owner",
+                "lease",
+                &Authority {
+                    target: target(),
+                    geometry_revision: 4,
+                    batch_epoch: "epoch".into(),
+                    active: false,
+                },
+            )
+            .unwrap();
+        assert!(!bindings.batch_active("owner", "lease", "token").unwrap());
+        assert_eq!(
+            bindings.admit_sequence("owner", "lease", "token", "epoch:1"),
+            Err("binding_inactive")
+        );
+        let mut authority = Authority {
+            target: target(),
+            geometry_revision: 5,
+            batch_epoch: "epoch".into(),
+            active: true,
+        };
+        assert!(
+            bindings
+                .activate("owner", "lease", "token", &authority)
+                .is_err()
+        );
+        authority.geometry_revision = 4;
+        bindings
+            .activate("owner", "lease", "token", &authority)
+            .unwrap();
+        assert!(bindings.batch_active("owner", "lease", "token").unwrap());
+        bindings
+            .admit_sequence("owner", "lease", "token", "epoch:1")
+            .unwrap();
+        assert_eq!(
+            bindings.admit_sequence("owner", "lease", "token", "epoch:1"),
+            Err("receipt_expired")
+        );
+        assert_eq!(
+            bindings.admit_sequence("owner", "lease", "token", "epoch:3"),
+            Err("sequence_conflict")
+        );
+        bindings
+            .revoke(LIFECYCLE, "revoke", "token", target())
+            .unwrap();
+        assert!(
+            bindings
+                .activate("owner", "lease", "token", &authority)
+                .is_err()
+        );
+        assert!(
+            bindings
+                .admit_sequence("owner", "lease", "token", "epoch:2")
+                .is_err()
+        );
+    }
+
+    #[test]
     fn revoke_before_authority_cannot_bind_and_unknown_token_never_claims_retirement() {
         let mut bindings = Bindings::default();
         assert!(
@@ -397,7 +584,17 @@ mod tests {
         bindings.revoke(LIFECYCLE, "r", "token", target()).unwrap();
         assert!(
             bindings
-                .bind("token", "owner", "lease", target(), 1)
+                .bind(
+                    "token",
+                    "owner",
+                    "lease",
+                    &Authority {
+                        target: target(),
+                        geometry_revision: 1,
+                        batch_epoch: "epoch".into(),
+                        active: true
+                    }
+                )
                 .is_err()
         );
     }
@@ -409,6 +606,7 @@ mod tests {
             "token".into(),
             json!({}),
             Instant::now() + Duration::from_secs(1),
+            "boot".into(),
         )
         .unwrap();
         let mut send = |command| -> ModuleResult<Response> {
@@ -418,10 +616,11 @@ mod tests {
                 } => {
                     assert_eq!(parent, Some(7));
                     assert_eq!(payload["token"], "token");
+                    assert_eq!(payload["input_boot_epoch"], "boot");
                     Ok(Response::Accepted { id: 1 })
                 }
                 Command::TakeResult { .. } => Ok(Response::Result {
-                    payload: json!({"status":"succeeded","target":target(),"geometry_revision":1,"batch_epoch":"epoch","allowed_actions":[]}),
+                    payload: json!({"status":"succeeded","target":target(),"geometry_revision":1,"batch_epoch":"epoch","active":true,"allowed_actions":[]}),
                 }),
                 Command::ReleaseResult { .. } => Ok(Response::Ok),
                 _ => panic!("unexpected command"),
@@ -435,13 +634,14 @@ mod tests {
             "token".into(),
             json!({}),
             Instant::now() + Duration::from_secs(1),
+            "boot".into(),
         )
         .unwrap();
         let mut send = |command| -> ModuleResult<Response> {
             match command {
                 Command::Request { .. } => Ok(Response::Accepted { id: 1 }),
                 Command::TakeResult { .. } => Ok(Response::Result {
-                    payload: json!({"status":"succeeded","target":{"kind":"host","host_epoch":"forged"},"geometry_revision":1,"batch_epoch":"epoch"}),
+                    payload: json!({"status":"succeeded","target":{"kind":"host","host_epoch":"forged"},"geometry_revision":1,"batch_epoch":"epoch","active":true}),
                 }),
                 Command::ReleaseResult { .. } => Ok(Response::Ok),
                 _ => panic!("unexpected command"),

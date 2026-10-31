@@ -9,6 +9,7 @@ mod gamepad_profile;
 mod model;
 pub mod shortcut;
 mod shortcut_bridge;
+mod shortcut_cache;
 mod shortcut_discovery;
 mod shortcut_dispatch;
 mod shortcut_job;
@@ -72,6 +73,10 @@ struct InputModule {
     shortcut_job: Option<(String, shortcut_job::ShortcutJob)>,
     bindings: session_binding::Bindings,
     acquire_job: Option<session_binding::AcquireJob>,
+    activation_job: Option<(QueuedRequest, session_binding::BatchActivationJob)>,
+    input_boot_epoch: String,
+    shortcut_cache: shortcut_cache::ShortcutCache,
+    has_consumed_held: bool,
     pending_revoke: Option<(QueuedRequest, session_binding::RevokeRequest)>,
 }
 
@@ -91,6 +96,16 @@ struct DeliveryProofRequest {
     sequence: u64,
     operation_id: String,
     reservation_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoundBatch {
+    action: String,
+    lease: String,
+    input_binding: String,
+    operation_id: String,
+    events: Vec<model::Event>,
 }
 
 #[derive(Deserialize)]
@@ -178,7 +193,16 @@ impl ManagedModule for InputModule {
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
+        let mut boot_random = [0u8; 16];
+        getrandom::fill(&mut boot_random).map_err(|_| "input boot identity unavailable")?;
+        let input_boot_epoch = boot_random
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         Ok(Self {
+            input_boot_epoch,
+            shortcut_cache: shortcut_cache::ShortcutCache::default(),
+            has_consumed_held: true,
             runtime,
             controller: Controller::new(backend, settings.allow_injection),
             product_settings: ProductSettings::new(),
@@ -186,6 +210,7 @@ impl ManagedModule for InputModule {
             shortcut_job: None,
             bindings: session_binding::Bindings::default(),
             acquire_job: None,
+            activation_job: None,
             pending_revoke: None,
         })
     }
@@ -195,6 +220,7 @@ impl ManagedModule for InputModule {
         self.product_settings
             .advance(&mut |command| runtime.send(command), &mut self.controller)?;
         self.advance_acquire()?;
+        self.advance_activation()?;
         self.advance_shortcut()?;
         self.advance_revoke()?;
         self.drain_queued()?;
@@ -215,6 +241,7 @@ impl ManagedModule for InputModule {
             self.accept_request(id, caller, service, payload, remaining_ms)?;
         }
         self.advance_acquire()?;
+        self.advance_activation()?;
         self.advance_shortcut()?;
         self.advance_revoke()?;
         self.drain_queued()?;
@@ -310,6 +337,8 @@ impl InputModule {
                     false,
                 );
             }
+            self.shortcut_cache.invalidate(&revoke.token);
+            self.has_consumed_held = true;
             if transferred {
                 self.shortcut_job
                     .as_mut()
@@ -331,6 +360,7 @@ impl InputModule {
         }
         let defer = ((self.shortcut_job.is_some()
             || self.acquire_job.is_some()
+            || self.activation_job.is_some()
             || self.pending_revoke.is_some())
             && !is_read_only_input(&request.payload))
             || should_defer_settings_request(
@@ -359,6 +389,7 @@ impl InputModule {
             && !self.product_settings.busy()
             && self.shortcut_job.is_none()
             && self.acquire_job.is_none()
+            && self.activation_job.is_none()
             && self.pending_revoke.is_none()
         {
             let Some(request) = self.queued.pop_front() else {
@@ -495,6 +526,7 @@ impl InputModule {
                 token.clone(),
                 payload,
                 request.deadline,
+                self.input_boot_epoch.clone(),
             ) {
                 Ok(job) => self.acquire_job = Some(job),
                 Err(error) => {
@@ -617,17 +649,30 @@ impl InputModule {
             && (request.payload.get("operation_id").is_some()
                 || request.payload.get("input_binding").is_some())
         {
-            let lease = request
-                .payload
-                .get("lease")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let token = request
-                .payload
-                .get("input_binding")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let target = match self.bindings.batch_target(&request.caller, lease, token) {
+            let batch: BoundBatch = match serde_json::from_value(request.payload.clone()) {
+                Ok(batch) => batch,
+                Err(_) => {
+                    return self.complete(
+                        request.id,
+                        InputError::new("invalid_request", "invalid bound batch").payload(),
+                        &request.caller,
+                        false,
+                    );
+                }
+            };
+            if batch.action != "batch" {
+                return self.complete(
+                    request.id,
+                    InputError::new("invalid_request", "invalid bound batch").payload(),
+                    &request.caller,
+                    false,
+                );
+            }
+            let target = match self.bindings.batch_target(
+                &request.caller,
+                &batch.lease,
+                &batch.input_binding,
+            ) {
                 Ok(target) => target,
                 Err(code) => {
                     return self.complete(
@@ -638,12 +683,98 @@ impl InputModule {
                     );
                 }
             };
+            match self
+                .bindings
+                .batch_active(&request.caller, &batch.lease, &batch.input_binding)
+            {
+                Ok(true) => (),
+                Ok(false) => {
+                    match session_binding::BatchActivationJob::new(
+                        request.id,
+                        batch.input_binding.clone(),
+                        request.deadline,
+                        self.input_boot_epoch.clone(),
+                    ) {
+                        Ok(job) => {
+                            self.activation_job = Some((request, job));
+                            return Ok(());
+                        }
+                        Err(message) => {
+                            return self.complete(
+                                request.id,
+                                InputError::new("binding_unavailable", message).payload(),
+                                &request.caller,
+                                false,
+                            );
+                        }
+                    }
+                }
+                Err(code) => {
+                    return self.complete(
+                        request.id,
+                        InputError::new(code, "input binding unavailable").payload(),
+                        &request.caller,
+                        false,
+                    );
+                }
+            }
+            if let Err(code) = self.bindings.admit_sequence(
+                &request.caller,
+                &batch.lease,
+                &batch.input_binding,
+                &batch.operation_id,
+            ) {
+                return self.complete(
+                    request.id,
+                    InputError::new(code, "input sequence rejected").payload(),
+                    &request.caller,
+                    false,
+                );
+            }
+            let bypass_keyboard = self.shortcut_cache.can_bypass_keyboard(
+                &batch.input_binding,
+                &target,
+                Instant::now(),
+                self.has_consumed_held,
+            );
+            if non_keyboard_batch(&batch.events) || bypass_keyboard {
+                let runtime = &self.runtime;
+                let bindings = &self.bindings;
+                let mut guard = || match runtime.send(Command::CheckRequest {
+                    request: request.id,
+                }) {
+                    Ok(Response::Ok) => bindings
+                        .batch_active(&request.caller, &batch.lease, &batch.input_binding)
+                        .and_then(|active| {
+                            if active {
+                                Ok(())
+                            } else {
+                                Err("binding_inactive")
+                            }
+                        })
+                        .map_err(|code| InputError::new(code, "input binding retired")),
+                    _ => Err(InputError::new("cancelled", "input request cancelled")),
+                };
+                let operation = Operation::Batch {
+                    lease: batch.lease.clone(),
+                    events: batch.events,
+                };
+                let mut reply =
+                    self.controller
+                        .handle(&request.caller, operation, Instant::now(), &mut guard);
+                if reply["ok"] == true {
+                    reply["operation_id"] = batch.operation_id.into();
+                }
+                let cleanup = completion_requires_cleanup(true, &reply);
+                return self.complete(request.id, reply, &request.caller, cleanup);
+            }
             return match shortcut_job::ShortcutJob::new(
                 request.id,
                 request.caller.clone(),
                 request.payload,
                 target,
                 request.deadline,
+                self.input_boot_epoch.clone(),
             ) {
                 Ok(job) => {
                     self.shortcut_job = Some((request.caller, job));
@@ -765,13 +896,7 @@ impl InputModule {
                         .to_owned();
                     if self
                         .bindings
-                        .bind(
-                            &job.token,
-                            &job.owner,
-                            &lease,
-                            authority.target.clone(),
-                            authority.geometry_revision,
-                        )
+                        .bind(&job.token, &job.owner, &lease, &authority)
                         .is_err()
                     {
                         self.controller.cancel_owner(&job.owner);
@@ -783,6 +908,8 @@ impl InputModule {
                             false,
                         );
                     }
+                    self.shortcut_cache.invalidate(&job.token);
+                    self.has_consumed_held = true;
                     reply["input_binding"] = job.token.clone().into();
                     reply["target"] =
                         serde_json::to_value(authority.target).map_err(|e| e.to_string())?;
@@ -806,6 +933,55 @@ impl InputModule {
             return Ok(());
         };
         self.complete(request.id, serde_json::json!({"ok":true,"status":"retired","token":revoke.token,"target":revoke.target}), &request.caller, false)
+    }
+
+    fn advance_activation(&mut self) -> ModuleResult<()> {
+        let Some((request, mut job)) = self.activation_job.take() else {
+            return Ok(());
+        };
+        let token = request.payload["input_binding"].as_str().unwrap_or("");
+        let lease = request.payload["lease"].as_str().unwrap_or("");
+        if self
+            .bindings
+            .authorize_batch(&request.caller, lease, Some(token))
+            .is_err()
+        {
+            job.cancel(&mut |command| self.runtime.send(command));
+            return self.complete(
+                request.id,
+                InputError::new("binding_retired", "input binding revoked").payload(),
+                &request.caller,
+                false,
+            );
+        }
+        match job.advance(&mut |command| self.runtime.send(command)) {
+            Ok(None) => {
+                self.activation_job = Some((request, job));
+                Ok(())
+            }
+            Ok(Some(authority)) => {
+                if self
+                    .bindings
+                    .activate(&request.caller, lease, token, &authority)
+                    .is_err()
+                {
+                    return self.complete(
+                        request.id,
+                        InputError::new("binding_inactive", "input generation is not active")
+                            .payload(),
+                        &request.caller,
+                        false,
+                    );
+                }
+                self.dispatch(request)
+            }
+            Err(message) => self.complete(
+                request.id,
+                InputError::new("binding_unavailable", message).payload(),
+                &request.caller,
+                false,
+            ),
+        }
     }
 
     fn advance_shortcut(&mut self) -> ModuleResult<()> {
@@ -849,7 +1025,22 @@ impl InputModule {
                 self.shortcut_job = Some((caller, job));
                 Ok(())
             }
-            Ok(Some(payload)) => self.complete(request, payload, &caller, false),
+            Ok(Some(payload)) => {
+                if payload["ok"] == true {
+                    self.has_consumed_held = job.has_consumed_held();
+                    if let Some(snapshot) = job.take_cache_snapshot()
+                        && let Ok(target) = self.bindings.batch_target(&caller, &lease, &binding)
+                    {
+                        self.shortcut_cache.install(
+                            binding.clone(),
+                            target,
+                            snapshot,
+                            Instant::now(),
+                        );
+                    }
+                }
+                self.complete(request, payload, &caller, false)
+            }
             Err(message) => {
                 let armed = job.armed();
                 if armed {
@@ -902,6 +1093,13 @@ impl InputModule {
             }
         }
     }
+}
+
+fn non_keyboard_batch(events: &[model::Event]) -> bool {
+    !events.is_empty()
+        && events
+            .iter()
+            .all(|event| !matches!(event, model::Event::Key { .. }))
 }
 
 fn is_read_only_input(payload: &Value) -> bool {
