@@ -310,8 +310,16 @@ cursor with `revision_conflict`.
 {"action":"export_list","limit":32,"cursor":null}
 ```
 
-The authenticated **immediate caller** selects the applicable mapping,
-independently of the request initiator. An unmapped caller receives
+Direct consumers use the authenticated **immediate caller** to select the
+mapping. The operator-approved startup setting `library_principal` selects one
+trusted library facade, defaulting to `amaterasu.library`; its delegated
+`export_list`, `resolve_exported`, and `resolve_exported_artwork` calls use the
+authenticated runtime initiator to select the mapping. The setting must be a
+1–128 character principal containing only ASCII letters, digits, dots,
+underscores, or hyphens. The request cannot choose the facade or catalog owner.
+The library principal cannot be the catalog, management, NVHTTP, or launch
+principal, or any principal configured in `launch_principals`.
+An unmapped caller or initiator receives
 `permission_denied` before state access. The payload cannot supply an owner,
 initiator or search query. Call grants for catalog and delegated state access
 are still required. `export_principals` grants only `export_list` and anchors

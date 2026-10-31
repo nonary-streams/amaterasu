@@ -2364,6 +2364,75 @@ fn library_exports_use_the_authenticated_configured_initiator() {
 }
 
 #[test]
+fn selected_library_principal_controls_delegated_reads() {
+    let configured = || {
+        Pipeline::new_with_steam_id_export_principals(
+            BTreeSet::new(),
+            BTreeMap::from([("nvhttp".into(), "owner".into())]),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .with_library_principal("external.library".into())
+    };
+    let requests = || {
+        [
+            Operation::ExportList {
+                cursor: None,
+                limit: None,
+            },
+            Operation::ResolveExported {
+                id: "app-0000000000000001".into(),
+            },
+            Operation::ResolveExportedArtwork {
+                id: "app-0000000000000001".into(),
+            },
+        ]
+    };
+    let pipeline = configured();
+    for request in requests() {
+        let (key, _, _) = pipeline
+            .select_catalog("external.library", "nvhttp", request)
+            .unwrap();
+        assert_eq!(key, "principal/owner");
+    }
+    for caller in ["amaterasu.library", "unconfigured.library"] {
+        for request in requests() {
+            assert!(
+                pipeline.select_catalog(caller, "nvhttp", request).is_err(),
+                "{caller}"
+            );
+        }
+    }
+    for request in requests() {
+        assert!(
+            pipeline
+                .select_catalog("external.library", "unconfigured", request)
+                .is_err()
+        );
+    }
+    let default = Pipeline::new_with_steam_id_export_principals(
+        BTreeSet::new(),
+        BTreeMap::from([("nvhttp".into(), "owner".into())]),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    for request in requests() {
+        assert!(
+            default
+                .select_catalog("amaterasu.library", "nvhttp", request)
+                .is_ok()
+        );
+    }
+    for request in requests() {
+        assert!(
+            default
+                .select_catalog("external.library", "nvhttp", request)
+                .is_err()
+        );
+    }
+}
+
+#[test]
 fn library_resolve_returns_only_public_fields() {
     let mut backend = Backend::default();
     let mut pipeline = Pipeline::new_with_steam_id_export_principals(

@@ -226,6 +226,7 @@ struct Scan {
 }
 #[derive(Default)]
 pub struct Pipeline {
+    library_principal: Option<String>,
     launch_principals: BTreeSet<String>,
     export_principals: BTreeMap<String, String>,
     steam_id_export_principals: BTreeMap<String, String>,
@@ -238,6 +239,11 @@ pub struct Pipeline {
     seed: DesktopSeed,
 }
 impl Pipeline {
+    pub fn with_library_principal(mut self, principal: String) -> Self {
+        self.library_principal = Some(principal);
+        self
+    }
+
     pub fn new_with_steam_id_export_principals(
         launch_principals: BTreeSet<String>,
         export_principals: BTreeMap<String, String>,
@@ -271,6 +277,10 @@ impl Pipeline {
         initiator: &str,
         operation: Operation,
     ) -> Result<(String, Option<String>, Operation), Value> {
+        let library_principal = self
+            .library_principal
+            .as_deref()
+            .unwrap_or(LIBRARY_PRINCIPAL);
         if matches!(operation, Operation::ProviderPlayniteFullscreenEntry { .. })
             && caller != PLAYNITE_IMPORTER
         {
@@ -304,7 +314,7 @@ impl Pipeline {
                 Ok((format!("principal/{caller}"), None, operation))
             }
             operation @ Operation::ExportList { .. } => {
-                let consumer = if caller == LIBRARY_PRINCIPAL {
+                let consumer = if caller == library_principal {
                     initiator
                 } else {
                     caller
@@ -318,7 +328,7 @@ impl Pipeline {
                 Ok((format!("principal/{owner}"), None, operation))
             }
             operation @ Operation::ResolveExported { .. } => {
-                if caller != LIBRARY_PRINCIPAL {
+                if caller != library_principal {
                     return Err(error(
                         "permission_denied",
                         "caller is not the library facade",
@@ -333,7 +343,7 @@ impl Pipeline {
                 Ok((format!("principal/{owner}"), None, operation))
             }
             operation @ Operation::ResolveExportedArtwork { .. } => {
-                let consumer = if caller == LIBRARY_PRINCIPAL {
+                let consumer = if caller == library_principal {
                     initiator
                 } else {
                     caller

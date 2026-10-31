@@ -11,9 +11,11 @@ use pipeline::Pipeline;
 const SERVICE: &str = "amaterasu.catalog/1";
 const STATE_SERVICE: &str = "amaterasu.state/1";
 
-#[derive(Default, serde::Deserialize)]
+#[derive(serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Settings {
+    /// Trusted library caller selected by the operator-approved package.
+    library_principal: String,
     launch_principals: std::collections::BTreeSet<String>,
     export_principals: std::collections::BTreeMap<String, String>,
     steam_id_export_principals: std::collections::BTreeMap<String, String>,
@@ -25,9 +27,32 @@ struct Settings {
     seed_desktop_entry: bool,
 }
 
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            library_principal: "amaterasu.library".into(),
+            launch_principals: Default::default(),
+            export_principals: Default::default(),
+            steam_id_export_principals: Default::default(),
+            import_principals: Default::default(),
+            provider_launch_principals: Default::default(),
+            seed_desktop_entry: false,
+        }
+    }
+}
+
 impl Settings {
     fn validate(&self) -> ModuleResult<()> {
-        if self.launch_principals.len() > 16
+        if !valid_principal(&self.library_principal)
+            || matches!(
+                self.library_principal.as_str(),
+                "amaterasu.nvhttp"
+                    | "amaterasu.management"
+                    | "amaterasu.launch"
+                    | "amaterasu.catalog"
+            )
+            || self.launch_principals.contains(&self.library_principal)
+            || self.launch_principals.len() > 16
             || self
                 .launch_principals
                 .iter()
@@ -106,6 +131,7 @@ impl ManagedModule for CatalogModule {
                 settings.steam_id_export_principals,
                 settings.import_principals,
             )
+            .with_library_principal(settings.library_principal)
             .with_provider_launch_principals(settings.provider_launch_principals)
             .with_desktop_seed(seeded_owners),
         })
@@ -122,6 +148,46 @@ amaterasu_module_sdk::export_module!(CatalogModule);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_library_principal_is_validated_at_startup() {
+        let defaults: Settings = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(defaults.library_principal, "amaterasu.library");
+        let selected: Settings =
+            serde_json::from_value(serde_json::json!({"library_principal":"external.library"}))
+                .unwrap();
+        assert!(selected.validate().is_ok());
+        for invalid in [
+            "",
+            "bad/name",
+            "a b",
+            "amaterasu.nvhttp",
+            "amaterasu.management",
+            "amaterasu.launch",
+            "amaterasu.catalog",
+        ] {
+            let settings: Settings =
+                serde_json::from_value(serde_json::json!({"library_principal":invalid})).unwrap();
+            assert!(settings.validate().is_err(), "{invalid}");
+        }
+        let launch_overlap: Settings = serde_json::from_value(serde_json::json!({
+            "library_principal":"external.library", "launch_principals":["external.library"]
+        }))
+        .unwrap();
+        assert!(launch_overlap.validate().is_err());
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!(false),
+            serde_json::json!(7),
+        ] {
+            assert!(
+                serde_json::from_value::<Settings>(
+                    serde_json::json!({"library_principal":invalid})
+                )
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn provider_launch_mapping_requires_unique_authorized_importers() {
