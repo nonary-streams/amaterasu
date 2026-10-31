@@ -713,3 +713,69 @@ fn released_root_scope_cannot_hide_unrelated_resource_or_obligation() {
     unrelated.plan.mutation_domains[0].domain = "other-domain".into();
     assert!(!root_plan_is_scoped_to_released_resource(&unrelated));
 }
+
+#[test]
+fn retired_stream_without_proof_keeps_its_admission() {
+    let fixture = Fixture::new();
+    let mut journal = fixture.coordinator.shared.borrow().value.clone();
+    let session = journal.sessions.get_mut("session-a").unwrap();
+    session.streams.insert(
+        "stream".into(),
+        StreamRecord {
+            provider_graph: None,
+            generation: 1,
+            phase: StreamPhase::Retired,
+            candidate: None,
+            required: BTreeSet::new(),
+            acknowledgements: BTreeSet::new(),
+            retirements: BTreeSet::new(),
+            binding_owner: "provider-a".into(),
+            preparation_transition: "prepare".into(),
+            provider_settings: BTreeMap::new(),
+        },
+    );
+    assert!(
+        closed_stream_admissions(&journal, &journal.sessions["session-a"])
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn forged_stream_proof_cannot_close_admissions() {
+    let fixture = Fixture::new();
+    let mut journal = fixture.coordinator.shared.borrow().value.clone();
+    let epoch = journal.host_epoch.clone();
+    let target = LifecycleTarget::Stream {
+        host_epoch: epoch,
+        session_id: "session-a".into(),
+        stream_id: "stream".into(),
+        generation: 1,
+    };
+    journal
+        .sessions
+        .get_mut("session-a")
+        .unwrap()
+        .streams
+        .insert(
+            "stream".into(),
+            StreamRecord {
+                provider_graph: None,
+                generation: 1,
+                phase: StreamPhase::Retired,
+                candidate: None,
+                required: BTreeSet::new(),
+                acknowledgements: BTreeSet::new(),
+                retirements: BTreeSet::new(),
+                binding_owner: "provider-a".into(),
+                preparation_transition: "prepare".into(),
+                provider_settings: BTreeMap::new(),
+            },
+        );
+    let selected = super::super::finalize_selection::tests::fixture();
+    journal.composed_releases = serde_json::from_value(json!({"proofs":[{
+        "work":{"phase":"stream.release","target":target,"intent":null,"reason":null,"video":null,"transition_id":"release","providers":[],"index":0,"states":{},"candidate":null,"waiting_retirement":false},
+        "finalize_permit_id":"forged", "released_output":selected.input.output
+    }]})).unwrap();
+    assert!(closed_stream_admissions(&journal, &journal.sessions["session-a"]).is_err());
+}

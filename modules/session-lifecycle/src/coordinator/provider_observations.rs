@@ -49,6 +49,112 @@ fn root_plan_is_scoped_to_released_resource(root: &super::composition::StoredOut
         })
 }
 
+/// Return only admissions named by an authenticated stream cleanup chain.
+fn closed_stream_admissions(
+    journal: &Journal,
+    session: &SessionRecord,
+) -> ModuleResult<BTreeSet<String>> {
+    let mut closed = BTreeSet::new();
+    for (stream_id, stream) in &session.streams {
+        let target = LifecycleTarget::Stream {
+            host_epoch: session.host_epoch.clone(),
+            session_id: session.id.clone(),
+            stream_id: stream_id.clone(),
+            generation: stream.generation,
+        };
+        let has_standalone = journal.stream_releases.has_released(&target);
+        let has_composed = journal.composed_releases.contains_target(&target);
+        if !has_standalone && !has_composed {
+            continue;
+        }
+        let (cleanup_id, _) = journal
+            .verified_released_output(&target)
+            .ok_or("stream_release_unproven")?;
+        let mut results = journal
+            .finalize_results
+            .records()
+            .filter(|result| result.request.target == target);
+        let finalized = results.next().ok_or("stream_release_finalize_missing")?;
+        if results.next().is_some() {
+            return Err("stream_release_finalize_ambiguous".into());
+        }
+        let permit = journal
+            .authority
+            .finalize_permits
+            .get(&finalized.request.permit_id)
+            .ok_or("stream_release_finalize_permit_missing")?;
+        if !finalized.validate_structure()
+            || !finalized.validate_control_chain(journal)
+            || !permit.consumed
+            || !permit.settled
+            || permit.request != finalized.request
+            || !journal
+                .authority
+                .output_admissions
+                .contains(&finalized.request.admission_id)
+        {
+            return Err("stream_release_finalize_unproven".into());
+        }
+        let generation =
+            super::resource_generation::historical_generation(journal, &finalized.selection.input)?;
+        let owner = &finalized.selection.policy.owner_provider;
+        if session.resource_generations.get(owner) != Some(&generation) {
+            // Earlier generations are handled by the independently verified action closure.
+            continue;
+        }
+        let stage = finalized
+            .selection
+            .stage
+            .as_ref()
+            .ok_or("stream_release_stage_missing")?;
+        let mut candidates = BTreeSet::from([
+            stage.admission_id.clone(),
+            finalized.request.admission_id.clone(),
+            cleanup_id.to_owned(),
+        ]);
+        if has_composed {
+            let transition = journal
+                .admission_transitions
+                .get(cleanup_id)
+                .ok_or("stream_release_transition_missing")?;
+            let work = journal
+                .composed_releases
+                .verified_work_for(journal, &target, transition)
+                .ok_or("stream_release_unproven")?;
+            let source = finalized
+                .chain_work
+                .as_ref()
+                .ok_or("stream_release_source_missing")?;
+            candidates.extend(
+                work.states
+                    .values()
+                    .filter_map(|state| state.admission_id.clone()),
+            );
+            candidates.extend(
+                source
+                    .states
+                    .values()
+                    .filter_map(|state| state.admission_id.clone()),
+            );
+        }
+        for id in candidates {
+            if !session.admission_ids.contains(&id)
+                || session.admission_targets.get(&id) != Some(&target)
+                || !matches!(
+                    session.admission_phases.get(&id),
+                    Some(LifecyclePhase::StreamPrepare | LifecyclePhase::StreamRelease)
+                )
+                || !journal.authority.settled.contains_key(&id)
+                || journal.authority.admissions.contains_key(&id)
+            {
+                return Err("stream_release_admission_invalid".into());
+            }
+            closed.insert(id);
+        }
+    }
+    Ok(closed)
+}
+
 /// Only authenticated terminal action evidence closes historical admissions.
 /// Domain names and a released output flag alone do not prove cleanup.
 fn closed_admissions(journal: &Journal, session: &SessionRecord) -> ModuleResult<BTreeSet<String>> {
@@ -57,7 +163,7 @@ fn closed_admissions(journal: &Journal, session: &SessionRecord) -> ModuleResult
         session_id: session.id.clone(),
         generation: session.generation,
     };
-    let mut closed = BTreeSet::new();
+    let mut closed = closed_stream_admissions(journal, session)?;
     for root in journal.composition.records().filter(|root| {
         root.output.origin == target && root.state == super::composition::OutputState::Released
     }) {
