@@ -2,6 +2,7 @@
 """Validate split participant and registry policy assembly."""
 import copy
 import hashlib
+import json
 import unittest
 from unittest import mock
 
@@ -45,6 +46,9 @@ class CompositionPolicyTest(unittest.TestCase):
         self.assertEqual(result["input_actions"], [])
         self.assertEqual(result["action_grants"], [])
         self.assertTrue(all("untrusted" not in approval["callers"] for approval in result["api_methods"]))
+        self.assertTrue(all({m["method"] for m in entry["approved_methods"]} == {"settings_validate"}
+                            for entry in result["registry_descriptors"]))
+        self.assertEqual(len(result["api_methods"]), len(self.owner["approvals"]) + len(self.display["approvals"]))
 
     def test_action_requires_exact_contract(self):
         with self.assertRaisesRegex(ValueError, "does not advertise"):
@@ -61,6 +65,11 @@ class CompositionPolicyTest(unittest.TestCase):
         result = policy.provider_entries(self.selected, True)
         self.assertEqual(result["input_actions"], [check.OWNER + "/remove-owned"])
         self.assertEqual(len(result["action_grants"]), 3)
+        registry = {entry["descriptor"]["provider"]: entry for entry in result["registry_descriptors"]}
+        self.assertEqual({m["method"] for m in registry[check.OWNER]["approved_methods"]},
+                         {"settings_validate", "action_plan", "action_execute", "action_status"})
+        self.assertEqual({m["method"] for m in registry[check.DISPLAY]["approved_methods"]}, {"settings_validate"})
+        self.assertEqual(len(result["api_methods"]), len(self.owner["approvals"]) + len(self.display["approvals"]))
         self.assertTrue(all(grant["target_kinds"] == ["stream"] for grant in result["action_grants"]))
         self.owner["descriptor"]["actions"][0]["required_capabilities"] = ["unexpected"]
         with self.assertRaisesRegex(ValueError, "unsupported owner action"):
@@ -83,6 +92,19 @@ class CompositionPolicyTest(unittest.TestCase):
         self.assertEqual(result["action_grants"], [])
         with self.assertRaisesRegex(ValueError, "does not advertise"):
             policy.provider_entries(self.selected, True)
+
+    def test_registry_payload_omits_large_unreferenced_method_schemas(self):
+        for item in self.selected:
+            for approval in item["approvals"]:
+                if approval["method"]["method"] != "settings_validate":
+                    approval["method"]["request"]["required"] = {
+                        f"field_{index}": "string" for index in range(64)}
+        result = policy.provider_entries(self.selected)
+        registry_bytes = json.dumps({"descriptors": result["registry_descriptors"]},
+                                    separators=(",", ":")).encode()
+        self.assertLess(len(registry_bytes), 16 * 1024)
+        self.assertTrue(any(len(a["method"]["request"]["required"]) == 64
+                            for a in result["api_methods"]))
 
     def test_action_profile_requires_owner_grants_and_full_call_chain(self):
         self.owner["descriptor"]["actions"] = [{"id": check.OWNER + "/remove-owned", "execution": "session_mutation",

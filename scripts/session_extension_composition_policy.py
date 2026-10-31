@@ -68,6 +68,7 @@ def provider_entries(selected: list[dict], enable_action: bool = False) -> dict:
         by_id[identity] = item
     if set(by_id) != {check.DISPLAY, check.OWNER}:
         raise ValueError("both selected providers are required")
+    action_id = approved_action(by_id[check.OWNER]["descriptor"], enable_action)
     validation_callers = [legacy.REGISTRY, legacy.ACTIONS, legacy.LIFECYCLE, legacy.MANAGEMENT,
                           legacy.INPUT, legacy.STREAM, legacy.RTSP, legacy.NVHTTP, legacy.CONSOLE]
     registry = []
@@ -93,8 +94,18 @@ def provider_entries(selected: list[dict], enable_action: bool = False) -> dict:
         grants = [{"caller": caller, "scope": {"kind": "host"}, "read": True,
                    "write": caller in (legacy.MANAGEMENT, legacy.CONSOLE)}
                   for caller in validation_callers if caller != legacy.REGISTRY]
+        # Registry validates only the descriptor's settings and advertised
+        # action methods. Lifecycle and owner-control methods stay pinned in
+        # broker approvals, and need not consume the bounded registry payload.
+        registry_names = {"settings_validate"}
+        if provider == check.OWNER and descriptor["actions"]:
+            registry_names.update({"action_plan", "action_execute", "action_status"})
+        registry_methods = [entry["method"] for entry in selected_approvals
+                            if entry["method"]["method"] in registry_names]
+        if {method["method"] for method in registry_methods} != registry_names:
+            raise ValueError("descriptor methods are missing from registry approvals")
         registry.append({"descriptor": copy.deepcopy(descriptor), "descriptor_sha256": digest,
-                         "approved_methods": [entry["method"] for entry in selected_approvals],
+                         "approved_methods": registry_methods,
                          "grants": grants, "migrations": []})
         defaults = {option["id"]: option["definition"]["default"] for option in descriptor["options"]}
         participant = {"provider": provider, "contract_version": 2,
@@ -110,7 +121,6 @@ def provider_entries(selected: list[dict], enable_action: bool = False) -> dict:
         approvals.extend(selected_approvals)
     if by_id[check.DISPLAY]["descriptor"].get("actions"):
         raise ValueError("display settings actions are unsupported")
-    action_id = approved_action(by_id[check.OWNER]["descriptor"], enable_action)
     action_grants = [{"principal": identity, "action_ids": [action_id],
                       "target_kinds": ["stream"], "execution_classes": ["session_mutation"]}
                      for identity in (legacy.MANAGEMENT, legacy.INPUT, legacy.STREAM)] if enable_action else []
