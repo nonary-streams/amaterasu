@@ -66,6 +66,15 @@ reply also contains the canonical parent `session_target` and whether the known
 session consumers are retired. Payload identity fields alone never authorize an
 effect.
 
+Retained plans carry their original target and lifecycle phase. Provider metadata
+distinguishes the last observed mutation-domain state from domains requiring a
+new readback. A selected provider can submit `refresh_provider_observations` for
+its established, unlocked domains and resources; the coordinator validates and
+persists the complete batch atomically. This records the trusted provider's
+native readback. It does not independently prove operating-system state.
+Producer identity remains stable across consumer borrows; individual native
+borrow tokens remain separate lease evidence.
+
 ## Settings and actions
 
 Descriptors use namespaced IDs and declarative schemas. Adding an option or action
