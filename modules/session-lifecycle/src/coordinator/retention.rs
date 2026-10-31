@@ -33,6 +33,57 @@ pub(super) fn expired(journal: &Journal, key: &str) -> bool {
     journal.retention.tombstones.contains(&digest(key))
 }
 
+// Operation receipt keys are JSON arrays. The NUL-prefixed domain cannot
+// collide with an existing receipt key, even for arbitrary caller IDs.
+fn session_fence_key(epoch: &str, session_id: &str) -> String {
+    format!(
+        "\0session:{}",
+        serde_json::to_string(&(epoch, session_id)).expect("string tuple serializes")
+    )
+}
+
+/// A closed session fence also covers every stream generation in that session.
+pub(super) fn session_expired(journal: &Journal, target: &LifecycleTarget) -> bool {
+    let Ok((epoch, session_id, _, _)) = operations::target_parts(target) else {
+        return false;
+    };
+    journal
+        .retention
+        .tombstones
+        .contains(&digest(&session_fence_key(epoch, session_id)))
+}
+
+/// Add only to a private journal clone whose corresponding session has been
+/// fully closed. The caller must remove its live session and commit all proof
+/// retirement in the same atomic write. Existing receipt fences share the same
+/// bounded budget and are never displaced.
+#[allow(
+    dead_code,
+    reason = "awaits the atomic ended-session closure transaction"
+)]
+pub(super) fn fence_closed_session(
+    journal: &mut Journal,
+    target: &LifecycleTarget,
+) -> ModuleResult<()> {
+    let LifecycleTarget::Session {
+        host_epoch,
+        session_id,
+        generation,
+    } = target
+    else {
+        return Err("session_target_required".into());
+    };
+    if !valid_id(host_epoch) || !valid_id(session_id) || *generation == 0 {
+        return Err("invalid_session_target".into());
+    }
+    let key = digest(&session_fence_key(host_epoch, session_id));
+    if !journal.retention.tombstones.contains(&key) && at_capacity(journal) {
+        return Err("retention_capacity_exhausted".into());
+    }
+    journal.retention.tombstones.insert(key);
+    Ok(())
+}
+
 pub(super) fn at_capacity(journal: &Journal) -> bool {
     journal.retention.tombstones.len() >= MAX_TOMBSTONES
 }
@@ -55,6 +106,16 @@ pub(super) fn validate(journal: &Journal) -> bool {
             .receipts
             .keys()
             .all(|key| !retention.tombstones.contains(&digest(key)))
+        && journal.sessions.values().all(|session| {
+            !session_expired(
+                journal,
+                &LifecycleTarget::Session {
+                    host_epoch: session.host_epoch.clone(),
+                    session_id: session.id.clone(),
+                    generation: session.generation,
+                },
+            )
+        })
 }
 
 fn target(value: &Value) -> Option<LifecycleTarget> {
@@ -313,6 +374,46 @@ mod tests {
             json!({"version":3,"host_epoch":"epoch","receipts":{},"sessions":{}}),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn expired_session_fence_is_exact_durable_and_capacity_bounded() {
+        let mut journal = journal();
+        let target = LifecycleTarget::Session {
+            host_epoch: "epoch".into(),
+            session_id: "one".into(),
+            generation: 1,
+        };
+        fence_closed_session(&mut journal, &target).unwrap();
+        let restored: Journal =
+            serde_json::from_slice(&serde_json::to_vec(&journal).unwrap()).unwrap();
+        assert!(validate(&restored));
+        assert!(session_expired(&restored, &target));
+        let child = LifecycleTarget::Stream {
+            host_epoch: "epoch".into(),
+            session_id: "one".into(),
+            stream_id: "stream".into(),
+            generation: 7,
+        };
+        assert!(session_expired(&restored, &child));
+        let other = LifecycleTarget::Session {
+            host_epoch: "other-epoch".into(),
+            session_id: "one".into(),
+            generation: 1,
+        };
+        assert!(!session_expired(&restored, &other));
+        assert!(
+            matches!(operations::checked_target(&restored, &target, "caller", "caller"), Err(error) if error == "session_expired")
+        );
+        journal.retention.tombstones = (0..MAX_TOMBSTONES)
+            .map(|id| digest(&format!("other-{id}")))
+            .collect();
+        let before = journal.retention.tombstones.clone();
+        assert_eq!(
+            fence_closed_session(&mut journal, &target).unwrap_err(),
+            "retention_capacity_exhausted"
+        );
+        assert_eq!(journal.retention.tombstones, before);
     }
 
     fn insert_ended(journal: &mut Journal, id: usize, status: &str) -> String {

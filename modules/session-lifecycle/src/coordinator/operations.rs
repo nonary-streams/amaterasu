@@ -36,6 +36,9 @@ pub(super) fn checked_target<'a>(
     initiator: &str,
 ) -> ModuleResult<(&'a SessionRecord, Option<String>)> {
     let (epoch, id, stream, generation) = target_parts(target)?;
+    if retention::session_expired(journal, target) {
+        return Err("session_expired".into());
+    }
     if epoch != journal.host_epoch {
         return Err("stale_host_epoch".into());
     }
@@ -230,6 +233,9 @@ impl Coordinator {
                 session_id: id.clone(),
                 generation: 1,
             };
+            if retention::session_expired(&next, &target) {
+                return Err("session_identity_expired".into());
+            }
             let current =
                 self.new_work(LifecyclePhase::SessionPrepare, target.clone(), &payload)?;
             response = json!({"status":"pending","host_epoch":next.host_epoch,"session_id":id,"generation":1,"target":target,"transition_id":current.transition_id});
