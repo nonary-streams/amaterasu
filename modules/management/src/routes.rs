@@ -22,6 +22,23 @@ pub fn resolve(path: &str) -> Option<Route> {
             "extension_call",
             Some("account.self"),
         ),
+        ("extension-actions", action) => (
+            "amaterasu.extension-actions/1",
+            match action {
+                "open_epoch" => "open_epoch",
+                "invoke" => "invoke",
+                "status" => "status",
+                "close_epoch" => "close_epoch",
+                "retire_epoch" => "retire_epoch",
+                _ => return None,
+            },
+            Some("configuration.write"),
+        ),
+        ("extension-actions-target", "snapshot") => (
+            "amaterasu.session-lifecycle/1",
+            "snapshot",
+            Some("configuration.write"),
+        ),
         ("session-extensions", action) => (
             "amaterasu.extension-registry/1",
             match action {
@@ -486,7 +503,12 @@ pub fn payload(route: Route, bytes: &[u8]) -> Result<Value, &'static str> {
         return Err("the route defines the action");
     }
     crate::route_payload::validate(route, object)?;
-    if route.service == "amaterasu.extension-registry/1" {
+    if matches!(
+        route.service,
+        "amaterasu.extension-registry/1"
+            | "amaterasu.extension-actions/1"
+            | "amaterasu.session-lifecycle/1"
+    ) {
         object.insert("operation".into(), route.action.into());
     } else {
         object.insert("action".into(), route.action.into());
@@ -497,6 +519,18 @@ pub fn payload(route: Route, bytes: &[u8]) -> Result<Value, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extension_action_ingress_limits_targets_and_rejects_authority_fields() {
+        let invoke = resolve("/v1/extension-actions/invoke").unwrap();
+        assert_eq!(invoke.scope, Some("configuration.write"));
+        let host = br#"{"epoch":"epoch","sequence":1,"operation_id":"epoch:1","action_id":"provider/action","target":{"kind":"host","host_epoch":"host"},"arguments":{},"expected_settings_revision":null}"#;
+        assert_eq!(payload(invoke, host).unwrap()["operation"], "invoke");
+        let session = br#"{"epoch":"epoch","sequence":1,"operation_id":"epoch:1","action_id":"provider/action","target":{"kind":"session","host_epoch":"host","session_id":"s","expected_generation":1},"arguments":{},"expected_settings_revision":null}"#;
+        assert!(payload(invoke, session).is_err());
+        let forged = br#"{"epoch":"epoch","sequence":1,"operation_id":"epoch:1","action_id":"provider/action","target":{"kind":"host","host_epoch":"host","admin":true},"arguments":{},"expected_settings_revision":null}"#;
+        assert!(payload(invoke, forged).is_err());
+    }
 
     #[test]
     fn session_extension_settings_only_accept_host_scope_and_server_action() {

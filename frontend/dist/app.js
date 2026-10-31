@@ -16044,6 +16044,104 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    class ExtensionActionClient {
+        api;
+        openId = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("");
+        epoch = null;
+        submitted = false;
+        constructor(api) {
+            this.api = api;
+        }
+        get wasSubmitted() { return this.submitted; }
+        async invoke(actionId, args) {
+            if (this.submitted)
+                throw new Error("This action may already have been submitted. Check its status before starting another.");
+            const snapshot = await this.api.post("extension-actions-target/snapshot");
+            if (typeof snapshot.host_epoch !== "string" || !snapshot.host_epoch)
+                throw new Error("Invalid host snapshot.");
+            if (!this.epoch) {
+                const opened = await this.api.post("extension-actions/open_epoch", { operation_id: this.openId });
+                if (typeof opened.epoch !== "string" || !opened.epoch)
+                    throw new Error("Invalid action epoch.");
+                this.epoch = opened.epoch;
+            }
+            const epoch = this.epoch;
+            this.submitted = true;
+            return this.api.post("extension-actions/invoke", {
+                epoch, sequence: 1, operation_id: `${epoch}:1`, action_id: actionId,
+                target: { kind: "host", host_epoch: snapshot.host_epoch }, arguments: args, expected_settings_revision: null,
+            });
+        }
+        async retireRejected(receipt) {
+            if (!this.epoch || receipt.status !== "rejected" || receipt.operation_id !== `${this.epoch}:1`)
+                throw new Error("Only a confirmed rejected receipt can be retired.");
+            await this.api.post("extension-actions/close_epoch", { epoch: this.epoch });
+            await this.api.post("extension-actions/retire_epoch", { epoch: this.epoch });
+        }
+        async status() {
+            if (!this.epoch || !this.submitted)
+                throw new Error("No action has been submitted.");
+            return this.api.post("extension-actions/status", { epoch: this.epoch, sequence: 1 });
+        }
+    }
+    Amaterasu.ExtensionActionClient = ExtensionActionClient;
+    function renderExtensionAction(context, action) {
+        const form = Amaterasu.el("form", "settings-form");
+        const fields = new Map();
+        for (const [name, definition] of Object.entries(action.arguments)) {
+            const editor = Amaterasu.extensionFieldEditor(definition, structuredClone(definition.default));
+            fields.set(name, editor);
+            form.append(Amaterasu.el("label", "field", Amaterasu.el("span", "field-label", name), editor.node));
+        }
+        const status = Amaterasu.el("div", "muted");
+        status.setAttribute("aria-live", "polite");
+        const submit = Amaterasu.el("button", "button primary", action.label);
+        submit.type = "submit";
+        submit.disabled = !context.api.allows("configuration.write");
+        const check = Amaterasu.button("Check action status", async () => {
+            try {
+                show(await client.status());
+            }
+            catch (error) {
+                status.textContent = Amaterasu.messageOf(error);
+            }
+        });
+        check.disabled = true;
+        const client = new ExtensionActionClient(context.api);
+        function show(receipt) {
+            status.textContent = `Action ${receipt.status}${receipt.reason ? `: ${receipt.reason}` : ""}`;
+        }
+        form.addEventListener("submit", (event) => {
+            event.preventDefault();
+            void (async () => {
+                submit.disabled = true;
+                try {
+                    const args = Object.fromEntries([...fields].map(([name, editor]) => [name, editor.value()]));
+                    const result = await client.invoke(action.id, args);
+                    check.disabled = false;
+                    show(result);
+                    if (result.status === "rejected") {
+                        try {
+                            await client.retireRejected(result);
+                            check.disabled = true;
+                        }
+                        catch { }
+                    }
+                }
+                catch (error) {
+                    status.textContent = Amaterasu.messageOf(error);
+                    check.disabled = !client.wasSubmitted;
+                    submit.disabled = client.wasSubmitted || !context.api.allows("configuration.write");
+                }
+            })();
+        });
+        form.append(Amaterasu.el("p", "muted", action.description), submit, check, status);
+        return form;
+    }
+    Amaterasu.renderExtensionAction = renderExtensionAction;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     function renderSessionExtensionSettings(context, area) {
         let generation = 0;
         async function load() {
@@ -16121,6 +16219,13 @@ var Amaterasu;
                     });
                     panels.push(Amaterasu.panel(descriptor.provider, form));
                 });
+                for (const descriptor of descriptors) {
+                    if (!Array.isArray(descriptor.actions))
+                        throw new Error("Invalid extension actions response.");
+                    const actions = descriptor.actions.filter((action) => Array.isArray(action.allowed_targets) && action.allowed_targets.includes("host") && ["read_only", "host_mutation"].includes(action.execution));
+                    if (actions.length)
+                        panels.push(Amaterasu.panel(`${descriptor.provider} actions`, ...actions.map((action) => Amaterasu.renderExtensionAction(context, action))));
+                }
                 area.replaceChildren(...panels);
             }
             catch (error) {

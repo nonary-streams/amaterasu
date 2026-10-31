@@ -11,6 +11,7 @@ namespace Amaterasu {
   interface SessionExtensionDescriptor {
     provider: string;
     options: SessionExtensionOption[];
+    actions: SessionExtensionAction[];
   }
   interface SessionExtensionSettings {
     revision: number;
@@ -86,6 +87,11 @@ namespace Amaterasu {
           });
           panels.push(panel(descriptor.provider, form));
         });
+        for (const descriptor of descriptors) {
+          if (!Array.isArray(descriptor.actions)) throw new Error("Invalid extension actions response.");
+          const actions = descriptor.actions.filter((action) => Array.isArray(action.allowed_targets) && action.allowed_targets.includes("host") && ["read_only", "host_mutation"].includes(action.execution));
+          if (actions.length) panels.push(panel(`${descriptor.provider} actions`, ...actions.map((action) => renderExtensionAction(context, action))));
+        }
         area.replaceChildren(...panels);
       } catch (error) {
         if (current === generation && context.content.isConnected) area.replaceChildren(errorPanel(error, load));

@@ -36,6 +36,8 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
             fields(object, &[], &[])
         }
         "amaterasu.extension-registry/1" => session_extensions(route.action, object),
+        "amaterasu.extension-actions/1" => extension_actions(route.action, object),
+        "amaterasu.session-lifecycle/1" if route.action == "snapshot" => fields(object, &[], &[]),
         "amaterasu.authentication/1" => authentication(route.action, object),
         "amaterasu.management/1" => management_settings(route.action, object),
         "amaterasu.host-configuration/1" => host_configuration(route.action, object),
@@ -365,6 +367,69 @@ fn video(action: &str, object: &Object) -> Result<(), &'static str> {
         || !operation_id.bytes().all(|byte| byte.is_ascii_graphic())
     {
         return Err(INVALID);
+    }
+    Ok(())
+}
+
+fn extension_actions(action: &str, object: &Object) -> Result<(), &'static str> {
+    match action {
+        "open_epoch" => {
+            fields(object, &["operation_id"], &[])?;
+            text(object, "operation_id")?;
+        }
+        "close_epoch" | "retire_epoch" => {
+            fields(object, &["epoch"], &[])?;
+            text(object, "epoch")?;
+        }
+        "status" => {
+            fields(object, &["epoch", "sequence"], &[])?;
+            text(object, "epoch")?;
+            if object
+                .get("sequence")
+                .and_then(Value::as_u64)
+                .is_none_or(|n| n == 0)
+            {
+                return Err(INVALID);
+            }
+        }
+        "invoke" => {
+            fields(
+                object,
+                &[
+                    "epoch",
+                    "sequence",
+                    "operation_id",
+                    "action_id",
+                    "target",
+                    "arguments",
+                    "expected_settings_revision",
+                ],
+                &[],
+            )?;
+            for name in ["epoch", "operation_id", "action_id"] {
+                text(object, name)?;
+            }
+            if object
+                .get("sequence")
+                .and_then(Value::as_u64)
+                .is_none_or(|n| n == 0)
+                || !object.get("arguments").is_some_and(Value::is_object)
+                || !object
+                    .get("expected_settings_revision")
+                    .is_some_and(|v| v.is_null() || v.is_string())
+            {
+                return Err(INVALID);
+            }
+            let Some(target) = object.get("target").and_then(Value::as_object) else {
+                return Err(INVALID);
+            };
+            fields(target, &["kind", "host_epoch"], &[])?;
+            if target.get("kind").and_then(Value::as_str) != Some("host") {
+                return Err(INVALID);
+            }
+            text(target, "host_epoch")?;
+        }
+        _ => return Err(INVALID),
     }
     Ok(())
 }

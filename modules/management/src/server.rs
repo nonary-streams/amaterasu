@@ -278,6 +278,10 @@ enum Stage {
         browser_auth: Option<BrowserAuth>,
         capture: Option<CaptureDispatch>,
     },
+    SessionExtensionDispatching {
+        request_id: u64,
+        action: &'static str,
+    },
     ExtensionDispatching {
         request_id: u64,
     },
@@ -344,6 +348,20 @@ impl Connection {
                     selection_owners: context.selection_owners,
                 },
             )?,
+            Stage::SessionExtensionDispatching { request_id, action } => {
+                match runtime.send_ephemeral(Command::TakeResult {
+                    request: request_id,
+                })? {
+                    Response::Pending => {
+                        self.stage = Stage::SessionExtensionDispatching { request_id, action }
+                    }
+                    Response::Result { payload } => {
+                        let (status, body) = session_extension_response(action, payload);
+                        self.respond(status, body);
+                    }
+                    _ => self.fail(503, "service_unavailable"),
+                }
+            }
             Stage::ExtensionDispatching { request_id } => {
                 match runtime.send_ephemeral(Command::TakeResult {
                     request: request_id,
@@ -393,7 +411,8 @@ impl Connection {
     fn expire(&mut self, runtime: &RuntimeClient) {
         if let Stage::Verifying { request_id, .. }
         | Stage::Dispatching { request_id, .. }
-        | Stage::ExtensionDispatching { request_id } = self.stage
+        | Stage::ExtensionDispatching { request_id }
+        | Stage::SessionExtensionDispatching { request_id, .. } = self.stage
         {
             let _ = runtime.send(Command::Cancel {
                 request: request_id,
@@ -788,6 +807,20 @@ impl Connection {
                 request.bearer.take().map_or(Value::Null, Value::String),
             );
         }
+        if matches!(
+            route.service,
+            "amaterasu.extension-actions/1" | "amaterasu.session-lifecycle/1"
+        ) {
+            if let Some(request_id) =
+                self.submit(runtime, route.service, request.payload, operation)?
+            {
+                self.stage = Stage::SessionExtensionDispatching {
+                    request_id,
+                    action: route.action,
+                };
+            }
+            return Ok(());
+        }
         if let Some(request_id) = self.submit(runtime, route.service, request.payload, operation)? {
             self.stage = Stage::Dispatching {
                 request_id,
@@ -1171,6 +1204,60 @@ fn authorized(payload: &Value, required_scope: Option<&str>) -> bool {
 
 // Browser roles are an additional boundary on top of the token's exact scopes.
 // Legacy and non-browser credentials retain their existing scope policy.
+fn session_extension_response(action: &str, mut payload: Value) -> (u16, Value) {
+    let Some(object) = payload.as_object_mut() else {
+        return (502, json!({"ok":false,"error":{"code":"invalid_response"}}));
+    };
+    let status = object.get("status").and_then(Value::as_str).unwrap_or("");
+    if status == "error" {
+        let code = object
+            .get("code")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty() && s.len() <= 128)
+            .unwrap_or("service_unavailable");
+        return (400, json!({"ok":false,"error":{"code":code}}));
+    }
+    let valid = match action {
+        "snapshot" => {
+            status == "ok"
+                && object
+                    .get("host_epoch")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty() && s.len() <= 256)
+        }
+        "open_epoch" => {
+            status == "ok"
+                && object
+                    .get("epoch")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty() && s.len() <= 256)
+        }
+        "close_epoch" | "retire_epoch" => status == "ok",
+        "invoke" | "status" => {
+            matches!(
+                status,
+                "queued"
+                    | "running"
+                    | "succeeded"
+                    | "rejected"
+                    | "cancelled"
+                    | "failed"
+                    | "recovery_required"
+                    | "receipt_expired"
+            ) && object
+                .get("operation_id")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        }
+        _ => false,
+    };
+    if !valid {
+        return (502, json!({"ok":false,"error":{"code":"invalid_response"}}));
+    }
+    object.insert("ok".into(), Value::Bool(true));
+    (200, payload)
+}
+
 fn role_permits(payload: &Value, request: &http::Request) -> bool {
     if !payload
         .get("subject")
@@ -1465,6 +1552,27 @@ mod tests {
         let current_payload = verification_payload(&mut current_request);
         assert_eq!(current_payload["required_scopes"], json!([]));
         assert!(current_payload.get("legacy_request").is_none());
+    }
+
+    #[test]
+    fn action_response_distinguishes_receipt_rejection_from_transport_error() {
+        let (status, body) = session_extension_response(
+            "invoke",
+            json!({"status":"rejected","operation_id":"epoch:1","reason":"lifecycle_permit_unavailable"}),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["status"], "rejected");
+        let (status, body) = session_extension_response(
+            "invoke",
+            json!({"status":"error","code":"permission_denied"}),
+        );
+        assert_eq!(status, 400);
+        assert_eq!(body["error"]["code"], "permission_denied");
+        assert_eq!(
+            session_extension_response("snapshot", json!({"status":"ok"})).0,
+            502
+        );
     }
 
     #[test]
