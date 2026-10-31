@@ -262,6 +262,19 @@ impl Coordinator {
             transition_id: work.transition_id.clone(),
             operation_id,
             target: work.target.clone(),
+            resource_generation: {
+                let shared = self.shared.borrow();
+                let (_, session_id, _, _) = operations::target_parts(&work.target)?;
+                Some(
+                    *shared
+                        .value
+                        .sessions
+                        .get(session_id)
+                        .and_then(|session| session.resource_generations.get(&participant.provider))
+                        .filter(|generation| **generation > 0)
+                        .ok_or("resource_generation_unavailable")?,
+                )
+            },
             phase: work.phase.clone(),
             settings_revision: participant.settings_revision.clone(),
             settings: serde_json::from_value(participant.settings.clone())

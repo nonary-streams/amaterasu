@@ -203,6 +203,7 @@ impl Coordinator {
                     admission_ids: BTreeSet::new(),
                     admission_targets: BTreeMap::new(),
                     admission_phases: BTreeMap::new(),
+                    resource_generations: Default::default(),
                     provider_settings: BTreeMap::new(),
                 },
             );

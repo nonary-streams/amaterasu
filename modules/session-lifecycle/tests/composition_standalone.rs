@@ -143,7 +143,10 @@ impl Harness {
                 let method = json!({"service":"example.display/2","method":name,"interface_major":2,"interface_minor":0,"request":{"required":{},"optional":{},"allow_extra":true},"response":{"required":{},"optional":{},"allow_extra":true},"privilege":"user"});
                 methods.push(method);
             }
-            configuration["api_methods"]=json!(methods.iter().map(|method|json!({"provider":"display","callers":[COORDINATOR],"method":method})).collect::<Vec<_>>());
+            configuration["api_methods"] = json!(methods
+                .iter()
+                .map(|method| json!({"provider":"display","callers":[COORDINATOR],"method":method}))
+                .collect::<Vec<_>>());
         }
         if registry_settings.is_some() {
             configuration["principals"][COORDINATOR]["call"]
@@ -300,7 +303,7 @@ impl Harness {
                             "display",
                             Command::Complete {
                                 request: id,
-                                payload: json!({"status":"cleanup","outcomes":outcomes})
+                                payload: json!({"status":"cleanup","outcomes":outcomes,"outputs":args["dependency_inputs"]})
                             }
                         ),
                         Response::Ok
@@ -351,7 +354,10 @@ impl Harness {
                                 service: SERVICE.into(),
                                 payload,
                                 timeout_ms: 5000,
-                                operation_id: "verify-finalize-request".into(),
+                                operation_id: format!(
+                                    "verify-finalize-request-{}",
+                                    self.refresh_round
+                                ),
                                 parent: Some(id),
                             },
                         );
@@ -601,6 +607,17 @@ fn real_broker_persists_v2_session_output() {
         1
     );
     let stored = &journal["composition"]["outputs"][0];
+    assert_eq!(
+        journal["session_prepare_evidence"]["records"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        journal["session_prepare_evidence"]["records"][0]["proof"]["terminal"]["state"]["state"],
+        "completed"
+    );
     assert_eq!(stored["output"]["output_id"], "screen-output");
     assert_eq!(
         stored["callback_proof"]["terminal"]["state"]["state"],
@@ -842,6 +859,33 @@ fn real_broker_stream_release_preserves_session_root() {
             .len(),
         1
     );
+    assert_eq!(
+        journal["stream_releases"]["proofs"][0]["released_output"],
+        journal["finalize_results"]["records"][0]["applied"]["output"]
+    );
+    let resumed = harness.call("transport", json!({"operation":"resume_stream","operation_id":"stream.resume","target":session,"intent":"resume","requested_video":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false}}));
+    assert_eq!(resumed["status"], "pending", "{resumed}");
+    let mut resume_result = Value::Null;
+    for _ in 0..200 {
+        resume_result = harness.call(
+            "transport",
+            json!({"operation":"lookup","operation_id":"stream.resume"}),
+        );
+        if resume_result["status"] != "pending" {
+            break;
+        }
+    }
+    assert_eq!(resume_result["status"], "succeeded", "{resume_result}");
+    let resumed_journal: Value =
+        serde_json::from_slice(&std::fs::read(harness.root.join("journal.json")).unwrap()).unwrap();
+    assert_eq!(
+        resumed_journal["composition"]["staged_outputs"][1]["before"],
+        journal["stream_releases"]["proofs"][0]["released_output"]
+    );
+    assert_eq!(
+        resumed_journal["composition"]["staged_outputs"][1]["prior_release_admission"],
+        journal["stream_releases"]["proofs"][0]["callback"]["request"]["admission_id"]
+    );
     let calls = harness.provider_calls.len();
     // SAFETY: destroy the live module once before creating its replacement.
     unsafe { (harness.api.destroy)(harness.instance) };
@@ -1011,6 +1055,9 @@ fn real_broker_deferred_cleanup_keeps_root_and_no_release_proof() {
         }
     }
     assert_eq!(released["status"], "recovery_required", "{released}");
+    assert!(harness.provider_calls.iter().any(|call| {
+        call["method"] == "lifecycle_callback" && call["arguments"]["phase"] == "stream.release"
+    }));
     let journal: Value =
         serde_json::from_slice(&std::fs::read(harness.root.join("journal.json")).unwrap()).unwrap();
     assert_eq!(journal["composition"]["outputs"][0]["state"], "retained");

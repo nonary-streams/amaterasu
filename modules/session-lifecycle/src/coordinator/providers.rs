@@ -385,6 +385,21 @@ impl PrepareJournal for WorkWriter {
             return Err("admission_target_mismatch".into());
         }
         let (_, session_id, _, _) = super::operations::target_parts(&target)?;
+        if let Some(generation) = state.request.resource_generation {
+            let session = next.sessions.get_mut(session_id).ok_or("unknown_session")?;
+            match session.resource_generations.get(&self.provider) {
+                Some(current) if *current == generation => {}
+                None if phase == LifecyclePhase::SessionPrepare
+                    && session.phase == SessionPhase::Preparing
+                    && generation == 1 =>
+                {
+                    session
+                        .resource_generations
+                        .insert(self.provider.clone(), generation);
+                }
+                _ => return Err("resource_generation_mismatch".into()),
+            }
+        }
         if let Some(id) = &state.admission_id {
             record_admission(&mut next, session_id, id, &target, &phase, &transition_id)?;
         }
@@ -826,19 +841,6 @@ impl Coordinator {
                 self.fail_work(&key, "restart_requires_cleanup")?;
                 continue;
             }
-            // Until cleanup carries a validated released-output refinement,
-            // retain the target and all lineage rather than allowing a release
-            // that cannot be safely resumed.
-            if work.phase == LifecyclePhase::StreamRelease
-                && self.settings.participants.iter().any(|participant| {
-                    &participant.provider == provider
-                        && participant.contract_version
-                            == amaterasu_extension_api::COMPOSITION_VERSION
-                })
-            {
-                self.cleanup_failure(&key, "release_output_refinement_required")?;
-                continue;
-            }
             // Unsupported v2 phases must be rejected before settings discovery or
             // any provider call. A session output alone does not authorize a
             // stream attachment or cleanup callback.
@@ -1005,6 +1007,33 @@ impl Coordinator {
                     transition_id: work.transition_id.clone(),
                     operation_id,
                     target: work.target.clone(),
+                    resource_generation: if participant.contract_version
+                        == amaterasu_extension_api::COMPOSITION_VERSION
+                        && self
+                            .settings
+                            .finalize_policies
+                            .iter()
+                            .any(|policy| policy.owner_provider == *provider)
+                    {
+                        let shared = self.shared.borrow();
+                        let (_, session_id, _, _) = super::operations::target_parts(&work.target)?;
+                        let session = shared
+                            .value
+                            .sessions
+                            .get(session_id)
+                            .ok_or("unknown_session")?;
+                        match session.resource_generations.get(provider) {
+                            Some(generation) if *generation > 0 => Some(*generation),
+                            None if work.phase == LifecyclePhase::SessionPrepare
+                                && session.phase == SessionPhase::Preparing =>
+                            {
+                                Some(1)
+                            }
+                            _ => return Err("resource_generation_unavailable".into()),
+                        }
+                    } else {
+                        None
+                    },
                     phase: work.phase.clone(),
                     settings_revision: participant.settings_revision.clone(),
                     settings: serde_json::from_value(participant.settings.clone())
@@ -1895,6 +1924,7 @@ mod admission_target_tests {
             admission_ids: Default::default(),
             admission_targets: Default::default(),
             admission_phases: Default::default(),
+            resource_generations: Default::default(),
             provider_settings: Default::default(),
         }
     }

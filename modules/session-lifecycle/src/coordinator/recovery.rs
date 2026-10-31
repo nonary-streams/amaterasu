@@ -213,6 +213,7 @@ mod tests {
             admission_targets: Default::default(),
             admission_phases: Default::default(),
             provider_settings: Default::default(),
+            resource_generations: Default::default(),
             streams: [(
                 "stream".into(),
                 StreamRecord {

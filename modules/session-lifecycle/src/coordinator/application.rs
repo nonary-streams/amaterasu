@@ -302,6 +302,7 @@ mod tests {
                 admission_ids: Default::default(),
                 admission_targets: Default::default(),
                 admission_phases: Default::default(),
+                resource_generations: Default::default(),
                 provider_settings: Default::default(),
                 streams: BTreeMap::new(),
                 obligations: vec![],

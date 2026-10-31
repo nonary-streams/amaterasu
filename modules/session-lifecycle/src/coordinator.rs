@@ -8,6 +8,8 @@ mod application;
 mod composition;
 #[allow(dead_code)] // Controls stay gated until sequencing is qualified.
 mod composition_control;
+#[allow(dead_code)] // Composed finalization is still gated.
+mod composition_finalize;
 mod composition_prepare;
 mod composition_progress;
 mod control_backend;
@@ -300,6 +302,9 @@ struct SessionRecord {
     admission_phases: BTreeMap<String, LifecyclePhase>,
     #[serde(default)]
     provider_settings: BTreeMap<String, settings_snapshot::FrozenSettings>,
+    /// Coordinator-owned generation of each session resource producer.
+    #[serde(default)]
+    resource_generations: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -412,6 +417,13 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                     }
                 })
             })
+        })
+        || journal.sessions.values().any(|session| {
+            session.resource_generations.len() > 32
+                || session
+                    .resource_generations
+                    .iter()
+                    .any(|(provider, generation)| !valid_id(provider) || *generation == 0)
         })
         || !retention::validate(journal)
         || journal.admission_transitions.len() > 128
