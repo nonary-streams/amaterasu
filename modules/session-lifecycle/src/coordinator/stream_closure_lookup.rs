@@ -57,7 +57,11 @@ fn receipt_references(receipt: &Receipt, target: &Value) -> bool {
 }
 
 fn pending_receipt_references(receipt: &Receipt, target: &Value) -> bool {
-    receipt_is_pending(receipt) && receipt_references(receipt, target)
+    receipt_is_pending(receipt)
+        && (receipt_references(receipt, target)
+            || (receipt.work.is_none()
+                && receipt.wait_target.is_none()
+                && receipt.request.get("target").is_none_or(Value::is_null)))
 }
 
 impl Coordinator {
@@ -357,6 +361,9 @@ mod retirement_safe_tests {
         };
         journal.receipts.insert("unrelated".into(), unrelated);
         assert!(coordinator.retirement_safe(&journal, &target));
+        journal.receipts.get_mut("unrelated").unwrap().request = json!({});
+        assert!(!coordinator.retirement_safe(&journal, &target));
+        journal.receipts.get_mut("unrelated").unwrap().request = json!({"target":session});
         let original = Receipt {
             caller: "caller".into(),
             initiator: "client".into(),
