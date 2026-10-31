@@ -326,6 +326,7 @@ dependencies = [
 name = "amaterasu-extension-api"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-configuration-schema",
  "serde",
  "serde_json",
 ]
