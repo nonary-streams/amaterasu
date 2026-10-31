@@ -321,6 +321,48 @@ impl<D: Driver> Manager<D> {
 
     pub fn handle(&mut self, caller: &str, operation: Operation) -> Value {
         match operation {
+            Operation::ReconfigureModeOnlyStatus {
+                operation_id,
+                identity,
+                reference_id,
+                borrow_id,
+                expected_topology_domain_id,
+                expected_topology_revision,
+            } => {
+                drop((
+                    operation_id,
+                    identity,
+                    reference_id,
+                    borrow_id,
+                    expected_topology_domain_id,
+                    expected_topology_revision,
+                ));
+                failure("unsupported_binding")
+            }
+            Operation::ReconfigureModeOnly {
+                operation_id,
+                identity,
+                reference_id,
+                borrow_id,
+                width,
+                height,
+                refresh_millihz,
+                expected_topology_domain_id,
+                expected_topology_revision,
+            } => {
+                drop((
+                    operation_id,
+                    identity,
+                    reference_id,
+                    borrow_id,
+                    width,
+                    height,
+                    refresh_millihz,
+                    expected_topology_domain_id,
+                    expected_topology_revision,
+                ));
+                failure("unsupported_binding")
+            }
             Operation::ReconfigureStatus {
                 operation_id,
                 identity,

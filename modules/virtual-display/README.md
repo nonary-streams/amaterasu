@@ -78,6 +78,20 @@ operation or queues KScreen work. A matching operation can report pending or
 its revalidated result; an unknown operation, restart or uncertain effect
 returns `recovery_required`.
 
+Linux also exposes `reconfigure_mode_only` and `reconfigure_mode_only_status`
+with the same ownership, operation and domain fields. Status advertises the
+protocol as `mode_only_preservation: "kscreen-strict-v1"`; this is not proof
+that the current desktop exposes all required observations. The operation uses
+an already advertised mode and sends only a mode command. It journals the old
+and requested mode together with a strict desktop baseline, then verifies the
+owned mode and all observed connected-output identities, placement, scale,
+rotation, HDR, WCG, priority and VRR policy. Missing evidence fails before the
+mode command; an uncertain or mismatched effect retains the recovery fence.
+Successful results contain `mode_only_preserved: true`, the verified owned
+output's `preservation_readback`, and a replacement borrow. The readback is
+observed KScreen state; it does not assert an abstract layout policy.
+The separate status action only looks up an already admitted operation.
+
 `$XDG_STATE_HOME/amaterasu/virtual-display-linux` (default
 `~/.local/state/amaterasu/virtual-display-linux`) is locked against other
 Amaterasu hosts and synced before connect. Startup removes interrupted owned

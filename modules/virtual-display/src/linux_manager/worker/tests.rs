@@ -72,6 +72,7 @@ struct FakeCompositor {
     fail: bool,
     placements: Vec<(String, Placement)>,
     restored: Vec<bool>,
+    mode_journal: Option<PathBuf>,
 }
 impl FakeCompositor {
     fn new() -> Self {
@@ -79,10 +80,38 @@ impl FakeCompositor {
             fail: false,
             placements: Vec::new(),
             restored: Vec::new(),
+            mode_journal: None,
         }
     }
 }
 impl Compositor for FakeCompositor {
+    fn mode_only_baseline(
+        &mut self,
+        _: &str,
+        _: &Specification,
+        _: &Specification,
+    ) -> Result<serde_json::Value, String> {
+        Ok(serde_json::json!({"state":{"preserved":true},"old_mode":"1","desired_mode":"2"}))
+    }
+    fn apply_mode_only(
+        &mut self,
+        _: &str,
+        _: &Specification,
+        baseline: &serde_json::Value,
+    ) -> Result<(), String> {
+        let path = self.mode_journal.as_ref().ok_or("missing test journal")?;
+        let document: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            document["records"][0]["transition"]["preservation_baseline"],
+            *baseline
+        );
+        assert_eq!(document["records"][0]["transition"]["completed"], false);
+        if self.fail {
+            Err("uncertain mode effect".into())
+        } else {
+            Ok(())
+        }
+    }
     fn snapshot(&mut self, changing: &str) -> Result<Option<super::super::layout::Layout>, String> {
         super::super::layout::Layout::capture(&serde_json::json!({"outputs":[{"name":"Virtual-1","connected":true,"enabled":true,"currentModeId":"1","modes":[{"id":"1","size":{"width":3840,"height":2160},"refreshRate":60}],"pos":{"x":0,"y":0},"scale":2.5,"rotation":1,"hdr":false,"wcg":true,"priority":1}]}), changing).map(Some)
     }
@@ -187,6 +216,8 @@ fn reconfigure_persists_old_and_new_modes_and_retains_uncertain_intent() {
         old: old.clone(),
         desired: desired.clone(),
         completed: false,
+        mode_only: false,
+        preservation_baseline: None,
     };
     controller.compositor.fail = true;
     assert!(
@@ -229,6 +260,49 @@ fn reconfigure_persists_old_and_new_modes_and_retains_uncertain_intent() {
     fs::remove_dir_all(root).unwrap();
 }
 #[test]
+fn mode_only_persists_baseline_before_effect_and_retains_uncertain_transition() {
+    let (root, mut controller) = fixture();
+    let old = specification(FIRST);
+    let record = controller
+        .create_with_references(
+            "owner".into(),
+            old.clone(),
+            ScaleSetting::Retain,
+            Some(std::collections::BTreeSet::from(["ref-1".into()])),
+            VirtualDisplayLayout::Extended,
+        )
+        .unwrap();
+    let mut desired = old.clone();
+    desired.width = 1280;
+    controller.compositor.mode_journal = Some(root.join("connectors.json"));
+    controller.compositor.fail = true;
+    let transition = super::super::Transition {
+        operation_id: "mode-only-1".into(),
+        reference_id: "ref-1".into(),
+        borrow_id: "a".repeat(64),
+        old,
+        desired,
+        completed: false,
+        mode_only: true,
+        preservation_baseline: None,
+    };
+    assert!(
+        controller
+            .reconfigure(
+                &record.key(),
+                transition,
+                ScaleSetting::Retain,
+                VirtualDisplayLayout::Extended
+            )
+            .is_err()
+    );
+    let saved = controller.journal.records[0].transition.as_ref().unwrap();
+    assert!(saved.mode_only && !saved.completed && saved.preservation_baseline.is_some());
+    drop(controller);
+    assert!(Journal::open(&root).unwrap().records[0].valid());
+    fs::remove_dir_all(root).unwrap();
+}
+#[test]
 fn reconfigure_records_confirmed_mode_before_success() {
     let (root, mut controller) = fixture();
     let old = specification(FIRST);
@@ -250,6 +324,8 @@ fn reconfigure_records_confirmed_mode_before_success() {
         old,
         desired,
         completed: false,
+        mode_only: false,
+        preservation_baseline: None,
     };
     let mut result = controller
         .reconfigure(
@@ -312,6 +388,8 @@ fn pending_reconfiguration_keeps_old_borrow_fenced_until_worker_settles() {
                 old: old.clone(),
                 desired: old,
                 completed: false,
+                mode_only: false,
+                preservation_baseline: None,
             },
             state: "pending",
             result: None,
@@ -334,6 +412,12 @@ fn pending_reconfiguration_keeps_old_borrow_fenced_until_worker_settles() {
     assert_eq!(
         manager.reconfigure_status("owner", "resize-1", FIRST, "ref-1", &borrow_id, "domain", 1)["state"],
         "pending"
+    );
+    assert_eq!(
+        manager.reconfigure_mode_only_status(
+            "owner", "resize-1", FIRST, "ref-1", &borrow_id, "domain", 1
+        )["code"],
+        "recovery_required"
     );
     assert_eq!(
         manager.release_borrow("owner", FIRST, "ref-1", &borrow_id)["code"],

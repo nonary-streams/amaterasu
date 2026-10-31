@@ -42,6 +42,10 @@ struct Transition {
     old: Specification,
     desired: Specification,
     completed: bool,
+    #[serde(default)]
+    mode_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preservation_baseline: Option<Value>,
 }
 impl Record {
     fn key(&self) -> (String, String) {
@@ -72,6 +76,17 @@ impl Record {
                     && transition.desired.validate().is_ok()
                     && transition.old.identity == self.specification.identity
                     && transition.desired.identity == self.specification.identity
+                    && if transition.mode_only {
+                        transition
+                            .preservation_baseline
+                            .as_ref()
+                            .is_some_and(|baseline| {
+                                baseline.is_object()
+                                    && serde_json::to_vec(baseline).is_ok_and(|v| v.len() <= 32_768)
+                            })
+                    } else {
+                        transition.preservation_baseline.is_none()
+                    }
                     && if transition.completed {
                         self.specification == transition.desired
                     } else {
@@ -242,6 +257,9 @@ impl Manager {
                     if let Some(change) = self.reconfigurations.get_mut(&key) {
                         match result {
                             Ok(record) => {
+                                if let Some(transition) = record.transition.clone() {
+                                    change.transition = transition;
+                                }
                                 if let Some(monitor) = self.monitors.get_mut(&key) {
                                     monitor.specification = record.specification;
                                     monitor.state = "ready";
@@ -319,6 +337,50 @@ impl Manager {
     pub fn admit(&mut self, caller: &str, operation: Operation) -> (Value, Option<Admission>) {
         self.tick();
         match operation {
+            Operation::ReconfigureModeOnlyStatus {
+                operation_id,
+                identity,
+                reference_id,
+                borrow_id,
+                expected_topology_domain_id,
+                expected_topology_revision,
+            } => (
+                self.reconfigure_mode_only_status(
+                    caller,
+                    &operation_id,
+                    &identity,
+                    &reference_id,
+                    &borrow_id,
+                    &expected_topology_domain_id,
+                    expected_topology_revision,
+                ),
+                None,
+            ),
+            Operation::ReconfigureModeOnly {
+                operation_id,
+                identity,
+                reference_id,
+                borrow_id,
+                width,
+                height,
+                refresh_millihz,
+                expected_topology_domain_id,
+                expected_topology_revision,
+            } => (
+                self.reconfigure_mode_only(
+                    caller,
+                    operation_id,
+                    identity,
+                    reference_id,
+                    borrow_id,
+                    width,
+                    height,
+                    refresh_millihz,
+                    expected_topology_domain_id,
+                    expected_topology_revision,
+                ),
+                None,
+            ),
             Operation::ReconfigureStatus {
                 operation_id,
                 identity,
@@ -665,11 +727,113 @@ impl Manager {
         domain_id: &str,
         revision: u64,
     ) -> Value {
+        self.reconfigure_status_inner(
+            caller,
+            operation_id,
+            identity,
+            reference_id,
+            borrow_id,
+            domain_id,
+            revision,
+            false,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn reconfigure_mode_only_status(
+        &mut self,
+        caller: &str,
+        operation_id: &str,
+        identity: &str,
+        reference_id: &str,
+        borrow_id: &str,
+        domain_id: &str,
+        revision: u64,
+    ) -> Value {
+        self.reconfigure_status_inner(
+            caller,
+            operation_id,
+            identity,
+            reference_id,
+            borrow_id,
+            domain_id,
+            revision,
+            true,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn reconfigure(
+        &mut self,
+        caller: &str,
+        operation_id: String,
+        identity: String,
+        reference_id: String,
+        borrow_id: String,
+        width: u32,
+        height: u32,
+        refresh_millihz: u32,
+        domain_id: String,
+        revision: u64,
+    ) -> Value {
+        self.reconfigure_inner(
+            caller,
+            operation_id,
+            identity,
+            reference_id,
+            borrow_id,
+            width,
+            height,
+            refresh_millihz,
+            domain_id,
+            revision,
+            false,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn reconfigure_mode_only(
+        &mut self,
+        caller: &str,
+        operation_id: String,
+        identity: String,
+        reference_id: String,
+        borrow_id: String,
+        width: u32,
+        height: u32,
+        refresh_millihz: u32,
+        domain_id: String,
+        revision: u64,
+    ) -> Value {
+        self.reconfigure_inner(
+            caller,
+            operation_id,
+            identity,
+            reference_id,
+            borrow_id,
+            width,
+            height,
+            refresh_millihz,
+            domain_id,
+            revision,
+            true,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn reconfigure_status_inner(
+        &mut self,
+        caller: &str,
+        operation_id: &str,
+        identity: &str,
+        reference_id: &str,
+        borrow_id: &str,
+        domain_id: &str,
+        revision: u64,
+        mode_only: bool,
+    ) -> Value {
         let key = (caller.to_owned(), identity.to_owned());
         let Some(change) = self.reconfigurations.get(&key) else {
             return failure("recovery_required");
         };
-        if self.domain_id != domain_id
+        if change.transition.mode_only != mode_only
+            || self.domain_id != domain_id
             || change.domain_id != domain_id
             || change.revision != revision
             || change.transition.operation_id != operation_id
@@ -698,7 +862,7 @@ impl Manager {
         }
     }
     #[allow(clippy::too_many_arguments)]
-    fn reconfigure(
+    fn reconfigure_inner(
         &mut self,
         caller: &str,
         operation_id: String,
@@ -710,13 +874,15 @@ impl Manager {
         refresh_millihz: u32,
         domain_id: String,
         revision: u64,
+        mode_only: bool,
     ) -> Value {
         let key = (caller.to_owned(), identity.clone());
         if let Some(change) = self.reconfigurations.get(&key)
             && !(change.state == "succeeded" && change.transition.operation_id != operation_id)
         {
             let t = &change.transition;
-            if t.operation_id != operation_id
+            if t.mode_only != mode_only
+                || t.operation_id != operation_id
                 || t.reference_id != reference_id
                 || t.borrow_id != borrow_id
                 || t.desired.width != width
@@ -789,6 +955,8 @@ impl Manager {
             old: monitor.specification.clone(),
             desired,
             completed: false,
+            mode_only,
+            preservation_baseline: None,
         };
         let work = Work::Reconfigure {
             key: key.clone(),
@@ -825,6 +993,19 @@ impl Manager {
         let old_borrow = change.transition.borrow_id.clone();
         let reference_id = change.transition.reference_id.clone();
         let operation_id = change.transition.operation_id.clone();
+        let mode_only = change.transition.mode_only;
+        let preservation_readback =
+            change
+                .transition
+                .preservation_baseline
+                .as_ref()
+                .and_then(|baseline| {
+                    let output = self.monitors.get(key)?.output.as_deref()?;
+                    baseline.get("state")?.get(output).cloned()
+                });
+        if mode_only && preservation_readback.is_none() {
+            return failure("recovery_required");
+        }
         let Some(old_observation) = self
             .borrows
             .get(&old_borrow)
@@ -882,7 +1063,11 @@ impl Manager {
             .get_mut(key)
             .expect("existing transition")
             .state = "succeeded";
-        let result = json!({"ok":true,"state":"succeeded","operation_id":operation_id,"borrow_id":new_borrow,"observed_output":Self::observation(&output, observation),"mutation_domain":self.domain()});
+        let mut result = json!({"ok":true,"state":"succeeded","operation_id":operation_id,"borrow_id":new_borrow,"observed_output":Self::observation(&output, observation),"mutation_domain":self.domain()});
+        if mode_only {
+            result["mode_only_preserved"] = json!(true);
+            result["preservation_readback"] = json!(preservation_readback);
+        }
         self.reconfigurations
             .get_mut(key)
             .expect("existing transition")
@@ -1111,7 +1296,7 @@ impl Manager {
                         .is_some_and(|references| references.contains(reference))
                 })
             });
-        json!({"reference_owned":reference_id.map(|_|reference_owned),"ok":true,"enabled":self.settings.enabled,"native_supported":true,"driver":"libvirtualdisplay",
+        json!({"reference_owned":reference_id.map(|_|reference_owned),"ok":true,"enabled":self.settings.enabled,"native_supported":true,"driver":"libvirtualdisplay","mode_only_preservation":"kscreen-strict-v1",
             "ownership_authority":"unix_uid_broker","mutation_domain":self.domain(),"settings":{"virtual_display_layout":self.settings.virtual_display_layout,"dd_virtual_display_scale":Self::scale_value(self.settings.dd_virtual_display_scale),"dd_activate_virtual_display":self.settings.dd_activate_virtual_display,"dd_use_sunshine_virtual_display_driver":self.settings.dd_use_sunshine_virtual_display_driver},"recovery_ready":self.ready && self.reconfigurations.values().all(|change| change.state == "succeeded"),"recovery_error":self.recovery_error,"monitors":monitors,
             "activation_requested":self.settings.dd_activate_virtual_display,
             "configured_permanent_monitor_count":self.settings.dd_virtual_display_permanent_count,"permanent_monitor_runtime_supported":false})

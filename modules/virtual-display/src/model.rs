@@ -155,6 +155,25 @@ impl Default for Settings {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    ReconfigureModeOnlyStatus {
+        operation_id: String,
+        identity: String,
+        reference_id: String,
+        borrow_id: String,
+        expected_topology_domain_id: String,
+        expected_topology_revision: u64,
+    },
+    ReconfigureModeOnly {
+        operation_id: String,
+        identity: String,
+        reference_id: String,
+        borrow_id: String,
+        width: u32,
+        height: u32,
+        refresh_millihz: u32,
+        expected_topology_domain_id: String,
+        expected_topology_revision: u64,
+    },
     ReconfigureStatus {
         operation_id: String,
         identity: String,

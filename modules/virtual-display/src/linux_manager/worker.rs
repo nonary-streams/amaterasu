@@ -44,7 +44,7 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
     fn reconfigure(
         &mut self,
         key: &(String, String),
-        transition: super::Transition,
+        mut transition: super::Transition,
         scale: ScaleSetting,
         layout: VirtualDisplayLayout,
     ) -> Result<Record, String> {
@@ -64,13 +64,39 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
         {
             return Err("reconfigure precondition changed".into());
         }
+        if transition.mode_only {
+            transition.preservation_baseline = Some(self.compositor.mode_only_baseline(
+                &record.output,
+                &transition.old,
+                &transition.desired,
+            )?);
+        }
         // The complete old/new intent remains available for cleanup even if the
         // compositor command partially executes or the process disappears.
         record.transition = Some(transition.clone());
+        if !record.valid() {
+            return Err("invalid reconfiguration journal record".into());
+        }
         self.journal.update(record.clone())?;
-        let placement = self.placement(&record.output, layout);
-        self.compositor
-            .configure(&record.output, &transition.desired, None, &placement, scale)?;
+        if transition.mode_only {
+            self.compositor.apply_mode_only(
+                &record.output,
+                &transition.desired,
+                transition
+                    .preservation_baseline
+                    .as_ref()
+                    .ok_or("missing preservation baseline")?,
+            )?;
+        } else {
+            let placement = self.placement(&record.output, layout);
+            self.compositor.configure(
+                &record.output,
+                &transition.desired,
+                None,
+                &placement,
+                scale,
+            )?;
+        }
         if !self.broker.connected(&record.output)? {
             return Err("owned connector disappeared during reconfiguration".into());
         }

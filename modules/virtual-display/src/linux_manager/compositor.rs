@@ -21,6 +21,22 @@ pub(super) enum Placement {
 }
 
 pub(super) trait Compositor: Send {
+    fn mode_only_baseline(
+        &mut self,
+        _output: &str,
+        _old: &Specification,
+        _desired: &Specification,
+    ) -> Result<Value, String> {
+        Err("mode-only preservation is unavailable".into())
+    }
+    fn apply_mode_only(
+        &mut self,
+        _output: &str,
+        _desired: &Specification,
+        _baseline: &Value,
+    ) -> Result<(), String> {
+        Err("mode-only preservation is unavailable".into())
+    }
     fn snapshot(&mut self, _changing: &str) -> Result<Option<Layout>, String> {
         Ok(None)
     }
@@ -38,6 +54,52 @@ pub(super) trait Compositor: Send {
 }
 pub(super) struct KScreen;
 impl Compositor for KScreen {
+    fn mode_only_baseline(
+        &mut self,
+        output: &str,
+        old: &Specification,
+        desired: &Specification,
+    ) -> Result<Value, String> {
+        let configuration = query()?;
+        let old_mode = mode(&configuration, output, old).ok_or("current mode unavailable")?;
+        if find_output(&configuration, output).and_then(|value| value["currentModeId"].as_str())
+            != Some(old_mode.as_str())
+        {
+            return Err("current mode does not match owned record".into());
+        }
+        let desired_mode =
+            mode(&configuration, output, desired).ok_or("requested mode unavailable")?;
+        Ok(
+            serde_json::json!({"state": preservation_state(&configuration, output)?, "old_mode":old_mode, "desired_mode":desired_mode}),
+        )
+    }
+    fn apply_mode_only(
+        &mut self,
+        output: &str,
+        desired: &Specification,
+        baseline: &Value,
+    ) -> Result<(), String> {
+        let current = query()?;
+        let desired_mode = baseline["desired_mode"]
+            .as_str()
+            .ok_or("missing requested mode")?;
+        if preservation_state(&current, output)? != baseline["state"]
+            || find_output(&current, output).and_then(|value| value["currentModeId"].as_str())
+                != baseline["old_mode"].as_str()
+            || mode(&current, output, desired).as_deref() != Some(desired_mode)
+        {
+            return Err("display state changed before mode-only operation".into());
+        }
+        run(&mode_only_arguments(output, desired_mode)?)?;
+        let after = query()?;
+        if preservation_state(&after, output)? != baseline["state"]
+            || find_output(&after, output).and_then(|value| value["currentModeId"].as_str())
+                != Some(desired_mode)
+        {
+            return Err("mode-only preservation readback differs".into());
+        }
+        Ok(())
+    }
     fn snapshot(&mut self, changing: &str) -> Result<Option<Layout>, String> {
         Layout::capture(&query()?, changing).map(Some)
     }
@@ -114,6 +176,75 @@ impl Compositor for KScreen {
         }
         Ok(())
     }
+}
+
+fn mode_only_arguments(output: &str, mode: &str) -> Result<Vec<String>, String> {
+    if !valid_output_name(output)
+        || mode.is_empty()
+        || !mode.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err("invalid mode-only target".into());
+    }
+    Ok(vec![format!("output.{output}.mode.{mode}")])
+}
+
+/// Strictly read every connected output. Missing facts cannot prove that a
+/// mode operation preserved them; never substitute a default.
+fn preservation_state(configuration: &Value, owned: &str) -> Result<Value, String> {
+    let outputs = configuration["outputs"]
+        .as_array()
+        .filter(|outputs| outputs.len() <= 64)
+        .ok_or("invalid output list")?;
+    let mut states = std::collections::BTreeMap::new();
+    for output in outputs {
+        let name = output["name"]
+            .as_str()
+            .filter(|name| valid_output_name(name))
+            .ok_or("invalid output name")?;
+        let connected = output["connected"]
+            .as_bool()
+            .ok_or("missing connection state")?;
+        if !connected {
+            continue;
+        }
+        let native_id = output
+            .get("id")
+            .filter(|value| value.is_string() || value.is_u64())
+            .ok_or("missing output identity")?;
+        let enabled = output["enabled"].as_bool().ok_or("missing enabled state")?;
+        let x = output["pos"]["x"].as_i64().ok_or("missing position")?;
+        let y = output["pos"]["y"].as_i64().ok_or("missing position")?;
+        let scale = output["scale"]
+            .as_f64()
+            .filter(|v| v.is_finite() && (0.25..=5.0).contains(v))
+            .ok_or("missing scale")?;
+        let rotation = output["rotation"]
+            .as_u64()
+            .filter(|v| matches!(v, 1 | 2 | 4 | 8))
+            .ok_or("missing rotation")?;
+        let priority = output["priority"]
+            .as_u64()
+            .filter(|v| *v <= 64)
+            .ok_or("missing priority")?;
+        let hdr = output["hdr"].as_bool().ok_or("missing HDR state")?;
+        let wcg = output["wcg"].as_bool().ok_or("missing WCG state")?;
+        let vrr = output
+            .get("vrrPolicy")
+            .filter(|value| value.is_string() || value.is_u64())
+            .ok_or("missing VRR policy")?;
+        let mode = output["currentModeId"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or("missing current mode")?;
+        let state = serde_json::json!({"id":native_id,"enabled":enabled,"x":x,"y":y,"scale":scale,"rotation":rotation,"priority":priority,"hdr":hdr,"wcg":wcg,"vrr":vrr,"mode":if name == owned {None} else {Some(mode)}});
+        if states.insert(name.to_owned(), state).is_some() {
+            return Err("duplicate output name".into());
+        }
+    }
+    if !states.contains_key(owned) {
+        return Err("owned output unavailable".into());
+    }
+    serde_json::to_value(states).map_err(|_| "invalid preservation state".into())
 }
 /// Turns off every other enabled display except `keep`, makes the owned output
 /// the primary display at the origin (or right of the kept outputs), and
@@ -331,6 +462,39 @@ fn run(arguments: &[String]) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn mode_only_verifies_all_preserved_axes_and_emits_only_mode_command() {
+        let output = json!({"id":1,"name":"Virtual-1","connected":true,"enabled":true,"pos":{"x":0,"y":0},"scale":1.5,"rotation":1,"priority":1,"hdr":false,"wcg":false,"vrrPolicy":0,"currentModeId":"1"});
+        let mut peer = output.clone();
+        peer["name"] = json!("HDMI-A-1");
+        peer["id"] = json!(2);
+        peer["priority"] = json!(2);
+        let before = json!({"outputs":[output,peer]});
+        let saved = preservation_state(&before, "Virtual-1").unwrap();
+        let mut after = before.clone();
+        after["outputs"][0]["currentModeId"] = json!("2");
+        assert_eq!(preservation_state(&after, "Virtual-1").unwrap(), saved);
+        for field in [
+            "scale",
+            "rotation",
+            "priority",
+            "hdr",
+            "wcg",
+            "vrrPolicy",
+            "currentModeId",
+        ] {
+            let mut changed = after.clone();
+            changed["outputs"][1][field] = json!(null);
+            assert!(preservation_state(&changed, "Virtual-1").is_err());
+        }
+        after["outputs"][1]["pos"]["x"] = json!(1);
+        assert_ne!(preservation_state(&after, "Virtual-1").unwrap(), saved);
+        assert_eq!(
+            mode_only_arguments("Virtual-1", "2").unwrap(),
+            ["output.Virtual-1.mode.2"]
+        );
+        assert!(mode_only_arguments("Virtual-1", "2.inject").is_err());
+    }
     #[test]
     fn new_display_is_placed_after_scaled_existing_outputs_without_moving_them() {
         let configuration = json!({"outputs":[{"name":"Virtual-1","connected":true,"enabled":true,"pos":{"x":0},"size":{"width":3840,"height":2160},"scale":2.5,"rotation":1},
