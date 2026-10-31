@@ -102,6 +102,18 @@ impl Workflow {
         record: &'a Record,
         environment: &std::collections::BTreeMap<String, String>,
     ) -> Result<(&'a str, Value), &'static str> {
+        if !self.cleanup
+            && matches!(
+                self.step,
+                Step::CreateSession
+                    | Step::Acquire
+                    | Step::PrepareApplication
+                    | Step::StartProvider
+                    | Step::Activate
+            )
+        {
+            record.validate_library_policy_identity()?;
+        }
         let session = record.session_id;
         Ok(match self.step {
             Step::Catalog => {

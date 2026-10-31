@@ -1561,6 +1561,19 @@ impl Pipeline {
                 };
                 record.cleanup_budget_ms = u64::try_from(cleanup_budget(Some(target)).as_millis())
                     .map_err(|_| "cleanup budget exceeds protocol range")?;
+                let snapshot_id = match random_display_admission_token() {
+                    Ok(id) => id,
+                    Err(code) => return self.dependency_failed(job, code, send),
+                };
+                record.library_policy_identity = Some(
+                    amaterasu_module_sdk::application_library::preflight::PolicyIdentity::Library {
+                        version: 1,
+                        application: selection.application.clone(),
+                        entry_revision: selection.revision.clone(),
+                        policy_revision: revision.clone(),
+                        snapshot_id,
+                    },
+                );
                 record.library_policy_revision = Some(revision);
                 job.step = Step::CreateSession;
             }

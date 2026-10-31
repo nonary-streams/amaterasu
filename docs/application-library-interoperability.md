@@ -231,3 +231,9 @@ and source/user ownership, authenticated user/device/seat policy, optional sourc
 management and asynchronous actions, and durable execution recovery. This first
 increment supplies a usable read/handoff boundary without declaring those
 features implemented.
+
+### Source-qualified policy identity checkpoint
+
+When a selected v2 library launch resolves its separately selected policy provider, Launch now retains a `PolicyIdentity::Library` containing the logical application reference, opaque entry revision, opaque policy revision and a fresh snapshot ID. The SDK also represents a catalog identity with its existing numeric revision as a distinct tagged variant. These identities compare by exact source and fields; they are not authority tokens and no library revision is converted to an integer. Before forward session, preparation and provider effects, Launch checks the stored library, application, entry revision and policy revision against the selected record. This guards internal consistency only; it does not prove that the policy is still current.
+
+This is a retained identity on the existing direct library-launch path. It does not yet add a library preflight endpoint or thread the identity through NVHTTP, display admission or RTSP; it does not recheck policy changes between preflight and launch. The legacy catalog path and the `/2` direct-caller restriction remain unchanged. Keep the source-qualified streaming profile closed until the separate owner-bound token, policy/display verification, RTSP integration and real replacement tests exist.
