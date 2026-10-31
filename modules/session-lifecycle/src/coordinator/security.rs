@@ -16,6 +16,7 @@ pub(super) struct ValidationJob {
     deadline: Instant,
     durable: bool,
     input_token: Option<String>,
+    resource_generation: Option<u64>,
 }
 pub(super) struct RevocationJob {
     request: Option<u64>,
@@ -37,6 +38,56 @@ fn target_for(binding: &ActiveBinding) -> LifecycleTarget {
         generation: binding.generation,
     }
 }
+// Binding metadata comes from a completed owner finalization and the exact
+// retained producer callback, not from the consumer's request.
+fn binding_resource_generation(
+    journal: &Journal,
+    target: &LifecycleTarget,
+    binding: &CaptureBinding,
+    provider: &str,
+) -> ModuleResult<u64> {
+    let (epoch, session_id, stream_id, generation) = operations::target_parts(target)?;
+    let session = journal
+        .sessions
+        .get(session_id)
+        .ok_or("resource_session_missing")?;
+    let stream = stream_id
+        .and_then(|id| session.streams.get(id))
+        .ok_or("resource_stream_missing")?;
+    if journal.host_epoch != epoch
+        || session.host_epoch != epoch
+        || stream.generation != generation
+        || stream.binding_owner != provider
+        || stream.candidate.as_ref() != Some(binding)
+    {
+        return Err("resource_binding_stale".into());
+    }
+    let mut results = journal.finalize_results.records().filter(|result| {
+        result.request.target == *target
+            && result.request.transition_id == stream.preparation_transition
+            && result.selection.policy.owner_provider == provider
+            && matches!(&result.applied, amaterasu_extension_api::ResourceControlResponse::Applied { candidate: Some(candidate), .. } if candidate.as_ref() == binding)
+    });
+    let result = results.next().ok_or("resource_finalize_missing")?;
+    if results.next().is_some()
+        || !result.validate_structure()
+        || !result.validate_control_chain(journal)
+    {
+        return Err("resource_finalize_invalid".into());
+    }
+    let mut roots = journal.composition.records().filter(|root| {
+        root.admission_id == result.selection.input.admission_id
+            && root.transition_id == result.selection.input.transition_id
+            && root.output == result.selection.input.output
+            && root.output.producer == provider
+    });
+    let root = roots.next().ok_or("resource_root_missing")?;
+    if roots.next().is_some() {
+        return Err("resource_root_ambiguous".into());
+    }
+    resource_generation::current_root_generation(journal, root)
+}
+
 fn normalized_observation(value: &Value) -> ModuleResult<Value> {
     if !value.is_object()
         || serde_json::to_vec(value)
@@ -408,6 +459,7 @@ impl Coordinator {
                 deadline: Instant::now() + Duration::from_secs(5),
                 durable: ack,
                 input_token,
+                resource_generation: None,
             },
         );
         Ok(response)
@@ -484,7 +536,23 @@ impl Coordinator {
                     [stream.unwrap()]
                 .preparation_transition
                 .clone();
-                let payload = json!({"operation_id":job.operation_id,"transition_id":transition,"target":job.target,"plan_revision":job.binding.plan_revision,"binding":job.binding,"observation":job.observation});
+                let mut payload = json!({"operation_id":job.operation_id,"transition_id":transition,"target":job.target,"plan_revision":job.binding.plan_revision,"binding":job.binding,"observation":job.observation});
+                if selection.participant.contract_version
+                    == amaterasu_extension_api::COMPOSITION_VERSION
+                {
+                    let generation = binding_resource_generation(
+                        &self.shared.borrow().value,
+                        &job.target,
+                        &job.binding,
+                        &job.provider,
+                    );
+                    let Ok(generation) = generation else {
+                        self.finish_validation(&job, None)?;
+                        continue;
+                    };
+                    payload["resource_generation"] = json!(generation);
+                    job.resource_generation = Some(generation);
+                }
                 match send(Command::CallApi {
                     service: method.service.clone(),
                     method: method.method.clone(),
@@ -513,6 +581,10 @@ impl Coordinator {
         result: Option<Value>,
     ) -> ModuleResult<()> {
         let mut next = self.shared.borrow().value.clone();
+        let generation_current = job.resource_generation.is_none_or(|expected| {
+            binding_resource_generation(&next, &job.target, &job.binding, &job.provider)
+                == Ok(expected)
+        });
         let (_, session_id, stream_id, generation) = super::operations::target_parts(&job.target)?;
         let stream = next
             .sessions
@@ -534,7 +606,8 @@ impl Coordinator {
                     && r["observation"] == job.observation
                     && r["plan_revision"] == job.binding.plan_revision
             }
-        }) && stream.generation == generation
+        }) && generation_current
+            && stream.generation == generation
             && stream.candidate.as_ref() == Some(&job.binding)
             && if job.consumer.is_some() {
                 stream.phase == StreamPhase::Ready
@@ -1052,5 +1125,46 @@ mod resource_generation_tests {
         );
         drop(coordinator);
         std::fs::remove_dir_all(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod binding_generation_tests {
+    use super::*;
+
+    fn fixture() -> (Journal, LifecycleTarget, CaptureBinding) {
+        let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":2});
+        let binding = json!({"capture_provider":"capture","selector_schema":"selector/1","selector":{},"resource":{"provider":"owner","resource_id":"display","incarnation":"native","revision":2,"execution_domain":"seat","mutation_domain":null},"mode":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false},"plan_revision":1,"geometry_revision":2,"generation":2});
+        let session = json!({"host_epoch":"epoch","id":"session","generation":1,"phase":"ready","owner":{"caller":"transport","initiator":"client"},"delegates":[],"application_ref":null,"settings_revision":"revision","application_retired":false,"streams":{"stream":{"generation":2,"phase":"ready","candidate":binding,"binding_owner":"owner","required":[],"acknowledgements":[],"retirements":[]}},"resource_generations":{"owner":7}});
+        (serde_json::from_value(json!({"version":3,"host_epoch":"epoch","receipts":{},"sessions":{"session":session}})).unwrap(), serde_json::from_value(target).unwrap(), serde_json::from_value(binding).unwrap())
+    }
+
+    #[test]
+    fn no_finalized_owner_evidence_rejects_binding_generation() {
+        let (journal, target, binding) = fixture();
+        assert_eq!(
+            binding_resource_generation(&journal, &target, &binding, "owner").unwrap_err(),
+            "resource_finalize_missing"
+        );
+    }
+
+    #[test]
+    fn stale_target_binding_or_owner_never_selects_generation() {
+        let (mut journal, target, mut binding) = fixture();
+        assert_eq!(
+            binding_resource_generation(&journal, &target, &binding, "other").unwrap_err(),
+            "resource_binding_stale"
+        );
+        binding.geometry_revision += 1;
+        assert_eq!(
+            binding_resource_generation(&journal, &target, &binding, "owner").unwrap_err(),
+            "resource_binding_stale"
+        );
+        binding.geometry_revision -= 1;
+        journal.host_epoch = "new-epoch".into();
+        assert_eq!(
+            binding_resource_generation(&journal, &target, &binding, "owner").unwrap_err(),
+            "resource_binding_stale"
+        );
     }
 }
