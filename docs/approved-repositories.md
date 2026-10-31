@@ -72,4 +72,6 @@ the installed bootstrap policy for each named caller. The publisher adds only
 those calls to the signed component requests; an absent, unselected, or
 unapproved caller or service is rejected. Add every required transit caller
 explicitly. API method schemas and caller authorization still require their own
-operator policy approval.
+operator policy approval. For a worked
+application-library provider binding and lifecycle limitations, see
+[provider configuration](application-library-provider-configuration.md).
