@@ -86,13 +86,59 @@ impl StateStore {
                 return crate::collection::Collection::open(&self.directory, &path, &collection)?
                     .commit(expected_revision, metadata, edits);
             }
+            Operation::CollectionDraftBegin {
+                collection,
+                draft_id,
+                expected_revision,
+            } => {
+                return crate::draft::begin(
+                    &self.directory,
+                    &path,
+                    &collection,
+                    &draft_id,
+                    expected_revision,
+                );
+            }
+            Operation::CollectionDraftAppend {
+                collection,
+                draft_id,
+                sequence,
+                edits,
+            } => {
+                return crate::draft::append(&path, &collection, &draft_id, sequence, edits);
+            }
+            Operation::CollectionDraftPublish {
+                collection,
+                draft_id,
+                expected_revision,
+                metadata,
+            } => {
+                return crate::draft::publish(
+                    &self.directory,
+                    &path,
+                    &collection,
+                    &draft_id,
+                    expected_revision,
+                    metadata,
+                );
+            }
+            Operation::CollectionDraftAbort {
+                collection,
+                draft_id,
+            } => {
+                return crate::draft::abort(&path, &collection, &draft_id);
+            }
             _ => (),
         }
         let mut namespace = load_namespace(&path)?;
         match operation {
             Operation::CollectionGet { .. }
             | Operation::CollectionPage { .. }
-            | Operation::CollectionCommit { .. } => unreachable!("collections handled above"),
+            | Operation::CollectionCommit { .. }
+            | Operation::CollectionDraftBegin { .. }
+            | Operation::CollectionDraftAppend { .. }
+            | Operation::CollectionDraftPublish { .. }
+            | Operation::CollectionDraftAbort { .. } => unreachable!("collections handled above"),
             Operation::Get { key } => Ok(json!({
                 "ok": true, "revision": namespace.revision,
                 "found": namespace.values.contains_key(&key),
@@ -151,7 +197,11 @@ fn validate_operation(operation: &Operation) -> Result<(), StateError> {
     match operation {
         Operation::CollectionGet { collection, .. }
         | Operation::CollectionPage { collection, .. }
-        | Operation::CollectionCommit { collection, .. } => validate_key(collection),
+        | Operation::CollectionCommit { collection, .. }
+        | Operation::CollectionDraftBegin { collection, .. }
+        | Operation::CollectionDraftAppend { collection, .. }
+        | Operation::CollectionDraftPublish { collection, .. }
+        | Operation::CollectionDraftAbort { collection, .. } => validate_key(collection),
         Operation::Get { key } | Operation::Delete { key, .. } => validate_key(key),
         Operation::Set { key, value, .. } => {
             validate_key(key)?;

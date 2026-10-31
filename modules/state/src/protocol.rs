@@ -20,6 +20,27 @@ pub enum Operation {
         metadata: Value,
         edits: Vec<crate::collection::Edit>,
     },
+    CollectionDraftBegin {
+        collection: String,
+        draft_id: String,
+        expected_revision: u64,
+    },
+    CollectionDraftAppend {
+        collection: String,
+        draft_id: String,
+        sequence: u64,
+        edits: Vec<crate::collection::Edit>,
+    },
+    CollectionDraftPublish {
+        collection: String,
+        draft_id: String,
+        expected_revision: u64,
+        metadata: Value,
+    },
+    CollectionDraftAbort {
+        collection: String,
+        draft_id: String,
+    },
     Get {
         key: String,
     },

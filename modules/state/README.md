@@ -93,3 +93,44 @@ validation checks revision references, range bounds, metadata size and aggregate
 counts; leaf loading also validates each range and its recorded count. Tests persist and reopen 10,000 entries, traverse them with
 16 KiB envelope assertions, exercise isolation and stale revisions, and inject a
 failure between shard persistence and manifest publication.
+
+### Durable collection drafts
+
+A State caller may prepare a collection commit in bounded chunks without making
+its changes visible to collection reads:
+
+```json
+{"action":"collection_draft_begin","collection":"apps","draft_id":"scan_42","expected_revision":7}
+{"action":"collection_draft_append","collection":"apps","draft_id":"scan_42","sequence":0,"edits":[{"key":"app-1","value":{"name":"Game"}}]}
+{"action":"collection_draft_publish","collection":"apps","draft_id":"scan_42","expected_revision":7,"metadata":{"revision":8}}
+```
+
+Drafts belong to the authenticated State caller and the named collection. IDs
+contain 1–64 ASCII letters, digits, hyphens or underscores and must be unique
+among that caller's active drafts. Begin pins the collection revision and returns
+`next_sequence`; repeating begin with the same ID, collection and revision resumes
+it. Append sequences begin at zero. Retrying the most recent append with exactly
+the same edits is idempotent; different content or an out-of-order sequence is
+rejected. Keys must be unique across the entire draft.
+
+Publish checks that the pinned revision is still current, validates all edits,
+and atomically replaces the collection manifest once. A revision conflict leaves
+both the published collection and the draft intact. After a successful publish,
+a retry with the same ID, base revision and metadata returns the published
+revision while that publication remains the latest collection commit. A later
+commit supersedes this receipt. Call `collection_draft_abort` with `collection`
+and `draft_id` to discard a draft; abort is idempotent. Callers should abort
+abandoned or conflicted drafts. Drafts persist across restarts. Starting a new
+draft reclaims valid drafts idle for at least 24 hours; resuming a draft or
+successfully appending refreshes its idle time. Incomplete draft directories from
+interrupted creation are reclaimed on the same schedule. Malformed entries and
+uncertain timestamps are retained rather than deleted. State serializes its
+requests under its root lock, so reclamation cannot race an in-flight operation.
+
+A caller can hold at most 16 active drafts. Each draft is limited to 1,024
+chunks, 100,000 edits and 16 MiB of encoded chunk data. Each chunk contains at
+most 128 edits and its encoded edits array must fit 12,000 bytes; individual
+collection entry and transport limits also apply. These bounds do not guarantee
+that every maximum-size catalog can be published in one draft. Publication
+materializes the bounded draft in memory and may take longer for larger changes;
+a timeout can leave its outcome ambiguous, so retry the same publish request.

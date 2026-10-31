@@ -32,6 +32,8 @@ struct Manifest {
     revision: u64,
     metadata: Value,
     count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    draft_receipt: Option<DraftReceipt>,
     // Lower inclusive key bounds index ordered leaf files. The first bound is
     // always empty, so inserts below the current minimum still have an owner.
     shards: BTreeMap<String, ShardReference>,
@@ -43,6 +45,7 @@ impl Default for Manifest {
             revision: 0,
             metadata: Value::Null,
             count: 0,
+            draft_receipt: None,
             shards: BTreeMap::new(),
         }
     }
@@ -60,6 +63,16 @@ impl Manifest {
             || count != self.count
             || self.shards.len() > self.count + 1
             || encoded_size(&self.metadata)? > 1024
+            || self.draft_receipt.as_ref().is_some_and(|receipt| {
+                receipt.id.is_empty()
+                    || receipt.id.len() > 64
+                    || !receipt
+                        .id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                    || receipt.expected_revision.checked_add(1) != Some(self.revision)
+                    || receipt.metadata != self.metadata
+            })
             || self
                 .shards
                 .first_key_value()
@@ -88,11 +101,19 @@ impl Manifest {
             .map_or_else(String::new, |(bound, _)| bound.clone())
     }
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Edit {
     pub key: String,
     pub value: Option<Value>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DraftReceipt {
+    pub(crate) id: String,
+    pub(crate) expected_revision: u64,
+    pub(crate) metadata: Value,
 }
 
 pub struct Collection<'a> {
@@ -217,13 +238,38 @@ impl<'a> Collection<'a> {
         Ok(page.reply(revision, false))
     }
     pub fn commit(
-        mut self,
+        self,
         expected: u64,
         metadata: Value,
         edits: Vec<Edit>,
     ) -> Result<Value, StateError> {
         self.check_revision(expected)?;
         validate_commit(&metadata, &edits)?;
+        self.commit_checked(expected, metadata, edits, None)
+    }
+    pub(crate) fn commit_draft(
+        self,
+        expected: u64,
+        metadata: Value,
+        edits: Vec<Edit>,
+        receipt: DraftReceipt,
+    ) -> Result<Value, StateError> {
+        self.check_revision(expected)?;
+        validate_large_commit(&metadata, &edits)?;
+        self.commit_checked(expected, metadata, edits, Some(receipt))
+    }
+    pub(crate) fn draft_receipt(&self) -> Option<&DraftReceipt> {
+        self.manifest.draft_receipt.as_ref()
+    }
+    fn commit_checked(
+        mut self,
+        expected: u64,
+        metadata: Value,
+        edits: Vec<Edit>,
+        receipt: Option<DraftReceipt>,
+    ) -> Result<Value, StateError> {
+        self.check_revision(expected)?;
+        self.manifest.draft_receipt = receipt;
         let revision = self.manifest.revision.checked_add(1).ok_or_else(|| {
             StateError::new("revision_exhausted", "collection revision exhausted")
         })?;
@@ -416,8 +462,17 @@ fn collection_directory(namespace: &Path, name: &str) -> Result<PathBuf, StateEr
     }
     Ok(directory)
 }
-fn validate_commit(metadata: &Value, edits: &[Edit]) -> Result<(), StateError> {
-    if encoded_size(metadata)? > 1024 || edits.len() > 128 {
+pub(crate) fn validate_commit(metadata: &Value, edits: &[Edit]) -> Result<(), StateError> {
+    if edits.len() > 128 {
+        return Err(StateError::new(
+            "invalid_request",
+            "collection commit exceeds metadata or edit limit",
+        ));
+    }
+    validate_large_commit(metadata, edits)
+}
+fn validate_large_commit(metadata: &Value, edits: &[Edit]) -> Result<(), StateError> {
+    if encoded_size(metadata)? > 1024 || edits.len() > MAX_ITEMS {
         return Err(StateError::new(
             "invalid_request",
             "collection commit exceeds metadata or edit limit",

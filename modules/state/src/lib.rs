@@ -1,5 +1,6 @@
 //! Durable caller-scoped JSON state, served through the runtime request queue.
 mod collection;
+mod draft;
 mod protocol;
 mod snapshot;
 mod store;

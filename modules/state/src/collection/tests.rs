@@ -297,3 +297,218 @@ fn corrupt_manifest_counts_and_leaf_counts_return_errors_without_mutating() {
     assert_eq!(failure["error"]["code"], "corrupt_storage");
     assert_eq!(std::fs::read(&path).unwrap(), valid);
 }
+
+#[test]
+fn durable_draft_publishes_many_edits_atomically_and_replays_after_restart() {
+    let directory = Directory::new();
+    let store = StateStore::open(directory.0.clone()).unwrap();
+    let call = |payload| bounded_handle(&store, "catalog", payload);
+    let begin = json!({"action":"collection_draft_begin","collection":"apps","draft_id":"draft_1","expected_revision":0});
+    assert_eq!(call(begin.clone())["next_sequence"], 0);
+    for sequence in 0..10 {
+        let edits: Vec<_> = (0..50)
+            .map(|n| json!({"key":format!("app-{:016x}",sequence * 50 + n),"value":entry(n)}))
+            .collect();
+        let append = json!({"action":"collection_draft_append","collection":"apps","draft_id":"draft_1","sequence":sequence,"edits":edits});
+        assert_eq!(call(append.clone())["next_sequence"], sequence + 1);
+        assert_eq!(call(append)["replayed"], true);
+        assert_eq!(
+            call(json!({"action":"collection_get","collection":"apps"}))["count"],
+            0
+        );
+    }
+    drop(store);
+    let store = StateStore::open(directory.0.clone()).unwrap();
+    assert_eq!(
+        bounded_handle(&store, "catalog", begin)["next_sequence"],
+        10
+    );
+    let publish = json!({"action":"collection_draft_publish","collection":"apps","draft_id":"draft_1","expected_revision":0,"metadata":{"revision":1}});
+    assert_eq!(
+        bounded_handle(&store, "catalog", publish.clone())["revision"],
+        1
+    );
+    drop(store);
+    let store = StateStore::open(directory.0.clone()).unwrap();
+    let replay = bounded_handle(&store, "catalog", publish);
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["revision"], 1);
+    assert_eq!(
+        bounded_handle(
+            &store,
+            "catalog",
+            json!({"action":"collection_get","collection":"apps"})
+        )["count"],
+        500
+    );
+}
+
+#[test]
+fn drafts_are_namespace_bound_conflict_safe_and_abortable() {
+    let directory = Directory::new();
+    let store = StateStore::open(directory.0.clone()).unwrap();
+    let begin = json!({"action":"collection_draft_begin","collection":"apps","draft_id":"draft_2","expected_revision":0});
+    assert_eq!(store.handle("first", begin.clone())["ok"], true);
+    let append = json!({"action":"collection_draft_append","collection":"apps","draft_id":"draft_2","sequence":0,"edits":[{"key":"one","value":1}]});
+    assert_eq!(store.handle("first", append)["ok"], true);
+    let changed = json!({"action":"collection_draft_append","collection":"apps","draft_id":"draft_2","sequence":0,"edits":[{"key":"one","value":2}]});
+    assert_eq!(
+        store.handle("first", changed)["error"]["code"],
+        "sequence_conflict"
+    );
+    let wrong_collection =
+        json!({"action":"collection_draft_abort","collection":"other","draft_id":"draft_2"});
+    assert_eq!(
+        store.handle("first", wrong_collection)["error"]["code"],
+        "draft_conflict"
+    );
+    assert_eq!(store.handle("second", begin)["ok"], true);
+    assert_eq!(store.handle("first", json!({"action":"collection_commit","collection":"apps","expected_revision":0,"metadata":{},"edits":[{"key":"manual","value":3}]}))["ok"], true);
+    let publish = json!({"action":"collection_draft_publish","collection":"apps","draft_id":"draft_2","expected_revision":0,"metadata":{}});
+    assert_eq!(
+        store.handle("first", publish)["error"]["code"],
+        "revision_conflict"
+    );
+    let found = store.handle(
+        "first",
+        json!({"action":"collection_get","collection":"apps","key":"manual"}),
+    );
+    assert_eq!(found["value"], 3);
+    let abort = json!({"action":"collection_draft_abort","collection":"apps","draft_id":"draft_2"});
+    assert_eq!(store.handle("first", abort.clone())["ok"], true);
+    assert_eq!(store.handle("first", abort)["ok"], true);
+    assert_eq!(store.handle("second", json!({"action":"collection_draft_begin","collection":"apps","draft_id":"draft_2","expected_revision":0}))["next_sequence"], 0);
+}
+
+#[test]
+fn published_receipt_replay_never_removes_reused_id_in_another_collection() {
+    let directory = Directory::new();
+    let store = StateStore::open(directory.0.clone()).unwrap();
+    let begin = |collection| json!({"action":"collection_draft_begin","collection":collection,"draft_id":"shared","expected_revision":0});
+    let publish = json!({"action":"collection_draft_publish","collection":"first","draft_id":"shared","expected_revision":0,"metadata":{}});
+    assert_eq!(store.handle("catalog", begin("first"))["ok"], true);
+    assert_eq!(store.handle("catalog", publish.clone())["ok"], true);
+    assert_eq!(store.handle("catalog", begin("second"))["ok"], true);
+    assert_eq!(store.handle("catalog", publish)["replayed"], true);
+    assert_eq!(store.handle("catalog", json!({"action":"collection_draft_append","collection":"second","draft_id":"shared","sequence":0,"edits":[{"key":"safe","value":1}]}))["ok"], true);
+}
+
+#[test]
+fn draft_limits_and_cross_chunk_duplicate_keys_fail_before_publication() {
+    let directory = Directory::new();
+    let store = StateStore::open(directory.0.clone()).unwrap();
+    for n in 0..16 {
+        let result = store.handle("catalog", json!({"action":"collection_draft_begin","collection":"apps","draft_id":format!("draft-{n}"),"expected_revision":0}));
+        assert_eq!(result["ok"], true, "{result}");
+    }
+    let full = store.handle("catalog", json!({"action":"collection_draft_begin","collection":"apps","draft_id":"overflow","expected_revision":0}));
+    assert_eq!(full["error"]["code"], "resource_exhausted");
+    for sequence in 0..2 {
+        let result = store.handle("catalog", json!({"action":"collection_draft_append","collection":"apps","draft_id":"draft-0","sequence":sequence,"edits":[{"key":"same","value":sequence}]}));
+        assert_eq!(result["ok"], true);
+    }
+    let rejected = store.handle("catalog", json!({"action":"collection_draft_publish","collection":"apps","draft_id":"draft-0","expected_revision":0,"metadata":{}}));
+    assert_eq!(rejected["error"]["code"], "invalid_request");
+    assert_eq!(
+        store.handle(
+            "catalog",
+            json!({"action":"collection_get","collection":"apps"})
+        )["revision"],
+        0
+    );
+    assert_eq!(
+        store.handle(
+            "catalog",
+            json!({"action":"collection_draft_abort","collection":"apps","draft_id":"draft-0"})
+        )["ok"],
+        true
+    );
+    assert_eq!(store.handle("catalog", json!({"action":"collection_draft_begin","collection":"apps","draft_id":"available","expected_revision":0}))["ok"], true);
+}
+
+#[test]
+fn restart_recovers_chunk_persisted_before_draft_cursor_update() {
+    let directory = Directory::new();
+    let store = StateStore::open(directory.0.clone()).unwrap();
+    let begin = json!({"action":"collection_draft_begin","collection":"apps","draft_id":"crash","expected_revision":0});
+    assert_eq!(store.handle("catalog", begin)["ok"], true);
+    drop(store);
+    let path = directory
+        .0
+        .join("namespaces/636174616c6f67/drafts/crash/chunk-0000000000000000.json");
+    let chunk = json!([{"key":"one","value":1}]);
+    amaterasu_storage::write_atomically(&path, &serde_json::to_vec(&chunk).unwrap()).unwrap();
+    let store = StateStore::open(directory.0.clone()).unwrap();
+    let changed = json!({"action":"collection_draft_append","collection":"apps","draft_id":"crash","sequence":0,"edits":[{"key":"one","value":2}]});
+    assert_eq!(
+        store.handle("catalog", changed)["error"]["code"],
+        "sequence_conflict"
+    );
+    let same = json!({"action":"collection_draft_append","collection":"apps","draft_id":"crash","sequence":0,"edits":chunk});
+    assert_eq!(store.handle("catalog", same)["next_sequence"], 1);
+    let publish = json!({"action":"collection_draft_publish","collection":"apps","draft_id":"crash","expected_revision":0,"metadata":{}});
+    assert_eq!(store.handle("catalog", publish)["ok"], true);
+    assert_eq!(
+        store.handle(
+            "catalog",
+            json!({"action":"collection_get","collection":"apps","key":"one"})
+        )["value"],
+        1
+    );
+}
+
+#[test]
+fn stale_drafts_are_reclaimed_while_recent_and_resumed_drafts_survive() {
+    use std::time::{Duration, SystemTime};
+    let directory = Directory::new();
+    let store = StateStore::open(directory.0.clone()).unwrap();
+    let begin = |id| json!({"action":"collection_draft_begin","collection":"apps","draft_id":id,"expected_revision":0});
+    for id in ["stale", "resume", "recent"] {
+        assert_eq!(store.handle("catalog", begin(id))["ok"], true);
+    }
+    let root = directory.0.join("namespaces/636174616c6f67/drafts");
+    let old = SystemTime::now()
+        .checked_sub(Duration::from_secs(25 * 3600))
+        .unwrap();
+    for id in ["stale", "resume"] {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.join(id).join("draft.json"))
+            .unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+    }
+    assert_eq!(store.handle("catalog", begin("resume"))["ok"], true);
+    assert_eq!(store.handle("catalog", begin("new"))["ok"], true);
+    assert!(!root.join("stale").exists());
+    assert!(root.join("resume").exists());
+    assert!(root.join("recent").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_reclamation_retains_malformed_and_symlinked_entries() {
+    use std::time::{Duration, SystemTime};
+    let directory = Directory::new();
+    let store = StateStore::open(directory.0.clone()).unwrap();
+    let begin = |id| json!({"action":"collection_draft_begin","collection":"apps","draft_id":id,"expected_revision":0});
+    assert_eq!(store.handle("catalog", begin("malformed"))["ok"], true);
+    let base = directory.0.join("namespaces/636174616c6f67/drafts");
+    let state_path = base.join("malformed/draft.json");
+    std::fs::write(&state_path, b"invalid").unwrap();
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&state_path)
+        .unwrap();
+    file.set_times(
+        std::fs::FileTimes::new().set_modified(SystemTime::now() - Duration::from_secs(25 * 3600)),
+    )
+    .unwrap();
+    let outside = directory.0.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, base.join("linked")).unwrap();
+    assert_eq!(store.handle("catalog", begin("new"))["ok"], true);
+    assert!(state_path.exists());
+    assert!(base.join("linked").is_symlink());
+    assert!(outside.exists());
+}
