@@ -398,3 +398,245 @@ fn transferred_action_fences_new_preparation_across_sessions_until_terminal() {
         "pending"
     );
 }
+
+#[test]
+fn frozen_action_lineage_survives_restart_and_rejects_tampering() {
+    use crate::adapter::{MethodSettings, ParticipantSettings};
+    use crate::prepare_authority::{Admission, MethodApproval, ProviderSelection};
+    use sha2::{Digest, Sha256};
+
+    let dir = TestDirectory::new();
+    let path = dir.journal();
+    let mut coordinator = Coordinator::open(&path).unwrap();
+    let method = |name: &str| MethodSettings {
+        service: "display/1".into(),
+        method: name.into(),
+        interface_major: 1,
+        interface_minor: 0,
+        schema_revision: 1,
+    };
+    let participant = ParticipantSettings {
+        contract_version: 1,
+        depends_on: vec![],
+        provider: "display".into(),
+        plan_method: method("plan"),
+        callback_method: method("callback"),
+        status_method: method("status"),
+        binding_validate_method: None,
+        capabilities: Default::default(),
+        cleanup_methods: vec![],
+        settings_revision: "rev".into(),
+        settings: json!({}),
+    };
+    let approvals = [&participant.plan_method, &participant.callback_method, &participant.status_method]
+        .iter().map(|method| MethodApproval { method: (*method).clone(), broker_approval: json!({"provider":"display","method":{"service":method.service,"method":method.method,"interface_major":method.interface_major,"interface_minor":method.interface_minor}}) }).collect();
+    let selection = ProviderSelection {
+        participant: participant.clone(),
+        approvals,
+        capabilities: Default::default(),
+        cleanup_methods: vec![],
+        authorized_borrowers: Default::default(),
+    };
+    coordinator.settings.participants.push(participant);
+    coordinator
+        .selections
+        .insert("display".into(), selection.clone());
+    coordinator.approval_cursor = 3;
+    let mut state = coordinator.shared.borrow().value.clone();
+    let epoch = state.host_epoch.clone();
+    let graph = ProviderGraph {
+        order: vec!["display".into()],
+        dependencies: [("display".into(), vec![])].into(),
+    };
+    let session_target = LifecycleTarget::Session {
+        host_epoch: epoch.clone(),
+        session_id: "session".into(),
+        generation: 3,
+    };
+    let stream_target = LifecycleTarget::Stream {
+        host_epoch: epoch.clone(),
+        session_id: "session".into(),
+        stream_id: "stream".into(),
+        generation: 4,
+    };
+    let plan_value = json!({"plan_id":"plan","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{"selected_settings_revision":"rev"},"obligations":[],"affected_consumers":[],"consumer_change":"reconnect_required","candidate_constraint":null,"allowed_degradation":[]});
+    let plan: amaterasu_extension_api::ResourcePlan =
+        serde_json::from_value(plan_value.clone()).unwrap();
+    let stream = StreamRecord {
+        provider_graph: Some(graph.clone()),
+        generation: 4,
+        phase: StreamPhase::Active,
+        candidate: None,
+        required: ["capture".into()].into(),
+        acknowledgements: ["capture".into()].into(),
+        retirements: Default::default(),
+        binding_owner: "display".into(),
+        preparation_transition: String::new(),
+        provider_settings: [(
+            "display".into(),
+            settings_snapshot::FrozenSettings {
+                settings: json!({}),
+                revision: "rev".into(),
+            },
+        )]
+        .into(),
+    };
+    let session = SessionRecord {
+        provider_graph: Some(graph),
+        host_epoch: epoch.clone(),
+        id: "session".into(),
+        generation: 3,
+        phase: SessionPhase::Ready,
+        owner: crate::action_authority::Principal {
+            caller: "transport".into(),
+            initiator: "user".into(),
+        },
+        delegates: Default::default(),
+        application_ref: json!({}),
+        settings_revision: "revision".into(),
+        application_retired: false,
+        streams: [("stream".into(), stream)].into(),
+        obligations: vec![],
+        required_consumers: None,
+        application: None,
+        application_operation_id: None,
+        admission_ids: ["session-admission".into(), "stream-admission".into()].into(),
+        admission_targets: [
+            ("session-admission".into(), session_target),
+            ("stream-admission".into(), stream_target),
+        ]
+        .into(),
+        admission_phases: [
+            ("session-admission".into(), LifecyclePhase::SessionPrepare),
+            ("stream-admission".into(), LifecyclePhase::StreamPrepare),
+        ]
+        .into(),
+        provider_settings: Default::default(),
+    };
+    state.sessions.insert("session".into(), session);
+    for id in ["session-admission", "stream-admission"] {
+        state.authority.settled.insert(
+            id.into(),
+            Admission {
+                provider: "display".into(),
+                selection: selection.clone(),
+                plan: plan.clone(),
+                rights: vec![],
+            },
+        );
+        state
+            .admission_transitions
+            .insert(id.into(), format!("transition-{id}"));
+    }
+    save(&coordinator.shared, state).unwrap();
+    let digest: String = Sha256::digest(serde_json::to_vec(&plan_value).unwrap())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let target =
+        json!({"kind":"session","host_epoch":epoch,"session_id":"session","expected_generation":3});
+    let service = coordinator.settings.action_service.clone();
+    let auth = json!({"operation":"authorize_action","operation_id":"frozen-action","action_id":"display/remove","target":target,"plan_digest":digest,"plan":plan_value,"source":{"caller":"transport","initiator":"user"},"provider":"display","execute_method":{"service":"display/1","method":"execute","interface_major":1,"interface_minor":0,"schema_revision":1}});
+    let permit = coordinator.action_operation(&service, "service", &auth);
+    assert_eq!(permit["status"], "succeeded");
+    let mut transition = json!({"operation":"consume_action_permit","operation_id":"frozen-action","action_id":"display/remove","target":target,"plan_digest":digest,"permit":permit["permit"]});
+    assert_eq!(
+        coordinator.action_operation(&service, "service", &transition)["status"],
+        "succeeded"
+    );
+    transition["operation"] = json!("begin_action_transition");
+    assert_eq!(
+        coordinator.action_operation(&service, "service", &transition)["status"],
+        "pending"
+    );
+    let frozen = coordinator.shared.borrow().value.clone();
+    assert!(validate_journal(&frozen).is_ok());
+    let key = receipt_key(&service, "action-transition", "frozen-action");
+    let snapshot = frozen.receipts[&key]
+        .work
+        .as_ref()
+        .unwrap()
+        .action_transfer
+        .as_ref()
+        .unwrap()
+        .snapshot
+        .as_ref()
+        .unwrap()
+        .clone();
+    assert!(
+        snapshot
+            .session_admissions
+            .contains_key("session-admission")
+    );
+    assert!(snapshot.stream_admissions.contains_key("stream-admission"));
+    for mutate in 0..4 {
+        let mut tampered = frozen.clone();
+        match mutate {
+            0 => {
+                tampered
+                    .authority
+                    .settled
+                    .get_mut("session-admission")
+                    .unwrap()
+                    .plan
+                    .revision += 1
+            }
+            1 => {
+                *tampered
+                    .admission_transitions
+                    .get_mut("stream-admission")
+                    .unwrap() = "other-transition".into()
+            }
+            2 => {
+                tampered
+                    .sessions
+                    .get_mut("session")
+                    .unwrap()
+                    .owner
+                    .initiator = "attacker".into()
+            }
+            _ => tampered.sessions.get_mut("session").unwrap().generation += 1,
+        }
+        assert!(
+            validate_journal(&tampered).is_err(),
+            "tampering case {mutate}"
+        );
+    }
+    drop(coordinator);
+    let recovered = Coordinator::open(&path).unwrap();
+    let first_recovery_epoch = {
+        let state = &recovered.shared.borrow().value;
+        assert_ne!(state.host_epoch, epoch);
+        let receipt = &state.receipts[&key];
+        assert_eq!(receipt.response["status"], "recovery_required");
+        assert!(
+            receipt
+                .work
+                .as_ref()
+                .unwrap()
+                .action_transfer
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .as_ref()
+                == Some(&snapshot)
+        );
+        state.host_epoch.clone()
+    };
+    drop(recovered);
+    let second_recovery = Coordinator::open(&path).unwrap();
+    let state = &second_recovery.shared.borrow().value;
+    assert_ne!(state.host_epoch, first_recovery_epoch);
+    assert!(
+        state.receipts[&key]
+            .work
+            .as_ref()
+            .unwrap()
+            .action_transfer
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .as_ref()
+            == Some(&snapshot)
+    );
+}
