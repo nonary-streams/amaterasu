@@ -618,6 +618,7 @@ void am_pw_snapshot(struct am_pw_session *session, struct am_pw_snapshot *output
     output->registry_global=session->geometry.registry_global; output->mode_width=session->geometry.mode_width;
     output->mode_height=session->geometry.mode_height; output->refresh_millihz=session->geometry.refresh_millihz;
     memcpy(output->output_name,session->geometry.output_name,sizeof(output->output_name));
+    memcpy(output->compositor_id,session->geometry.compositor_id,sizeof(output->compositor_id));
     g_mutex_unlock(&session->geometry_lock);
 }
 

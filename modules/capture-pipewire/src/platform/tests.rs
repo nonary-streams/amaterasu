@@ -267,3 +267,91 @@ fn native_named_output_validation_matches_admission() {
         );
     }
 }
+
+#[cfg(amaterasu_kwin)]
+#[test]
+fn compositor_identity_is_canonical_and_socket_peer_bound() {
+    use std::os::fd::AsRawFd;
+    let boot = std::ffi::CString::new("12345678-1234-1234-1234-123456789abc").unwrap();
+    let mut digest = [0 as std::ffi::c_char; 65];
+    // SAFETY: arguments are valid, and digest has room for the fixed result.
+    assert_eq!(
+        unsafe { super::am_kwin_compositor_digest(boot.as_ptr(), 42, 123456, digest.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: the successful call writes a NUL-terminated digest.
+    assert_eq!(
+        unsafe { std::ffi::CStr::from_ptr(digest.as_ptr()) }
+            .to_str()
+            .unwrap(),
+        "ae079eb62723ef9365d82146be3c9ec20d425a067ac346111b35bb0cf6133d66"
+    );
+    let provider_vector = std::ffi::CString::new("00000000-0000-0000-0000-000000000001").unwrap();
+    // SAFETY: the input string and writable digest buffer remain valid for the call.
+    assert_eq!(
+        unsafe {
+            super::am_kwin_compositor_digest(provider_vector.as_ptr(), 42, 123, digest.as_mut_ptr())
+        },
+        0
+    );
+    // SAFETY: the successful call writes a terminated digest.
+    assert_eq!(
+        unsafe { std::ffi::CStr::from_ptr(digest.as_ptr()) }
+            .to_str()
+            .unwrap(),
+        "3d3d4ac4d977d80fb5c38b6cf9f90787d9051298687dd88b46b16addc7476db5"
+    );
+    let (one, two) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut first = [0 as std::ffi::c_char; 65];
+    let mut second = [0 as std::ffi::c_char; 65];
+    // SAFETY: live sockets and writable buffers are supplied.
+    assert_eq!(
+        unsafe { super::am_kwin_peer_identity(one.as_raw_fd(), first.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: same as above for the other peer.
+    assert_eq!(
+        unsafe { super::am_kwin_peer_identity(two.as_raw_fd(), second.as_mut_ptr()) },
+        0
+    );
+    assert_eq!(first, second);
+    let mut validated = [1 as std::ffi::c_char; 65];
+    // SAFETY: the descriptors and fixed-size input and output buffers remain live.
+    assert_eq!(
+        unsafe {
+            super::am_kwin_validate_peer_identity(
+                one.as_raw_fd(),
+                first.as_ptr(),
+                validated.as_mut_ptr(),
+            )
+        },
+        0
+    );
+    assert_eq!(validated, first);
+    let mismatch = std::ffi::CString::new("a".repeat(64)).unwrap();
+    // SAFETY: the peer and both buffers are valid; a mismatch must suppress identity.
+    assert_eq!(
+        unsafe {
+            super::am_kwin_validate_peer_identity(
+                one.as_raw_fd(),
+                mismatch.as_ptr(),
+                validated.as_mut_ptr(),
+            )
+        },
+        -1
+    );
+    assert_eq!(validated[0], 0);
+    // SAFETY: an unavailable socket must also suppress the previously populated output.
+    assert_eq!(
+        unsafe {
+            super::am_kwin_validate_peer_identity(-1, first.as_ptr(), validated.as_mut_ptr())
+        },
+        -1
+    );
+    assert_eq!(validated[0], 0);
+    // SAFETY: an invalid descriptor and valid output buffer are permitted.
+    assert_eq!(
+        unsafe { super::am_kwin_peer_identity(-1, first.as_mut_ptr()) },
+        -1
+    );
+}

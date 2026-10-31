@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE
 #include "kwin.h"
 #include "zkde-screencast-unstable-v1.h"
 #include "xdg-output-unstable-v1.h"
@@ -7,8 +7,10 @@
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 
 #define MAX_OUTPUTS 64
 struct output {
@@ -33,8 +35,66 @@ struct am_kwin {
     size_t count,selected;
     uint32_t node;
     uint64_t serial;
+    char compositor_id[65];
     bool failed;
 };
+
+int am_kwin_compositor_digest(const char *boot_id,uint32_t pid,uint64_t starttime,char identity[65]) {
+    if (!boot_id || !identity || !pid || !starttime || strlen(boot_id)!=36) return -1;
+    for (size_t i=0;i<36;i++) {
+        bool hyphen=i==8 || i==13 || i==18 || i==23;
+        if (hyphen ? boot_id[i]!='-' : !((boot_id[i]>='0' && boot_id[i]<='9') || (boot_id[i]>='a' && boot_id[i]<='f'))) return -1;
+    }
+    char input[160];
+    int length=snprintf(input,sizeof(input),"amaterasu-wayland-compositor-v1\n%s\n%u\n%llu\n",boot_id,pid,(unsigned long long)starttime);
+    if (length<0 || (size_t)length>=sizeof(input)) return -1;
+    char *digest=g_compute_checksum_for_string(G_CHECKSUM_SHA256,input,length);
+    if (!digest) return -1;
+    memcpy(identity,digest,65); g_free(digest); return 0;
+}
+
+static int peer_credentials(int fd,struct ucred *peer) {
+    socklen_t size=sizeof(*peer);
+    return getsockopt(fd,SOL_SOCKET,SO_PEERCRED,peer,&size)==0 && size==sizeof(*peer) && peer->pid>0 ? 0:-1;
+}
+
+static int read_starttime(pid_t pid,uint64_t *starttime) {
+    char path[64],line[8192];
+    if (snprintf(path,sizeof(path),"/proc/%ld/stat",(long)pid)<0) return -1;
+    FILE *file=fopen(path,"r"); if (!file) return -1;
+    bool read_ok=fgets(line,sizeof(line),file)!=NULL && strchr(line,'\n')!=NULL;
+    fclose(file); if (!read_ok) return -1;
+    char *end=strrchr(line,')'); if (!end || end[1]!=' ') return -1;
+    char *save=NULL, *field=strtok_r(end+2," ",&save);
+    for (unsigned index=3;field && index<22;index++) field=strtok_r(NULL," ",&save);
+    if (!field || !*field) return -1;
+    for (char *p=field;*p;p++) if (*p<'0' || *p>'9') return -1;
+    errno=0; char *last=NULL; unsigned long long value=strtoull(field,&last,10);
+    if (errno || !last || *last || !value) return -1;
+    *starttime=(uint64_t)value; return 0;
+}
+
+int am_kwin_peer_identity(int fd,char identity[65]) {
+    struct ucred before,after; uint64_t first,second;
+    char boot_id[40];
+    if (peer_credentials(fd,&before)<0 || read_starttime(before.pid,&first)<0) return -1;
+    FILE *file=fopen("/proc/sys/kernel/random/boot_id","r"); if (!file) return -1;
+    bool read_ok=fgets(boot_id,sizeof(boot_id),file)!=NULL; fclose(file);
+    if (!read_ok) return -1;
+    size_t length=strlen(boot_id);
+    if (length!=37 || boot_id[36]!='\n') return -1;
+    boot_id[36]='\0';
+    if (peer_credentials(fd,&after)<0 || before.pid!=after.pid || before.uid!=after.uid || before.gid!=after.gid ||
+        read_starttime(after.pid,&second)<0 || first!=second) return -1;
+    return am_kwin_compositor_digest(boot_id,(uint32_t)before.pid,first,identity);
+}
+
+int am_kwin_validate_peer_identity(int fd,const char *pinned,char identity[65]) {
+    char current[65];
+    identity[0]='\0';
+    if (!pinned || strlen(pinned)!=64 || am_kwin_peer_identity(fd,current)<0 || strcmp(current,pinned)!=0) return -1;
+    memcpy(identity,current,65); return 0;
+}
 static void output_geometry(void *data,struct wl_output *object,int32_t x,int32_t y,int32_t pw,int32_t ph,int32_t sub,const char *make,const char *model,int32_t transform) {
     (void)data;(void)object;(void)x;(void)y;(void)pw;(void)ph;(void)sub;(void)make;(void)model;(void)transform;
 }
@@ -158,6 +218,8 @@ struct am_kwin *am_kwin_open(const char *output,const atomic_bool *stopped,int64
     connection->selected=SIZE_MAX;
     connection->display=wl_display_connect(NULL);
     if (!connection->display) goto failure;
+    /* Identity is optional for ordinary capture, but required for binding. */
+    (void)am_kwin_peer_identity(wl_display_get_fd(connection->display),connection->compositor_id);
     connection->registry=wl_display_get_registry(connection->display);
     wl_registry_add_listener(connection->registry,&registry_listener,connection);
     if (synchronize(connection,stopped,deadline)<0 || !connection->manager || !connection->xdg_manager) goto failure;
@@ -184,6 +246,8 @@ failure:
 }
 int am_kwin_snapshot(struct am_kwin *connection,uint32_t *node,uint64_t *serial,struct am_kwin_geometry *geometry) {
     if (!connection || !node || !serial || !geometry || connection->failed || connection->selected>=connection->count) return -1;
+    char compositor_id[65]={0};
+    bool identity_valid=am_kwin_validate_peer_identity(wl_display_get_fd(connection->display),connection->compositor_id,compositor_id)==0;
     int64_t left=INT32_MAX,top=INT32_MAX,right=INT32_MIN,bottom=INT32_MIN;
     for (size_t i=0;i<connection->count;i++) {
         const struct output *output=&connection->outputs[i];
@@ -202,6 +266,9 @@ int am_kwin_snapshot(struct am_kwin *connection,uint32_t *node,uint64_t *serial,
     geometry->registry_global=selected->global; geometry->mode_width=selected->mode_width;
     geometry->mode_height=selected->mode_height; geometry->refresh_millihz=selected->refresh_millihz;
     memcpy(geometry->output_name,selected->name,sizeof(geometry->output_name));
+    memset(geometry->compositor_id,0,sizeof(geometry->compositor_id));
+    if (identity_valid && am_kwin_validate_peer_identity(wl_display_get_fd(connection->display),connection->compositor_id,compositor_id)==0)
+        memcpy(geometry->compositor_id,compositor_id,sizeof(geometry->compositor_id));
     *node=connection->node;*serial=connection->serial;
     return 0;
 }

@@ -639,6 +639,7 @@ fn named_capture_reports_only_observed_live_output() {
     *driver.observed.lock().unwrap() = Some(crate::backend::ObservedCapture {
         version: 1,
         protocol: "wayland-wl-output",
+        compositor_id: "a".repeat(64),
         registry_global: 73,
         output_name: "Virtual-12".into(),
         width: 1920,

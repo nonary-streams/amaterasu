@@ -50,6 +50,7 @@ struct Snapshot {
     mode_height: u32,
     refresh_millihz: u32,
     output_name: [c_char; 128],
+    compositor_id: [c_char; 65],
 }
 
 impl Default for Snapshot {
@@ -63,6 +64,18 @@ impl Default for Snapshot {
 unsafe extern "C" {
     #[cfg(test)]
     fn am_pw_valid_named_output(output: *const c_char) -> i32;
+    #[cfg(test)]
+    fn am_kwin_peer_identity(fd: i32, identity: *mut c_char) -> i32;
+    #[cfg(test)]
+    fn am_kwin_validate_peer_identity(fd: i32, pinned: *const c_char, identity: *mut c_char)
+    -> i32;
+    #[cfg(test)]
+    fn am_kwin_compositor_digest(
+        boot_id: *const c_char,
+        pid: u32,
+        starttime: u64,
+        identity: *mut c_char,
+    ) -> i32;
     fn am_pw_start_output(
         output: *const c_char,
         timeout: u32,
@@ -232,9 +245,22 @@ impl SourceSession for NativeSession {
         if output_name.is_empty() {
             return None;
         }
+        // SAFETY: the native digest occupies 64 hex bytes and a trailing NUL.
+        let compositor_id = unsafe { CStr::from_ptr(snapshot.compositor_id.as_ptr()) }
+            .to_str()
+            .ok()?
+            .to_owned();
+        if compositor_id.len() != 64
+            || !compositor_id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return None;
+        }
         Some(ObservedCapture {
             version: 1,
             protocol: "wayland-wl-output",
+            compositor_id,
             registry_global: snapshot.registry_global,
             output_name,
             width: snapshot.mode_width,

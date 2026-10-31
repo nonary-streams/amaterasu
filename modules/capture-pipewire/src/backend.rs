@@ -8,6 +8,7 @@ use std::sync::Arc;
 pub struct ObservedCapture {
     pub version: u8,
     pub protocol: &'static str,
+    pub compositor_id: String,
     pub registry_global: u32,
     pub output_name: String,
     pub width: u32,
