@@ -90,7 +90,14 @@ mode command; an uncertain or mismatched effect retains the recovery fence.
 Successful results contain `mode_only_preserved: true`, the verified owned
 output's `preservation_readback`, and a replacement borrow. The readback is
 observed KScreen state; it does not assert an abstract layout policy.
-The separate status action only looks up an already admitted operation.
+Each successful report re-queries KScreen and includes equal lowercase SHA-256
+`preservation_before_digest` and `preservation_after_digest` values. They cover
+the complete connected-output preservation state, serialized as JSON with
+recursively sorted object keys and no whitespace; the changing output's mode is
+checked separately. A changed or unavailable readback fences the operation and
+borrow for recovery. The separate status action only looks up an already
+admitted operation. Multiple owned references are allowed when exactly one
+provider borrow exists; legacy reconfigure continues to require one reference.
 
 `$XDG_STATE_HOME/amaterasu/virtual-display-linux` (default
 `~/.local/state/amaterasu/virtual-display-linux`) is locked against other

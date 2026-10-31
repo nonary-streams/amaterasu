@@ -21,6 +21,14 @@ pub(super) enum Placement {
 }
 
 pub(super) trait Compositor: Send {
+    fn verify_mode_only(
+        &mut self,
+        _output: &str,
+        _desired: &Specification,
+        _baseline: &Value,
+    ) -> Result<Value, String> {
+        Err("mode-only verification is unavailable".into())
+    }
     fn mode_only_baseline(
         &mut self,
         _output: &str,
@@ -54,6 +62,14 @@ pub(super) trait Compositor: Send {
 }
 pub(super) struct KScreen;
 impl Compositor for KScreen {
+    fn verify_mode_only(
+        &mut self,
+        output: &str,
+        desired: &Specification,
+        baseline: &Value,
+    ) -> Result<Value, String> {
+        verify_mode_only_state(&query()?, output, desired, baseline)
+    }
     fn mode_only_baseline(
         &mut self,
         output: &str,
@@ -186,6 +202,60 @@ fn mode_only_arguments(output: &str, mode: &str) -> Result<Vec<String>, String> 
         return Err("invalid mode-only target".into());
     }
     Ok(vec![format!("output.{output}.mode.{mode}")])
+}
+
+fn verify_mode_only_state(
+    configuration: &Value,
+    output: &str,
+    desired: &Specification,
+    baseline: &Value,
+) -> Result<Value, String> {
+    let expected_mode = baseline["desired_mode"]
+        .as_str()
+        .ok_or("missing requested mode")?;
+    let state = preservation_state(configuration, output)?;
+    if state != baseline["state"]
+        || find_output(configuration, output).and_then(|value| value["currentModeId"].as_str())
+            != Some(expected_mode)
+        || mode(configuration, output, desired).as_deref() != Some(expected_mode)
+    {
+        return Err("mode-only preservation readback differs".into());
+    }
+    let readback = state
+        .get(output)
+        .cloned()
+        .ok_or("owned output unavailable")?;
+    let before_digest = state_digest(&baseline["state"])?;
+    let after_digest = state_digest(&state)?;
+    if before_digest != after_digest {
+        return Err("preservation digest mismatch".into());
+    }
+    Ok(
+        serde_json::json!({"readback": readback, "before_digest": before_digest, "after_digest": after_digest}),
+    )
+}
+
+fn state_digest(state: &Value) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    fn canonical(value: &Value) -> Value {
+        match value {
+            Value::Object(map) => {
+                let mut sorted: Vec<_> = map.iter().collect();
+                sorted.sort_by_key(|(key, _)| *key);
+                Value::Object(
+                    sorted
+                        .into_iter()
+                        .map(|(key, value)| (key.clone(), canonical(value)))
+                        .collect(),
+                )
+            }
+            Value::Array(values) => Value::Array(values.iter().map(canonical).collect()),
+            _ => value.clone(),
+        }
+    }
+    let encoded =
+        serde_json::to_vec(&canonical(state)).map_err(|_| "invalid preservation state")?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
 }
 
 /// Strictly read every connected output. Missing facts cannot prove that a
@@ -462,6 +532,43 @@ fn run(arguments: &[String]) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn preservation_digest_is_stable_and_covers_nested_changes() {
+        let before = json!({"z":{"b":2,"a":1},"a":[true,false]});
+        let reordered = json!({"a":[true,false],"z":{"a":1,"b":2}});
+        assert_eq!(
+            state_digest(&before).unwrap(),
+            state_digest(&reordered).unwrap()
+        );
+        let changed = json!({"a":[true,false],"z":{"a":1,"b":3}});
+        assert_ne!(
+            state_digest(&before).unwrap(),
+            state_digest(&changed).unwrap()
+        );
+    }
+    #[test]
+    fn mode_only_status_rejects_fresh_desktop_or_mode_drift() {
+        let mut configuration = json!({"outputs":[{"id":1,"name":"Virtual-1","connected":true,"enabled":true,"pos":{"x":0,"y":0},"scale":1.5,"rotation":1,"priority":1,"hdr":false,"wcg":false,"vrrPolicy":0,"currentModeId":"2","modes":[{"id":"2","size":{"width":1280,"height":720},"refreshRate":60.0}]}]});
+        let desired = Specification {
+            identity: "11111111-1111-4111-8111-111111111111".into(),
+            name: "Amaterasu".into(),
+            width: 1280,
+            height: 720,
+            refresh_millihz: 60000,
+            hdr_enabled: false,
+        };
+        let baseline = json!({"state":preservation_state(&configuration, "Virtual-1").unwrap(),"desired_mode":"2"});
+        let current =
+            verify_mode_only_state(&configuration, "Virtual-1", &desired, &baseline).unwrap();
+        assert_eq!(current["readback"]["scale"], json!(1.5));
+        assert_eq!(current["before_digest"], current["after_digest"]);
+        assert_eq!(current["before_digest"].as_str().unwrap().len(), 64);
+        configuration["outputs"][0]["scale"] = json!(2.0);
+        assert!(verify_mode_only_state(&configuration, "Virtual-1", &desired, &baseline).is_err());
+        configuration["outputs"][0]["scale"] = json!(1.5);
+        configuration["outputs"][0]["currentModeId"] = json!("3");
+        assert!(verify_mode_only_state(&configuration, "Virtual-1", &desired, &baseline).is_err());
+    }
     #[test]
     fn mode_only_verifies_all_preserved_axes_and_emits_only_mode_command() {
         let output = json!({"id":1,"name":"Virtual-1","connected":true,"enabled":true,"pos":{"x":0,"y":0},"scale":1.5,"rotation":1,"priority":1,"hdr":false,"wcg":false,"vrrPolicy":0,"currentModeId":"1"});

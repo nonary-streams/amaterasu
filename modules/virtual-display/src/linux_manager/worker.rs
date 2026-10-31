@@ -268,6 +268,21 @@ pub(super) fn run<B: Broker, C: Compositor, I: ConnectorInventory>(
             break;
         }
         let event = match work {
+            Work::VerifyModeOnly {
+                key,
+                output,
+                desired,
+                baseline,
+            } => {
+                let result = controller
+                    .compositor
+                    .verify_mode_only(&output, &desired, &baseline);
+                Event::ModeOnlyVerified {
+                    key,
+                    result,
+                    observed_at: std::time::Instant::now(),
+                }
+            }
             Work::Reconfigure {
                 key,
                 transition,

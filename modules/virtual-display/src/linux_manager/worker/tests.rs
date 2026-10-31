@@ -195,6 +195,19 @@ fn mode_change_retains_the_same_compositor_and_registry_global() {
     assert!(!same_output_identity(before, after));
 }
 #[test]
+fn mode_only_allows_staged_owned_reference_but_legacy_requires_one() {
+    let refs = std::collections::BTreeSet::from(["session".into(), "stream".into()]);
+    assert!(super::super::references_admit_reconfigure(
+        &refs, "stream", true
+    ));
+    assert!(!super::super::references_admit_reconfigure(
+        &refs, "other", true
+    ));
+    assert!(!super::super::references_admit_reconfigure(
+        &refs, "stream", false
+    ));
+}
+#[test]
 fn reconfigure_persists_old_and_new_modes_and_retains_uncertain_intent() {
     let (root, mut controller) = fixture();
     let old = specification(FIRST);
@@ -395,6 +408,7 @@ fn pending_reconfiguration_keeps_old_borrow_fenced_until_worker_settles() {
             result: None,
             domain_id: "domain".into(),
             revision: 1,
+            verification: None,
         },
     );
     let unknown =
@@ -425,7 +439,45 @@ fn pending_reconfiguration_keeps_old_borrow_fenced_until_worker_settles() {
     );
     assert_eq!(manager.borrows.len(), 1);
     assert_eq!(manager.domain()["pending_mutations"], 1);
-    manager.reconfigurations.get_mut(&key).unwrap().state = "recovery_required";
+    manager
+        .reconfigurations
+        .get_mut(&key)
+        .unwrap()
+        .transition
+        .mode_only = true;
+    manager.reconfigurations.get_mut(&key).unwrap().verification =
+        Some(super::super::Verification::Pending);
+    assert!(manager.poll_mode_only_verification(&key).unwrap().is_none());
+    manager.reconfigurations.get_mut(&key).unwrap().verification =
+        Some(super::super::Verification::Finished {
+            result: Ok(serde_json::json!({"readback":{"scale":2}})),
+            observed_at: std::time::Instant::now(),
+        });
+    assert_eq!(
+        manager.poll_mode_only_verification(&key).unwrap().unwrap()["readback"]["scale"],
+        2
+    );
+    manager.reconfigurations.get_mut(&key).unwrap().verification =
+        Some(super::super::Verification::Finished {
+            result: Ok(serde_json::json!({"readback":{"scale":3}})),
+            observed_at: std::time::Instant::now() - std::time::Duration::from_secs(2),
+        });
+    assert!(
+        manager.poll_mode_only_verification(&key).is_err(),
+        "expired proof must not be reused"
+    );
+    let mut cached = serde_json::json!({"ok":true,"preservation_readback":{"scale":1}});
+    let fresh = manager.apply_fresh_mode_only_readback(
+        &key,
+        &mut cached,
+        Ok(serde_json::json!({"readback":{"scale":2},"before_digest":"a","after_digest":"a"})),
+    );
+    assert_eq!(fresh["preservation_readback"]["scale"], 2);
+    let failed =
+        manager.apply_fresh_mode_only_readback(&key, &mut cached, Err("desktop changed".into()));
+    assert_eq!(failed["code"], "recovery_required");
+    assert_eq!(manager.reconfigurations[&key].state, "recovery_required");
+    assert!(!manager.borrows[&borrow_id].valid);
     assert_eq!(manager.domain()["pending_mutations"], 1);
     assert_eq!(
         manager.release_borrow("owner", FIRST, "ref-1", &borrow_id)["released"],

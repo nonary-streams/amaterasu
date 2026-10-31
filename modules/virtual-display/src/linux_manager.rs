@@ -130,8 +130,22 @@ struct Reconfiguration {
     result: Option<Value>,
     domain_id: String,
     revision: u64,
+    verification: Option<Verification>,
+}
+enum Verification {
+    Pending,
+    Finished {
+        result: Result<Value, String>,
+        observed_at: std::time::Instant,
+    },
 }
 enum Work {
+    VerifyModeOnly {
+        key: (String, String),
+        output: String,
+        desired: Specification,
+        baseline: Value,
+    },
     Reconfigure {
         key: (String, String),
         transition: Transition,
@@ -155,6 +169,11 @@ enum Work {
     },
 }
 enum Event {
+    ModeOnlyVerified {
+        key: (String, String),
+        result: Result<Value, String>,
+        observed_at: std::time::Instant,
+    },
     Reconfigured {
         key: (String, String),
         result: Result<Record, String>,
@@ -252,6 +271,20 @@ impl Manager {
             .and_then(|receiver| receiver.try_recv().ok())
         {
             match event {
+                Event::ModeOnlyVerified {
+                    key,
+                    result,
+                    observed_at,
+                } => {
+                    if let Some(change) = self.reconfigurations.get_mut(&key)
+                        && matches!(change.verification, Some(Verification::Pending))
+                    {
+                        change.verification = Some(Verification::Finished {
+                            result,
+                            observed_at,
+                        });
+                    }
+                }
                 Event::Reconfigured { key, result } => {
                     self.pending_mutations = self.pending_mutations.saturating_sub(1);
                     if let Some(change) = self.reconfigurations.get_mut(&key) {
@@ -847,13 +880,13 @@ impl Manager {
                 return failure("recovery_required");
             };
             let verified = self.validate_borrow(caller, identity, reference_id, new_borrow);
-            return if verified["ok"] == true
-                && verified["mutation_domain"] == result["mutation_domain"]
-            {
-                result
-            } else {
-                failure("recovery_required")
-            };
+            if verified["ok"] != true || verified["mutation_domain"] != result["mutation_domain"] {
+                if mode_only {
+                    self.fence_mode_only(&key);
+                }
+                return failure("recovery_required");
+            }
+            return self.refresh_reconfigure_result(&key, result);
         }
         match change.state {
             "pending" => json!({"ok":true,"state":"pending","operation_id":operation_id}),
@@ -877,6 +910,11 @@ impl Manager {
         mode_only: bool,
     ) -> Value {
         let key = (caller.to_owned(), identity.clone());
+        if self.reconfigurations.get(&key).is_some_and(|change| {
+            change.transition.operation_id != operation_id && change.verification.is_some()
+        }) {
+            return failure("reconfigure_pending");
+        }
         if let Some(change) = self.reconfigurations.get(&key)
             && !(change.state == "succeeded" && change.transition.operation_id != operation_id)
         {
@@ -902,9 +940,12 @@ impl Manager {
                 if validation["ok"] != true
                     || validation["mutation_domain"] != result["mutation_domain"]
                 {
+                    if mode_only {
+                        self.fence_mode_only(&key);
+                    }
                     return failure("recovery_required");
                 }
-                return result;
+                return self.refresh_reconfigure_result(&key, result);
             }
             match change.state {
                 "pending" => {
@@ -937,7 +978,7 @@ impl Manager {
             || !monitor
                 .references
                 .as_ref()
-                .is_some_and(|refs| refs.len() == 1 && refs.contains(&reference_id))
+                .is_some_and(|refs| references_admit_reconfigure(refs, &reference_id, mode_only))
         {
             return failure("reference_conflict");
         }
@@ -982,6 +1023,7 @@ impl Manager {
                 result: None,
                 domain_id,
                 revision,
+                verification: None,
             },
         );
         json!({"ok":true,"state":"pending","operation_id":operation_id})
@@ -994,18 +1036,18 @@ impl Manager {
         let reference_id = change.transition.reference_id.clone();
         let operation_id = change.transition.operation_id.clone();
         let mode_only = change.transition.mode_only;
-        let preservation_readback =
-            change
-                .transition
-                .preservation_baseline
-                .as_ref()
-                .and_then(|baseline| {
-                    let output = self.monitors.get(key)?.output.as_deref()?;
-                    baseline.get("state")?.get(output).cloned()
-                });
-        if mode_only && preservation_readback.is_none() {
-            return failure("recovery_required");
-        }
+        let preservation_readback = if mode_only {
+            match self.poll_mode_only_verification(key) {
+                Ok(Some(readback)) => Some(readback),
+                Ok(None) => return json!({"ok":true,"state":"pending","operation_id":operation_id}),
+                Err(_) => {
+                    self.fence_mode_only(key);
+                    return failure("recovery_required");
+                }
+            }
+        } else {
+            None
+        };
         let Some(old_observation) = self
             .borrows
             .get(&old_borrow)
@@ -1066,13 +1108,107 @@ impl Manager {
         let mut result = json!({"ok":true,"state":"succeeded","operation_id":operation_id,"borrow_id":new_borrow,"observed_output":Self::observation(&output, observation),"mutation_domain":self.domain()});
         if mode_only {
             result["mode_only_preserved"] = json!(true);
-            result["preservation_readback"] = json!(preservation_readback);
+            let proof = preservation_readback.expect("verified mode-only readback");
+            result["preservation_readback"] = proof["readback"].clone();
+            result["preservation_before_digest"] = proof["before_digest"].clone();
+            result["preservation_after_digest"] = proof["after_digest"].clone();
         }
         self.reconfigurations
             .get_mut(key)
             .expect("existing transition")
             .result = Some(result.clone());
         result
+    }
+    fn poll_mode_only_verification(
+        &mut self,
+        key: &(String, String),
+    ) -> Result<Option<Value>, String> {
+        let change = self.reconfigurations.get_mut(key).ok_or("missing change")?;
+        match change.verification.take() {
+            Some(Verification::Pending) => {
+                change.verification = Some(Verification::Pending);
+                return Ok(None);
+            }
+            Some(Verification::Finished {
+                result,
+                observed_at,
+            }) if result.is_err() || observed_at.elapsed() <= std::time::Duration::from_secs(1) => {
+                return result.map(Some);
+            }
+            None | Some(Verification::Finished { .. }) => {}
+        }
+        let baseline = change
+            .transition
+            .preservation_baseline
+            .clone()
+            .ok_or("missing baseline")?;
+        let desired = change.transition.desired.clone();
+        let output = self
+            .monitors
+            .get(key)
+            .and_then(|monitor| monitor.output.clone())
+            .ok_or("missing output")?;
+        if !self.enqueue(Work::VerifyModeOnly {
+            key: key.clone(),
+            output,
+            desired,
+            baseline,
+        }) {
+            return Ok(None);
+        }
+        self.reconfigurations
+            .get_mut(key)
+            .expect("existing change")
+            .verification = Some(Verification::Pending);
+        Ok(None)
+    }
+    fn fence_mode_only(&mut self, key: &(String, String)) {
+        if let Some(change) = self.reconfigurations.get_mut(key) {
+            change.state = "recovery_required";
+            change.result = None;
+            change.verification = None;
+        }
+        for borrow in self
+            .borrows
+            .values_mut()
+            .filter(|borrow| &borrow.key == key)
+        {
+            borrow.valid = false;
+        }
+        self.topology_revision = self.topology_revision.saturating_add(1);
+    }
+    fn refresh_reconfigure_result(&mut self, key: &(String, String), mut result: Value) -> Value {
+        if !self
+            .reconfigurations
+            .get(key)
+            .is_some_and(|change| change.transition.mode_only)
+        {
+            return result;
+        }
+        match self.poll_mode_only_verification(key) {
+            Ok(Some(proof)) => self.apply_fresh_mode_only_readback(key, &mut result, Ok(proof)),
+            Ok(None) => json!({"ok":true,"state":"pending","operation_id":result["operation_id"]}),
+            Err(error) => self.apply_fresh_mode_only_readback(key, &mut result, Err(error)),
+        }
+    }
+    fn apply_fresh_mode_only_readback(
+        &mut self,
+        key: &(String, String),
+        result: &mut Value,
+        readback: Result<Value, String>,
+    ) -> Value {
+        match readback {
+            Ok(proof) => {
+                result["preservation_readback"] = proof["readback"].clone();
+                result["preservation_before_digest"] = proof["before_digest"].clone();
+                result["preservation_after_digest"] = proof["after_digest"].clone();
+                result.clone()
+            }
+            Err(_) => {
+                self.fence_mode_only(key);
+                failure("recovery_required")
+            }
+        }
     }
     fn borrow(
         &mut self,
@@ -1301,6 +1437,14 @@ impl Manager {
             "activation_requested":self.settings.dd_activate_virtual_display,
             "configured_permanent_monitor_count":self.settings.dd_virtual_display_permanent_count,"permanent_monitor_runtime_supported":false})
     }
+}
+
+fn references_admit_reconfigure(
+    refs: &BTreeSet<String>,
+    reference_id: &str,
+    mode_only: bool,
+) -> bool {
+    refs.contains(reference_id) && (mode_only || refs.len() == 1)
 }
 fn same_output_identity(before: observer::Observation, after: observer::Observation) -> bool {
     before.compositor_id == after.compositor_id && before.global == after.global
