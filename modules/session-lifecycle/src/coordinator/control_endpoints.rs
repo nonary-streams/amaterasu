@@ -4,7 +4,7 @@
 //! current durable graph, output and admission state. A permit or request field
 //! alone never supplies this context. No permissive backend is installed here.
 use amaterasu_extension_api::{
-    ResourceControlRequest, SchemaRef, validate_resource_control_request,
+    LifecycleTarget, ResourceControlRequest, SchemaRef, validate_resource_control_request,
 };
 use amaterasu_module_sdk::ModuleResult;
 use serde::Deserialize;
@@ -33,6 +33,8 @@ enum Operation {
 pub(super) struct ResolvedControl {
     pub participant: ParticipantSettings,
     pub context: ControlContext,
+    /// Read from the coordinator's canonical session record.
+    pub session_target: LifecycleTarget,
 }
 
 /// Trusted coordinator implementation. It must re-read current state for each
@@ -69,7 +71,9 @@ pub(super) fn control_endpoint(
     backend: &mut impl ControlEndpointBackend,
 ) -> Value {
     match authorize(caller, payload, backend) {
-        Ok(status) => json!({"status":status}),
+        Ok((status, resolved)) => {
+            json!({"status":status, "session_target":resolved.session_target, "target":resolved.context.target, "output":resolved.context.output})
+        }
         Err(_) => json!({"status":"rejected","reason":"resource_control_not_authorized"}),
     }
 }
@@ -78,7 +82,7 @@ fn authorize(
     caller: &str,
     payload: Value,
     backend: &mut impl ControlEndpointBackend,
-) -> ModuleResult<&'static str> {
+) -> ModuleResult<(&'static str, ResolvedControl)> {
     let envelope: Envelope =
         serde_json::from_value(payload).map_err(|_| "invalid_control_envelope")?;
     let request = &envelope.request;
@@ -88,6 +92,10 @@ fn authorize(
     }
     let resolved = backend.resolve(request)?;
     let context = &resolved.context;
+    if !matches!(&resolved.session_target, LifecycleTarget::Session { host_epoch, session_id, generation } if *generation > 0 && matches!(&context.target, LifecycleTarget::Stream { host_epoch: stream_epoch, session_id: stream_session, .. } if host_epoch == stream_epoch && session_id == stream_session) && context.parent_generation == Some(*generation))
+    {
+        return Err("control_session_mismatch".into());
+    }
     if caller != context.policy.owner_provider
         || resolved.participant.provider != context.policy.dependent_provider
         || context.target != request.target
@@ -103,16 +111,17 @@ fn authorize(
         return Err("control_context_mismatch".into());
     }
     backend.validate_arguments(&context.policy.argument_schema, &request.proposal.arguments)?;
-    match envelope.operation {
+    let status = match envelope.operation {
         Operation::VerifyResourceControl => match backend.consume(caller, &resolved, request)? {
-            ControlPermitUse::Execute => Ok("execute"),
-            ControlPermitUse::ReattachOnly => Ok("reattach_only"),
+            ControlPermitUse::Execute => "execute",
+            ControlPermitUse::ReattachOnly => "reattach_only",
         },
         Operation::ValidateResourceControl => {
             backend.validate(caller, &resolved, request)?;
-            Ok("valid")
+            "valid"
         }
-    }
+    };
+    Ok((status, resolved))
 }
 
 #[cfg(test)]
@@ -135,6 +144,7 @@ mod tests {
             Ok(ResolvedControl {
                 participant: self.resolved.participant.clone(),
                 context: self.resolved.context.clone(),
+                session_target: self.resolved.session_target.clone(),
             })
         }
         fn validate_arguments(&mut self, _: &SchemaRef, arguments: &Value) -> ModuleResult<()> {
@@ -184,6 +194,7 @@ mod tests {
                 resolved: ResolvedControl {
                     participant,
                     context,
+                    session_target: serde_json::from_value(json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1})).unwrap(),
                 },
                 schema_available: true,
                 consumed: false,
@@ -196,10 +207,10 @@ mod tests {
     #[test]
     fn verify_consumes_once_and_pre_effect_validation_is_read_only() {
         let (mut backend, mut payload) = fixture();
-        assert_eq!(
-            control_endpoint("owner", payload.clone(), &mut backend)["status"],
-            "execute"
-        );
+        let first = control_endpoint("owner", payload.clone(), &mut backend);
+        assert_eq!(first["status"], "execute");
+        assert_eq!(first["session_target"]["generation"], 1);
+        assert_eq!(first["output"]["output_id"], "out");
         assert_eq!(
             control_endpoint("owner", payload.clone(), &mut backend)["status"],
             "reattach_only"
