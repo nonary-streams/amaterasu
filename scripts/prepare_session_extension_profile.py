@@ -105,7 +105,7 @@ def prepare(bootstrap: dict, root: Path, descriptor: dict, descriptor_digest: st
         principal["call"] = sorted(set(principal.get("call", [])) | set(services))
     principals[CONSOLE]["call"] = sorted(set(principals[CONSOLE].get("call", [])) |
                                          {REGISTRY_SERVICE, ACTIONS_SERVICE, LIFECYCLE_SERVICE, STATE, PROVIDER_SERVICE})
-    validation_callers = [REGISTRY, LIFECYCLE, MANAGEMENT, INPUT, STREAM, RTSP, NVHTTP, CONSOLE]
+    validation_callers = [REGISTRY, ACTIONS, LIFECYCLE, MANAGEMENT, INPUT, STREAM, RTSP, NVHTTP, CONSOLE]
     for approval in approvals:
         if approval["method"]["method"] == "settings_validate":
             approval["callers"] = validation_callers
