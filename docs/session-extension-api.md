@@ -72,7 +72,7 @@ consumer acknowledges the exact binding.
 
 The selected capability is `amaterasu.display-target`. Its frozen schema
 references are `display-target/1` (SHA-256
-`8521cdfd92da98b25136bd01720d397f0d7fee14748c08afde76a0379fa18941`)
+`ededc620113268bcae3990d492deeef039c5e9c5ff28067a676dd992fe6324ce`)
 and `display-control/1` (SHA-256
 `c2c3ce866277cb29bbd9fbd947899917538d46b1020df3197fbd264159607d87`).
 The owner service `nonary.virtual-screen/2` exposes the planned
