@@ -760,6 +760,7 @@ dependencies = [
  "amaterasu-contracts",
  "amaterasu-module-sdk",
  "libloading",
+ "serde",
  "serde_json",
 ]
 
