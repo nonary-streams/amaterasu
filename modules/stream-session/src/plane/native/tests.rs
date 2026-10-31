@@ -363,7 +363,7 @@ fn encoder_backend_status_is_distinct_from_other_native_failures() {
         Err("audio_encoder_failed")
     );
     assert_eq!(
-        accepted(MEDIA_BACKEND_ERROR),
-        Err("native_operation_failed")
+        accepted(MEDIA_BACKEND_ERROR, "native_video_submit_failed"),
+        Err("native_video_submit_failed")
     );
 }

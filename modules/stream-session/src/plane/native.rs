@@ -151,7 +151,7 @@ impl Backend for NativeBackend {
                 &message,
             )
         };
-        accepted(status)
+        accepted(status, "native_rumble_failed")
     }
 
     fn control(&mut self) -> PlaneResult<Option<ControlRecord>> {
@@ -189,13 +189,16 @@ impl Backend for NativeBackend {
             len: message.payload.len(),
             sequence: 0,
         };
-        accepted(unsafe {
-            (api.send)(
-                self.control.context(),
-                self.handles.control_transport,
-                &control_message,
-            )
-        })
+        accepted(
+            unsafe {
+                (api.send)(
+                    self.control.context(),
+                    self.handles.control_transport,
+                    &control_message,
+                )
+            },
+            "native_feedback_failed",
+        )
     }
 
     fn video(&mut self) -> PlaneResult<Option<VideoPacket>> {
@@ -278,9 +281,12 @@ impl Backend for NativeBackend {
         // SAFETY: packet points into an owned assembly retained until return.
         let api = unsafe { self.media.table::<MediaTransportApi>() }
             .map_err(|_| "native_layout_mismatch")?;
-        accepted(unsafe {
-            (api.submit_video)(self.media.context(), self.handles.media_transport, packet)
-        })
+        accepted(
+            unsafe {
+                (api.submit_video)(self.media.context(), self.handles.media_transport, packet)
+            },
+            "native_video_submit_failed",
+        )
     }
 
     fn submit_pcm(&mut self, frame: &AudioFrame) -> PlaneResult<bool> {
@@ -296,9 +302,12 @@ impl Backend for NativeBackend {
         // SAFETY: packet allocation remains owned by the plane until return.
         let api = unsafe { self.media.table::<MediaTransportApi>() }
             .map_err(|_| "native_layout_mismatch")?;
-        accepted(unsafe {
-            (api.submit_audio)(self.media.context(), self.handles.media_transport, packet)
-        })
+        accepted(
+            unsafe {
+                (api.submit_audio)(self.media.context(), self.handles.media_transport, packet)
+            },
+            "native_audio_submit_failed",
+        )
     }
 
     fn drain_encoder(&mut self) -> PlaneResult<bool> {
@@ -314,16 +323,22 @@ impl Backend for NativeBackend {
         // SAFETY: no callback or borrowed allocation escapes this call.
         let api = unsafe { self.media.table::<MediaTransportApi>() }
             .map_err(|_| "native_layout_mismatch")?;
-        accepted(unsafe { (api.drain)(self.media.context(), self.handles.media_transport) })
+        accepted(
+            unsafe { (api.drain)(self.media.context(), self.handles.media_transport) },
+            "native_transport_drain_failed",
+        )
     }
 }
 
-fn accepted(status: Status) -> PlaneResult<bool> {
+fn accepted(status: Status, failure: &'static str) -> PlaneResult<bool> {
     match status {
         STATUS_OK => Ok(true),
         MEDIA_BUSY | MEDIA_PENDING => Ok(false),
         MEDIA_CLOSED => Err("native_stream_closed"),
-        _ => Err("native_operation_failed"),
+        _ => {
+            eprintln!("amaterasu native operation failed operation={failure} status={status}");
+            Err(failure)
+        }
     }
 }
 
@@ -331,7 +346,7 @@ fn encoder_accepted(status: Status) -> PlaneResult<bool> {
     if status == MEDIA_BACKEND_ERROR {
         Err("audio_encoder_failed")
     } else {
-        accepted(status)
+        accepted(status, "native_audio_encoder_failed")
     }
 }
 
