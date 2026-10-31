@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 
 const CACHE_TTL: Duration = Duration::from_secs(1);
 
+#[derive(Clone)]
 pub(crate) struct Snapshot {
+    pub context: String,
     pub approval_revision: u64,
     pub settings_revisions: BTreeMap<String, u64>,
     pub bindings: Vec<Keybinding>,
@@ -102,6 +104,7 @@ mod tests {
     }
     fn snapshot() -> Snapshot {
         Snapshot {
+            context: "active".into(),
             approval_revision: 7,
             settings_revisions: [("provider".into(), 3)].into(),
             bindings: vec![],

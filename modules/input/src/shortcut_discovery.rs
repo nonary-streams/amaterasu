@@ -20,6 +20,7 @@ pub(crate) struct CanonicalContext {
     pub session_id: String,
     pub target: LifecycleTarget,
     pub input_binding: String,
+    pub input_boot_epoch: String,
     pub application: Option<String>,
     pub paired_client: Option<String>,
     pub context: String,
@@ -84,6 +85,7 @@ impl DiscoveryJob {
         };
         if !valid(&context.session_id)
             || !valid(&context.input_binding)
+            || !valid(&context.input_boot_epoch)
             || !valid(&context.context)
             || context.paired_client.is_some()
             || !matches!(&context.target, LifecycleTarget::Stream { session_id, .. } if session_id == &context.session_id)
@@ -164,7 +166,7 @@ impl DiscoveryJob {
                 json!({"operation":"settings_get","provider":descriptor.provider,
                     "scope":{"kind":"session","id":self.context.session_id},
                     "application":self.context.application,"paired_client":null,"session":self.context.session_id,
-                    "target":self.context.target,"input_binding":self.context.input_binding})
+                    "target":self.context.target,"input_binding":self.context.input_binding,"input_boot_epoch":self.context.input_boot_epoch})
             }
             Stage::Done => return Err("shortcut discovery already consumed".into()),
         };
@@ -353,6 +355,7 @@ pub(crate) mod tests {
                     generation: 1,
                 },
                 input_binding: "token".into(),
+                input_boot_epoch: "boot".into(),
                 application: None,
                 paired_client: None,
                 context: "active".into(),
@@ -386,6 +389,7 @@ pub(crate) mod tests {
                         json!({"kind":"stream","host_epoch":"host","session_id":"session","stream_id":"stream","generation":1})
                     );
                     assert_eq!(pending["input_binding"], "token");
+                    assert_eq!(pending["input_boot_epoch"], "boot");
                     assert!(pending["paired_client"].is_null());
                     Ok(Response::Result {
                         payload: json!({"ok":true,"revision":1,"effective":{"shortcut":{"value":binding(),"source":null}}}),
@@ -408,6 +412,7 @@ pub(crate) mod tests {
             session_id: "session".into(),
             target,
             input_binding: "token".into(),
+            input_boot_epoch: "boot".into(),
             application: None,
             paired_client,
             context: "active".into(),

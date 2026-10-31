@@ -731,6 +731,78 @@ impl InputModule {
                     false,
                 );
             }
+            // A cached nonmatching chord has no shortcut effects. Reconstruct
+            // forwarded held keys from the controller before testing it.
+            if !self.has_consumed_held
+                && !non_keyboard_batch(&batch.events)
+                && let Some(snapshot) =
+                    self.shortcut_cache
+                        .get(&batch.input_binding, &target, Instant::now())
+                && !snapshot.bindings.is_empty()
+            {
+                let mut matcher = shortcut::Matcher::default();
+                let staged = matcher
+                    .replace_approved_bindings(
+                        &snapshot.bindings,
+                        amaterasu_extension_api::BindingSource::SessionInput,
+                        &snapshot.context,
+                    )
+                    .map_err(str::to_owned)
+                    .and_then(|()| {
+                        let held = self
+                            .controller
+                            .shortcut_source_held_keys(
+                                &request.caller,
+                                &batch.lease,
+                                Instant::now(),
+                            )
+                            .map_err(|_| "input lease unavailable".to_owned())?
+                            .into_iter()
+                            .map(|key| (key, shortcut::Disposition::Forward))
+                            .collect::<Vec<_>>();
+                        matcher.recover_held(&held).map_err(str::to_owned)?;
+                        shortcut_bridge::StagedBatch::prepare(
+                            &self.controller,
+                            &matcher,
+                            &request.caller,
+                            &batch.lease,
+                            batch.events.clone(),
+                            Value::Null,
+                            Instant::now(),
+                        )
+                        .map_err(|_| "invalid staged input".to_owned())
+                    });
+                if let Ok(staged) = staged
+                    && staged.intents().is_empty()
+                {
+                    let runtime = &self.runtime;
+                    let bindings = &self.bindings;
+                    let mut guard = || match runtime.send(Command::CheckRequest {
+                        request: request.id,
+                    }) {
+                        Ok(Response::Ok) => bindings
+                            .batch_active(&request.caller, &batch.lease, &batch.input_binding)
+                            .and_then(|active| {
+                                if active {
+                                    Ok(())
+                                } else {
+                                    Err("binding_inactive")
+                                }
+                            })
+                            .map_err(|code| InputError::new(code, "input binding retired")),
+                        _ => Err(InputError::new("cancelled", "input request cancelled")),
+                    };
+                    if let Ok(mut reply) =
+                        staged.deliver_forwarded(&mut self.controller, Instant::now(), &mut guard)
+                    {
+                        if reply["ok"] == true {
+                            reply["operation_id"] = batch.operation_id.into();
+                        }
+                        let cleanup = completion_requires_cleanup(true, &reply);
+                        return self.complete(request.id, reply, &request.caller, cleanup);
+                    }
+                }
+            }
             let bypass_keyboard = self.shortcut_cache.can_bypass_keyboard(
                 &batch.input_binding,
                 &target,

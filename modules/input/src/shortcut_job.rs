@@ -378,6 +378,7 @@ impl ShortcutJob {
                         session_id: session_id.clone(),
                         target: authority.target.clone(),
                         input_binding: self.request.input_binding.clone(),
+                        input_boot_epoch: self.input_boot_epoch.clone(),
                         application: authority.application.clone(),
                         paired_client: authority.paired_client.clone(),
                         context: authority.context.clone(),
@@ -386,8 +387,8 @@ impl ShortcutJob {
                         .deadline
                         .saturating_duration_since(Instant::now())
                         .as_millis() as u64;
-                    self.discovery = Some(DiscoveryJob::new(self.parent, context, timeout)?);
                     self.store = Some(ShortcutStore::new(self.epoch.clone())?);
+                    self.discovery = Some(DiscoveryJob::new(self.parent, context, timeout)?);
                     self.authority = Some(authority);
                     Step::Discover
                 }
@@ -411,6 +412,7 @@ impl ShortcutJob {
                             .collect::<Vec<_>>();
                         let discovery = self.discovery.as_ref().unwrap();
                         self.cache_snapshot = Some(Snapshot {
+                            context: authority.context.clone(),
                             approval_revision: discovery
                                 .approval_revision()
                                 .ok_or("missing approval revision")?,
@@ -774,6 +776,7 @@ mod tests {
         requests: BTreeMap<u64, (String, Value)>,
         actionful: bool,
         commits: usize,
+        registry_requests: usize,
     }
     impl Host {
         fn send(&mut self, command: Command) -> ModuleResult<Response> {
@@ -811,6 +814,7 @@ mod tests {
                             }
                         }
                         "amaterasu.extension-registry/1" => {
+                            self.registry_requests += 1;
                             if payload["operation"] == "list" {
                                 json!({"ok":true,"revision":1,"items":if self.actionful {vec![crate::shortcut_discovery::tests::descriptor()]} else {vec![]},"next":null})
                             } else {
@@ -1023,6 +1027,7 @@ mod tests {
         assert_eq!(result.unwrap()["ok"], true);
         assert!(trace.borrow().is_empty());
         assert_eq!(host.commits, 1);
+        assert!(host.registry_requests >= 2);
         assert_eq!(
             host.value.unwrap()["receipts"]["1"]["intents"][0]["phase"],
             "terminal"

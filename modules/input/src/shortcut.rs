@@ -374,6 +374,30 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_held_modifier_can_start_a_newly_enabled_shortcut() {
+        let mut matcher = Matcher::default();
+        matcher.replace_bindings(vec![binding()]).unwrap();
+        // The native fast path forwarded this modifier before shortcuts were
+        // enabled; recovery must treat it as held without replaying its edge.
+        matcher
+            .recover_held(&[(key(1), Disposition::Forward)])
+            .unwrap();
+        let mut actions = 0;
+        assert_eq!(
+            matcher
+                .edge(&key(2), KeyState::Down, |_, _| {
+                    actions += 1;
+                    Ok::<_, ()>(())
+                })
+                .unwrap(),
+            Disposition::Consume
+        );
+        assert_eq!(actions, 1);
+        assert_eq!(edge(&mut matcher, 2, KeyState::Up), Disposition::Consume);
+        assert_eq!(edge(&mut matcher, 1, KeyState::Up), Disposition::Forward);
+    }
+
+    #[test]
     fn recovered_snapshot_does_not_create_an_action() {
         let mut matcher = Matcher::default();
         matcher.replace_bindings(vec![binding()]).unwrap();

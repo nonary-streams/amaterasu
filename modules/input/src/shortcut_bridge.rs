@@ -80,6 +80,30 @@ impl StagedBatch {
         &self.intents
     }
 
+    /// A fully forwarded batch has no shortcut ownership or action effects and
+    /// can use the lease's ordered, revocation-guarded native path directly.
+    pub fn deliver_forwarded<B: Backend>(
+        self,
+        controller: &mut Controller<B>,
+        now: Instant,
+        guard: &mut impl FnMut() -> InputResult<()>,
+    ) -> InputResult<Value> {
+        if !self.intents.is_empty()
+            || self.dispositions.iter().any(|d| *d != Disposition::Forward)
+            || self
+                .matcher
+                .held_snapshot()
+                .iter()
+                .any(|(_, d)| *d == Disposition::Consume)
+        {
+            return Err(InputError::new(
+                "invalid_sequence",
+                "shortcut ownership requires durable admission",
+            ));
+        }
+        Ok(controller.deliver_prepared_batch(self.prepared, now, guard))
+    }
+
     /// Store the whole disposition and action intent with the input receipt.
     /// The supplied dispatch intents must already have approved, durable
     /// lifecycle/action reservations; unverified source claims are insufficient.
@@ -259,6 +283,107 @@ mod tests {
             key: Key::LinuxEvdev { code },
             state,
         }
+    }
+
+    #[test]
+    fn forwarded_fast_path_preserves_modifier_for_later_shortcut_and_obeys_guard() {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let mut controller = Controller::new(BackendFake(trace.clone()), true);
+        let now = Instant::now();
+        let acquire: Operation =
+            serde_json::from_value(json!({"action":"acquire","ttl_ms":30000})).unwrap();
+        let lease = controller.handle("owner", acquire, now, &mut || Ok(()))["lease"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let matcher = Matcher::default();
+        let denied = StagedBatch::prepare(
+            &controller,
+            &matcher,
+            "owner",
+            &lease,
+            vec![key(1, KeyState::Down)],
+            Value::Null,
+            now,
+        )
+        .unwrap();
+        let reply = denied
+            .deliver_forwarded(&mut controller, now, &mut || {
+                Err(InputError::new("revoked", "revoked"))
+            })
+            .unwrap();
+        assert_eq!(reply["ok"], false);
+        assert!(trace.borrow().is_empty());
+        let acquire: Operation =
+            serde_json::from_value(json!({"action":"acquire","ttl_ms":30000})).unwrap();
+        let lease = controller.handle("owner", acquire, now, &mut || Ok(()))["lease"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let forwarded = StagedBatch::prepare(
+            &controller,
+            &matcher,
+            "owner",
+            &lease,
+            vec![key(1, KeyState::Down)],
+            Value::Null,
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            forwarded
+                .deliver_forwarded(&mut controller, now, &mut || Ok(()))
+                .unwrap()["ok"],
+            true
+        );
+        let held = controller
+            .shortcut_source_held_keys("owner", &lease, now)
+            .unwrap()
+            .into_iter()
+            .map(|key| (key, Disposition::Forward))
+            .collect::<Vec<_>>();
+        let mut matcher = Matcher::default();
+        matcher.recover_held(&held).unwrap();
+        matcher
+            .replace_approved_bindings(
+                &[Keybinding {
+                    id: "binding".into(),
+                    enabled: true,
+                    source: BindingSource::SessionInput,
+                    context: "game".into(),
+                    trigger: KeyIdentity::LinuxEvdev { code: 2 },
+                    modifiers: vec![KeyIdentity::LinuxEvdev { code: 1 }],
+                    propagation: BindingPropagation::ConsumeTrigger,
+                    action_id: "example/remove".into(),
+                    arguments: Default::default(),
+                    target: BindingTarget::CurrentSession,
+                }],
+                BindingSource::SessionInput,
+                "game",
+            )
+            .unwrap();
+        let matched = StagedBatch::prepare(
+            &controller,
+            &matcher,
+            "owner",
+            &lease,
+            vec![key(2, KeyState::Down)],
+            Value::Null,
+            now,
+        )
+        .unwrap();
+        assert_eq!(matched.intents().len(), 1);
+        assert!(
+            matched
+                .deliver_forwarded(&mut controller, now, &mut || Ok(()))
+                .is_err()
+        );
+        assert_eq!(trace.borrow().len(), 1);
+        assert!(
+            controller
+                .shortcut_source_held_keys("other", &lease, now)
+                .is_err()
+        );
     }
 
     #[test]
