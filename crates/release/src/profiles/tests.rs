@@ -1305,7 +1305,10 @@ fn catalog_profiles_scope_lutris_steam_id_export_authorization() {
             if principal != "amaterasu.console" {
                 assert_eq!(
                     grants.call.contains("amaterasu.lutris/1"),
-                    principal == MANAGEMENT.id || principal == LAUNCH.id || principal == NVHTTP.id,
+                    principal == MANAGEMENT.id
+                        || principal == LAUNCH.id
+                        || principal == NVHTTP.id
+                        || principal == LIBRARY.id,
                     "unexpected Lutris call grant for {principal}"
                 );
             }
@@ -1789,7 +1792,34 @@ fn catalog_profiles_package_library_with_scoped_calls() {
             .find(|component| component.id == LIBRARY.id)
             .unwrap();
         assert_eq!(library.provides, &["amaterasu.library/1"]);
-        assert_eq!(library.calls, &["amaterasu.catalog/1"]);
+        let expected = if matches!(
+            profile,
+            PackageProfile::LinuxSession | PackageProfile::LinuxSessionExtensions
+        ) {
+            &[
+                "amaterasu.catalog/1",
+                "amaterasu.steam/1",
+                "amaterasu.lutris/1",
+            ][..]
+        } else {
+            &[
+                "amaterasu.catalog/1",
+                "amaterasu.steam/1",
+                "amaterasu.lutris/1",
+                "amaterasu.playnite/1",
+            ][..]
+        };
+        assert_eq!(library.calls, expected);
+        for provider in &expected[1..] {
+            assert!(
+                components
+                    .iter()
+                    .find(|component| component.id == NVHTTP.id)
+                    .unwrap()
+                    .calls
+                    .contains(provider)
+            );
+        }
         let nvhttp = components
             .iter()
             .find(|component| component.id == NVHTTP.id)

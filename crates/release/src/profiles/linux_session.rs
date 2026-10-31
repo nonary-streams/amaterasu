@@ -142,6 +142,22 @@ const LINUX_SESSION_VIDEO: ComponentDefinition = ComponentDefinition {
 //   video -> encode / current-user PipeWire capture
 //   stream-session -> session / display / virtual-display / input / audio / audio-encode
 //   nvhttp -> launch / catalog / application / session / input / pairing / encode
+// The Linux session excludes Playnite, so only grant providers present in this profile.
+const LINUX_SESSION_LIBRARY: ComponentDefinition = ComponentDefinition {
+    calls: &[
+        "amaterasu.catalog/1",
+        "amaterasu.steam/1",
+        "amaterasu.lutris/1",
+    ],
+    dependencies: &[
+        RUNTIME_ID,
+        "amaterasu.catalog",
+        "amaterasu.steam",
+        "amaterasu.lutris",
+    ],
+    ..LIBRARY
+};
+
 const LINUX_SESSION_NVHTTP: ComponentDefinition = ComponentDefinition {
     calls: &[
         "amaterasu.lutris/1",
@@ -151,6 +167,7 @@ const LINUX_SESSION_NVHTTP: ComponentDefinition = ComponentDefinition {
         "amaterasu.state/1",
         "amaterasu.catalog/1",
         "amaterasu.library/1",
+        "amaterasu.steam/1",
         "amaterasu.launch/1",
         "amaterasu.display/1",
         "amaterasu.virtual-display/1",
@@ -175,6 +192,8 @@ const LINUX_SESSION_NVHTTP: ComponentDefinition = ComponentDefinition {
         "amaterasu.state",
         "amaterasu.catalog",
         "amaterasu.library",
+        "amaterasu.steam",
+        "amaterasu.lutris",
         "amaterasu.launch",
         "amaterasu.display",
         "amaterasu.rtsp",
@@ -320,7 +339,7 @@ pub const COMPONENTS: &[ComponentDefinition] = &[
     STEAM,
     LUTRIS,
     CATALOG,
-    LIBRARY,
+    LINUX_SESSION_LIBRARY,
     APPLICATION,
     AUTHENTICATION,
     LINUX_SESSION_MANAGEMENT,
@@ -389,7 +408,7 @@ pub const EXTENSION_COMPONENTS: &[ComponentDefinition] = &[
     STEAM,
     LUTRIS,
     CATALOG,
-    LIBRARY,
+    LINUX_SESSION_LIBRARY,
     APPLICATION,
     AUTHENTICATION,
     LINUX_SESSION_MANAGEMENT,

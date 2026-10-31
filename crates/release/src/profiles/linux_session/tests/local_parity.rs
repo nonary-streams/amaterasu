@@ -336,6 +336,13 @@ fn delegated_paths() -> Vec<Vec<&'static str>> {
     ] {
         paths.push(vec![direct]);
     }
+    for service in [
+        "amaterasu.catalog/1",
+        "amaterasu.steam/1",
+        "amaterasu.lutris/1",
+    ] {
+        paths.push(vec!["amaterasu.library/1", service]);
+    }
     paths.push(vec!["amaterasu.pairing/1", "amaterasu.state/1"]);
     paths.push(vec!["amaterasu.catalog/1", "amaterasu.state/1"]);
     paths
@@ -553,6 +560,31 @@ fn real_broker_delivers_every_delegated_request_and_enforces_each_ancestor() {
         );
     }
 
+    // Both the initiating NVHTTP and the immediate library caller need each
+    // provider grant for parented artwork requests.
+    for service in ["amaterasu.steam/1", "amaterasu.lutris/1"] {
+        for ancestor in [NVHTTP_ID, LIBRARY.id] {
+            let mut narrowed = policy.clone();
+            narrowed
+                .principals
+                .get_mut(ancestor)
+                .unwrap()
+                .call
+                .remove(service);
+            let mut broker = registered_broker(narrowed);
+            assert_eq!(
+                run(
+                    &mut broker,
+                    &["amaterasu.library/1", service],
+                    "artwork-narrowed"
+                )
+                .as_deref(),
+                Some("permission_denied"),
+                "{ancestor} without {service} must be denied"
+            );
+        }
+    }
+
     for outsider in ["amaterasu.pairing", "amaterasu.catalog", CONSOLE_ID] {
         for service in ["amaterasu.capture-kms/1", "amaterasu.virtual-display/1"] {
             assert!(
@@ -583,6 +615,7 @@ fn nvhttp_chain_grants_match_the_agreed_services_exactly() {
             "amaterasu.state/1",
             "amaterasu.catalog/1",
             "amaterasu.library/1",
+            "amaterasu.steam/1",
             "amaterasu.launch/1",
             "amaterasu.display/1",
             "amaterasu.virtual-display/1",

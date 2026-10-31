@@ -189,11 +189,22 @@ const LIBRARY: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.library",
     library: "amaterasu_library",
     provides: &["amaterasu.library/1"],
-    calls: &["amaterasu.catalog/1"],
+    calls: &[
+        "amaterasu.catalog/1",
+        "amaterasu.steam/1",
+        "amaterasu.lutris/1",
+        "amaterasu.playnite/1",
+    ],
     publishes: &[],
     native_provides: &[],
     native_uses: &[],
-    dependencies: &[RUNTIME_ID, "amaterasu.catalog"],
+    dependencies: &[
+        RUNTIME_ID,
+        "amaterasu.catalog",
+        "amaterasu.steam",
+        "amaterasu.lutris",
+        "amaterasu.playnite",
+    ],
 };
 
 const APPLICATION: ComponentDefinition = ComponentDefinition {
@@ -340,6 +351,7 @@ const NVHTTP: ComponentDefinition = ComponentDefinition {
         "amaterasu.state/1",
         "amaterasu.catalog/1",
         "amaterasu.library/1",
+        "amaterasu.steam/1",
         "amaterasu.launch/1",
         "amaterasu.display/1",
         "amaterasu.playnite/1",
@@ -371,6 +383,8 @@ const NVHTTP: ComponentDefinition = ComponentDefinition {
         "amaterasu.launch",
         "amaterasu.display",
         "amaterasu.playnite",
+        "amaterasu.steam",
+        "amaterasu.lutris",
         "amaterasu.rtsp",
     ],
 };
@@ -985,6 +999,7 @@ const SOFTWARE_NVHTTP: ComponentDefinition = ComponentDefinition {
         "amaterasu.state/1",
         "amaterasu.catalog/1",
         "amaterasu.library/1",
+        "amaterasu.steam/1",
         "amaterasu.launch/1",
         "amaterasu.display/1",
         "amaterasu.playnite/1",
@@ -1269,6 +1284,7 @@ const LINUX_NVHTTP: ComponentDefinition = ComponentDefinition {
         "amaterasu.state/1",
         "amaterasu.catalog/1",
         "amaterasu.library/1",
+        "amaterasu.steam/1",
         "amaterasu.launch/1",
         "amaterasu.display/1",
         "amaterasu.playnite/1",
