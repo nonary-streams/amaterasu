@@ -85,19 +85,6 @@ impl Coordinator {
         if obligations.is_empty() && selected.is_none() {
             return rejection("target_not_owned");
         }
-        let plans: Vec<_> = session
-            .admission_ids
-            .iter()
-            .filter_map(|id| {
-                journal
-                    .authority
-                    .admissions
-                    .get(id)
-                    .or_else(|| journal.authority.settled.get(id))
-            })
-            .filter(|admission| admission.provider == caller)
-            .map(|admission| &admission.plan)
-            .collect();
         let resource = selected
             .and_then(|(_, stream)| stream.candidate.as_ref())
             .map(|candidate| &candidate.resource);
@@ -136,7 +123,7 @@ impl Coordinator {
         let Ok(metadata) = super::provider_observations::metadata(journal, session, caller) else {
             return rejection("provider_metadata_unavailable");
         };
-        let result = json!({"status":"succeeded","provider":caller,"target":target,"session_target":{"kind":"session","host_epoch":session.host_epoch,"session_id":session.id,"generation":session.generation},"execution_domain":execution_domain,"settings_revision":snapshot.revision,"settings":snapshot.settings,"streams":streams,"obligations":obligations,"plans":plans,"mutation_domains":mutation_domains,"admitted_plans":metadata["admitted_plans"],"resource_targets":metadata["resource_targets"],"stale_mutation_domains":metadata["stale_mutation_domains"]});
+        let result = json!({"status":"succeeded","provider":caller,"target":target,"session_target":{"kind":"session","host_epoch":session.host_epoch,"session_id":session.id,"generation":session.generation},"execution_domain":execution_domain,"settings_revision":snapshot.revision,"settings":snapshot.settings,"streams":streams,"obligations":obligations,"mutation_domains":mutation_domains,"admitted_plans":metadata["admitted_plans"],"resource_targets":metadata["resource_targets"],"stale_mutation_domains":metadata["stale_mutation_domains"]});
         if serde_json::to_vec(&result).map_or(true, |bytes| bytes.len() > 16 * 1024) {
             return rejection("provider_metadata_too_large");
         }

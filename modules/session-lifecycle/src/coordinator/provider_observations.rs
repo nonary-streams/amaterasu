@@ -34,7 +34,6 @@ pub(super) fn metadata(
         }
     }
     let mut admitted = Vec::new();
-    let mut plans = Vec::new();
     let mut domains = BTreeMap::new();
     let mut target_values = BTreeSet::new();
     let mut obligations = Vec::new();
@@ -104,7 +103,6 @@ pub(super) fn metadata(
             admitted.push(
                 json!({"admission_id":id,"target":target,"phase":phase,"plan":admission.plan}),
             );
-            plans.push(admission.plan.clone());
             included = true;
         }
         if included {
@@ -128,7 +126,7 @@ pub(super) fn metadata(
         .into_iter()
         .map(|target| serde_json::from_str(&target).expect("serialized target is valid"))
         .collect();
-    if plans.len() > MAX_ITEMS
+    if admitted.len() > MAX_ITEMS
         || obligations.len() > MAX_ITEMS
         || domains.len() > MAX_ITEMS
         || targets.len() > MAX_ITEMS
@@ -140,7 +138,7 @@ pub(super) fn metadata(
         .filter(|domain| journal.authority.refresh_required.contains(*domain))
         .cloned()
         .collect();
-    let value = json!({"plans":plans,"admitted_plans":admitted,"obligations":obligations,"mutation_domains":domains.into_values().collect::<Vec<_>>(),"stale_mutation_domains":stale,"resource_targets":targets});
+    let value = json!({"admitted_plans":admitted,"obligations":obligations,"mutation_domains":domains.into_values().collect::<Vec<_>>(),"stale_mutation_domains":stale,"resource_targets":targets});
     if serde_json::to_vec(&value).map_err(|e| e.to_string())?.len() > MAX_RESPONSE_BYTES {
         return Err("provider_metadata_too_large".into());
     }

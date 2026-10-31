@@ -288,3 +288,40 @@ fn refresh_rejects_other_session_domains_and_duplicates_atomically() {
         2
     );
 }
+
+#[test]
+fn three_large_admissions_are_sent_once_with_provenance() {
+    let fixture = Fixture::new();
+    let mut journal = fixture.coordinator.shared.borrow().value.clone();
+    add(
+        &mut journal,
+        "session-c",
+        "admission-third",
+        "provider-a",
+        "shared",
+        LifecyclePhase::StreamPrepare,
+    );
+    for id in ["admission-a", "admission-b", "admission-third"] {
+        journal
+            .authority
+            .settled
+            .get_mut(id)
+            .unwrap()
+            .plan
+            .constraints = json!({"provider_state":"x".repeat(3000)});
+    }
+    let value = metadata(&journal, &journal.sessions["session-a"], "provider-a").unwrap();
+    assert!(value.get("plans").is_none());
+    let admitted = value["admitted_plans"].as_array().unwrap();
+    assert_eq!(admitted.len(), 3);
+    assert!(admitted.iter().all(|entry| {
+        entry["target"].is_object()
+            && entry["phase"].is_string()
+            && entry["plan"]["constraints"]["provider_state"]
+                .as_str()
+                .unwrap()
+                .len()
+                == 3000
+    }));
+    assert!(serde_json::to_vec(&value).unwrap().len() < 16 * 1024);
+}
