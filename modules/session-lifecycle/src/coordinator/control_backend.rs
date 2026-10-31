@@ -1,21 +1,10 @@
 //! Concrete control verification backed by coordinator-owned durable state.
 use super::control_endpoints::{ControlEndpointBackend, ResolvedControl, control_endpoint};
 use super::*;
-use crate::prepare_authority::{
-    AuthorityJournal, ControlContext, ControlPermitUse, CoordinatorPrepareAuthority,
-};
+use crate::prepare_authority::{ControlContext, ControlPermitUse, CoordinatorPrepareAuthority};
 use amaterasu_extension_api::{
     ResourceControlRequest, ResourceControlSettlementRequest, SchemaRef,
 };
-
-struct Writer(Shared);
-impl AuthorityJournal for Writer {
-    fn persist(&mut self, state: &AuthorityState) -> ModuleResult<()> {
-        let mut next = self.0.borrow().value.clone();
-        next.authority = state.clone();
-        save(&self.0, next)
-    }
-}
 
 struct Backend<'a> {
     coordinator: &'a mut Coordinator,
@@ -44,12 +33,36 @@ fn target_phase_allowed(
 }
 
 impl Backend<'_> {
-    fn authority(&self) -> ModuleResult<CoordinatorPrepareAuthority<Writer>> {
-        CoordinatorPrepareAuthority::new(
-            self.coordinator.shared.borrow().value.authority.clone(),
-            self.coordinator.selections.values().cloned().collect(),
-            Writer(self.coordinator.shared.clone()),
-        )
+    fn authority(
+        &self,
+        request: &ResourceControlRequest,
+    ) -> ModuleResult<CoordinatorPrepareAuthority<super::providers::AuthorityWriter>> {
+        let work = {
+            let shared = self.coordinator.shared.borrow();
+            let mut matches = shared.value.receipts.values().filter_map(|receipt| {
+                if receipt.response["status"] != "pending" {
+                    return None;
+                }
+                let work = receipt.work.as_ref()?;
+                let progress = work.composition_progress.as_ref()?;
+                (work.target == request.target
+                    && work.transition_id == request.transition_id
+                    && progress
+                        .controls
+                        .iter()
+                        .any(|control| control.dispatch.request == *request)
+                    && work.states.values().any(|state| {
+                        state.admission_id.as_deref() == Some(request.admission_id.as_str())
+                    }))
+                .then_some(work)
+            });
+            let work = matches.next().ok_or("active_control_work_unavailable")?;
+            if matches.next().is_some() {
+                return Err("ambiguous_control_work".into());
+            }
+            work.clone()
+        };
+        self.coordinator.authority_for_work(&work)
     }
 }
 
@@ -344,7 +357,7 @@ impl ControlEndpointBackend for Backend<'_> {
         request: &ResourceControlRequest,
     ) -> ModuleResult<()> {
         let catalog = self.coordinator.settings.schema_catalog()?;
-        self.authority()?.describe_control_permit(
+        self.authority(request)?.describe_control_permit(
             owner,
             &resolved.participant,
             &resolved.context,
@@ -359,7 +372,7 @@ impl ControlEndpointBackend for Backend<'_> {
         request: &ResourceControlRequest,
     ) -> ModuleResult<ControlPermitUse> {
         let catalog = self.coordinator.settings.schema_catalog()?;
-        self.authority()?.consume_control_permit(
+        self.authority(request)?.consume_control_permit(
             owner,
             &resolved.participant,
             &resolved.context,
@@ -374,7 +387,7 @@ impl ControlEndpointBackend for Backend<'_> {
         request: &ResourceControlRequest,
     ) -> ModuleResult<()> {
         let catalog = self.coordinator.settings.schema_catalog()?;
-        self.authority()?.validate_control_permit(
+        self.authority(request)?.validate_control_permit(
             owner,
             &resolved.participant,
             &resolved.context,
