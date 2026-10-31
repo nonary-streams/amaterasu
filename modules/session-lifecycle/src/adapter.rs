@@ -1,5 +1,5 @@
 //! Broker adapter for the lifecycle authority. Request payloads do not establish identity.
-use crate::prepare_authority::ControlPolicy;
+use crate::prepare_authority::{ControlPolicy, FinalizePolicy};
 use amaterasu_extension_api::{ConsumerRequirements, MethodRef, ResourceAccess, SchemaRef};
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use serde::{Deserialize, Serialize};
@@ -45,6 +45,10 @@ pub struct LifecycleSettings {
     pub participants: Vec<ParticipantSettings>,
     /// Installed owner-mediated control grants; absent means no control is allowed.
     pub control_policies: Vec<ControlPolicy>,
+    /// Exact owner finalization grants, pinned independently from control grants.
+    pub finalize_policies: Vec<FinalizePolicy>,
+    /// Exact UTF-8 schema documents supplied by installed signed policy.
+    pub schema_documents: Vec<SchemaDocument>,
     pub consumers: ConsumerSettings,
     pub consumer_requirements: ConsumerRequirements,
 }
@@ -62,6 +66,8 @@ impl Default for LifecycleSettings {
             operation_grants: BTreeMap::new(),
             participants: Vec::new(),
             control_policies: Vec::new(),
+            finalize_policies: Vec::new(),
+            schema_documents: Vec::new(),
             consumers: ConsumerSettings::default(),
             consumer_requirements: ConsumerRequirements {
                 execution_domain: String::new(),
@@ -70,6 +76,13 @@ impl Default for LifecycleSettings {
             },
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SchemaDocument {
+    pub reference: SchemaRef,
+    pub document: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -130,6 +143,42 @@ fn valid_schema_reference(schema: &SchemaRef) -> bool {
 }
 
 impl LifecycleSettings {
+    /// Compile only policy-supplied local documents; no runtime fetch or request
+    /// payload can add a schema. Every control and finalization pin must resolve exactly.
+    pub(crate) fn schema_catalog(
+        &self,
+    ) -> ModuleResult<amaterasu_extension_api::schemas::SchemaCatalog> {
+        if self.schema_documents.len() > 32
+            || self
+                .schema_documents
+                .iter()
+                .any(|entry| entry.document.len() > 12_000)
+            || self
+                .schema_documents
+                .iter()
+                .map(|entry| entry.document.len())
+                .sum::<usize>()
+                > 12_000
+        {
+            return Err("lifecycle schema document limit exceeded".into());
+        }
+        let catalog = amaterasu_extension_api::schemas::SchemaCatalog::compile(
+            self.schema_documents
+                .iter()
+                .map(|entry| (entry.reference.clone(), entry.document.as_str())),
+        )?;
+        if self.control_policies.iter().any(|policy| {
+            !catalog.contains(&policy.argument_schema) || !catalog.contains(&policy.output_schema)
+        }) || self
+            .finalize_policies
+            .iter()
+            .any(|policy| !catalog.contains(&policy.output_schema))
+        {
+            return Err("lifecycle policy schema unavailable".into());
+        }
+        Ok(catalog)
+    }
+
     /// Validate installed policy shape and graph binding. Resolving the actual
     /// schema bytes and installed method approvals remains a separate authority check.
     fn validate_control_policies(&self) -> ModuleResult<()> {
@@ -165,6 +214,45 @@ impl LifecycleSettings {
                     .any(|domain| !valid_opaque_id(domain))
             {
                 return Err("invalid lifecycle control policy".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_finalize_policies(&self) -> ModuleResult<()> {
+        if self.finalize_policies.len() > 128 {
+            return Err("too many lifecycle finalize policies".into());
+        }
+        for (index, policy) in self.finalize_policies.iter().enumerate() {
+            if !self
+                .participants
+                .iter()
+                .any(|p| p.provider == policy.owner_provider)
+                || self.finalize_policies[..index].contains(policy)
+                || !valid_identifier(&policy.owner_service)
+                || policy.owner_service != policy.method.service
+                || !valid_identifier(&policy.method.method)
+                || policy.method.interface_major == 0
+                || policy.method.schema_revision == 0
+                || !valid_opaque_id(&policy.output_capability)
+                || !valid_schema_reference(&policy.output_schema)
+                || !self
+                    .consumer_requirements
+                    .capture_providers
+                    .contains(&policy.capture_provider)
+                || !self
+                    .consumer_requirements
+                    .selector_schemas
+                    .contains(&policy.selector_schema)
+                || matches!(policy.required_access, ResourceAccess::Read)
+                || policy.mutation_domains.is_empty()
+                || policy.mutation_domains.len() > 32
+                || policy
+                    .mutation_domains
+                    .iter()
+                    .any(|domain| !valid_opaque_id(domain))
+            {
+                return Err("invalid lifecycle finalize policy".into());
             }
         }
         Ok(())
@@ -351,6 +439,8 @@ impl LifecycleSettings {
         }
         self.resolved_participants()?;
         self.validate_control_policies()?;
+        self.validate_finalize_policies()?;
+        self.schema_catalog()?;
         Ok(())
     }
 }
@@ -796,9 +886,12 @@ mod tests {
     fn installed_control_policy_requires_exact_graph_and_valid_pins() {
         let method = json!({"service":"owner/1","method":"apply","interface_major":1,"interface_minor":0,"schema_revision":1});
         let participant = |provider: &str, depends_on: Value| json!({"provider":provider,"depends_on":depends_on,"plan_method":method,"callback_method":method,"status_method":method,"capabilities":[],"cleanup_methods":[],"settings_revision":"initial","settings":{}});
-        let schema = json!({"id":"schema/1","major":1,"minor":0,"digest":"a".repeat(64)});
+        use sha2::{Digest, Sha256};
+        let document = r#"{"$id":"schema/1","$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#;
+        let digest = format!("{:x}", Sha256::digest(document.as_bytes()));
+        let schema = json!({"id":"schema/1","major":1,"minor":0,"digest":digest});
         let policy = json!({"dependent_provider":"dependent","owner_provider":"owner","owner_service":"owner/1","owner_method":method,"argument_schema":schema,"output_capability":"display/output","output_schema":schema,"max_access":"exclusive","mutation_domains":["seat:0"]});
-        let mut settings: LifecycleSettings = serde_json::from_value(json!({"journal_path":"/test", "consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector/1"]},"participants":[participant("dependent",json!(["owner"])),participant("owner",json!([]))],"control_policies":[policy]})).unwrap();
+        let mut settings: LifecycleSettings = serde_json::from_value(json!({"journal_path":"/test", "consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector/1"]},"participants":[participant("dependent",json!(["owner"])),participant("owner",json!([]))],"control_policies":[policy], "schema_documents":[{"reference":schema,"document":document}]})).unwrap();
         assert!(settings.validate().is_ok());
         settings
             .control_policies
@@ -810,7 +903,7 @@ mod tests {
         settings.participants[0].depends_on.push("owner".into());
         settings.control_policies[0].argument_schema.digest = "A".repeat(64);
         assert!(settings.validate().is_err());
-        settings.control_policies[0].argument_schema.digest = "a".repeat(64);
+        settings.control_policies[0].argument_schema.digest = digest;
         settings.control_policies[0].owner_method.service = "other/1".into();
         assert!(settings.validate().is_err());
         settings.control_policies[0].owner_method.service = "owner/1".into();
@@ -821,5 +914,33 @@ mod tests {
         assert!(settings.validate().is_err());
         settings.control_policies.clear();
         assert!(settings.validate().is_ok());
+        let finalize = json!({"owner_provider":"owner","owner_service":"owner/1","method":method,"output_capability":"display/output","output_schema":schema,"capture_provider":"capture","selector_schema":"selector/1","required_access":"exclusive","mutation_domains":["seat:0"]});
+        settings.finalize_policies = vec![serde_json::from_value(finalize).unwrap()];
+        assert!(settings.validate().is_ok());
+        settings
+            .finalize_policies
+            .push(settings.finalize_policies[0].clone());
+        assert!(settings.validate().is_err());
+        settings.finalize_policies.pop();
+        settings.finalize_policies[0].capture_provider = "wrong".into();
+        assert!(settings.validate().is_err());
+        settings.finalize_policies[0].capture_provider = "capture".into();
+        settings.finalize_policies[0].method.service = "wrong/1".into();
+        assert!(settings.validate().is_err());
+        settings.finalize_policies[0].method.service = "owner/1".into();
+        settings.finalize_policies[0].required_access = ResourceAccess::Read;
+        assert!(settings.validate().is_err());
+        settings.finalize_policies[0].required_access = ResourceAccess::Exclusive;
+        settings.finalize_policies[0].mutation_domains.clear();
+        assert!(settings.validate().is_err());
+        settings.finalize_policies[0]
+            .mutation_domains
+            .insert("seat:0".into());
+        settings.finalize_policies[0].output_schema.digest = "f".repeat(64);
+        assert!(settings.validate().is_err());
+        settings.finalize_policies.clear();
+        assert!(settings.validate().is_ok());
+        settings.schema_documents[0].document.push(' ');
+        assert!(settings.validate().is_err());
     }
 }
