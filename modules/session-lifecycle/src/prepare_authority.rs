@@ -1281,7 +1281,6 @@ mod tests {
     }
     fn selection() -> ProviderSelection {
         let participant = ParticipantSettings {
-            depends_on: vec![],
             provider: "display".into(),
             depends_on: vec![],
             plan_method: method("plan"),
