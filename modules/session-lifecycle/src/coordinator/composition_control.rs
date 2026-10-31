@@ -7,6 +7,16 @@ use super::composition_progress::CompositionProgress;
 use super::*;
 use amaterasu_extension_api::{MethodRef, ResourceOutput};
 
+fn ensure_control_scope_unfenced(
+    book: &super::closed_stream::ClosedStreamBook,
+    target: &LifecycleTarget,
+) -> ModuleResult<()> {
+    if book.scope_fenced(target) {
+        return Err("control_scope_retired".into());
+    }
+    Ok(())
+}
+
 fn ensure_control_operation_unfenced(
     book: &super::control_settlement::ControlSettlementBook,
     owner: &str,
@@ -331,6 +341,7 @@ impl Coordinator {
             transition_id: work.transition_id.clone(),
             parent_generation: Some(parent_generation),
         };
+        ensure_control_scope_unfenced(&self.shared.borrow().value.closed_streams, &work.target)?;
         let mut authority = self.authority_for_work(work)?;
         let selected_providers = self.work_selections(work)?;
         let owner = selected_providers
@@ -526,6 +537,10 @@ impl Coordinator {
                 .as_ref()
                 .is_none_or(|record| record.state == crate::provider_dispatch::DispatchState::Ready)
         {
+            ensure_control_scope_unfenced(
+                &self.shared.borrow().value.closed_streams,
+                &control.dispatch.request.target,
+            )?;
             ensure_control_operation_unfenced(
                 &self.shared.borrow().value.control_settlements,
                 &control.dispatch.request.proposal.owner_provider,
@@ -1001,6 +1016,28 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closed_stream_scope_cannot_issue_or_replay_control() {
+        use sha2::{Digest, Sha256};
+        let target: LifecycleTarget = serde_json::from_value(json!({
+            "kind":"stream", "host_epoch":"epoch", "session_id":"session",
+            "stream_id":"stream", "generation":1
+        }))
+        .unwrap();
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&json!(["closed-stream-scope-v1", target])).unwrap())
+        );
+        let book: super::super::closed_stream::ClosedStreamBook =
+            serde_json::from_value(json!({"records":[],"expired_scopes":[digest]})).unwrap();
+        assert!(ensure_control_scope_unfenced(&book, &target).is_err());
+        let mut other = target.clone();
+        if let LifecycleTarget::Stream { generation, .. } = &mut other {
+            *generation += 1;
+        }
+        assert!(ensure_control_scope_unfenced(&book, &other).is_ok());
+    }
 
     #[test]
     fn retired_control_operation_cannot_be_dispatched_again() {
