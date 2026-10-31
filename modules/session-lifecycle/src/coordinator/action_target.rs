@@ -178,11 +178,14 @@ impl Coordinator {
         if !matches!(session.phase, SessionPhase::Ready | SessionPhase::Paused) {
             return rejection("target_not_active");
         }
+        let replan = selected_stream.is_some()
+            && self.is_exact_replan_description(journal, caller, payload, &target);
         if let Some(stream_id) = selected_stream {
             if session.streams.get(stream_id).is_none_or(|stream| {
                 stream.generation != generation
                     || stream.binding_owner != caller
-                    || stream.phase != StreamPhase::Active
+                    || (stream.phase != StreamPhase::Active
+                        && !(replan && stream.phase == StreamPhase::Retired))
             }) {
                 return rejection("target_not_owned");
             }
@@ -190,7 +193,7 @@ impl Coordinator {
             return rejection("stale_generation");
         }
         if session.phase == SessionPhase::Paused
-            && (selected_stream.is_some()
+            && ((selected_stream.is_some() && !replan)
                 || session
                     .streams
                     .values()
@@ -346,5 +349,61 @@ impl Coordinator {
             return rejection("provider_metadata_too_large");
         }
         result
+    }
+
+    /// IDs only select a unique durable transfer; they do not establish
+    /// authority. The broker-authenticated provider and retained proof do.
+    fn is_exact_replan_description(
+        &self,
+        journal: &Journal,
+        caller: &str,
+        payload: &Value,
+        target: &ActionTarget,
+    ) -> bool {
+        let (Some(operation_id), Some(action_id)) = (
+            payload["operation_id"].as_str(),
+            payload["action_id"].as_str(),
+        ) else {
+            return false;
+        };
+        let Ok(target_value) = serde_json::to_value(target) else {
+            return false;
+        };
+        let mut matches = journal.receipts.values().filter(|receipt| {
+            let Some(work) = &receipt.work else {
+                return false;
+            };
+            let Some(transfer) = &work.action_transfer else {
+                return false;
+            };
+            if receipt.caller != self.settings.action_service
+                || transfer.service != self.settings.action_service
+                || transfer.binding.operation_id != operation_id
+                || transfer.binding.action_id != action_id
+                || serde_json::to_value(&transfer.binding.target).ok().as_ref()
+                    != Some(&target_value)
+            {
+                return false;
+            }
+            true
+        });
+        let Some(receipt) = matches.next() else {
+            return false;
+        };
+        if matches.next().is_some() {
+            return false;
+        }
+        let Some(work) = &receipt.work else {
+            return false;
+        };
+        let Some(transfer) = &work.action_transfer else {
+            return false;
+        };
+        transfer.stage == ActionTransferStage::ReplanRequired
+            && journal
+                .actions
+                .execution_for_permit(&transfer.service, &transfer.permit)
+                .is_ok_and(|(provider, _, _)| provider == caller)
+            && super::action_release_proof::validate_replan_stage(journal, receipt, work, transfer)
     }
 }

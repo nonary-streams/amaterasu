@@ -1968,6 +1968,21 @@ mod tests {
             coordinator.describe_action_target("display", &v2)["status"],
             "rejected"
         );
+        let mut retired = paused.clone();
+        let mut old_stream = scoped.sessions["session"].streams["stream"].clone();
+        old_stream.phase = StreamPhase::Retired;
+        retired
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .streams
+            .insert("stream".into(), old_stream);
+        save(&coordinator.shared, retired).unwrap();
+        let retired_request = json!({"operation":"describe_action_target","version":2,"operation_id":"guessed","action_id":"display/remove","target":{"kind":"stream","host_epoch":epoch,"session_id":"session","stream_id":"stream","expected_generation":4}});
+        assert_eq!(
+            coordinator.describe_action_target("display", &retired_request)["reason"],
+            "target_not_owned"
+        );
         let mut unavailable = paused.clone();
         let mut book = serde_json::to_value(&unavailable.composition).unwrap();
         book["outputs"][0]["state"] = json!("recovery_required");
