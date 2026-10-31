@@ -4,6 +4,7 @@ mod action_target;
 mod application;
 #[allow(dead_code)] // Admission and control remain disabled until schema verification is wired.
 mod composition;
+mod composition_prepare;
 mod composition_progress;
 mod control_backend;
 #[allow(dead_code)] // Control dispatch remains gated until coordinator sequencing is wired.
@@ -14,6 +15,7 @@ mod control_settlement;
 mod finalize_backend;
 #[allow(dead_code)]
 mod finalize_dispatch;
+mod finalize_endpoints;
 #[allow(dead_code)]
 mod finalize_result;
 mod finalize_endpoints;
@@ -708,6 +710,7 @@ pub struct Coordinator {
     selections: BTreeMap<String, ProviderSelection>,
     approval_cursor: usize,
     drivers: BTreeMap<String, PrepareDriver>,
+    finalize_drivers: BTreeMap<String, finalize_dispatch::FinalizeDispatch>,
     validations: BTreeMap<String, security::ValidationJob>,
     revocations: BTreeMap<String, security::RevocationJob>,
     application_jobs: BTreeMap<String, application::ApplicationJob>,
@@ -777,6 +780,7 @@ impl Coordinator {
             selections: BTreeMap::new(),
             approval_cursor: 0,
             drivers: BTreeMap::new(),
+            finalize_drivers: BTreeMap::new(),
             validations: BTreeMap::new(),
             revocations: BTreeMap::new(),
             application_jobs: BTreeMap::new(),
@@ -807,6 +811,14 @@ impl Coordinator {
         }
         if operation == "verify_provider_epoch" {
             return self.verify_provider(caller, &payload);
+        }
+        if matches!(
+            operation,
+            "describe_resource_finalize"
+                | "verify_resource_finalize"
+                | "validate_resource_finalize"
+        ) {
+            return self.finalize_operation(caller, payload);
         }
         if operation == "resolve_settings_scope" {
             return self.resolve_settings_scope(caller, payload);

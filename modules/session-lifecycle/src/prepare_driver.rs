@@ -142,13 +142,20 @@ impl PrepareDriver {
         if (!finalize_plan && !standalone_prepare && state.request.version != 1)
             || (standalone_prepare
                 && (state.request.version != api::COMPOSITION_VERSION
-                    || !state.request.dependency_inputs.is_empty()
                     || !state.request.control_results.is_empty()
+                    || match state.request.phase {
+                        api::LifecyclePhase::SessionPrepare => {
+                            !state.request.dependency_inputs.is_empty()
+                        }
+                        api::LifecyclePhase::StreamPrepare => {
+                            state.request.dependency_inputs.len() != 1
+                        }
+                        _ => true,
+                    }
                     || !matches!(
                         state.request.operation,
                         ProviderOperation::ResourcePlan | ProviderOperation::LifecycleCallback
                     )
-                    || state.request.phase != api::LifecyclePhase::SessionPrepare
                     || !matches!(
                         state.phase,
                         PreparePhase::Plan
@@ -801,7 +808,7 @@ mod tests {
     }
 
     #[test]
-    fn standalone_v2_allows_only_session_prepare_without_dependencies() {
+    fn standalone_v2_requires_dependency_for_stream_prepare() {
         let (mut settings, mut state) = fixture();
         let participant = &mut settings.participants[0];
         participant.contract_version = api::COMPOSITION_VERSION;

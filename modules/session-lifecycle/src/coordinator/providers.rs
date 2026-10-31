@@ -545,7 +545,7 @@ impl Coordinator {
         )
     }
 
-    fn work_selections(&self, work: &Work) -> ModuleResult<Vec<ProviderSelection>> {
+    pub(super) fn work_selections(&self, work: &Work) -> ModuleResult<Vec<ProviderSelection>> {
         let journal = &self.shared.borrow().value;
         let (_, session_id, _, _) = super::operations::target_parts(&work.target)?;
         let session = journal.sessions.get(session_id).ok_or("unknown_session")?;
@@ -650,6 +650,55 @@ impl Coordinator {
                     self.fail_work(&key, "restart_requires_cleanup")?;
                     continue;
                 }
+                let standalone_stream = work.phase == LifecyclePhase::StreamPrepare
+                    && work.providers.len() == 1
+                    && self.settings.participants.iter().any(|participant| {
+                        participant.provider == work.providers[0]
+                            && participant.contract_version
+                                == amaterasu_extension_api::COMPOSITION_VERSION
+                    });
+                if standalone_stream && work.candidate.is_none() {
+                    let outcome = if work
+                        .composition_progress
+                        .as_ref()
+                        .and_then(|progress| progress.finalize.as_ref())
+                        .is_none_or(|finalize| {
+                            finalize.owner_plan.phase != PreparePhase::FinalizePlanAdmitted
+                        }) {
+                        self.advance_standalone_finalize_plan(&key, &work, send)
+                            .map(|_| ())
+                    } else if work
+                        .composition_progress
+                        .as_ref()
+                        .and_then(|progress| progress.finalize.as_ref())
+                        .and_then(|finalize| finalize.dispatch.as_ref())
+                        .is_some_and(|dispatch| {
+                            matches!(
+                                dispatch.phase,
+                                super::finalize_dispatch::FinalizePhase::Confirmed { .. }
+                            )
+                        })
+                    {
+                        self.commit_standalone_finalize(&key, &work)
+                    } else {
+                        self.advance_standalone_finalize_effect(&key, &work, send)
+                            .map(|_| ())
+                    };
+                    if let Err(reason) = outcome {
+                        // Finalization may already have crossed its effect boundary.
+                        // Preserve the exact work, permit and dispatch evidence for
+                        // recovery instead of replacing it with a cleanup work item.
+                        let mut next = self.shared.borrow().value.clone();
+                        let receipt = next
+                            .receipts
+                            .get_mut(&key)
+                            .ok_or("transition_no_longer_active")?;
+                        receipt.response["status"] = json!("recovery_required");
+                        receipt.response["reason"] = json!(reason);
+                        save(&self.shared, next)?;
+                    }
+                    continue;
+                }
                 if let Err(reason) = self.complete_work(&key, &work) {
                     self.fail_work(&key, &reason)?;
                 }
@@ -680,8 +729,10 @@ impl Coordinator {
             if self.settings.participants.iter().any(|participant| {
                 &participant.provider == provider
                     && participant.contract_version == amaterasu_extension_api::COMPOSITION_VERSION
-            }) && work.phase != LifecyclePhase::SessionPrepare
-            {
+            }) && !matches!(
+                work.phase,
+                LifecyclePhase::SessionPrepare | LifecyclePhase::StreamPrepare
+            ) {
                 self.fail_work(&key, "composition_path_not_supported")?;
                 continue;
             }
@@ -715,7 +766,10 @@ impl Coordinator {
             };
             let standalone_v2 = participant.contract_version
                 == amaterasu_extension_api::COMPOSITION_VERSION
-                && matches!(work.phase, LifecyclePhase::SessionPrepare)
+                && matches!(
+                    work.phase,
+                    LifecyclePhase::SessionPrepare | LifecyclePhase::StreamPrepare
+                )
                 && work.provider_graph.as_ref().is_some_and(|graph| {
                     graph.order == [participant.provider.clone()]
                         && graph
@@ -741,6 +795,27 @@ impl Coordinator {
                 Err(_) => continue,
             };
             if !work.states.contains_key(provider) {
+                let dependency_inputs =
+                    if standalone_v2 && work.phase == LifecyclePhase::StreamPrepare {
+                        let resolved = {
+                            let shared = self.shared.borrow();
+                            super::composition_prepare::standalone_stream_input(
+                                &shared.value,
+                                &effective_settings,
+                                &work,
+                                provider,
+                            )
+                        };
+                        match resolved {
+                            Ok(input) => vec![input],
+                            Err(reason) => {
+                                self.fail_work(&key, &reason)?;
+                                continue;
+                            }
+                        }
+                    } else {
+                        vec![]
+                    };
                 let (sequence, operation_id) = authority.allocate(provider)?;
                 let request = ProviderRequest {
                     provider_sequence: sequence,
@@ -761,7 +836,7 @@ impl Coordinator {
                     plan_revision: None,
                     admission_id: None,
                     approved_plan: None,
-                    dependency_inputs: vec![],
+                    dependency_inputs,
                     control_results: vec![],
                 };
                 let state = PrepareState {
@@ -1201,6 +1276,27 @@ impl Coordinator {
         }
         let mut next = self.shared.borrow().value.clone();
         let (_, id, stream_id, _) = super::operations::target_parts(&work.target)?;
+        let mut finalize_owners = next.finalize_results.records().filter_map(|record| {
+            if record.request.target != work.target
+                || record.request.transition_id != work.transition_id
+            {
+                return None;
+            }
+            match &record.applied {
+                amaterasu_extension_api::ResourceControlResponse::Applied {
+                    candidate: Some(candidate),
+                    ..
+                } if Some(candidate.as_ref()) == work.candidate.as_ref() => {
+                    Some(record.selection.policy.owner_provider.clone())
+                }
+                _ => None,
+            }
+        });
+        let finalize_owner = finalize_owners.next();
+        if finalize_owners.next().is_some() {
+            return Err("capture_owner_ambiguous".into());
+        }
+        drop(finalize_owners);
         let session = next.sessions.get_mut(id).ok_or("unknown_session")?;
         let mut response = json!({"status":"succeeded","target":work.target,"transition_id":work.transition_id,"host_epoch":session.host_epoch,"session_id":session.id,"generation":session.generation});
         if let Some(stream) = stream_id.and_then(|id| session.streams.get(id)) {
@@ -1252,6 +1348,7 @@ impl Coordinator {
                         )
                         .then(|| provider.clone())
                     })
+                    .or(finalize_owner)
                     .ok_or("capture_owner_missing")?;
                 response["candidate"] =
                     serde_json::to_value(candidate).map_err(|e| e.to_string())?;

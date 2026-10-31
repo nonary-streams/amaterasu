@@ -1805,6 +1805,13 @@ impl<J: AuthorityJournal> PrepareAuthority for CoordinatorPrepareAuthority<J> {
             if next.domain_locks.contains_key(&domain.domain) {
                 return Err("mutation domain is reserved".into());
             }
+            // Version 2 effects require a separate authenticated native
+            // observation after each previous admission releases its domain.
+            if participant.contract_version == amaterasu_extension_api::COMPOSITION_VERSION
+                && refreshable.contains(&domain.domain)
+            {
+                return Err("fresh provider observation required".into());
+            }
             let observed = DomainState {
                 revision: domain.expected_revision,
                 borrowers: domain.borrowers.clone(),
@@ -2560,6 +2567,22 @@ mod tests {
             authority.state.settled[&admission].plan.obligations.len(),
             1
         );
+        // V2 cannot use its plan as a substitute for the owner's separate
+        // authenticated post-effect observation.
+        let mut v2 = selection.clone();
+        v2.participant.contract_version = amaterasu_extension_api::COMPOSITION_VERSION;
+        let mut composed = CoordinatorPrepareAuthority::new(
+            authority.state.clone(),
+            vec![v2.clone()],
+            Journal::default(),
+        )
+        .unwrap();
+        assert!(composed.admit_plan(&v2.participant, &plan()).is_err());
+        let fresh = composed.state.snapshot.domains["topology"].clone();
+        composed
+            .refresh_observations("display", &[("topology".into(), fresh)], &[])
+            .unwrap();
+        assert!(composed.admit_plan(&v2.participant, &plan()).is_ok());
         let mut changed = plan();
         changed.mutation_domains[0].expected_revision = 5;
         changed.mutation_domains[0]
