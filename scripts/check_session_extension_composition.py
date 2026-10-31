@@ -18,7 +18,7 @@ from export_session_extension_split import load
 
 DISPLAY = "nonary.display-settings"
 OWNER = "nonary.virtual-screen"
-TARGET_DIGEST = "8521cdfd92da98b25136bd01720d397f0d7fee14748c08afde76a0379fa18941"
+TARGET_DIGEST = "ededc620113268bcae3990d492deeef039c5e9c5ff28067a676dd992fe6324ce"
 CONTROL_DIGEST = "c2c3ce866277cb29bbd9fbd947899917538d46b1020df3197fbd264159607d87"
 DISPLAY_METHODS = {"settings_validate", "resource_plan", "lifecycle_callback", "lifecycle_status"}
 OWNER_METHODS = {"settings_validate", "resource_plan", "lifecycle_callback", "lifecycle_status",

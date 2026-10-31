@@ -199,7 +199,7 @@ def lifecycle_graph(owner_approvals: list[dict], target_document: bytes, control
     """
     import hashlib
 
-    roles = {"control", "control_status", "settlement", "settlement_status", "finalize", "finalize_status"}
+    roles = {"control", "control_status", "settlement", "finalize", "finalize_status"}
     if set(method_names) != roles or any(not isinstance(name, str) or not name for name in method_names.values()):
         raise ValueError("complete owner method selections are required")
     for document, digest in ((target_document, check.TARGET_DIGEST), (control_document, check.CONTROL_DIGEST)):
@@ -221,7 +221,6 @@ def lifecycle_graph(owner_approvals: list[dict], target_document: bytes, control
                "owner_method": method_ref(check.OWNER, method_names["control"]),
                "status_method": method_ref(check.OWNER, method_names["control_status"]),
                "settlement_method": method_ref(check.OWNER, method_names["settlement"]),
-               "settlement_status_method": method_ref(check.OWNER, method_names["settlement_status"]),
                "argument_schema": control_schema, "max_access": "exclusive"}
     finalize = {**copy.deepcopy(common), "method": method_ref(check.OWNER, method_names["finalize"]),
                 "status_method": method_ref(check.OWNER, method_names["finalize_status"]),
@@ -230,3 +229,34 @@ def lifecycle_graph(owner_approvals: list[dict], target_document: bytes, control
     return {"control_policies": [control], "finalize_policies": [finalize],
             "schema_documents": [{"reference": target_schema, "document": target_document.decode("utf-8")},
                                  {"reference": control_schema, "document": control_document.decode("utf-8")} ]}
+
+
+def lifecycle_configuration(journal_path: str, graph: dict, additional_grants: dict[str, list[str]]) -> dict:
+    """Combine the pinned graph with explicitly reviewed provider operations.
+
+    The caller must confirm these operation names are implemented and necessary;
+    this builder does not turn on composition or bypass the runtime gate.
+    """
+    if not isinstance(journal_path, str) or not journal_path.startswith("/"):
+        raise ValueError("an absolute lifecycle journal path is required")
+    if set(graph) != {"control_policies", "finalize_policies", "schema_documents"}:
+        raise ValueError("complete installed graph is required")
+    if set(additional_grants) != {check.OWNER, check.DISPLAY}:
+        raise ValueError("reviewed operations for both providers are required")
+    operations = copy.deepcopy(legacy.OPERATIONS)
+    # The old combined provider's operations do not transfer to either v2
+    # participant; the selected operations must be reviewed independently.
+    operations.pop(legacy.PROVIDER, None)
+    for provider, names in additional_grants.items():
+        if not isinstance(names, list) or any(not isinstance(name, str) or not name or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789_" for c in name) for name in names) or len(names) != len(set(names)):
+            raise ValueError("invalid provider operation grants")
+        operations[provider] = sorted(set(operations.get(provider, [])) | set(names))
+    return {"journal_path": journal_path, "trusted_callers": sorted(operations),
+            "session_delegates": [legacy.RTSP, legacy.STREAM],
+            "action_service": legacy.ACTIONS, "settings_registry_caller": legacy.REGISTRY,
+            "settings_registry_service": legacy.REGISTRY_SERVICE, "operation_grants": operations,
+            "consumers": {"capture": [legacy.STREAM], "input": [legacy.STREAM, legacy.INPUT]},
+            "consumer_requirements": {"execution_domain": "desktop",
+                                      "capture_providers": ["amaterasu.capture-pipewire/1"],
+                                      "selector_schemas": ["amaterasu.kwin-wl-output/1"]},
+            **copy.deepcopy(graph)}

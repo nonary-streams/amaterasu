@@ -120,7 +120,7 @@ class CompositionPolicyTest(unittest.TestCase):
     def test_resource_scoped_graph_pins_owner_methods_and_schema_bytes(self):
         target, control = b'{"target":true}\n', b'{"control":true}\n'
         names = {"control": "resource_control", "control_status": "resource_status",
-                 "settlement": "resource_control_settle", "settlement_status": "resource_settle_status",
+                 "settlement": "resource_control_settle",
                  "finalize": "resource_finalize", "finalize_status": "resource_status"}
         approvals = copy.deepcopy(self.owner["approvals"])
         for name in set(names.values()) - check.OWNER_METHODS:
@@ -139,6 +139,18 @@ class CompositionPolicyTest(unittest.TestCase):
             names["control_status"] = "not_approved"
             with self.assertRaisesRegex(ValueError, "lacks an approval"):
                 policy.lifecycle_graph(approvals, target, control, names)
+
+    def test_lifecycle_settings_retain_baseline_and_reviewed_provider_grants(self):
+        graph = {"control_policies": [], "finalize_policies": [], "schema_documents": []}
+        settings = policy.lifecycle_configuration("/private/journal.json", graph,
+            {check.OWNER: ["verify_resource_control"], check.DISPLAY: []})
+        self.assertIn("prepare", settings["operation_grants"][legacy.NVHTTP])
+        self.assertIn("verify_resource_control", settings["operation_grants"][check.OWNER])
+        self.assertEqual(settings["operation_grants"][check.DISPLAY], [])
+        self.assertIn(check.OWNER, settings["trusted_callers"])
+        self.assertEqual(settings["consumer_requirements"]["capture_providers"], ["amaterasu.capture-pipewire/1"])
+        with self.assertRaisesRegex(ValueError, "both providers"):
+            policy.lifecycle_configuration("/private/journal.json", graph, {check.OWNER: []})
 
 
 if __name__ == "__main__":
