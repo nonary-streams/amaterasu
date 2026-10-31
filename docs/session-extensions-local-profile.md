@@ -99,3 +99,30 @@ settings snapshots for sessions; saved-settings propagation and host startup
 with the final integrated binaries still need end-to-end qualification. Run the
 signed integration fixture and validate the relevant operating-system and hardware scenario before relying
 on those behaviors.
+
+## Planned split-provider upgrade
+
+The planned composition separates `nonary.virtual-screen/2`, which owns virtual
+screen resources and native leases, from `nonary.display-settings/2`, which
+applies display policy. The existing profile and commands above still select the
+combined v1 provider; they do not install or migrate this split composition. The
+native `amaterasu.virtual-display/1` service remains a separate lower-level
+interface. V1 method schemas remain unchanged; a v2 provider requires its own
+approved methods and schemas.
+
+The intended upgrade starts with a fresh isolated profile. Preserve the old
+registry document or an export of it, and retire any old virtual resources
+through their original owner before moving to the new composition. Native
+ownership, lifecycle journals, and outstanding cleanup obligations cannot be
+transferred by copying settings or a resource identifier. Existing combined
+state or owned resources must block the new composition until resolved; an
+unknown or failed cleanup is not proof of retirement.
+
+Settings transfer requires an explicit, non-mutating export and mapping:
+display configuration belongs to display-settings, while retention and lifecycle
+policy belongs to virtual-screen. Validate both resulting documents before
+enabling effects, preserving scopes and unrelated existing global settings.
+The current preparer configures no registry migration plans and supplies no
+cross-provider export or import command. The exact mapping, migration tooling,
+and fail-closed upgrade checks require implementation and validation before this
+is an executable upgrade procedure.

@@ -53,6 +53,31 @@ rights until the callback settles, including across asynchronous status polling.
 Native capture evidence is provider-specific; the coordinator preserves it and
 checks the common negotiated mode and exact binding identity.
 
+### Planned dependent-provider composition
+
+The planned split uses separately approved `nonary.virtual-screen/2` and
+`nonary.display-settings/2` services. The former owns the producer and its native
+leases; the latter consumes its selected output and applies display policy. The
+existing v1 provider contracts remain unchanged. This is a design target, not a
+claim that the current single-provider profile implements the split.
+
+The coordinator must validate the installed dependency graph, schemas, and
+method approvals before effects. It must persist the producer's selected output
+and cleanup obligations before admitting dependent operations, and bind those
+operations to the exact target, resource incarnation, and generation. A resource
+identifier or handoff payload does not grant authority to use a native lease:
+the owner performs authorized effects under coordinator-issued rights. Capture
+is published only after the dependent result and producer are validated and the
+consumer acknowledges the exact binding.
+
+Release and rollback proceed in reverse dependency order. Independent cleanup
+continues after a failure, but an unresolved dependent effect or cleanup must
+fence release of its prerequisite. Recovery queries recorded operations rather
+than replaying unknown effects. The selected graph, settings snapshots, and
+inputs must remain stable for recovery; there is no silent provider substitution
+after effects. These requirements need integrated tests and separate live
+platform and hardware qualification.
+
 The first consumer adapter accepts Linux KDE/Wayland SDR bindings through
 `amaterasu.capture-pipewire/1` and `amaterasu.kwin-wl-output/1`, with PipeWire
 explicitly selected. Windows, HDR, and other capture adapters still require
