@@ -88,6 +88,7 @@ impl Coordinator {
             providers.reverse();
         }
         Ok(Work {
+            composition_progress: None,
             phase,
             target,
             intent: payload

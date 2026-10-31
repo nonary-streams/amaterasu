@@ -4,6 +4,9 @@ mod action_target;
 mod application;
 #[allow(dead_code)] // Admission and control remain disabled until schema verification is wired.
 mod composition;
+mod composition_progress;
+#[allow(dead_code)] // Control dispatch remains gated until coordinator sequencing is wired.
+mod control_dispatch;
 mod operations;
 mod provider_observations;
 mod providers;
@@ -58,6 +61,9 @@ struct ProviderGraph {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Work {
+    /// Inert until composition sequencing and owner verification are installed.
+    #[serde(default)]
+    composition_progress: Option<composition_progress::CompositionProgress>,
     phase: LifecyclePhase,
     target: LifecycleTarget,
     intent: Option<StreamIntent>,

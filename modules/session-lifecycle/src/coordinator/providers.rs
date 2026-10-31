@@ -325,7 +325,7 @@ impl Coordinator {
         &mut self,
         send: &mut dyn FnMut(Command) -> ModuleResult<Response>,
     ) -> ModuleResult<()> {
-        let methods: Vec<_> = self
+        let mut methods: Vec<_> = self
             .settings
             .participants
             .iter()
@@ -341,6 +341,46 @@ impl Coordinator {
                 methods.into_iter().map(move |m| (p.clone(), m))
             })
             .collect();
+        // Control and finalization each have separately installed effect and
+        // status methods. Never infer status authority from lifecycle callbacks.
+        let mut add_policy_method =
+            |owner: &str, method: &amaterasu_extension_api::MethodRef| -> ModuleResult<()> {
+                let participant = self
+                    .settings
+                    .participants
+                    .iter()
+                    .find(|p| p.provider == owner)
+                    .ok_or("policy_owner_unavailable")?;
+                let selected = crate::adapter::MethodSettings {
+                    service: method.service.clone(),
+                    method: method.method.clone(),
+                    interface_major: method.interface_major,
+                    interface_minor: method.interface_minor,
+                    schema_revision: method.schema_revision,
+                };
+                if let Some((_, old)) = methods.iter().find(|(p, old)| {
+                    p.provider == owner
+                        && old.service == selected.service
+                        && old.method == selected.method
+                        && old.interface_major == selected.interface_major
+                        && old.interface_minor == selected.interface_minor
+                }) {
+                    if old != &selected {
+                        return Err("policy_method_revision_conflict".into());
+                    }
+                } else {
+                    methods.push((participant.clone(), selected));
+                }
+                Ok(())
+            };
+        for policy in &self.settings.control_policies {
+            add_policy_method(&policy.owner_provider, &policy.owner_method)?;
+            add_policy_method(&policy.owner_provider, &policy.status_method)?;
+        }
+        for policy in &self.settings.finalize_policies {
+            add_policy_method(&policy.owner_provider, &policy.method)?;
+            add_policy_method(&policy.owner_provider, &policy.status_method)?;
+        }
         if self.approval_cursor >= methods.len() {
             return Ok(());
         }
@@ -353,6 +393,10 @@ impl Coordinator {
         })?;
         if let Response::Result { payload } = response {
             if payload["provider"].as_str() != Some(participant.provider.as_str())
+                || payload["method"]["service"].as_str() != Some(method.service.as_str())
+                || payload["method"]["method"].as_str() != Some(method.method.as_str())
+                || payload["method"]["interface_major"].as_u64()
+                    != Some(u64::from(method.interface_major))
                 || payload["method"]["interface_minor"].as_u64()
                     != Some(u64::from(method.interface_minor))
             {
@@ -1248,6 +1292,7 @@ impl Coordinator {
             } else {
                 let receipt = next.receipts.get_mut(key).unwrap();
                 receipt.work = Some(Work {
+                    composition_progress: None,
                     phase,
                     target: work.target.clone(),
                     intent: None,
@@ -1502,6 +1547,7 @@ mod dependency_cleanup_tests {
 
     fn work() -> Work {
         Work {
+            composition_progress: None,
             phase: LifecyclePhase::SessionRelease,
             target: LifecycleTarget::Session {
                 host_epoch: "epoch".into(),
