@@ -69,6 +69,9 @@ pub trait SessionAuthority {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PendingEffect {
+    /// Authenticated broker caller principal; together with operation_id this
+    /// identifies the broker operation and the authority used for reconciliation.
+    pub caller: String,
     pub operation_id: String,
     pub context: SessionContext,
     pub message_type: u16,
@@ -83,12 +86,42 @@ pub struct PendingEffect {
     pub parent: Option<u64>,
 }
 
-/// The host must atomically record a new effect or recognize an identical retry.
-/// Failure, capacity exhaustion, conflicting reuse, or unavailable durable state
-/// must return an error. This interface deliberately has no automatic deletion;
-/// the owning coordinator settles obligations only after confirmed cleanup.
+/// Result of an atomic, durable reservation. Existing and uncertain operations
+/// require reconciliation; neither authorizes a new provider call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reservation {
+    New,
+    Existing,
+    Uncertain,
+}
+
+/// The host must atomically reserve the (caller, operation_id) pair, preserving
+/// the complete effect until confirmed cleanup. An identical record is Existing;
+/// conflicting reuse, capacity exhaustion and unavailable durable state fail
+/// closed. If the store cannot determine whether an admission occurred, return
+/// Uncertain. A crash after New also requires reconciliation, even if no broker
+/// call was made. Retain the reservation or a tombstone until the host prevents
+/// all further use of that operation identity. If bounded storage is full, reject
+/// new work; do not evict identities that may be retried. Reconciliation must
+/// use current host authority; a retained parent ID is not authority after restart.
+/// Do not treat broker retry retention as durable deduplication.
 pub trait ObligationStore {
-    fn reserve(&mut self, effect: &PendingEffect) -> Result<(), &'static str>;
+    fn reserve(&mut self, effect: &PendingEffect) -> Result<Reservation, &'static str>;
+}
+
+/// A trusted composition binding the actual authenticated broker endpoint and
+/// its principal. Never construct from client input: `send` must always use the
+/// endpoint belonging to `caller`, including after a runtime restart. The host
+/// must retain or re-establish that authority for reconciliation.
+pub struct BrokerEndpoint<'a, F> {
+    caller: &'a str,
+    send: F,
+}
+
+impl<'a, F> BrokerEndpoint<'a, F> {
+    pub fn new(caller: &'a str, send: F) -> Self {
+        Self { caller, send }
+    }
 }
 
 /// Authenticated ingress values supplied by the trusted owning coordinator.
@@ -149,15 +182,16 @@ impl ProtocolRouter {
     }
 
     /// Route an authenticated inner control message using the existing broker.
-    /// `send` must use the caller endpoint that was installed in the approval.
+    /// The endpoint must be the trusted caller endpoint installed in the approval.
     /// Even a transport error after reservation leaves the effect in `store`.
     pub fn dispatch<A: SessionAuthority, S: ObligationStore>(
         &self,
         authority: &A,
         store: &mut S,
         request: DispatchRequest<'_>,
-        mut send: impl FnMut(Command) -> Result<Response, String>,
+        endpoint: BrokerEndpoint<'_, impl FnMut(Command) -> Result<Response, String>>,
     ) -> Result<Response, String> {
+        let BrokerEndpoint { caller, mut send } = endpoint;
         let DispatchRequest {
             context,
             message_type,
@@ -171,7 +205,10 @@ impl ProtocolRouter {
             .iter()
             .find(|route| route.message_type == message_type)
             .ok_or("unregistered_route")?;
-        if !valid_context(context)
+        if !amaterasu_contracts::valid_name(caller)
+            || !route.approval.callers.contains(caller)
+            || !route.cleanup_approval.callers.contains(caller)
+            || !valid_context(context)
             || !amaterasu_contracts::valid_name(operation_id)
             || !(1..=30_000).contains(&timeout_ms)
             || payload.len() > route.max_payload_bytes
@@ -205,6 +242,7 @@ impl ProtocolRouter {
             }
         }
         let effect = PendingEffect {
+            caller: caller.into(),
             operation_id: operation_id.into(),
             context: context.clone(),
             message_type,
@@ -216,7 +254,12 @@ impl ProtocolRouter {
             timeout_ms,
             parent,
         };
-        store.reserve(&effect).map_err(str::to_owned)?;
+        match store.reserve(&effect).map_err(str::to_owned)? {
+            Reservation::New => {}
+            Reservation::Existing | Reservation::Uncertain => {
+                return Err("operation_requires_reconciliation".into());
+            }
+        }
         send(Command::CallApi {
             service: method.service.clone(),
             method: method.method.clone(),

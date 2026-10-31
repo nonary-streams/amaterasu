@@ -7,8 +7,8 @@ use amaterasu_contracts::{
 use amaterasu_module_sdk::{
     extension_api::{LifecycleTarget, MethodRef},
     protocol::{
-        DispatchRequest, ObligationStore, PendingEffect, ProtocolRouter, Route, SessionAuthority,
-        SessionContext, validate_response,
+        BrokerEndpoint, DispatchRequest, ObligationStore, PendingEffect, ProtocolRouter,
+        Reservation, Route, SessionAuthority, SessionContext, validate_response,
     },
 };
 use amaterasu_runtime::Broker;
@@ -108,16 +108,17 @@ impl SessionAuthority for Authority {
     }
 }
 #[derive(Default)]
-struct Ledger(BTreeMap<String, PendingEffect>);
+struct Ledger(BTreeMap<(String, String), PendingEffect>);
 impl ObligationStore for Ledger {
-    fn reserve(&mut self, effect: &PendingEffect) -> Result<(), &'static str> {
-        match self.0.get(&effect.operation_id) {
-            Some(existing) if existing == effect => Ok(()),
+    fn reserve(&mut self, effect: &PendingEffect) -> Result<Reservation, &'static str> {
+        let key = (effect.caller.clone(), effect.operation_id.clone());
+        match self.0.get(&key) {
+            Some(existing) if existing == effect => Ok(Reservation::Existing),
             Some(_) => Err("conflict"),
             None if self.0.len() >= 4 => Err("capacity"),
             None => {
-                self.0.insert(effect.operation_id.clone(), effect.clone());
-                Ok(())
+                self.0.insert(key, effect.clone());
+                Ok(Reservation::New)
             }
         }
     }
@@ -132,6 +133,14 @@ fn setup(routes: &[Route]) -> Broker {
         },
     );
     for route in routes {
+        for caller in &route.approval.callers {
+            config
+                .principals
+                .entry(caller.clone())
+                .or_default()
+                .call
+                .insert(route.method.service.clone());
+        }
         config.principals.insert(
             route.approval.provider.clone(),
             Grants {
@@ -174,6 +183,22 @@ fn consume(
     body: &[u8],
     operation: &str,
 ) -> Result<Response, String> {
+    consume_as(
+        CLIENT, router, authority, ledger, broker, ctx, body, operation,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consume_as(
+    caller: &str,
+    router: &ProtocolRouter,
+    authority: &Authority,
+    ledger: &mut Ledger,
+    broker: &mut Broker,
+    ctx: &SessionContext,
+    body: &[u8],
+    operation: &str,
+) -> Result<Response, String> {
     router.dispatch(
         authority,
         ledger,
@@ -185,7 +210,7 @@ fn consume(
             timeout_ms: 1000,
             parent: None,
         },
-        |cmd| Ok(broker.dispatch(CLIENT, cmd)),
+        BrokerEndpoint::new(caller, |cmd| Ok(broker.dispatch(caller, cmd))),
     )
 }
 fn reply(broker: &mut Broker, provider: &str, label: &str) -> u64 {
@@ -233,8 +258,14 @@ fn unchanged_consumer_routes_to_two_registered_providers_and_retains_obligations
         assert!(
             matches!(broker.dispatch(CLIENT, Command::TakeResult { request:id }), Response::Result { payload } if payload["provider"] == label)
         );
-        assert_eq!(ledger.0[label].provider, selection.approval.provider);
-        assert_eq!(ledger.0[label].cleanup, selection.cleanup);
+        assert_eq!(
+            ledger.0[&(CLIENT.into(), label.into())].provider,
+            selection.approval.provider
+        );
+        assert_eq!(
+            ledger.0[&(CLIENT.into(), label.into())].cleanup,
+            selection.cleanup
+        );
     }
 }
 #[test]
@@ -352,7 +383,7 @@ fn uncertain_broker_result_never_discards_reserved_effect() {
                 timeout_ms: 1000,
                 parent: None,
             },
-            |cmd| {
+            BrokerEndpoint::new(CLIENT, |cmd| {
                 calls += 1;
                 if calls == 3 {
                     let _ = broker.dispatch(CLIENT, cmd);
@@ -360,15 +391,33 @@ fn uncertain_broker_result_never_discards_reserved_effect() {
                 } else {
                     Ok(broker.dispatch(CLIENT, cmd))
                 }
-            },
+            }),
         )
         .unwrap_err();
     assert_eq!(error, "lost reply");
-    assert!(ledger.0.contains_key("lost"));
+    assert!(ledger.0.contains_key(&(CLIENT.into(), "lost".into())));
     assert!(matches!(
         broker.dispatch("example.provider_a", Command::Poll {}),
         Response::Request { .. }
     ));
+    assert_eq!(
+        consume(
+            &router,
+            &auth,
+            &mut ledger,
+            &mut broker,
+            &context("verified"),
+            b"hello",
+            "lost"
+        )
+        .unwrap_err(),
+        "operation_requires_reconciliation"
+    );
+    assert!(matches!(
+        broker.dispatch("example.provider_a", Command::Poll {}),
+        Response::Pending
+    ));
+    assert_eq!(ledger.0.len(), 1);
 }
 
 #[test]
@@ -520,7 +569,7 @@ fn unchanged_router_consumer_uses_two_independent_module_artifacts() {
                     timeout_ms: 1000,
                     parent: None,
                 },
-                |cmd| client.send(cmd),
+                BrokerEndpoint::new(CLIENT, |cmd| client.send(cmd)),
             )
             .unwrap();
         let Response::Accepted { id } = response else {
@@ -530,7 +579,10 @@ fn unchanged_router_consumer_uses_two_independent_module_artifacts() {
         assert!(
             matches!(client.send(Command::TakeResult { request:id }).unwrap(), Response::Result { payload } if payload["provider"] == label)
         );
-        assert_eq!(ledger.0["artifact"].provider, provider);
+        assert_eq!(
+            ledger.0[&(CLIENT.into(), "artifact".into())].provider,
+            provider
+        );
         drop(module);
         drop(runtime);
     }
@@ -581,14 +633,14 @@ fn missing_cleanup_approval_never_admits_or_reserves() {
                 timeout_ms: 1000,
                 parent: None,
             },
-            |cmd| {
+            BrokerEndpoint::new(CLIENT, |cmd| {
                 calls += 1;
                 if calls == 2 {
                     Ok(Response::error("not_found", "cleanup missing"))
                 } else {
                     Ok(broker.dispatch(CLIENT, cmd))
                 }
-            },
+            }),
         )
         .unwrap_err();
     assert_eq!(error, "approval_unavailable");
@@ -627,7 +679,7 @@ fn default_authority_and_unregistered_routes_deny_before_provider_calls() {
                     timeout_ms: 1000,
                     parent: None,
                 },
-                &mut send
+                BrokerEndpoint::new(CLIENT, &mut send)
             )
             .unwrap_err(),
         "unauthorized"
@@ -645,11 +697,142 @@ fn default_authority_and_unregistered_routes_deny_before_provider_calls() {
                     timeout_ms: 1000,
                     parent: None,
                 },
-                &mut send
+                BrokerEndpoint::new(CLIENT, &mut send)
             )
             .unwrap_err(),
         "unregistered_route"
     );
     assert_eq!(calls, 0);
     assert!(ledger.0.is_empty());
+}
+
+#[test]
+fn identical_operations_from_distinct_approved_callers_keep_distinct_obligations() {
+    let other = "example.consumer_two";
+    let mut selection = route("example.provider_a", "example.a/1");
+    selection.approval.callers.insert(other.into());
+    selection.cleanup_approval.callers.insert(other.into());
+    let mut broker = setup(std::slice::from_ref(&selection));
+    let router = ProtocolRouter::new(vec![selection]).unwrap();
+    let mut ledger = Ledger::default();
+    let auth = Authority {
+        negotiated: true,
+        permitted: true,
+    };
+    let mut request_ids = Vec::new();
+    for caller in [CLIENT, other] {
+        let response = consume_as(
+            caller,
+            &router,
+            &auth,
+            &mut ledger,
+            &mut broker,
+            &context("verified"),
+            b"hello",
+            "same",
+        )
+        .unwrap();
+        let Response::Accepted { id } = response else {
+            panic!("not admitted")
+        };
+        request_ids.push(id);
+    }
+    assert_ne!(request_ids[0], request_ids[1]);
+    assert_eq!(ledger.0.len(), 2);
+    for caller in [CLIENT, other] {
+        assert_eq!(ledger.0[&(caller.into(), "same".into())].caller, caller);
+        assert!(matches!(
+            broker.dispatch("example.provider_a", Command::Poll {}),
+            Response::Request { .. }
+        ));
+    }
+}
+
+#[test]
+fn retained_obligation_blocks_retry_after_broker_record_eviction_and_restart() {
+    let selection = route("example.provider_a", "example.a/1");
+    let mut broker = setup(std::slice::from_ref(&selection));
+    let router = ProtocolRouter::new(vec![selection.clone()]).unwrap();
+    let mut ledger = Ledger::default();
+    let auth = Authority {
+        negotiated: true,
+        permitted: true,
+    };
+    let Response::Accepted { id } = consume(
+        &router,
+        &auth,
+        &mut ledger,
+        &mut broker,
+        &context("verified"),
+        b"hello",
+        "retry",
+    )
+    .unwrap() else {
+        panic!("not admitted")
+    };
+    assert_eq!(reply(&mut broker, "example.provider_a", "a"), id);
+    // Release removes the record, simulating the same absence as retention expiry
+    // without a five-minute sleep or changing the runtime's test clock.
+    assert!(matches!(
+        broker.dispatch(CLIENT, Command::ReleaseResult { request: id }),
+        Response::Ok
+    ));
+    for after_restart in [false, true] {
+        if after_restart {
+            broker = setup(std::slice::from_ref(&selection));
+        }
+        assert_eq!(
+            consume(
+                &router,
+                &auth,
+                &mut ledger,
+                &mut broker,
+                &context("verified"),
+                b"hello",
+                "retry"
+            )
+            .unwrap_err(),
+            "operation_requires_reconciliation"
+        );
+        assert!(matches!(
+            broker.dispatch("example.provider_a", Command::Poll {}),
+            Response::Pending
+        ));
+        assert_eq!(ledger.0.len(), 1);
+    }
+}
+
+#[test]
+fn uncertain_reservation_never_admits_provider_call() {
+    struct UncertainStore;
+    impl ObligationStore for UncertainStore {
+        fn reserve(&mut self, _: &PendingEffect) -> Result<Reservation, &'static str> {
+            Ok(Reservation::Uncertain)
+        }
+    }
+    let selection = route("example.provider_a", "example.a/1");
+    let mut broker = setup(std::slice::from_ref(&selection));
+    let router = ProtocolRouter::new(vec![selection]).unwrap();
+    let auth = Authority {
+        negotiated: true,
+        permitted: true,
+    };
+    let result = router.dispatch(
+        &auth,
+        &mut UncertainStore,
+        DispatchRequest {
+            context: &context("verified"),
+            message_type: KIND,
+            payload: b"hello",
+            operation_id: "uncertain",
+            timeout_ms: 1000,
+            parent: None,
+        },
+        BrokerEndpoint::new(CLIENT, |cmd| Ok(broker.dispatch(CLIENT, cmd))),
+    );
+    assert_eq!(result.unwrap_err(), "operation_requires_reconciliation");
+    assert!(matches!(
+        broker.dispatch("example.provider_a", Command::Poll {}),
+        Response::Pending
+    ));
 }
