@@ -77,3 +77,56 @@ test("keybinding rejects chords mixing provider encodings", () => {
   const editor = extensionKeybindingEditor({ id: "x", enabled: true, source: "session_input", context: "stream", target: "current_session", propagation: "forward", action_id: "example/action", arguments: {}, trigger: { platform: "windows_scan", code: 30, extended: false }, modifiers: [{ platform: "linux_evdev", code: 29 }] });
   assert.throws(() => editor.value(), /same key encoding/);
 });
+
+test("optional keybinding remains unset until a user explicitly creates it", () => {
+  const { optionalExtensionKeybindingEditor } = editorEnvironment();
+  const editor = optionalExtensionKeybindingEditor(null);
+  assert.equal(editor.value(), null);
+  assert.equal(editor.node.children[2].hidden, false);
+  editor.node.children[2].click();
+  assert.throws(() => editor.value(), /Complete the binding/);
+  editor.node.children[3].click();
+  assert.equal(editor.value(), null);
+});
+
+test("an existing optional binding can be explicitly removed without inventing a shortcut", () => {
+  const { optionalExtensionKeybindingEditor } = editorEnvironment();
+  const binding = { id: "remove", enabled: true, source: "session_input", context: "active", target: "current_stream", propagation: "consume_trigger", action_id: "example/remove", arguments: {}, trigger: { platform: "linux_evdev", code: 30 }, modifiers: [] };
+  const editor = optionalExtensionKeybindingEditor(binding);
+  assert.deepEqual(normalized(editor.value()), binding);
+  editor.node.children[3].click();
+  assert.equal(editor.value(), null);
+});
+
+test("nullable schema preserves null and uses its template only after explicit selection", () => {
+  const create = editorEnvironment().extensionFieldEditor;
+  const editor = create({ type: "nullable", default: null, inner: { type: "string", default: "example" } }, null);
+  assert.equal(editor.value(), null);
+  editor.node.children[2].click();
+  assert.equal(editor.value(), "example");
+  editor.node.children[3].click();
+  assert.equal(editor.value(), null);
+  assert.throws(() => create({ type: "nullable", default: null }, null), /Invalid nullable setting/);
+});
+
+test("creating a shortcut requires an explicit trigger and action", () => {
+  const { optionalExtensionKeybindingEditor } = editorEnvironment();
+  const editor = optionalExtensionKeybindingEditor(null);
+  editor.node.children[2].click();
+  const fields = editor.node.children[1].children[0].children;
+  fields[0].children[1].value = "my-binding";
+  fields[2].children[1].value = "active";
+  fields[3].children[1].value = "session_input";
+  fields[4].children[1].value = "current_stream";
+  fields[5].children[1].value = "consume_trigger";
+  fields[6].children[1].value = "example/remove";
+  assert.throws(() => editor.value(), /valid number|key code/);
+  const trigger = fields[8];
+  trigger.children[1].children[1].value = "linux_evdev";
+  trigger.children[2].children[1].value = "30";
+  assert.deepEqual(normalized(editor.value()), {
+    id: "my-binding", enabled: false, source: "session_input", context: "active", target: "current_stream",
+    propagation: "consume_trigger", action_id: "example/remove", arguments: {},
+    trigger: { platform: "linux_evdev", code: 30 }, modifiers: [],
+  });
+});

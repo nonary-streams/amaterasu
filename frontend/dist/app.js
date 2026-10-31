@@ -15820,6 +15820,26 @@ var Amaterasu;
 (function (Amaterasu) {
     function extensionFieldEditor(definition, value) {
         switch (definition.type) {
+            case "nullable": {
+                if (!definition.inner)
+                    throw new Error("Invalid nullable setting.");
+                const inner = definition.inner;
+                const group = Amaterasu.el("div", "extension-nullable");
+                const area = Amaterasu.el("div");
+                const status = Amaterasu.el("p", "muted");
+                let editor = value === null ? null : extensionFieldEditor(inner, value);
+                const add = Amaterasu.button("Set value", () => { editor = extensionFieldEditor(inner, structuredClone(inner.default)); render(); });
+                const remove = Amaterasu.button("Clear value", () => { editor = null; render(); });
+                function render() {
+                    status.textContent = editor ? "Value set." : "No value set.";
+                    add.hidden = editor !== null;
+                    remove.hidden = editor === null;
+                    area.replaceChildren(...(editor ? [editor.node] : []));
+                }
+                group.append(status, area, add, remove);
+                render();
+                return { node: group, value: () => editor ? editor.value() : null };
+            }
             case "boolean": {
                 const control = Amaterasu.input("", "", "checkbox");
                 control.checked = value === true;
@@ -15934,6 +15954,11 @@ var Amaterasu;
     function bindingChoice(label, value, choices) {
         const select = Amaterasu.el("select");
         select.setAttribute("aria-label", label);
+        if (!value) {
+            const placeholder = Amaterasu.el("option", "", `Choose ${label.toLowerCase()}`);
+            placeholder.value = "";
+            select.append(placeholder);
+        }
         for (const [id, name] of choices) {
             const option = Amaterasu.el("option", "", name);
             option.value = id;
@@ -15943,14 +15968,14 @@ var Amaterasu;
         return select;
     }
     function bindingKeyEditor(key, label) {
-        if (!key || !["linux_evdev", "windows_scan", "moonlight_vk"].includes(key.platform))
+        if (!key || !["", "linux_evdev", "windows_scan", "moonlight_vk"].includes(key.platform))
             throw new Error("Unsupported key identity.");
         const group = Amaterasu.el("fieldset", "extension-key", Amaterasu.el("legend", "", label));
         const platform = bindingChoice("Key encoding", key.platform, [
             ["linux_evdev", "Linux evdev (physical)"], ["windows_scan", "Windows scan code (physical)"],
             ["moonlight_vk", "Moonlight virtual key"],
         ]);
-        const code = Amaterasu.input("", String(key.code), "number");
+        const code = Amaterasu.input("", key.code === null ? "" : String(key.code), "number");
         code.min = "1";
         code.max = "65535";
         code.step = "1";
@@ -15958,7 +15983,7 @@ var Amaterasu;
         flag.checked = key.platform === "windows_scan" ? key.extended === true : key.normalized === true;
         const flagLabel = Amaterasu.el("label", "", flag, Amaterasu.el("span"));
         const updateFlag = () => {
-            flagLabel.hidden = platform.value === "linux_evdev";
+            flagLabel.hidden = !platform.value || platform.value === "linux_evdev";
             flagLabel.lastElementChild.textContent = platform.value === "windows_scan" ? " Extended scan code" : " Normalized Moonlight key";
             code.max = platform.value === "moonlight_vk" ? "255" : "65535";
         };
@@ -15990,7 +16015,7 @@ var Amaterasu;
         const enabled = Amaterasu.input("", "", "checkbox");
         enabled.checked = binding.enabled;
         const source = bindingChoice("Source", binding.source, [["session_input", "Session input"], ["host_local", "Host local"]]);
-        const target = bindingChoice("Target", binding.target, [["current_session", "Current session"], ["host", "Host"]]);
+        const target = bindingChoice("Target", binding.target, [["current_stream", "Current stream"], ["current_session", "Current session"], ["host", "Host"]]);
         const propagation = bindingChoice("Propagation", binding.propagation, [["forward", "Forward trigger"], ["consume_trigger", "Consume trigger"]]);
         const action = Amaterasu.input("", binding.action_id);
         const args = Amaterasu.el("textarea");
@@ -16019,6 +16044,8 @@ var Amaterasu;
                     : { platform: "linux_evdev", code: 29 });
         }));
         return { node: group, value: () => {
+                if (!id.value.trim() || !context.value.trim() || !action.value.trim() || !source.value || !target.value || !propagation.value)
+                    throw new Error("Complete the binding ID, context, source, target, propagation and action.");
                 let parsed;
                 try {
                     parsed = JSON.parse(args.value);
@@ -16041,6 +16068,31 @@ var Amaterasu;
             } };
     }
     Amaterasu.extensionKeybindingEditor = extensionKeybindingEditor;
+    function optionalExtensionKeybindingEditor(value) {
+        if (value !== null && (!value || typeof value !== "object" || Array.isArray(value)))
+            throw new Error("Invalid optional keybinding.");
+        const group = Amaterasu.el("div", "extension-optional-keybinding");
+        const area = Amaterasu.el("div");
+        const status = Amaterasu.el("p", "muted");
+        let editor = null;
+        const add = Amaterasu.button("Add shortcut", () => {
+            editor = extensionKeybindingEditor({ id: "", enabled: false, source: "", context: "", target: "", propagation: "", action_id: "", arguments: {}, trigger: { platform: "", code: null }, modifiers: [] });
+            render();
+        });
+        const remove = Amaterasu.button("Remove shortcut", () => { editor = null; render(); });
+        function render() {
+            status.textContent = editor ? "Configure the shortcut before saving." : "No shortcut configured.";
+            add.hidden = editor !== null;
+            remove.hidden = editor === null;
+            area.replaceChildren(...(editor ? [editor.node] : []));
+        }
+        if (value !== null)
+            editor = extensionKeybindingEditor(value);
+        group.append(status, area, add, remove);
+        render();
+        return { node: group, value: () => editor ? editor.value() : null };
+    }
+    Amaterasu.optionalExtensionKeybindingEditor = optionalExtensionKeybindingEditor;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
@@ -16190,7 +16242,9 @@ var Amaterasu;
                         if (option.presentation != null && option.presentation !== "keybinding")
                             throw new Error("Unsupported extension setting presentation.");
                         const editor = option.presentation === "keybinding"
-                            ? Amaterasu.extensionKeybindingEditor(editorValue)
+                            ? option.definition.type === "nullable" && option.definition.inner
+                                ? Amaterasu.optionalExtensionKeybindingEditor(editorValue)
+                                : Amaterasu.extensionKeybindingEditor(editorValue)
                             : Amaterasu.extensionFieldEditor(option.definition, editorValue);
                         const inherit = Amaterasu.input("", "", "checkbox");
                         inherit.checked = !isOverride;
