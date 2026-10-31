@@ -255,6 +255,16 @@ pub struct ProviderStatusRequest {
     pub receipt_id: String,
 }
 
+/// Status query for a resource control operation. The reply is a
+/// [`ResourceControlResponse`]; an unknown receipt is `Rejected` with reason
+/// `unknown_receipt`.
+pub type ResourceControlStatusRequest = ProviderStatusRequest;
+
+/// Status query for resource finalization. The reply is a
+/// [`ResourceControlResponse`]; an unknown receipt is `Rejected` with reason
+/// `unknown_receipt`.
+pub type ResourceFinalizeStatusRequest = ProviderStatusRequest;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CleanupState {
@@ -1198,6 +1208,21 @@ fn validate_method(method: &MethodRef) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn control_and_finalize_status_share_the_existing_wire_contract() {
+        let wire = json!({"provider_sequence":7,"operation_id":"operation","transition_id":"transition","receipt_id":"receipt"});
+        let control: ResourceControlStatusRequest = serde_json::from_value(wire.clone()).unwrap();
+        let finalize: ResourceFinalizeStatusRequest = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(control, finalize);
+        assert_eq!(serde_json::to_value(control).unwrap(), wire);
+        let unknown: ResourceControlResponse =
+            serde_json::from_value(json!({"status":"rejected","reason":"unknown_receipt"}))
+                .unwrap();
+        assert!(
+            matches!(unknown, ResourceControlResponse::Rejected { reason } if reason == "unknown_receipt")
+        );
+    }
 
     #[test]
     fn v1_omits_composition_fields_and_v2_binds_selected_input() {
