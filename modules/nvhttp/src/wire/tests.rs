@@ -840,6 +840,8 @@ fn peer(
         secure,
         peer_certificate,
         peer_trusted,
+        list_allowed: peer_trusted,
+        launch_allowed: peer_trusted,
     }
 }
 
@@ -1215,6 +1217,45 @@ fn unpairing_a_client_cancels_its_active_launch_through_the_revoke_path() {
 }
 
 #[test]
+fn launch_permission_loss_stops_owned_session_while_certificate_remains_paired() {
+    let mut router = streaming_router();
+    let mut broker = Broker::default();
+    let now = Instant::now();
+    assert!(
+        router
+            .dispatch_with(
+                19,
+                request(LAUNCH_TARGET),
+                trusted_tls(&[1, 2, 3]),
+                now,
+                &mut |command| broker.send(command)
+            )
+            .is_none()
+    );
+    let (_, launched) = poll_until_reply(&mut router, &mut broker, now);
+    assert_eq!(launched.status, 200);
+    router.reply_delivered(19);
+    let certificate = [1, 2, 3];
+    let paired = |peer: &[u8]| peer == certificate;
+    assert!(paired(&certificate));
+    router.revoke_untrusted(|peer| paired(peer) && peer != certificate);
+    for _ in 0..64 {
+        poll(&mut router, &mut broker, now);
+        if !router.launches.busy() {
+            break;
+        }
+    }
+    assert!(!router.launches.busy());
+    assert!(paired(&certificate));
+    assert!(
+        broker
+            .accepted
+            .iter()
+            .any(|payload| payload["action"] == "stop")
+    );
+}
+
+#[test]
 fn untrusted_tls_serverinfo_is_an_http_success_carrying_xml_401() {
     let mut router = router();
     let mut broker = Broker::default();
@@ -1233,5 +1274,23 @@ fn untrusted_tls_serverinfo_is_an_http_success_carrying_xml_401() {
     let body = String::from_utf8(reply.body).unwrap();
     assert!(body.contains("status_code=\"401\""), "{body}");
     assert!(!body.contains("PairStatus"));
+    assert!(broker.accepted.is_empty());
+}
+
+#[test]
+fn denied_launch_permission_blocks_known_ids_and_resume_before_work() {
+    let mut router = streaming_router();
+    let mut broker = Broker::default();
+    let now = Instant::now();
+    for target in ["/launch?appid=7", "/resume?appid=7"] {
+        let mut context = trusted_tls(&[1, 2, 3]);
+        context.launch_allowed = false;
+        let reply = router
+            .dispatch_with(1, request(target), context, now, &mut |command| {
+                broker.send(command)
+            })
+            .unwrap();
+        assert_eq!(reply.status, 403);
+    }
     assert!(broker.accepted.is_empty());
 }

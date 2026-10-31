@@ -481,6 +481,8 @@ fn pairing_action(action: &str) -> Option<&'static str> {
         "approve_pin" => Some("approve_pin"),
         "unpair" => Some("unpair"),
         "update_client_config_overrides" => Some("update_client_config_overrides"),
+        "update_client_permissions" => Some("update_client_permissions"),
+        "set_permission_mode" => Some("set_permission_mode"),
         _ => None,
     }
 }
@@ -2041,6 +2043,38 @@ mod tests {
         assert!(payload(status, br#"{"action":"launch_start"}"#).is_err());
         assert!(resolve("/v1/playnite/launch/start").is_none());
     }
+    #[test]
+    fn pairing_permission_routes_are_admin_scoped_and_strict() {
+        let update = resolve("/v1/pairing/update_client_permissions").unwrap();
+        let mode = resolve("/v1/pairing/set_permission_mode").unwrap();
+        assert_eq!(update.scope, Some("pairing.admin"));
+        assert_eq!(mode.scope, Some("pairing.admin"));
+        let certificate_id = "a".repeat(64);
+        let permissions = serde_json::json!({"list_apps":true,"view_streams":true,"launch_apps":false,"terminate_streams":false});
+        let body = serde_json::json!({"certificate_id":certificate_id,"expected_revision":3,"permissions":permissions});
+        assert_eq!(
+            payload(update, &serde_json::to_vec(&body).unwrap()).unwrap()["action"],
+            "update_client_permissions"
+        );
+        for invalid in [
+            serde_json::json!({"certificate_id":"bad","expected_revision":3,"permissions":permissions}),
+            serde_json::json!({"certificate_id":certificate_id,"expected_revision":3,"permissions":{"list_apps":true}}),
+            serde_json::json!({"certificate_id":certificate_id,"expected_revision":3,"permissions":{"list_apps":true,"view_streams":true,"launch_apps":false,"terminate_streams":false,"admin":true}}),
+            serde_json::json!({"certificate_id":certificate_id,"expected_revision":-1,"permissions":permissions}),
+        ] {
+            assert!(payload(update, &serde_json::to_vec(&invalid).unwrap()).is_err());
+        }
+        assert!(payload(mode, br#"{"enabled":true,"expected_revision":0}"#).is_ok());
+        assert!(payload(mode, br#"{"enabled":1,"expected_revision":0}"#).is_err());
+        assert!(
+            payload(
+                mode,
+                br#"{"enabled":true,"expected_revision":0,"caller":"other"}"#
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn managed_launch_routes_bind_scope_and_exact_identifiers() {
         let status = resolve("/v1/nvhttp/launch_status").unwrap();

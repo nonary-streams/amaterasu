@@ -157,9 +157,15 @@ namespace Amaterasu {
   export function renderHostManagement(context: PageContext): void {
     const pairingArea = el("div");
     const pairedClientsArea = el("div");
+    const permissionsArea = el("div");
     const drafts = context.registerDraftGuard ? trackDrafts(pairedClientsArea) : null;
+    const permissionDrafts = context.registerDraftGuard ? trackDrafts(permissionsArea) : null;
     let clientSaveBusy = false;
-    if (drafts) context.registerDraftGuard?.(() => clientSaveBusy || drafts.isDirty(), drafts.dispose);
+    let permissionSaveBusy = false;
+    if (drafts && permissionDrafts) context.registerDraftGuard?.(
+      () => clientSaveBusy || permissionSaveBusy || drafts.isDirty() || permissionDrafts.isDirty(),
+      () => { drafts.dispose(); permissionDrafts.dispose(); },
+    );
     const loadPairedClients = createPairedClientEditor(context, pairedClientsArea, () => drafts, (busy) => {
       clientSaveBusy = busy;
     });
@@ -190,6 +196,7 @@ namespace Amaterasu {
       ),
       panel("Pending device pairing", pairingArea),
       pairedClientsArea,
+      permissionsArea,
       panel("KDE desktop capture consent", captureArea),
       panel("Host listeners", hostArea),
       panel("Streaming status", runtimeArea),
@@ -385,7 +392,10 @@ namespace Amaterasu {
     }
 
     void loadPairings();
-    if (context.api.allows("pairing.admin")) void loadPairedClients();
+    if (context.api.allows("pairing.admin")) {
+      void loadPairedClients();
+      renderClientPermissions(context, permissionsArea, (busy) => { permissionSaveBusy = busy; });
+    }
     else pairedClientsArea.append(panel("Paired clients", el("p", "muted", "This account does not have permission to manage paired clients.")));
     renderCaptureConsent(context, captureArea);
     void loadHost();

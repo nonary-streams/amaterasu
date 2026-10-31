@@ -29,12 +29,14 @@ fn document() -> Document {
             certificate_pem: HOST_CERT.into(),
             private_key_pem: HOST_KEY.into(),
         }),
+        permission_mode_enabled: false,
         clients: vec![Client {
             certificate_id: peer.fingerprint,
             client_id: "client".into(),
             name: "Client".into(),
             certificate_pem: CLIENT_CERT.into(),
             paired_at: 0,
+            permissions: crate::protocol::ClientPermissions::default(),
             config_overrides: crate::protocol::ClientConfigOverrides::default(),
         }],
     }
@@ -601,4 +603,74 @@ fn concurrent_readers_pin_memory_but_cannot_commit_results_after_invalidation() 
     for worker in workers {
         worker.join().unwrap();
     }
+}
+
+#[test]
+fn permission_api_reads_current_committed_certificate_policy() {
+    let shared = Arc::new(Shared::default());
+    let factory = Factory::new(shared.clone(), ["transport".into()].into());
+    let query = NativeInterfaceQuery {
+        header: AbiHeader::of::<NativeInterfaceQuery>(),
+        interface_major: INTERFACE_MAJOR,
+        min_minor: INTERFACE_MINOR_PERMISSIONS,
+        min_size: size_of::<IdentityApiV1_1>() as u32,
+    };
+    let mut output = std::ptr::null();
+    assert_eq!(
+        unsafe {
+            bind(
+                factory.api.context,
+                BorrowedBytes::new(b"transport"),
+                &query,
+                &mut output,
+            )
+        },
+        STATUS_OK
+    );
+    let api = unsafe { &*output.cast::<IdentityApiV1_1>() };
+    let context = api.v1_0.base.context;
+    let client = crypto_certificate_der(CLIENT_CERT);
+    let check = |permission| unsafe {
+        (api.check_permission)(context, BorrowedBytes::new(&client), permission)
+    };
+    assert_eq!(check(PERMISSION_LAUNCH), IDENTITY_UNAVAILABLE);
+    let mut document = document();
+    document.permission_mode_enabled = true;
+    document.clients[0].permissions = crate::protocol::ClientPermissions::subsequent_client();
+    shared
+        .publish(1, Snapshot::prepare(&document, time()).unwrap())
+        .unwrap();
+    assert_eq!(check(PERMISSION_LIST), STATUS_OK);
+    assert_eq!(check(PERMISSION_VIEW), STATUS_OK);
+    assert_eq!(check(PERMISSION_LAUNCH), IDENTITY_FORBIDDEN);
+    assert_eq!(check(99), STATUS_INVALID_ARGUMENT);
+    assert_eq!(
+        unsafe {
+            (api.check_permission)(
+                context,
+                BorrowedBytes::new(&crypto_certificate_der(HOST_CERT)),
+                PERMISSION_VIEW,
+            )
+        },
+        IDENTITY_UNTRUSTED
+    );
+    document.clients[0].permissions.launch_apps = true;
+    shared
+        .publish(2, Snapshot::prepare(&document, time()).unwrap())
+        .unwrap();
+    assert_eq!(check(PERMISSION_LAUNCH), STATUS_OK);
+    document.clients[0].permissions = crate::protocol::ClientPermissions {
+        list_apps: false,
+        view_streams: false,
+        launch_apps: false,
+        terminate_streams: false,
+    };
+    document.permission_mode_enabled = false;
+    shared
+        .publish(3, Snapshot::prepare(&document, time()).unwrap())
+        .unwrap();
+    assert_eq!(check(PERMISSION_LAUNCH), STATUS_OK);
+    shared.invalidate();
+    assert_eq!(check(PERMISSION_LAUNCH), IDENTITY_UNAVAILABLE);
+    unsafe { (api.v1_0.base.release.unwrap())(context) };
 }

@@ -14760,6 +14760,127 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    const permissionKeys = ["list_apps", "view_streams", "launch_apps", "terminate_streams"];
+    function parseClientPermissionState(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("Invalid client permissions response.");
+        const reply = value;
+        if (reply.ok !== true || !Number.isSafeInteger(reply.revision) || reply.revision < 0 ||
+            typeof reply.permission_mode_enabled !== "boolean" || !Array.isArray(reply.clients))
+            throw new Error("Client permissions are unavailable on this host.");
+        const seen = new Set();
+        const clients = reply.clients.map((item) => {
+            if (!item || typeof item !== "object" || Array.isArray(item))
+                throw new Error("Invalid client permissions response.");
+            const client = item;
+            if (typeof client.certificate_id !== "string" || !/^[0-9a-fA-F]{64}$/.test(client.certificate_id) ||
+                seen.has(client.certificate_id) || typeof client.name !== "string" || !client.permissions ||
+                typeof client.permissions !== "object" || Array.isArray(client.permissions))
+                throw new Error("Invalid client permissions response.");
+            const permissions = client.permissions;
+            if (Object.keys(permissions).length !== permissionKeys.length || permissionKeys.some((key) => typeof permissions[key] !== "boolean"))
+                throw new Error("This host reports permissions that this editor cannot safely preserve.");
+            seen.add(client.certificate_id);
+            return { certificate_id: client.certificate_id, name: client.name, permissions: permissions };
+        });
+        return { revision: reply.revision, permission_mode_enabled: reply.permission_mode_enabled, clients };
+    }
+    Amaterasu.parseClientPermissionState = parseClientPermissionState;
+    function renderClientPermissions(context, area, onSaveBusy = () => { }) {
+        if (!context.api.allows("pairing.admin"))
+            return;
+        let generation = 0;
+        async function load() {
+            const request = ++generation;
+            area.replaceChildren(Amaterasu.el("p", "muted", "Loading client permissions…"));
+            try {
+                const state = parseClientPermissionState(await context.api.post("pairing/list_clients"));
+                if (!context.content.isConnected || request !== generation)
+                    return;
+                const body = Amaterasu.el("div"), status = Amaterasu.el("div");
+                const baseline = new Map();
+                const mode = Amaterasu.input("permission_mode_enabled", "", "checkbox");
+                mode.checked = state.permission_mode_enabled;
+                baseline.set(mode, mode.checked);
+                const saveMode = Amaterasu.button("Save permission mode", () => void save("pairing/set_permission_mode", { enabled: mode.checked }, (saved) => saved.permission_mode_enabled === mode.checked, [mode]));
+                body.append(Amaterasu.field("Enforce client permissions", mode, "When enabled, listing and launching applications are controlled by these grants. Disabled by default."), saveMode);
+                if (state.permission_mode_enabled) {
+                    body.append(Amaterasu.el("p", "muted", "Launch and the stored view grant also allow listing. The view streams permission currently grants listing, not separate stream viewing. Termination is not enforced yet; its stored grant is preserved."));
+                    for (const client of state.clients) {
+                        const checks = {};
+                        const rows = Amaterasu.el("div", "form-grid");
+                        for (const [key, label] of [["list_apps", "List applications"], ["view_streams", "Additional listing grant (view streams permission)"], ["launch_apps", "Launch applications"]]) {
+                            const check = Amaterasu.input(`${key}_${client.certificate_id}`, "", "checkbox");
+                            check.checked = client.permissions[key];
+                            checks[key] = check;
+                            baseline.set(check, check.checked);
+                            rows.append(Amaterasu.field(label, check));
+                        }
+                        const saveClient = Amaterasu.button("Save permissions", () => {
+                            const permissions = { ...client.permissions, list_apps: checks.list_apps.checked, view_streams: checks.view_streams.checked, launch_apps: checks.launch_apps.checked };
+                            void save("pairing/update_client_permissions", { certificate_id: client.certificate_id, permissions }, (saved) => {
+                                const updated = saved.clients.find((item) => item.certificate_id === client.certificate_id);
+                                return !!updated && permissionKeys.every((key) => updated.permissions[key] === permissions[key]);
+                            }, Object.values(checks));
+                        });
+                        const name = typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(client.name) : client.name;
+                        const effective = Amaterasu.el("p", "muted");
+                        const updateEffective = () => {
+                            effective.textContent = checks.list_apps.checked || checks.view_streams.checked || checks.launch_apps.checked
+                                ? "Effective listing: allowed." : "Effective listing: denied.";
+                        };
+                        for (const check of Object.values(checks))
+                            check.addEventListener("change", updateEffective);
+                        updateEffective();
+                        body.append(Amaterasu.el("section", "account-card", Amaterasu.el("h3", "", name), effective, rows, saveClient));
+                    }
+                    if (!state.clients.length)
+                        body.append(Amaterasu.el("p", "muted", "No paired clients."));
+                }
+                const refresh = Amaterasu.button("Refresh permissions", () => {
+                    if (window.confirm("Reload client permissions and discard unsaved changes?"))
+                        void load();
+                });
+                area.replaceChildren(Amaterasu.panel("Client permissions", refresh, body, status));
+                async function save(path, payload, matches, submitted) {
+                    const otherDrafts = Array.from(baseline).some(([control, value]) => !submitted.includes(control) && control.checked !== value);
+                    if (otherDrafts && !window.confirm("Saving will reload and discard other unsaved permission changes. Continue?"))
+                        return;
+                    for (const control of Array.from(body.querySelectorAll("input, button")))
+                        control.disabled = true;
+                    refresh.disabled = true;
+                    onSaveBusy(true);
+                    status.replaceChildren(Amaterasu.el("p", "muted", "Saving client permissions…"));
+                    try {
+                        await context.api.post(path, { ...payload, expected_revision: state.revision });
+                        const saved = parseClientPermissionState(await context.api.post("pairing/list_clients"));
+                        if (saved.revision !== state.revision + 1 || !matches(saved))
+                            throw new Error("The saved permissions could not be confirmed.");
+                        context.notify("Client permissions saved.");
+                        await load();
+                    }
+                    catch (error) {
+                        if (!context.content.isConnected)
+                            return;
+                        status.replaceChildren(Amaterasu.errorPanel(error), Amaterasu.el("p", "muted", "Permissions may have changed. Refresh to review the latest state before trying again."));
+                        refresh.disabled = false;
+                    }
+                    finally {
+                        onSaveBusy(false);
+                    }
+                }
+            }
+            catch (error) {
+                if (context.content.isConnected && request === generation)
+                    area.replaceChildren(Amaterasu.errorPanel(error, load));
+            }
+        }
+        void load();
+    }
+    Amaterasu.renderClientPermissions = renderClientPermissions;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     function parsePendingPairings(value) {
         if (!value || typeof value !== "object" || Array.isArray(value))
             throw new Error("Pending pairing response is invalid.");
@@ -14863,10 +14984,13 @@ var Amaterasu;
     function renderHostManagement(context) {
         const pairingArea = Amaterasu.el("div");
         const pairedClientsArea = Amaterasu.el("div");
+        const permissionsArea = Amaterasu.el("div");
         const drafts = context.registerDraftGuard ? Amaterasu.trackDrafts(pairedClientsArea) : null;
+        const permissionDrafts = context.registerDraftGuard ? Amaterasu.trackDrafts(permissionsArea) : null;
         let clientSaveBusy = false;
-        if (drafts)
-            context.registerDraftGuard?.(() => clientSaveBusy || drafts.isDirty(), drafts.dispose);
+        let permissionSaveBusy = false;
+        if (drafts && permissionDrafts)
+            context.registerDraftGuard?.(() => clientSaveBusy || permissionSaveBusy || drafts.isDirty() || permissionDrafts.isDirty(), () => { drafts.dispose(); permissionDrafts.dispose(); });
         const loadPairedClients = Amaterasu.createPairedClientEditor(context, pairedClientsArea, () => drafts, (busy) => {
             clientSaveBusy = busy;
         });
@@ -14889,7 +15013,7 @@ var Amaterasu;
             void loadHost();
             void loadSessions();
             void loadRuntime();
-        })), Amaterasu.panel("Pending device pairing", pairingArea), pairedClientsArea, Amaterasu.panel("KDE desktop capture consent", captureArea), Amaterasu.panel("Host listeners", hostArea), Amaterasu.panel("Streaming status", runtimeArea), Amaterasu.panel("Session coordination", sessionArea));
+        })), Amaterasu.panel("Pending device pairing", pairingArea), pairedClientsArea, permissionsArea, Amaterasu.panel("KDE desktop capture consent", captureArea), Amaterasu.panel("Host listeners", hostArea), Amaterasu.panel("Streaming status", runtimeArea), Amaterasu.panel("Session coordination", sessionArea));
         async function loadPairings(notice) {
             if (!context.content.isConnected)
                 return;
@@ -15050,8 +15174,10 @@ var Amaterasu;
             }
         }
         void loadPairings();
-        if (context.api.allows("pairing.admin"))
+        if (context.api.allows("pairing.admin")) {
             void loadPairedClients();
+            Amaterasu.renderClientPermissions(context, permissionsArea, (busy) => { permissionSaveBusy = busy; });
+        }
         else
             pairedClientsArea.append(Amaterasu.panel("Paired clients", Amaterasu.el("p", "muted", "This account does not have permission to manage paired clients.")));
         renderCaptureConsent(context, captureArea);

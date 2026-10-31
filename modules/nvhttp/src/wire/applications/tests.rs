@@ -27,6 +27,8 @@ fn request_context(secure: bool, trusted: bool, certificate: bool) -> RequestCon
     RequestContext {
         secure,
         peer_trusted: trusted,
+        list_allowed: trusted,
+        launch_allowed: trusted,
         remote: "127.0.0.1".parse().unwrap(),
         peer_certificate: certificate.then(|| vec![1, 2, 3]),
     }
@@ -469,6 +471,7 @@ fn desktop_list_survives_missing_or_unavailable_catalog_provider() {
             connection: Some(7),
             purpose: Purpose::Applications {
                 desktop_enabled: true,
+                certificate: vec![1, 2, 3],
             },
             call: Call::Ready {
                 payload: json!({}),
@@ -491,4 +494,33 @@ fn desktop_list_survives_missing_or_unavailable_catalog_provider() {
                 .contains("<AppTitle>Desktop</AppTitle>")
         );
     }
+}
+
+#[test]
+fn list_permission_is_checked_before_and_during_catalog_pagination() {
+    let now = Instant::now();
+    let mut router = router();
+    let mut denied = request_context(true, true, true);
+    denied.list_allowed = false;
+    assert_eq!(dispatch(&mut router, denied, now).unwrap().status, 403);
+    assert!(router.jobs.is_empty());
+
+    assert!(dispatch(&mut router, request_context(true, true, true), now).is_none());
+    let mut catalog = Catalog {
+        hold: true,
+        ..Catalog::default()
+    };
+    assert!(poll(&mut router, &mut catalog, now).is_empty());
+    let replies = router.poll_with_identity(
+        now,
+        &mut |command| catalog.send(command),
+        |cert, permission| {
+            assert_eq!(cert, &[1, 2, 3]);
+            assert_eq!(permission, Permission::List);
+            false
+        },
+    );
+    assert_eq!(replies.len(), 1);
+    assert_eq!(catalog.cancelled, vec![1]);
+    assert!(router.jobs.is_empty());
 }

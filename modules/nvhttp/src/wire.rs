@@ -32,6 +32,8 @@ pub struct RequestContext {
     /// Set only after the transport verifies TLS possession and checks this
     /// certificate against the live committed pairing authority for this request.
     pub peer_trusted: bool,
+    pub list_allowed: bool,
+    pub launch_allowed: bool,
 }
 
 impl RequestContext {
@@ -57,12 +59,19 @@ impl RequestContext {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Permission {
+    List,
+    Launch,
+}
+
 #[derive(Debug)]
 pub struct Reply {
     pub status: u16,
     pub content_type: &'static str,
     pub body: Vec<u8>,
     pub requires_paired_tls: bool,
+    pub permission: Option<Permission>,
 }
 
 impl Reply {
@@ -130,6 +139,7 @@ enum Purpose {
     Cleanup,
     Applications {
         desktop_enabled: bool,
+        certificate: Vec<u8>,
     },
 }
 
@@ -331,10 +341,12 @@ impl Router {
                 .map(|error| xml::error(503, error))
             }
             "/pair" => self.pair(connection, query, &peer, now),
-            "/applist" => self.applications(connection, trusted, now),
+            "/applist" => self.applications(connection, &peer, now),
             "/launch" => {
                 if !trusted {
                     Some(xml::error(401, "authenticated paired TLS is required"))
+                } else if !peer.launch_allowed {
+                    Some(xml::error(403, "launch permission denied"))
                 } else {
                     let request = match streaming::launch_request(&query) {
                         Ok(request) => request,
@@ -385,6 +397,9 @@ impl Router {
             "/resume" => {
                 if !trusted {
                     return Some(xml::error(401, "authenticated paired TLS is required"));
+                }
+                if !peer.launch_allowed {
+                    return Some(xml::error(403, "launch permission denied"));
                 }
                 let request = match streaming::launch_request(&query) {
                     Ok(request) => request,
@@ -475,9 +490,9 @@ impl Router {
             Job {
                 connection,
                 applications: match purpose {
-                    Purpose::Applications { desktop_enabled } => {
-                        Some(applications::Applications::new(desktop_enabled))
-                    }
+                    Purpose::Applications {
+                        desktop_enabled, ..
+                    } => Some(applications::Applications::new(desktop_enabled)),
                     _ => None,
                 },
                 purpose,
@@ -494,12 +509,12 @@ impl Router {
     pub fn poll_with_trust(
         &mut self,
         runtime: &RuntimeClient,
-        trusted: impl FnMut(&[u8]) -> bool,
+        allowed: impl FnMut(&[u8], Permission) -> bool,
     ) -> Vec<(u64, Reply)> {
         self.poll_with_identity(
             Instant::now(),
             &mut |command| runtime.send_ephemeral(command),
-            trusted,
+            allowed,
         )
     }
 
@@ -509,22 +524,38 @@ impl Router {
         now: Instant,
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
     ) -> Vec<(u64, Reply)> {
-        self.poll_with_identity(now, send, |_| true)
+        self.poll_with_identity(now, send, |_, _| true)
     }
 
     fn poll_with_identity(
         &mut self,
         now: Instant,
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
-        trusted: impl FnMut(&[u8]) -> bool,
+        mut allowed: impl FnMut(&[u8], Permission) -> bool,
     ) -> Vec<(u64, Reply)> {
         self.poll_cancellations(now, send);
-        let mut replies = self.launches.poll_with_trust(now, send, trusted);
+        let mut replies = self.launches.poll_with_trust(now, send, |certificate| {
+            allowed(certificate, Permission::Launch)
+        });
         let keys: Vec<_> = self.jobs.keys().copied().collect();
         for key in keys {
             let Some(mut job) = self.jobs.remove(&key) else {
                 continue;
             };
+            let permission = match &job.purpose {
+                Purpose::Applications { certificate, .. } => {
+                    Some((certificate.as_slice(), Permission::List))
+                }
+                Purpose::LaunchIdentity { peer, .. } => {
+                    Some((peer.certificate(), Permission::Launch))
+                }
+                _ => None,
+            };
+            if permission.is_some_and(|(certificate, permission)| !allowed(certificate, permission))
+            {
+                self.expire_job(job, now, send, &mut replies);
+                continue;
+            }
             if now >= job.deadline {
                 self.expire_job(job, now, send, &mut replies);
                 continue;

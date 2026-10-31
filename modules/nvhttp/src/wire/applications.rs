@@ -1,5 +1,5 @@
 //! Collect one catalog revision completely before publishing a Moonlight app list.
-use super::{Call, Job, Purpose, Reply, Router, xml};
+use super::{Call, Job, Permission, Purpose, Reply, RequestContext, Router, xml};
 use crate::launch::DESKTOP_APP_ID;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -162,6 +162,7 @@ impl Applications {
             content_type: "application/xml; charset=utf-8",
             body: self.body.into_bytes(),
             requires_paired_tls: true,
+            permission: Some(Permission::List),
         }
     }
 }
@@ -220,11 +221,14 @@ impl Router {
     pub(super) fn applications(
         &mut self,
         connection: u64,
-        trusted: bool,
+        peer: &RequestContext,
         now: Instant,
     ) -> Option<Reply> {
-        if !trusted {
+        if !peer.trusted() {
             return Some(xml::error(401, "authenticated paired TLS is required"));
+        }
+        if !peer.list_allowed {
+            return Some(xml::error(403, "application list permission denied"));
         }
         if self
             .jobs
@@ -239,6 +243,7 @@ impl Router {
             Some(connection),
             Purpose::Applications {
                 desktop_enabled: self.launches.desktop_enabled(),
+                certificate: peer.peer_certificate.clone().expect("trusted certificate"),
             },
             json!({"action":"export_list","limit":PAGE_SIZE}),
             now + LIST_TIMEOUT,

@@ -1,5 +1,5 @@
 //! Rustls owns TLS; the pairing provider retains private keys behind IdentityApi.
-use amaterasu_identity::IdentityApi;
+use amaterasu_identity::{INTERFACE_MINOR_PERMISSIONS, IdentityApiV1_1};
 use amaterasu_module_sdk::{NativeBinding, RuntimeClient, abi::*};
 use rustls::{
     CertificateError, DigitallySignedStruct, DistinguishedName, Error, ServerConfig,
@@ -25,6 +25,7 @@ struct NativeCalls {
     certificate: unsafe extern "C" fn(*mut c_void, ReplySink) -> Status,
     sign: unsafe extern "C" fn(*mut c_void, u32, BorrowedBytes, ReplySink) -> Status,
     verify: unsafe extern "C" fn(*mut c_void, BorrowedBytes) -> Status,
+    permission: unsafe extern "C" fn(*mut c_void, BorrowedBytes, u32) -> Status,
 }
 
 struct Bridge {
@@ -86,6 +87,26 @@ impl Bridge {
         })
     }
 
+    fn permission_status(&self, certificate: &[u8], permission: u32) -> Status {
+        if certificate.is_empty() || certificate.len() > amaterasu_identity::MAX_CERTIFICATE_BYTES {
+            return amaterasu_identity::IDENTITY_UNTRUSTED;
+        }
+        let Ok(active) = self.active.lock() else {
+            return amaterasu_identity::IDENTITY_UNAVAILABLE;
+        };
+        if !*active {
+            return amaterasu_identity::IDENTITY_UNAVAILABLE;
+        }
+        // SAFETY: the active gate pins the synchronous provider binding; DER lives through the call.
+        unsafe {
+            (self.calls.permission)(
+                self.calls.context,
+                BorrowedBytes::new(certificate),
+                permission,
+            )
+        }
+    }
+
     fn trusted(&self, certificate: &[u8]) -> bool {
         if certificate.is_empty() || certificate.len() > amaterasu_identity::MAX_CERTIFICATE_BYTES {
             return false;
@@ -104,6 +125,13 @@ impl Bridge {
     }
 }
 
+fn permission_revoked(status: Status) -> bool {
+    matches!(
+        status,
+        amaterasu_identity::IDENTITY_FORBIDDEN | amaterasu_identity::IDENTITY_UNTRUSTED
+    )
+}
+
 pub struct Identity {
     bridge: Arc<Bridge>,
     binding: Option<NativeBinding>,
@@ -116,19 +144,20 @@ impl Identity {
             runtime.bind_native(
                 amaterasu_identity::SERVICE,
                 amaterasu_identity::INTERFACE_MAJOR,
-                amaterasu_identity::INTERFACE_MINOR,
-                size_of::<IdentityApi>() as u32,
+                INTERFACE_MINOR_PERMISSIONS,
+                size_of::<IdentityApiV1_1>() as u32,
             )
         }?;
         let bridge = {
             // SAFETY: requested product interface/version/size match IdentityApi.
-            let api = unsafe { binding.table::<IdentityApi>() }?;
+            let api = unsafe { binding.table::<IdentityApiV1_1>() }?;
             Arc::new(Bridge {
                 calls: NativeCalls {
                     context: binding.context(),
-                    certificate: api.certificate,
-                    sign: api.sign,
-                    verify: api.verify_client,
+                    certificate: api.v1_0.certificate,
+                    sign: api.v1_0.sign,
+                    verify: api.v1_0.verify_client,
+                    permission: api.check_permission,
                 },
                 active: Mutex::new(true),
             })
@@ -145,6 +174,23 @@ impl Identity {
 
     pub fn trusted(&self, certificate: &[u8]) -> bool {
         self.bridge.trusted(certificate)
+    }
+
+    pub fn allowed(&self, certificate: &[u8], permission: crate::wire::Permission) -> bool {
+        let selector = match permission {
+            crate::wire::Permission::List => amaterasu_identity::PERMISSION_LIST,
+            crate::wire::Permission::Launch => amaterasu_identity::PERMISSION_LAUNCH,
+        };
+        self.bridge.permission_status(certificate, selector) == STATUS_OK
+    }
+
+    /// A transiently unavailable authority blocks new work, but does not prove
+    /// that an existing session was revoked. Retry until a committed denial.
+    pub fn launch_not_revoked(&self, certificate: &[u8]) -> bool {
+        let status = self
+            .bridge
+            .permission_status(certificate, amaterasu_identity::PERMISSION_LAUNCH);
+        !permission_revoked(status)
     }
 
     pub fn configuration(&self, certificate: Vec<u8>) -> Result<Arc<ServerConfig>, Error> {
@@ -438,6 +484,20 @@ mod tests {
         STATUS_OK
     }
 
+    unsafe extern "C" fn permission(_: *mut c_void, _: BorrowedBytes, _: u32) -> Status {
+        STATUS_OK
+    }
+
+    #[test]
+    fn unavailable_permission_does_not_prove_session_revocation() {
+        assert!(!permission_revoked(STATUS_OK));
+        assert!(!permission_revoked(
+            amaterasu_identity::IDENTITY_UNAVAILABLE
+        ));
+        assert!(permission_revoked(amaterasu_identity::IDENTITY_FORBIDDEN));
+        assert!(permission_revoked(amaterasu_identity::IDENTITY_UNTRUSTED));
+    }
+
     #[test]
     fn cloned_rustls_signer_cannot_call_identity_after_owner_gate_closes() {
         let counter = AtomicUsize::new(0);
@@ -447,6 +507,7 @@ mod tests {
                 certificate,
                 sign,
                 verify,
+                permission,
             },
             active: Mutex::new(true),
         });
@@ -510,6 +571,7 @@ mod tests {
                     certificate,
                     sign,
                     verify,
+                    permission,
                 },
                 active: Mutex::new(true),
             }),

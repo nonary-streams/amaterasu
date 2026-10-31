@@ -81,6 +81,9 @@ pub struct Pipeline {
     host_configuration_retry_seconds: u64,
     identity_migration_checked: bool,
     pairing_notice: Option<PairingNoticeStage>,
+    recovery_needed: bool,
+    recovery_request: Option<(u64, bool, Option<u64>)>,
+    recovery_retry_at: Option<Instant>,
 }
 
 enum PairingNoticeStage {
@@ -148,6 +151,9 @@ impl Pipeline {
             host_configuration_retry_seconds: 1,
             identity_migration_checked: false,
             pairing_notice: None,
+            recovery_needed: false,
+            recovery_request: None,
+            recovery_retry_at: None,
         }
     }
 
@@ -212,6 +218,7 @@ impl Pipeline {
             let result = self.advance_identity_generation(now, &mut send);
             if result.is_err() {
                 self.identity.invalidate();
+                self.recovery_needed = true;
             }
             return result;
         }
@@ -235,6 +242,7 @@ impl Pipeline {
         };
         if result.is_err() {
             self.identity.invalidate();
+            self.recovery_needed = true;
         }
         result
     }
@@ -326,6 +334,7 @@ impl Pipeline {
                     .is_some_and(|previous| previous.provider_revision != revision)
                 {
                     self.identity.invalidate();
+                    self.recovery_needed = true;
                 }
                 if payload["ok"] != true || payload["ready"] != true {
                     self.fail_host_configuration(now);
@@ -368,6 +377,7 @@ impl Pipeline {
             && !std::path::Path::new(&paths.private_key_path).exists()
         {
             self.identity.invalidate();
+            self.recovery_needed = true;
             let loader: Generator<ConfiguredIdentity> = Box::new(move || {
                 ConfiguredIdentity::load(
                     &paths.certificate_path,
@@ -413,6 +423,7 @@ impl Pipeline {
                     }
                     Some(_) => {
                         self.identity.invalidate();
+                        self.recovery_needed = true;
                         Arc::new(identity)
                     }
                     None => Arc::new(identity),
@@ -669,6 +680,7 @@ impl Pipeline {
         self.host_configuration_retry_seconds =
             (self.host_configuration_retry_seconds * 2).min(HOST_CONFIGURATION_MAX_RETRY_SECONDS);
         self.identity.invalidate();
+        self.recovery_needed = true;
     }
 
     fn request_host_configuration(
@@ -772,7 +784,7 @@ impl Pipeline {
             None => send(Command::Poll {})?,
         };
         match incoming {
-            Response::Pending => Ok(()),
+            Response::Pending => self.recover_identity(now, &mut send),
             Response::Request {
                 id,
                 caller,
@@ -781,6 +793,9 @@ impl Pipeline {
                 remaining_ms,
                 ..
             } => {
+                if let Some((_, stale, _)) = &mut self.recovery_request {
+                    *stale = true;
+                }
                 if service != SERVICE {
                     return complete(&mut send, id, error("invalid_service"));
                 }
@@ -812,6 +827,7 @@ impl Pipeline {
                 }
                 if operation.may_write() && !is_client_configuration_update(&operation) {
                     self.identity.invalidate();
+                    self.recovery_needed = true;
                 }
                 let request = Request {
                     id,
@@ -864,6 +880,7 @@ impl Pipeline {
             }
             _ => {
                 self.identity.invalidate();
+                self.recovery_needed = true;
                 complete(send, request.id, error("state_unavailable"))
             }
         }
@@ -893,15 +910,18 @@ impl Pipeline {
                     } => {
                         if payload["revision"].as_u64() != Some(expected_ack_revision) {
                             self.identity.invalidate();
+                            self.recovery_needed = true;
                             return complete(send, pending.request.id, error("state_unavailable"));
                         }
                         self.publish_identity(expected_ack_revision, snapshot)?;
+                        self.recovery_needed = false;
                         complete(send, pending.request.id, response)
                     }
                     Stage::Loading(operation) => {
                         if Instant::now() >= pending.request.deadline {
                             if is_client_configuration_update(&operation) {
                                 self.identity.invalidate();
+                                self.recovery_needed = true;
                             }
                             return complete(send, pending.request.id, error("deadline_exceeded"));
                         }
@@ -913,6 +933,7 @@ impl Pipeline {
                         ) {
                             if is_client_configuration_update(&operation) {
                                 self.identity.invalidate();
+                                self.recovery_needed = true;
                             }
                             return complete(send, pending.request.id, error("request_ended"));
                         }
@@ -922,6 +943,7 @@ impl Pipeline {
                                 Ok(document) => document,
                                 Err(code) => {
                                     self.identity.invalidate();
+                                    self.recovery_needed = true;
                                     return complete(send, pending.request.id, error(code));
                                 }
                             };
@@ -943,6 +965,7 @@ impl Pipeline {
                     && payload["error"]["current_revision"].as_u64().is_some() =>
             {
                 self.identity.invalidate();
+                self.recovery_needed = true;
                 complete(
                     send,
                     pending.request.id,
@@ -956,6 +979,7 @@ impl Pipeline {
             // Never echo transport/state messages: they can contain input values.
             _ => {
                 self.identity.invalidate();
+                self.recovery_needed = true;
                 complete(send, pending.request.id, error("state_unavailable"))
             }
         }
@@ -1105,6 +1129,7 @@ impl Pipeline {
             Ok(snapshot) => snapshot,
             Err(code) => {
                 self.identity.invalidate();
+                self.recovery_needed = true;
                 return complete(send, request.id, error(code));
             }
         };
@@ -1134,6 +1159,12 @@ impl Pipeline {
         let expected_revision = match &operation {
             Operation::UpdateClientConfigOverrides {
                 expected_revision, ..
+            }
+            | Operation::UpdateClientPermissions {
+                expected_revision, ..
+            }
+            | Operation::SetPermissionMode {
+                expected_revision, ..
             } => Some(*expected_revision),
             Operation::Unpair {
                 expected_revision, ..
@@ -1160,6 +1191,7 @@ impl Pipeline {
             let durable_document = Document {
                 identity: generated_identity,
                 clients: document.clients.clone(),
+                permission_mode_enabled: document.permission_mode_enabled,
             };
             if durable_document.identity.is_none() {
                 return complete(send, request.id, error("identity_failure"));
@@ -1178,6 +1210,7 @@ impl Pipeline {
             None => Document {
                 identity: durable_document.identity.clone(),
                 clients: durable_document.clients.clone(),
+                permission_mode_enabled: durable_document.permission_mode_enabled,
             },
         };
         let is_server_certificate_request = matches!(&operation, Operation::GetServerCert { .. });
@@ -1194,6 +1227,7 @@ impl Pipeline {
                 }
                 if let Some(document) = initialized_document {
                     self.identity.invalidate();
+                    self.recovery_needed = true;
                     let Some(expected_ack_revision) = revision.checked_add(1) else {
                         return complete(send, request.id, error("state_unavailable"));
                     };
@@ -1220,6 +1254,7 @@ impl Pipeline {
                     );
                 }
                 self.publish_identity(revision, loaded)?;
+                self.recovery_needed = false;
                 complete(send, request.id, response)
             }
             Ok(Change::Write {
@@ -1233,9 +1268,11 @@ impl Pipeline {
                 }
                 if !configuration_only {
                     self.identity.invalidate();
+                    self.recovery_needed = true;
                 }
                 let Some(expected_ack_revision) = revision.checked_add(1) else {
                     self.identity.invalidate();
+                    self.recovery_needed = true;
                     return complete(send, request.id, error("state_unavailable"));
                 };
                 let snapshot_now = if initialize {
@@ -1250,6 +1287,7 @@ impl Pipeline {
                     Ok(snapshot) => snapshot,
                     Err(code) => {
                         self.identity.invalidate();
+                        self.recovery_needed = true;
                         return complete(send, request.id, error(code));
                     }
                 };
@@ -1271,9 +1309,75 @@ impl Pipeline {
             }
             Err(code) => {
                 self.publish_identity(revision, loaded)?;
+                self.recovery_needed = false;
                 complete(send, request.id, error(code))
             }
         }
+    }
+
+    // Only run in an idle tick. An overlapping foreground operation marks the
+    // read stale, so its older response can never republish revoked authority.
+    fn recover_identity(
+        &mut self,
+        now: u64,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<()> {
+        if let Some((request, stale, configuration_revision)) = self.recovery_request.take() {
+            match send(Command::TakeResult { request })? {
+                Response::Pending => {
+                    self.recovery_request = Some((request, stale, configuration_revision));
+                    return Ok(());
+                }
+                Response::Result { payload }
+                    if payload["ok"] == true
+                        && !stale
+                        && configuration_revision
+                            == self
+                                .configured_identity()
+                                .map(|value| value.provider_revision) =>
+                {
+                    if let (Some(revision), Ok(document)) = (
+                        payload["revision"].as_u64(),
+                        read_document(&payload, now, self.configured_identity().is_none()),
+                    ) && let Ok(snapshot) = self.prepare_snapshot(&document, now)
+                        && self.publish_identity(revision, snapshot).is_ok()
+                    {
+                        self.recovery_needed = false;
+                        self.recovery_retry_at = None;
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
+            self.recovery_retry_at = Some(Instant::now() + Duration::from_secs(1));
+        }
+        if !self.recovery_needed
+            || self
+                .recovery_retry_at
+                .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            return Ok(());
+        }
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).map_err(|_| "pairing recovery entropy unavailable")?;
+        match send(Command::Request {
+            service: STATE_SERVICE.into(),
+            payload: json!({"action":"get","key":STATE_KEY}),
+            timeout_ms: 5_000,
+            operation_id: format!("pairing.recovery.{}", u128::from_le_bytes(nonce)),
+            parent: None,
+        })? {
+            Response::Accepted { id } => {
+                self.recovery_request = Some((
+                    id,
+                    false,
+                    self.configured_identity()
+                        .map(|value| value.provider_revision),
+                ))
+            }
+            _ => self.recovery_retry_at = Some(Instant::now() + Duration::from_secs(1)),
+        }
+        Ok(())
     }
 
     fn prepare_snapshot(
@@ -1351,6 +1455,7 @@ fn overlay_document(document: &Document, configured_identity: &ConfiguredIdentit
     let mut overlay = Document {
         identity: document.identity.clone(),
         clients: document.clients.clone(),
+        permission_mode_enabled: document.permission_mode_enabled,
     };
     if let Some(identity) = overlay.identity.as_mut() {
         identity.certificate_pem = configured_identity.certificate_pem.clone();

@@ -34,6 +34,7 @@
     "src/session_history.ts",
     "src/session_timeline.ts",
     "src/pages.ts",
+    "src/permission-management.ts",
     "src/management.ts",
     "src/accounts.ts",
     "src/tokens.ts",

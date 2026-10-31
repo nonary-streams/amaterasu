@@ -86,6 +86,7 @@ pub fn import_legacy_pairing(
             name: device.name,
             certificate_pem: device.certificate_pem,
             paired_at: now,
+            permissions: crate::protocol::ClientPermissions::default(),
             config_overrides: crate::protocol::ClientConfigOverrides::default(),
         });
     }
@@ -93,6 +94,7 @@ pub fn import_legacy_pairing(
     let document = Document {
         identity: Some(identity),
         clients,
+        permission_mode_enabled: false,
     };
     document
         .validate(now)

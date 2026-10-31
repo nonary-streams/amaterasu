@@ -222,7 +222,15 @@ impl Server {
         closed
     }
 
+    #[cfg(test)]
     pub fn tick(&mut self) -> Events {
+        self.tick_checked(|_, _| true)
+    }
+
+    pub fn tick_checked(
+        &mut self,
+        mut verify: impl FnMut(&[u8], Option<crate::wire::Permission>) -> bool,
+    ) -> Events {
         self.accept(false);
         self.accept(true);
         let mut events = Events {
@@ -232,6 +240,18 @@ impl Server {
         let now = Instant::now();
         for (id, connection) in &mut self.connections {
             if now >= connection.deadline {
+                events.closed.push(Closed {
+                    id: *id,
+                    response_delivered: false,
+                });
+                continue;
+            }
+            if let Some(output) = &connection.output
+                && output.requires_paired_tls
+                && !connection
+                    .peer_certificate()
+                    .is_some_and(|certificate| verify(&certificate, output.permission))
+            {
                 events.closed.push(Closed {
                     id: *id,
                     response_delivered: false,
@@ -327,7 +347,7 @@ impl Server {
         &mut self,
         id: u64,
         reply: Reply,
-        verify: impl FnOnce(&[u8]) -> bool,
+        verify: impl FnOnce(&[u8], Option<crate::wire::Permission>) -> bool,
     ) -> bool {
         let paired = if reply.requires_paired_tls {
             self.connections
@@ -336,7 +356,7 @@ impl Server {
                 .filter(|tls| !tls.is_handshaking())
                 .and_then(|tls| tls.peer_certificates())
                 .and_then(|certificates| certificates.first())
-                .is_some_and(|certificate| verify(certificate.as_ref()))
+                .is_some_and(|certificate| verify(certificate.as_ref(), reply.permission))
         } else {
             false
         };
@@ -468,6 +488,8 @@ fn normalize_ip(address: IpAddr) -> IpAddr {
 }
 
 struct Output {
+    requires_paired_tls: bool,
+    permission: Option<crate::wire::Permission>,
     bytes: Vec<u8>,
     offset: usize,
 }
@@ -613,7 +635,12 @@ impl Connection {
         };
         let mut bytes=format!("HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",reply.status,reason,reply.content_type,reply.body.len()).into_bytes();
         bytes.extend_from_slice(&reply.body);
-        self.output = Some(Output { bytes, offset: 0 });
+        self.output = Some(Output {
+            bytes,
+            offset: 0,
+            requires_paired_tls: reply.requires_paired_tls,
+            permission: reply.permission,
+        });
         self.input.clear();
         self.waiting = false;
         self.response_delivered = false;
@@ -739,6 +766,7 @@ fn simple_reply(status: u16, message: &str) -> Reply {
         content_type: "text/plain; charset=utf-8",
         body: message.as_bytes().to_vec(),
         requires_paired_tls: false,
+        permission: None,
     }
 }
 
@@ -861,6 +889,41 @@ mod tests {
         assert!(response.ends_with(b"hello"));
         assert!(delivered);
         assert_eq!(server.connections(), 0);
+    }
+
+    #[test]
+    fn queued_protected_response_is_closed_before_writing_without_authority() {
+        let settings = Settings {
+            enabled: true,
+            http_bind: "127.0.0.1:0".parse().unwrap(),
+            https_bind: "127.0.0.1:0".parse().unwrap(),
+            ..Settings::default()
+        };
+        let mut server = Server::bind(&settings).unwrap();
+        let mut client = TcpStream::connect(server.http_address()).unwrap();
+        client.set_nonblocking(true).unwrap();
+        client
+            .write_all(b"GET /applist HTTP/1.1\r\nHost: test\r\n\r\n")
+            .unwrap();
+        let mut queued = false;
+        for _ in 0..100 {
+            for request in server.tick().requests {
+                let mut reply = simple_reply(200, "private catalog");
+                reply.requires_paired_tls = true;
+                reply.permission = Some(crate::wire::Permission::List);
+                assert!(server.respond(request.id, reply));
+                queued = true;
+            }
+            if queued {
+                break;
+            }
+        }
+        assert!(queued);
+        let events = server.tick_checked(|_, _| false);
+        assert_eq!(events.closed.len(), 1);
+        assert!(!events.closed[0].response_delivered);
+        let mut bytes = [0; 128];
+        assert_eq!(client.read(&mut bytes).unwrap(), 0);
     }
 
     #[test]
@@ -1445,6 +1508,8 @@ mod tests {
             tls: Some(tls),
             input: Vec::new(),
             output: Some(Output {
+                requires_paired_tls: false,
+                permission: None,
                 bytes: b"response".to_vec(),
                 offset: 0,
             }),

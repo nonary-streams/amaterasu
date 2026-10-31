@@ -34,6 +34,7 @@ pub fn response(status: u16, message: &str, fields: &[(&str, &str)]) -> Reply {
         content_type: "application/xml; charset=utf-8",
         body: body.into_bytes(),
         requires_paired_tls: false,
+        permission: None,
     }
 }
 

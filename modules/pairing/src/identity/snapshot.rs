@@ -83,6 +83,7 @@ struct CertificateRecord {
     der: Vec<u8>,
     not_before: u64,
     not_after: u64,
+    permissions: crate::protocol::ClientPermissions,
 }
 impl CertificateRecord {
     fn parse(certificate: &Certificate) -> Result<Self, &'static str> {
@@ -92,6 +93,7 @@ impl CertificateRecord {
         }
         Ok(Self {
             der,
+            permissions: crate::protocol::ClientPermissions::default(),
             not_before: certificate
                 .tbs_certificate
                 .validity
@@ -115,6 +117,7 @@ pub struct Snapshot {
     host: CertificateRecord,
     key: RsaPrivateKey,
     clients: Vec<CertificateRecord>,
+    permission_mode_enabled: bool,
 }
 impl Snapshot {
     pub fn prepare(document: &Document, now: u64) -> Result<Option<Arc<Self>>, &'static str> {
@@ -155,6 +158,7 @@ impl Snapshot {
                 private_key_pem: configured_identity.private_key_pem.clone(),
             }),
             clients: document.clients.clone(),
+            permission_mode_enabled: document.permission_mode_enabled,
         };
         validation_document.validate(now)?;
         Self::prepare_material(
@@ -181,16 +185,50 @@ impl Snapshot {
             .clients
             .iter()
             .map(|client| {
-                CertificateRecord::parse(
+                let mut record = CertificateRecord::parse(
                     &crypto::parse_certificate(&client.certificate_pem, None)?.certificate,
-                )
+                )?;
+                record.permissions = client.permissions;
+                Ok(record)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Arc::new(Self { host, key, clients }))
+        Ok(Arc::new(Self {
+            host,
+            key,
+            clients,
+            permission_mode_enabled: document.permission_mode_enabled,
+        }))
     }
 
     pub fn certificate(&self) -> &[u8] {
         &self.host.der
+    }
+
+    pub fn check_permission(&self, der: &[u8], now: u64, permission: u32) -> Result<(), Status> {
+        if !matches!(
+            permission,
+            PERMISSION_LIST | PERMISSION_LAUNCH | PERMISSION_VIEW
+        ) {
+            return Err(amaterasu_module_sdk::abi::STATUS_INVALID_ARGUMENT);
+        }
+        let client = self
+            .clients
+            .iter()
+            .find(|client| client.der == der && client.valid(now))
+            .ok_or(IDENTITY_UNTRUSTED)?;
+        let p = client.permissions;
+        let allowed = !self.permission_mode_enabled
+            || match permission {
+                PERMISSION_LIST => p.list_apps || p.view_streams || p.launch_apps,
+                PERMISSION_VIEW => p.view_streams || p.launch_apps,
+                PERMISSION_LAUNCH => p.launch_apps,
+                _ => unreachable!(),
+            };
+        if allowed {
+            Ok(())
+        } else {
+            Err(IDENTITY_FORBIDDEN)
+        }
     }
 
     pub fn verify_client(&self, der: &[u8], now: u64) -> bool {

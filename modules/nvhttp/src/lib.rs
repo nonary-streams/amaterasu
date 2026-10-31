@@ -478,12 +478,19 @@ impl ManagedModule for NvhttpModule {
             let revoked = router.revoke_untrusted(|certificate| {
                 self.identity
                     .as_ref()
-                    .is_some_and(|identity| identity.trusted(certificate))
+                    .is_none_or(|identity| identity.launch_not_revoked(certificate))
             });
             for connection in revoked {
                 server.close(connection);
             }
-            let events = server.tick();
+            let events = server.tick_checked(|certificate, permission| {
+                self.identity.as_ref().is_some_and(|identity| {
+                    permission.map_or_else(
+                        || identity.trusted(certificate),
+                        |permission| identity.allowed(certificate, permission),
+                    )
+                })
+            });
             for closed in events.closed {
                 if closed.response_delivered {
                     router.reply_delivered(closed.id);
@@ -501,6 +508,18 @@ impl ManagedModule for NvhttpModule {
                                 .as_ref()
                                 .is_some_and(|identity| identity.trusted(certificate))
                         });
+                let allowed = |permission| {
+                    incoming
+                        .peer_certificate
+                        .as_ref()
+                        .is_some_and(|certificate| {
+                            self.identity
+                                .as_ref()
+                                .is_some_and(|identity| identity.allowed(certificate, permission))
+                        })
+                };
+                let list_allowed = trusted && allowed(wire::Permission::List);
+                let launch_allowed = trusted && allowed(wire::Permission::Launch);
                 if incoming.request.target.split('?').next() == Some("/launch") {
                     // Deliberately omit the query: Moonlight sends session keys there.
                     eprintln!(
@@ -516,28 +535,37 @@ impl ManagedModule for NvhttpModule {
                         remote: incoming.remote,
                         peer_certificate: incoming.peer_certificate,
                         peer_trusted: trusted,
+                        list_allowed,
+                        launch_allowed,
                     },
                     &self.runtime,
                 ) {
-                    let accepted = server.respond_checked(incoming.id, reply, |certificate| {
-                        self.identity
-                            .as_ref()
-                            .is_some_and(|identity| identity.trusted(certificate))
-                    });
+                    let accepted =
+                        server.respond_checked(incoming.id, reply, |certificate, permission| {
+                            self.identity.as_ref().is_some_and(|identity| {
+                                permission.map_or_else(
+                                    || identity.trusted(certificate),
+                                    |permission| identity.allowed(certificate, permission),
+                                )
+                            })
+                        });
                     if !accepted {
                         router.cancel(incoming.id, &self.runtime);
                     }
                 }
             }
-            for (id, reply) in router.poll_with_trust(&self.runtime, |certificate| {
+            for (id, reply) in router.poll_with_trust(&self.runtime, |certificate, permission| {
                 self.identity
                     .as_ref()
-                    .is_some_and(|identity| identity.trusted(certificate))
+                    .is_some_and(|identity| identity.allowed(certificate, permission))
             }) {
-                let accepted = server.respond_checked(id, reply, |certificate| {
-                    self.identity
-                        .as_ref()
-                        .is_some_and(|identity| identity.trusted(certificate))
+                let accepted = server.respond_checked(id, reply, |certificate, permission| {
+                    self.identity.as_ref().is_some_and(|identity| {
+                        permission.map_or_else(
+                            || identity.trusted(certificate),
+                            |permission| identity.allowed(certificate, permission),
+                        )
+                    })
                 });
                 if !accepted {
                     router.cancel(id, &self.runtime);

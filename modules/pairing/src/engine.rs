@@ -130,6 +130,20 @@ impl Engine {
                 *config_overrides,
                 now,
             ),
+            Operation::UpdateClientPermissions {
+                certificate_id,
+                permissions,
+                ..
+            } => Self::update_client_permissions(document, &certificate_id, permissions, now),
+            Operation::SetPermissionMode { enabled, .. } => {
+                let mut document = document;
+                document.permission_mode_enabled = enabled;
+                write(
+                    document,
+                    json!({"ok":true,"permission_mode_enabled":enabled}),
+                    now,
+                )
+            }
             Operation::CheckClientCertificate { certificate_pem } => {
                 Self::check_certificate(&document, &certificate_pem, now)
             }
@@ -206,6 +220,7 @@ impl Engine {
             name,
             certificate_pem,
             paired_at: now,
+            permissions: ClientPermissions::default(),
             config_overrides: ClientConfigOverrides::default(),
         });
         write(document, response, now)
@@ -265,6 +280,7 @@ impl Engine {
                     name,
                     certificate_pem: pem,
                     paired_at: 0,
+                    permissions: ClientPermissions::default(),
                     config_overrides: ClientConfigOverrides::default(),
                 },
                 salt,
@@ -316,7 +332,10 @@ impl Engine {
         mut document: Document,
         now: u64,
     ) -> Result<Change, &'static str> {
-        let client = self.take_owned(caller, &id)?.finish(proof, now)?;
+        let mut client = self.take_owned(caller, &id)?.finish(proof, now)?;
+        if !document.clients.is_empty() {
+            client.permissions = ClientPermissions::subsequent_client();
+        }
         if document.clients.len() >= MAX_CLIENTS
             || document
                 .clients
@@ -390,6 +409,24 @@ impl Engine {
             now,
         )
     }
+    fn update_client_permissions(
+        mut document: Document,
+        certificate_id: &str,
+        permissions: ClientPermissions,
+        now: u64,
+    ) -> Result<Change, &'static str> {
+        let client = document
+            .clients
+            .iter_mut()
+            .find(|client| client.certificate_id == certificate_id)
+            .ok_or("not_paired")?;
+        client.permissions = permissions;
+        write(
+            document,
+            json!({"ok":true,"certificate_id":certificate_id}),
+            now,
+        )
+    }
     fn check_certificate(document: &Document, pem: &str, now: u64) -> Result<Change, &'static str> {
         let certificate = crypto::parse_certificate(pem, Some(now))?;
         let client = document
@@ -398,7 +435,7 @@ impl Engine {
             .find(|client| client.certificate_id == certificate.fingerprint)
             .ok_or("not_paired")?;
         Ok(Change::Read(
-            json!({"ok":true,"paired":1,"certificate_id":client.certificate_id,"client_id":client.client_id,"config_overrides":client.config_overrides}),
+            json!({"ok":true,"paired":1,"certificate_id":client.certificate_id,"client_id":client.client_id,"config_overrides":client.config_overrides,"permissions":client.permissions,"permission_mode_enabled":document.permission_mode_enabled}),
         ))
     }
 }
@@ -420,9 +457,10 @@ fn client_metadata(document: &Document) -> Value {
                 "client_id": client.client_id,
                 "name": client.name,
                 "paired_at": client.paired_at,
+                "permissions": client.permissions,
                 "config_overrides": client.config_overrides
             })
         })
         .collect();
-    json!({"ok":true,"clients":clients})
+    json!({"ok":true,"clients":clients,"permission_mode_enabled":document.permission_mode_enabled})
 }

@@ -165,7 +165,7 @@ Plaintext requests cannot use browser cookie routes or cookie authentication.
 | `/v1/account-sessions/` | list, revoke | `configuration.write` and an administrator session |
 | `/v1/diagnostics/` | query, counters, status | `diagnostics.read` |
 | `/v1/diagnostics/` | record, increment | `diagnostics.write` |
-| `/v1/pairing/` | identity, pending, list_clients, approve_pin, unpair | `pairing.admin` |
+| `/v1/pairing/` | identity, pending, list_clients, approve_pin, unpair, update_client_config_overrides, update_client_permissions, set_permission_mode | `pairing.admin` |
 | `/v1/display/` | status, enumerate | `display.read` |
 | `/v1/display/` | apply, restore, recover | `display.write` |
 | `/v1/capture/` | select_portal_source, cancel_portal_selection | `capture.write` |
@@ -281,6 +281,8 @@ Pairing routes require **`pairing.admin`** even for public identity and metadata
 | `/v1/pairing/list_clients` | `{}` |
 | `/v1/pairing/approve_pin` | `{"pairing_id":"<pending id>","pin":"0123"}` |
 | `/v1/pairing/unpair` | `{"certificate_id":"<64 hex fingerprint>","expected_revision":7}` (revision optional for legacy clients) |
+| `/v1/pairing/update_client_permissions` | `{"certificate_id":"<64 hex fingerprint>","expected_revision":7,"permissions":{"list_apps":true,"view_streams":true,"launch_apps":false,"terminate_streams":false}}` |
+| `/v1/pairing/set_permission_mode` | `{"enabled":true,"expected_revision":7}` |
 
 The PIN must be a four-digit string, preserving leading zeros. Initialize/import
 of host identity and direct client trust imports remain trusted-console-only.

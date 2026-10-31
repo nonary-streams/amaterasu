@@ -178,6 +178,10 @@ pub struct PeerIdentity {
 }
 
 impl PeerIdentity {
+    pub(crate) fn certificate(&self) -> &[u8] {
+        &self.certificate
+    }
+
     pub fn new(remote: IpAddr, certificate: Vec<u8>) -> Result<Self, &'static str> {
         if invalid_peer(remote)
             || certificate.is_empty()
@@ -1642,6 +1646,7 @@ fn success_reply(record: &Record) -> Reply {
     }
     let mut reply = xml::response(200, "OK", &fields);
     reply.requires_paired_tls = true;
+    reply.permission = Some(crate::wire::Permission::Launch);
     reply
 }
 

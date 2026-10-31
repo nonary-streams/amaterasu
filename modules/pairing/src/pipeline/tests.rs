@@ -52,6 +52,7 @@ struct Harness {
     revision: u64,
     incoming: Option<Response>,
     state_reply: Option<Response>,
+    recovery_reply: Option<Response>,
     output: Option<Value>,
     writes: usize,
     fail_write: bool,
@@ -67,6 +68,7 @@ impl Harness {
             revision: 0,
             incoming: None,
             state_reply: None,
+            recovery_reply: None,
             output: None,
             writes: 0,
             fail_write: false,
@@ -99,6 +101,13 @@ impl Harness {
                     return Ok(Response::Accepted { id: 70 });
                 }
                 assert_eq!(service, STATE_SERVICE);
+                if parent.is_none() {
+                    assert_eq!(payload["action"], "get");
+                    self.recovery_reply = Some(Response::Result {
+                        payload: json!({"ok":true,"revision":self.revision,"found":self.document.is_some(),"value":self.document}),
+                    });
+                    return Ok(Response::Accepted { id: 51 });
+                }
                 assert_eq!(parent, Some(7));
                 assert_eq!(payload["key"], STATE_KEY);
                 let response = if payload["action"] == "get" {
@@ -143,6 +152,9 @@ impl Harness {
                 };
                 self.state_reply = Some(Response::Result { payload: response });
                 Response::Accepted { id: 50 }
+            }
+            Command::TakeResult { request: 51 } => {
+                self.recovery_reply.take().unwrap_or(Response::Pending)
             }
             Command::TakeResult { request: 50 } => {
                 self.state_reply.take().unwrap_or(Response::Pending)
@@ -3089,4 +3101,227 @@ fn missing_configured_identity_provisioning_yields_ticks_and_invalidates_stale_t
     ));
     assert_eq!(harness.state_writes, 0);
     fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn certificate_permissions_are_administered_with_revision_and_survive_restart() {
+    let mut state = Harness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.initialize(&mut pipeline);
+    import_client(&mut state, &mut pipeline, "moonlight", CLIENT_CERT);
+    let listed = state.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"list_clients"}),
+        now(),
+    );
+    assert_eq!(listed["permission_mode_enabled"], false);
+    let certificate_id = listed["clients"][0]["certificate_id"].clone();
+    let revision = listed["revision"].as_u64().unwrap();
+    let permissions =
+        json!({"list_apps":true,"view_streams":true,"launch_apps":false,"terminate_streams":false});
+    let update = json!({"action":"update_client_permissions","certificate_id":certificate_id,"permissions":permissions,"expected_revision":revision});
+    assert_eq!(
+        state.request(&mut pipeline, "nvhttp", update.clone(), now())["code"],
+        "forbidden"
+    );
+    assert_eq!(
+        state.request(&mut pipeline, "console", update.clone(), now())["ok"],
+        true
+    );
+    assert_eq!(
+        state.request(&mut pipeline, "console", update, now())["code"],
+        "revision_conflict"
+    );
+    let mode =
+        json!({"action":"set_permission_mode","enabled":true,"expected_revision":state.revision});
+    assert_eq!(
+        state.request(&mut pipeline, "console", mode, now())["ok"],
+        true
+    );
+    let mut restarted = Pipeline::new(settings());
+    let checked = check_client(&mut state, &mut restarted, CLIENT_CERT);
+    assert_eq!(checked["permissions"], permissions);
+    assert_eq!(checked["permission_mode_enabled"], true);
+    assert_eq!(checked["certificate_id"], certificate_id);
+}
+
+#[test]
+fn old_pairing_documents_default_to_full_client_permissions_and_disabled_mode() {
+    let document = stored_document_with_fixture_identity(paired_fixture_client());
+    let parsed: crate::protocol::Document = serde_json::from_value(document).unwrap();
+    assert!(!parsed.permission_mode_enabled);
+    assert_eq!(
+        parsed.clients[0].permissions,
+        crate::protocol::ClientPermissions::default()
+    );
+}
+
+#[test]
+fn permission_write_suspends_authority_until_acknowledged_or_refreshed() {
+    use amaterasu_identity::{IDENTITY_FORBIDDEN, PERMISSION_LAUNCH};
+    let (mut pipeline, mut harness, certificate_id) = paired_native_client();
+    let client = crypto_certificate_der(CLIENT_CERT);
+    let mode =
+        json!({"action":"set_permission_mode","enabled":true,"expected_revision":harness.revision});
+    assert_eq!(
+        harness.request(&mut pipeline, "console", mode, now())["ok"],
+        true
+    );
+    let old = pipeline.identity.get(now()).unwrap();
+    assert_eq!(
+        old.check_permission(&client, now(), PERMISSION_LAUNCH),
+        Ok(())
+    );
+    harness.enqueue("console", json!({
+        "action":"update_client_permissions", "certificate_id":certificate_id,
+        "permissions":{"list_apps":true,"view_streams":true,"launch_apps":false,"terminate_streams":false},
+        "expected_revision":harness.revision
+    }));
+    pipeline
+        .tick_at(now(), |command| harness.send(command))
+        .unwrap();
+    assert!(!pipeline.identity.current(&old, now()));
+    assert!(pipeline.identity.get(now()).is_err());
+    pipeline
+        .tick_at(now(), |command| harness.send(command))
+        .unwrap();
+    assert!(pipeline.identity.get(now()).is_err());
+    pipeline
+        .tick_at(now(), |command| harness.send(command))
+        .unwrap();
+    let committed = pipeline.identity.get(now()).unwrap();
+    assert_eq!(
+        committed.check_permission(&client, now(), PERMISSION_LAUNCH),
+        Err(IDENTITY_FORBIDDEN)
+    );
+
+    harness.fail_write = true;
+    let mode = json!({"action":"set_permission_mode","enabled":false,"expected_revision":harness.revision});
+    assert_eq!(
+        harness.request(&mut pipeline, "console", mode, now())["ok"],
+        false
+    );
+    assert!(pipeline.identity.get(now()).is_err());
+    assert_eq!(
+        harness.request(
+            &mut pipeline,
+            "nvhttp",
+            json!({"action":"check_client_certificate","certificate_pem":CLIENT_CERT}),
+            now()
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        pipeline
+            .identity
+            .get(now())
+            .unwrap()
+            .check_permission(&client, now(), PERMISSION_LAUNCH),
+        Err(IDENTITY_FORBIDDEN)
+    );
+}
+
+#[test]
+fn uncertain_write_recovers_committed_permissions_without_foreground_requests() {
+    use amaterasu_identity::{IDENTITY_FORBIDDEN, PERMISSION_LAUNCH};
+    let (mut pipeline, mut harness, certificate_id) = paired_native_client();
+    let client = crypto_certificate_der(CLIENT_CERT);
+    // Simulate a different committed policy followed by an uncertain write result.
+    let stored = harness.document.as_mut().unwrap();
+    stored["permission_mode_enabled"] = json!(true);
+    stored["clients"][0]["permissions"] =
+        json!({"list_apps":true,"view_streams":true,"launch_apps":false,"terminate_streams":false});
+    harness.revision += 1;
+    harness.fail_write = true;
+    let request = json!({"action":"update_client_permissions","certificate_id":certificate_id,"permissions":{"list_apps":true,"view_streams":true,"launch_apps":true,"terminate_streams":true},"expected_revision":harness.revision});
+    assert_eq!(
+        harness.request(&mut pipeline, "console", request, now())["ok"],
+        false
+    );
+    assert!(pipeline.identity.get(now()).is_err());
+    pipeline
+        .tick_at(now(), |command| harness.send(command))
+        .unwrap();
+    assert!(pipeline.identity.get(now()).is_err());
+    pipeline
+        .tick_at(now(), |command| harness.send(command))
+        .unwrap();
+    assert_eq!(
+        pipeline
+            .identity
+            .get(now())
+            .unwrap()
+            .check_permission(&client, now(), PERMISSION_LAUNCH),
+        Err(IDENTITY_FORBIDDEN)
+    );
+}
+
+#[test]
+fn recovery_read_overlapped_by_permission_write_cannot_restore_old_policy() {
+    use amaterasu_identity::{IDENTITY_FORBIDDEN, PERMISSION_LAUNCH};
+    let (mut pipeline, mut harness, certificate_id) = paired_native_client();
+    let client = crypto_certificate_der(CLIENT_CERT);
+    harness.fail_write = true;
+    let mode =
+        json!({"action":"set_permission_mode","enabled":true,"expected_revision":harness.revision});
+    assert_eq!(
+        harness.request(&mut pipeline, "console", mode.clone(), now())["ok"],
+        false
+    );
+    pipeline
+        .tick_at(now(), |command| harness.send(command))
+        .unwrap();
+    assert!(harness.recovery_reply.is_some());
+    harness.fail_write = false;
+    assert_eq!(
+        harness.request(&mut pipeline, "console", mode, now())["ok"],
+        true
+    );
+    let update = json!({"action":"update_client_permissions","certificate_id":certificate_id,"permissions":{"list_apps":true,"view_streams":true,"launch_apps":false,"terminate_streams":false},"expected_revision":harness.revision});
+    assert_eq!(
+        harness.request(&mut pipeline, "console", update, now())["ok"],
+        true
+    );
+    pipeline
+        .tick_at(now(), |command| harness.send(command))
+        .unwrap();
+    assert!(harness.recovery_reply.is_none());
+    assert_eq!(
+        pipeline
+            .identity
+            .get(now())
+            .unwrap()
+            .check_permission(&client, now(), PERMISSION_LAUNCH),
+        Err(IDENTITY_FORBIDDEN)
+    );
+}
+
+#[test]
+fn uncertain_write_recovery_observes_committed_unpair() {
+    let (mut pipeline, mut harness, _) = paired_native_client();
+    let client = crypto_certificate_der(CLIENT_CERT);
+    harness.document.as_mut().unwrap()["clients"] = json!([]);
+    harness.revision += 1;
+    harness.fail_write = true;
+    let mode =
+        json!({"action":"set_permission_mode","enabled":true,"expected_revision":harness.revision});
+    assert_eq!(
+        harness.request(&mut pipeline, "console", mode, now())["ok"],
+        false
+    );
+    assert!(pipeline.identity.get(now()).is_err());
+    pipeline
+        .tick_at(now(), |command| harness.send(command))
+        .unwrap();
+    pipeline
+        .tick_at(now(), |command| harness.send(command))
+        .unwrap();
+    assert!(
+        !pipeline
+            .identity
+            .get(now())
+            .unwrap()
+            .verify_client(&client, now())
+    );
 }

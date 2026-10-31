@@ -77,6 +77,15 @@ pub enum Operation {
         config_overrides: Box<ClientConfigOverrides>,
         expected_revision: u64,
     },
+    UpdateClientPermissions {
+        certificate_id: String,
+        permissions: ClientPermissions,
+        expected_revision: u64,
+    },
+    SetPermissionMode {
+        enabled: bool,
+        expected_revision: u64,
+    },
     CheckClientCertificate {
         certificate_pem: String,
     },
@@ -153,6 +162,7 @@ impl Operation {
                 config_overrides,
                 expected_revision: _,
             } => hex_length(certificate_id, 32) && config_overrides.validate().is_ok(),
+            Self::UpdateClientPermissions { certificate_id, .. } => hex_length(certificate_id, 32),
             Self::CheckClientCertificate { certificate_pem }
             | Self::UnpairPresentedClient { certificate_pem } => certificate_pem.len() <= 4096,
             _ => true,
@@ -173,6 +183,8 @@ impl Operation {
                 | Self::Unpair { .. }
                 | Self::UnpairPresentedClient { .. }
                 | Self::UpdateClientConfigOverrides { .. }
+                | Self::UpdateClientPermissions { .. }
+                | Self::SetPermissionMode { .. }
         )
     }
 
@@ -196,6 +208,8 @@ impl Operation {
                 | Self::ListClients {}
                 | Self::Unpair { .. }
                 | Self::UpdateClientConfigOverrides { .. }
+                | Self::UpdateClientPermissions { .. }
+                | Self::SetPermissionMode { .. }
         )
     }
 }
@@ -205,6 +219,8 @@ impl Operation {
 pub struct Document {
     pub identity: Option<Identity>,
     pub clients: Vec<Client>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub permission_mode_enabled: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -221,8 +237,44 @@ pub struct Client {
     pub name: String,
     pub certificate_pem: String,
     pub paired_at: u64,
+    #[serde(default, skip_serializing_if = "ClientPermissions::is_default")]
+    pub permissions: ClientPermissions,
     #[serde(default, skip_serializing_if = "ClientConfigOverrides::is_empty")]
     pub config_overrides: ClientConfigOverrides,
+}
+
+/// Certificate-bound privileges. Missing legacy metadata retains full access.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientPermissions {
+    pub list_apps: bool,
+    pub view_streams: bool,
+    pub launch_apps: bool,
+    pub terminate_streams: bool,
+}
+impl Default for ClientPermissions {
+    fn default() -> Self {
+        Self {
+            list_apps: true,
+            view_streams: true,
+            launch_apps: true,
+            terminate_streams: true,
+        }
+    }
+}
+impl ClientPermissions {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn subsequent_client() -> Self {
+        Self {
+            list_apps: true,
+            view_streams: true,
+            launch_apps: false,
+            terminate_streams: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

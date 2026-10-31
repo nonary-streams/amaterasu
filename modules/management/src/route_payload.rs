@@ -3787,6 +3787,46 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
             }
             Ok(())
         }
+        "update_client_permissions" => {
+            fields(
+                object,
+                &["certificate_id", "expected_revision", "permissions"],
+                &[],
+            )?;
+            let certificate_id = text(object, "certificate_id")?;
+            if certificate_id.len() != 64
+                || !certificate_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(INVALID);
+            }
+            unsigned_u64(object, "expected_revision")?;
+            let permissions = object
+                .get("permissions")
+                .and_then(Value::as_object)
+                .ok_or(INVALID)?;
+            let names = [
+                "list_apps",
+                "view_streams",
+                "launch_apps",
+                "terminate_streams",
+            ];
+            fields(permissions, &names, &[])?;
+            if names
+                .iter()
+                .any(|name| !permissions.get(*name).is_some_and(Value::is_boolean))
+            {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
+        "set_permission_mode" => {
+            fields(object, &["enabled", "expected_revision"], &[])?;
+            unsigned_u64(object, "expected_revision")?;
+            if !object.get("enabled").is_some_and(Value::is_boolean) {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
         "update_client_config_overrides" => {
             fields(
                 object,

@@ -1623,6 +1623,8 @@ mod tests {
             assert!(!allowed(role, "/v1/application/launch"));
             assert!(!allowed(role, "/v1/application/terminate"));
             assert!(!allowed(role, "/v1/pairing/list_clients"));
+            assert!(!allowed(role, "/v1/pairing/update_client_permissions"));
+            assert!(!allowed(role, "/v1/pairing/set_permission_mode"));
             assert!(!allowed(role, "/v1/host-logs/open"));
             assert!(!allowed(role, "/v1/host-logs/export_start"));
             assert!(!allowed(role, "/v1/tokens/issue"));
@@ -1639,6 +1641,11 @@ mod tests {
         assert!(allowed("operator", "/v1/nvhttp/launch_status"));
         assert!(allowed("operator", "/v1/nvhttp/stop_launch"));
         assert!(allowed("administrator", "/v1/pairing/list_clients"));
+        assert!(allowed(
+            "administrator",
+            "/v1/pairing/update_client_permissions"
+        ));
+        assert!(allowed("administrator", "/v1/pairing/set_permission_mode"));
         assert!(allowed("administrator", "/v1/host-logs/open"));
         assert!(allowed("administrator", "/v1/host-logs/export_start"));
         assert!(allowed("administrator", "/v1/tokens/issue"));

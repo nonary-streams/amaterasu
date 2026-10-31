@@ -134,6 +134,7 @@ mod tests {
                 private_key_pem: HOST_KEY.into(),
             }),
             clients: Vec::new(),
+            permission_mode_enabled: false,
         }
     }
 
