@@ -136,7 +136,7 @@ impl ApiRegistry {
             }
             approvals.push(approval.clone());
             // Bound serialized output, including schemas controlled by installed policy.
-            if serde_json::to_vec(&approvals).map_or(true, |bytes| bytes.len() > 12_000) {
+            if serde_json::to_vec(&approvals).map_or(true, |bytes| bytes.len() > 11_500) {
                 approvals.pop();
                 if approvals.is_empty() {
                     return Response::error(

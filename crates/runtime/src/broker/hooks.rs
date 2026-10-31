@@ -45,7 +45,38 @@ impl HookInvocation {
         requests: &mut RequestRouter,
         registered: &BTreeSet<(String, String)>,
     ) -> Response {
-        if now >= self.deadline {
+        if let Some(participant) = self.active_participant.take() {
+            let mut result = requests.result(&self.owner, participant.request_id);
+            if matches!(result, Response::Pending) {
+                self.active_participant = Some(participant);
+                if now < self.deadline {
+                    return Response::Pending;
+                }
+            } else {
+                requests.release(&self.owner, participant.request_id);
+                if self.cleanup {
+                    if matches!(&result, Response::Error { code, .. } if code == "deadline_exceeded")
+                    {
+                        result =
+                            Response::error("deadline_exceeded", "participant outcome is unknown");
+                    }
+                    self.outcomes.push(HookOutcome {
+                        participant: participant.name,
+                        result: Box::new(result),
+                    });
+                } else if let Response::Result { payload } = result {
+                    self.proposals.push(Proposal {
+                        participant: participant.name,
+                        payload,
+                    });
+                } else {
+                    return result;
+                }
+            }
+        }
+        if now >= self.deadline
+            && (self.active_participant.is_some() || !self.remaining_participants.is_empty())
+        {
             if self.cleanup {
                 if let Some(participant) = self.active_participant.as_ref() {
                     self.outcomes.push(HookOutcome {
@@ -75,27 +106,6 @@ impl HookInvocation {
             }
             self.cancel_active(now, requests);
             return Response::error("deadline_exceeded", "hook deadline elapsed");
-        }
-        if let Some(participant) = self.active_participant.take() {
-            let result = requests.result(&self.owner, participant.request_id);
-            if matches!(result, Response::Pending) {
-                self.active_participant = Some(participant);
-                return Response::Pending;
-            }
-            requests.release(&self.owner, participant.request_id);
-            if self.cleanup {
-                self.outcomes.push(HookOutcome {
-                    participant: participant.name,
-                    result: Box::new(result),
-                });
-            } else if let Response::Result { payload } = result {
-                self.proposals.push(Proposal {
-                    participant: participant.name,
-                    payload,
-                });
-            } else {
-                return result;
-            }
         }
         while let Some(participant) = self.remaining_participants.pop_front() {
             let response = if !registered.contains(&(self.hook_name.clone(), participant.clone())) {

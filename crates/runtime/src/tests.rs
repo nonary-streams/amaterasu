@@ -1978,3 +1978,53 @@ fn cleanup_deadline_reports_unknown_and_unattempted_participants() {
         matches!(&*outcomes[1].result, Response::Error { message, .. } if message.contains("not attempted"))
     );
 }
+
+#[test]
+fn completed_hook_result_survives_a_poll_after_the_deadline() {
+    let mut broker = test_broker();
+    broker.dispatch(
+        "provider",
+        Command::RegisterHook {
+            hook: "prepare/1".into(),
+        },
+    );
+    let now = Instant::now();
+    let invocation = accepted_id(broker.dispatch_at(
+        "client",
+        Command::RunHookOperation {
+            hook: "prepare/1".into(),
+            payload: json!({}),
+            operation_id: "delayed.poll".into(),
+            cleanup: true,
+        },
+        now,
+    ));
+    assert!(matches!(
+        broker.dispatch_at("client", Command::HookResult { invocation }, now),
+        Response::Pending
+    ));
+    let Response::Request { id, .. } = broker.dispatch_at("provider", Command::Poll {}, now) else {
+        panic!()
+    };
+    assert!(matches!(
+        broker.dispatch_at(
+            "provider",
+            Command::Complete {
+                request: id,
+                payload: json!({"released":true})
+            },
+            now + Duration::from_millis(50)
+        ),
+        Response::Ok
+    ));
+    let Response::HookCleanupResult { outcomes } = broker.dispatch_at(
+        "client",
+        Command::HookResult { invocation },
+        now + Duration::from_millis(101),
+    ) else {
+        panic!()
+    };
+    assert!(
+        matches!(&*outcomes[0].result, Response::Result { payload } if payload == &json!({"released":true}))
+    );
+}
