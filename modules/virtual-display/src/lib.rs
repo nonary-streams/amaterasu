@@ -45,15 +45,24 @@ impl ManagedModule for VirtualDisplayModule {
         };
         let settings: Settings =
             serde_json::from_value(payload).map_err(|_| "invalid virtual display settings")?;
-        runtime.require_success(Command::Register {
+        let legacy_registered = match runtime.send(Command::Register {
             service: SERVICE.into(),
-        })?;
-        // Older compositions do not approve the optional versioned service.
-        // A denied registration leaves the existing /1 alias fully available.
-        match display::register(&runtime) {
-            Ok(()) => {}
-            Err(ServiceError::Broker { code, .. }) if code == "permission_denied" => {}
+        })? {
+            Response::Ok => true,
+            Response::Error { code, .. } if code == "permission_denied" => false,
+            response => {
+                return Err(format!(
+                    "legacy virtual display registration failed: {response:?}"
+                ));
+            }
+        };
+        let typed_registered = match display::register(&runtime) {
+            Ok(()) => true,
+            Err(ServiceError::Broker { code, .. }) if code == "permission_denied" => false,
             Err(error) => return Err(format!("virtual display API registration failed: {error}")),
+        };
+        if !legacy_registered && !typed_registered {
+            return Err("no virtual display service was approved for this provider".into());
         }
         #[cfg(amaterasu_libvirtualdisplay)]
         let manager = linux_manager::Manager::start(settings)?;
@@ -160,3 +169,6 @@ fn handle_display_api<B: service_adapter::Backend>(
         Err(error) => Err(error.to_string()),
     }
 }
+
+#[cfg(test)]
+mod startup_tests;

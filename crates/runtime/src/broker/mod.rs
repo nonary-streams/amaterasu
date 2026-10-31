@@ -224,8 +224,22 @@ impl Broker {
                 {
                     return errors::permission_denied();
                 }
+                let selected_here = self
+                    .configuration
+                    .service_selections
+                    .broker
+                    .get(&method.service)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|selection| selection.provider == caller);
                 let registered = self.api.register(caller, grants, method.clone());
-                if registered.is_error() {
+                if matches!(&registered, Response::Error { code, .. } if code == "permission_denied")
+                    && selected_here
+                {
+                    Response::error(
+                        "incompatible_api",
+                        "the selected provider method is not approved",
+                    )
+                } else if registered.is_error() {
                     registered
                 } else {
                     self.requests

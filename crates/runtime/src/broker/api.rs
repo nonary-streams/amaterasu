@@ -52,15 +52,30 @@ impl ApiRegistry {
 
     pub fn register(&mut self, caller: &str, grants: &Grants, method: ApiMethod) -> Response {
         let key = key(&method);
+        if !grants.provide.contains(&method.service) {
+            return permission_denied();
+        }
         let Some(approval) = self.approved.get(&key) else {
-            return permission_denied();
+            // Disclose a mismatch only to the approved provider of this service.
+            return if self.approved.values().any(|approval| {
+                approval.provider == caller && approval.method.service == method.service
+            }) {
+                Response::error(
+                    "incompatible_api",
+                    "the provider method does not match its installed approval",
+                )
+            } else {
+                permission_denied()
+            };
         };
-        if approval.provider != caller
-            || approval.method != method
-            || approval.method.privilege != ApiPrivilege::User
-            || !grants.provide.contains(&method.service)
-        {
+        if approval.provider != caller || approval.method.privilege != ApiPrivilege::User {
             return permission_denied();
+        }
+        if approval.method != method {
+            return Response::error(
+                "incompatible_api",
+                "the provider method does not match its installed approval",
+            );
         }
         if self.registered.insert(key) {
             self.revision += 1;

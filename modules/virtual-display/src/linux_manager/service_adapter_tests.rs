@@ -35,6 +35,47 @@ unsafe extern "C" fn invoke(context: *mut c_void, input: BorrowedBytes, reply: R
     unsafe { reply.send(&bytes) };
     STATUS_OK
 }
+struct CancelCompletionEndpoint {
+    broker: Arc<Mutex<Broker>>,
+    request_id: u64,
+}
+unsafe extern "C" fn cancel_completion_invoke(
+    context: *mut c_void,
+    input: BorrowedBytes,
+    reply: ReplySink,
+) -> i32 {
+    // SAFETY: the endpoint and input remain valid for the synchronous invocation.
+    let endpoint = unsafe { &*context.cast::<CancelCompletionEndpoint>() };
+    let command: Command = serde_json::from_slice(unsafe { input.read().unwrap() }).unwrap();
+    let mut broker = endpoint.broker.lock().unwrap();
+    if matches!(command, Command::Complete { request, .. } if request == endpoint.request_id) {
+        assert!(matches!(
+            broker.dispatch(
+                "alice",
+                Command::Cancel {
+                    request: endpoint.request_id
+                }
+            ),
+            amaterasu_contracts::Response::Ok
+        ));
+    }
+    let result = broker.dispatch("provider", command);
+    let bytes = serde_json::to_vec(&result).unwrap();
+    // SAFETY: the sink copies the bytes before returning.
+    unsafe { reply.send(&bytes) };
+    STATUS_OK
+}
+fn cancellation_client(endpoint: &CancelCompletionEndpoint) -> RuntimeClient {
+    let host = HostApi {
+        header: AbiHeader::of::<HostApi>(),
+        context: (endpoint as *const CancelCompletionEndpoint)
+            .cast_mut()
+            .cast(),
+        invoke: cancel_completion_invoke,
+    };
+    // SAFETY: the endpoint remains alive throughout the injected invocation.
+    unsafe { RuntimeClient::from_endpoint(host) }
+}
 fn client(endpoint: &Endpoint) -> RuntimeClient {
     let host = HostApi {
         header: AbiHeader::of::<HostApi>(),
@@ -286,6 +327,41 @@ fn production_linux_manager_routes_fenced_requests_to_fake_worker_via_broker() {
         ),
         Reply::Conflict
     );
+    // A cancelled conflict never admitted new work and must not poison the
+    // existing successful operation's recovery record.
+    let mut cancelled_conflict = create(first.clone(), "first", initial.clone());
+    if let Request::Create { name, .. } = &mut cancelled_conflict {
+        *name = "Conflict again".into();
+    }
+    let call = display::call(&alice, options("cancel-conflict"), cancelled_conflict).unwrap();
+    let incoming = provider.poll_serialized().unwrap().unwrap();
+    let fault = CancelCompletionEndpoint {
+        broker: p.broker.clone(),
+        request_id: call.id(),
+    };
+    crate::handle_display_api(
+        &cancellation_client(&fault),
+        &mut manager,
+        &mut adapter,
+        incoming,
+    )
+    .unwrap();
+    assert!(call.poll().is_err());
+    assert!(call.release().is_ok());
+    assert_eq!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "recover-after-conflict",
+            Request::Recover {
+                owner: first.clone(),
+                operation_id: "first".into()
+            }
+        ),
+        ready
+    );
+    assert!(observed.try_recv().is_err());
     assert_eq!(
         exchange(
             &mut manager,

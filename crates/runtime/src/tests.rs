@@ -858,7 +858,7 @@ fn installed_user_api_methods_enforce_identity_schema_version_and_raw_route_bloc
     altered.request.allow_extra = true;
     assert_error_code(
         broker.dispatch(provider, Command::RegisterApi { method: altered }),
-        "permission_denied",
+        "incompatible_api",
     );
     assert_error_code(
         broker.dispatch(
