@@ -4,6 +4,8 @@
 //! obligations before exposing outputs or dispatching dependent calls. Installed
 //! schema validation and active-resource reobservation are external prerequisites;
 //! this module never treats serialized provider data as authorization.
+use crate::adapter::SchemaDocument;
+use crate::prepare_authority::{ControlPolicy, FinalizePolicy, MethodApproval};
 use amaterasu_extension_api::{
     LifecycleTarget, ResourceAccess, ResourceOutput, ResourcePlan, SchemaRef,
 };
@@ -34,10 +36,110 @@ pub struct StoredOutput {
     pub state: OutputState,
 }
 
+/// Frozen installed selection, broker approvals and exact upstream provenance.
+/// The live coordinator must still recheck current grants, graph and observations.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompositionSelectionSnapshot {
+    pub target: LifecycleTarget,
+    pub transition_id: String,
+    pub input: StoredOutput,
+    pub control_policy: ControlPolicy,
+    pub finalize_policy: FinalizePolicy,
+    pub control_approval: MethodApproval,
+    pub control_status_approval: MethodApproval,
+    pub finalize_approval: MethodApproval,
+    pub finalize_status_approval: MethodApproval,
+    pub schema_documents: Vec<SchemaDocument>,
+}
+
+impl CompositionSelectionSnapshot {
+    /// This checks internal consistency, not current authority or live state.
+    pub fn validate_structure(&self) -> bool {
+        let policy = &self.control_policy;
+        let finalize = &self.finalize_policy;
+        let output = &self.input.output;
+        if !valid_target(&self.target)
+            || !valid_text(&self.transition_id)
+            || self.input.state != OutputState::Retained
+            || !valid_stored(&self.input)
+            || !target_allows(&output.origin, &self.target)
+            || policy.owner_provider != output.producer
+            || policy.owner_service != output.producer_service
+            || policy.output_capability != output.capability
+            || policy.output_schema != output.schema
+            || finalize.owner_provider != output.producer
+            || finalize.owner_service != output.producer_service
+            || finalize.output_capability != output.capability
+            || finalize.output_schema != output.schema
+            || !approval_matches(
+                &self.control_approval,
+                &policy.owner_provider,
+                &policy.owner_method,
+            )
+            || !approval_matches(
+                &self.finalize_approval,
+                &finalize.owner_provider,
+                &finalize.method,
+            )
+            || !approval_is_valid(&self.control_status_approval, &policy.owner_provider)
+            || !approval_is_valid(&self.finalize_status_approval, &policy.owner_provider)
+            || self.schema_documents.len() > 32
+            || self
+                .schema_documents
+                .iter()
+                .map(|schema| schema.document.len())
+                .sum::<usize>()
+                > 12_000
+        {
+            return false;
+        }
+        let catalog = amaterasu_extension_api::schemas::SchemaCatalog::compile(
+            self.schema_documents
+                .iter()
+                .map(|doc| (doc.reference.clone(), doc.document.as_str())),
+        );
+        catalog.is_ok_and(|catalog| {
+            catalog.contains(&policy.argument_schema)
+                && catalog.validate(&output.schema, &output.data).is_ok()
+        })
+    }
+}
+
+fn approval_is_valid(approval: &MethodApproval, provider: &str) -> bool {
+    let method = &approval.method;
+    let data = &approval.broker_approval;
+    valid_text(&method.service)
+        && valid_text(&method.method)
+        && method.interface_major != 0
+        && method.schema_revision != 0
+        && data["provider"].as_str() == Some(provider)
+        && data["method"]["service"].as_str() == Some(&method.service)
+        && data["method"]["method"].as_str() == Some(&method.method)
+        && data["method"]["interface_major"].as_u64() == Some(u64::from(method.interface_major))
+        && data["method"]["interface_minor"].as_u64() == Some(u64::from(method.interface_minor))
+}
+fn approval_matches(
+    approval: &MethodApproval,
+    provider: &str,
+    expected: &amaterasu_extension_api::MethodRef,
+) -> bool {
+    let method = &approval.method;
+    approval_is_valid(approval, provider)
+        && method.service == expected.service
+        && method.method == expected.method
+        && method.interface_major == expected.interface_major
+        && method.interface_minor == expected.interface_minor
+        && method.schema_revision == expected.schema_revision
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompositionBook {
     outputs: Vec<StoredOutput>,
+    /// Selected dependencies and approvals survive completed work and pause.
+    #[serde(default)]
+    selections: Vec<CompositionSelectionSnapshot>,
 }
 
 /// A policy-selected direct dependency. Schema is immutable and pinned by digest.
@@ -60,12 +162,23 @@ impl CompositionBook {
     /// Structural checks do not authorize outputs or validate schema semantics.
     pub fn validate_structure(&self) -> bool {
         self.outputs.len() <= MAX_OUTPUTS
+            && self.selections.len() <= MAX_OUTPUTS
             && self.outputs.iter().enumerate().all(|(index, item)| {
                 valid_stored(item)
                     && !self.outputs[..index]
                         .iter()
                         .any(|old| same_key(&old.output, &item.output))
             })
+            && self
+                .selections
+                .iter()
+                .enumerate()
+                .all(|(index, selection)| {
+                    selection.validate_structure()
+                        && !self.selections[..index]
+                            .iter()
+                            .any(|old| same_selection(old, selection))
+                })
     }
 
     pub fn records(&self) -> impl Iterator<Item = &StoredOutput> {
@@ -76,6 +189,66 @@ impl CompositionBook {
         self.outputs
             .iter()
             .any(|item| item.admission_id == admission_id)
+            || self
+                .selections
+                .iter()
+                .any(|selection| selection.input.admission_id == admission_id)
+    }
+
+    pub fn selections(&self) -> impl Iterator<Item = &CompositionSelectionSnapshot> {
+        self.selections.iter()
+    }
+
+    /// The verifier must resolve policy, graph edges, all method approvals and
+    /// schemas from installed policy and broker state. Persist before dispatch.
+    pub fn record_selection(
+        &mut self,
+        selection: CompositionSelectionSnapshot,
+        verify_installed: &impl Fn(&CompositionSelectionSnapshot) -> bool,
+    ) -> Result<(), &'static str> {
+        if !selection.validate_structure()
+            || !verify_installed(&selection)
+            || self.get(
+                &selection.input.output.producer,
+                &selection.input.output.output_id,
+                &selection.input.output.origin,
+            ) != Some(&selection.input)
+        {
+            return Err("invalid_composition_selection");
+        }
+        if let Some(old) = self
+            .selections
+            .iter()
+            .find(|old| same_selection(old, &selection))
+        {
+            return if old == &selection {
+                Ok(())
+            } else {
+                Err("composition_selection_conflict")
+            };
+        }
+        if self.selections.len() >= MAX_OUTPUTS {
+            return Err("composition_selection_capacity");
+        }
+        self.selections.push(selection);
+        Ok(())
+    }
+
+    pub fn selection(
+        &self,
+        target: &LifecycleTarget,
+        transition_id: &str,
+        dependent: &str,
+        owner: &str,
+        output_id: &str,
+    ) -> Option<&CompositionSelectionSnapshot> {
+        self.selections.iter().find(|item| {
+            &item.target == target
+                && item.transition_id == transition_id
+                && item.control_policy.dependent_provider == dependent
+                && item.input.output.producer == owner
+                && item.input.output.output_id == output_id
+        })
     }
 
     /// Verify the response against the exact selected producer and admitted
@@ -206,6 +379,12 @@ impl CompositionBook {
 fn same_key(a: &ResourceOutput, b: &ResourceOutput) -> bool {
     a.producer == b.producer && a.output_id == b.output_id && a.origin == b.origin
 }
+fn same_selection(a: &CompositionSelectionSnapshot, b: &CompositionSelectionSnapshot) -> bool {
+    a.target == b.target
+        && a.transition_id == b.transition_id
+        && a.control_policy.dependent_provider == b.control_policy.dependent_provider
+        && same_key(&a.input.output, &b.input.output)
+}
 fn valid_text(value: &str) -> bool {
     !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
 }
@@ -335,7 +514,7 @@ fn target_allows(origin: &LifecycleTarget, target: &LifecycleTarget) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     fn target() -> LifecycleTarget {
         LifecycleTarget::Session {
@@ -439,5 +618,65 @@ mod tests {
         }))
         .unwrap();
         assert!(super::super::validate_journal(&journal).is_err());
+    }
+
+    #[test]
+    fn selection_pins_output_schemas_and_broker_approvals() {
+        use sha2::{Digest, Sha256};
+        let document = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"screen/1","type":"object"}"#;
+        let mut stored = record();
+        stored.output.schema.digest = format!("{:x}", Sha256::digest(document.as_bytes()));
+        let schema = stored.output.schema.clone();
+        let method = json!({"service":"screen/1","method":"control","interface_major":1,"interface_minor":0,"schema_revision":1});
+        let status = json!({"service":"screen/1","method":"status","interface_major":1,"interface_minor":0,"schema_revision":1});
+        let approval = |m: &Value| {
+            serde_json::from_value::<MethodApproval>(
+                json!({"method":m,"broker_approval":{"provider":"screen","method":m}}),
+            )
+            .unwrap()
+        };
+        let policy: ControlPolicy = serde_json::from_value(json!({"dependent_provider":"settings","owner_provider":"screen","owner_service":"screen/1","owner_method":method,"argument_schema":schema,"output_capability":"screen","output_schema":schema,"max_access":"exclusive","mutation_domains":[]})).unwrap();
+        let finalize: FinalizePolicy = serde_json::from_value(json!({"owner_provider":"screen","owner_service":"screen/1","method":method,"output_capability":"screen","output_schema":schema,"capture_provider":"capture","selector_schema":"selector/1","required_access":"exclusive","mutation_domains":[]})).unwrap();
+        let snapshot = CompositionSelectionSnapshot {
+            target: target(),
+            transition_id: "consumer-transition".into(),
+            input: stored.clone(),
+            control_policy: policy,
+            finalize_policy: finalize,
+            control_approval: approval(&method),
+            control_status_approval: approval(&status),
+            finalize_approval: approval(&method),
+            finalize_status_approval: approval(&status),
+            schema_documents: vec![SchemaDocument {
+                reference: schema,
+                document: document.into(),
+            }],
+        };
+        assert!(snapshot.validate_structure());
+        let mut book = CompositionBook::default();
+        let selected = OutputSelection {
+            producer: stored.output.producer.clone(),
+            service: stored.output.producer_service.clone(),
+            capability: stored.output.capability.clone(),
+            schema: stored.output.schema.clone(),
+        };
+        book.record(stored, &selected, &target(), &|_| true)
+            .unwrap();
+        assert!(book.record_selection(snapshot.clone(), &|_| false).is_err());
+        book.record_selection(snapshot.clone(), &|_| true).unwrap();
+        let mut forged = snapshot;
+        forged.control_status_approval.broker_approval["provider"] = json!("other");
+        assert!(!forged.validate_structure());
+        book.fence_after_restart();
+        assert!(
+            book.selection(
+                &target(),
+                "consumer-transition",
+                "settings",
+                "screen",
+                "output"
+            )
+            .is_some()
+        );
     }
 }

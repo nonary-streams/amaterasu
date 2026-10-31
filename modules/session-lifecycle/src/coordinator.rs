@@ -347,6 +347,81 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                     )
                 )
         })
+        || journal.composition.selections().any(|selection| {
+            let Ok((epoch, session_id, stream_id, generation)) =
+                operations::target_parts(&selection.target)
+            else {
+                return true;
+            };
+            let Some(session) = journal.sessions.get(session_id) else {
+                return true;
+            };
+            if session.host_epoch != epoch {
+                return true;
+            }
+            let graph = match stream_id {
+                Some(stream_id) => {
+                    let Some(stream) = session.streams.get(stream_id) else {
+                        return true;
+                    };
+                    if stream.generation != generation {
+                        return true;
+                    }
+                    &stream.provider_graph
+                }
+                None => {
+                    if session.generation != generation {
+                        return true;
+                    }
+                    &session.provider_graph
+                }
+            };
+            let Some(graph) = graph else {
+                return true;
+            };
+            if !graph
+                .dependencies
+                .get(&selection.control_policy.dependent_provider)
+                .is_some_and(|deps| deps.contains(&selection.control_policy.owner_provider))
+            {
+                return true;
+            }
+            let output = &selection.input.output;
+            if let LifecycleTarget::Session {
+                generation: origin_generation,
+                ..
+            } = &output.origin
+                && *origin_generation != session.generation
+            {
+                return true;
+            }
+            let canonical = journal.composition.records().find(|record| {
+                record.output.producer == output.producer
+                    && record.output.output_id == output.output_id
+                    && record.output.origin == output.origin
+            });
+            if canonical.is_none_or(|record| {
+                record.output != *output
+                    || record.admission_id != selection.input.admission_id
+                    || record.transition_id != selection.input.transition_id
+                    || record.plan != selection.input.plan
+            }) {
+                return true;
+            }
+            !journal.receipts.values().any(|receipt| {
+                receipt.work.as_ref().is_some_and(|work| {
+                    work.target == selection.target && work.transition_id == selection.transition_id
+                }) || (receipt.response["transition_id"].as_str() == Some(&selection.transition_id)
+                    && receipt
+                        .response
+                        .get("target")
+                        .and_then(|value| {
+                            serde_json::from_value::<LifecycleTarget>(value.clone()).ok()
+                        })
+                        .as_ref()
+                        == Some(&selection.target))
+            })
+        })
         || !journal.inputs.validate()
         || journal.actions.validate().is_err()
         || journal

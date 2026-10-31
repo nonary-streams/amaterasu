@@ -6,6 +6,7 @@
 //! reply; never authorize effects if persistence has an uncertain outcome.
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 const MAX_OPERATIONS: usize = 1024;
@@ -124,9 +125,18 @@ struct ActionExecution {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ActionRebind {
+    old_token: String,
+    old_binding: ActionBinding,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Reservation {
     action_service: String,
     permit_token: String,
+    #[serde(default)]
+    rebind: Option<ActionRebind>,
     /// Set only when the running action is owned by a durable teardown.
     transition_id: Option<String>,
     transition_ready: bool,
@@ -174,6 +184,12 @@ fn valid_token(value: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
+fn canonical_plan_digest(plan: &amaterasu_extension_api::ResourcePlan) -> Option<String> {
+    let value = serde_json::to_value(plan).ok()?;
+    let bytes = serde_json::to_vec(&value).ok()?;
+    Some(format!("{:x}", Sha256::digest(bytes)))
+}
+
 fn valid_binding(binding: &ActionBinding) -> bool {
     valid_id(&binding.operation_id)
         && binding.target.valid()
@@ -248,6 +264,19 @@ impl ActionAuthority {
                         || (!execution.claimed && !execution.guard_nonces.is_empty())
                         || (execution.claimed && !reservation.transition_ready)
                 })
+                || reservation.rebind.as_ref().is_some_and(|old| {
+                    !valid_token(&old.old_token)
+                        || !valid_binding(&old.old_binding)
+                        || old.old_token == reservation.permit_token
+                        || key(&old.old_binding) != key(&reservation.binding)
+                        || old.old_binding.action_id != reservation.binding.action_id
+                        || old.old_binding.target != reservation.binding.target
+                        || reservation.transition_id.is_none()
+                        || reservation.execution.as_ref().is_none_or(|execution| {
+                            canonical_plan_digest(&execution.plan).as_deref()
+                                != Some(reservation.binding.plan_digest.as_str())
+                        })
+                })
                 || !tokens.insert(&reservation.permit_token)
                 || *stored_key != key(&reservation.binding)
             {
@@ -264,6 +293,13 @@ impl ActionAuthority {
                 | ReservationState::Failed { receipt }
                     if receipt_valid(receipt) => {}
                 _ => return Err(AuthorityError::InvalidState),
+            }
+        }
+        for reservation in self.reservations.values() {
+            if let Some(old) = &reservation.rebind
+                && !tokens.insert(&old.old_token)
+            {
+                return Err(AuthorityError::InvalidState);
             }
         }
         Ok(())
@@ -311,16 +347,19 @@ impl ActionAuthority {
         for _ in 0..4 {
             let token = amaterasu_storage::random_identifier()
                 .map_err(|_| AuthorityError::RandomUnavailable)?;
-            if !self
-                .reservations
-                .values()
-                .any(|item| item.permit_token == token)
-            {
+            if !self.reservations.values().any(|item| {
+                item.permit_token == token
+                    || item
+                        .rebind
+                        .as_ref()
+                        .is_some_and(|old| old.old_token == token)
+            }) {
                 self.reservations.insert(
                     operation_key,
                     Reservation {
                         action_service: caller.into(),
                         permit_token: token.clone(),
+                        rebind: None,
                         transition_id: None,
                         transition_ready: false,
                         execution: None,
@@ -524,6 +563,120 @@ impl ActionAuthority {
             execution.method.clone(),
             execution.plan.clone(),
         ))
+    }
+
+    /// Resolve an old token for an idempotent rebind retry. This is available
+    /// only to the configured action service; it never authorizes execution.
+    pub fn binding_for_rebind(
+        &self,
+        caller: &str,
+        old_token: &str,
+    ) -> Result<ActionBinding, AuthorityError> {
+        self.validate()?;
+        let item = self
+            .reservations
+            .values()
+            .find(|item| {
+                item.action_service == caller
+                    && (item.permit_token == old_token
+                        || item
+                            .rebind
+                            .as_ref()
+                            .is_some_and(|old| old.old_token == old_token))
+            })
+            .ok_or(AuthorityError::NotAuthorized)?;
+        Ok(item
+            .rebind
+            .as_ref()
+            .filter(|old| old.old_token == old_token)
+            .map_or_else(|| item.binding.clone(), |old| old.old_binding.clone()))
+    }
+
+    /// Replace a transferred action's plan and permit after the coordinator has
+    /// verified durable dependent cleanup and fresh installed policy/rights.
+    /// Persist this mutation together with the matching Work transfer before
+    /// returning the new token. Old-token retries return the identical result.
+    pub fn rebind_transferred(
+        &mut self,
+        caller: &str,
+        old_token: &str,
+        old_binding: &ActionBinding,
+        transition_id: &str,
+        plan: &amaterasu_extension_api::ResourcePlan,
+        digest: &str,
+    ) -> Result<(String, ActionBinding), AuthorityError> {
+        self.validate()?;
+        if !valid_id(transition_id)
+            || !valid_digest(digest)
+            || amaterasu_extension_api::validate_resource_plan(plan).is_err()
+        {
+            return Err(AuthorityError::Invalid);
+        }
+        if canonical_plan_digest(plan).as_deref() != Some(digest) {
+            return Err(AuthorityError::Invalid);
+        }
+        let reservation_key = key(old_binding);
+        let item = self
+            .reservations
+            .get(&reservation_key)
+            .ok_or(AuthorityError::NotAuthorized)?;
+        if item.action_service != caller || item.transition_id.as_deref() != Some(transition_id) {
+            return Err(AuthorityError::NotAuthorized);
+        }
+        if let Some(old) = &item.rebind {
+            let execution = item
+                .execution
+                .as_ref()
+                .ok_or(AuthorityError::InvalidState)?;
+            if old.old_token == old_token
+                && old.old_binding == *old_binding
+                && item.binding.plan_digest == digest
+                && execution.plan == *plan
+            {
+                return Ok((item.permit_token.clone(), item.binding.clone()));
+            }
+            return Err(AuthorityError::Conflict);
+        }
+        let execution = item
+            .execution
+            .as_ref()
+            .ok_or(AuthorityError::InvalidState)?;
+        if item.permit_token != old_token
+            || item.binding != *old_binding
+            || !matches!(item.state, ReservationState::Running)
+            || item.transition_ready
+            || execution.claimed
+        {
+            return Err(AuthorityError::NotAuthorized);
+        }
+        let mut token = None;
+        for _ in 0..8 {
+            let candidate = amaterasu_storage::random_identifier()
+                .map_err(|_| AuthorityError::RandomUnavailable)?;
+            if !self.reservations.values().any(|other| {
+                other.permit_token == candidate
+                    || other
+                        .rebind
+                        .as_ref()
+                        .is_some_and(|old| old.old_token == candidate)
+            }) {
+                token = Some(candidate);
+                break;
+            }
+        }
+        let token = token.ok_or(AuthorityError::RandomUnavailable)?;
+        let item = self
+            .reservations
+            .get_mut(&reservation_key)
+            .expect("checked reservation");
+        item.rebind = Some(ActionRebind {
+            old_token: old_token.into(),
+            old_binding: old_binding.clone(),
+        });
+        item.permit_token = token.clone();
+        item.binding.plan_digest = digest.into();
+        item.execution.as_mut().expect("checked execution").plan = plan.clone();
+        Ok((token, item.binding.clone()))
     }
 
     /// Only the coordinator may call this after independently confirming all
@@ -968,6 +1121,111 @@ mod tests {
                 .transfer_to_transition("action-service", &token, &binding, "other")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn transferred_rebind_rotates_token_and_replays_exact_result_after_restart() {
+        let mut authority = ActionAuthority::default();
+        let binding = binding();
+        let token = authority
+            .authorize_action("action-service", &binding, &canonical(&binding), 1, 10)
+            .unwrap();
+        let method = amaterasu_extension_api::MethodRef {
+            service: "display/1".into(),
+            method: "execute".into(),
+            interface_major: 1,
+            interface_minor: 0,
+            schema_revision: 1,
+        };
+        let mut plan: amaterasu_extension_api::ResourcePlan = serde_json::from_value(json!({"plan_id":"p","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]})).unwrap();
+        authority
+            .bind_execution(
+                "action-service",
+                &token,
+                &binding,
+                "display",
+                &method,
+                &plan,
+            )
+            .unwrap();
+        authority
+            .consume_action_permit("action-service", &binding, &canonical(&binding), &token, 2)
+            .unwrap();
+        authority
+            .transfer_to_transition("action-service", &token, &binding, "transition")
+            .unwrap();
+        plan.revision = 2;
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&serde_json::to_value(&plan).unwrap()).unwrap())
+        );
+        assert!(
+            authority
+                .rebind_transferred("other", &token, &binding, "transition", &plan, &digest)
+                .is_err()
+        );
+        let (new_token, new_binding) = authority
+            .rebind_transferred(
+                "action-service",
+                &token,
+                &binding,
+                "transition",
+                &plan,
+                &digest,
+            )
+            .unwrap();
+        assert_ne!(token, new_token);
+        assert_eq!(new_binding.plan_digest, digest);
+        assert!(
+            authority
+                .binding_for_permit("action-service", &token)
+                .is_err()
+        );
+        assert_eq!(
+            authority.binding_for_rebind("action-service", &token),
+            Ok(binding.clone())
+        );
+        let mut recovered: ActionAuthority =
+            serde_json::from_slice(&serde_json::to_vec(&authority).unwrap()).unwrap();
+        assert_eq!(
+            recovered.rebind_transferred(
+                "action-service",
+                &token,
+                &binding,
+                "transition",
+                &plan,
+                &digest
+            ),
+            Ok((new_token.clone(), new_binding.clone()))
+        );
+        let mut changed = plan.clone();
+        changed.revision = 3;
+        let changed_digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&serde_json::to_value(&changed).unwrap()).unwrap())
+        );
+        assert_eq!(
+            recovered.rebind_transferred(
+                "action-service",
+                &token,
+                &binding,
+                "transition",
+                &changed,
+                &changed_digest
+            ),
+            Err(AuthorityError::Conflict)
+        );
+        assert!(
+            recovered
+                .claim_effect("display", &new_token, &new_binding, &method)
+                .is_err()
+        );
+        recovered
+            .mark_transition_ready("action-service", &new_token, &new_binding, "transition")
+            .unwrap();
+        recovered
+            .claim_effect("display", &new_token, &new_binding, &method)
+            .unwrap();
     }
 
     #[test]
