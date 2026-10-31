@@ -956,6 +956,7 @@ pub(super) fn standalone_stream_input(
     {
         return Err("session_output_provenance_mismatch".into());
     }
+    super::resource_generation::current_root_generation(journal, &input)?;
     // Resume must consume the most recent authenticated release readback;
     // falling back to the original session snapshot would resurrect stale state.
     let current = if let Some(previous) = journal.composition.staged_outputs().rev().find(|stage| {
