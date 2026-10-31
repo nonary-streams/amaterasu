@@ -2,6 +2,7 @@
 pub mod application_library;
 pub mod audio;
 pub mod capture;
+pub mod configuration;
 pub mod data_plane;
 pub mod encode;
 pub mod exports;
@@ -13,6 +14,7 @@ pub mod network;
 pub mod network_http;
 pub mod requests;
 pub mod service;
+pub mod state;
 pub mod transport;
 pub mod video;
 pub mod virtual_display;

@@ -4,7 +4,7 @@ use crate::protocol::{
     product_success, success,
 };
 use amaterasu_configuration_schema::{defaults, validate_values};
-use amaterasu_module_sdk::{Command, ModuleResult, Response};
+use amaterasu_module_sdk::{Command, ModuleResult, Response, state::StateRequest};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -116,7 +116,10 @@ impl Pipeline {
         incoming: Incoming,
         send: &mut impl FnMut(Command) -> TransportResult,
     ) -> ModuleResult<()> {
-        let payload = json!({"action":"get","key":incoming.key});
+        let payload = StateRequest::Get {
+            key: incoming.key.clone(),
+        }
+        .payload();
         match submit(
             send,
             incoming.request_id,
@@ -325,8 +328,12 @@ impl Pipeline {
                 ),
             );
         }
-        let payload =
-            json!({"action":"set","key":key,"value":document,"expected_revision":state_revision});
+        let payload = StateRequest::Set {
+            key: key.clone(),
+            value: serde_json::to_value(&document).map_err(|error| error.to_string())?,
+            expected_revision: Some(state_revision),
+        }
+        .payload();
         match submit(send, request_id, deadline, "save", payload)? {
             Response::Accepted { id } => {
                 self.pending = Some(Pending {
@@ -365,8 +372,12 @@ impl Pipeline {
                 ),
             );
         }
-        let payload =
-            json!({"action":"set","key":key,"value":document,"expected_revision":state_revision});
+        let payload = StateRequest::Set {
+            key: key.clone(),
+            value: serde_json::to_value(&document).map_err(|error| error.to_string())?,
+            expected_revision: Some(state_revision),
+        }
+        .payload();
         match submit(send, request_id, deadline, "product_save", payload)? {
             Response::Accepted { id } => {
                 self.pending = Some(Pending {

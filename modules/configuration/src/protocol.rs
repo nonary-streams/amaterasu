@@ -306,3 +306,85 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod sdk_contract_tests {
+    use super::*;
+    use amaterasu_module_sdk::configuration::{self, ProductSettingsRequest};
+
+    fn exercise(mut call: impl FnMut(ProductSettingsRequest) -> Value) {
+        let empty = configuration::decode_response(call(ProductSettingsRequest::ProductGet {}))
+            .unwrap()
+            .unwrap();
+        assert!(!empty.found);
+        let update = || ProductSettingsRequest::ProductUpdate {
+            version: 1,
+            values: [("enabled".into(), json!(true))].into_iter().collect(),
+            expected_revision: 0,
+        };
+        let saved = configuration::decode_response(call(update()))
+            .unwrap()
+            .unwrap();
+        assert!(saved.found);
+        assert_eq!(saved.revision, 1);
+        assert_eq!(saved.values["enabled"], true);
+        let conflict = configuration::decode_response(call(update()))
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(conflict.code, "revision_conflict");
+        assert_eq!(conflict.current_revision, Some(1));
+    }
+
+    #[test]
+    fn same_consumer_accepts_real_and_independent_product_providers() {
+        let mut document = None;
+        exercise(|request| {
+            let operation = serde_json::from_value(request.payload()).unwrap();
+            match apply_product(operation, document.clone()) {
+                Ok(ProductChange::Read(found)) => product_success(found),
+                Ok(ProductChange::Write(saved)) => {
+                    document = Some(saved.clone());
+                    product_success(Some(saved))
+                }
+                Err(error) => error,
+            }
+        });
+        let mut revision = 0;
+        let mut values = Map::new();
+        exercise(|request| match request {
+            ProductSettingsRequest::ProductGet {} => {
+                json!({"ok":true,"found":revision != 0,"version":if revision == 0 {None} else {Some(1)},"revision":revision,"values":values})
+            }
+            ProductSettingsRequest::ProductUpdate {
+                version,
+                values: new_values,
+                expected_revision,
+            } => {
+                if expected_revision != revision {
+                    json!({"ok":false,"error":{"code":"revision_conflict","message":"revision differs","current_revision":revision}})
+                } else {
+                    revision += 1;
+                    values = new_values;
+                    json!({"ok":true,"found":true,"version":version,"revision":revision,"values":values})
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn no_owner_selector_or_inconsistent_documents() {
+        assert!(
+            serde_json::from_value::<ProductSettingsRequest>(
+                json!({"action":"product_get","owner":"other"})
+            )
+            .is_err()
+        );
+        assert!(
+            configuration::decode_response(
+                json!({"ok":true,"found":true,"version":null,"revision":1,"values":{}})
+            )
+            .is_err()
+        );
+        assert!(configuration::decode_response(json!({"ok":false})).is_err());
+    }
+}
