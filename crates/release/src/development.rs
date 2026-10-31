@@ -2792,6 +2792,12 @@ fn read_external_component(
     {
         return Err("external artifact name must be a simple filename".into());
     }
+    if matches!(
+        manifest.file.as_str(),
+        "manifest.json" | "manifest.sig" | crate::capture_authority_package::HELPER_FILE
+    ) {
+        return Err("external artifact name is reserved by the package format".into());
+    }
     let approved = bootstrap
         .policy
         .principals
@@ -3001,6 +3007,16 @@ mod external_component_tests {
         assert_eq!(selected.manifest.sha256, sha256(b"independent bytes"));
         assert_eq!(selected.manifest.size, 17);
         assert_eq!(selected.manifest.requires, manifest.requires);
+        for reserved in [
+            "manifest.json",
+            "manifest.sig",
+            crate::capture_authority_package::HELPER_FILE,
+        ] {
+            let mut reserved_manifest = manifest.clone();
+            reserved_manifest.file = reserved.into();
+            fs::write(&template, serde_json::to_vec(&reserved_manifest).unwrap()).unwrap();
+            assert!(read_external_component(&template, &artifact, &bootstrap).is_err());
+        }
         let mut unsafe_manifest = manifest;
         unsafe_manifest.file = "../escape".into();
         fs::write(&template, serde_json::to_vec(&unsafe_manifest).unwrap()).unwrap();

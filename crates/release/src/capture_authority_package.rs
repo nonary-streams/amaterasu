@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub const SPEC_FILE: &str = "capture-authority-package.json";
-const HELPER_FILE: &str = "amaterasu-vkms-frame-helper";
+pub(crate) const HELPER_FILE: &str = "amaterasu-vkms-frame-helper";
 
 /// Local publisher input only. It is never interpreted as approved authority.
 #[derive(Deserialize, Serialize)]
