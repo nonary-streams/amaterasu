@@ -34,7 +34,19 @@ pub(super) struct SessionChildrenSnapshot {
     finalize_policies: BTreeSet<String>,
     schema_documents: BTreeSet<String>,
     #[serde(default)]
+    scope_roots: BTreeMap<String, String>,
+    #[serde(default)]
+    historical_roots: BTreeMap<String, HistoricalSessionRoot>,
+    #[serde(default)]
     latest_release: Option<LatestReleaseWitness>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoricalSessionRoot {
+    admission_id: String,
+    resource_generation: u64,
+    output: amaterasu_extension_api::ResourceOutput,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -48,6 +60,52 @@ struct LatestReleaseWitness {
 }
 
 impl SessionChildrenSnapshot {
+    pub(super) fn valid_lineages(&self, target: &LifecycleTarget, owner: &str) -> bool {
+        if self.scope_roots.is_empty() && self.historical_roots.is_empty() {
+            return true;
+        }
+        self.scope_roots.len() == self.scopes.len()
+            && self
+                .scope_roots
+                .keys()
+                .all(|scope| self.scopes.contains(scope))
+            && self
+                .scope_roots
+                .values()
+                .all(|key| self.historical_roots.contains_key(key))
+            && self.historical_roots.iter().all(|(key, root)| {
+                valid_id(&root.admission_id)
+                    && root.resource_generation > 0
+                    && root.output.origin == *target
+                    && root.output.producer == owner
+                    && amaterasu_extension_api::validate_resource_output(&root.output).is_ok()
+                    && commitment(&(
+                        "ended-history-root-v1",
+                        &root.admission_id,
+                        root.resource_generation,
+                        &root.output,
+                    ))
+                    .as_ref()
+                        == Some(key)
+                    && self.scope_roots.values().any(|used| used == key)
+            })
+    }
+
+    pub(super) fn historical_root_for_scope<'a>(
+        &'a self,
+        target: &LifecycleTarget,
+        legacy_root: &'a amaterasu_extension_api::ResourceOutput,
+        legacy_generation: u64,
+    ) -> Option<(&'a amaterasu_extension_api::ResourceOutput, u64)> {
+        if self.scope_roots.is_empty() && self.historical_roots.is_empty() {
+            return self
+                .contains_scope(target)
+                .then_some((legacy_root, legacy_generation));
+        }
+        let key = self.scope_roots.get(&scope_digest(target)?)?;
+        let root = self.historical_roots.get(key)?;
+        Some((&root.output, root.resource_generation))
+    }
     #[cfg(test)]
     pub(super) fn test_set_latest_release(
         &mut self,
@@ -227,6 +285,78 @@ struct ArchivedStream {
     settlement_commitments: Vec<String>,
     settlement_tuples: Vec<SettlementTuple>,
     closed_obligations: Vec<String>,
+}
+
+#[cfg(test)]
+pub(super) fn test_multiroot_snapshot(
+    journal: &Journal,
+    current: &composition::StoredOutput,
+    old: &amaterasu_extension_api::ResourceOutput,
+    old_admission: &str,
+    old_generation: u64,
+    current_generation: u64,
+) -> Option<(SessionChildrenSnapshot, LifecycleTarget, LifecycleTarget)> {
+    let (epoch, id, None, parent_generation) =
+        operations::target_parts(&current.output.origin).ok()?
+    else {
+        return None;
+    };
+    let child = |stream: &str| LifecycleTarget::Stream {
+        host_epoch: epoch.into(),
+        session_id: id.into(),
+        stream_id: stream.into(),
+        generation: 1,
+    };
+    let old_target = child("old-child");
+    let new_target = child("new-child");
+    let archive = |target: LifecycleTarget,
+                   admission: &str,
+                   output: &amaterasu_extension_api::ResourceOutput,
+                   generation|
+     -> Option<ArchivedStream> {
+        Some(ArchivedStream {
+            target,
+            parent_generation,
+            resource_generation: generation,
+            root_admission: admission.into(),
+            root_output: commitment(output)?,
+            owner: output.producer.clone(),
+            graph_commitment: "a".repeat(64),
+            release_commitment: "b".repeat(64),
+            finalize_commitment: "c".repeat(64),
+            finalize_tuple: "d".repeat(64),
+            finalize_policy: "e".repeat(64),
+            finalize_schemas: vec![],
+            settlement_commitments: vec![],
+            settlement_tuples: vec![],
+            closed_obligations: vec![],
+        })
+    };
+    let mut book = ClosedStreamBook::default();
+    book.archived.push(archive(
+        old_target.clone(),
+        old_admission,
+        old,
+        old_generation,
+    )?);
+    book.archived.push(archive(
+        new_target.clone(),
+        &current.admission_id,
+        &current.output,
+        current_generation,
+    )?);
+    book.expired_scopes.insert(scope_digest(&old_target)?);
+    book.expired_scopes.insert(scope_digest(&new_target)?);
+    if !book.archived[0].valid(journal) || !book.archived[1].valid(journal) {
+        return None;
+    }
+    let snapshot = book.session_children_snapshot(
+        journal,
+        &current.output.origin,
+        current,
+        current_generation,
+    )?;
+    Some((snapshot, old_target, new_target))
 }
 
 #[cfg(test)]
@@ -858,36 +988,85 @@ impl ClosedStreamBook {
         {
             return None;
         }
-        let root_digest = commitment(&root.output)?;
-        if self
-            .records
-            .iter()
-            .filter(|record| {
-                operations::target_parts(&record.target).is_ok_and(|(_, id, _, _)| id == session_id)
-            })
-            .any(|record| {
-                record.root_admission != root.admission_id
-                    || record.root_output != root_digest
-                    || record.owner != root.output.producer
-                    || record.resource_generation != resource_generation
-            })
-            || self
-                .archived
-                .iter()
-                .filter(|record| {
-                    operations::target_parts(&record.target)
-                        .is_ok_and(|(_, id, _, _)| id == session_id)
-                })
-                .any(|record| {
-                    record.root_admission != root.admission_id
-                        || record.root_output != root_digest
-                        || record.owner != root.output.producer
-                        || record.resource_generation != resource_generation
-                })
-        {
+        let mut snapshot = self.session_children_raw(target)?;
+        let mut capture_root = |child: &LifecycleTarget,
+                                parent_generation: u64,
+                                admission: &str,
+                                output_commitment: &str,
+                                owner: &str,
+                                resource_generation: u64|
+         -> Option<()> {
+            let (_, id, _, _) = operations::target_parts(child).ok()?;
+            if id != session_id {
+                return Some(());
+            }
+            if owner != root.output.producer {
+                return None;
+            }
+            let output = historical_root(
+                journal,
+                child,
+                parent_generation,
+                admission,
+                output_commitment,
+                owner,
+                resource_generation,
+            )?
+            .clone();
+            if output.origin != *target {
+                return None;
+            }
+            let key = commitment(&(
+                "ended-history-root-v1",
+                admission,
+                resource_generation,
+                &output,
+            ))?;
+            let historical = HistoricalSessionRoot {
+                admission_id: admission.into(),
+                resource_generation,
+                output,
+            };
+            if snapshot
+                .historical_roots
+                .get(&key)
+                .is_some_and(|old| old != &historical)
+            {
+                return None;
+            }
+            snapshot.historical_roots.insert(key.clone(), historical);
+            if snapshot
+                .scope_roots
+                .insert(scope_digest(child)?, key)
+                .is_some()
+            {
+                return None;
+            }
+            Some(())
+        };
+        for record in &self.records {
+            capture_root(
+                &record.target,
+                record.parent_generation,
+                &record.root_admission,
+                &record.root_output,
+                &record.owner,
+                record.resource_generation,
+            )?;
+        }
+        for record in &self.archived {
+            capture_root(
+                &record.target,
+                record.parent_generation,
+                &record.root_admission,
+                &record.root_output,
+                &record.owner,
+                record.resource_generation,
+            )?;
+        }
+        if !snapshot.valid_lineages(target, &root.output.producer) {
             return None;
         }
-        let mut snapshot = self.session_children_raw(target)?;
         if session.streams.iter().any(|(stream_id, stream)| {
             let child = LifecycleTarget::Stream {
                 host_epoch: epoch.into(),
@@ -903,6 +1082,10 @@ impl ClosedStreamBook {
         if let Some(anchor) = journal.composition.stage_anchor(&root.output) {
             let record = self.unique_record(journal, &anchor.target)?;
             if !self.validates_anchor(journal, anchor)
+                || record.root_admission != root.admission_id
+                || record.root_output != commitment(&root.output)?
+                || record.owner != root.output.producer
+                || record.resource_generation != resource_generation
                 || journal.verified_released_output(&anchor.target)
                     != Some((anchor.release_admission.as_str(), &anchor.released))
                 || session_release::session_release_input(journal, root).ok()? != anchor.released
@@ -948,6 +1131,8 @@ impl ClosedStreamBook {
             control_policies: BTreeSet::new(),
             finalize_policies: BTreeSet::new(),
             schema_documents: BTreeSet::new(),
+            scope_roots: BTreeMap::new(),
+            historical_roots: BTreeMap::new(),
             latest_release: None,
         };
         let mut capture = |child: &LifecycleTarget,

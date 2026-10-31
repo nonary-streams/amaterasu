@@ -31,6 +31,13 @@ impl Coordinator {
             &query.request.target,
             caller,
         ) {
+            let (_, historical_generation) = history
+                .historical_root_for_scope(
+                    &query.request.target,
+                    &cert.root.output,
+                    cert.resource_generation,
+                )
+                .ok_or("ended_session_root_unavailable")?;
             let ResourceControlResponse::Applied { output, .. } = &query.response else {
                 return Err("ended_finalize_unavailable".into());
             };
@@ -46,7 +53,7 @@ impl Coordinator {
                 return Err("ended_finalize_unavailable".into());
             }
             return Ok(json!({"status":"valid", "target":query.request.target,
-                "result_id":query.request.permit_id, "resource_generation":cert.resource_generation}));
+                "result_id":query.request.permit_id, "resource_generation":historical_generation}));
         }
         if !journal.finalize_results.validate_structure() {
             return Err("invalid_finalize_result_book".into());

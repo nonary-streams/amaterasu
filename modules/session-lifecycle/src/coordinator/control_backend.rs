@@ -821,6 +821,13 @@ impl Coordinator {
                     &tuple.request.target,
                     caller,
                 ) {
+                    let (historical_root, historical_generation) = history
+                        .historical_root_for_scope(
+                            &tuple.request.target,
+                            &cert.root.output,
+                            cert.resource_generation,
+                        )
+                        .ok_or("ended_session_root_unavailable")?;
                     if !history.installed(&self.settings)
                         || !history.contains_settlement(caller, &tuple)
                         || super::checkpoint_queries::has_original_result(
@@ -837,7 +844,7 @@ impl Coordinator {
                     }
                     return Ok(
                         json!({"status":"valid", "session_target":cert.target, "target":tuple.request.target,
-                        "output":tuple.output, "root_output":cert.root.output, "resource_generation":cert.resource_generation,
+                        "output":tuple.output, "root_output":historical_root, "resource_generation":historical_generation,
                         "consumers_retired":false}),
                     );
                 }

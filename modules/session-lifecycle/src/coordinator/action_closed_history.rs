@@ -761,6 +761,64 @@ mod tests {
             resource_generation::current_root_generation(&journal, &replacement),
             Ok(8)
         );
+        journal.sessions.get_mut("session").unwrap().streams.clear();
+        let (snapshot, old_child, new_child) = closed_stream::test_multiroot_snapshot(
+            &journal,
+            &replacement,
+            &root.output,
+            &root.admission_id,
+            7,
+            8,
+        )
+        .expect("both historical roots must authenticate");
+        assert!(snapshot.valid_lineages(&replacement.output.origin, "owner"));
+        assert_eq!(
+            snapshot.historical_root_for_scope(&old_child, &replacement.output, 8),
+            Some((&root.output, 7))
+        );
+        assert_eq!(
+            snapshot.historical_root_for_scope(&new_child, &replacement.output, 8),
+            Some((&replacement.output, 8))
+        );
+        let reopened: closed_stream::SessionChildrenSnapshot =
+            serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        assert!(reopened.valid_lineages(&replacement.output.origin, "owner"));
+        assert_eq!(
+            reopened.historical_root_for_scope(&old_child, &replacement.output, 8),
+            Some((&root.output, 7))
+        );
+        let mut forged = serde_json::to_value(&snapshot).unwrap();
+        let roots = forged["historical_roots"].as_object_mut().unwrap();
+        let old = roots
+            .values_mut()
+            .find(|value| value["admission_id"] == root.admission_id)
+            .unwrap();
+        old["resource_generation"] = json!(9);
+        let forged: closed_stream::SessionChildrenSnapshot =
+            serde_json::from_value(forged).unwrap();
+        assert!(!forged.valid_lineages(&replacement.output.origin, "owner"));
+        assert!(
+            closed_stream::test_multiroot_snapshot(
+                &journal,
+                &replacement,
+                &root.output,
+                "forged-admission",
+                7,
+                8
+            )
+            .is_none()
+        );
+        assert!(
+            closed_stream::test_multiroot_snapshot(
+                &journal,
+                &replacement,
+                &root.output,
+                &root.admission_id,
+                9,
+                8
+            )
+            .is_none()
+        );
         let recovered: Journal =
             serde_json::from_value(serde_json::to_value(&journal).unwrap()).unwrap();
         assert!(

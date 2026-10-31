@@ -398,6 +398,7 @@ impl EndedSessionCertificate {
                 Some(children) => {
                     children.len() != self.closed_children as usize
                         || !children.valid_for(&self.target)
+                        || !children.valid_lineages(&self.target, &self.producer)
                 }
                 None => self.closed_children != 0,
             }
