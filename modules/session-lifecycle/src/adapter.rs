@@ -89,7 +89,7 @@ pub struct SchemaDocument {
 #[serde(deny_unknown_fields)]
 pub struct ParticipantSettings {
     pub provider: String,
-    /// Wire contract version. Version 2 remains disabled until scheduling is ready.
+    /// Wire contract version. Version 2 is restricted to the owner-only session qualification profile.
     #[serde(default = "default_contract_version")]
     pub contract_version: u32,
     /// Required participants that must prepare before this provider.
@@ -268,6 +268,29 @@ impl LifecycleSettings {
         Ok(())
     }
 
+    /// Version 2 currently supports only one independently selected producer.
+    /// Coordinator phase admission separately fences unsupported lifecycle work.
+    fn validate_contract_profile(&self) -> ModuleResult<()> {
+        let uses_v2 = self.participants.iter().any(|p| p.contract_version == 2);
+        if !uses_v2 {
+            return Ok(());
+        }
+        let [participant] = self.participants.as_slice() else {
+            return Err("unsupported v2 lifecycle profile".into());
+        };
+        let [finalize] = self.finalize_policies.as_slice() else {
+            return Err("unsupported v2 lifecycle profile".into());
+        };
+        if participant.contract_version != 2
+            || !participant.depends_on.is_empty()
+            || !self.control_policies.is_empty()
+            || finalize.owner_provider != participant.provider
+        {
+            return Err("unsupported v2 lifecycle profile".into());
+        }
+        Ok(())
+    }
+
     /// Resolve required dependencies before admission. Among ready participants,
     /// the earliest configured provider wins, preserving deterministic tie order.
     pub(crate) fn resolved_participants(&self) -> ModuleResult<Vec<String>> {
@@ -403,7 +426,7 @@ impl LifecycleSettings {
         }
         for participant in &self.participants {
             if !valid_identifier(&participant.provider)
-                || participant.contract_version != 1
+                || !matches!(participant.contract_version, 1 | 2)
                 || !providers.insert(&participant.provider)
                 || participant.capabilities.len() > 32
                 || participant
@@ -441,7 +464,7 @@ impl LifecycleSettings {
             {
                 if !valid_identifier(&method.service)
                     || !valid_identifier(&method.method)
-                    || method.interface_major != 1
+                    || method.interface_major != participant.contract_version
                     || method.schema_revision == 0
                 {
                     return Err("invalid lifecycle participant method".into());
@@ -449,6 +472,7 @@ impl LifecycleSettings {
             }
         }
         self.resolved_participants()?;
+        self.validate_contract_profile()?;
         self.validate_control_policies()?;
         self.validate_finalize_policies()?;
         self.schema_catalog()?;
@@ -991,5 +1015,38 @@ mod tests {
         assert!(settings.validate().is_ok());
         settings.schema_documents[0].document.push(' ');
         assert!(settings.validate().is_err());
+    }
+    #[test]
+    fn v2_qualification_requires_one_owner_exact_finalize_and_v2_methods() {
+        use sha2::{Digest, Sha256};
+        let document = r#"{"$id":"output/1","$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#;
+        let schema = json!({"id":"output/1","major":1,"minor":0,"digest":format!("{:x}",Sha256::digest(document.as_bytes()))});
+        let method = json!({"service":"owner/2","method":"plan","interface_major":2,"interface_minor":0,"schema_revision":1});
+        let participant = json!({"provider":"owner","contract_version":2,"plan_method":method,"callback_method":method,"status_method":method,"capabilities":[],"cleanup_methods":[],"settings_revision":"initial","settings":{}});
+        let finalize = json!({"owner_provider":"owner","owner_service":"owner/2","method":method,"status_method":method,"output_capability":"display/output","output_schema":schema,"capture_provider":"capture","selector_schema":"selector/1","required_access":"exclusive","domain_scope":"resource","mutation_domains":[]});
+        let settings: LifecycleSettings = serde_json::from_value(json!({"journal_path":"/test","participants":[participant],"finalize_policies":[finalize],"schema_documents":[{"reference":schema,"document":document}],"consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector/1"]}})).unwrap();
+        assert!(settings.validate().is_ok());
+        let mut invalid = settings.clone();
+        invalid.finalize_policies.clear();
+        assert!(invalid.validate().is_err());
+        let mut invalid = settings.clone();
+        invalid.participants.push(invalid.participants[0].clone());
+        invalid.participants[1].provider = "other".into();
+        assert!(invalid.validate().is_err());
+        let mut invalid = settings.clone();
+        invalid.participants[0].callback_method.interface_major = 1;
+        assert!(invalid.validate().is_err());
+        let mut invalid = settings.clone();
+        invalid.finalize_policies[0].owner_provider = "other".into();
+        assert!(invalid.validate().is_err());
+        let mut invalid = settings.clone();
+        invalid.schema_documents.clear();
+        assert!(invalid.validate().is_err());
+        let mut invalid = settings.clone();
+        invalid.participants[0].depends_on.push("missing".into());
+        assert!(invalid.validate().is_err());
+        let mut invalid = settings;
+        invalid.participants[0].contract_version = 3;
+        assert!(invalid.validate().is_err());
     }
 }
