@@ -21,6 +21,16 @@ const KEY: &str = "protocol-obligations/v1";
 const MAX_ENTRIES: usize = 8;
 const MAX_JOURNAL_BYTES: usize = 8_000;
 
+/// Use a fresh value for every State mutation attempt, including cleanup and
+/// compaction; a reused broker operation ID may replay an old success instead
+/// of executing the intended CAS. Keep the ID through that one request only.
+pub fn fresh_state_operation_id() -> Result<String, &'static str> {
+    let mut nonce = [0_u8; 16];
+    getrandom::fill(&mut nonce).map_err(|_| "entropy_unavailable")?;
+    let suffix: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(format!("protocol.state.{suffix}"))
+}
+
 /// Trusted composition assertion, not remote input or implementation proof.
 /// The owner must bind every request to this actual State provider and caller,
 /// and verify that its selected implementation offers durable atomic CAS.
@@ -196,6 +206,7 @@ pub fn prepare_reservation(
     Ok(ReservationPlan::Write(Box::new(PendingWrite {
         request: set_journal(revision, &journal)?,
         expected_revision: revision,
+        state_operation_id: fresh_state_operation_id()?,
         effect,
     })))
 }
@@ -206,11 +217,16 @@ pub enum ReservationPlan {
 pub struct PendingWrite {
     request: StateRequest,
     expected_revision: u64,
+    state_operation_id: String,
     effect: PendingEffect,
 }
 impl PendingWrite {
     pub fn request(&self) -> &StateRequest {
         &self.request
+    }
+    /// Use this fresh ID when submitting the State request to the broker.
+    pub fn state_operation_id(&self) -> &str {
+        &self.state_operation_id
     }
     /// Match this terminal response to the exact request and endpoint; unknown or
     /// lost replies must not call this method. Reread and reconcile instead.
@@ -230,6 +246,13 @@ impl PendingWrite {
 pub struct ReadyReservation {
     effect: Option<PendingEffect>,
 }
+impl ReadyReservation {
+    pub(crate) fn from_confirmed(effect: PendingEffect) -> Self {
+        Self {
+            effect: Some(effect),
+        }
+    }
+}
 impl ObligationStore for ReadyReservation {
     fn reserve(&mut self, effect: &PendingEffect) -> Result<Reservation, &'static str> {
         match self.effect.take() {
@@ -240,6 +263,7 @@ impl ObligationStore for ReadyReservation {
 }
 /// Caller must independently verify provider cleanup and worker retirement before
 /// marking it complete. Tombstones retain operation identity and cannot be reused.
+/// Submit the State write with a fresh `fresh_state_operation_id`.
 pub fn prepare_cleanup(
     _binding: &DurableStateBinding,
     response: &Value,
@@ -266,7 +290,8 @@ pub fn journal_epoch(response: &Value) -> Result<Option<String>, &'static str> {
 /// independently confirmed. Pending or uncertain entries always block retirement.
 /// The authority must reject old epochs before provider admission and admission to
 /// the new epoch must remain closed until this CAS is confirmed or reconciled.
-/// Do not reuse legacy v1 journals without a separate safe migration.
+/// Do not reuse legacy v1 journals without a separate safe migration. Submit the
+/// State write with a fresh `fresh_state_operation_id`.
 pub fn prepare_epoch_retirement(
     _binding: &DurableStateBinding,
     response: &Value,

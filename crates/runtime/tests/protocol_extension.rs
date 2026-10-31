@@ -947,3 +947,65 @@ fn stale_authority_epoch_is_rejected_before_provider_admission() {
         Response::Pending
     ));
 }
+
+#[test]
+fn sequenced_journal_receipt_routes_through_unchanged_broker_consumer() {
+    use amaterasu_module_sdk::{
+        protocol_sequence::{self, SequencedSource},
+        protocol_state::{CleanupReference, DURABLE_CAS_CAPABILITY, DurableStateBinding},
+    };
+    let selection = route("example.provider_a", "example.a/1");
+    let mut broker = setup(std::slice::from_ref(&selection));
+    let router = ProtocolRouter::new(vec![selection]).unwrap();
+    let auth = Authority {
+        negotiated: true,
+        permitted: true,
+    };
+    let ctx = context("verified");
+    let source = SequencedSource::new(CLIENT, &ctx).unwrap();
+    let operation = source.operation_id(1).unwrap();
+    let request = || DispatchRequest {
+        context: &ctx,
+        message_type: KIND,
+        payload: b"hello",
+        operation_id: &operation,
+        timeout_ms: 1000,
+        parent: None,
+    };
+    let effect = router.prepare_effect(CLIENT, &request()).unwrap();
+    let binding = DurableStateBinding::new("owner", "state", DURABLE_CAS_CAPABILITY).unwrap();
+    let initial = serde_json::json!({"ok":true,"revision":0,"found":false,"value":null});
+    let pending = protocol_sequence::prepare_issue(
+        &binding,
+        &source,
+        &initial,
+        effect,
+        CleanupReference::new("a".repeat(64)).unwrap(),
+    )
+    .unwrap();
+    let mut receipt = pending
+        .confirmed(serde_json::json!({"ok":true,"revision":1}))
+        .unwrap();
+    assert!(matches!(
+        router
+            .dispatch(
+                &auth,
+                &mut receipt,
+                request(),
+                BrokerEndpoint::new(CLIENT, |cmd| Ok(broker.dispatch(CLIENT, cmd)))
+            )
+            .unwrap(),
+        Response::Accepted { .. }
+    ));
+    assert_eq!(
+        router
+            .dispatch(
+                &auth,
+                &mut receipt,
+                request(),
+                BrokerEndpoint::new(CLIENT, |cmd| Ok(broker.dispatch(CLIENT, cmd)))
+            )
+            .unwrap_err(),
+        "reservation_mismatch"
+    );
+}

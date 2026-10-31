@@ -306,7 +306,7 @@ pub fn validate_response(payload: &serde_json::Value) -> Result<(), &'static str
 fn valid_name(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
 }
-fn valid_context(context: &SessionContext) -> bool {
+pub(crate) fn valid_context(context: &SessionContext) -> bool {
     valid_name(&context.authority_epoch)
         && matches!(&context.target, LifecycleTarget::Stream { host_epoch, session_id, stream_id, generation }
         if valid_name(host_epoch) && valid_name(session_id) && valid_name(stream_id) && *generation > 0)

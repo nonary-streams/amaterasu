@@ -136,6 +136,7 @@ fn stale_cas_capacity_and_durability_selection_fail_closed() {
     .unwrap() else {
         panic!()
     };
+    assert_ne!(first.state_operation_id(), stale.state_operation_id());
     assert_eq!(invoke(&store, first.request())["ok"], true);
     let rejected = invoke(&store, stale.request());
     assert!(stale.confirmed(rejected).is_err());
@@ -323,6 +324,198 @@ fn legacy_journal_is_not_silently_reset_or_compacted() {
         invoke(&store, &protocol_state::read_request())["value"]["version"],
         1
     );
+    drop(store);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn sequenced_source_runs_two_thousand_effects_without_global_epoch_rotation() {
+    use amaterasu_module_sdk::protocol_sequence::{self, Lookup, SequencedSource};
+    let path = directory();
+    let mut store = TestStateStore::open(path.clone()).unwrap();
+    let template = effect("caller", "unused");
+    let source = SequencedSource::new(&template.caller, &template.context).unwrap();
+    let mut unrelated = template.clone();
+    if let LifecycleTarget::Stream { stream_id, .. } = &mut unrelated.context.target {
+        *stream_id = "unrelated-live-stream".into();
+    }
+    let other_source = SequencedSource::new(&unrelated.caller, &unrelated.context).unwrap();
+    unrelated.operation_id = other_source.operation_id(1).unwrap();
+    let other_read = invoke(&store, &other_source.read_request());
+    let other_pending = protocol_sequence::prepare_issue(
+        &binding(),
+        &other_source,
+        &other_read,
+        unrelated.clone(),
+        reference(),
+    )
+    .unwrap();
+    let other_response = invoke(&store, other_pending.request());
+    assert!(other_pending.confirmed(other_response).is_ok());
+    for sequence in 1..=2000 {
+        let read = invoke(&store, &source.read_request());
+        assert_eq!(
+            protocol_sequence::next_sequence(&source, &read).unwrap(),
+            sequence
+        );
+        let mut item = template.clone();
+        item.operation_id = source.operation_id(sequence).unwrap();
+        let pending =
+            protocol_sequence::prepare_issue(&binding(), &source, &read, item.clone(), reference())
+                .unwrap();
+        let result = invoke(&store, pending.request());
+        let mut receipt = pending.confirmed(result).unwrap();
+        assert_eq!(receipt.reserve(&item), Ok(Reservation::New));
+        let current = invoke(&store, &source.read_request());
+        let cleanup = protocol_sequence::prepare_cleanup(
+            &binding(),
+            &source,
+            &current,
+            sequence,
+            &item,
+            &reference(),
+        )
+        .unwrap();
+        assert_eq!(invoke(&store, &cleanup)["ok"], true);
+        let retired = invoke(&store, &source.read_request());
+        assert_eq!(
+            protocol_sequence::lookup(&source, &retired, sequence).unwrap(),
+            Lookup::Retired
+        );
+        assert!(retired.to_string().len() < 1000);
+        if sequence % 500 == 0 {
+            drop(store);
+            store = TestStateStore::open(path.clone()).unwrap();
+        }
+    }
+    let read = invoke(&store, &source.read_request());
+    assert_eq!(
+        protocol_sequence::lookup(&source, &read, 1).unwrap(),
+        Lookup::Retired
+    );
+    assert_eq!(
+        protocol_sequence::next_sequence(&source, &read).unwrap(),
+        2001
+    );
+    let other_read = invoke(&store, &other_source.read_request());
+    assert!(
+        matches!(protocol_sequence::lookup(&other_source, &other_read, 1).unwrap(), Lookup::Existing(entry) if !entry.cleaned && entry.effect == unrelated)
+    );
+    drop(store);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn sequenced_cleanup_gaps_loss_and_replays_fail_closed() {
+    use amaterasu_module_sdk::protocol_sequence::{self, Lookup, SequencedSource};
+    let path = directory();
+    let mut store = TestStateStore::open(path.clone()).unwrap();
+    let template = effect("caller", "unused");
+    let source = SequencedSource::new(&template.caller, &template.context).unwrap();
+    let mut effects = Vec::new();
+    for sequence in 1..=8 {
+        let read = invoke(&store, &source.read_request());
+        let mut item = template.clone();
+        item.operation_id = source.operation_id(sequence).unwrap();
+        let pending =
+            protocol_sequence::prepare_issue(&binding(), &source, &read, item.clone(), reference())
+                .unwrap();
+        let another =
+            protocol_sequence::prepare_issue(&binding(), &source, &read, item.clone(), reference())
+                .unwrap();
+        assert_ne!(pending.state_operation_id(), another.state_operation_id());
+        assert_eq!(invoke(&store, pending.request())["ok"], true);
+        let stale_response = invoke(&store, another.request());
+        assert!(another.confirmed(stale_response).is_err());
+        // Lost State reply: a reread identifies an existing effect, not a receipt.
+        drop(pending);
+        let observed = invoke(&store, &source.read_request());
+        assert!(matches!(
+            protocol_sequence::lookup(&source, &observed, sequence).unwrap(),
+            Lookup::Existing(_)
+        ));
+        effects.push(item);
+    }
+    for sequence in [2_u64, 4, 8] {
+        let read = invoke(&store, &source.read_request());
+        let cleanup = protocol_sequence::prepare_cleanup(
+            &binding(),
+            &source,
+            &read,
+            sequence,
+            &effects[(sequence - 1) as usize],
+            &reference(),
+        )
+        .unwrap();
+        assert_eq!(invoke(&store, &cleanup)["ok"], true); // lose reply
+    }
+    drop(store);
+    store = TestStateStore::open(path.clone()).unwrap();
+    let read = invoke(&store, &source.read_request());
+    assert_eq!(
+        protocol_sequence::next_sequence(&source, &read),
+        Err("capacity")
+    );
+    assert!(
+        matches!(protocol_sequence::lookup(&source, &read, 2).unwrap(), Lookup::Existing(entry) if entry.cleaned)
+    );
+    assert!(
+        matches!(protocol_sequence::lookup(&source, &read, 1).unwrap(), Lookup::Existing(entry) if !entry.cleaned)
+    );
+    let cleanup = protocol_sequence::prepare_cleanup(
+        &binding(),
+        &source,
+        &read,
+        1,
+        &effects[0],
+        &reference(),
+    )
+    .unwrap();
+    assert_eq!(invoke(&store, &cleanup)["ok"], true);
+    let read = invoke(&store, &source.read_request());
+    assert_eq!(
+        protocol_sequence::lookup(&source, &read, 1).unwrap(),
+        Lookup::Retired
+    );
+    assert_eq!(
+        protocol_sequence::lookup(&source, &read, 2).unwrap(),
+        Lookup::Retired
+    );
+    assert_eq!(protocol_sequence::next_sequence(&source, &read).unwrap(), 9);
+    assert!(matches!(
+        protocol_sequence::prepare_cleanup(
+            &binding(),
+            &source,
+            &read,
+            1,
+            &effects[0],
+            &reference()
+        ),
+        Err("retired")
+    ));
+    let mut replay = effects[0].clone();
+    assert!(matches!(
+        protocol_sequence::prepare_issue(&binding(), &source, &read, replay.clone(), reference()),
+        Err("identity_mismatch")
+    ));
+    replay.context.target = match replay.context.target {
+        LifecycleTarget::Stream {
+            host_epoch,
+            session_id,
+            stream_id,
+            generation,
+        } => LifecycleTarget::Stream {
+            host_epoch,
+            session_id,
+            stream_id,
+            generation: generation + 1,
+        },
+        _ => unreachable!(),
+    };
+    assert!(matches!(
+        protocol_sequence::prepare_issue(&binding(), &source, &read, replay, reference()),
+        Err("identity_mismatch")
+    ));
     drop(store);
     std::fs::remove_dir_all(path).unwrap();
 }
