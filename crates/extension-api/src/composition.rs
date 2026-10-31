@@ -90,6 +90,15 @@ pub struct ResourceControlRequest {
     pub remaining_ms: u64,
 }
 
+/// Durable coordinator tuple presented to the owner for settlement.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceControlSettlementRequest {
+    pub request: ResourceControlRequest,
+    pub output: ResourceOutput,
+    pub settlement_id: String,
+}
+
 /// Owner's result for an admitted control operation.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
@@ -438,6 +447,38 @@ pub fn validate_resource_control_response(
     Ok(())
 }
 
+/// Validate the exact settlement tuple's shape; the owner must independently
+/// verify it against the coordinator's durable admission and provisional result.
+pub fn validate_resource_control_settlement_request(
+    settlement: &ResourceControlSettlementRequest,
+) -> Result<(), String> {
+    if !crate::valid_opaque_id(&settlement.settlement_id) || !within_size(settlement) {
+        return Err("invalid resource control settlement".into());
+    }
+    validate_resource_control_response(
+        &settlement.request,
+        &ResourceControlResponse::Applied {
+            output: Box::new(settlement.output.clone()),
+            candidate: None,
+        },
+    )
+}
+
+/// Only an acknowledgement of the exact settled output completes settlement.
+pub fn validate_resource_control_settlement_response(
+    settlement: &ResourceControlSettlementRequest,
+    response: &ResourceControlResponse,
+) -> Result<(), String> {
+    validate_resource_control_settlement_request(settlement)?;
+    match response {
+        ResourceControlResponse::Applied {
+            output,
+            candidate: None,
+        } if output.as_ref() == &settlement.output => Ok(()),
+        _ => Err("settlement acknowledgement does not match output".into()),
+    }
+}
+
 /// Validate finalized data structurally; confirmations, authorization and readback remain separate.
 pub fn validate_resource_finalize_request(request: &ResourceFinalizeRequest) -> Result<(), String> {
     validate_resource_output(&request.output)?;
@@ -597,6 +638,31 @@ mod tests {
         let mut other = request.clone();
         other.provider_sequence = 0;
         assert!(validate_resource_control_request(&other).is_err());
+    }
+
+    #[test]
+    fn settlement_requires_exact_bound_output_and_acknowledgement() {
+        let (output, request, _) = fixture();
+        let settlement = ResourceControlSettlementRequest {
+            request,
+            output: output.clone(),
+            settlement_id: "settlement".into(),
+        };
+        assert!(validate_resource_control_settlement_request(&settlement).is_ok());
+        let ack = ResourceControlResponse::Applied {
+            output: Box::new(output),
+            candidate: None,
+        };
+        assert!(validate_resource_control_settlement_response(&settlement, &ack).is_ok());
+        let mut changed = settlement.clone();
+        changed.output.resource.incarnation = "foreign".into();
+        assert!(validate_resource_control_settlement_request(&changed).is_err());
+        let mut changed = settlement.clone();
+        changed.settlement_id.clear();
+        assert!(validate_resource_control_settlement_request(&changed).is_err());
+        let mut changed = settlement.clone();
+        changed.output.data = json!({"different": true});
+        assert!(validate_resource_control_settlement_response(&changed, &ack).is_err());
     }
 
     #[test]
