@@ -101,6 +101,7 @@ pub(super) fn fence_session_receipts(
             operations::target_parts(target)
                 .is_ok_and(|(host, id, _, _)| host == epoch && id == session_id)
         }) || (receipt.request["operation"] == "prepare"
+            && receipt.response["host_epoch"].as_str() == Some(epoch)
             && receipt.response["session_id"].as_str() == Some(session_id));
         if !matches {
             continue;
@@ -145,6 +146,7 @@ pub(super) fn fence_exact_receipts(
             operations::target_parts(target)
                 .is_ok_and(|(host, id, _, _)| host == epoch && id == session_id)
         }) || (receipt.request["operation"] == "prepare"
+            && receipt.response["host_epoch"].as_str() == Some(epoch)
             && receipt.response["session_id"].as_str() == Some(session_id));
         if !belongs
             || targets.iter().flatten().any(|target| {
@@ -574,7 +576,7 @@ mod tests {
             create_key.clone(),
             receipt(
                 json!({"operation":"prepare"}),
-                json!({"status":"succeeded","session_id":"one"}),
+                json!({"status":"succeeded","host_epoch":"epoch","session_id":"one"}),
             ),
         );
         journal.receipts.insert(
@@ -595,6 +597,17 @@ mod tests {
         assert_eq!(journal.receipts.len(), 2);
         assert!(journal.retention.tombstones.is_empty());
         journal.recovery_sources.clear();
+        let mut other_epoch = journal.clone();
+        other_epoch.receipts.get_mut(&create_key).unwrap().response["host_epoch"] =
+            json!("other-epoch");
+        assert!(
+            fence_exact_receipts(
+                &mut other_epoch,
+                &session,
+                &BTreeSet::from([create_key.clone()])
+            )
+            .is_err()
+        );
         let foreign_key = receipt_key("caller", "caller", "foreign");
         journal.receipts.insert(
             foreign_key.clone(),
