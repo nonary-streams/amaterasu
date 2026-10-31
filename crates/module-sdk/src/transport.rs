@@ -53,3 +53,6 @@ pub unsafe fn bind_control(runtime: &RuntimeClient, service: &str) -> ModuleResu
         )
     }
 }
+
+/// Optional broker receipt for aborting an entire owned control stream.
+pub mod control_retirement;

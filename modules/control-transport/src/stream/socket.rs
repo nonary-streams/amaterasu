@@ -60,6 +60,13 @@ impl Stream {
             let Some(packet) = self.pending_datagram.as_ref() else {
                 return;
             };
+            #[cfg(test)]
+            if let Some((entered, resume)) = self.before_local_send.take() {
+                entered.send(()).expect("test observer remains live");
+                resume
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("test releases local send");
+            }
             match socket.send_to(packet, remote) {
                 Ok(length) if length == packet.len() => {
                     self.pending_datagram = None;

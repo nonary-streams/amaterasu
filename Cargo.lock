@@ -261,10 +261,12 @@ dependencies = [
 name = "amaterasu-control-transport"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-contracts",
  "amaterasu-gamestream",
  "amaterasu-media",
  "amaterasu-module-sdk",
  "amaterasu-network-policy",
+ "amaterasu-runtime",
  "getrandom 0.3.4",
  "serde",
  "serde_json",

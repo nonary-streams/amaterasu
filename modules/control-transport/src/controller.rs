@@ -15,12 +15,19 @@ struct OperationRecord {
     specification: Open,
 }
 
+struct RetiredStream {
+    owner: String,
+    operation_id: Option<String>,
+}
+
 pub struct Controller {
     network: Network,
     settings: Settings,
     streams: BTreeMap<u64, Stream>,
     operations: BTreeMap<(String, String), OperationRecord>,
     issued_ids: BTreeSet<u64>,
+    retired_streams: BTreeMap<u64, RetiredStream>,
+    retirement_epoch: Option<String>,
     used_keys: Vec<[u8; 16]>,
     epoch: Instant,
 }
@@ -38,6 +45,8 @@ impl Controller {
             streams: BTreeMap::new(),
             operations: BTreeMap::new(),
             issued_ids: BTreeSet::new(),
+            retired_streams: BTreeMap::new(),
+            retirement_epoch: random_epoch(),
             used_keys: Vec::new(),
             epoch: Instant::now(),
         }
@@ -47,6 +56,22 @@ impl Controller {
         let (payload, created) = match operation {
             Operation::Open(request) => return self.open(owner, request),
             Operation::Close { stream } => (self.close(owner, stream)?, None),
+            Operation::Retire {
+                stream,
+                operation_id,
+                provider_epoch,
+            } => (
+                self.retire(owner, stream, &operation_id, &provider_epoch)?,
+                None,
+            ),
+            Operation::RetirementStatus {
+                stream,
+                operation_id,
+                provider_epoch,
+            } => (
+                self.retirement_status(owner, stream, &operation_id, &provider_epoch)?,
+                None,
+            ),
             Operation::Lookup { operation_id } => {
                 if !valid_name(&operation_id) {
                     return Err("invalid_operation_id");
@@ -56,7 +81,7 @@ impl Controller {
                     .get(&(owner.into(), operation_id))
                     .ok_or("stream_not_found")?;
                 (
-                    self.owned(owner, record.stream)?.metadata(record.stream),
+                    self.metadata(self.owned(owner, record.stream)?, record.stream),
                     None,
                 )
             }
@@ -85,7 +110,7 @@ impl Controller {
                 }
                 let stream = self.streams.get(&record.stream).ok_or("stream_closed")?;
                 return Ok(Reply {
-                    payload: stream.metadata(record.stream),
+                    payload: self.metadata(stream, record.stream),
                     created: None,
                 });
             }
@@ -96,7 +121,7 @@ impl Controller {
         self.admit(owner, &key)?;
         let id = self.new_id()?;
         let stream = Stream::open_with_network(&self.network, owner, &request, &key, self.now())?;
-        let payload = stream.metadata(id);
+        let payload = self.metadata(&stream, id);
         self.streams.insert(id, stream);
         self.issued_ids.insert(id);
         self.used_keys.push(key);
@@ -165,8 +190,90 @@ impl Controller {
 
     pub fn close(&mut self, owner: &str, id: u64) -> ControlResult<Value> {
         self.owned(owner, id)?;
-        self.streams.remove(&id);
+        // Drop peer, queued datagrams and the owned Network SDK socket before
+        // publishing the tombstone. Native calls and tick share this controller.
+        drop(self.streams.remove(&id));
+        self.retired_streams.insert(
+            id,
+            RetiredStream {
+                owner: owner.into(),
+                operation_id: None,
+            },
+        );
         Ok(json!({"ok": true}))
+    }
+
+    fn check_retirement_epoch(&self, expected: &str) -> ControlResult<()> {
+        match self.retirement_epoch.as_deref() {
+            Some(epoch) if epoch == expected => Ok(()),
+            Some(_) => Err("retirement_epoch_mismatch"),
+            None => Err("retirement_unavailable"),
+        }
+    }
+
+    fn retire(
+        &mut self,
+        owner: &str,
+        id: u64,
+        operation: &str,
+        epoch: &str,
+    ) -> ControlResult<Value> {
+        self.check_retirement_epoch(epoch)?;
+        if !valid_name(operation) {
+            return Err("invalid_operation_id");
+        }
+        if self.retired_streams.iter().any(|(other, record)| {
+            *other != id
+                && record.owner == owner
+                && record.operation_id.as_deref() == Some(operation)
+        }) {
+            return Err("operation_conflict");
+        }
+        if let Some(record) = self.retired_streams.get(&id) {
+            if record.owner != owner {
+                return Err("stream_not_found");
+            }
+            if record
+                .operation_id
+                .as_deref()
+                .is_some_and(|existing| existing != operation)
+            {
+                return Err("operation_conflict");
+            }
+        } else {
+            self.close(owner, id)?;
+        }
+        self.retired_streams
+            .get_mut(&id)
+            .expect("owned stream is retired")
+            .operation_id = Some(operation.into());
+        Ok(retirement_reply(id, operation, epoch))
+    }
+
+    fn retirement_status(
+        &self,
+        owner: &str,
+        id: u64,
+        operation: &str,
+        epoch: &str,
+    ) -> ControlResult<Value> {
+        self.check_retirement_epoch(epoch)?;
+        if !valid_name(operation) {
+            return Err("invalid_operation_id");
+        }
+        self.retired_streams
+            .get(&id)
+            .filter(|record| {
+                record.owner == owner && record.operation_id.as_deref() == Some(operation)
+            })
+            .ok_or("retirement_unknown")?;
+        Ok(retirement_reply(id, operation, epoch))
+    }
+
+    fn metadata(&self, stream: &Stream, id: u64) -> Value {
+        let mut payload = stream.metadata(id);
+        payload["retirement_epoch"] = json!(self.retirement_epoch);
+        payload
     }
 
     fn status(&self, owner: &str, requested: Option<u64>) -> Value {
@@ -176,7 +283,7 @@ impl Controller {
             .filter(|(id, stream)| {
                 stream.owner == owner && requested.is_none_or(|requested| requested == **id)
             })
-            .map(|(id, stream)| stream.metadata(*id))
+            .map(|(id, stream)| self.metadata(stream, *id))
             .collect();
         json!({"ok": true, "enabled": self.settings.enabled, "streams": streams})
     }
@@ -217,6 +324,17 @@ impl Controller {
             None => MEDIA_CLOSED,
         }
     }
+}
+
+fn random_epoch() -> Option<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).ok()?;
+    Some(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn retirement_reply(stream: u64, operation_id: &str, provider_epoch: &str) -> Value {
+    json!({"ok":true,"state":"retired","scope":"whole_control_stream",
+        "stream":stream,"operation_id":operation_id,"provider_epoch":provider_epoch})
 }
 
 #[cfg(test)]

@@ -123,7 +123,23 @@ pub fn parse_key(value: &str) -> ControlResult<[u8; 16]> {
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Open(Open),
-    Lookup { operation_id: String },
-    Close { stream: u64 },
-    Status { stream: Option<u64> },
+    Lookup {
+        operation_id: String,
+    },
+    Close {
+        stream: u64,
+    },
+    Retire {
+        stream: u64,
+        operation_id: String,
+        provider_epoch: String,
+    },
+    RetirementStatus {
+        stream: u64,
+        operation_id: String,
+        provider_epoch: String,
+    },
+    Status {
+        stream: Option<u64>,
+    },
 }

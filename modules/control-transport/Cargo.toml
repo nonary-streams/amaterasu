@@ -18,6 +18,8 @@ getrandom.workspace = true
 
 [dev-dependencies]
 amaterasu-network-policy = { path = "../../crates/network-policy", features = ["test-support"] }
+amaterasu-runtime = { path = "../../crates/runtime" }
+amaterasu-contracts.workspace = true
 
 amaterasu-module-sdk = { workspace = true, features = ["network-test-support"] }
 

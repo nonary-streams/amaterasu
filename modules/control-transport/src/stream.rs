@@ -38,6 +38,8 @@ pub struct Stream {
     sealer: ControlSealer,
     opener: ControlOpener,
     pending_datagram: Option<Vec<u8>>,
+    #[cfg(test)]
+    before_local_send: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
     incoming: VecDeque<Received>,
     incoming_bytes: usize,
     opened: u64,
@@ -52,6 +54,91 @@ pub struct Stream {
 }
 
 impl Stream {
+    #[cfg(test)]
+    pub(crate) fn stage_pending_datagram_for_test(
+        &mut self,
+        destination: SocketAddr,
+        bytes: Vec<u8>,
+    ) {
+        self.remote = Some(destination);
+        self.pending_datagram = Some(bytes);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_local_send_for_test(
+        &mut self,
+        entered: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        self.before_local_send = Some((entered, resume));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stage_reliable_enet_for_test(
+        &mut self,
+        destination: SocketAddr,
+        connect_data: u32,
+    ) {
+        use amaterasu_gamestream::enet::{
+            CONTROL_CHANNEL, Command, CommandBody, Connect, Datagram, FLAG_ACKNOWLEDGE, Header,
+            Limits, UNCONNECTED_PEER, encode,
+        };
+        let connect = Datagram {
+            header: Header {
+                peer_id: UNCONNECTED_PEER,
+                session_id: 0,
+                sent_time: Some(0),
+            },
+            commands: vec![Command {
+                channel_id: CONTROL_CHANNEL,
+                reliable_sequence: 1,
+                flags: FLAG_ACKNOWLEDGE,
+                body: CommandBody::Connect(Connect {
+                    outgoing_peer_id: 0,
+                    incoming_session_id: 255,
+                    outgoing_session_id: 255,
+                    mtu: 900,
+                    window_size: 65536,
+                    channel_count: 48,
+                    incoming_bandwidth: 0,
+                    outgoing_bandwidth: 0,
+                    packet_throttle_interval: 5000,
+                    packet_throttle_acceleration: 2,
+                    packet_throttle_deceleration: 2,
+                    connect_id: [1, 2, 3, 4],
+                    data: connect_data,
+                }),
+            }],
+        };
+        self.peer
+            .receive(&encode(&connect, &Limits::default()).unwrap(), 0)
+            .unwrap();
+        self.peer.pop_datagram().unwrap();
+        let ack = Datagram {
+            header: Header {
+                peer_id: 0,
+                session_id: 0,
+                sent_time: Some(1),
+            },
+            commands: vec![Command {
+                channel_id: CONTROL_CHANNEL,
+                reliable_sequence: 1,
+                flags: 0,
+                body: CommandBody::Acknowledge {
+                    received_sequence: 1,
+                    received_sent_time: 0,
+                },
+            }],
+        };
+        self.peer
+            .receive(&encode(&ack, &Limits::default()).unwrap(), 1)
+            .unwrap();
+        self.peer
+            .send(0, b"queued-reliable-feedback", Delivery::Reliable, 2)
+            .unwrap();
+        self.remote = Some(destination);
+    }
+
     #[cfg(test)]
     pub fn open(owner: &str, request: &Open, key: &[u8; 16], now: u64) -> ControlResult<Self> {
         Self::open_with_network(&Network::test_provider(), owner, request, key, now)
@@ -102,6 +189,8 @@ impl Stream {
             sealer,
             opener,
             pending_datagram: None,
+            #[cfg(test)]
+            before_local_send: None,
             incoming: VecDeque::new(),
             incoming_bytes: 0,
             opened: now,

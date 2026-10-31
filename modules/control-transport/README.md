@@ -139,3 +139,52 @@ This verifies an encrypted control component, not a complete Moonlight session.
 Authenticated launch/RTSP orchestration, actual input dispatch, IDR/feedback
 routing, congestion/pacing integration, reconnect policy and target-system
 runtime qualification remain required.
+
+## Optional whole-stream retirement receipt
+
+The provider exposes an additive, owner-scoped whole-stream retirement operation
+for a trusted coordinator that must fence queued control feedback. `open`,
+`lookup`, and live stream `status` include `retirement_epoch`, a random 128-bit
+lowercase hexadecimal provider-instance identifier, or null if randomness was
+unavailable. A caller that requires retirement proof must retain the non-null
+value and fail closed if the provider does not implement this optional contract.
+The epoch is an incarnation label, not a credential. An old epoch is rejected
+after provider restart; no old receipt is invented from absence of a stream.
+
+The exact broker request and response are:
+
+```json
+{"action":"retire","stream":123,"operation_id":"retire-opaque-id","provider_epoch":"0123456789abcdef0123456789abcdef"}
+{"ok":true,"state":"retired","scope":"whole_control_stream","stream":123,"operation_id":"retire-opaque-id","provider_epoch":"0123456789abcdef0123456789abcdef"}
+```
+
+An owner can repeat the same request or send `retirement_status` with the same
+three fields after an uncertain reply. Both return the same receipt. A different
+operation on an already receipted stream, or reuse of an operation ID for another
+stream of the same owner, fails with `operation_conflict`; an unreceipted or
+foreign status returns `retirement_unknown`. Wrong epochs fail with
+`retirement_epoch_mismatch`. A stream previously closed by its owner may be
+claimed for one retirement operation in that same provider lifetime. Tombstones
+are bounded by the existing 1024 issued-stream limit and retained until the
+provider is destroyed. Use distinct broker operation IDs for a retirement and
+its status query; those are separate from the retirement `operation_id`.
+
+Both broker operations resolve the runtime-supplied immediate owner and share
+the controller mutex with native sends and socket flushes. Once retirement
+obtains that mutex, it drops the entire owned stream, including its ENet peer,
+unsent datagram and retransmission queues, before recording the receipt. A
+native send that reaches the controller after retirement receives `MEDIA_CLOSED`.
+The receipt therefore confirms that this control stream will make no further
+Network SDK sends. It does not cancel an already completed socket handoff, prove
+remote delivery or recall packets already sent. The Network SDK socket's drop
+attempts provider close, but its API does not expose the close result here; the
+receipt does not independently attest an OS handle was released or that an
+alternative network provider has no internal asynchronous queue.
+
+This operation removes the **whole control stream**, including unrelated
+controller feedback and control traffic; it is not per-source cancellation. The
+stream-session owner must stop new source admission before calling it, hold the
+protocol-owned effect/drain barrier until both input work and the transport are
+retired, and reconcile unknown outcomes. The receipt alone is not authorization
+to affect a session or acknowledge a source revocation. No automatic source
+routing or session teardown is enabled by installing this operation.

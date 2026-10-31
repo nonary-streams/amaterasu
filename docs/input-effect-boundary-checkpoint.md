@@ -69,3 +69,37 @@ not connected to `session_binding::AcquireJob` or `RoutePolicy::install`; no
 production source effect is enabled. The route still needs distinct stream,
 source and device incarnation fields, and the app worker's final admission
 operation must supply the required authority and drain semantics before wiring.
+
+## Prepared whole-stream retirement seam
+
+The control transport now offers an optional owner-scoped `retire` and
+`retirement_status` broker operation with a provider epoch and a replayable
+retirement operation ID. Exact JSON, ownership and reply semantics are in
+[the control transport contract](../modules/control-transport/README.md#optional-whole-stream-retirement-receipt),
+and `amaterasu_module_sdk::transport::control_retirement` supplies the request
+and receipt types. Its scope is `whole_control_stream`: it destroys the ENet
+peer and its queued datagrams and retransmissions, not one source. The provider
+serializes the local send callback, socket handoff and stream removal with the
+same controller mutex. The receipt says this stream will issue no future Network
+SDK sends; it does not recall earlier socket handoffs or establish delivery or
+independent Network-provider worker retirement. Provider restart changes the
+epoch and makes prior receipts unresolvable, so recovery must remain fenced.
+
+The protocol authority owner must first fence new admissions and then have the
+actual stream-session owner invoke this operation on the selected control
+provider using the epoch saved from that stream's open response. After any lost
+response, query `retirement_status` with the same retirement operation ID and
+provider epoch and verify the exact stream, operation, epoch, state and scope.
+Only combine that receipt with settled input/backend work and the app worker's
+revocation barrier. Do not grant a protocol caller ownership of another module's
+stream, treat a label as authority, or fall back to a bare close/status when a
+receipt is unavailable. This checkpoint does not connect any production route
+or acknowledge source revocation. The pending protocol gate remains required.
+
+The new control-provider tests use only loopback and cover unsent datagram
+retirement, rejection of late native sends, owner and epoch mismatch, status
+after a lost broker reply, and a local send held in flight while retirement waits
+for the controller lock. Their one observed datagram was handed off before the
+retirement receipt; the test makes no claim that it can be recalled. A selected
+replacement transport must independently implement the same contract and pass
+an unchanged consumer test before it is relied upon.
