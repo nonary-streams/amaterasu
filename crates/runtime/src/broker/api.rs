@@ -1,8 +1,8 @@
 //! Installed method contracts for dynamically named user-process services.
 //! Approval is policy data, never self-issued by a native publisher.
 use amaterasu_contracts::{
-    ApiFieldKind, ApiMethod, ApiMethodApproval, ApiPrivilege, ApiSchema, Grants, Response,
-    RuntimeConfig, valid_name,
+    ApiApprovalCursor, ApiFieldKind, ApiMethod, ApiMethodApproval, ApiPrivilege, ApiSchema, Grants,
+    Response, RuntimeConfig, valid_name,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -29,6 +29,7 @@ pub(super) struct ApiQuery<'a> {
 pub(super) struct ApiRegistry {
     approved: BTreeMap<MethodKey, ApiMethodApproval>,
     registered: BTreeSet<MethodKey>,
+    revision: u64,
 }
 
 impl ApiRegistry {
@@ -41,6 +42,7 @@ impl ApiRegistry {
                 .map(|approval| (key(&approval.method), approval))
                 .collect(),
             registered: BTreeSet::new(),
+            revision: 0,
         }
     }
 
@@ -60,7 +62,9 @@ impl ApiRegistry {
         {
             return permission_denied();
         }
-        self.registered.insert(key);
+        if self.registered.insert(key) {
+            self.revision += 1;
+        }
         Response::Ok
     }
 
@@ -86,6 +90,78 @@ impl ApiRegistry {
         };
         Response::Result {
             payload: payload.expect("API approval is serializable"),
+        }
+    }
+
+    /// Enumerate only methods this authenticated endpoint can query and call.
+    pub fn list_approvals(
+        &self,
+        caller: &str,
+        grants: &Grants,
+        authority: Option<&(String, BTreeSet<String>)>,
+        after: Option<ApiApprovalCursor>,
+        limit: u16,
+    ) -> Response {
+        if !(1..=16).contains(&limit) {
+            return Response::error("invalid_request", "page limit must be 1 through 16");
+        }
+        if after
+            .as_ref()
+            .is_some_and(|cursor| cursor.revision != self.revision)
+        {
+            return Response::error(
+                "stale_revision",
+                "API registrations changed during discovery",
+            );
+        }
+        let after_key = after.map(|cursor| (cursor.service, cursor.method, cursor.interface_major));
+        let mut eligible = self
+            .approved
+            .iter()
+            .filter(|(key, _)| {
+                after_key.as_ref().is_none_or(|after| *key > after)
+                    && authority.is_none_or(|(initiator, allowed)| {
+                        allowed.contains(&key.0) && self.approved[*key].callers.contains(initiator)
+                    })
+                    && self
+                        .authorized(caller, grants, &key.0, &key.1, key.2)
+                        .is_some()
+            })
+            .peekable();
+        let mut approvals = Vec::new();
+        let mut last = None;
+        while let Some((key, approval)) = eligible.peek().copied() {
+            if approvals.len() == usize::from(limit) {
+                break;
+            }
+            approvals.push(approval.clone());
+            // Bound serialized output, including schemas controlled by installed policy.
+            if serde_json::to_vec(&approvals).map_or(true, |bytes| bytes.len() > 12_000) {
+                approvals.pop();
+                if approvals.is_empty() {
+                    return Response::error(
+                        "resource_exhausted",
+                        "approval exceeds discovery page limit",
+                    );
+                }
+                break;
+            }
+            last = Some(ApiApprovalCursor {
+                revision: self.revision,
+                service: key.0.clone(),
+                method: key.1.clone(),
+                interface_major: key.2,
+            });
+            eligible.next();
+        }
+        Response::ApiApprovals {
+            revision: self.revision,
+            approvals,
+            next: if eligible.peek().is_some() {
+                last
+            } else {
+                None
+            },
         }
     }
 

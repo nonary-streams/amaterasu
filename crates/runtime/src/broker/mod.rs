@@ -345,6 +345,35 @@ impl Broker {
             Command::Unsubscribe { subscription } => self.events.unsubscribe(caller, subscription),
             Command::RegisterHook { hook } => self.hooks.register(caller, grants, hook),
             Command::RunHook { hook, payload } => self.hooks.begin(caller, hook, payload, now),
+            Command::RunHookOperation {
+                hook,
+                payload,
+                operation_id,
+                cleanup,
+            } => self
+                .hooks
+                .begin_operation(caller, hook, payload, operation_id, cleanup, now),
+            Command::ListApiApprovals {
+                parent,
+                after,
+                limit,
+            } => {
+                let authority = match parent {
+                    Some(id) => match self.requests.discovery_authority(caller, id) {
+                        Ok(authority) => Some(authority),
+                        Err(error) => return error,
+                    },
+                    None => None,
+                };
+                self.api
+                    .list_approvals(caller, grants, authority.as_ref(), after, limit)
+            }
+            Command::LookupHook { operation_id } => self.hooks.lookup(caller, &operation_id),
+            Command::CancelHook { invocation } => {
+                self.hooks
+                    .cancel(caller, invocation, now, &mut self.requests)
+            }
+            Command::ReleaseHook { invocation } => self.hooks.release(caller, invocation),
             Command::HookResult { invocation } => {
                 self.hooks
                     .advance(caller, grants, invocation, now, &mut self.requests)
