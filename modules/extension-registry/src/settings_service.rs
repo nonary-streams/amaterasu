@@ -101,7 +101,7 @@ impl SettingsService {
         parent: u64,
         identities: (&str, &str),
         remaining_ms: u64,
-        operation: SettingsOperation,
+        mut operation: SettingsOperation,
     ) -> Result<(), Value> {
         let (caller, initiator) = identities;
         if self.pending.len() >= MAX_PENDING {
@@ -109,6 +109,30 @@ impl SettingsService {
                 "resource_exhausted",
                 "settings queue is full",
             ));
+        }
+        if let SettingsOperation::Get {
+            scope,
+            application,
+            paired_client,
+            session,
+            ..
+        } = &mut operation
+        {
+            let selected = match scope {
+                Scope::Host => None,
+                Scope::Application(id) => Some((application, id)),
+                Scope::PairedClient(id) => Some((paired_client, id)),
+                Scope::Session(id) => Some((session, id)),
+            };
+            if let Some((selector, id)) = selected {
+                if selector.as_ref().is_some_and(|current| current != id) {
+                    return Err(discovery::failure(
+                        "invalid_request",
+                        "scope and effective selector differ",
+                    ));
+                }
+                *selector = Some(id.clone());
+            }
         }
         let host_scope = Scope::Host;
         let (provider, scope, write) = match &operation {

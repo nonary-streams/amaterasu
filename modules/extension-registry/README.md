@@ -25,7 +25,9 @@ Dynamic application and session reads may include a `target` (tagged
 `LifecycleTarget`) and optional `input_binding`. The registry requests lifecycle
 authorization for every selected scope, relaying only the caller and initiator
 provided by the broker. It accepts only the coordinator's matching canonical
-target and scope. Input-token authorization requires a configured trusted input
+target and scope. A read is authorized when lifecycle accepts its scope request;
+revocation does not retroactively retract an already admitted read. Input effects
+require separate revalidation. Input-token authorization requires a configured trusted input
 consumer and a current token bound to the exact active stream. Dynamic paired
 client reads and dynamic writes remain unavailable. Provider validation and
 migration have not yet been qualified through an installed host fixture.

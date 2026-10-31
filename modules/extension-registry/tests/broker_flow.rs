@@ -74,7 +74,7 @@ impl Harness {
             DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir(&root).unwrap();
-        let descriptor = json!({"provider":"example.demo","revision":if migrating {2} else {1},"options":[],"actions":[],"capabilities":[],"settings_validate":{"service":"example.demo/1","method":"settings_validate","interface_major":1,"interface_minor":0,"schema_revision":1}});
+        let descriptor = json!({"provider":"example.demo","revision":if migrating {2} else {1},"options":[{"id":"enabled","label":"Enabled","help":"","definition":{"type":"boolean","default":true},"allowed_scopes":["host","application","session"],"apply_policy":"next_session","required_capabilities":[]}],"actions":[],"capabilities":[],"settings_validate":{"service":"example.demo/1","method":"settings_validate","interface_major":1,"interface_minor":0,"schema_revision":1}});
         use sha2::{Digest, Sha256};
         let typed: amaterasu_extension_api::ExtensionDescriptor =
             serde_json::from_value(descriptor.clone()).unwrap();
@@ -500,4 +500,24 @@ fn delegated_input_source_is_attested_by_broker_not_request_payload() {
         harness.scope_source,
         Some(json!({"caller":"input","initiator":"management"}))
     );
+}
+
+#[test]
+fn canonical_scope_also_selects_effective_overlay() {
+    let mut harness = Harness::new();
+    harness.state = Some(
+        json!({"revision":1,"schema_revision":1,"layers":[{"scope":{"kind":"session","id":"session"},"values":{"enabled":false}}]}),
+    );
+    harness.state_revision = 1;
+    let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":7});
+    let result=harness.call("management",json!({"operation":"settings_get","provider":"example.demo","scope":{"kind":"session","id":"session"},"application":null,"paired_client":null,"session":null,"target":target,"input_binding":"token"}));
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["values"]["enabled"], false);
+    assert_eq!(result["effective"]["enabled"]["value"], false);
+    assert_eq!(
+        result["effective"]["enabled"]["source"],
+        json!({"kind":"session","id":"session"})
+    );
+    let mismatch=harness.call("management",json!({"operation":"settings_get","provider":"example.demo","scope":{"kind":"session","id":"session"},"application":null,"paired_client":null,"session":"other","target":target,"input_binding":"token"}));
+    assert_eq!(mismatch["error"]["code"], "invalid_request");
 }
