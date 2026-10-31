@@ -8,7 +8,6 @@ trusted code. End-to-end session/display behavior requires separate validation.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -42,10 +41,11 @@ OPERATIONS = {
 }
 
 
-def run(*arguments: object) -> None:
+def run(*arguments: object) -> str:
     result = subprocess.run([str(argument) for argument in arguments], text=True, capture_output=True, timeout=120)
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+    return result.stdout.strip()
 
 
 def method_ref(name: str) -> dict:
@@ -53,7 +53,7 @@ def method_ref(name: str) -> dict:
             "interface_minor": 0, "schema_revision": 1}
 
 
-def prepare(bootstrap: dict, root: Path, descriptor: dict, approvals: list[dict], component: dict) -> dict:
+def prepare(bootstrap: dict, root: Path, descriptor: dict, descriptor_digest: str, approvals: list[dict], component: dict) -> dict:
     if descriptor.get("provider") != PROVIDER or component.get("id") != PROVIDER:
         raise ValueError("unexpected display provider identity")
     if any(approval.get("provider") != PROVIDER or approval.get("method", {}).get("service") != PROVIDER_SERVICE for approval in approvals):
@@ -95,11 +95,10 @@ def prepare(bootstrap: dict, root: Path, descriptor: dict, approvals: list[dict]
     if len(identities) != len(set(identities)):
         raise ValueError("provider API approval conflicts with existing policy")
     policy["api_methods"] = installed + approvals
-    descriptor_bytes = json.dumps(descriptor, ensure_ascii=False, separators=(",", ":")).encode()
     grants = [{"caller": identity, "scope": {"kind": "host"}, "read": True,
                "write": identity in (MANAGEMENT, CONSOLE)} for identity in validation_callers if identity != REGISTRY]
     settings[REGISTRY] = {"descriptors": [{"descriptor": descriptor,
-        "descriptor_sha256": hashlib.sha256(descriptor_bytes).hexdigest(),
+        "descriptor_sha256": descriptor_digest,
         "approved_methods": [item["method"] for item in approvals], "grants": grants, "migrations": []}]}
     defaults = {option["id"]: option["definition"]["default"] for option in descriptor["options"]}
     if defaults.get("enabled") is not False:
@@ -147,7 +146,8 @@ def main() -> None:
     run(args.publisher, "init-linux-session", args.root, *options)
     bootstrap_path = args.root / "bootstrap.json"
     bootstrap = json.loads(bootstrap_path.read_text())
-    calls = prepare(bootstrap, args.root.resolve(), descriptor, approvals, component)
+    descriptor_digest = run(args.publisher, "extension-descriptor-digest", examples / "settings-descriptor.json")
+    calls = prepare(bootstrap, args.root.resolve(), descriptor, descriptor_digest, approvals, component)
     bootstrap_path.write_text(json.dumps(bootstrap, indent=2) + "\n")
     with tempfile.TemporaryDirectory(prefix="amaterasu-extension-grants-") as temporary:
         call_path = Path(temporary) / "calls.json"

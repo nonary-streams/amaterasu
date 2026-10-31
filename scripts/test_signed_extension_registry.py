@@ -8,7 +8,6 @@ The provider currently exposes settings validation only, not display lifecycle.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -36,11 +35,13 @@ def main() -> None:
     publisher, host = target / f"amaterasu-release{suffix}", target / f"amaterasu{suffix}"
     examples = args.provider_repo / "examples"
     descriptor = json.loads((examples / "settings-descriptor.json").read_text())
-    approval = json.loads((examples / "settings-validation-approval.json").read_text())
-    provider, service = descriptor["provider"], approval["method"]["service"]
-    approval["callers"] = ["amaterasu.extension-registry", "amaterasu.console"]
-    descriptor_bytes = json.dumps(descriptor, ensure_ascii=False, separators=(",", ":")).encode()
-    descriptor_digest = hashlib.sha256(descriptor_bytes).hexdigest()
+    approvals = json.loads((examples / "lifecycle-api-approvals.json").read_text())["api_methods"]
+    provider, service = descriptor["provider"], approvals[0]["method"]["service"]
+    for approval in approvals:
+        approval["callers"] = (["amaterasu.extension-registry", "amaterasu.console"]
+                               if approval["method"]["method"] == "settings_validate"
+                               else ["amaterasu.extension-registry"])
+    descriptor_digest = run(publisher, "extension-descriptor-digest", examples / "settings-descriptor.json").strip()
     with tempfile.TemporaryDirectory(prefix="amaterasu-signed-registry-") as temporary:
         root = Path(temporary) / "root"
         package = Path(temporary) / "package"
@@ -48,7 +49,9 @@ def main() -> None:
         bootstrap_path = root / "bootstrap.json"
         bootstrap = json.loads(bootstrap_path.read_text())
         policy = bootstrap["policy"]
-        policy["principals"][provider] = {"provide": [service]}
+        template = examples / ("component-windows.json" if os.name == "nt" else "component-linux.json")
+        component = json.loads(template.read_text())
+        policy["principals"][provider] = component["requested"]
         policy["principals"]["amaterasu.extension-registry"] = {
             "provide": ["amaterasu.extension-registry/1"], "call": ["amaterasu.state/1", service],
         }
@@ -56,17 +59,16 @@ def main() -> None:
         console["call"] = sorted(set(console.get("call", [])) | {
             "amaterasu.extension-registry/1", "amaterasu.state/1", service,
         })
-        policy["api_methods"] = [approval]
+        policy["api_methods"] = approvals
         policy["settings"]["amaterasu.extension-registry"] = {"descriptors": [{
             "descriptor": descriptor, "descriptor_sha256": descriptor_digest,
-            "approved_methods": [approval["method"]],
+            "approved_methods": [approval["method"] for approval in approvals],
             "grants": [{"caller": "amaterasu.console", "scope": {"kind": "host"},
                         "read": True, "write": True}], "migrations": [],
         }]}
         bootstrap_path.write_text(json.dumps(bootstrap))
         calls = Path(temporary) / "calls.json"
         calls.write_text(json.dumps({"amaterasu.extension-registry": [service]}))
-        template = examples / ("component-windows.json" if os.name == "nt" else "component-linux.json")
         run(publisher, "pack-registry-fixture", root, target, package, "1", "--external-component",
             template, args.provider_library, "--call-grants", calls)
         run(publisher, "verify", root, package)

@@ -2801,6 +2801,20 @@ pub(crate) fn x264_runtime_available(_: u32) -> bool {
     false
 }
 
+/// Hash the validated descriptor's typed wire representation, independent of input key ordering.
+pub fn read_extension_descriptor_digest(path: &Path) -> PackageResult<String> {
+    let descriptor: amaterasu_extension_api::ExtensionDescriptor = read_json(path)?;
+    extension_descriptor_digest(&descriptor)
+}
+
+fn extension_descriptor_digest(
+    descriptor: &amaterasu_extension_api::ExtensionDescriptor,
+) -> PackageResult<String> {
+    amaterasu_extension_api::validate_descriptor(descriptor)?;
+    let bytes = serde_json::to_vec(descriptor).map_err(|error| error.to_string())?;
+    Ok(sha256(&bytes))
+}
+
 /// The template declares identity, dependencies and requested routing grants. The
 /// selected bytes, not template-supplied hash or size, determine integrity.
 struct ExternalComponent {
@@ -2958,6 +2972,18 @@ fn library_filename(name: &str) -> String {
 #[cfg(test)]
 mod external_component_tests {
     use super::*;
+
+    #[test]
+    fn descriptor_digest_does_not_depend_on_input_key_order() {
+        let first = r#"{"provider":"example.demo","revision":1,"options":[],"actions":[],"capabilities":[],"settings_validate":{"service":"example.demo/1","method":"validate","interface_major":1,"interface_minor":0,"schema_revision":1}}"#;
+        let second = r#"{"settings_validate":{"schema_revision":1,"interface_minor":0,"interface_major":1,"method":"validate","service":"example.demo/1"},"capabilities":[],"actions":[],"options":[],"revision":1,"provider":"example.demo"}"#;
+        let first = serde_json::from_str(first).unwrap();
+        let second = serde_json::from_str(second).unwrap();
+        assert_eq!(
+            extension_descriptor_digest(&first).unwrap(),
+            extension_descriptor_digest(&second).unwrap()
+        );
+    }
 
     #[test]
     fn added_calls_require_a_selected_service_and_operator_approval() {
