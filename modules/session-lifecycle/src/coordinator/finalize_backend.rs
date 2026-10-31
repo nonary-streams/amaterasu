@@ -19,10 +19,34 @@ struct Backend<'a> {
     coordinator: &'a mut Coordinator,
 }
 impl Backend<'_> {
-    fn authority(&self) -> ModuleResult<CoordinatorPrepareAuthority<Writer>> {
+    fn authority(
+        &self,
+        request: &ResourceFinalizeRequest,
+    ) -> ModuleResult<CoordinatorPrepareAuthority<Writer>> {
+        let (state, work) = {
+            let shared = self.coordinator.shared.borrow();
+            let mut matches = shared.value.receipts.values().filter_map(|receipt| {
+                let work = receipt.work.as_ref()?;
+                let finalize = work.composition_progress.as_ref()?.finalize.as_ref()?;
+                (work.target == request.target
+                    && work.transition_id == request.transition_id
+                    && finalize.owner_plan.admission_id.as_deref()
+                        == Some(request.admission_id.as_str())
+                    && finalize
+                        .dispatch
+                        .as_ref()
+                        .is_some_and(|dispatch| dispatch.request == *request))
+                .then_some(work.clone())
+            });
+            let work = matches.next().ok_or("finalize_work_missing")?;
+            if matches.next().is_some() {
+                return Err("finalize_work_ambiguous".into());
+            }
+            (shared.value.authority.clone(), work)
+        };
         CoordinatorPrepareAuthority::new(
-            self.coordinator.shared.borrow().value.authority.clone(),
-            self.coordinator.selections.values().cloned().collect(),
+            state,
+            self.coordinator.work_selections(&work)?,
             Writer(self.coordinator.shared.clone()),
         )
     }
@@ -279,7 +303,7 @@ impl FinalizeEndpointBackend for Backend<'_> {
         resolved: &ResolvedFinalize,
         request: &ResourceFinalizeRequest,
     ) -> ModuleResult<()> {
-        self.authority()?.describe_finalize_permit(
+        self.authority(request)?.describe_finalize_permit(
             owner,
             &resolved.participant,
             &resolved.context,
@@ -292,7 +316,7 @@ impl FinalizeEndpointBackend for Backend<'_> {
         resolved: &ResolvedFinalize,
         request: &ResourceFinalizeRequest,
     ) -> ModuleResult<ControlPermitUse> {
-        self.authority()?.consume_finalize_permit(
+        self.authority(request)?.consume_finalize_permit(
             owner,
             &resolved.participant,
             &resolved.context,
@@ -305,7 +329,7 @@ impl FinalizeEndpointBackend for Backend<'_> {
         resolved: &ResolvedFinalize,
         request: &ResourceFinalizeRequest,
     ) -> ModuleResult<()> {
-        self.authority()?.validate_finalize_permit(
+        self.authority(request)?.validate_finalize_permit(
             owner,
             &resolved.participant,
             &resolved.context,

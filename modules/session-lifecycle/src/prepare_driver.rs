@@ -181,7 +181,7 @@ impl PrepareDriver {
                     )))
             || (standalone_release
                 && (state.request.version != api::COMPOSITION_VERSION
-                    || !state.request.dependency_inputs.is_empty()
+                    || state.request.dependency_inputs.len() != 1
                     || !state.request.control_results.is_empty()
                     || !matches!(
                         state.request.operation,
@@ -879,7 +879,7 @@ mod tests {
         state.participant = participant.clone();
         state.request.version = api::COMPOSITION_VERSION;
         state.request.phase = api::LifecyclePhase::StreamRelease;
-        assert!(PrepareDriver::new_standalone_release(state.clone(), &settings).is_ok());
+        assert!(PrepareDriver::new_standalone_release(state.clone(), &settings).is_err());
         state.request.phase = api::LifecyclePhase::StreamPrepare;
         assert!(PrepareDriver::new_standalone_release(state, &settings).is_err());
     }

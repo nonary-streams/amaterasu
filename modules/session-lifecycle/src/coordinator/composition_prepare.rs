@@ -393,6 +393,13 @@ impl Coordinator {
     }
 }
 
+struct StagedFinalizeAuthority;
+impl crate::prepare_authority::AuthorityJournal for StagedFinalizeAuthority {
+    fn persist(&mut self, _: &crate::prepare_authority::AuthorityState) -> ModuleResult<()> {
+        Ok(())
+    }
+}
+
 impl Coordinator {
     /// Reserve a fresh owner finalization permit and freeze the exact approved
     /// dispatch. No owner effect is sent by this method.
@@ -453,8 +460,14 @@ impl Coordinator {
             transition_id: work.transition_id.clone(),
             parent_generation: selection.parent_generation,
         };
-        let mut authority = self.authority_for_work(work)?;
-        let (sequence, operation_id) = authority.allocate(&participant.provider)?;
+        let mut allocator = self.authority_for_work(work)?;
+        let (sequence, operation_id) = allocator.allocate(&participant.provider)?;
+        let authority_before = self.shared.borrow().value.authority.clone();
+        let mut authority = crate::prepare_authority::CoordinatorPrepareAuthority::new(
+            authority_before.clone(),
+            self.work_selections(work)?,
+            StagedFinalizeAuthority,
+        )?;
         let mut request = ResourceFinalizeRequest {
             version: amaterasu_extension_api::COMPOSITION_VERSION,
             transition_id: work.transition_id.clone(),
@@ -514,6 +527,13 @@ impl Coordinator {
             return Err("finalization_changed".into());
         }
         current_finalize.dispatch = Some(dispatch);
+        if serde_json::to_value(&next.authority).map_err(|_| "invalid_authority_state")?
+            != serde_json::to_value(&authority_before).map_err(|_| "invalid_authority_state")?
+        {
+            return Err("finalize_authority_changed".into());
+        }
+        next.authority = authority.state().clone();
+        validate_journal(&next).map_err(|_| "invalid_finalize_journal")?;
         save(&self.shared, next)
     }
 }
@@ -875,7 +895,28 @@ pub(super) fn standalone_stream_input(
     {
         return Err("session_output_provenance_mismatch".into());
     }
+    // Resume must consume the most recent authenticated release readback;
+    // falling back to the original session snapshot would resurrect stale state.
+    let current = if let Some(previous) = journal.composition.staged_outputs().rev().find(|stage| {
+        stage.after.producer == input.output.producer
+            && stage.after.output_id == input.output.output_id
+            && stage.after.origin == input.output.origin
+    }) {
+        if !journal
+            .stream_releases
+            .has_valid_released(journal, &previous.target)
+        {
+            return Err("prior_stream_release_unverified".into());
+        }
+        journal
+            .stream_releases
+            .released_output_for_target(&previous.target)
+            .map(|(_, output)| output.clone())
+            .ok_or("prior_stream_release_readback_missing")?
+    } else {
+        input.output
+    };
     // The owner refreshes its native observation during the read-only plan.
     // Admission independently checks freshness before any callback effect.
-    Ok(input.output)
+    Ok(current)
 }

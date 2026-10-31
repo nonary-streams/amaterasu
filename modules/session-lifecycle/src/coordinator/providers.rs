@@ -598,6 +598,37 @@ impl Coordinator {
             if consumers_retired && session.obligations.iter().any(|o| o.provider == *provider) {
                 selected.authorized_borrowers.insert(session.id.clone());
             }
+            if work.phase == LifecyclePhase::StreamPrepare
+                && work.provider_graph.as_ref().is_some_and(|graph| {
+                    graph.order.contains(provider) && graph.dependencies.contains_key(provider)
+                })
+                && let LifecycleTarget::Stream {
+                    stream_id,
+                    generation,
+                    ..
+                } = &work.target
+                && session.streams.get(stream_id).is_some_and(|stream| {
+                    stream.generation == *generation && stream.phase == StreamPhase::Preparing
+                })
+            {
+                let mut stages = journal.composition.staged_outputs().filter(|stage| {
+                    stage.target == work.target && stage.after.producer == *provider
+                });
+                if let Some(stage) = stages.next()
+                    && stages.next().is_none()
+                    && journal
+                        .composition
+                        .staged_for(&work.target, provider, &stage.after.output_id)
+                        .ok()
+                        == Some(stage)
+                    && stage.after.domain_observations.iter().any(|observation| {
+                        observation.complete
+                            && observation.borrowers.get(stream_id) == Some(generation)
+                    })
+                {
+                    selected.authorized_borrowers.insert(stream_id.clone());
+                }
+            }
             selected.authorized_borrowers.extend(
                 session
                     .streams
@@ -758,6 +789,19 @@ impl Coordinator {
                 self.fail_work(&key, "restart_requires_cleanup")?;
                 continue;
             }
+            // Until cleanup carries a validated released-output refinement,
+            // retain the target and all lineage rather than allowing a release
+            // that cannot be safely resumed.
+            if work.phase == LifecyclePhase::StreamRelease
+                && self.settings.participants.iter().any(|participant| {
+                    &participant.provider == provider
+                        && participant.contract_version
+                            == amaterasu_extension_api::COMPOSITION_VERSION
+                })
+            {
+                self.cleanup_failure(&key, "release_output_refinement_required")?;
+                continue;
+            }
             // Unsupported v2 phases must be rejected before settings discovery or
             // any provider call. A session output alone does not authorize a
             // stream attachment or cleanup callback.
@@ -848,27 +892,45 @@ impl Coordinator {
                 Err(_) => continue,
             };
             if !work.states.contains_key(provider) {
-                let dependency_inputs =
-                    if standalone_v2 && work.phase == LifecyclePhase::StreamPrepare {
-                        let resolved = {
-                            let shared = self.shared.borrow();
-                            super::composition_prepare::standalone_stream_input(
-                                &shared.value,
-                                &effective_settings,
-                                &work,
-                                provider,
-                            )
-                        };
-                        match resolved {
-                            Ok(input) => vec![input],
-                            Err(reason) => {
-                                self.fail_work(&key, &reason)?;
-                                continue;
-                            }
-                        }
-                    } else {
-                        vec![]
+                let dependency_inputs = if standalone_v2
+                    && work.phase == LifecyclePhase::StreamPrepare
+                {
+                    let resolved = {
+                        let shared = self.shared.borrow();
+                        super::composition_prepare::standalone_stream_input(
+                            &shared.value,
+                            &effective_settings,
+                            &work,
+                            provider,
+                        )
                     };
+                    match resolved {
+                        Ok(input) => vec![input],
+                        Err(reason) => {
+                            self.fail_work(&key, &reason)?;
+                            continue;
+                        }
+                    }
+                } else if standalone_v2 && work.phase == LifecyclePhase::StreamRelease {
+                    let shared = self.shared.borrow();
+                    let mut results = shared.value.finalize_results.records().filter(|record| {
+                        record.request.target == work.target
+                            && record.selection.policy.owner_provider == *provider
+                    });
+                    let result = results.next().ok_or("finalize_result_missing")?;
+                    if results.next().is_some() {
+                        return Err("finalize_result_ambiguous".into());
+                    }
+                    let amaterasu_extension_api::ResourceControlResponse::Applied {
+                        output, ..
+                    } = &result.applied
+                    else {
+                        return Err("finalize_output_missing".into());
+                    };
+                    vec![(**output).clone()]
+                } else {
+                    vec![]
+                };
                 let (sequence, operation_id) = authority.allocate(provider)?;
                 let request = ProviderRequest {
                     provider_sequence: sequence,
@@ -1452,6 +1514,7 @@ impl Coordinator {
                         next.authority.admissions.contains_key(admission)
                             || next.authority.settled.contains_key(admission)
                             || next.composition.references_admission(admission)
+                            || next.session_releases.references_admission(admission)
                             || next.stream_releases.references_admission(admission)
                             || next
                                 .finalize_results
@@ -1732,6 +1795,7 @@ mod admission_target_tests {
             control_settlements: Default::default(),
             finalize_results: Default::default(),
             stream_releases: Default::default(),
+            session_releases: Default::default(),
             admission_transitions: Default::default(),
         };
         let target = LifecycleTarget::Stream {
