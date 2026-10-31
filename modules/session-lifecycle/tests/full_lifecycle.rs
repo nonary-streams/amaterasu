@@ -226,13 +226,25 @@ impl Harness {
                 let args = &payload["arguments"];
                 if payload["method"] == "resource_plan" {
                     let stream = args["phase"] == "stream.prepare";
+                    // A previous successful prepare materializes this producer.
+                    // Resume must plan the observed identity, not claim it is new.
+                    let existing = self.provider_calls.iter().any(|call| {
+                        call["method"] == "lifecycle_callback"
+                            && call["arguments"]["phase"] == "stream.prepare"
+                    });
+                    let incarnation = if existing {
+                        json!("native")
+                    } else {
+                        Value::Null
+                    };
+                    let revision = if existing { json!(1) } else { Value::Null };
                     let resources = if stream {
-                        json!([{"provider":"display","resource_id":"output","incarnation":null,"expected_revision":null,"execution_domain":"seat","mutation_domains":[],"access":"read"}])
+                        json!([{"provider":"display","resource_id":"output","incarnation":incarnation,"expected_revision":revision,"execution_domain":"seat","mutation_domains":[],"access":"read"}])
                     } else {
                         json!([])
                     };
                     let constraint = if stream {
-                        json!({"capture_provider":"capture","selector_schema":"example/1","resource_provider":"display","resource_id":"output","incarnation":null,"execution_domain":"seat","mode":args["requested_video"],"plan_revision":1})
+                        json!({"capture_provider":"capture","selector_schema":"example/1","resource_provider":"display","resource_id":"output","incarnation":incarnation,"execution_domain":"seat","mode":args["requested_video"],"plan_revision":1})
                     } else {
                         Value::Null
                     };
@@ -472,6 +484,18 @@ fn production_abi_drives_prepare_pause_resume_and_application_retirement() {
     harness.pause(&first, "first");
     let second = harness.prepare_and_start_stream(&session, "second", true);
     assert_ne!(first["stream_id"], second["stream_id"]);
+    let stream_plans: Vec<_> = harness
+        .provider_calls
+        .iter()
+        .filter(|call| {
+            call["method"] == "lifecycle_callback" && call["arguments"]["phase"] == "stream.prepare"
+        })
+        .map(|call| &call["arguments"]["approved_plan"]["resources"][0])
+        .collect();
+    assert_eq!(stream_plans.len(), 2);
+    assert!(stream_plans[0]["incarnation"].is_null());
+    assert_eq!(stream_plans[1]["incarnation"], "native");
+    assert_eq!(stream_plans[1]["expected_revision"], 1);
     harness.pause(&second, "second");
     let end = harness.call(
         "transport",
