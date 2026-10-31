@@ -283,13 +283,13 @@ impl CompositionBook {
     }
 
     pub fn references_admission(&self, admission_id: &str) -> bool {
-        self.staged_outputs
+        self.staged_outputs.iter().any(|stage| {
+            stage.admission_id == admission_id
+                || stage.prior_release_admission.as_deref() == Some(admission_id)
+        }) || self
+            .outputs
             .iter()
-            .any(|stage| stage.admission_id == admission_id)
-            || self
-                .outputs
-                .iter()
-                .any(|item| item.admission_id == admission_id)
+            .any(|item| item.admission_id == admission_id)
             || self
                 .selections
                 .iter()
@@ -1428,6 +1428,14 @@ mod tests {
                 pending_dispatch: None,
             },
         };
+        let mut prior_reference = stage.clone();
+        prior_reference.prior_release_admission = Some("prior-release".into());
+        let reference_book = CompositionBook {
+            staged_outputs: vec![prior_reference],
+            ..Default::default()
+        };
+        assert!(reference_book.references_admission("prior-release"));
+        assert!(!reference_book.references_admission("other-release"));
         let mut wrong_parent = stage.clone();
         wrong_parent.parent_generation += 1;
         assert!(book.record_stage(wrong_parent, &|_| true).is_err());
