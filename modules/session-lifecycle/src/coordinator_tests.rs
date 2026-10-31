@@ -372,6 +372,8 @@ fn transferred_action_fences_new_preparation_across_sessions_until_terminal() {
         input_reservation_id: None,
         admission_id: None,
         snapshot: None,
+        stage: ActionTransferStage::CleanupPending,
+        release_proof: None,
     });
     save(&coordinator.shared, next).unwrap();
     let rejected = coordinator.handle(

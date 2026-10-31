@@ -183,6 +183,19 @@ struct ActionTransfer {
     admission_id: Option<String>,
     #[serde(default)]
     snapshot: Option<ActionReleaseSnapshot>,
+    #[serde(default)]
+    stage: ActionTransferStage,
+    #[serde(default)]
+    release_proof: Option<action_release_proof::ActionReleaseProof>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ActionTransferStage {
+    #[default]
+    CleanupPending,
+    ReplanRequired,
+    Rebound,
 }
 
 /// Immutable pre-cleanup lineage captured in the action-transfer transaction.
@@ -387,7 +400,16 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                         !action_endpoints::action_snapshot_matches(
                             journal, receipt, work, transfer, snapshot,
                         )
-                    })
+                    }) || match transfer.stage {
+                        ActionTransferStage::CleanupPending => transfer.release_proof.is_some(),
+                        ActionTransferStage::ReplanRequired => {
+                            !action_release_proof::validate_replan_stage(
+                                journal, receipt, work, transfer,
+                            )
+                        }
+                        // The rebind writer is not installed; do not accept a claimed stage.
+                        ActionTransferStage::Rebound => true,
+                    }
                 })
             })
         })

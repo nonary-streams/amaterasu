@@ -555,6 +555,8 @@ impl Coordinator {
                         input_reservation_id: input_id,
                         admission_id: None,
                         snapshot: Some(snapshot),
+                        stage: super::ActionTransferStage::CleanupPending,
+                        release_proof: None,
                     }),
                 };
                 journal.receipts.insert(
@@ -1517,6 +1519,26 @@ mod tests {
                 .order
                 .clear();
             assert!(super::super::validate_journal(&tampered).is_err());
+            let mut premature = journal.clone();
+            premature
+                .receipts
+                .get_mut(&key)
+                .unwrap()
+                .work
+                .as_mut()
+                .unwrap()
+                .action_transfer
+                .as_mut()
+                .unwrap()
+                .stage = super::super::ActionTransferStage::ReplanRequired;
+            assert!(super::super::validate_journal(&premature).is_err());
+            let mut legacy = serde_json::to_value(journal).unwrap();
+            legacy["receipts"][&key]["work"]["action_transfer"]
+                .as_object_mut()
+                .unwrap()
+                .remove("stage");
+            let restored: super::super::Journal = serde_json::from_value(legacy).unwrap();
+            assert!(super::super::validate_journal(&restored).is_ok());
         }
         let mut competing = auth.clone();
         competing["operation_id"] = json!("competing");

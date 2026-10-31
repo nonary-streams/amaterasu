@@ -175,7 +175,7 @@ pub(super) fn validate_graph_callbacks(
         } => epoch == host_epoch && id == session_id && *expected_generation == session.generation,
         _ => false,
     };
-    if host_epoch != &journal.host_epoch || host_epoch != &session.host_epoch
+    if host_epoch != &session.host_epoch
         || stream.generation != *generation || stream.phase != StreamPhase::Retired
         || stream.retirements != stream.required || work.phase != LifecyclePhase::StreamRelease
         || session.streams.iter().any(|(id, other)| id != stream_id && other.phase != StreamPhase::Retired)
@@ -272,6 +272,41 @@ pub(super) fn validate_graph_callbacks(
         }
     }
     true
+}
+
+/// Replan can only be journaled after every graph callback and the owner's
+/// authenticated released-output finalization have been retained. The caller
+/// must separately check the current host epoch before granting live access.
+pub(super) fn validate_replan_stage(
+    journal: &Journal,
+    receipt: &Receipt,
+    work: &Work,
+    transfer: &ActionTransfer,
+) -> bool {
+    let Some(proof) = &transfer.release_proof else {
+        return false;
+    };
+    let Ok((owner, _, _)) = journal
+        .actions
+        .execution_for_permit(&transfer.service, &transfer.permit)
+    else {
+        return false;
+    };
+    matches!(
+        receipt.response["status"].as_str(),
+        Some("replan_required" | "recovery_required")
+    ) && receipt.response["operation_id"].as_str() == Some(transfer.binding.operation_id.as_str())
+        && receipt.response["target"]
+            == serde_json::to_value(&transfer.binding.target).unwrap_or(Value::Null)
+        && receipt.response["plan_digest"].as_str() == Some(transfer.binding.plan_digest.as_str())
+        && receipt.response["transition_id"].as_str() == Some(work.transition_id.as_str())
+        && validate_graph_callbacks(journal, work, proof)
+        && journal
+            .stream_releases
+            .has_released_for(&work.target, &owner, &work.transition_id)
+        && journal
+            .stream_releases
+            .has_valid_released(journal, &work.target)
 }
 
 #[cfg(test)]
