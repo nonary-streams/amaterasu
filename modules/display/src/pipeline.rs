@@ -57,16 +57,28 @@ pub struct Pipeline<P> {
     queued: VecDeque<Incoming>,
     pending: Option<Pending>,
     active_lease: Option<String>,
+    mutation_domain_id: Option<String>,
     sequence: u64,
 }
 impl<P: Platform> Pipeline<P> {
     pub fn new(platform: P, allow_mutation: bool) -> Self {
+        let mut nonce = [0u8; 16];
+        let mutation_domain_id = getrandom::fill(&mut nonce).ok().map(|()| {
+            format!(
+                "physical_provider_session:{}",
+                nonce
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            )
+        });
         Self {
             platform,
             allow_mutation,
             queued: VecDeque::new(),
             pending: None,
             active_lease: None,
+            mutation_domain_id,
             sequence: 0,
         }
     }
@@ -126,6 +138,28 @@ impl<P: Platform> Pipeline<P> {
         incoming: Incoming,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
+        if let Operation::Apply {
+            expected_mutation_domain_id,
+            expected_mutation_domain_revision,
+            mode_policy: Some(policy),
+            ..
+        } = &incoming.operation
+            && (expected_mutation_domain_id.is_some()
+                || expected_mutation_domain_revision.is_some())
+            && matches!(
+                policy.configuration_option,
+                Some(DisplayConfigurationOption::Disabled | DisplayConfigurationOption::VerifyOnly)
+            )
+        {
+            return complete(
+                send,
+                incoming.context.request,
+                failure(
+                    "unsupported_domain_operation",
+                    "domain fencing requires a journaled mutation",
+                ),
+            );
+        }
         if let Operation::Apply {
             configuration,
             expected_topology_revision,
@@ -335,7 +369,7 @@ impl<P: Platform> Pipeline<P> {
             return complete(
                 send,
                 context.request,
-                json!({"ok":true,"platform":self.platform.name(),"native_supported":self.platform.supported(),"mutation_enabled":self.allow_mutation,"state":state,"owned_by_caller":own,"lease":journal.as_ref().filter(|_| own).map(|journal| &journal.lease),"operation_id":journal.as_ref().filter(|_| own).and_then(|journal| journal.operation_id.as_ref())}),
+                json!({"ok":true,"platform":self.platform.name(),"native_supported":self.platform.supported(),"mutation_enabled":self.allow_mutation,"state":state,"owned_by_caller":own,"lease":journal.as_ref().filter(|_| own).map(|journal| &journal.lease),"operation_id":journal.as_ref().filter(|_| own).and_then(|journal| journal.operation_id.as_ref()),"mutation_domain":self.mutation_domain_id.as_ref().filter(|_| self.platform.supported()).map(|id|json!({"id":id,"revision":revision,"active_leases":usize::from(journal.is_some()),"scope":"provider_lease_only","external_borrowers_known":false}))}),
             );
         }
         if !self.allow_mutation {
@@ -362,6 +396,8 @@ impl<P: Platform> Pipeline<P> {
             Operation::Apply {
                 mut configuration,
                 expected_topology_revision,
+                expected_mutation_domain_id,
+                expected_mutation_domain_revision,
                 operation_id,
                 mode_policy,
                 mode_policies,
@@ -369,6 +405,8 @@ impl<P: Platform> Pipeline<P> {
                 let request_identity = serde_json::to_value(Operation::Apply {
                     configuration: configuration.clone(),
                     expected_topology_revision: expected_topology_revision.clone(),
+                    expected_mutation_domain_id: expected_mutation_domain_id.clone(),
+                    expected_mutation_domain_revision,
                     operation_id: operation_id.clone(),
                     mode_policy: mode_policy.clone(),
                     mode_policies: mode_policies.clone(),
@@ -381,6 +419,8 @@ impl<P: Platform> Pipeline<P> {
                     {
                         if journal.request_identity.as_ref() == Some(&request_identity)
                             || (journal.request_identity.is_none()
+                                && expected_mutation_domain_id.is_none()
+                                && expected_mutation_domain_revision.is_none()
                                 && mode_policy.is_none()
                                 && mode_policies.is_none()
                                 && expected_topology_revision == journal.expected_topology_revision
@@ -417,6 +457,35 @@ impl<P: Platform> Pipeline<P> {
                             "a display lease or recovery journal already exists",
                         ),
                     );
+                }
+                match (
+                    &expected_mutation_domain_id,
+                    expected_mutation_domain_revision,
+                ) {
+                    (None, None) => {}
+                    (Some(id), Some(expected))
+                        if self.mutation_domain_id.as_ref() == Some(id) && revision == expected => {
+                    }
+                    (Some(_), Some(_)) => {
+                        return complete(
+                            send,
+                            context.request,
+                            failure(
+                                "mutation_domain_changed",
+                                "physical provider domain or journal revision changed",
+                            ),
+                        );
+                    }
+                    _ => {
+                        return complete(
+                            send,
+                            context.request,
+                            failure(
+                                "invalid_request",
+                                "physical domain id and revision must be supplied together",
+                            ),
+                        );
+                    }
                 }
                 if operation_id.as_ref().is_some_and(|id| {
                     id.is_empty()

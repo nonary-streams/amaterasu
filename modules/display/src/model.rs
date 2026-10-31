@@ -10,6 +10,9 @@ use std::collections::BTreeSet;
 pub const MAX_DISPLAYS: usize = 16;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+// This is a bounded, short-lived wire request; keeping its fields inline makes
+// the serialized operation and durable request identity straightforward.
+#[allow(clippy::large_enum_variant)]
 pub enum Operation {
     Status,
     Snapshot,
@@ -22,6 +25,10 @@ pub enum Operation {
         configuration: Configuration,
         #[serde(default)]
         expected_topology_revision: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_mutation_domain_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_mutation_domain_revision: Option<u64>,
         #[serde(default)]
         operation_id: Option<String>,
         #[serde(default)]

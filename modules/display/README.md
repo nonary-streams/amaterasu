@@ -380,3 +380,25 @@ API references: [QueryDisplayConfig](https://learn.microsoft.com/en-us/windows/w
 [DisplayConfigGetDeviceInfo](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-displayconfiggetdeviceinfo),
 [DisplayConfigSetDeviceInfo](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-displayconfigsetdeviceinfo),
 [EnumDisplaySettingsExW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enumdisplaysettingsexw).
+
+## Cooperative physical mutation domain
+
+On a supported native provider, `status` includes a `mutation_domain` with an
+opaque `physical_provider_session:` ID, the durable state namespace revision,
+`active_leases`, `scope: "provider_lease_only"`, and
+`external_borrowers_known: false`. A new provider lifetime gets a new ID.
+The count reports this service's journaled physical lease, including recovery
+required; it is not an inventory of capture consumers or other applications.
+
+A journaled `apply` may carry both `expected_mutation_domain_id` and
+`expected_mutation_domain_revision`. The service rejects an incomplete pair or
+a changed ID or revision before preparing a journal or invoking native effects.
+The state-service revision CAS then protects the durable prepare boundary. The
+existing `expected_topology_revision` remains a distinct opaque snapshot token
+and continues to guard the observed native topology. An exact operation-ID retry
+still reconciles the original journal without repeating its native effect.
+
+This is a cooperative fence for mutations through this provider. Session
+coordination must separately fence its known consumers, and external desktop
+applications may change topology between observations. Linux physical mutation
+remains gated by its provider capability.

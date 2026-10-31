@@ -4118,3 +4118,51 @@ fn interrupted_kscreen_lease_holds_on_hotplug_and_readback_failure() {
     assert_eq!(duplicate["error"]["code"], "not_found");
     assert_eq!(restarted.platform.kscreen_restore_calls, 3);
 }
+
+#[test]
+fn physical_domain_tracks_durable_lease_revision_and_rejects_stale_plans() {
+    let mut state = State::default();
+    let mut pipeline = Pipeline::new(FakePlatform::default(), true);
+    let status = state.run(&mut pipeline, "owner", json!({"action":"status"}));
+    let domain = &status["mutation_domain"];
+    assert!(
+        domain["id"]
+            .as_str()
+            .unwrap()
+            .starts_with("physical_provider_session:")
+    );
+    assert_eq!(domain["revision"], 0);
+    assert_eq!(domain["active_leases"], 0);
+    assert_eq!(domain["scope"], "provider_lease_only");
+    assert_eq!(domain["external_borrowers_known"], false);
+    let mut request = json!({"action":"apply","configuration":configuration(),"operation_id":"domain-1","expected_mutation_domain_id":domain["id"],"expected_mutation_domain_revision":domain["revision"]});
+    let applied = state.run(&mut pipeline, "owner", request.clone());
+    assert_eq!(applied["applied"], true);
+    let during = state.run(&mut pipeline, "foreign", json!({"action":"status"}));
+    assert_eq!(during["mutation_domain"]["active_leases"], 1);
+    assert_eq!(during["mutation_domain"]["revision"], 1);
+    assert!(during["lease"].is_null());
+    assert_eq!(
+        state.run(&mut pipeline, "owner", request.clone())["state"],
+        "recovery_required"
+    );
+    assert_eq!(
+        state.run(
+            &mut pipeline,
+            "owner",
+            json!({"action":"restore","lease":applied["lease"]})
+        )["restored"],
+        true
+    );
+    request["operation_id"] = "domain-2".into();
+    assert_eq!(
+        state.run(&mut pipeline, "owner", request.clone())["error"]["code"],
+        "mutation_domain_changed"
+    );
+    request["expected_mutation_domain_revision"] = json!(2);
+    let restarted = &mut Pipeline::new(FakePlatform::default(), true);
+    assert_eq!(
+        state.run(restarted, "owner", request)["error"]["code"],
+        "mutation_domain_changed"
+    );
+}
