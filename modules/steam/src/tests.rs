@@ -882,7 +882,7 @@ impl FakeHost {
                                 "ok":true,
                                 "revision":self.catalog_revision,
                                 "generation":self.catalog_generation,
-                                "next_sequence":0
+                                "next_sequence":0,"staged":true
                             })
                         }
                         "provider_snapshot_batch" => {

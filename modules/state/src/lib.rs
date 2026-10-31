@@ -5,6 +5,26 @@ mod protocol;
 mod snapshot;
 mod store;
 
+/// Minimal in-process State interface for cross-module integration tests.
+/// The feature is disabled in production builds.
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    use serde_json::Value;
+    use std::path::PathBuf;
+
+    pub struct TestStateStore(crate::store::StateStore);
+
+    impl TestStateStore {
+        pub fn open(directory: PathBuf) -> Result<Self, String> {
+            crate::store::StateStore::open(directory).map(Self)
+        }
+
+        pub fn handle(&self, caller: &str, payload: Value) -> Value {
+            self.0.handle(caller, payload)
+        }
+    }
+}
+
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use store::StateStore;
 
@@ -69,6 +89,33 @@ fn complete_result(response: Response) -> ModuleResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn test_support_opens_real_caller_scoped_store() {
+        let directory = std::env::temp_dir().join(format!(
+            "amaterasu-state-test-support-{}",
+            amaterasu_storage::random_identifier().unwrap()
+        ));
+        let store = test_support::TestStateStore::open(directory.clone()).unwrap();
+        assert_eq!(
+            store.handle(
+                "first",
+                serde_json::json!({"action":"set","key":"one","value":1})
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            store.handle("first", serde_json::json!({"action":"get","key":"one"}))["value"],
+            1
+        );
+        assert_eq!(
+            store.handle("second", serde_json::json!({"action":"get","key":"one"}))["found"],
+            false
+        );
+        drop(store);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn completion_discards_expired_requests_but_surfaces_other_errors() {

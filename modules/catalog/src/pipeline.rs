@@ -4,8 +4,9 @@ use crate::model::{
 };
 use crate::product::{
     CommittedBatch, ENTRY_PREFIX, MAX_BATCH_BYTES, MAX_BATCH_ENTRIES, Marker, RemovalReason,
-    STATE_PREFIX, SnapshotState, entry_key, fingerprint_bytes, marker_value, parse_entry_key,
-    provider_entry_fingerprint, state_key, valid_source_id, valid_sync_id, validate_marker,
+    STATE_PREFIX, SnapshotState, StagedIntents, entry_key, fingerprint_bytes, marker_value,
+    parse_entry_key, provider_entry_fingerprint, state_key, valid_source_id, valid_sync_id,
+    validate_marker,
 };
 use crate::protocol::{
     Change, Cursor, Operation, ProviderEntry, apply, error, matches_query, project_entry,
@@ -18,10 +19,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_QUEUED: usize = 32;
 const PAGE_BYTES: usize = 12_000;
+const STAGED_PREFIX: &str = "~provider.batch:";
 const MAX_SCAN: usize = 256;
 // A launch scan can cross public entries and their provider markers before
-// reaching the Lutris prefix. It remains bounded by both catalog populations.
-const MAX_LAUNCH_MARKER_SCAN: usize = MAX_ENTRIES * 2;
+// reaching the Lutris prefix, including unpublished staged-batch rows.
+const MAX_LAUNCH_MARKER_SCAN: usize = 100_000;
 const MANAGEMENT_PRINCIPAL: &str = "amaterasu.management";
 const LIBRARY_PRINCIPAL: &str = "amaterasu.library";
 const PLAYNITE_IMPORTER: &str = "amaterasu.playnite";
@@ -73,6 +75,15 @@ enum Stage {
     },
     ProviderPaging(ProviderScan),
     ProviderSaving(ProviderSave),
+    StagedCacheCheck {
+        operation: Operation,
+        session: ProviderSession,
+    },
+    DraftReset(DraftPublish),
+    DraftBegin(DraftPublish),
+    DraftAppend(DraftPublish),
+    DraftVerify(DraftPublish),
+    DraftPublishing(DraftPublish),
     ProviderOverrideEntry(Box<ProviderOverrideEntry>),
 }
 struct LaunchMarkerScan {
@@ -102,6 +113,14 @@ struct ProviderFullscreenEntry {
     marker: Marker,
 }
 
+struct DraftPublish {
+    save: ProviderSave,
+    draft_id: String,
+    content_id: String,
+    chunks: Vec<Vec<Value>>,
+    next: usize,
+}
+
 struct ProviderScan {
     operation: Operation,
     state_revision: u64,
@@ -117,7 +136,9 @@ struct ProviderScan {
     artwork_entries: BTreeMap<String, Entry>,
     entry_ids: BTreeSet<String>,
     markers: BTreeMap<String, Marker>,
+    marker_entry_ids: BTreeSet<String>,
     provider_state: Option<SnapshotState>,
+    staged_rows: BTreeMap<String, StagedIntents>,
 }
 
 struct ProviderInventoryRequest {
@@ -143,6 +164,7 @@ struct ProviderSession {
     markers: BTreeMap<String, Marker>,
     seen_source_ids: BTreeSet<String>,
     state: SnapshotState,
+    staged_rows: BTreeMap<String, StagedIntents>,
 }
 
 struct ProviderSave {
@@ -161,6 +183,7 @@ struct ProviderBatch {
     selection_remove_source_ids: Vec<String>,
 }
 struct ProviderBegin {
+    staged: bool,
     sync_id: String,
     source_revision: u64,
     provider_epoch: u64,
@@ -494,6 +517,21 @@ impl Pipeline {
                 ),
             );
         };
+        if matches!(operation, Operation::ProviderSnapshotBatch { .. })
+            && self
+                .provider_sessions
+                .get(caller)
+                .is_some_and(|session| session.state.staged)
+            && let Some(session) = self.provider_sessions.remove(caller)
+        {
+            let payload = json!({"action":"collection_get","collection":context.key,"key":null});
+            return self.submit(
+                context,
+                payload,
+                Stage::StagedCacheCheck { operation, session },
+                send,
+            );
+        }
         if !matches!(
             operation,
             Operation::ProviderSnapshotBegin { .. } | Operation::ProviderSnapshotRevoke { .. }
@@ -527,12 +565,14 @@ impl Pipeline {
             operation,
             Operation::ProviderSnapshotBegin { .. } | Operation::ProviderSnapshotRevoke { .. }
         ) && !matches!(operation, Operation::ProviderSnapshotInventory { .. })
-            && !(caller == PLAYNITE_IMPORTER
-                && matches!(
-                    operation,
-                    Operation::ProviderSnapshotBatch { .. }
-                        | Operation::ProviderSnapshotFinish { .. }
-                ))
+            && !(matches!(
+                operation,
+                Operation::ProviderSnapshotBatch { .. } | Operation::ProviderSnapshotFinish { .. }
+            ) && (caller == PLAYNITE_IMPORTER
+                || self
+                    .provider_sessions
+                    .get(caller)
+                    .is_some_and(|session| session.state.staged)))
             && let Some(session) = self.provider_sessions.get(caller).cloned()
         {
             return self.apply_provider_operation(context, operation, session, send);
@@ -579,7 +619,7 @@ impl Pipeline {
             })
             .map(|marker| marker.source_id.clone())
             .collect();
-        let session = ProviderSession {
+        let mut session = ProviderSession {
             caller,
             key: context.key.clone(),
             state_present,
@@ -594,7 +634,19 @@ impl Pipeline {
             markers: scan.markers,
             seen_source_ids,
             state,
+            staged_rows: scan.staged_rows,
         };
+        if session.state.staged && !session.state.finished {
+            let intents = match collect_staged(&session) {
+                Ok(intents) => intents,
+                Err(failure) => return complete(send, context.request_id, failure),
+            };
+            session.seen_source_ids =
+                match validate_staged_intents(&session.caller, &BTreeSet::new(), &intents) {
+                    Ok(ids) => ids,
+                    Err(failure) => return complete(send, context.request_id, failure),
+                };
+        }
         self.apply_provider_operation(context, scan.operation, session, send)
     }
 
@@ -698,10 +750,12 @@ impl Pipeline {
                 source_revision,
                 provider_epoch,
                 expected_collection_revision,
+                staged,
             } => self.begin_snapshot(
                 context,
                 session,
                 ProviderBegin {
+                    staged,
                     sync_id,
                     source_revision,
                     provider_epoch,
@@ -854,6 +908,22 @@ impl Pipeline {
                         send,
                         context.request_id,
                         revision_conflict(session.document_revision),
+                    );
+                }
+                if session.state.staged {
+                    return self.stage_provider_batch(
+                        context,
+                        session,
+                        ProviderBatch {
+                            sequence,
+                            expected_revision,
+                            fingerprint: batch_fingerprint,
+                            entries,
+                            remove_source_ids,
+                            expire_source_ids,
+                            selection_remove_source_ids,
+                        },
+                        send,
                     );
                 }
                 self.commit_provider_batch(
@@ -1534,6 +1604,7 @@ impl Pipeline {
         send: &mut impl FnMut(Command) -> TransportResult,
     ) -> ModuleResult<()> {
         let ProviderBegin {
+            staged,
             sync_id,
             source_revision,
             provider_epoch,
@@ -1580,7 +1651,7 @@ impl Pipeline {
                     error("snapshot_conflict", "revoked snapshot cannot be resumed"),
                 );
             }
-            if session.state.source_revision != source_revision {
+            if session.state.source_revision != source_revision || session.state.staged != staged {
                 return complete(
                     send,
                     context.request_id,
@@ -1595,7 +1666,7 @@ impl Pipeline {
             return complete(
                 send,
                 context.request_id,
-                json!({"ok":true,"revision":session.document_revision,"generation":session.state.generation,"provider_epoch":provider_epoch,"next_sequence":session.state.next_sequence}),
+                json!({"ok":true,"revision":session.document_revision,"generation":session.state.generation,"provider_epoch":provider_epoch,"next_sequence":session.state.next_sequence,"staged":session.state.staged}),
             );
         }
         let is_new_state = !session.state_present;
@@ -1608,6 +1679,9 @@ impl Pipeline {
         };
         session.state = SnapshotState {
             version: 1,
+            staged,
+            staged_at_unix: staged.then(unix_timestamp).flatten(),
+            staged_intents: StagedIntents::default(),
             provider_epoch,
             last_revocation_id: session.state.last_revocation_id.clone(),
             revoked: false,
@@ -1630,11 +1704,10 @@ impl Pipeline {
             session.provider_count = session.provider_count.saturating_add(1);
             session.state_present = true;
         }
-        let reply = json!({"ok":true,"revision":session.document_revision,"generation":generation,"provider_epoch":provider_epoch,"next_sequence":0});
-        let payload = collection_commit(
-            &session,
-            vec![json!({"key":key,"value":session.state.clone()})],
-        );
+        let reply = json!({"ok":true,"revision":session.document_revision,"generation":generation,"provider_epoch":provider_epoch,"next_sequence":0,"staged":staged});
+        let mut edits = vec![json!({"key":key,"value":session.state.clone()})];
+        edits.extend(reclaim_abandoned_batches(&mut session));
+        let payload = collection_commit(&session, edits);
         self.submit(
             context,
             payload,
@@ -1733,291 +1806,16 @@ impl Pipeline {
     fn commit_provider_batch(
         &mut self,
         context: Context,
-        mut session: ProviderSession,
+        session: ProviderSession,
         batch: ProviderBatch,
         send: &mut impl FnMut(Command) -> TransportResult,
     ) -> ModuleResult<()> {
-        let ProviderBatch {
-            sequence,
-            expected_revision,
-            fingerprint: batch_fingerprint,
-            entries,
-            remove_source_ids,
-            expire_source_ids,
-            selection_remove_source_ids,
-        } = batch;
-        let mut source_ids = BTreeSet::new();
-        for source_id in entries
-            .iter()
-            .map(|entry| entry.source_id.as_str())
-            .chain(remove_source_ids.iter().map(String::as_str))
-            .chain(expire_source_ids.iter().map(String::as_str))
-            .chain(selection_remove_source_ids.iter().map(String::as_str))
-        {
-            if !valid_source_id(source_id)
-                || (session.caller == PLAYNITE_IMPORTER
-                    && source_id == PLAYNITE_FULLSCREEN_SOURCE_ID)
-                || session.seen_source_ids.contains(source_id)
-                || !source_ids.insert(source_id.to_owned())
-            {
-                return complete(
-                    send,
-                    context.request_id,
-                    error(
-                        "duplicate_source_id",
-                        "provider snapshot repeats a source ID within its generation",
-                    ),
-                );
-            }
-        }
-        let mut edits = Vec::new();
-        let mut entries_changed = false;
-        for provider_entry in entries {
-            let ProviderEntry {
-                source_id,
-                mut entry,
-                source_flags,
-                preserve_artwork,
-            } = provider_entry;
-            let invalid_launch_owner = matches!(
-                &entry.launch,
-                Launch::Playnite { .. } | Launch::PlayniteFullscreen { .. }
-            ) && session.caller != PLAYNITE_IMPORTER;
-            // Fullscreen is a reserved provider row and Desktop is user-managed;
-            // neither can arrive through a library snapshot.
-            let invalid_fullscreen_import = matches!(
-                &entry.launch,
-                Launch::PlayniteFullscreen { .. } | Launch::Desktop { .. }
-            );
-            let valid_playnite_identity = session.caller == PLAYNITE_IMPORTER
-                && crate::model::valid_guid(&source_id)
-                && !source_id.bytes().any(|byte| byte.is_ascii_uppercase())
-                && matches!(&entry.launch, Launch::Playnite { game_id, .. } if game_id == &source_id);
-            let invalid_artwork_owner = match &entry.artwork {
-                Some(ArtworkReference::Steam { app_id, .. }) => {
-                    session.caller != STEAM_IMPORTER || source_id != format!("steam:{app_id}")
-                }
-                Some(ArtworkReference::Lutris { game_id, .. }) => {
-                    session.caller != LUTRIS_IMPORTER || source_id != game_id.to_string()
-                }
-                Some(ArtworkReference::Playnite { game_id, .. }) => {
-                    !valid_playnite_identity || game_id != &source_id
-                }
-                None => false,
-            } || (preserve_artwork
-                && (!valid_playnite_identity || entry.artwork.is_some()));
-            let has_steam_metadata = entry.steam_id.is_some() || entry.steam_install_dir.is_some();
-            let valid_steam_metadata_identity = entry.steam_id.as_ref().is_some_and(|app_id| {
-                session.caller == STEAM_IMPORTER && source_id == format!("steam:{app_id}")
-            });
-            let invalid_steam_metadata = has_steam_metadata && !valid_steam_metadata_identity;
-            if invalid_artwork_owner {
-                return complete(
-                    send,
-                    context.request_id,
-                    error(
-                        "provider_artwork_required",
-                        "provider artwork requires its authenticated importer and matching source ID",
-                    ),
-                );
-            }
-            if invalid_steam_metadata {
-                return complete(
-                    send,
-                    context.request_id,
-                    error(
-                        "provider_identity_required",
-                        "Steam metadata requires the authenticated Steam importer and matching source ID",
-                    ),
-                );
-            }
-            if entry.validate().is_err() || invalid_launch_owner || invalid_fullscreen_import {
-                return complete(
-                    send,
-                    context.request_id,
-                    error(
-                        "invalid_entry",
-                        "provider entry identity or value is invalid",
-                    ),
-                );
-            }
-            let key = entry_key(&session.caller, &source_id);
-            let existing = session.markers.get(&key).cloned();
-            let source_flags = source_flags
-                .or_else(|| existing.as_ref().map(|marker| marker.source_flags))
-                .unwrap_or_default();
-            let added_at_unix = match existing.as_ref() {
-                Some(marker) => marker.added_at_unix,
-                None => unix_timestamp(),
-            };
-            let (entry_id, detached, config_overrides) = if let Some(marker) = existing.clone() {
-                if !validate_marker(&marker, &session.caller, &source_id) {
-                    return complete(send, context.request_id, malformed());
-                }
-                if session.markers.values().any(|other| {
-                    other.entry_id == marker.entry_id
-                        && (other.caller != marker.caller || other.source_id != marker.source_id)
-                }) {
-                    return complete(send, context.request_id, malformed());
-                }
-                if marker.detached
-                    || session.fingerprints.get(&marker.entry_id) != Some(&marker.fingerprint)
-                {
-                    (marker.entry_id, true, marker.config_overrides)
-                } else {
-                    (marker.entry_id, false, marker.config_overrides)
-                }
-            } else {
-                if session.entry_ids.len() >= MAX_ENTRIES {
-                    return complete(
-                        send,
-                        context.request_id,
-                        error("resource_exhausted", "catalog entry limit reached"),
-                    );
-                }
-                let entry_id = format!("app-{:016x}", session.next_id);
-                if session.entry_ids.contains(&entry_id)
-                    || session
-                        .markers
-                        .values()
-                        .any(|marker| marker.entry_id == entry_id)
-                {
-                    return complete(
-                        send,
-                        context.request_id,
-                        error("entry_conflict", "next catalog ID is already owned"),
-                    );
-                }
-                let Some(next_id) = session.next_id.checked_add(1) else {
-                    return complete(
-                        send,
-                        context.request_id,
-                        error("resource_exhausted", "catalog ID space exhausted"),
-                    );
-                };
-                session.next_id = next_id;
-                session.entry_ids.insert(entry_id.clone());
-                (entry_id, false, ConfigOverrides::default())
-            };
-            if preserve_artwork
-                && !detached
-                && let Some(previous) = session.artwork_entries.get(&entry_id)
-                && matches!((&previous.launch, &previous.artwork),
-                    (Launch::Playnite { game_id: launch_id, .. }, Some(ArtworkReference::Playnite { game_id, .. }))
-                        if launch_id == &source_id && game_id == &source_id)
-            {
-                entry.artwork = previous.artwork.clone();
-            }
-            if session.caller == PLAYNITE_IMPORTER {
-                entry.config_overrides = config_overrides.clone();
-            }
-            let desired_fingerprint = provider_entry_fingerprint(&session.caller, &entry);
-            let mut marker = Marker {
-                version: 1,
-                caller: session.caller.clone(),
-                source_id: source_id.clone(),
-                entry_id: entry_id.clone(),
-                generation: session.state.generation,
-                fingerprint: desired_fingerprint.clone(),
-                config_overrides,
-                detached,
-                remove_generation: None,
-                added_at_unix,
-                source_flags,
-                remove_reason: None,
-            };
-            if detached {
-                // A changed or deleted Entry has become user-owned. Keep it and
-                // stop provider updates from silently replacing it.
-                marker.fingerprint = session
-                    .fingerprints
-                    .get(&entry_id)
-                    .cloned()
-                    .unwrap_or_else(|| "0".repeat(64));
-            } else {
-                if session.fingerprints.get(&entry_id) != Some(&desired_fingerprint) {
-                    session
-                        .fingerprints
-                        .insert(entry_id.clone(), desired_fingerprint);
-                    edits.push(json!({"key":entry_id,"value":entry}));
-                    entries_changed = true;
-                }
-                session.entry_ids.insert(entry_id.clone());
-            }
-            if !session.markers.contains_key(&key) {
-                session.provider_count = session.provider_count.saturating_add(1);
-            }
-            session.markers.insert(key.clone(), marker.clone());
-            session.seen_source_ids.insert(source_id);
-            edits.push(json!({"key":key,"value":marker_value(&marker)}));
-        }
-        for (source_id, reason) in remove_source_ids
-            .into_iter()
-            .map(|source_id| (source_id, RemovalReason::Uninstalled))
-            .chain(
-                expire_source_ids
-                    .into_iter()
-                    .map(|source_id| (source_id, RemovalReason::Expired)),
-            )
-            .chain(
-                selection_remove_source_ids
-                    .into_iter()
-                    .map(|source_id| (source_id, RemovalReason::Selection)),
-            )
-        {
-            let key = entry_key(&session.caller, &source_id);
-            if let Some(mut marker) = session.markers.get(&key).cloned() {
-                if !validate_marker(&marker, &session.caller, &source_id) {
-                    return complete(send, context.request_id, malformed());
-                }
-                marker.remove_generation = Some(session.state.generation);
-                marker.remove_reason = Some(reason);
-                session.markers.insert(key.clone(), marker.clone());
-                edits.push(json!({"key":key,"value":marker_value(&marker)}));
-            }
-            session.seen_source_ids.insert(source_id);
-        }
-        let new_revision = if entries_changed {
-            let Some(revision) = session.document_revision.checked_add(1) else {
-                return complete(
-                    send,
-                    context.request_id,
-                    error("resource_exhausted", "catalog revision exhausted"),
-                );
-            };
-            revision
-        } else {
-            session.document_revision
+        let (session, edits) = match plan_provider_batch(session, batch) {
+            Ok(plan) => plan,
+            Err(failure) => return complete(send, context.request_id, failure),
         };
-        let Some(next_sequence) = session.state.next_sequence.checked_add(1) else {
-            return complete(
-                send,
-                context.request_id,
-                error("resource_exhausted", "provider sequence space exhausted"),
-            );
-        };
-        session.state.next_sequence = next_sequence;
-        session.state.finished = false;
-        session.state.cleanup_pending = false;
-        session.state.finish_expected_revision = None;
-        session.state.finish_remove_stale = true;
-        session.state.finish_remove_uninstalled = false;
-        session.state.finish_remove_expired = false;
-        session.state.finish_remove_selection = false;
-        session.state.last_batch = Some(CommittedBatch {
-            sequence,
-            expected_revision,
-            revision: new_revision,
-            next_sequence,
-            fingerprint: batch_fingerprint,
-        });
-        session.document_revision = new_revision;
-        edits.push(json!({
-            "key":state_key(&session.caller),
-            "value":session.state.clone(),
-        }));
         let payload = collection_commit(&session, edits);
-        let reply = json!({"ok":true,"revision":new_revision,"generation":session.state.generation,"provider_epoch":session.state.provider_epoch,"next_sequence":next_sequence});
+        let reply = json!({"ok":true,"revision":session.document_revision,"generation":session.state.generation,"provider_epoch":session.state.provider_epoch,"next_sequence":session.state.next_sequence});
         self.submit(
             context,
             payload,
@@ -2029,6 +1827,239 @@ impl Pipeline {
             }),
             send,
         )
+    }
+
+    fn stage_provider_batch(
+        &mut self,
+        context: Context,
+        mut session: ProviderSession,
+        batch: ProviderBatch,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        let sequence = batch.sequence;
+        let expected_revision = batch.expected_revision;
+        let fingerprint = batch.fingerprint.clone();
+        let row = StagedIntents {
+            entries: batch.entries,
+            remove_source_ids: batch.remove_source_ids,
+            expire_source_ids: batch.expire_source_ids,
+            selection_remove_source_ids: batch.selection_remove_source_ids,
+        };
+        let source_ids =
+            match validate_staged_intents(&session.caller, &session.seen_source_ids, &row) {
+                Ok(ids) => ids,
+                Err(failure) => return complete(send, context.request_id, failure),
+            };
+        session.seen_source_ids.extend(source_ids);
+        let Some(next_sequence) = sequence.checked_add(1) else {
+            return complete(
+                send,
+                context.request_id,
+                error("resource_exhausted", "provider sequence space exhausted"),
+            );
+        };
+        session.state.next_sequence = next_sequence;
+        session.state.last_batch = Some(CommittedBatch {
+            sequence,
+            expected_revision,
+            revision: session.document_revision,
+            next_sequence,
+            fingerprint,
+        });
+        let key = staged_key(&session.caller, session.state.generation, sequence);
+        let cleanup = reclaim_abandoned_batches(&mut session);
+        if session.staged_rows.len() >= 12_500 {
+            return complete(
+                send,
+                context.request_id,
+                error("resource_exhausted", "too many staged batches"),
+            );
+        }
+        session.provider_count = match session.provider_count.checked_add(1) {
+            Some(count) => count,
+            None => {
+                return complete(
+                    send,
+                    context.request_id,
+                    error("resource_exhausted", "provider count exhausted"),
+                );
+            }
+        };
+        session.staged_rows.insert(key.clone(), row.clone());
+        let mut edits = vec![
+            json!({"key":state_key(&session.caller), "value":session.state}),
+            json!({"key":key, "value":row}),
+        ];
+        edits.extend(cleanup);
+        let payload = collection_commit(&session, edits);
+        let reply = json!({"ok":true,"revision":session.document_revision,"generation":session.state.generation,"provider_epoch":session.state.provider_epoch,"next_sequence":next_sequence});
+        self.submit(
+            context,
+            payload,
+            Stage::ProviderSaving(ProviderSave {
+                session,
+                reply,
+                remaining_cleanup: Vec::new(),
+                finish: false,
+            }),
+            send,
+        )
+    }
+
+    fn publish_staged_snapshot(
+        &mut self,
+        context: Context,
+        mut session: ProviderSession,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        let remove_stale = session.state.finish_remove_stale;
+        let remove_uninstalled = session.state.finish_remove_uninstalled;
+        let remove_expired = session.state.finish_remove_expired;
+        let remove_selection = session.state.finish_remove_selection;
+        let original_revision = session.document_revision;
+        let finish_state = session.state.clone();
+        let intents = match collect_staged(&session) {
+            Ok(intents) => intents,
+            Err(failure) => return complete(send, context.request_id, failure),
+        };
+        session.seen_source_ids.clear();
+        let planned = staged_batch(&intents, original_revision);
+        let (mut session, edits) = match plan_provider_batch(session, planned) {
+            Ok(result) => result,
+            Err(failure) => return complete(send, context.request_id, failure),
+        };
+        session.state = finish_state;
+        let batch_changed = session.document_revision != original_revision;
+        session.document_revision = original_revision;
+        let stale = plan_stale_markers(
+            &session,
+            session.state.generation,
+            remove_stale,
+            remove_uninstalled,
+            remove_expired,
+            remove_selection,
+        );
+        let cleanup = match plan_cleanup_edits(&mut session, stale) {
+            Ok(edits) => edits,
+            Err(failure) => return complete(send, context.request_id, failure),
+        };
+        let changed = batch_changed || session.document_revision != original_revision;
+        session.document_revision = match original_revision.checked_add(u64::from(changed)) {
+            Some(revision) => revision,
+            None => {
+                return complete(
+                    send,
+                    context.request_id,
+                    error("resource_exhausted", "catalog revision exhausted"),
+                );
+            }
+        };
+        session.state.staged_intents = StagedIntents::default();
+        session.state.staged_at_unix = None;
+        session.state.cleanup_pending = false;
+        let mut unique = BTreeMap::new();
+        for edit in edits.into_iter().chain(cleanup) {
+            let key = edit["key"].as_str().expect("planned edit key").to_owned();
+            unique.insert(key, edit);
+        }
+        unique.insert(
+            state_key(&session.caller),
+            json!({"key":state_key(&session.caller), "value":session.state}),
+        );
+        for key in session.staged_rows.keys() {
+            unique.insert(key.clone(), json!({"key":key,"value":null}));
+        }
+        session.provider_count = match session
+            .provider_count
+            .checked_sub(session.staged_rows.len() as u64)
+        {
+            Some(count) => count,
+            None => return complete(send, context.request_id, malformed()),
+        };
+        session.staged_rows.clear();
+        let mut chunks = Vec::new();
+        let mut chunk = Vec::new();
+        for edit in unique.into_values() {
+            chunk.push(edit);
+            if serde_json::to_vec(&chunk).map_or(true, |bytes| bytes.len() > 11_500) {
+                let last = chunk.pop().expect("one edit");
+                if chunk.is_empty() {
+                    return complete(
+                        send,
+                        context.request_id,
+                        error("resource_exhausted", "publication edit exceeds draft limit"),
+                    );
+                }
+                chunks.push(std::mem::take(&mut chunk));
+                chunk.push(last);
+            }
+            if chunk.len() == 128 {
+                chunks.push(std::mem::take(&mut chunk));
+            }
+        }
+        if !chunk.is_empty() {
+            chunks.push(chunk);
+        }
+        if chunks.len() > 1024
+            || chunks
+                .iter()
+                .map(|chunk| serde_json::to_vec(chunk).map_or(usize::MAX, |b| b.len()))
+                .sum::<usize>()
+                > 16 * 1024 * 1024
+        {
+            return complete(
+                send,
+                context.request_id,
+                error(
+                    "resource_exhausted",
+                    "staged publication exceeds draft limits",
+                ),
+            );
+        }
+        let reply = json!({"ok":true,"revision":session.document_revision,"generation":session.state.generation,"provider_epoch":session.state.provider_epoch,"complete":true,"cleanup_pending":false,"remove_stale":remove_stale,"remove_uninstalled":remove_uninstalled,"remove_expired":remove_expired,"remove_selection":remove_selection});
+        let draft_id = fingerprint_bytes(format!("{}:{}", session.key, session.caller).as_bytes());
+        // Bind the resumable draft to the exact chunk bytes and resulting metadata.
+        // The State store compares this digest before accepting a resumed prefix.
+        let plan = json!({"chunks":chunks,"metadata":{"revision":session.document_revision,"next_id":session.next_id,"provider_count":session.provider_count}});
+        let content_id = match serde_json::to_vec(&plan) {
+            Ok(bytes) => fingerprint_bytes(&bytes),
+            Err(_) => return complete(send, context.request_id, malformed()),
+        };
+        let payload = json!({"action":"collection_draft_begin", "collection":session.key, "draft_id":draft_id, "content_id":content_id, "expected_revision":session.collection_revision});
+        self.submit(
+            context,
+            payload,
+            Stage::DraftBegin(DraftPublish {
+                save: ProviderSave {
+                    session,
+                    reply,
+                    remaining_cleanup: Vec::new(),
+                    finish: true,
+                },
+                draft_id,
+                content_id,
+                chunks,
+                next: 0,
+            }),
+            send,
+        )
+    }
+
+    fn continue_draft(
+        &mut self,
+        context: Context,
+        mut draft: DraftPublish,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
+        if draft.next < draft.chunks.len() {
+            let payload = json!({"action":"collection_draft_append", "collection":draft.save.session.key, "draft_id":draft.draft_id, "sequence":draft.next, "edits":draft.chunks[draft.next]});
+            draft.next += 1;
+            self.submit(context, payload, Stage::DraftAppend(draft), send)
+        } else {
+            let session = &draft.save.session;
+            let payload = json!({"action":"collection_draft_publish", "collection":session.key, "draft_id":draft.draft_id, "expected_revision":session.collection_revision, "metadata":{"revision":session.document_revision,"next_id":session.next_id,"provider_count":session.provider_count}});
+            self.submit(context, payload, Stage::DraftPublishing(draft), send)
+        }
     }
 
     fn finish_snapshot(
@@ -2113,28 +2144,17 @@ impl Pipeline {
             session.state.finish_remove_expired = remove_expired;
             session.state.finish_remove_selection = remove_selection;
         }
-        let mut stale_by_key = BTreeMap::new();
-        for marker in session.markers.values().filter(|marker| {
-            marker.caller == session.caller
-                && !(session.caller == PLAYNITE_IMPORTER
-                    && marker.source_id == PLAYNITE_FULLSCREEN_SOURCE_ID)
-                && ((remove_stale && marker.generation < generation)
-                    || (marker.remove_generation == Some(generation)
-                        && match marker.remove_reason {
-                            Some(RemovalReason::Uninstalled) => remove_uninstalled,
-                            Some(RemovalReason::Expired) => remove_expired,
-                            Some(RemovalReason::Selection) => remove_selection,
-                            // Existing generations written before removal reasons
-                            // represented explicit-uninstalled tombstones only.
-                            None => remove_uninstalled,
-                        }))
-        }) {
-            stale_by_key.insert(
-                entry_key(&session.caller, &marker.source_id),
-                marker.clone(),
-            );
+        if session.state.staged {
+            return self.publish_staged_snapshot(context, session, send);
         }
-        let stale: Vec<Marker> = stale_by_key.into_values().collect();
+        let stale = plan_stale_markers(
+            &session,
+            generation,
+            remove_stale,
+            remove_uninstalled,
+            remove_expired,
+            remove_selection,
+        );
         session.state.cleanup_pending = !stale.is_empty();
         self.commit_provider_cleanup(context, session, stale, send)
     }
@@ -2149,32 +2169,10 @@ impl Pipeline {
         const CLEANUP_BATCH: usize = 63;
         let count = stale.len().min(CLEANUP_BATCH);
         let remaining = stale.split_off(count);
-        let mut edits = Vec::with_capacity(count * 2 + 1);
-        let mut removed_entry = false;
-        for marker in stale {
-            let key = entry_key(&session.caller, &marker.source_id);
-            if !marker.detached
-                && session.fingerprints.get(&marker.entry_id) == Some(&marker.fingerprint)
-            {
-                edits.push(json!({"key":marker.entry_id,"value":null}));
-                session.entry_ids.remove(&marker.entry_id);
-                session.fingerprints.remove(&marker.entry_id);
-                removed_entry = true;
-            }
-            edits.push(json!({"key":key,"value":null}));
-            session.markers.remove(&key);
-            session.provider_count = session.provider_count.saturating_sub(1);
-        }
-        if removed_entry {
-            let Some(revision) = session.document_revision.checked_add(1) else {
-                return complete(
-                    send,
-                    context.request_id,
-                    error("resource_exhausted", "catalog revision exhausted"),
-                );
-            };
-            session.document_revision = revision;
-        }
+        let mut edits = match plan_cleanup_edits(&mut session, stale) {
+            Ok(edits) => edits,
+            Err(failure) => return complete(send, context.request_id, failure),
+        };
         session.state.cleanup_pending = !remaining.is_empty();
         edits.push(json!({
             "key":state_key(&session.caller),
@@ -2250,11 +2248,26 @@ impl Pipeline {
                 Ok(())
             }
             Response::Result { payload } => {
-                if matches!(&pending.stage, Stage::ProviderSaving(_)) {
+                if matches!(
+                    &pending.stage,
+                    Stage::ProviderSaving(_) | Stage::DraftPublishing(_)
+                ) {
                     self.provider_sessions
                         .retain(|_, session| session.key != pending.context.key);
                 }
                 if payload["ok"] != true {
+                    if payload["error"]["code"] == "draft_conflict"
+                        && let Stage::DraftBegin(draft) = pending.stage
+                    {
+                        let abort = json!({"action":"collection_draft_abort","collection":draft.save.session.key,"draft_id":draft.draft_id});
+                        return self.submit(pending.context, abort, Stage::DraftReset(draft), send);
+                    }
+                    if payload["error"]["code"] == "sequence_conflict"
+                        && let Stage::DraftVerify(draft) = pending.stage
+                    {
+                        let abort = json!({"action":"collection_draft_abort","collection":draft.save.session.key,"draft_id":draft.draft_id});
+                        return self.submit(pending.context, abort, Stage::DraftReset(draft), send);
+                    }
                     let failure = if payload["ok"] == false && payload["error"].is_object() {
                         payload
                     } else {
@@ -2262,13 +2275,26 @@ impl Pipeline {
                     };
                     return complete(send, pending.context.request_id, failure);
                 }
-                let Some(revision) = payload["revision"].as_u64() else {
+                let revision = if matches!(
+                    pending.stage,
+                    Stage::DraftReset(_)
+                        | Stage::DraftBegin(_)
+                        | Stage::DraftAppend(_)
+                        | Stage::DraftVerify(_)
+                ) {
+                    0
+                } else if let Some(revision) = payload["revision"].as_u64() {
+                    revision
+                } else {
                     return complete(send, pending.context.request_id, malformed());
                 };
                 self.consume(pending.context, pending.stage, revision, payload, send)
             }
             failure => {
-                if matches!(&pending.stage, Stage::ProviderSaving(_)) {
+                if matches!(
+                    &pending.stage,
+                    Stage::ProviderSaving(_) | Stage::DraftPublishing(_)
+                ) {
                     self.provider_sessions
                         .retain(|_, session| session.key != pending.context.key);
                 }
@@ -2285,6 +2311,46 @@ impl Pipeline {
         send: &mut impl FnMut(Command) -> TransportResult,
     ) -> ModuleResult<()> {
         match stage {
+            Stage::DraftReset(draft) => {
+                let payload = json!({"action":"collection_draft_begin", "collection":draft.save.session.key, "draft_id":draft.draft_id, "content_id":draft.content_id, "expected_revision":draft.save.session.collection_revision});
+                self.submit(context, payload, Stage::DraftBegin(draft), send)
+            }
+            Stage::DraftPublishing(draft) => self.consume(
+                context,
+                Stage::ProviderSaving(draft.save),
+                state_revision,
+                payload,
+                send,
+            ),
+            Stage::DraftBegin(mut draft) => {
+                let Some(next) = payload["next_sequence"]
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                else {
+                    return complete(send, context.request_id, malformed());
+                };
+                if next > draft.chunks.len() {
+                    return complete(send, context.request_id, malformed());
+                }
+                draft.next = next;
+                if next > 0 {
+                    let payload = json!({"action":"collection_draft_append", "collection":draft.save.session.key, "draft_id":draft.draft_id, "sequence":next - 1, "edits":draft.chunks[next - 1]});
+                    return self.submit(context, payload, Stage::DraftVerify(draft), send);
+                }
+                self.continue_draft(context, draft, send)
+            }
+            Stage::DraftVerify(draft) => {
+                if payload["next_sequence"].as_u64() != Some(draft.next as u64) {
+                    return complete(send, context.request_id, malformed());
+                }
+                self.continue_draft(context, draft, send)
+            }
+            Stage::DraftAppend(draft) => {
+                if payload["next_sequence"].as_u64() != Some(draft.next as u64) {
+                    return complete(send, context.request_id, malformed());
+                }
+                self.continue_draft(context, draft, send)
+            }
             Stage::Saving(reply) => {
                 self.provider_sessions
                     .retain(|_, session| session.key != context.key);
@@ -2309,8 +2375,7 @@ impl Pipeline {
                     );
                 }
                 if let Some(caller) = &context.importer {
-                    self.provider_sessions
-                        .insert(caller.clone(), save.session.clone());
+                    self.provider_sessions.insert(caller.clone(), save.session);
                 }
                 complete(send, context.request_id, save.reply)
             }
@@ -2358,6 +2423,19 @@ impl Pipeline {
                     }
                 }
                 self.operate(context, operation, state_revision, document, send)
+            }
+            Stage::StagedCacheCheck { operation, session } => {
+                if state_revision == session.collection_revision {
+                    self.apply_provider_operation(context, operation, session, send)
+                } else {
+                    self.consume(
+                        context,
+                        Stage::ProviderLoading(operation),
+                        state_revision,
+                        payload,
+                        send,
+                    )
+                }
             }
             Stage::ProviderInventoryCheck { operation, session } => {
                 if state_revision != session.collection_revision {
@@ -2408,7 +2486,9 @@ impl Pipeline {
                     artwork_entries: BTreeMap::new(),
                     entry_ids: BTreeSet::new(),
                     markers: BTreeMap::new(),
+                    marker_entry_ids: BTreeSet::new(),
                     provider_state: None,
+                    staged_rows: BTreeMap::new(),
                 };
                 self.scan_provider_page(context, scan, send)
             }
@@ -2440,15 +2520,26 @@ impl Pipeline {
                             Ok(marker) if validate_marker(&marker, caller, source_id) => marker,
                             _ => return complete(send, context.request_id, malformed()),
                         };
-                        if scan
-                            .markers
-                            .values()
-                            .any(|existing| existing.entry_id == marker.entry_id)
-                        {
+                        if !scan.marker_entry_ids.insert(marker.entry_id.clone()) {
                             return complete(send, context.request_id, malformed());
                         }
                         scan.markers.insert(key.into(), marker);
                         scan.hidden_rows += 1;
+                    } else if key.starts_with(STAGED_PREFIX) {
+                        scan.hidden_rows += 1;
+                        let Some((caller, _, _)) = parse_staged_key(key) else {
+                            return complete(send, context.request_id, malformed());
+                        };
+                        if Some(caller) == context.importer.as_deref() {
+                            let row: StagedIntents =
+                                match serde_json::from_value(row["value"].clone()) {
+                                    Ok(row) => row,
+                                    Err(_) => {
+                                        return complete(send, context.request_id, malformed());
+                                    }
+                                };
+                            scan.staged_rows.insert(key.into(), row);
+                        }
                     } else if key == seed::MARKER_KEY {
                         scan.hidden_rows += 1;
                     } else if let Some(caller) = key.strip_prefix(STATE_PREFIX) {
@@ -3038,6 +3129,453 @@ pub(crate) fn header(metadata: &Value) -> Result<Document, Value> {
     Ok(document)
 }
 
+/// Bound cleanup work while leaving the current generation and public entries untouched.
+fn reclaim_abandoned_batches(session: &mut ProviderSession) -> Vec<Value> {
+    let boundary = staged_key(&session.caller, session.state.generation, 0);
+    // Rows in this map belong to this caller, and fixed-width generations sort
+    // in chronological order. The range avoids rescanning the active snapshot.
+    let keys: Vec<String> = session
+        .staged_rows
+        .range(..boundary)
+        .take(4) // Reserve frame space for a maximum-sized incoming batch.
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in &keys {
+        session.staged_rows.remove(key);
+        session.provider_count -= 1;
+    }
+    keys.into_iter()
+        .map(|key| json!({"key":key,"value":null}))
+        .collect()
+}
+
+fn staged_key(caller: &str, generation: u64, sequence: u64) -> String {
+    format!("{STAGED_PREFIX}{caller}:{generation:020}:{sequence:020}")
+}
+
+fn parse_staged_key(key: &str) -> Option<(&str, u64, u64)> {
+    let rest = key.strip_prefix(STAGED_PREFIX)?;
+    let (rest, sequence) = rest.rsplit_once(':')?;
+    let (caller, generation) = rest.rsplit_once(':')?;
+    if caller.is_empty() || generation.len() != 20 || sequence.len() != 20 {
+        return None;
+    }
+    let generation = generation.parse().ok()?;
+    let sequence = sequence.parse().ok()?;
+    (staged_key(caller, generation, sequence) == key).then_some((caller, generation, sequence))
+}
+
+fn extend_intents(target: &mut StagedIntents, source: &StagedIntents) {
+    target.entries.extend(source.entries.clone());
+    target
+        .remove_source_ids
+        .extend(source.remove_source_ids.clone());
+    target
+        .expire_source_ids
+        .extend(source.expire_source_ids.clone());
+    target
+        .selection_remove_source_ids
+        .extend(source.selection_remove_source_ids.clone());
+}
+
+fn collect_staged(session: &ProviderSession) -> Result<StagedIntents, Value> {
+    let mut result = session.state.staged_intents.clone();
+    let mut sequence = if result.is_empty() { Some(0) } else { None };
+    let mut found = false;
+    for (key, row) in &session.staged_rows {
+        let (_, generation, row_sequence) = parse_staged_key(key).ok_or_else(malformed)?;
+        if generation == session.state.generation {
+            if sequence.is_some_and(|expected| row_sequence != expected) {
+                return Err(malformed());
+            }
+            sequence = row_sequence.checked_add(1);
+            if sequence.is_none() {
+                return Err(malformed());
+            }
+            found = true;
+            extend_intents(&mut result, row);
+        }
+    }
+    // Old in-state staged snapshots remain readable while upgrading.
+    if (found && sequence != Some(session.state.next_sequence))
+        || (!found && result.is_empty() && session.state.next_sequence != 0)
+    {
+        return Err(malformed());
+    }
+    Ok(result)
+}
+
+fn validate_staged_intents(
+    caller: &str,
+    seen: &BTreeSet<String>,
+    intents: &StagedIntents,
+) -> Result<BTreeSet<String>, Value> {
+    let mut ids = BTreeSet::new();
+    for source_id in intents
+        .entries
+        .iter()
+        .map(|entry| entry.source_id.as_str())
+        .chain(intents.remove_source_ids.iter().map(String::as_str))
+        .chain(intents.expire_source_ids.iter().map(String::as_str))
+        .chain(
+            intents
+                .selection_remove_source_ids
+                .iter()
+                .map(String::as_str),
+        )
+    {
+        if !valid_source_id(source_id)
+            || (caller == PLAYNITE_IMPORTER && source_id == PLAYNITE_FULLSCREEN_SOURCE_ID)
+            || seen.contains(source_id)
+            || !ids.insert(source_id.to_owned())
+        {
+            return Err(error(
+                "duplicate_source_id",
+                "provider snapshot repeats a source ID within its generation",
+            ));
+        }
+    }
+    for item in &intents.entries {
+        validate_provider_entry(caller, &item.source_id, &item.entry, item.preserve_artwork)?;
+    }
+    Ok(ids)
+}
+
+fn staged_batch(intents: &StagedIntents, revision: u64) -> ProviderBatch {
+    ProviderBatch {
+        sequence: 0,
+        expected_revision: revision,
+        fingerprint: String::new(),
+        entries: intents.entries.clone(),
+        remove_source_ids: intents.remove_source_ids.clone(),
+        expire_source_ids: intents.expire_source_ids.clone(),
+        selection_remove_source_ids: intents.selection_remove_source_ids.clone(),
+    }
+}
+
+/// Validate and plan a provider batch without publishing the collection edits.
+fn validate_provider_entry(
+    caller: &str,
+    source_id: &str,
+    entry: &Entry,
+    preserve_artwork: bool,
+) -> Result<(), Value> {
+    let invalid_launch_owner = matches!(
+        &entry.launch,
+        Launch::Playnite { .. } | Launch::PlayniteFullscreen { .. }
+    ) && caller != PLAYNITE_IMPORTER;
+    // Fullscreen is a reserved provider row and Desktop is user-managed;
+    // neither can arrive through a library snapshot.
+    let invalid_fullscreen_import = matches!(
+        &entry.launch,
+        Launch::PlayniteFullscreen { .. } | Launch::Desktop { .. }
+    );
+    let valid_playnite_identity = caller == PLAYNITE_IMPORTER
+        && crate::model::valid_guid(source_id)
+        && !source_id.bytes().any(|byte| byte.is_ascii_uppercase())
+        && matches!(&entry.launch, Launch::Playnite { game_id, .. } if game_id.as_str() == source_id);
+    let invalid_artwork_owner = match &entry.artwork {
+        Some(ArtworkReference::Steam { app_id, .. }) => {
+            caller != STEAM_IMPORTER || source_id != format!("steam:{app_id}")
+        }
+        Some(ArtworkReference::Lutris { game_id, .. }) => {
+            caller != LUTRIS_IMPORTER || source_id != game_id.to_string()
+        }
+        Some(ArtworkReference::Playnite { game_id, .. }) => {
+            !valid_playnite_identity || game_id.as_str() != source_id
+        }
+        None => false,
+    } || (preserve_artwork
+        && (!valid_playnite_identity || entry.artwork.is_some()));
+    let has_steam_metadata = entry.steam_id.is_some() || entry.steam_install_dir.is_some();
+    let valid_steam_metadata_identity = entry
+        .steam_id
+        .as_ref()
+        .is_some_and(|app_id| caller == STEAM_IMPORTER && source_id == format!("steam:{app_id}"));
+    let invalid_steam_metadata = has_steam_metadata && !valid_steam_metadata_identity;
+    if invalid_artwork_owner {
+        return Err(error(
+            "provider_artwork_required",
+            "provider artwork requires its authenticated importer and matching source ID",
+        ));
+    }
+    if invalid_steam_metadata {
+        return Err(error(
+            "provider_identity_required",
+            "Steam metadata requires the authenticated Steam importer and matching source ID",
+        ));
+    }
+    if entry.validate().is_err() || invalid_launch_owner || invalid_fullscreen_import {
+        return Err(error(
+            "invalid_entry",
+            "provider entry identity or value is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn plan_provider_batch(
+    mut session: ProviderSession,
+    batch: ProviderBatch,
+) -> Result<(ProviderSession, Vec<Value>), Value> {
+    let ProviderBatch {
+        sequence,
+        expected_revision,
+        fingerprint: batch_fingerprint,
+        entries,
+        remove_source_ids,
+        expire_source_ids,
+        selection_remove_source_ids,
+    } = batch;
+    let mut source_ids = BTreeSet::new();
+    for source_id in entries
+        .iter()
+        .map(|entry| entry.source_id.as_str())
+        .chain(remove_source_ids.iter().map(String::as_str))
+        .chain(expire_source_ids.iter().map(String::as_str))
+        .chain(selection_remove_source_ids.iter().map(String::as_str))
+    {
+        if !valid_source_id(source_id)
+            || (session.caller == PLAYNITE_IMPORTER && source_id == PLAYNITE_FULLSCREEN_SOURCE_ID)
+            || session.seen_source_ids.contains(source_id)
+            || !source_ids.insert(source_id.to_owned())
+        {
+            return Err(error(
+                "duplicate_source_id",
+                "provider snapshot repeats a source ID within its generation",
+            ));
+        }
+    }
+    let mut owned_entry_ids = BTreeSet::new();
+    if session
+        .markers
+        .values()
+        .any(|marker| !owned_entry_ids.insert(marker.entry_id.clone()))
+    {
+        return Err(malformed());
+    }
+    let mut edits = Vec::new();
+    let mut entries_changed = false;
+    for provider_entry in entries {
+        let ProviderEntry {
+            source_id,
+            mut entry,
+            source_flags,
+            preserve_artwork,
+        } = provider_entry;
+        validate_provider_entry(&session.caller, &source_id, &entry, preserve_artwork)?;
+        let key = entry_key(&session.caller, &source_id);
+        let existing = session.markers.get(&key).cloned();
+        let source_flags = source_flags
+            .or_else(|| existing.as_ref().map(|marker| marker.source_flags))
+            .unwrap_or_default();
+        let added_at_unix = match existing.as_ref() {
+            Some(marker) => marker.added_at_unix,
+            None if session.state.staged => session.state.staged_at_unix,
+            None => unix_timestamp(),
+        };
+        let (entry_id, detached, config_overrides) = if let Some(marker) = existing.clone() {
+            if !validate_marker(&marker, &session.caller, &source_id) {
+                return Err(malformed());
+            }
+            if marker.detached
+                || session.fingerprints.get(&marker.entry_id) != Some(&marker.fingerprint)
+            {
+                (marker.entry_id, true, marker.config_overrides)
+            } else {
+                (marker.entry_id, false, marker.config_overrides)
+            }
+        } else {
+            if session.entry_ids.len() >= MAX_ENTRIES {
+                return Err(error("resource_exhausted", "catalog entry limit reached"));
+            }
+            let entry_id = format!("app-{:016x}", session.next_id);
+            if session.entry_ids.contains(&entry_id) || owned_entry_ids.contains(&entry_id) {
+                return Err(error("entry_conflict", "next catalog ID is already owned"));
+            }
+            let Some(next_id) = session.next_id.checked_add(1) else {
+                return Err(error("resource_exhausted", "catalog ID space exhausted"));
+            };
+            session.next_id = next_id;
+            session.entry_ids.insert(entry_id.clone());
+            owned_entry_ids.insert(entry_id.clone());
+            (entry_id, false, ConfigOverrides::default())
+        };
+        if preserve_artwork
+            && !detached
+            && let Some(previous) = session.artwork_entries.get(&entry_id)
+            && matches!((&previous.launch, &previous.artwork),
+                (Launch::Playnite { game_id: launch_id, .. }, Some(ArtworkReference::Playnite { game_id, .. }))
+                    if launch_id == &source_id && game_id == &source_id)
+        {
+            entry.artwork = previous.artwork.clone();
+        }
+        if session.caller == PLAYNITE_IMPORTER {
+            entry.config_overrides = config_overrides.clone();
+        }
+        let desired_fingerprint = provider_entry_fingerprint(&session.caller, &entry);
+        let mut marker = Marker {
+            version: 1,
+            caller: session.caller.clone(),
+            source_id: source_id.clone(),
+            entry_id: entry_id.clone(),
+            generation: session.state.generation,
+            fingerprint: desired_fingerprint.clone(),
+            config_overrides,
+            detached,
+            remove_generation: None,
+            added_at_unix,
+            source_flags,
+            remove_reason: None,
+        };
+        if detached {
+            // A changed or deleted Entry has become user-owned. Keep it and
+            // stop provider updates from silently replacing it.
+            marker.fingerprint = session
+                .fingerprints
+                .get(&entry_id)
+                .cloned()
+                .unwrap_or_else(|| "0".repeat(64));
+        } else {
+            if session.fingerprints.get(&entry_id) != Some(&desired_fingerprint) {
+                session
+                    .fingerprints
+                    .insert(entry_id.clone(), desired_fingerprint);
+                edits.push(json!({"key":entry_id,"value":entry}));
+                entries_changed = true;
+            }
+            session.entry_ids.insert(entry_id.clone());
+        }
+        if !session.markers.contains_key(&key) {
+            session.provider_count = session.provider_count.saturating_add(1);
+        }
+        session.markers.insert(key.clone(), marker.clone());
+        session.seen_source_ids.insert(source_id);
+        edits.push(json!({"key":key,"value":marker_value(&marker)}));
+    }
+    for (source_id, reason) in remove_source_ids
+        .into_iter()
+        .map(|source_id| (source_id, RemovalReason::Uninstalled))
+        .chain(
+            expire_source_ids
+                .into_iter()
+                .map(|source_id| (source_id, RemovalReason::Expired)),
+        )
+        .chain(
+            selection_remove_source_ids
+                .into_iter()
+                .map(|source_id| (source_id, RemovalReason::Selection)),
+        )
+    {
+        let key = entry_key(&session.caller, &source_id);
+        if let Some(mut marker) = session.markers.get(&key).cloned() {
+            if !validate_marker(&marker, &session.caller, &source_id) {
+                return Err(malformed());
+            }
+            marker.remove_generation = Some(session.state.generation);
+            marker.remove_reason = Some(reason);
+            session.markers.insert(key.clone(), marker.clone());
+            edits.push(json!({"key":key,"value":marker_value(&marker)}));
+        }
+        session.seen_source_ids.insert(source_id);
+    }
+    let new_revision = if entries_changed {
+        let Some(revision) = session.document_revision.checked_add(1) else {
+            return Err(error("resource_exhausted", "catalog revision exhausted"));
+        };
+        revision
+    } else {
+        session.document_revision
+    };
+    let Some(next_sequence) = session.state.next_sequence.checked_add(1) else {
+        return Err(error(
+            "resource_exhausted",
+            "provider sequence space exhausted",
+        ));
+    };
+    session.state.next_sequence = next_sequence;
+    session.state.finished = false;
+    session.state.cleanup_pending = false;
+    session.state.finish_expected_revision = None;
+    session.state.finish_remove_stale = true;
+    session.state.finish_remove_uninstalled = false;
+    session.state.finish_remove_expired = false;
+    session.state.finish_remove_selection = false;
+    session.state.last_batch = Some(CommittedBatch {
+        sequence,
+        expected_revision,
+        revision: new_revision,
+        next_sequence,
+        fingerprint: batch_fingerprint,
+    });
+    session.document_revision = new_revision;
+    edits.push(json!({
+        "key":state_key(&session.caller),
+        "value":session.state.clone(),
+    }));
+    Ok((session, edits))
+}
+
+/// Select cleanup candidates without changing the collection. A staged publisher
+/// can combine these candidates with its planned writes in one transaction.
+fn plan_stale_markers(
+    session: &ProviderSession,
+    generation: u64,
+    remove_stale: bool,
+    remove_uninstalled: bool,
+    remove_expired: bool,
+    remove_selection: bool,
+) -> Vec<Marker> {
+    session
+        .markers
+        .values()
+        .filter(|marker| {
+            marker.caller == session.caller
+                && !(session.caller == PLAYNITE_IMPORTER
+                    && marker.source_id == PLAYNITE_FULLSCREEN_SOURCE_ID)
+                && ((remove_stale && marker.generation < generation)
+                    || (marker.remove_generation == Some(generation)
+                        && match marker.remove_reason {
+                            Some(RemovalReason::Uninstalled) | None => remove_uninstalled,
+                            Some(RemovalReason::Expired) => remove_expired,
+                            Some(RemovalReason::Selection) => remove_selection,
+                        }))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Plan cleanup against the scanned collection, preserving edited or detached
+/// entries. This only mutates the in-memory session; the caller publishes edits.
+fn plan_cleanup_edits(
+    session: &mut ProviderSession,
+    stale: Vec<Marker>,
+) -> Result<Vec<Value>, Value> {
+    let mut edits = Vec::with_capacity(stale.len() * 2);
+    let mut removed_entry = false;
+    for marker in stale {
+        let key = entry_key(&session.caller, &marker.source_id);
+        if !marker.detached
+            && session.fingerprints.get(&marker.entry_id) == Some(&marker.fingerprint)
+        {
+            edits.push(json!({"key":marker.entry_id,"value":null}));
+            session.entry_ids.remove(&marker.entry_id);
+            session.fingerprints.remove(&marker.entry_id);
+            removed_entry = true;
+        }
+        edits.push(json!({"key":key,"value":null}));
+        session.markers.remove(&key);
+        session.provider_count = session.provider_count.saturating_sub(1);
+    }
+    if removed_entry {
+        session.document_revision = session
+            .document_revision
+            .checked_add(1)
+            .ok_or_else(|| error("resource_exhausted", "catalog revision exhausted"))?;
+    }
+    Ok(edits)
+}
+
 fn collection_commit(session: &ProviderSession, edits: Vec<Value>) -> Value {
     json!({
         "action":"collection_commit",
@@ -3118,7 +3656,10 @@ fn valid_collection_cursor(value: &str) -> bool {
 /// Hidden rows that are never catalog entries: provider markers and state, and
 /// the first-run seed marker.
 fn is_reserved_key(key: &str) -> bool {
-    key.starts_with(ENTRY_PREFIX) || key.starts_with(STATE_PREFIX) || key == seed::MARKER_KEY
+    key.starts_with(ENTRY_PREFIX)
+        || key.starts_with(STATE_PREFIX)
+        || key.starts_with(STAGED_PREFIX)
+        || key == seed::MARKER_KEY
 }
 fn malformed() -> Value {
     error(

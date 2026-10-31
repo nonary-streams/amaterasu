@@ -116,6 +116,7 @@ impl Transaction {
         match self.stage {
             Stage::Begin => json!({
                 "action":"provider_snapshot_begin",
+                "staged":true,
                 "sync_id":self.sync_id,
                 "source_revision":self.source_revision,
             }),
@@ -190,6 +191,9 @@ impl Transaction {
             .ok_or("catalog response omitted generation")?;
         match self.stage {
             Stage::Begin => {
+                if payload.get("staged").and_then(Value::as_bool) != Some(true) {
+                    return Err("catalog did not confirm staged snapshot support".into());
+                }
                 let next_sequence = payload
                     .get("next_sequence")
                     .and_then(Value::as_u64)
@@ -1856,7 +1860,7 @@ mod tests {
     #[test]
     fn stale_or_partial_discovery_never_becomes_a_complete_catalog_plan() {
         let malformed = json!({
-            "ok":true,"revision":1,"generation":2,"next_sequence":0
+            "ok":true,"revision":1,"generation":2,"next_sequence":0,"staged":true
         });
         let mut transaction = Transaction {
             sync_id: "sync".into(),
@@ -1877,6 +1881,15 @@ mod tests {
             delay_ticks: 0,
             cancel_after_call: false,
         };
+        assert_eq!(transaction.payload()["staged"], true);
+        assert!(
+            transaction
+                .advance_success(&json!({
+                    "ok":true,"revision":1,"generation":2,"next_sequence":0
+                }))
+                .is_err()
+        );
+        assert_eq!(transaction.stage, Stage::Begin);
         assert!(!transaction.advance_success(&malformed).unwrap());
         assert_eq!(transaction.stage, Stage::Finish);
         let incomplete_finish = json!({

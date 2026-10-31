@@ -1,5 +1,6 @@
 //! Durable provider ownership records kept beside, but separate from, user entries.
 use crate::model::{ConfigOverrides, Entry, bounded_text, parse_id};
+use crate::protocol::ProviderEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -48,6 +49,13 @@ pub(crate) enum RemovalReason {
 #[serde(deny_unknown_fields)]
 pub(crate) struct SnapshotState {
     pub(crate) version: u8,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) staged: bool,
+    /// Stable import time used when rebuilding an interrupted staged publication.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) staged_at_unix: Option<i64>,
+    #[serde(default, skip_serializing_if = "StagedIntents::is_empty")]
+    pub(crate) staged_intents: StagedIntents,
     #[serde(default)]
     pub(crate) provider_epoch: u64,
     #[serde(default)]
@@ -72,6 +80,24 @@ pub(crate) struct SnapshotState {
     pub(crate) finish_remove_selection: bool,
 }
 
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StagedIntents {
+    pub(crate) entries: Vec<ProviderEntry>,
+    pub(crate) remove_source_ids: Vec<String>,
+    pub(crate) expire_source_ids: Vec<String>,
+    pub(crate) selection_remove_source_ids: Vec<String>,
+}
+
+impl StagedIntents {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+            && self.remove_source_ids.is_empty()
+            && self.expire_source_ids.is_empty()
+            && self.selection_remove_source_ids.is_empty()
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CommittedBatch {
@@ -86,6 +112,9 @@ impl SnapshotState {
     pub(crate) fn initial() -> Self {
         Self {
             version: 1,
+            staged: false,
+            staged_at_unix: None,
+            staged_intents: StagedIntents::default(),
             provider_epoch: 0,
             last_revocation_id: None,
             revoked: false,
@@ -106,6 +135,8 @@ impl SnapshotState {
 
     pub(crate) fn validate(&self) -> bool {
         (self.version == 1)
+            && (self.staged || self.staged_intents.is_empty())
+            && (!self.finished || self.staged_intents.is_empty())
             && self.last_revocation_id.as_deref().is_none_or(valid_sync_id)
             && (self.last_revocation_id.is_none() || self.provider_epoch > 0)
             && (self.generation == 0 || valid_sync_id(&self.sync_id))

@@ -281,6 +281,7 @@ impl Transaction {
             }),
             Stage::Begin => json!({
                 "action":"provider_snapshot_begin",
+                "staged":true,
                 "sync_id":self.sync_id,
                 "source_revision":self.source_revision,
                 "provider_epoch":self.provider_epoch,
@@ -448,6 +449,9 @@ impl Transaction {
         match self.stage {
             Stage::Inventory => unreachable!("inventory responses are handled before this match"),
             Stage::Begin => {
+                if payload.get("staged").and_then(Value::as_bool) != Some(true) {
+                    return Err("catalog did not confirm staged snapshot support".into());
+                }
                 let next = payload
                     .get("next_sequence")
                     .and_then(Value::as_u64)
@@ -1968,10 +1972,19 @@ mod tests {
         let mut transaction = sync.transaction.take().unwrap();
         finish_inventory(&mut transaction, vec![], 5);
         assert_eq!(transaction.stage, Stage::Begin);
+        assert_eq!(transaction.payload()["staged"], true);
+        assert!(
+            transaction
+                .consume(json!({
+                    "ok":true,"revision":5,"generation":2,"next_sequence":0
+                }))
+                .is_err()
+        );
+        assert_eq!(transaction.stage, Stage::Begin);
         assert!(
             !transaction
                 .consume(json!({
-                    "ok":true,"revision":5,"generation":2,"next_sequence":0
+                    "ok":true,"revision":5,"generation":2,"next_sequence":0,"staged":true
                 }))
                 .unwrap()
         );
@@ -2152,7 +2165,7 @@ mod tests {
                     "ok":true,
                     "revision":5,
                     "generation":2,
-                    "next_sequence":0
+                    "next_sequence":0,"staged":true
                 }))
                 .unwrap()
         );

@@ -225,6 +225,7 @@ version = "0.1.0"
 dependencies = [
  "amaterasu-input-policy",
  "amaterasu-module-sdk",
+ "amaterasu-state",
  "serde",
  "serde_json",
  "sha2",

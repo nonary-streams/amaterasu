@@ -442,6 +442,26 @@ same `sync_id` resume that generation; a new or restarted source scan must use a
 fresh ID so partial data from the old generation cannot be mistaken for a
 complete snapshot.
 
+### Opt-in staged snapshots
+
+Set `"staged":true` in `provider_snapshot_begin` to durably collect batches
+without publishing their entries or removal intents. Retry begin with the same
+`sync_id`, source revision, and mode to resume after restart. Batch replies keep
+the catalog revision unchanged. A complete finish rescans the collection and
+publishes all entry changes, provenance changes, and selected cleanup in one
+compare-and-set commit. Manual edits made before that scan remain protected;
+concurrent writes during publication cause a revision conflict. The caller must
+retry with the current catalog revision. An incomplete finish cannot publish.
+Playnite provider epochs still fence revoked generations.
+
+The staged state row, including its key and serialized value, is limited to
+10,000 bytes. Publication must fit both 128 collection edits and a 16,384-byte
+serialized command. A `resource_exhausted` response leaves the published catalog
+unchanged; previously accepted staged batches remain available. These limits make
+this mode suitable only for bounded snapshots and cleanup sets. Starting a fresh
+snapshot requires a new `sync_id`. Omit `staged` for the existing incremental
+batch and cleanup behavior.
+
 Playnite uses explicit `installed:false` records as tombstones only when both
 `auto_sync` and `autosync_remove_uninstalled` are enabled. A manual refresh with
 `auto_sync` disabled does not apply membership cleanup. Selection exclusions and

@@ -144,6 +144,7 @@ impl Transaction {
             }),
             Stage::Begin => json!({
                 "action":"provider_snapshot_begin",
+                "staged":true,
                 "sync_id":self.sync_id,
                 "source_revision":self.source_revision,
                 "expected_collection_revision":self.collection_revision,
@@ -246,6 +247,9 @@ impl Transaction {
         match self.stage {
             Stage::Inventory => unreachable!("inventory responses are handled separately"),
             Stage::Begin => {
+                if response.get("staged").and_then(Value::as_bool) != Some(true) {
+                    return Err("catalog did not confirm staged snapshot support".into());
+                }
                 let next_sequence = response
                     .get("next_sequence")
                     .and_then(Value::as_u64)
@@ -1028,7 +1032,9 @@ mod tests {
                 1,
             )
             .unwrap();
-        catalog.respond_for_test(json!({"ok":true,"revision":8,"generation":3,"next_sequence":0}));
+        catalog.respond_for_test(
+            json!({"ok":true,"revision":8,"generation":3,"next_sequence":0,"staged":true}),
+        );
         let transaction = catalog.transaction.as_mut().unwrap();
         assert_eq!(transaction.stage, Stage::Batch);
         transaction.call = Call::Waiting { request: 42 };
@@ -1599,7 +1605,7 @@ mod tests {
 
         respond_to_catalog(
             &mut catalog,
-            json!({"ok":true,"revision":8,"generation":3,"next_sequence":0}),
+            json!({"ok":true,"revision":8,"generation":3,"next_sequence":0,"staged":true}),
         );
         let batch = catalog.transaction.as_ref().unwrap().payload();
         assert_eq!(batch["action"], "provider_snapshot_batch");
@@ -1825,10 +1831,21 @@ mod tests {
         assert_eq!(transaction.stage, Stage::Begin);
         let begin = transaction.payload();
         assert_eq!(begin["expected_collection_revision"], 42);
+        assert_eq!(begin["staged"], true);
+        assert!(
+            transaction
+                .consume(&json!({
+                    "ok":true,"revision":8,"generation":2,"next_sequence":0
+                }))
+                .is_err()
+        );
+        assert_eq!(transaction.stage, Stage::Begin);
 
         assert!(
             !transaction
-                .consume(&json!({"ok":true,"revision":8,"generation":2,"next_sequence":0}))
+                .consume(
+                    &json!({"ok":true,"revision":8,"generation":2,"next_sequence":0,"staged":true})
+                )
                 .unwrap()
         );
         let batch = transaction.payload();

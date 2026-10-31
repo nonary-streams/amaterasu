@@ -9,6 +9,8 @@ struct CleanupPolicy {
     remove_selection: bool,
 }
 
+type MockDraft = (u64, Vec<Vec<Value>>, Option<String>);
+
 #[derive(Default)]
 struct Backend {
     revision: u64,
@@ -18,9 +20,24 @@ struct Backend {
     fail: bool,
     lose_commit_ack_once: bool,
     collection_pages: usize,
+    drafts: BTreeMap<String, MockDraft>,
+    conflict_draft_publish_once: bool,
+    live: Option<amaterasu_state::test_support::TestStateStore>,
+    before_draft_publish: Option<Value>,
+    expire_caller_after_publish: bool,
+    expire_after_new_draft_chunk: bool,
 }
 impl Backend {
     fn handle(&mut self, request: Value) -> Value {
+        if let Some(store) = &self.live {
+            if request["action"] == "collection_draft_publish"
+                && let Some(edit) = self.before_draft_publish.take()
+            {
+                let changed = store.handle("amaterasu.catalog", edit);
+                assert_eq!(changed["ok"], true, "{changed}");
+            }
+            return store.handle("amaterasu.catalog", request);
+        }
         match request["action"].as_str().unwrap() {
             "get" => {
                 json!({"ok":true,"revision":0,"found":self.legacy.is_some(),"value":self.legacy})
@@ -36,6 +53,62 @@ impl Backend {
                     return error("revision_conflict", "concurrent write");
                 }
                 for edit in request["edits"].as_array().unwrap() {
+                    let key = edit["key"].as_str().unwrap();
+                    if edit["value"].is_null() {
+                        self.entries.remove(key);
+                    } else {
+                        self.entries.insert(key.into(), edit["value"].clone());
+                    }
+                }
+                self.metadata = request["metadata"].clone();
+                self.revision += 1;
+                json!({"ok":true,"revision":self.revision})
+            }
+            "collection_draft_abort" => {
+                self.drafts.remove(request["draft_id"].as_str().unwrap());
+                json!({"ok":true})
+            }
+            "collection_draft_begin" => {
+                let id = request["draft_id"].as_str().unwrap().to_owned();
+                let expected = request["expected_revision"].as_u64().unwrap();
+                let content_id = request["content_id"].as_str().map(str::to_owned);
+                let draft = self
+                    .drafts
+                    .entry(id)
+                    .or_insert_with(|| (expected, Vec::new(), content_id.clone()));
+                if draft.0 != expected || draft.2 != content_id {
+                    return error("draft_conflict", "draft revision differs");
+                }
+                json!({"ok":true,"next_sequence":draft.1.len()})
+            }
+            "collection_draft_append" => {
+                let draft = self
+                    .drafts
+                    .get_mut(request["draft_id"].as_str().unwrap())
+                    .unwrap();
+                let seq = request["sequence"].as_u64().unwrap() as usize;
+                let edits = request["edits"].as_array().unwrap().clone();
+                if seq == draft.1.len() {
+                    draft.1.push(edits);
+                } else if seq + 1 != draft.1.len() || draft.1[seq] != edits {
+                    return error("sequence_conflict", "draft sequence differs");
+                }
+                json!({"ok":true,"next_sequence":draft.1.len()})
+            }
+            "collection_draft_publish" => {
+                if self.conflict_draft_publish_once {
+                    self.conflict_draft_publish_once = false;
+                    self.revision += 1;
+                    return error("revision_conflict", "injected concurrent write");
+                }
+                let (expected, chunks, _) = self
+                    .drafts
+                    .remove(request["draft_id"].as_str().unwrap())
+                    .unwrap();
+                if expected != self.revision || request["expected_revision"] != self.revision {
+                    return error("revision_conflict", "concurrent write");
+                }
+                for edit in chunks.into_iter().flatten() {
                     let key = edit["key"].as_str().unwrap();
                     if edit["value"].is_null() {
                         self.entries.remove(key);
@@ -98,6 +171,7 @@ impl Backend {
         let mut result = None;
         let mut state_result = None;
         let mut operations = std::collections::BTreeSet::new();
+        let mut expire_pending = false;
         for _ in 0..1000 {
             pipeline
                 .tick(|command| {
@@ -130,9 +204,25 @@ impl Backend {
                                     .unwrap(),
                                 format!("principal/{owner}").as_str()
                             );
-                            let is_commit = payload["action"] == "collection_commit";
+                            let is_publish = payload["action"] == "collection_draft_publish";
+                            let is_append = payload["action"] == "collection_draft_append";
+                            let is_commit = payload["action"] == "collection_commit" || is_publish;
                             let result = self.handle(payload);
-                            state_result = Some(if is_commit && self.lose_commit_ack_once {
+                            if is_publish && self.expire_caller_after_publish {
+                                self.expire_caller_after_publish = false;
+                                expire_pending = true;
+                            }
+                            let lost_chunk = is_append
+                                && self.expire_after_new_draft_chunk
+                                && result["ok"] == true
+                                && result["replayed"] != true;
+                            if lost_chunk {
+                                self.expire_after_new_draft_chunk = false;
+                                expire_pending = true;
+                            }
+                            state_result = Some(if lost_chunk {
+                                error("deadline_exceeded", "injected lost chunk acknowledgement")
+                            } else if is_commit && self.lose_commit_ack_once {
                                 self.lose_commit_ack_once = false;
                                 error("deadline_exceeded", "injected lost commit acknowledgement")
                             } else {
@@ -155,6 +245,15 @@ impl Backend {
                     })
                 })
                 .unwrap();
+            if expire_pending {
+                pipeline
+                    .pending
+                    .as_mut()
+                    .expect("publication pending")
+                    .context
+                    .deadline = Instant::now() - Duration::from_millis(1);
+                expire_pending = false;
+            }
             if let Some(result) = result {
                 return result;
             }
@@ -5154,6 +5253,9 @@ fn provider_override_rejects_entries_marked_for_another_provider() {
     };
     let playnite_state = SnapshotState {
         version: 1,
+        staged: false,
+        staged_at_unix: None,
+        staged_intents: StagedIntents::default(),
         provider_epoch: 0,
         last_revocation_id: None,
         revoked: false,
@@ -6071,4 +6173,1032 @@ fn playnite_artwork_reference_requires_lowercase_guid_and_sha256() {
         let entry: Entry = serde_json::from_value(game).unwrap();
         assert_eq!(entry.validate().is_ok(), expected);
     }
+}
+
+#[test]
+fn cleanup_planner_preserves_manually_changed_entries_and_selects_only_owned_markers() {
+    let marker = |caller: &str, source: &str, id: &str, fingerprint: &str| Marker {
+        version: 1,
+        caller: caller.into(),
+        source_id: source.into(),
+        entry_id: id.into(),
+        generation: 1,
+        fingerprint: fingerprint.into(),
+        config_overrides: ConfigOverrides::default(),
+        detached: false,
+        remove_generation: None,
+        added_at_unix: None,
+        source_flags: 0,
+        remove_reason: None,
+    };
+    let owner = STEAM_IMPORTER;
+    let owned = marker(owner, "steam:1", "app-0000000000000001", "old");
+    let changed = marker(owner, "steam:2", "app-0000000000000002", "old");
+    let other = marker(LUTRIS_IMPORTER, "3", "app-0000000000000003", "old");
+    let markers = [owned.clone(), changed.clone(), other]
+        .into_iter()
+        .map(|m| (entry_key(&m.caller, &m.source_id), m))
+        .collect();
+    let mut session = ProviderSession {
+        caller: owner.into(),
+        key: "catalog".into(),
+        state_present: true,
+        collection_revision: 5,
+        document_revision: 4,
+        next_id: 4,
+        provider_count: 4,
+        entry_ids: [owned.entry_id.clone(), changed.entry_id.clone()]
+            .into_iter()
+            .collect(),
+        fingerprints: [
+            (owned.entry_id.clone(), "old".into()),
+            (changed.entry_id.clone(), "manual".into()),
+        ]
+        .into_iter()
+        .collect(),
+        entry_names: BTreeMap::new(),
+        artwork_entries: BTreeMap::new(),
+        markers,
+        seen_source_ids: BTreeSet::new(),
+        state: SnapshotState::initial(),
+        staged_rows: BTreeMap::new(),
+    };
+    let stale = plan_stale_markers(&session, 2, true, false, false, false);
+    assert_eq!(stale.len(), 2);
+    let edits = plan_cleanup_edits(&mut session, stale).unwrap();
+    assert_eq!(edits.len(), 3);
+    assert!(edits.iter().any(|edit| edit["key"] == owned.entry_id));
+    assert!(!edits.iter().any(|edit| edit["key"] == changed.entry_id));
+    assert!(session.entry_ids.contains(&changed.entry_id));
+    assert_eq!(session.document_revision, 5);
+    assert_eq!(session.provider_count, 2);
+    assert_eq!(session.markers.len(), 1);
+}
+
+#[test]
+fn staged_snapshot_survives_restart_and_publishes_only_after_complete_finish() {
+    let mut backend = Backend::default();
+    let mut pipeline = steam_artwork_importer();
+    run_steam_artwork_snapshot(&mut backend, &mut pipeline, "initial", 1, None);
+    let key = entry_key(STEAM_IMPORTER, "steam:42");
+    let id = backend.entries[&key]["entry_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let original = backend.entries[&id].clone();
+    let run = |backend: &mut Backend, pipeline: &mut Pipeline, payload| {
+        backend.run_for(
+            pipeline,
+            payload,
+            STEAM_IMPORTER,
+            MANAGEMENT_PRINCIPAL,
+            MANAGEMENT_PRINCIPAL,
+        )
+    };
+    let mut begin = snapshot_begin("staged", 2);
+    begin["staged"] = json!(true);
+    let started = run(&mut backend, &mut pipeline, begin.clone());
+    let generation = started["generation"].as_u64().unwrap();
+    let revision = started["revision"].as_u64().unwrap();
+    let batch = snapshot_batch(
+        "staged",
+        generation,
+        2,
+        0,
+        revision,
+        vec![("steam:42", steam_artwork_entry("New title", None))],
+    );
+    let staged = run(&mut backend, &mut pipeline, batch.clone());
+    assert_eq!(staged["ok"], true, "{staged}");
+    assert_eq!(backend.entries[&id], original);
+    let incomplete = run(
+        &mut backend,
+        &mut pipeline,
+        snapshot_finish("staged", generation, 2, revision, 1, false),
+    );
+    assert_eq!(incomplete["error"]["code"], "incomplete_snapshot");
+    assert_eq!(backend.entries[&id], original);
+    let mut restarted = steam_artwork_importer();
+    let resumed = run(&mut backend, &mut restarted, begin);
+    assert_eq!(resumed["next_sequence"], 1);
+    let replay = run(&mut backend, &mut restarted, batch);
+    assert_eq!(replay["replayed"], true);
+    let finish = run(
+        &mut backend,
+        &mut restarted,
+        snapshot_finish("staged", generation, 2, revision, 1, true),
+    );
+    assert_eq!(finish["ok"], true, "{finish}");
+    assert_eq!(backend.entries[&id]["name"], "New title");
+    assert_eq!(backend.entries[&key]["entry_id"], id);
+}
+
+#[test]
+fn staged_finish_reconciles_fresh_manual_changes_and_preserves_them() {
+    let mut backend = Backend::default();
+    let mut pipeline = steam_artwork_importer();
+    run_steam_artwork_snapshot(&mut backend, &mut pipeline, "initial-manual", 1, None);
+    let key = entry_key(STEAM_IMPORTER, "steam:42");
+    let id = backend.entries[&key]["entry_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut begin = snapshot_begin("staged-manual", 2);
+    begin["staged"] = json!(true);
+    let started = backend.run_for(
+        &mut pipeline,
+        begin,
+        STEAM_IMPORTER,
+        MANAGEMENT_PRINCIPAL,
+        MANAGEMENT_PRINCIPAL,
+    );
+    let generation = started["generation"].as_u64().unwrap();
+    let revision = started["revision"].as_u64().unwrap();
+    let batch = backend.run_for(
+        &mut pipeline,
+        snapshot_batch(
+            "staged-manual",
+            generation,
+            2,
+            0,
+            revision,
+            vec![("steam:42", steam_artwork_entry("Provider title", None))],
+        ),
+        STEAM_IMPORTER,
+        MANAGEMENT_PRINCIPAL,
+        MANAGEMENT_PRINCIPAL,
+    );
+    assert_eq!(batch["ok"], true, "{batch}");
+    let manual = backend.run_for(&mut pipeline, json!({"action":"update", "id":id, "expected_revision":revision, "entry":entry("Manual title")}), MANAGEMENT_PRINCIPAL, MANAGEMENT_PRINCIPAL, MANAGEMENT_PRINCIPAL);
+    assert_eq!(manual["ok"], true, "{manual}");
+    let conflict = backend.run_for(
+        &mut pipeline,
+        snapshot_finish("staged-manual", generation, 2, revision, 1, true),
+        STEAM_IMPORTER,
+        MANAGEMENT_PRINCIPAL,
+        MANAGEMENT_PRINCIPAL,
+    );
+    assert_eq!(conflict["error"]["code"], "revision_conflict");
+    let finish = backend.run_for(
+        &mut pipeline,
+        snapshot_finish("staged-manual", generation, 2, revision + 1, 1, true),
+        STEAM_IMPORTER,
+        MANAGEMENT_PRINCIPAL,
+        MANAGEMENT_PRINCIPAL,
+    );
+    assert_eq!(finish["ok"], true, "{finish}");
+    assert_eq!(backend.entries[&id]["name"], "Manual title");
+    assert_eq!(backend.entries[&key]["detached"], true);
+}
+
+#[test]
+fn staged_snapshot_rejects_mode_changes_and_duplicate_intents_after_restart() {
+    let mut backend = Backend::default();
+    let mut pipeline = steam_artwork_importer();
+    let run = |backend: &mut Backend, pipeline: &mut Pipeline, payload| {
+        backend.run_for(
+            pipeline,
+            payload,
+            STEAM_IMPORTER,
+            MANAGEMENT_PRINCIPAL,
+            MANAGEMENT_PRINCIPAL,
+        )
+    };
+    let mut begin = snapshot_begin("duplicates", 1);
+    begin["staged"] = json!(true);
+    let started = run(&mut backend, &mut pipeline, begin);
+    let generation = started["generation"].as_u64().unwrap();
+    let revision = started["revision"].as_u64().unwrap();
+    let mode_conflict = run(&mut backend, &mut pipeline, snapshot_begin("duplicates", 1));
+    assert_eq!(mode_conflict["error"]["code"], "snapshot_conflict");
+    let first = run(
+        &mut backend,
+        &mut pipeline,
+        snapshot_batch(
+            "duplicates",
+            generation,
+            1,
+            0,
+            revision,
+            vec![("steam:42", steam_artwork_entry("Title", None))],
+        ),
+    );
+    assert_eq!(first["ok"], true, "{first}");
+    let mut restarted = steam_artwork_importer();
+    let repeated = run(
+        &mut backend,
+        &mut restarted,
+        snapshot_batch(
+            "duplicates",
+            generation,
+            1,
+            1,
+            revision,
+            vec![("steam:42", steam_artwork_entry("Other", None))],
+        ),
+    );
+    assert_eq!(repeated["error"]["code"], "duplicate_source_id");
+    assert!(!backend.entries.keys().any(|key| key.starts_with("app-")));
+}
+
+#[test]
+fn staged_empty_snapshot_atomically_removes_stale_and_replays_lost_ack() {
+    let mut backend = Backend::default();
+    let mut pipeline = steam_artwork_importer();
+    run_steam_artwork_snapshot(&mut backend, &mut pipeline, "prior", 1, None);
+    let key = entry_key(STEAM_IMPORTER, "steam:42");
+    let id = backend.entries[&key]["entry_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut begin = snapshot_begin("empty-stage", 2);
+    begin["staged"] = json!(true);
+    let started = backend.run_for(
+        &mut pipeline,
+        begin,
+        STEAM_IMPORTER,
+        MANAGEMENT_PRINCIPAL,
+        MANAGEMENT_PRINCIPAL,
+    );
+    let generation = started["generation"].as_u64().unwrap();
+    let revision = started["revision"].as_u64().unwrap();
+    let finish = snapshot_finish("empty-stage", generation, 2, revision, 0, true);
+    backend.lose_commit_ack_once = true;
+    let lost = backend.run_for(
+        &mut pipeline,
+        finish.clone(),
+        STEAM_IMPORTER,
+        MANAGEMENT_PRINCIPAL,
+        MANAGEMENT_PRINCIPAL,
+    );
+    assert_eq!(lost["error"]["code"], "deadline_exceeded");
+    assert!(!backend.entries.contains_key(&id));
+    assert!(!backend.entries.contains_key(&key));
+    let mut restarted = steam_artwork_importer();
+    let replay = backend.run_for(
+        &mut restarted,
+        finish,
+        STEAM_IMPORTER,
+        MANAGEMENT_PRINCIPAL,
+        MANAGEMENT_PRINCIPAL,
+    );
+    assert_eq!(replay["ok"], true, "{replay}");
+    assert_eq!(replay["cleanup_pending"], false);
+}
+
+#[test]
+fn staged_playnite_revocation_fences_unpublished_intents() {
+    let mut backend = Backend::default();
+    let mut pipeline = playnite_importer();
+    let run = |backend: &mut Backend, pipeline: &mut Pipeline, payload| {
+        backend.run_for(
+            pipeline,
+            payload,
+            PLAYNITE_IMPORTER,
+            MANAGEMENT_PRINCIPAL,
+            MANAGEMENT_PRINCIPAL,
+        )
+    };
+    let mut begin = snapshot_begin("epoch-stage", 1);
+    begin["staged"] = json!(true);
+    let started = run(&mut backend, &mut pipeline, begin);
+    let generation = started["generation"].as_u64().unwrap();
+    let revision = started["revision"].as_u64().unwrap();
+    let batch = run(
+        &mut backend,
+        &mut pipeline,
+        snapshot_batch(
+            "epoch-stage",
+            generation,
+            1,
+            0,
+            revision,
+            vec![("playnite:one", playnite_entry("Title"))],
+        ),
+    );
+    assert_eq!(batch["ok"], true, "{batch}");
+    let revoked = run(
+        &mut backend,
+        &mut pipeline,
+        json!({"action":"provider_snapshot_revoke", "revocation_id":"revoke", "expected_provider_epoch":0}),
+    );
+    assert_eq!(revoked["provider_epoch"], 1);
+    let finish = run(
+        &mut backend,
+        &mut pipeline,
+        snapshot_finish("epoch-stage", generation, 1, revision, 1, true),
+    );
+    assert_eq!(finish["error"]["code"], "provider_epoch_conflict");
+    assert!(!backend.entries.keys().any(|key| key.starts_with("app-")));
+}
+
+#[test]
+fn staged_batches_exceed_old_size_limit_and_survive_restart() {
+    let mut backend = Backend::default();
+    let mut pipeline = steam_artwork_importer();
+    run_steam_artwork_snapshot(&mut backend, &mut pipeline, "prior-size", 1, None);
+    let original_key = entry_key(STEAM_IMPORTER, "steam:42");
+    let id = backend.entries[&original_key]["entry_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let original = backend.entries[&id].clone();
+    let run = |backend: &mut Backend, pipeline: &mut Pipeline, payload| {
+        backend.run_for(
+            pipeline,
+            payload,
+            STEAM_IMPORTER,
+            MANAGEMENT_PRINCIPAL,
+            MANAGEMENT_PRINCIPAL,
+        )
+    };
+    let mut begin = snapshot_begin("size-stage", 2);
+    begin["staged"] = json!(true);
+    let started = run(&mut backend, &mut pipeline, begin);
+    assert_eq!(started["staged"], true);
+    let generation = started["generation"].as_u64().unwrap();
+    let revision = started["revision"].as_u64().unwrap();
+    let mut large = entry("Large");
+    large["description"] = json!("x".repeat(1000));
+    let first = run(
+        &mut backend,
+        &mut pipeline,
+        snapshot_batch(
+            "size-stage",
+            generation,
+            2,
+            0,
+            revision,
+            vec![
+                ("a", large.clone()),
+                ("b", large.clone()),
+                ("c", large.clone()),
+                ("d", large.clone()),
+                ("i", large.clone()),
+                ("j", large.clone()),
+                ("k", large.clone()),
+            ],
+        ),
+    );
+    assert_eq!(first["ok"], true, "{first}");
+    let rejected = run(
+        &mut backend,
+        &mut pipeline,
+        snapshot_batch(
+            "size-stage",
+            generation,
+            2,
+            1,
+            revision,
+            vec![
+                ("e", large.clone()),
+                ("f", large.clone()),
+                ("g", large.clone()),
+                ("h", large),
+            ],
+        ),
+    );
+    assert_eq!(rejected["ok"], true, "{rejected}");
+    assert_eq!(backend.entries[&id], original);
+    let mut restarted = steam_artwork_importer();
+    let finish = run(
+        &mut backend,
+        &mut restarted,
+        snapshot_finish_policy("size-stage", generation, 2, revision, 2, true, false),
+    );
+    assert_eq!(finish["ok"], true, "{finish}");
+    assert_eq!(backend.entries[&id], original);
+}
+
+#[test]
+fn staged_publication_handles_large_cleanup_atomically() {
+    let mut backend = Backend::default();
+    let mut pipeline = steam_importer();
+    let run = |backend: &mut Backend, pipeline: &mut Pipeline, payload| {
+        backend.run_for(pipeline, payload, "steam", "management", "management")
+    };
+    let started = run(&mut backend, &mut pipeline, snapshot_begin("large-old", 1));
+    let generation = started["generation"].as_u64().unwrap();
+    let mut revision = started["revision"].as_u64().unwrap();
+    for sequence in 0..9 {
+        let ids: Vec<String> = (0..if sequence == 8 { 1 } else { 8 })
+            .map(|n| format!("source-{}", sequence * 8 + n))
+            .collect();
+        let items = ids.iter().map(|id| (id.as_str(), entry("Game"))).collect();
+        let result = run(
+            &mut backend,
+            &mut pipeline,
+            snapshot_batch("large-old", generation, 1, sequence, revision, items),
+        );
+        assert_eq!(result["ok"], true, "{result}");
+        revision = result["revision"].as_u64().unwrap();
+    }
+    let finished = run(
+        &mut backend,
+        &mut pipeline,
+        snapshot_finish("large-old", generation, 1, revision, 9, true),
+    );
+    assert_eq!(finished["ok"], true, "{finished}");
+    let mut begin = snapshot_begin("large-cleanup", 2);
+    begin["staged"] = json!(true);
+    let staged = run(&mut backend, &mut pipeline, begin);
+    let next_generation = staged["generation"].as_u64().unwrap();
+    let result = run(
+        &mut backend,
+        &mut pipeline,
+        snapshot_finish("large-cleanup", next_generation, 2, revision, 0, true),
+    );
+    assert_eq!(result["ok"], true, "{result}");
+    assert!(!backend.entries.keys().any(|key| key.starts_with("app-")));
+}
+
+#[test]
+fn staged_publish_conflict_retries_without_partial_edits() {
+    let mut backend = Backend::default();
+    let mut pipeline = steam_importer();
+    let run = |backend: &mut Backend, pipeline: &mut Pipeline, payload| {
+        backend.run_for(pipeline, payload, "steam", "management", "management")
+    };
+    let mut begin = snapshot_begin("conflict-stage", 1);
+    begin["staged"] = json!(true);
+    let started = run(&mut backend, &mut pipeline, begin);
+    let generation = started["generation"].as_u64().unwrap();
+    let revision = started["revision"].as_u64().unwrap();
+    let staged = run(
+        &mut backend,
+        &mut pipeline,
+        snapshot_batch(
+            "conflict-stage",
+            generation,
+            1,
+            0,
+            revision,
+            vec![("one", entry("One"))],
+        ),
+    );
+    assert_eq!(staged["ok"], true);
+    let before = backend.entries.clone();
+    backend.conflict_draft_publish_once = true;
+    let finish = snapshot_finish("conflict-stage", generation, 1, revision, 1, true);
+    let conflict = run(&mut backend, &mut pipeline, finish.clone());
+    assert_eq!(conflict["error"]["code"], "revision_conflict");
+    assert_eq!(backend.entries, before);
+    assert!(!backend.drafts.is_empty());
+    let mut restarted = steam_importer();
+    let published = run(&mut backend, &mut restarted, finish);
+    assert_eq!(published["ok"], true, "{published}");
+    assert!(backend.entries.keys().any(|key| key.starts_with("app-")));
+    assert!(
+        !backend
+            .entries
+            .keys()
+            .any(|key| key.starts_with(STAGED_PREFIX))
+    );
+}
+
+#[test]
+fn staged_many_batches_publish_after_restart() {
+    let mut backend = Backend::default();
+    let mut pipeline = steam_importer();
+    let run = |backend: &mut Backend, pipeline: &mut Pipeline, payload| {
+        backend.run_for(pipeline, payload, "steam", "management", "management")
+    };
+    let mut begin = snapshot_begin("many-batches", 1);
+    begin["staged"] = json!(true);
+    let started = run(&mut backend, &mut pipeline, begin);
+    let generation = started["generation"].as_u64().unwrap();
+    let revision = started["revision"].as_u64().unwrap();
+    for sequence in 0..125 {
+        let ids: Vec<_> = (0..8)
+            .map(|n| format!("game-{}", sequence * 8 + n))
+            .collect();
+        let items = ids.iter().map(|id| (id.as_str(), entry("Game"))).collect();
+        let result = run(
+            &mut backend,
+            &mut pipeline,
+            snapshot_batch("many-batches", generation, 1, sequence, revision, items),
+        );
+        assert_eq!(result["ok"], true, "batch {sequence}: {result}");
+        assert!(!backend.entries.keys().any(|key| key.starts_with("app-")));
+    }
+    let mut restarted = steam_importer();
+    let result = run(
+        &mut backend,
+        &mut restarted,
+        snapshot_finish("many-batches", generation, 1, revision, 125, true),
+    );
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(
+        backend
+            .entries
+            .keys()
+            .filter(|key| key.starts_with("app-"))
+            .count(),
+        1000
+    );
+    assert!(
+        !backend
+            .entries
+            .keys()
+            .any(|key| key.starts_with(STAGED_PREFIX))
+    );
+}
+
+fn real_state_backend() -> (Backend, std::path::PathBuf) {
+    let directory = std::env::temp_dir().join(format!(
+        "catalog-state-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let live = amaterasu_state::test_support::TestStateStore::open(directory.clone()).unwrap();
+    (
+        Backend {
+            live: Some(live),
+            ..Backend::default()
+        },
+        directory,
+    )
+}
+
+#[test]
+fn real_state_staged_batches_recover_after_restart_and_lost_publish_ack() {
+    let (mut backend, directory) = real_state_backend();
+    let mut pipeline = steam_importer();
+    let run = |backend: &mut Backend, pipeline: &mut Pipeline, payload| {
+        backend.run_for(pipeline, payload, "steam", "management", "management")
+    };
+    let mut begin = snapshot_begin("real-state", 1);
+    begin["staged"] = json!(true);
+    let started = run(&mut backend, &mut pipeline, begin);
+    assert_eq!(started["staged"], true, "{started}");
+    let generation = started["generation"].as_u64().unwrap();
+    let revision = started["revision"].as_u64().unwrap();
+    for sequence in 0..4 {
+        let ids: Vec<_> = (0..8)
+            .map(|n| format!("real-{}", sequence * 8 + n))
+            .collect();
+        let mut game = entry("Game");
+        game["description"] = json!("a".repeat(600));
+        let items = ids.iter().map(|id| (id.as_str(), game.clone())).collect();
+        let batch = run(
+            &mut backend,
+            &mut pipeline,
+            snapshot_batch("real-state", generation, 1, sequence, revision, items),
+        );
+        assert_eq!(batch["ok"], true, "{batch}");
+    }
+    let store = backend.live.take().unwrap();
+    let header = store.handle(
+        "amaterasu.catalog",
+        json!({"action":"collection_get","collection":"principal/management","key":null}),
+    );
+    assert_eq!(header["metadata"]["revision"], 0);
+    let draft_id = fingerprint_bytes("principal/management:steam".as_bytes());
+    let stale = store.handle("amaterasu.catalog", json!({"action":"collection_draft_begin","collection":"principal/management","draft_id":draft_id,"expected_revision":header["revision"]}));
+    assert_eq!(stale["ok"], true, "{stale}");
+    let append = store.handle("amaterasu.catalog", json!({"action":"collection_draft_append","collection":"principal/management","draft_id":draft_id,"sequence":0,"edits":[{"key":"poison","value":1}]}));
+    assert_eq!(append["ok"], true, "{append}");
+    drop(store);
+    backend.live =
+        Some(amaterasu_state::test_support::TestStateStore::open(directory.clone()).unwrap());
+    let mut restarted = steam_importer();
+    let finish = snapshot_finish("real-state", generation, 1, revision, 4, true);
+    backend.lose_commit_ack_once = true;
+    backend.expire_caller_after_publish = true;
+    let lost = run(&mut backend, &mut restarted, finish.clone());
+    assert_eq!(lost["error"]["code"], "deadline_exceeded", "{lost}");
+    // The caller deadline expires after the real State publication. An unrelated
+    // management edit then commits before the provider retries the finish.
+    let store = backend.live.as_ref().unwrap();
+    let published = store.handle(
+        "amaterasu.catalog",
+        json!({"action":"collection_get","collection":"principal/management","key":null}),
+    );
+    let mut metadata = published["metadata"].clone();
+    metadata["revision"] = json!(2);
+    metadata["next_id"] = json!(34);
+    let manual = store.handle("amaterasu.catalog", json!({"action":"collection_commit","collection":"principal/management","expected_revision":published["revision"],"metadata":metadata,"edits":[{"key":"app-0000000000000021","value":entry("Unrelated manual") }]}));
+    assert_eq!(manual["ok"], true, "{manual}");
+    let replay = run(&mut backend, &mut restarted, finish);
+    assert_eq!(replay["ok"], true, "{replay}");
+    let store = backend.live.take().unwrap();
+    let header = store.handle(
+        "amaterasu.catalog",
+        json!({"action":"collection_get","collection":"principal/management","key":null}),
+    );
+    assert_eq!(header["metadata"]["revision"], 2);
+    assert_eq!(header["count"], 66); // 33 entries, 32 ownership markers, one state row
+    let manual = store.handle("amaterasu.catalog", json!({"action":"collection_get","collection":"principal/management","key":"app-0000000000000021"}));
+    assert_eq!(manual["value"]["name"], "Unrelated manual");
+    let poison = store.handle(
+        "amaterasu.catalog",
+        json!({"action":"collection_get","collection":"principal/management","key":"poison"}),
+    );
+    assert!(poison["value"].is_null(), "{poison}");
+    drop(store);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn real_state_concurrent_manual_edit_fences_draft_and_is_preserved() {
+    let (mut backend, directory) = real_state_backend();
+    let mut pipeline = steam_importer();
+    let run = |backend: &mut Backend, pipeline: &mut Pipeline, payload| {
+        backend.run_for(pipeline, payload, "steam", "management", "management")
+    };
+    let prior = run(&mut backend, &mut pipeline, snapshot_begin("prior-real", 1));
+    let generation = prior["generation"].as_u64().unwrap();
+    let first = run(
+        &mut backend,
+        &mut pipeline,
+        snapshot_batch(
+            "prior-real",
+            generation,
+            1,
+            0,
+            0,
+            vec![("one", entry("Original"))],
+        ),
+    );
+    let revision = first["revision"].as_u64().unwrap();
+    assert_eq!(
+        run(
+            &mut backend,
+            &mut pipeline,
+            snapshot_finish("prior-real", generation, 1, revision, 1, true)
+        )["ok"],
+        true
+    );
+    let mut begin = snapshot_begin("new-real", 2);
+    begin["staged"] = json!(true);
+    let next = run(&mut backend, &mut pipeline, begin);
+    let generation = next["generation"].as_u64().unwrap();
+    assert_eq!(
+        run(
+            &mut backend,
+            &mut pipeline,
+            snapshot_batch(
+                "new-real",
+                generation,
+                2,
+                0,
+                revision,
+                vec![("one", entry("Provider"))]
+            )
+        )["ok"],
+        true
+    );
+    let store = backend.live.as_ref().unwrap();
+    let header = store.handle("amaterasu.catalog", json!({"action":"collection_get","collection":"principal/management","key":"app-0000000000000001"}));
+    let mut manual = header["value"].clone();
+    manual["name"] = json!("Manual");
+    let mut metadata = header["metadata"].clone();
+    metadata["revision"] = json!(revision + 1);
+    backend.before_draft_publish = Some(
+        json!({"action":"collection_commit","collection":"principal/management","expected_revision":header["revision"],"metadata":metadata,"edits":[{"key":"app-0000000000000001","value":manual}]}),
+    );
+    let conflict = run(
+        &mut backend,
+        &mut pipeline,
+        snapshot_finish("new-real", generation, 2, revision, 1, true),
+    );
+    assert_eq!(conflict["error"]["code"], "revision_conflict", "{conflict}");
+    let mut restarted = steam_importer();
+    let finish = run(
+        &mut backend,
+        &mut restarted,
+        snapshot_finish("new-real", generation, 2, revision + 1, 1, true),
+    );
+    assert_eq!(finish["ok"], true, "{finish}");
+    let store = backend.live.take().unwrap();
+    let row = store.handle("amaterasu.catalog", json!({"action":"collection_get","collection":"principal/management","key":"app-0000000000000001"}));
+    assert_eq!(row["value"]["name"], "Manual");
+    let marker = store.handle("amaterasu.catalog", json!({"action":"collection_get","collection":"principal/management","key":entry_key("steam", "one")}));
+    assert_eq!(marker["value"]["detached"], true);
+    drop(store);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn staged_cache_reload_preserves_duplicate_and_identity_validation() {
+    let mut backend = Backend::default();
+    let mut pipeline = steam_importer();
+    let run = |backend: &mut Backend, pipeline: &mut Pipeline, payload| {
+        backend.run_for(pipeline, payload, "steam", "management", "management")
+    };
+    let mut begin = snapshot_begin("cache-reload", 1);
+    begin["staged"] = json!(true);
+    let start = run(&mut backend, &mut pipeline, begin);
+    let generation = start["generation"].as_u64().unwrap();
+    let revision = start["revision"].as_u64().unwrap();
+    assert_eq!(
+        run(
+            &mut backend,
+            &mut pipeline,
+            snapshot_batch(
+                "cache-reload",
+                generation,
+                1,
+                0,
+                revision,
+                vec![("one", entry("One"))]
+            )
+        )["ok"],
+        true
+    );
+    // Simulate a separately committed update without touching the cached session.
+    backend.revision += 1;
+    let duplicate = run(
+        &mut backend,
+        &mut pipeline,
+        snapshot_batch(
+            "cache-reload",
+            generation,
+            1,
+            1,
+            revision,
+            vec![("one", entry("Repeated"))],
+        ),
+    );
+    assert_eq!(
+        duplicate["error"]["code"], "duplicate_source_id",
+        "{duplicate}"
+    );
+    let mut forged = entry("Forged");
+    forged["artwork"] = json!({"provider":"steam", "app_id":42, "revision":"1"});
+    let invalid = run(
+        &mut backend,
+        &mut pipeline,
+        snapshot_batch(
+            "cache-reload",
+            generation,
+            1,
+            1,
+            revision,
+            vec![("wrong-source", forged)],
+        ),
+    );
+    assert_eq!(
+        invalid["error"]["code"], "provider_artwork_required",
+        "{invalid}"
+    );
+}
+
+#[test]
+fn staged_mixed_update_and_cleanup_uses_one_revision_at_boundary() {
+    let mut backend = Backend::default();
+    let mut pipeline = steam_importer();
+    let run = |backend: &mut Backend, pipeline: &mut Pipeline, payload| {
+        backend.run_for(pipeline, payload, "steam", "management", "management")
+    };
+    let first = run(
+        &mut backend,
+        &mut pipeline,
+        snapshot_begin("boundary-old", 1),
+    );
+    let generation = first["generation"].as_u64().unwrap();
+    let batch = run(
+        &mut backend,
+        &mut pipeline,
+        snapshot_batch(
+            "boundary-old",
+            generation,
+            1,
+            0,
+            0,
+            vec![("one", entry("Old")), ("two", entry("Remove"))],
+        ),
+    );
+    let revision = batch["revision"].as_u64().unwrap();
+    assert_eq!(
+        run(
+            &mut backend,
+            &mut pipeline,
+            snapshot_finish("boundary-old", generation, 1, revision, 1, true)
+        )["ok"],
+        true
+    );
+    backend.metadata["revision"] = json!(u64::MAX - 1);
+    backend.revision += 1;
+    let mut begin = snapshot_begin("boundary-new", 2);
+    begin["staged"] = json!(true);
+    let started = run(&mut backend, &mut pipeline, begin);
+    let generation = started["generation"].as_u64().unwrap();
+    assert_eq!(started["revision"], u64::MAX - 1);
+    let batch = run(
+        &mut backend,
+        &mut pipeline,
+        snapshot_batch(
+            "boundary-new",
+            generation,
+            2,
+            0,
+            u64::MAX - 1,
+            vec![("one", entry("New"))],
+        ),
+    );
+    assert_eq!(batch["ok"], true, "{batch}");
+    let finish = run(
+        &mut backend,
+        &mut pipeline,
+        snapshot_finish("boundary-new", generation, 2, u64::MAX - 1, 1, true),
+    );
+    assert_eq!(finish["ok"], true, "{finish}");
+    assert_eq!(finish["revision"], u64::MAX);
+    assert_eq!(backend.entries["app-0000000000000001"]["name"], "New");
+    assert!(!backend.entries.contains_key("app-0000000000000002"));
+}
+
+#[test]
+fn staged_begin_reclaims_abandoned_generations_at_row_cap() {
+    let mut backend = Backend::default();
+    let mut pipeline = steam_importer();
+    let run = |backend: &mut Backend, pipeline: &mut Pipeline, payload| {
+        backend.run_for(pipeline, payload, "steam", "management", "management")
+    };
+    let mut begin = snapshot_begin("gc-initial", 1);
+    begin["staged"] = json!(true);
+    assert_eq!(run(&mut backend, &mut pipeline, begin)["ok"], true);
+    let row = json!({"entries":[],"remove_source_ids":[],"expire_source_ids":[],"selection_remove_source_ids":[]});
+    for sequence in 0..12_500 {
+        backend
+            .entries
+            .insert(staged_key("steam", 0, sequence), row.clone());
+    }
+    backend.entries.insert(staged_key("other", 0, 0), row);
+    backend
+        .entries
+        .insert("app-0000000000000001".into(), entry("Manual"));
+    backend.metadata["provider_count"] = json!(12_502);
+    backend.metadata["revision"] = json!(1);
+    backend.metadata["next_id"] = json!(2);
+    backend.revision += 1;
+    for generation in 2..5 {
+        let sync = format!("gc-{generation}");
+        let mut begin = snapshot_begin(&sync, generation);
+        begin["staged"] = json!(true);
+        let started = run(&mut backend, &mut pipeline, begin);
+        assert_eq!(started["ok"], true, "{started}");
+        let active = started["generation"].as_u64().unwrap();
+        let batch = run(
+            &mut backend,
+            &mut pipeline,
+            snapshot_batch(
+                &sync,
+                active,
+                generation,
+                0,
+                1,
+                vec![("active", entry("Hidden"))],
+            ),
+        );
+        assert_eq!(batch["ok"], true, "{batch}");
+        assert!(
+            backend
+                .entries
+                .contains_key(&staged_key("steam", active, 0))
+        );
+        assert_eq!(backend.entries["app-0000000000000001"]["name"], "Manual");
+        assert!(backend.entries.contains_key(&staged_key("other", 0, 0)));
+    }
+    assert!(
+        backend
+            .entries
+            .keys()
+            .filter(|key| key.starts_with(STAGED_PREFIX))
+            .count()
+            < 12_500
+    );
+}
+
+#[test]
+fn real_state_publication_resumes_across_repeated_lost_chunk_acks() {
+    let (mut backend, directory) = real_state_backend();
+    let mut pipeline = steam_importer();
+    let run = |backend: &mut Backend, pipeline: &mut Pipeline, payload| {
+        backend.run_for(pipeline, payload, "steam", "management", "management")
+    };
+    let mut begin = snapshot_begin("resume-draft", 1);
+    begin["staged"] = json!(true);
+    let started = run(&mut backend, &mut pipeline, begin);
+    let generation = started["generation"].as_u64().unwrap();
+    let revision = started["revision"].as_u64().unwrap();
+    for sequence in 0..8 {
+        let ids: Vec<_> = (0..8)
+            .map(|n| format!("resume-{}", sequence * 8 + n))
+            .collect();
+        let mut game = entry("Game");
+        game["description"] = json!("z".repeat(700));
+        let items = ids.iter().map(|id| (id.as_str(), game.clone())).collect();
+        let result = run(
+            &mut backend,
+            &mut pipeline,
+            snapshot_batch("resume-draft", generation, 1, sequence, revision, items),
+        );
+        assert_eq!(result["ok"], true, "{result}");
+    }
+    let finish = snapshot_finish("resume-draft", generation, 1, revision, 8, true);
+    let mut failures = 0;
+    for _ in 0..64 {
+        backend.expire_after_new_draft_chunk = true;
+        let result = run(&mut backend, &mut pipeline, finish.clone());
+        if result["ok"] == true {
+            break;
+        }
+        assert_eq!(result["error"]["code"], "deadline_exceeded", "{result}");
+        failures += 1;
+        let store = backend.live.take().unwrap();
+        drop(store);
+        backend.live =
+            Some(amaterasu_state::test_support::TestStateStore::open(directory.clone()).unwrap());
+        pipeline = steam_importer();
+    }
+    assert!(failures > 1, "the test must span multiple expirations");
+    let store = backend.live.take().unwrap();
+    let header = store.handle(
+        "amaterasu.catalog",
+        json!({"action":"collection_get","collection":"principal/management","key":null}),
+    );
+    assert_eq!(header["metadata"]["revision"], 1, "{header}");
+    assert_eq!(header["count"], 129);
+    drop(store);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn real_state_changed_finish_policy_discards_incompatible_partial_draft() {
+    let (mut backend, directory) = real_state_backend();
+    let mut pipeline = steam_importer();
+    let run = |backend: &mut Backend, pipeline: &mut Pipeline, payload| {
+        backend.run_for(pipeline, payload, "steam", "management", "management")
+    };
+    let prior = run(&mut backend, &mut pipeline, snapshot_begin("policy-old", 1));
+    let generation = prior["generation"].as_u64().unwrap();
+    let imported = run(
+        &mut backend,
+        &mut pipeline,
+        snapshot_batch(
+            "policy-old",
+            generation,
+            1,
+            0,
+            0,
+            vec![("old", entry("Keep me"))],
+        ),
+    );
+    let revision = imported["revision"].as_u64().unwrap();
+    assert_eq!(
+        run(
+            &mut backend,
+            &mut pipeline,
+            snapshot_finish("policy-old", generation, 1, revision, 1, true)
+        )["ok"],
+        true
+    );
+    let mut begin = snapshot_begin("policy-new", 2);
+    begin["staged"] = json!(true);
+    let started = run(&mut backend, &mut pipeline, begin);
+    let generation = started["generation"].as_u64().unwrap();
+    for sequence in 0..4 {
+        let ids: Vec<_> = (0..8)
+            .map(|n| format!("policy-{}", sequence * 8 + n))
+            .collect();
+        let mut game = entry("Game");
+        game["description"] = json!("d".repeat(700));
+        let items = ids.iter().map(|id| (id.as_str(), game.clone())).collect();
+        assert_eq!(
+            run(
+                &mut backend,
+                &mut pipeline,
+                snapshot_batch("policy-new", generation, 2, sequence, revision, items)
+            )["ok"],
+            true
+        );
+    }
+    backend.expire_after_new_draft_chunk = true;
+    let failed = run(
+        &mut backend,
+        &mut pipeline,
+        snapshot_finish("policy-new", generation, 2, revision, 4, true),
+    );
+    assert_eq!(failed["error"]["code"], "deadline_exceeded", "{failed}");
+    let finish = run(
+        &mut backend,
+        &mut pipeline,
+        snapshot_finish_policy("policy-new", generation, 2, revision, 4, true, false),
+    );
+    assert_eq!(finish["ok"], true, "{finish}");
+    let store = backend.live.take().unwrap();
+    let retained = store.handle("amaterasu.catalog", json!({"action":"collection_get","collection":"principal/management","key":"app-0000000000000001"}));
+    assert_eq!(retained["value"]["name"], "Keep me");
+    let header = store.handle(
+        "amaterasu.catalog",
+        json!({"action":"collection_get","collection":"principal/management","key":null}),
+    );
+    assert_eq!(header["count"], 67); // 33 entries, 33 markers and the provider state
+    drop(store);
+    std::fs::remove_dir_all(directory).unwrap();
 }

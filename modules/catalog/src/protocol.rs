@@ -70,6 +70,8 @@ pub enum Operation {
         provider_epoch: u64,
         #[serde(default)]
         expected_collection_revision: Option<u64>,
+        #[serde(default)]
+        staged: bool,
     },
     /// Only the authenticated Playnite importer may advance this durable fence.
     ProviderSnapshotRevoke {
@@ -131,7 +133,7 @@ fn default_remove_stale() -> bool {
     true
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderEntry {
     pub source_id: String,

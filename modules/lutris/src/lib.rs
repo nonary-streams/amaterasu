@@ -1241,7 +1241,9 @@ mod tests {
         assert_eq!(epoch, 7);
         assert!(catalog.busy());
         assert!(!catalog.succeeded());
-        catalog.respond_for_test(json!({"ok":true,"revision":1,"generation":2,"next_sequence":0}));
+        catalog.respond_for_test(
+            json!({"ok":true,"revision":1,"generation":2,"next_sequence":0,"staged":true}),
+        );
         assert!(!catalog.succeeded());
         catalog.respond_for_test(json!({
             "ok":true,"revision":1,"generation":2,"complete":true,
@@ -1262,7 +1264,9 @@ mod tests {
             .start_catalog(&mut catalog, &BTreeSet::new(), 7, true)
             .unwrap()
             .unwrap();
-        catalog.respond_for_test(json!({"ok":true,"revision":2,"generation":3,"next_sequence":0}));
+        catalog.respond_for_test(
+            json!({"ok":true,"revision":2,"generation":3,"next_sequence":0,"staged":true}),
+        );
         catalog.respond_for_test(json!({
             "ok":true,"revision":2,"generation":3,"complete":false,
             "cleanup_pending":false,"remove_stale":true,"remove_selection":true
@@ -1297,7 +1301,9 @@ mod tests {
             ),
             None
         );
-        catalog.respond_for_test(json!({"ok":true,"revision":1,"generation":2,"next_sequence":0}));
+        catalog.respond_for_test(
+            json!({"ok":true,"revision":1,"generation":2,"next_sequence":0,"staged":true}),
+        );
         catalog.respond_for_test(json!({
             "ok":true,"revision":1,"generation":2,"complete":false,
             "cleanup_pending":false,"remove_stale":true,"remove_selection":true
@@ -1328,7 +1334,9 @@ mod tests {
             .start(&source, &settings, &BTreeSet::new(), 2)
             .unwrap();
         pending = Some((signature.clone(), 3));
-        catalog.respond_for_test(json!({"ok":true,"revision":2,"generation":3,"next_sequence":0}));
+        catalog.respond_for_test(
+            json!({"ok":true,"revision":2,"generation":3,"next_sequence":0,"staged":true}),
+        );
         catalog.respond_for_test(json!({
             "ok":true,"revision":2,"generation":3,"complete":true,
             "cleanup_pending":false,"remove_stale":true,"remove_selection":true
@@ -1382,7 +1390,9 @@ mod tests {
         catalog
             .start(&changed, &ProductSettings::default(), &BTreeSet::new(), 2)
             .unwrap();
-        catalog.respond_for_test(json!({"ok":true,"revision":1,"generation":2,"next_sequence":0}));
+        catalog.respond_for_test(
+            json!({"ok":true,"revision":1,"generation":2,"next_sequence":0,"staged":true}),
+        );
         catalog.respond_for_test(json!({"ok":true,"revision":2,"generation":2,"next_sequence":1}));
         catalog.respond_for_test(json!({
             "ok":true,"revision":3,"generation":2,"complete":true,
@@ -1517,7 +1527,9 @@ mod tests {
             catalog.pending_payload_for_test()["action"],
             "provider_snapshot_begin"
         );
-        catalog.respond_for_test(json!({"ok":true,"revision":1,"generation":2,"next_sequence":0}));
+        catalog.respond_for_test(
+            json!({"ok":true,"revision":1,"generation":2,"next_sequence":0,"staged":true}),
+        );
         let batch = catalog.pending_payload_for_test();
         assert_eq!(batch["entries"][0]["source_id"], "8");
         assert_eq!(batch["selection_remove_source_ids"], json!(["10", "7"]));
