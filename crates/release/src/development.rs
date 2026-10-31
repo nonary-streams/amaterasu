@@ -296,20 +296,57 @@ pub fn build_package_with_external(
     external: Option<(&Path, &Path)>,
     call_grants: Option<&Path>,
 ) -> PackageResult<()> {
+    build_package_with_externals(
+        root,
+        artifacts,
+        output,
+        sequence,
+        profile,
+        &external.into_iter().collect::<Vec<_>>(),
+        call_grants,
+    )
+}
+
+/// Include independently built components in one signed component set.
+pub fn build_package_with_externals(
+    root: &Path,
+    artifacts: &Path,
+    output: &Path,
+    sequence: u64,
+    profile: PackageProfile,
+    external: &[(&Path, &Path)],
+    call_grants: Option<&Path>,
+) -> PackageResult<()> {
     let bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json"))?;
     if !bootstrap.development {
         return Err("development publisher cannot use a production root".into());
     }
     let external = external
+        .iter()
         .map(|(template, artifact)| read_external_component(template, artifact, &bootstrap))
-        .transpose()?;
+        .collect::<PackageResult<Vec<_>>>()?;
+    let mut ids = BTreeSet::new();
+    let mut files = BTreeSet::new();
+    for component in &external {
+        if !ids.insert(&component.manifest.id)
+            || !files.insert(&component.manifest.file)
+            || profile.components().iter().any(|entry| {
+                entry.id == component.manifest.id
+                    || library_filename(entry.library) == component.manifest.file
+            })
+        {
+            return Err(
+                "external component identity or artifact path duplicates the profile".into(),
+            );
+        }
+    }
     let call_grants = match call_grants {
         Some(path) => {
-            let external = external
-                .as_ref()
-                .ok_or("call grants require an external component")?;
+            if external.is_empty() {
+                return Err("call grants require an external component".into());
+            }
             let grants: BTreeMap<String, BTreeSet<String>> = read_json(path)?;
-            validate_external_call_grants(&grants, profile, external, &bootstrap)?;
+            validate_external_call_grants(&grants, profile, &external, &bootstrap)?;
             grants
         }
         None => BTreeMap::new(),
@@ -339,10 +376,10 @@ pub fn build_package_with_external(
         DEVELOPMENT_KEY_ID,
         x264_runtime_available,
         authority.as_ref(),
-        external.as_ref(),
+        &external,
         &call_grants,
     )?;
-    if external.is_some() {
+    if !external.is_empty() {
         verify_package(
             output,
             &bootstrap,
@@ -2494,7 +2531,7 @@ fn build_signed_package_with_runtime_probe(
         key_id,
         runtime_available,
         None,
-        None,
+        &[],
         &BTreeMap::new(),
     )
 }
@@ -2509,7 +2546,7 @@ fn build_signed_package_with_runtime_probe_and_authority(
     key_id: &str,
     runtime_available: impl FnOnce(u32) -> bool,
     authority: Option<&crate::capture_authority_package::PackageSpec>,
-    external: Option<&ExternalComponent>,
+    external: &[ExternalComponent],
     call_grants: &BTreeMap<String, BTreeSet<String>>,
 ) -> PackageResult<()> {
     if authority.is_some()
@@ -2550,7 +2587,7 @@ fn build_signed_package_with_runtime_probe_and_authority(
         components.push(component);
     }
 
-    if let Some(external) = external {
+    for external in external {
         if components.iter().any(|component| {
             component.id == external.manifest.id || component.file == external.manifest.file
         }) {
@@ -2863,7 +2900,7 @@ fn read_external_component(
 fn validate_external_call_grants(
     calls: &BTreeMap<String, BTreeSet<String>>,
     profile: PackageProfile,
-    external: &ExternalComponent,
+    external: &[ExternalComponent],
     bootstrap: &BootstrapConfig,
 ) -> PackageResult<()> {
     for (component, services) in calls {
@@ -2881,7 +2918,9 @@ fn validate_external_call_grants(
                 format!("call grant target has no installed approval: {component}")
             })?;
         for service in services {
-            let selected = external.manifest.requested.provide.contains(service)
+            let selected = external
+                .iter()
+                .any(|entry| entry.manifest.requested.provide.contains(service))
                 || profile
                     .components()
                     .iter()
@@ -3017,7 +3056,7 @@ mod external_component_tests {
             validate_external_call_grants(
                 &calls,
                 PackageProfile::RegistryFixture,
-                &external,
+                std::slice::from_ref(&external),
                 &bootstrap
             )
             .is_err()
@@ -3033,7 +3072,7 @@ mod external_component_tests {
             validate_external_call_grants(
                 &calls,
                 PackageProfile::RegistryFixture,
-                &external,
+                std::slice::from_ref(&external),
                 &bootstrap
             )
             .is_ok()
@@ -3050,11 +3089,169 @@ mod external_component_tests {
             validate_external_call_grants(
                 &unselected,
                 PackageProfile::RegistryFixture,
-                &external,
+                std::slice::from_ref(&external),
                 &bootstrap
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn multiple_external_components_are_signed_and_duplicates_are_rejected() {
+        let base = std::env::temp_dir().join(format!(
+            "amaterasu-external-pair-{}",
+            random_identifier().unwrap()
+        ));
+        let root = base.join("root");
+        let artifacts = base.join("artifacts");
+        let output = base.join("package");
+        fs::create_dir_all(&artifacts).unwrap();
+        initialize(&root).unwrap();
+        for definition in PackageProfile::Example.components() {
+            fs::write(
+                artifacts.join(library_filename(definition.library)),
+                b"fixture",
+            )
+            .unwrap();
+        }
+        let mut bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json")).unwrap();
+        let mut paths = Vec::new();
+        for name in ["first", "second"] {
+            let manifest = ComponentManifest {
+                id: format!("example.{name}"),
+                version: "0.1.0".into(),
+                file: format!("{name}.so"),
+                sha256: String::new(),
+                size: 0,
+                abi_major: amaterasu_abi::ABI_MAJOR,
+                runtime: false,
+                requires: BTreeMap::from([("amaterasu.runtime".into(), "0.1.0".into())]),
+                requested: Grants {
+                    provide: [format!("example.{name}/1")].into(),
+                    ..Default::default()
+                },
+            };
+            bootstrap
+                .policy
+                .principals
+                .insert(manifest.id.clone(), manifest.requested.clone());
+            let template = base.join(format!("{name}.json"));
+            let artifact = base.join(format!("{name}.bin"));
+            fs::write(&template, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            fs::write(&artifact, name).unwrap();
+            paths.push((template, artifact));
+        }
+        write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
+        let first = (paths[0].0.as_path(), paths[0].1.as_path());
+        let second = (paths[1].0.as_path(), paths[1].1.as_path());
+        assert!(
+            build_package_with_externals(
+                &root,
+                &artifacts,
+                &output,
+                1,
+                PackageProfile::Example,
+                &[first, first],
+                None
+            )
+            .is_err()
+        );
+        assert!(!output.exists());
+        let mut duplicate_file: ComponentManifest = read_json(&paths[1].0).unwrap();
+        duplicate_file.file = "first.so".into();
+        fs::write(&paths[1].0, serde_json::to_vec(&duplicate_file).unwrap()).unwrap();
+        assert!(
+            build_package_with_externals(
+                &root,
+                &artifacts,
+                &output,
+                1,
+                PackageProfile::Example,
+                &[first, second],
+                None
+            )
+            .is_err()
+        );
+        assert!(!output.exists());
+        duplicate_file.file = "second.so".into();
+        fs::write(&paths[1].0, serde_json::to_vec(&duplicate_file).unwrap()).unwrap();
+        let calls_path = base.join("calls.json");
+        let calls = BTreeMap::from([(
+            "amaterasu.example-echo",
+            ["example.first/1", "example.second/1"],
+        )]);
+        fs::write(&calls_path, serde_json::to_vec(&calls).unwrap()).unwrap();
+        bootstrap
+            .policy
+            .principals
+            .get_mut("amaterasu.example-echo")
+            .unwrap()
+            .call
+            .insert("example.first/1".into());
+        write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
+        assert!(
+            build_package_with_externals(
+                &root,
+                &artifacts,
+                &output,
+                1,
+                PackageProfile::Example,
+                &[first, second],
+                Some(&calls_path)
+            )
+            .is_err()
+        );
+        assert!(!output.exists());
+        bootstrap
+            .policy
+            .principals
+            .get_mut("amaterasu.example-echo")
+            .unwrap()
+            .call
+            .insert("example.second/1".into());
+        write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
+        build_package_with_externals(
+            &root,
+            &artifacts,
+            &output,
+            1,
+            PackageProfile::Example,
+            &[first, second],
+            Some(&calls_path),
+        )
+        .unwrap();
+        let policy = VerificationPolicy {
+            minimum_sequence: 0,
+            allow_historical: true,
+            now: unix_timestamp(),
+        };
+        let verified = verify_package(&output, &bootstrap, policy).unwrap();
+        assert!(verified.signed);
+        assert!(
+            verified.runtime_config.principals["amaterasu.example-echo"]
+                .call
+                .contains("example.first/1")
+        );
+        assert!(
+            verified.runtime_config.principals["amaterasu.example-echo"]
+                .call
+                .contains("example.second/1")
+        );
+        for name in ["first", "second"] {
+            assert!(
+                verified
+                    .manifest
+                    .components
+                    .iter()
+                    .any(|item| item.id == format!("example.{name}"))
+            );
+            let file = output.join(format!("{name}.so"));
+            let original = fs::read(&file).unwrap();
+            fs::write(&file, b"tampered").unwrap();
+            assert!(verify_package(&output, &bootstrap, policy).is_err());
+            fs::write(file, original).unwrap();
+        }
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
