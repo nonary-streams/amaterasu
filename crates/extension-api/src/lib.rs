@@ -562,6 +562,29 @@ pub fn validate_resource_plan(plan: &ResourcePlan) -> Result<(), String> {
             return Err("invalid obligation dependency".into());
         }
     }
+    if let Some(binding) = &plan.candidate_constraint
+        && (!valid_identifier(&binding.capture_provider)
+            || !valid_identifier(&binding.selector_schema)
+            || !valid_identifier(&binding.resource_provider)
+            || !valid_opaque_id(&binding.resource_id)
+            || !valid_opaque_id(&binding.execution_domain)
+            || binding.plan_revision != plan.revision
+            || binding
+                .incarnation
+                .as_ref()
+                .is_some_and(|id| !valid_opaque_id(id))
+            || !plan.resources.iter().any(|resource| {
+                resource.provider == binding.resource_provider
+                    && resource.resource_id == binding.resource_id
+                    && resource.execution_domain == binding.execution_domain
+                    && resource
+                        .incarnation
+                        .as_ref()
+                        .is_none_or(|incarnation| binding.incarnation.as_ref() == Some(incarnation))
+            }))
+    {
+        return Err("invalid binding constraint".into());
+    }
     let mut retired = BTreeSet::new();
     loop {
         let previous = retired.len();
@@ -582,6 +605,100 @@ pub fn validate_resource_plan(plan: &ResourcePlan) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Check response shape and ensure a prepared binding respects its admitted plan.
+/// This does not attest that a capture consumer actually opened that resource.
+pub fn validate_provider_response(
+    request: &ProviderRequest,
+    response: &ProviderResponse,
+) -> Result<(), String> {
+    if serde_json::to_vec(response)
+        .map_err(|error| error.to_string())?
+        .len()
+        > 12 * 1024
+    {
+        return Err("provider response exceeds size limit".into());
+    }
+    match response {
+        ProviderResponse::Planned { plan }
+            if request.operation == ProviderOperation::ResourcePlan =>
+        {
+            validate_resource_plan(plan)
+        }
+        ProviderResponse::Prepared {
+            candidate,
+            obligations,
+        } if request.operation == ProviderOperation::LifecycleCallback => {
+            let plan = request
+                .approved_plan
+                .as_ref()
+                .ok_or("missing admitted plan")?;
+            if obligations
+                .iter()
+                .any(|obligation| !plan.obligations.contains(obligation))
+            {
+                return Err("unadmitted obligation".into());
+            }
+            if let Some(candidate) = candidate {
+                validate_capture_binding(candidate)?;
+                let constraint = plan
+                    .candidate_constraint
+                    .as_ref()
+                    .ok_or("unadmitted binding")?;
+                if candidate.capture_provider != constraint.capture_provider
+                    || candidate.selector_schema != constraint.selector_schema
+                    || candidate.resource.provider != constraint.resource_provider
+                    || candidate.resource.resource_id != constraint.resource_id
+                    || candidate.resource.execution_domain != constraint.execution_domain
+                    || candidate.plan_revision != constraint.plan_revision
+                    || constraint
+                        .incarnation
+                        .as_ref()
+                        .is_some_and(|incarnation| incarnation != &candidate.resource.incarnation)
+                    || constraint
+                        .mode
+                        .as_ref()
+                        .is_some_and(|mode| mode != &candidate.mode)
+                {
+                    return Err("binding outside admitted plan".into());
+                }
+            }
+            Ok(())
+        }
+        ProviderResponse::Pending { receipt_id } if valid_opaque_id(receipt_id) => Ok(()),
+        ProviderResponse::Rejected { reason }
+        | ProviderResponse::Failed { reason }
+        | ProviderResponse::RecoveryRequired { reason }
+            if !reason.is_empty() && reason.len() <= 4096 =>
+        {
+            Ok(())
+        }
+        ProviderResponse::Cleanup { outcomes }
+            if request.operation == ProviderOperation::LifecycleCallback =>
+        {
+            let plan = request
+                .approved_plan
+                .as_ref()
+                .ok_or("missing admitted plan")?;
+            let mut seen = std::collections::BTreeSet::new();
+            if outcomes.iter().any(|outcome| {
+                !seen.insert(&outcome.obligation_id)
+                    || !plan
+                        .obligations
+                        .iter()
+                        .any(|obligation| obligation.obligation_id == outcome.obligation_id)
+                    || outcome
+                        .reason
+                        .as_ref()
+                        .is_some_and(|reason| reason.len() > 4096)
+            }) {
+                return Err("invalid cleanup outcome".into());
+            }
+            Ok(())
+        }
+        _ => Err("response does not match provider operation".into()),
+    }
 }
 
 /// Validate an exact candidate before any consumer opens it. Authorization,
@@ -809,6 +926,14 @@ mod tests {
         assert!(validate_provider_request(&request).is_err());
         request.admission_id = Some("admitted".into());
         assert!(validate_provider_request(&request).is_ok());
+        let response = ProviderResponse::Cleanup {
+            outcomes: vec![CleanupOutcome {
+                obligation_id: "foreign".into(),
+                state: CleanupState::Released,
+                reason: None,
+            }],
+        };
+        assert!(validate_provider_response(&request, &response).is_err());
     }
 
     #[test]
