@@ -1,5 +1,11 @@
 //! Bounded provider prepare orchestration. Resource authority is supplied by the
 //! coordinator and must hold through callback settlement and status polling.
+//!
+//! A failed or rejected callback does not prove that its effects were absent or
+//! cleaned up. Its admission remains fenced for recovery. The current protocol
+//! cannot settle a known partial preparation: that requires explicit enrollment
+//! of its scoped cleanup obligations. Recovery must reconcile the saved receipt,
+//! not replay the preparation after a restart.
 use amaterasu_extension_api::{
     self as api, ProviderOperation, ProviderRequest, ProviderResponse, ProviderStatusRequest,
     ResourcePlan,
@@ -641,6 +647,44 @@ mod tests {
                 .is_err()
         );
         assert!(journal.states.is_empty());
+    }
+    #[test]
+    fn callback_failure_and_rejection_retain_admission_for_recovery() {
+        for status in ["failed", "rejected"] {
+            for phase in [PreparePhase::Callback, PreparePhase::CallbackStatus] {
+                let (settings, mut state) = fixture();
+                let plan: ResourcePlan = serde_json::from_value(json!({"plan_id":"p","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]})).unwrap();
+                state.phase = phase;
+                state.plan = Some(plan.clone());
+                state.admission_id = Some("admission".into());
+                state.request.operation = ProviderOperation::LifecycleCallback;
+                state.request.plan_revision = Some(plan.revision);
+                state.request.admission_id = state.admission_id.clone();
+                state.request.approved_plan = Some(plan);
+                let mut driver = PrepareDriver::new(state, &settings).unwrap();
+                let mut authority = Authority {
+                    sequence: 1,
+                    rights: true,
+                    polls: 0,
+                };
+                let mut journal = Journal::default();
+                driver
+                    .settle(
+                        json!({"status":status,"reason":"partial outcome"}),
+                        &settings.participants[0],
+                        &mut authority,
+                        &mut journal,
+                    )
+                    .unwrap();
+                assert_eq!(driver.state.phase, PreparePhase::RecoveryRequired);
+                assert_eq!(driver.state.admission_id.as_deref(), Some("admission"));
+                assert!(authority.rights);
+                assert_eq!(
+                    journal.states.last().unwrap().phase,
+                    PreparePhase::RecoveryRequired
+                );
+            }
+        }
     }
     #[test]
     fn release_cleanup_keeps_deferred_and_unknown_outcomes_distinct() {
