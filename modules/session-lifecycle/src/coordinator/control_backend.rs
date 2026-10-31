@@ -994,27 +994,12 @@ impl Coordinator {
             {
                 return Err("settlement_stage_provenance_mismatch".into());
             }
-            if stage.after != permit.context.output {
-                let mut works = journal.receipts.values().filter_map(|receipt| {
-                    let work = receipt.work.as_ref()?;
-                    (work.target == tuple.request.target
-                        && work.transition_id == tuple.request.transition_id
-                        && work.composition_progress.as_ref().is_some_and(|progress| {
-                            progress
-                                .controls
-                                .iter()
-                                .any(|control| control.dispatch.request == tuple.request)
-                        }))
-                    .then_some(work)
-                });
-                let work = works.next().ok_or("settlement_control_work_missing")?;
-                if works.next().is_some()
-                    || control_input(self, journal, work, selection, &tuple.request, &stage.after)?
-                        .0
-                        != permit.context.output
-                {
-                    return Err("settlement_control_chain_mismatch".into());
-                }
+            if stage.after != permit.context.output
+                && super::control_history::authenticated_input(journal, &tuple.request, selection)
+                    .as_ref()
+                    != Some(&permit.context.output)
+            {
+                return Err("settlement_control_chain_mismatch".into());
             }
         }
         let source = journal
