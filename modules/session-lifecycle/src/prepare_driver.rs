@@ -103,6 +103,12 @@ impl PrepareDriver {
     /// Caller must durably reserve the operation and matching provider sequence
     /// before constructing this driver. No plan or effect is implied by creation.
     pub fn new(state: PrepareState, settings: &LifecycleSettings) -> ModuleResult<Self> {
+        // Version 2 requires durable control and finalization sequencing. The
+        // shared wire validator recognizes it, but this driver must not dispatch
+        // it until those coordinator-owned gates are implemented.
+        if state.request.version != 1 {
+            return Err("provider composition is not supported".into());
+        }
         if participant(settings, &state.provider)? != &state.participant
             || state.request.settings_revision != state.participant.settings_revision
             || serde_json::to_value(&state.request.settings).map_err(|e| e.to_string())?
@@ -627,6 +633,13 @@ mod tests {
         assert_eq!(authority.polls, 2);
         assert_eq!(authority.sequence, 3);
         assert_eq!(driver.state.last_sequence, 3);
+    }
+
+    #[test]
+    fn recovered_version_two_request_cannot_dispatch() {
+        let (settings, mut state) = fixture();
+        state.request.version = 2;
+        assert!(PrepareDriver::new(state, &settings).is_err());
     }
 
     #[test]

@@ -7,6 +7,26 @@ struct AuthorityWriter(Shared);
 impl AuthorityJournal for AuthorityWriter {
     fn persist(&mut self, state: &AuthorityState) -> ModuleResult<()> {
         let mut next = self.0.borrow().value.clone();
+        if next.admission_transitions.keys().any(|id| {
+            !state.admissions.contains_key(id)
+                && !state.settled.contains_key(id)
+                && next.composition.references_admission(id)
+        }) {
+            return Err("composition_admission_still_referenced".into());
+        }
+        next.admission_transitions
+            .retain(|id, _| state.admissions.contains_key(id) || state.settled.contains_key(id));
+        for session in next.sessions.values_mut() {
+            session
+                .admission_ids
+                .retain(|id| state.admissions.contains_key(id) || state.settled.contains_key(id));
+            session
+                .admission_targets
+                .retain(|id, _| session.admission_ids.contains(id));
+            session
+                .admission_phases
+                .retain(|id, _| session.admission_ids.contains(id));
+        }
         next.authority = state.clone();
         save(&self.0, next)
     }
@@ -19,7 +39,26 @@ fn record_admission(
     admission_id: &str,
     target: &LifecycleTarget,
     phase: &LifecyclePhase,
+    transition_id: &str,
 ) -> ModuleResult<()> {
+    if !valid_id(transition_id) {
+        return Err("invalid_admission_transition".into());
+    }
+    if next
+        .admission_transitions
+        .get(admission_id)
+        .is_some_and(|old| old != transition_id)
+    {
+        return Err("admission_transition_conflict".into());
+    }
+    if next
+        .sessions
+        .get(session_id)
+        .is_some_and(|session| session.admission_ids.contains(admission_id))
+        && !next.admission_transitions.contains_key(admission_id)
+    {
+        return Err("admission_transition_missing".into());
+    }
     if next
         .sessions
         .iter()
@@ -49,6 +88,8 @@ fn record_admission(
     session
         .admission_targets
         .insert(admission_id.to_owned(), target.clone());
+    next.admission_transitions
+        .insert(admission_id.to_owned(), transition_id.to_owned());
     Ok(())
 }
 
@@ -84,8 +125,16 @@ impl AuthorityJournal for ActionAdmissionWriter {
             .ok_or("action_transition_missing")?;
         let target = work.target.clone();
         let phase = work.phase.clone();
+        let transition_id = work.transition_id.clone();
         let (_, session_id, _, _) = super::operations::target_parts(&target)?;
-        record_admission(&mut next, session_id, &fresh[0], &target, &phase)?;
+        record_admission(
+            &mut next,
+            session_id,
+            &fresh[0],
+            &target,
+            &phase,
+            &transition_id,
+        )?;
         next.authority = state.clone();
         save(&self.shared, next)
     }
@@ -107,12 +156,16 @@ impl PrepareJournal for WorkWriter {
         work.states.insert(self.provider.clone(), state.clone());
         let target = work.target.clone();
         let phase = work.phase.clone();
-        if state.request.target != target || state.request.phase != phase {
+        let transition_id = work.transition_id.clone();
+        if state.request.target != target
+            || state.request.phase != phase
+            || state.request.transition_id != transition_id
+        {
             return Err("admission_target_mismatch".into());
         }
         let (_, session_id, _, _) = super::operations::target_parts(&target)?;
         if let Some(id) = &state.admission_id {
-            record_admission(&mut next, session_id, id, &target, &phase)?;
+            record_admission(&mut next, session_id, id, &target, &phase, &transition_id)?;
         }
         save(&self.shared, next)
     }
@@ -572,6 +625,7 @@ impl Coordinator {
                     };
                     authority.finish_admission_with_resource(provider, admission, resource)?;
                 }
+                let mut composition_cleanup_blocked = false;
                 if let Some(ProviderResponse::Cleanup { outcomes }) = &state.response {
                     let settled = self.shared.borrow().value.authority.settled.clone();
                     let owned = {
@@ -598,9 +652,24 @@ impl Coordinator {
                                 outcome.state == amaterasu_extension_api::CleanupState::Released
                             })
                         {
-                            authority.retire_settled(provider, &id, &matched)?;
+                            if self
+                                .shared
+                                .borrow()
+                                .value
+                                .composition
+                                .references_admission(&id)
+                            {
+                                composition_cleanup_blocked = true;
+                            } else {
+                                authority.retire_settled(provider, &id, &matched)?;
+                            }
                         }
                     }
+                }
+                if composition_cleanup_blocked {
+                    self.cleanup_failure(&key, "composition_output_cleanup_unconfirmed")?;
+                    self.drivers.remove(&runtime_key);
+                    continue;
                 }
                 if let Err(reason) = self.finish_participant(&key, provider, &state) {
                     if matches!(
@@ -1215,6 +1284,8 @@ mod admission_target_tests {
             recovery_sources: Default::default(),
             input_boot_epochs: Default::default(),
             retention: Default::default(),
+            composition: Default::default(),
+            admission_transitions: Default::default(),
         };
         let target = LifecycleTarget::Stream {
             host_epoch: "epoch".into(),
@@ -1228,6 +1299,7 @@ mod admission_target_tests {
             "admission",
             &target,
             &LifecyclePhase::StreamPrepare,
+            "transition",
         )
         .unwrap();
         record_admission(
@@ -1236,8 +1308,33 @@ mod admission_target_tests {
             "admission",
             &target,
             &LifecyclePhase::StreamPrepare,
+            "transition",
         )
         .unwrap();
+        assert!(
+            record_admission(
+                &mut journal,
+                "first",
+                "admission",
+                &target,
+                &LifecyclePhase::StreamPrepare,
+                "other-transition",
+            )
+            .is_err()
+        );
+        let mut legacy = journal.clone();
+        legacy.admission_transitions.clear();
+        assert!(
+            record_admission(
+                &mut legacy,
+                "first",
+                "admission",
+                &target,
+                &LifecyclePhase::StreamPrepare,
+                "transition",
+            )
+            .is_err()
+        );
         let changed = LifecycleTarget::Stream {
             host_epoch: "epoch".into(),
             session_id: "first".into(),
@@ -1250,7 +1347,8 @@ mod admission_target_tests {
                 "first",
                 "admission",
                 &changed,
-                &LifecyclePhase::StreamPrepare
+                &LifecyclePhase::StreamPrepare,
+                "transition"
             )
             .is_err()
         );
@@ -1260,7 +1358,8 @@ mod admission_target_tests {
                 "first",
                 "admission",
                 &target,
-                &LifecyclePhase::StreamRelease
+                &LifecyclePhase::StreamRelease,
+                "transition"
             )
             .is_err()
         );
@@ -1275,12 +1374,14 @@ mod admission_target_tests {
                 "second",
                 "admission",
                 &foreign,
-                &LifecyclePhase::SessionPrepare
+                &LifecyclePhase::SessionPrepare,
+                "transition"
             )
             .is_err()
         );
         let restored: Journal =
             serde_json::from_slice(&serde_json::to_vec(&journal).unwrap()).unwrap();
+        assert_eq!(restored.admission_transitions["admission"], "transition");
         assert_eq!(
             restored.sessions["first"].admission_targets["admission"],
             target
