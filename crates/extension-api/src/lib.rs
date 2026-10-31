@@ -363,6 +363,8 @@ pub enum ProviderResponse {
     },
     Cleanup {
         outcomes: Vec<CleanupOutcome>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        outputs: Vec<ResourceOutput>,
     },
     Failed {
         reason: String,
@@ -987,13 +989,26 @@ pub fn validate_provider_response(
         {
             Ok(())
         }
-        ProviderResponse::Cleanup { outcomes }
+        ProviderResponse::Cleanup { outcomes, outputs }
             if request.operation == ProviderOperation::LifecycleCallback =>
         {
             let plan = request
                 .approved_plan
                 .as_ref()
                 .ok_or("missing admitted plan")?;
+            let mut seen_outputs = std::collections::BTreeSet::new();
+            if outputs.len() > 32
+                || (!outputs.is_empty()
+                    && (request.version != COMPOSITION_VERSION
+                        || request.phase != LifecyclePhase::StreamRelease))
+                || outputs.iter().any(|output| {
+                    validate_resource_output(output).is_err()
+                        || !output_in_scope(output, &request.target)
+                        || !seen_outputs.insert((&output.producer, &output.output_id))
+                })
+            {
+                return Err("invalid cleanup outputs".into());
+            }
             let mut seen = std::collections::BTreeSet::new();
             if outcomes.iter().any(|outcome| {
                 !seen.insert(&outcome.obligation_id)
@@ -1012,6 +1027,33 @@ pub fn validate_provider_response(
         }
         _ => Err("response does not match provider operation".into()),
     }
+}
+
+/// Check cleanup readback against the coordinator-frozen current output and
+/// authenticated callback provider. The coordinator must verify durable lineage,
+/// installed schemas and confirmed cleanup before publishing this observation.
+pub fn validate_cleanup_output(
+    authenticated_provider: &str,
+    current: &ResourceOutput,
+    output: &ResourceOutput,
+) -> Result<(), String> {
+    if authenticated_provider != current.producer || output.producer != authenticated_provider {
+        return Err("cleanup output is not owned by provider".into());
+    }
+    validate_output_refinement(current, output)?;
+    if current.resource.revision == output.resource.revision
+        && (current.data != output.data
+            || current.domain_observations.iter().any(|old| {
+                output
+                    .domain_observations
+                    .iter()
+                    .find(|new| new.domain == old.domain)
+                    .is_none_or(|new| new.borrowers != old.borrowers)
+            }))
+    {
+        return Err("cleanup changed state without resource revision".into());
+    }
+    Ok(())
 }
 
 /// Validate an exact candidate before any consumer opens it. Authorization,
@@ -1230,6 +1272,54 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_readback_requires_versioned_release_and_owned_current_output() {
+        let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":2});
+        let origin =
+            json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1});
+        let resource = json!({"provider":"example.owner","resource_id":"resource","incarnation":"instance","revision":4,"execution_domain":"seat","mutation_domain":"domain","mutation_domains":["domain"]});
+        let current: ResourceOutput = serde_json::from_value(json!({"output_id":"selected","capability":"example.target","schema":{"id":"example.schema/1","major":1,"minor":0,"digest":"a".repeat(64)},"producer":"example.owner","producer_service":"example.owner/2","origin":origin,"resource":resource,"domain_observations":[{"domain":"domain","revision":1,"borrowers":{"stream":2},"complete":true}],"data":{"mode":"old"}})).unwrap();
+        let plan = json!({"plan_id":"plan","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]});
+        let mut request: ProviderRequest = serde_json::from_value(json!({"version":2,"provider_sequence":1,"operation":"lifecycle_callback","transition_id":"transition","operation_id":"operation","target":target,"phase":"stream.release","settings_revision":"settings","settings":{},"intent":null,"reason":"pause","requested_video":null,"consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector/1"]},"remaining_ms":5000,"plan_revision":1,"admission_id":"admitted","approved_plan":plan})).unwrap();
+        let mut updated = current.clone();
+        updated.resource.revision += 1;
+        updated.domain_observations[0].revision += 1;
+        updated.domain_observations[0].borrowers.clear();
+        updated.data = json!({"mode":"new"});
+        let response = ProviderResponse::Cleanup {
+            outcomes: vec![],
+            outputs: vec![updated.clone()],
+        };
+        assert!(validate_provider_response(&request, &response).is_ok());
+        assert!(validate_cleanup_output("example.owner", &current, &updated).is_ok());
+        assert!(validate_cleanup_output("example.dependent", &current, &updated).is_err());
+        let mut forged = updated.clone();
+        forged.resource.incarnation = "foreign".into();
+        assert!(validate_cleanup_output("example.owner", &current, &forged).is_err());
+        forged = updated.clone();
+        forged.resource.revision = current.resource.revision;
+        assert!(validate_cleanup_output("example.owner", &current, &forged).is_err());
+        forged = current.clone();
+        forged.domain_observations[0].revision += 1;
+        forged.domain_observations[0].borrowers.clear();
+        assert!(validate_cleanup_output("example.owner", &current, &forged).is_err());
+        request.version = 1;
+        assert!(validate_provider_response(&request, &response).is_err());
+        request.version = 2;
+        request.phase = LifecyclePhase::SessionRelease;
+        assert!(validate_provider_response(&request, &response).is_err());
+        let legacy = ProviderResponse::Cleanup {
+            outcomes: vec![],
+            outputs: vec![],
+        };
+        let serialized = serde_json::to_value(&legacy).unwrap();
+        assert!(serialized.get("outputs").is_none());
+        assert_eq!(
+            serde_json::from_value::<ProviderResponse>(serialized).unwrap(),
+            legacy
+        );
+    }
+
+    #[test]
     fn finalize_planning_binds_current_output_and_prior_controls() {
         let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":2});
         let resource = json!({"provider":"example.owner","resource_id":"resource","incarnation":"instance","revision":4,"execution_domain":"seat","mutation_domain":"domain","mutation_domains":["domain"]});
@@ -1444,6 +1534,7 @@ mod tests {
         assert!(validate_provider_request(&request).is_err());
         request.provider_sequence = 1;
         let response = ProviderResponse::Cleanup {
+            outputs: vec![],
             outcomes: vec![CleanupOutcome {
                 obligation_id: "foreign".into(),
                 state: CleanupState::Released,
