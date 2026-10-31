@@ -25,6 +25,9 @@ struct Epoch {
 struct Record {
     request: ActionInvoke,
     receipt: Value,
+    selected_provider: String,
+    registry_revision: u64,
+    descriptor: amaterasu_extension_api::ActionDescriptor,
 }
 
 #[derive(Default, Deserialize)]
@@ -411,6 +414,9 @@ impl ActionsModule {
         let Ok(invoke) = serde_json::from_value::<ActionInvoke>(request) else {
             return self.complete(incoming.id, failure("invalid_request"));
         };
+        if invoke.input_reservation_id.is_some() {
+            return self.complete(incoming.id, failure("input_reservation_unavailable"));
+        }
         let target_kind = match invoke.target {
             amaterasu_extension_api::ActionTarget::Session { .. } => "session",
             amaterasu_extension_api::ActionTarget::Stream { .. } => "stream",
@@ -472,6 +478,20 @@ impl ActionsModule {
         {
             return self.complete(incoming.id, failure("invalid_action"));
         }
+        let Some(provider) = response
+            .get("provider")
+            .and_then(Value::as_str)
+            .filter(|provider| !provider.is_empty() && provider.len() <= 256)
+        else {
+            return self.complete(incoming.id, failure("descriptor_unavailable"));
+        };
+        let Some(registry_revision) = response
+            .get("revision")
+            .and_then(Value::as_u64)
+            .filter(|revision| *revision > 0)
+        else {
+            return self.complete(incoming.id, failure("descriptor_unavailable"));
+        };
         let class = match action.execution {
             amaterasu_extension_api::ExecutionClass::ReadOnly => "read_only",
             amaterasu_extension_api::ExecutionClass::SessionMutation => "session_mutation",
@@ -501,6 +521,9 @@ impl ActionsModule {
             Record {
                 request: invoke,
                 receipt: receipt.clone(),
+                selected_provider: provider.to_owned(),
+                registry_revision,
+                descriptor: action,
             },
         );
         self.write(incoming.id, revision, metadata, &epoch_id, &epoch, receipt)
@@ -594,7 +617,7 @@ mod tests {
                     let value = if service == amaterasu_extension_api::EXTENSION_REGISTRY_SERVICE {
                         assert!(parent.is_some());
                         let method = json!({"service":"example.provider/1","method":"action_execute","interface_major":1,"interface_minor":0,"schema_revision":1});
-                        json!({"ok":true,"action":{"id":"example/action","label":"Example","description":"Example","execution":"session_mutation","arguments":{},"allowed_targets":["session"],"required_capabilities":[],"plan":method,"execute":method,"status":null}})
+                        json!({"ok":true,"provider":"example.provider","revision":1,"action":{"id":"example/action","label":"Example","description":"Example","execution":"session_mutation","arguments":{},"allowed_targets":["session"],"required_capabilities":[],"plan":method,"execute":method,"status":null}})
                     } else {
                         match payload["action"].as_str() {
                             Some("collection_get") => {

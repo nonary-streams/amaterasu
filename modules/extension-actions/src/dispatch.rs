@@ -9,6 +9,8 @@ use sha2::{Digest, Sha256};
 pub struct Dispatch {
     pub request: ActionInvoke,
     pub descriptor: ActionDescriptor,
+    pub selected_provider: String,
+    pub registry_revision: u64,
     pub caller: String,
     pub initiator: String,
     pub stage: Stage,
@@ -59,17 +61,25 @@ impl Dispatch {
     pub fn new(
         request: ActionInvoke,
         descriptor: ActionDescriptor,
+        selected_provider: String,
+        registry_revision: u64,
         caller: String,
         initiator: String,
     ) -> Result<Self, &'static str> {
         crate::validation::validate_request(&descriptor, &request)
             .map_err(|_| "invalid_request")?;
-        if caller.is_empty() || initiator.is_empty() {
+        if caller.is_empty()
+            || initiator.is_empty()
+            || selected_provider.is_empty()
+            || registry_revision == 0
+        {
             return Err("invalid_authority");
         }
         Ok(Self {
             request,
             descriptor,
+            selected_provider,
+            registry_revision,
             caller,
             initiator,
             stage: Stage::Planning,
@@ -265,7 +275,15 @@ mod tests {
             expected_settings_revision: None,
             input_reservation_id: None,
         };
-        Dispatch::new(request, descriptor, "caller".into(), "initiator".into()).unwrap()
+        Dispatch::new(
+            request,
+            descriptor,
+            "example".into(),
+            1,
+            "caller".into(),
+            "initiator".into(),
+        )
+        .unwrap()
     }
     #[test]
     fn effect_requires_matching_authorization_and_consume() {
