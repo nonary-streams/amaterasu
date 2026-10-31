@@ -53,6 +53,13 @@ rights until the callback settles, including across asynchronous status polling.
 Native capture evidence is provider-specific; the coordinator preserves it and
 checks the common negotiated mode and exact binding identity.
 
+The first consumer adapter accepts Linux KDE/Wayland SDR bindings through
+`amaterasu.capture-pipewire/1` and `amaterasu.kwin-wl-output/1`, with PipeWire
+explicitly selected. Windows, HDR, and other capture adapters still require
+implementation and qualification before they can use this lifecycle path.
+Legacy display mutations must be disabled when the extension owns display
+configuration; conflicting global, application, or client policies are rejected.
+
 `verify_provider_epoch` authenticates a selected provider's exact durable request.
 Its fingerprint is lowercase SHA-256 of the SDK's typed JSON serialization. The
 reply also contains the canonical parent `session_target` and whether the known
