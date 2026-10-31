@@ -7,8 +7,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use amaterasu_extension_api::{
-    CleanupOutcome, CleanupState, LifecycleTarget, MethodRef, ResourceAccess,
-    ResourceControlRequest, ResourceOutput, ResourcePlan, SchemaRef,
+    CleanupOutcome, CleanupState, ConfirmedControl, LifecycleTarget, MethodRef, ResourceAccess,
+    ResourceControlRequest, ResourceFinalizeRequest, ResourceOutput, ResourcePlan, SchemaRef,
 };
 use amaterasu_module_sdk::ModuleResult;
 use serde::{Deserialize, Serialize};
@@ -91,6 +91,43 @@ pub struct ControlPermit {
     pub settled: bool,
 }
 
+/// Independently installed approval for finalizing the producer's resource.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalizePolicy {
+    pub owner_provider: String,
+    pub owner_service: String,
+    pub method: MethodRef,
+    pub output_capability: String,
+    pub output_schema: SchemaRef,
+    pub capture_provider: String,
+    pub selector_schema: String,
+    pub required_access: ResourceAccess,
+    pub mutation_domains: BTreeSet<String>,
+}
+
+/// Reconstructed from frozen policy and authenticated, durable coordinator
+/// output/control records while the parent session and graph are locked.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalizeContext {
+    pub policy: FinalizePolicy,
+    pub output: ResourceOutput,
+    pub control_results: Vec<ConfirmedControl>,
+    pub target: LifecycleTarget,
+    pub transition_id: String,
+    pub parent_generation: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinalizePermit {
+    pub context: FinalizeContext,
+    pub request: ResourceFinalizeRequest,
+    pub consumed: bool,
+    pub settled: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ControlPermitUse {
     Execute,
@@ -121,6 +158,8 @@ pub struct AuthorityState {
     pub settled: BTreeMap<String, Admission>,
     #[serde(default)]
     pub control_permits: BTreeMap<String, ControlPermit>,
+    #[serde(default)]
+    pub finalize_permits: BTreeMap<String, FinalizePermit>,
 }
 
 pub trait AuthorityJournal {
@@ -157,7 +196,15 @@ fn valid_schema(schema: &SchemaRef) -> bool {
 }
 
 fn output_in_scope(context: &ControlContext) -> bool {
-    match (&context.output.origin, &context.target) {
+    output_matches_target(&context.output, &context.target, context.parent_generation)
+}
+
+fn output_matches_target(
+    output: &ResourceOutput,
+    target: &LifecycleTarget,
+    parent_generation: Option<u64>,
+) -> bool {
+    match (&output.origin, target) {
         (
             LifecycleTarget::Session {
                 host_epoch: a,
@@ -169,9 +216,108 @@ fn output_in_scope(context: &ControlContext) -> bool {
                 session_id: d,
                 ..
             },
-        ) => a == c && b == d && context.parent_generation == Some(*g),
+        ) => a == c && b == d && parent_generation == Some(*g),
         (origin, target) => origin == target,
     }
+}
+
+fn validate_finalize_binding(
+    admission: &Admission,
+    context: &FinalizeContext,
+    request: &ResourceFinalizeRequest,
+    snapshot: &PlanningSnapshot,
+) -> ModuleResult<()> {
+    let policy = &context.policy;
+    let resource = &context.output.resource;
+    let domains: BTreeSet<_> = resource.mutation_domains.iter().cloned().collect();
+    let constraint = admission
+        .plan
+        .candidate_constraint
+        .as_ref()
+        .ok_or("finalize capture constraint missing")?;
+    let planned = admission
+        .plan
+        .resources
+        .iter()
+        .find(|item| item.provider == resource.provider && item.resource_id == resource.resource_id)
+        .ok_or("finalize resource not admitted")?;
+    if admission.provider != policy.owner_provider
+        || !valid_id(&policy.owner_provider)
+        || !valid_id(&policy.owner_service)
+        || !valid_id(&policy.method.method)
+        || policy.method.service != policy.owner_service
+        || policy.method.interface_major != 2
+        || policy.method.schema_revision == 0
+        || !valid_id(&policy.output_capability)
+        || !valid_schema(&policy.output_schema)
+        || !valid_id(&policy.capture_provider)
+        || !valid_id(&policy.selector_schema)
+        || request.target != context.target
+        || request.transition_id != context.transition_id
+        || request.output != context.output
+        || request.control_results != context.control_results
+        || context.control_results.iter().any(|result| {
+            !output_matches_target(&result.output, &context.target, context.parent_generation)
+        })
+        || !output_matches_target(&context.output, &context.target, context.parent_generation)
+        || context.output.producer != policy.owner_provider
+        || context.output.producer_service != policy.owner_service
+        || context.output.capability != policy.output_capability
+        || context.output.schema != policy.output_schema
+        || resource.provider != policy.owner_provider
+        || domains.is_empty()
+        || domains.len() != resource.mutation_domains.len()
+        || domains != policy.mutation_domains
+        || planned.incarnation.as_deref() != Some(&resource.incarnation)
+        || planned.expected_revision != Some(resource.revision)
+        || planned.execution_domain != resource.execution_domain
+        || planned
+            .mutation_domains
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            != domains
+        || access_level(&planned.access) < access_level(&policy.required_access)
+        || constraint.capture_provider != policy.capture_provider
+        || constraint.selector_schema != policy.selector_schema
+        || constraint.resource_provider != resource.provider
+        || constraint.resource_id != resource.resource_id
+        || constraint.execution_domain != resource.execution_domain
+        || constraint.plan_revision != admission.plan.revision
+        || constraint
+            .incarnation
+            .as_ref()
+            .is_some_and(|value| value != &resource.incarnation)
+        || domains.iter().any(|domain| {
+            admission
+                .rights
+                .iter()
+                .find(|(name, _)| name == domain)
+                .is_none_or(|(_, right)| {
+                    let level = match right {
+                        Access::Read => 0,
+                        Access::Shared => 1,
+                        Access::Exclusive => 2,
+                    };
+                    level < access_level(&policy.required_access)
+                })
+        })
+        || snapshot
+            .resources
+            .get(&resource.provider)
+            .and_then(|items| items.get(&resource.resource_id))
+            != Some(&ResourceRef {
+                provider: resource.provider.clone(),
+                resource_id: resource.resource_id.clone(),
+                incarnation: resource.incarnation.clone(),
+                revision: resource.revision,
+                execution_domain: resource.execution_domain.clone(),
+                mutation_domains: domains,
+            })
+    {
+        return Err("finalize binding or rights differ from frozen authority".into());
+    }
+    Ok(())
 }
 
 fn validate_control_binding(
@@ -458,6 +604,7 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
             || state.admissions.len() + state.settled.len() > MAX_ADMISSIONS
             || state.issued_operation_ids.len() > 4096
             || state.control_permits.len() > MAX_ADMISSIONS
+            || state.finalize_permits.len() > MAX_ADMISSIONS
             || state.issued_operation_ids.iter().any(|id| !valid_id(id))
         {
             return Err("authority capacity exceeded".into());
@@ -527,6 +674,35 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
             }
             validate_control_binding(admission, &permit.context, &permit.request, &state.snapshot)?;
         }
+        for (id, permit) in &state.finalize_permits {
+            let admission = state
+                .admissions
+                .get(&permit.request.admission_id)
+                .ok_or("orphaned finalize permit")?;
+            if !valid_id(id)
+                || state.control_permits.contains_key(id)
+                || permit.request.permit_id != *id
+                || (permit.settled && !permit.consumed)
+                || !control_operations.insert(&permit.request.operation_id)
+                || !control_sequences.insert((
+                    &permit.context.policy.owner_provider,
+                    permit.request.provider_sequence,
+                ))
+                || state
+                    .sequences
+                    .get(&permit.context.policy.owner_provider)
+                    .is_none_or(|current| *current < permit.request.provider_sequence)
+            {
+                return Err("invalid recovered finalize permit".into());
+            }
+            amaterasu_extension_api::validate_resource_finalize_request(&permit.request)?;
+            validate_finalize_binding(
+                admission,
+                &permit.context,
+                &permit.request,
+                &state.snapshot,
+            )?;
+        }
         if state.refresh_required.iter().any(|domain| {
             !state.domain_owners.contains_key(domain) || state.domain_locks.contains_key(domain)
         }) {
@@ -589,6 +765,14 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
         {
             return Err("control outcome remains unsettled".into());
         }
+        if self
+            .state
+            .finalize_permits
+            .values()
+            .any(|permit| permit.request.admission_id == admission_id && !permit.settled)
+        {
+            return Err("finalize outcome remains unsettled".into());
+        }
         if let Some(settled) = self.state.settled.get(admission_id) {
             if settled.provider != provider {
                 return Err("admission provider mismatch".into());
@@ -648,6 +832,8 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
         }
         next.admissions.remove(admission_id);
         next.control_permits
+            .retain(|_, permit| permit.request.admission_id != admission_id);
+        next.finalize_permits
             .retain(|_, permit| permit.request.admission_id != admission_id);
         if !admission.plan.obligations.is_empty() {
             next.settled.insert(admission_id.to_owned(), admission);
@@ -916,16 +1102,24 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
                     || (permit.context.policy.owner_provider == context.policy.owner_provider
                         && permit.request.provider_sequence == request.provider_sequence)
             })
+            || self.state.finalize_permits.values().any(|permit| {
+                permit.request.operation_id == request.operation_id
+                    || (permit.context.policy.owner_provider == context.policy.owner_provider
+                        && permit.request.provider_sequence == request.provider_sequence)
+            })
         {
             return Err("control operation is not fresh".into());
         }
         let permit_id =
             amaterasu_storage::random_identifier().map_err(|_| "entropy unavailable")?;
-        if self.state.control_permits.contains_key(&permit_id) {
+        if self.state.control_permits.contains_key(&permit_id)
+            || self.state.finalize_permits.contains_key(&permit_id)
+        {
             return Err("permit ID collision".into());
         }
         let mut frozen = request.clone();
         frozen.permit_id = permit_id.clone();
+        amaterasu_extension_api::validate_resource_control_request(&frozen)?;
         let mut next = self.state.clone();
         next.control_permits.insert(
             permit_id.clone(),
@@ -1004,6 +1198,218 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
         next.control_permits
             .get_mut(&request.permit_id)
             .ok_or("unknown control permit")?
+            .settled = true;
+        self.persist(next)
+    }
+
+    /// Recheck a consumed control immediately before each native submission.
+    pub fn validate_control_permit(
+        &mut self,
+        owner_caller: &str,
+        participant: &ParticipantSettings,
+        context: &ControlContext,
+        request: &ResourceControlRequest,
+        validate_arguments: impl Fn(&SchemaRef, &Value) -> ModuleResult<()>,
+    ) -> ModuleResult<()> {
+        if self.poisoned {
+            return Err("authority journal requires recovery".into());
+        }
+        let permit = self
+            .state
+            .control_permits
+            .get(&request.permit_id)
+            .ok_or("unknown control permit")?;
+        if !permit.consumed
+            || permit.settled
+            || owner_caller != context.policy.owner_provider
+            || permit.context != *context
+            || permit.request != *request
+        {
+            return Err("control permit is not active".into());
+        }
+        amaterasu_extension_api::validate_resource_control_request(request)?;
+        let admission = self
+            .state
+            .admissions
+            .get(&request.admission_id)
+            .ok_or("unknown admission")?
+            .clone();
+        self.validate_rights(participant, &admission.plan, &request.admission_id)?;
+        validate_control_binding(&admission, context, request, &self.state.snapshot)?;
+        validate_arguments(&context.policy.argument_schema, &request.proposal.arguments)
+    }
+
+    /// Create a distinct finalize permit from a fresh owner admission. Context
+    /// must be reconstructed from installed policy and durable confirmed results.
+    pub fn issue_finalize_permit(
+        &mut self,
+        participant: &ParticipantSettings,
+        context: &FinalizeContext,
+        request: &mut ResourceFinalizeRequest,
+    ) -> ModuleResult<()> {
+        if self.poisoned || !request.permit_id.is_empty() {
+            return Err("invalid finalize issuance".into());
+        }
+        if let Some((id, permit)) = self
+            .state
+            .finalize_permits
+            .iter()
+            .find(|(_, permit)| permit.request.operation_id == request.operation_id)
+        {
+            let mut proposed = request.clone();
+            proposed.permit_id = id.clone();
+            if permit.context != *context || permit.request != proposed {
+                return Err("finalize operation conflicts with existing intent".into());
+            }
+            request.permit_id = id.clone();
+            return Ok(());
+        }
+        let admission = self
+            .state
+            .admissions
+            .get(&request.admission_id)
+            .ok_or("unknown admission")?
+            .clone();
+        self.validate_rights(participant, &admission.plan, &request.admission_id)?;
+        validate_finalize_binding(&admission, context, request, &self.state.snapshot)?;
+        if self.state.sequences.get(&context.policy.owner_provider)
+            != Some(&request.provider_sequence)
+            || self.state.finalize_permits.len() >= MAX_ADMISSIONS
+            || self.state.finalize_permits.values().any(|permit| {
+                permit.request.operation_id == request.operation_id
+                    || (permit.context.policy.owner_provider == context.policy.owner_provider
+                        && permit.request.provider_sequence == request.provider_sequence)
+            })
+            || self.state.control_permits.values().any(|permit| {
+                permit.request.operation_id == request.operation_id
+                    || (permit.context.policy.owner_provider == context.policy.owner_provider
+                        && permit.request.provider_sequence == request.provider_sequence)
+            })
+        {
+            return Err("finalize operation is not fresh".into());
+        }
+        let permit_id =
+            amaterasu_storage::random_identifier().map_err(|_| "entropy unavailable")?;
+        if self.state.finalize_permits.contains_key(&permit_id)
+            || self.state.control_permits.contains_key(&permit_id)
+        {
+            return Err("permit ID collision".into());
+        }
+        let mut frozen = request.clone();
+        frozen.permit_id = permit_id.clone();
+        amaterasu_extension_api::validate_resource_finalize_request(&frozen)?;
+        let mut next = self.state.clone();
+        next.finalize_permits.insert(
+            permit_id.clone(),
+            FinalizePermit {
+                context: context.clone(),
+                request: frozen,
+                consumed: false,
+                settled: false,
+            },
+        );
+        self.persist(next)?;
+        request.permit_id = permit_id;
+        Ok(())
+    }
+
+    pub fn consume_finalize_permit(
+        &mut self,
+        owner_caller: &str,
+        participant: &ParticipantSettings,
+        context: &FinalizeContext,
+        request: &ResourceFinalizeRequest,
+    ) -> ModuleResult<ControlPermitUse> {
+        if self.poisoned {
+            return Err("authority journal requires recovery".into());
+        }
+        let permit = self
+            .state
+            .finalize_permits
+            .get(&request.permit_id)
+            .ok_or("unknown finalize permit")?;
+        if owner_caller != context.policy.owner_provider
+            || permit.context != *context
+            || permit.request != *request
+        {
+            return Err("finalize permit binding mismatch".into());
+        }
+        if permit.consumed {
+            return Ok(ControlPermitUse::ReattachOnly);
+        }
+        let admission = self
+            .state
+            .admissions
+            .get(&request.admission_id)
+            .ok_or("unknown admission")?
+            .clone();
+        self.validate_rights(participant, &admission.plan, &request.admission_id)?;
+        amaterasu_extension_api::validate_resource_finalize_request(request)?;
+        validate_finalize_binding(&admission, context, request, &self.state.snapshot)?;
+        let mut next = self.state.clone();
+        next.finalize_permits
+            .get_mut(&request.permit_id)
+            .ok_or("unknown finalize permit")?
+            .consumed = true;
+        self.persist(next)?;
+        Ok(ControlPermitUse::Execute)
+    }
+
+    /// Revalidate the consumed finalize grant while its admission is held.
+    pub fn validate_finalize_permit(
+        &mut self,
+        owner_caller: &str,
+        participant: &ParticipantSettings,
+        context: &FinalizeContext,
+        request: &ResourceFinalizeRequest,
+    ) -> ModuleResult<()> {
+        if self.poisoned {
+            return Err("authority journal requires recovery".into());
+        }
+        let permit = self
+            .state
+            .finalize_permits
+            .get(&request.permit_id)
+            .ok_or("unknown finalize permit")?;
+        if !permit.consumed
+            || permit.settled
+            || owner_caller != context.policy.owner_provider
+            || permit.context != *context
+            || permit.request != *request
+        {
+            return Err("finalize permit is not active".into());
+        }
+        let admission = self
+            .state
+            .admissions
+            .get(&request.admission_id)
+            .ok_or("unknown admission")?
+            .clone();
+        self.validate_rights(participant, &admission.plan, &request.admission_id)?;
+        amaterasu_extension_api::validate_resource_finalize_request(request)?;
+        validate_finalize_binding(&admission, context, request, &self.state.snapshot)
+    }
+
+    /// Only the coordinator may mark a validated terminal owner result settled.
+    pub fn settle_finalize_permit(
+        &mut self,
+        request: &ResourceFinalizeRequest,
+    ) -> ModuleResult<()> {
+        let permit = self
+            .state
+            .finalize_permits
+            .get(&request.permit_id)
+            .ok_or("unknown finalize permit")?;
+        if permit.request != *request || !permit.consumed {
+            return Err("finalize permit not consumed".into());
+        }
+        if permit.settled {
+            return Ok(());
+        }
+        let mut next = self.state.clone();
+        next.finalize_permits
+            .get_mut(&request.permit_id)
+            .ok_or("unknown finalize permit")?
             .settled = true;
         self.persist(next)
     }
@@ -1328,13 +1734,13 @@ mod tests {
             json!({"kind":"session", "host_epoch":"host", "session_id":"session", "generation":1});
         let schema = json!({"id":"schema", "major":1, "minor":0, "digest":"a".repeat(64)});
         let resource = json!({"provider":"owner", "resource_id":"output", "incarnation":"native", "revision":2, "execution_domain":"seat", "mutation_domain":"topology", "mutation_domains":["topology"]});
-        let method = json!({"service":"display/1", "method":"control", "interface_major":1, "interface_minor":0, "schema_revision":2});
-        let proposal = json!({"proposal_id":"proposal", "output_id":"output-id", "owner_provider":"owner", "owner_service":"display/1", "target":target, "resource":resource, "method":method, "argument_schema":schema, "arguments":{"width":1920}, "access":"exclusive", "mutation_domains":["topology"]});
+        let method = json!({"service":"display/2", "method":"control", "interface_major":2, "interface_minor":0, "schema_revision":2});
+        let proposal = json!({"proposal_id":"proposal", "output_id":"output-id", "owner_provider":"owner", "owner_service":"display/2", "target":target, "resource":resource, "method":method, "argument_schema":schema, "arguments":{"width":1920}, "access":"exclusive", "mutation_domains":["topology"]});
         plan.control_proposals
             .push(serde_json::from_value(proposal.clone()).unwrap());
         let context: ControlContext = serde_json::from_value(json!({
-            "policy":{"dependent_provider":"display", "owner_provider":"owner", "owner_service":"display/1", "owner_method":method, "argument_schema":schema, "output_capability":"display", "output_schema":schema, "max_access":"exclusive", "mutation_domains":["topology"]},
-            "output":{"output_id":"output-id", "capability":"display", "schema":schema, "producer":"owner", "producer_service":"display/1", "origin":target, "resource":resource, "data":{}},
+            "policy":{"dependent_provider":"display", "owner_provider":"owner", "owner_service":"display/2", "owner_method":method, "argument_schema":schema, "output_capability":"display", "output_schema":schema, "max_access":"exclusive", "mutation_domains":["topology"]},
+            "output":{"output_id":"output-id", "capability":"display", "schema":schema, "producer":"owner", "producer_service":"display/2", "origin":target, "resource":resource, "data":{}},
             "target":target, "transition_id":"transition", "parent_generation":null
         })).unwrap();
         let mut state = AuthorityState::default();
@@ -1430,6 +1836,17 @@ mod tests {
                 .unwrap(),
             ControlPermitUse::Execute
         );
+        assert!(
+            authority
+                .validate_control_permit(
+                    "owner",
+                    &selected.participant,
+                    &context,
+                    &request,
+                    validate
+                )
+                .is_ok()
+        );
         assert_eq!(
             authority
                 .consume_control_permit(
@@ -1448,7 +1865,101 @@ mod tests {
                 .is_err()
         );
         authority.settle_control_permit(&request).unwrap();
+        assert!(
+            authority
+                .validate_control_permit(
+                    "owner",
+                    &selected.participant,
+                    &context,
+                    &request,
+                    validate
+                )
+                .is_err()
+        );
         authority
+            .finish_admission("display", &request.admission_id)
+            .unwrap();
+    }
+
+    #[test]
+    fn finalize_requires_distinct_current_owner_grant_and_fences_replay() {
+        let selected = selection();
+        let mut plan = plan();
+        plan.candidate_constraint = Some(serde_json::from_value(json!({"capture_provider":"capture", "selector_schema":"selector", "resource_provider":"display", "resource_id":"output", "incarnation":"native", "execution_domain":"seat", "mode":null, "plan_revision":1})).unwrap());
+        let target = json!({"kind":"stream","host_epoch":"host","session_id":"session","stream_id":"stream","generation":2});
+        let schema = json!({"id":"schema","major":1,"minor":0,"digest":"a".repeat(64)});
+        let output = json!({"output_id":"output-id","capability":"display","schema":schema,"producer":"display","producer_service":"display/2","origin":target,"resource":{"provider":"display","resource_id":"output","incarnation":"native","revision":2,"execution_domain":"seat","mutation_domain":"topology","mutation_domains":["topology"]},"data":{}});
+        let context: FinalizeContext = serde_json::from_value(json!({"policy":{"owner_provider":"display","owner_service":"display/2","method":{"service":"display/2","method":"finalize","interface_major":2,"interface_minor":0,"schema_revision":2},"output_capability":"display","output_schema":schema,"capture_provider":"capture","selector_schema":"selector","required_access":"exclusive","mutation_domains":["topology"]},"output":output,"control_results":[],"target":target,"transition_id":"transition","parent_generation":1})).unwrap();
+        let mut authority = CoordinatorPrepareAuthority::new(
+            AuthorityState::default(),
+            vec![selected.clone()],
+            Journal::default(),
+        )
+        .unwrap();
+        let (sequence, operation) = authority.allocate("display").unwrap();
+        let admission = authority.admit_plan(&selected.participant, &plan).unwrap();
+        let mut request: ResourceFinalizeRequest = serde_json::from_value(json!({"version":2,"transition_id":"transition","operation_id":operation,"provider_sequence":sequence,"target":target,"output":output,"control_results":[],"admission_id":admission,"permit_id":"","remaining_ms":1000})).unwrap();
+        authority
+            .issue_finalize_permit(&selected.participant, &context, &mut request)
+            .unwrap();
+        let mut retry = request.clone();
+        retry.permit_id.clear();
+        authority
+            .issue_finalize_permit(&selected.participant, &context, &mut retry)
+            .unwrap();
+        assert_eq!(retry.permit_id, request.permit_id);
+        let mut forged = request.clone();
+        forged.output.resource.revision += 1;
+        assert!(
+            authority
+                .consume_finalize_permit("display", &selected.participant, &context, &forged)
+                .is_err()
+        );
+        assert!(
+            authority
+                .consume_finalize_permit("foreign", &selected.participant, &context, &request)
+                .is_err()
+        );
+        assert!(
+            authority
+                .validate_finalize_permit("display", &selected.participant, &context, &request)
+                .is_err()
+        );
+        assert_eq!(
+            authority
+                .consume_finalize_permit("display", &selected.participant, &context, &request)
+                .unwrap(),
+            ControlPermitUse::Execute
+        );
+        assert!(
+            authority
+                .validate_finalize_permit("display", &selected.participant, &context, &request)
+                .is_ok()
+        );
+        let mut recovered = CoordinatorPrepareAuthority::new(
+            authority.state.clone(),
+            vec![selected.clone()],
+            Journal::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            recovered
+                .consume_finalize_permit("display", &selected.participant, &context, &request)
+                .unwrap(),
+            ControlPermitUse::ReattachOnly
+        );
+        assert!(
+            recovered
+                .finish_admission("display", &request.admission_id)
+                .is_err()
+        );
+        recovered.settle_finalize_permit(&request).unwrap();
+        assert!(
+            recovered
+                .validate_finalize_permit("display", &selected.participant, &context, &request)
+                .is_err()
+        );
+        recovered
             .finish_admission("display", &request.admission_id)
             .unwrap();
     }
