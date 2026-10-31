@@ -595,10 +595,11 @@ impl Coordinator {
                         };
                         if !succeeded {
                             session.phase = SessionPhase::RecoveryRequired;
-                        } else if session
-                            .streams
-                            .values()
-                            .all(|stream| stream.phase == StreamPhase::Retired)
+                        } else if session.phase != SessionPhase::Ending
+                            && session
+                                .streams
+                                .values()
+                                .all(|stream| stream.phase == StreamPhase::Retired)
                         {
                             session.phase = SessionPhase::Paused;
                         }
@@ -1113,6 +1114,11 @@ mod tests {
             coordinator.action_operation("display", "display", &verify)["status"],
             "rejected"
         );
+        let ending = coordinator.handle("transport", "user", json!({"operation":"end_session", "operation_id":"end-while-action", "target":{"kind":"session", "host_epoch":auth["target"]["host_epoch"], "session_id":"session", "generation":3}}));
+        assert_eq!(ending["status"], "pending");
+        assert!(
+            coordinator.shared.borrow().value.sessions["session"].phase == SessionPhase::Ending
+        );
         let mut complete = request;
         complete["operation"] = json!("complete_action");
         complete["outcome"] = json!("succeeded");
@@ -1120,6 +1126,9 @@ mod tests {
         assert_eq!(
             coordinator.action_operation(&service, "service", &complete)["status"],
             "succeeded"
+        );
+        assert!(
+            coordinator.shared.borrow().value.sessions["session"].phase == SessionPhase::Ending
         );
         let mut state = coordinator.shared.borrow().value.clone();
         state.sessions.get_mut("session").unwrap().phase = SessionPhase::Ready;
