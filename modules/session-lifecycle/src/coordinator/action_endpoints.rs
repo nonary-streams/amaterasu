@@ -1210,6 +1210,7 @@ mod tests {
             schema_revision: 1,
         };
         let participant = ParticipantSettings {
+            contract_version: 1,
             depends_on: vec![],
             provider: "display".into(),
             plan_method: method("plan"),
@@ -1516,6 +1517,7 @@ mod tests {
             schema_revision: 1,
         };
         coordinator.settings.participants.push(ParticipantSettings {
+            contract_version: 1,
             depends_on: vec![],
             provider: "display".into(),
             plan_method: method("plan"),
@@ -1715,6 +1717,17 @@ mod tests {
         book["outputs"][0]["state"] = json!("recovery_required");
         unavailable.composition = serde_json::from_value(book).unwrap();
         save(&coordinator.shared, unavailable).unwrap();
+        assert_eq!(
+            coordinator.describe_action_target("display", &v2)["reason"],
+            "owner_output_ambiguous_or_unavailable"
+        );
+        let mut ambiguous = paused.clone();
+        let mut book = serde_json::to_value(&ambiguous.composition).unwrap();
+        let mut second = book["outputs"][0].clone();
+        second["output"]["output_id"] = json!("other-output");
+        book["outputs"].as_array_mut().unwrap().push(second);
+        ambiguous.composition = serde_json::from_value(book).unwrap();
+        save(&coordinator.shared, ambiguous).unwrap();
         assert_eq!(
             coordinator.describe_action_target("display", &v2)["reason"],
             "owner_output_ambiguous_or_unavailable"
