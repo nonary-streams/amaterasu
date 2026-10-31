@@ -55,6 +55,13 @@ struct Harness {
     provider_calls: Vec<Value>,
     provider: bool,
     provider_invalid: bool,
+    simulate_stage_refresh: bool,
+    stage_refresh_request: Option<u64>,
+    stage_refresh_done: bool,
+    refresh_round: u64,
+    deferred_finalize_plan: Option<(u64, Value, Value)>,
+    verify_finalize: bool,
+    finalize_verify_request: Option<(u64, u64, Value)>,
     registry_settings: Option<(u64, Value)>,
 }
 
@@ -102,6 +109,7 @@ impl Harness {
         if provider {
             configuration["principals"][COORDINATOR]["call"] = json!([
                 "example.display/2",
+                SERVICE,
                 "amaterasu.input/1",
                 "amaterasu.launch/1"
             ]);
@@ -109,11 +117,14 @@ impl Harness {
                 json!({"provide":["example.display/2"],"call":[SERVICE]});
             configuration["settings"][COORDINATOR]["trusted_callers"] =
                 json!(["transport", "capture", "amaterasu.input", "display"]);
-            configuration["settings"][COORDINATOR]["operation_grants"]["display"] =
-                json!(["verify_provider_epoch"]);
+            configuration["settings"][COORDINATOR]["operation_grants"]["display"] = json!([
+                "verify_provider_epoch",
+                "refresh_provider_observations",
+                "verify_resource_finalize"
+            ]);
             let method_ref = |name: &str| json!({"service":"example.display/2","method":name,"interface_major":2,"interface_minor":0,"schema_revision":1});
             configuration["settings"][COORDINATOR]["consumer_requirements"] = json!({"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["example/1"]});
-            configuration["settings"][COORDINATOR]["participants"] = json!([{"provider":"display","contract_version":2,"plan_method":method_ref("resource_plan"),"callback_method":method_ref("lifecycle_callback"),"status_method":method_ref("lifecycle_status"),"binding_validate_method":method_ref("binding_validate"),"settings_revision":"one","settings":{},"capabilities":[],"cleanup_methods":[]}]);
+            configuration["settings"][COORDINATOR]["participants"] = json!([{"provider":"display","contract_version":2,"plan_method":method_ref("resource_plan"),"callback_method":method_ref("lifecycle_callback"),"status_method":method_ref("lifecycle_status"),"binding_validate_method":method_ref("binding_validate"),"settings_revision":"one","settings":{},"capabilities":[],"cleanup_methods":[method_ref("lifecycle_callback")]}]);
             let document = r#"{"$id":"output/1","$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#;
             let schema = json!({"id":"output/1","major":1,"minor":0,"digest":format!("{:x}",Sha256::digest(document.as_bytes()))});
             configuration["settings"][COORDINATOR]["schema_documents"] =
@@ -194,6 +205,13 @@ impl Harness {
             provider_calls: Vec::new(),
             provider,
             provider_invalid: false,
+            simulate_stage_refresh: false,
+            stage_refresh_request: None,
+            stage_refresh_done: false,
+            refresh_round: 0,
+            deferred_finalize_plan: None,
+            verify_finalize: false,
+            finalize_verify_request: None,
             registry_settings,
         };
         harness.start();
@@ -234,26 +252,177 @@ impl Harness {
                 self.provider_calls.push(payload.clone());
                 let args = &payload["arguments"];
                 if payload["method"] == "resource_plan" {
-                    let plan = json!({"plan_id":"session-plan","revision":1,"resources":[{"provider":"display","resource_id":"output","incarnation":null,"expected_revision":null,"execution_domain":"seat","mutation_domains":[],"access":"read"}],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]});
+                    let stream = args["phase"] == "stream.prepare";
+                    let finalize = args["operation"] == "resource_finalize_plan";
+                    let resource = json!({"provider":"display","resource_id":"output","incarnation":if stream {json!("native")} else {Value::Null},"expected_revision":if stream {json!(1)} else {Value::Null},"execution_domain":"seat","mutation_domains":["topology"],"access":if finalize {"exclusive"} else {"read"}});
+                    let constraint = if finalize {
+                        json!({"capture_provider":"capture","selector_schema":"example/1","resource_provider":"display","resource_id":"output","incarnation":"native","execution_domain":"seat","mode":args["requested_video"],"plan_revision":1,"geometry_revision":1})
+                    } else {
+                        Value::Null
+                    };
+                    let obligations = if finalize {
+                        json!([{"obligation_id":"finalize-cleanup","provider":"display","resource_id":"output","mutation_domain":"topology","cleanup_method":{"service":"example.display/2","method":"lifecycle_callback","interface_major":2,"interface_minor":0,"schema_revision":1},"payload":{},"depends_on":[]}])
+                    } else {
+                        json!([])
+                    };
+                    let plan = json!({"plan_id":if finalize {"finalize-plan"} else {"session-plan"},"revision":1,"resources":[resource],"mutation_domains":[{"domain":"topology","expected_revision":1,"borrowers":{},"access":if finalize {"exclusive"} else {"read"}}],"required_capabilities":[],"constraints":{},"obligations":obligations,"affected_consumers":[],"consumer_change":"live","candidate_constraint":constraint,"allowed_degradation":[]});
+                    if stream && self.simulate_stage_refresh {
+                        self.stage_refresh_done = false;
+                        self.stage_refresh_request = None;
+                        self.refresh_round += 1;
+                        self.deferred_finalize_plan = Some((id, plan, args["target"].clone()));
+                    } else {
+                        assert!(matches!(
+                            self.broker.borrow_mut().dispatch(
+                                "display",
+                                Command::Complete {
+                                    request: id,
+                                    payload: json!({"status":"planned","plan":plan})
+                                }
+                            ),
+                            Response::Ok
+                        ));
+                    }
+                } else if payload["method"] == "lifecycle_callback" {
+                    let document = r#"{"$id":"output/1","$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#;
+                    let schema = json!({"id":"output/1","major":1,"minor":0,"digest":format!("{:x}",Sha256::digest(document.as_bytes()))});
+                    let origin = if args["phase"] == "session.prepare" {
+                        args["target"].clone()
+                    } else {
+                        self.provider_calls
+                            .iter()
+                            .find(|call| {
+                                call["method"] == "lifecycle_callback"
+                                    && call["arguments"]["phase"] == "session.prepare"
+                            })
+                            .unwrap()["arguments"]["target"]
+                            .clone()
+                    };
+                    let output = json!({"output_id":"screen-output","capability":"display/output","schema":schema,"producer":"display","producer_service":"example.display/2","origin":origin,"resource":{"provider":"display","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":"topology","mutation_domains":["topology"]},"domain_observations":[{"domain":"topology","revision":1,"borrowers":{},"complete":true}],"data":if self.provider_invalid {json!("invalid")} else {json!({"ready":true})}});
+                    assert!(matches!(self.broker.borrow_mut().dispatch("display",Command::Complete {request:id,payload:json!({"status":"prepared","candidate":null,"obligations":[],"outputs":[output]})}),Response::Ok));
+                } else if payload["method"] == "finalize" {
+                    let candidate = json!({"capture_provider":"capture","selector_schema":"example/1","selector":{},"resource":args["output"]["resource"],"mode":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false},"plan_revision":1,"geometry_revision":1,"generation":args["target"]["generation"]});
+                    let result =
+                        json!({"status":"applied","output":args["output"],"candidate":candidate});
+                    if self.verify_finalize {
+                        let payload =
+                            json!({"operation":"verify_resource_finalize","request":args});
+                        let response = self.broker.borrow_mut().dispatch(
+                            "display",
+                            Command::Request {
+                                service: SERVICE.into(),
+                                payload,
+                                timeout_ms: 5000,
+                                operation_id: "verify-finalize-request".into(),
+                                parent: Some(id),
+                            },
+                        );
+                        let Response::Accepted { id: verify_id } = response else {
+                            panic!("verify request rejected: {response:?}");
+                        };
+                        self.finalize_verify_request = Some((verify_id, id, result));
+                    } else {
+                        assert!(matches!(
+                            self.broker.borrow_mut().dispatch(
+                                "display",
+                                Command::Complete {
+                                    request: id,
+                                    payload: result
+                                }
+                            ),
+                            Response::Ok
+                        ));
+                    }
+                } else {
+                    panic!("unexpected provider method: {payload}");
+                }
+            }
+        }
+        if self.simulate_stage_refresh && !self.stage_refresh_done {
+            if let Some(request) = self.stage_refresh_request {
+                let response = self
+                    .broker
+                    .borrow_mut()
+                    .dispatch("display", Command::TakeResult { request });
+                match response {
+                    Response::Pending => {}
+                    Response::Result { payload } => {
+                        assert_eq!(payload["status"], "succeeded", "{payload}");
+                        assert!(matches!(
+                            self.broker
+                                .borrow_mut()
+                                .dispatch("display", Command::ReleaseResult { request }),
+                            Response::Ok
+                        ));
+                        self.stage_refresh_done = true;
+                        let (owner_request, plan, _) = self
+                            .deferred_finalize_plan
+                            .take()
+                            .expect("pending finalize plan");
+                        assert!(matches!(
+                            self.broker.borrow_mut().dispatch(
+                                "display",
+                                Command::Complete {
+                                    request: owner_request,
+                                    payload: json!({"status":"planned","plan":plan})
+                                }
+                            ),
+                            Response::Ok
+                        ));
+                    }
+                    other => panic!("stage refresh failed: {other:?}"),
+                }
+            } else if let Some((owner_request, _, target)) = &self.deferred_finalize_plan {
+                let payload = json!({"operation":"refresh_provider_observations","operation_id":format!("stage-observe-{}",self.refresh_round),"target":target,"domains":[{"domain":"topology","revision":1,"borrowers":{}}],"resources":[{"provider":"display","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domains":["topology"]}]});
+                let response = self.broker.borrow_mut().dispatch(
+                    "display",
+                    Command::Request {
+                        service: SERVICE.into(),
+                        payload,
+                        timeout_ms: 5000,
+                        operation_id: format!("stage-refresh-request-{}", self.refresh_round),
+                        parent: Some(*owner_request),
+                    },
+                );
+                let Response::Accepted { id } = response else {
+                    panic!("stage observation rejected: {response:?}");
+                };
+                self.stage_refresh_request = Some(id);
+            }
+        }
+        if let Some((verify_id, owner_id, result)) = &self.finalize_verify_request {
+            let response = self.broker.borrow_mut().dispatch(
+                "display",
+                Command::TakeResult {
+                    request: *verify_id,
+                },
+            );
+            match response {
+                Response::Pending => {}
+                Response::Result { payload } => {
+                    assert_eq!(payload["status"], "execute", "{payload}");
                     assert!(matches!(
                         self.broker.borrow_mut().dispatch(
                             "display",
-                            Command::Complete {
-                                request: id,
-                                payload: json!({"status":"planned","plan":plan})
+                            Command::ReleaseResult {
+                                request: *verify_id
                             }
                         ),
                         Response::Ok
                     ));
-                } else if payload["method"] == "lifecycle_callback" {
-                    assert_eq!(args["phase"], "session.prepare");
-                    let document = r#"{"$id":"output/1","$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#;
-                    let schema = json!({"id":"output/1","major":1,"minor":0,"digest":format!("{:x}",Sha256::digest(document.as_bytes()))});
-                    let output = json!({"output_id":"screen-output","capability":"display/output","schema":schema,"producer":"display","producer_service":"example.display/2","origin":args["target"],"resource":{"provider":"display","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":null,"mutation_domains":[]},"data":if self.provider_invalid {json!("invalid")} else {json!({"ready":true})}});
-                    assert!(matches!(self.broker.borrow_mut().dispatch("display",Command::Complete {request:id,payload:json!({"status":"prepared","candidate":null,"obligations":[],"outputs":[output]})}),Response::Ok));
-                } else {
-                    panic!("unexpected provider method: {payload}");
+                    assert!(matches!(
+                        self.broker.borrow_mut().dispatch(
+                            "display",
+                            Command::Complete {
+                                request: *owner_id,
+                                payload: result.clone()
+                            }
+                        ),
+                        Response::Ok
+                    ));
+                    self.finalize_verify_request = None;
                 }
+                other => panic!("finalize verify failed: {other:?}"),
             }
         }
         if let Some((revision, settings)) = &self.registry_settings {
@@ -440,5 +609,124 @@ fn real_broker_rejects_malformed_v2_output() {
             .as_array()
             .unwrap()
             .is_empty()
+    );
+}
+
+#[test]
+fn real_broker_rejects_unverified_finalize_effect() {
+    let mut harness = Harness::with_provider(true);
+    harness.simulate_stage_refresh = true;
+    let started = harness.call("transport",json!({"operation":"prepare","operation_id":"session.prepare","application_ref":{"kind":"application","app_id":"app"}}));
+    assert_eq!(started["status"], "pending", "{started}");
+    let mut ready = Value::Null;
+    for _ in 0..120 {
+        ready = harness.call(
+            "transport",
+            json!({"operation":"lookup","operation_id":"session.prepare"}),
+        );
+        if ready["status"] != "pending" {
+            break;
+        }
+    }
+    assert_eq!(ready["status"], "succeeded", "{ready}");
+    let session = ready["target"].clone();
+    let bound = harness.call("transport", json!({"operation":"bind_application","operation_id":"app.bind","target":session,"launch_id":42,"application_operation_id":"launch-42"}));
+    assert_eq!(bound["status"], "succeeded", "{bound}");
+    let started = harness.call("transport",json!({"operation":"prepare_stream","operation_id":"stream.prepare","target":session,"intent":"initial","requested_video":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false}}));
+    assert_eq!(started["status"], "pending", "{started}");
+    let mut result = Value::Null;
+    for _ in 0..200 {
+        result = harness.call(
+            "transport",
+            json!({"operation":"lookup","operation_id":"stream.prepare"}),
+        );
+        if result["status"] != "pending" {
+            break;
+        }
+    }
+    assert_eq!(result["status"], "recovery_required", "{result}");
+    assert_eq!(result["reason"], "finalize permit not consumed");
+    assert!(result.get("candidate").is_none());
+}
+
+#[test]
+fn real_broker_stages_and_finalizes_with_verified_owner() {
+    let mut harness = Harness::with_provider(true);
+    harness.simulate_stage_refresh = true;
+    harness.verify_finalize = true;
+    let started = harness.call("transport",json!({"operation":"prepare","operation_id":"session.prepare","application_ref":{"kind":"application","app_id":"app"}}));
+    assert_eq!(started["status"], "pending", "{started}");
+    let mut ready = Value::Null;
+    for _ in 0..120 {
+        ready = harness.call(
+            "transport",
+            json!({"operation":"lookup","operation_id":"session.prepare"}),
+        );
+        if ready["status"] != "pending" {
+            break;
+        }
+    }
+    assert_eq!(ready["status"], "succeeded", "{ready}");
+    let session = ready["target"].clone();
+    let bound = harness.call("transport", json!({"operation":"bind_application","operation_id":"app.bind","target":session,"launch_id":42,"application_operation_id":"launch-42"}));
+    assert_eq!(bound["status"], "succeeded", "{bound}");
+    let started = harness.call("transport",json!({"operation":"prepare_stream","operation_id":"stream.prepare","target":session,"intent":"initial","requested_video":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false}}));
+    assert_eq!(started["status"], "pending", "{started}");
+    let mut result = Value::Null;
+    for _ in 0..200 {
+        result = harness.call(
+            "transport",
+            json!({"operation":"lookup","operation_id":"stream.prepare"}),
+        );
+        if result.get("reason").is_some() {
+            eprintln!("stream progress: {result}");
+        }
+        if result["status"] != "pending" {
+            break;
+        }
+    }
+    assert_eq!(result["status"], "succeeded", "{result}");
+    assert_eq!(result["candidate"]["geometry_revision"], 1);
+    let journal: Value =
+        serde_json::from_slice(&std::fs::read(harness.root.join("journal.json")).unwrap()).unwrap();
+    assert_eq!(
+        journal["finalize_results"]["records"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let record = &journal["finalize_results"]["records"][0];
+    assert_eq!(record["selection"]["stage"]["target"], result["target"]);
+    assert_eq!(record["plan_terminal"]["state"]["state"], "completed");
+    assert_eq!(record["terminal"]["state"]["state"], "completed");
+    let permit = record["request"]["permit_id"].as_str().unwrap();
+    assert_eq!(
+        journal["authority"]["finalize_permits"][permit]["settled"],
+        true
+    );
+    let calls = harness.provider_calls.len();
+    // SAFETY: the current instance is live and replaced only after destruction.
+    unsafe { (harness.api.destroy)(harness.instance) };
+    harness.instance = std::ptr::null_mut();
+    harness.start();
+    let recovered = harness.call(
+        "transport",
+        json!({"operation":"lookup","operation_id":"stream.prepare"}),
+    );
+    assert_eq!(recovered["status"], "succeeded", "{recovered}");
+    assert_eq!(harness.provider_calls.len(), calls);
+    let recovered_journal: Value =
+        serde_json::from_slice(&std::fs::read(harness.root.join("journal.json")).unwrap()).unwrap();
+    assert_eq!(
+        recovered_journal["composition"]["outputs"][0]["state"],
+        "recovery_required"
+    );
+    assert_eq!(
+        recovered_journal["finalize_results"]["records"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
     );
 }
