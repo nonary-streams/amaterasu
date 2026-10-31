@@ -1,5 +1,5 @@
 //! Broker adapter for the lifecycle authority. Request payloads do not establish identity.
-use crate::prepare_authority::{ControlPolicy, FinalizePolicy};
+use crate::prepare_authority::{ControlPolicy, DomainScope, FinalizePolicy};
 use amaterasu_extension_api::{ConsumerRequirements, MethodRef, ResourceAccess, SchemaRef};
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use serde::{Deserialize, Serialize};
@@ -142,6 +142,22 @@ fn valid_schema_reference(schema: &SchemaRef) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn valid_control_method(method: &MethodRef, service: &str) -> bool {
+    method.service == service
+        && valid_identifier(&method.method)
+        && method.interface_major == 2
+        && method.schema_revision != 0
+}
+
+fn valid_domain_scope(scope: DomainScope, domains: &BTreeSet<String>) -> bool {
+    domains.len() <= 32
+        && domains.iter().all(|domain| valid_opaque_id(domain))
+        && match scope {
+            DomainScope::Static => !domains.is_empty(),
+            DomainScope::Resource => domains.is_empty(),
+        }
+}
+
 impl LifecycleSettings {
     /// Compile only policy-supplied local documents; no runtime fetch or request
     /// payload can add a schema. Every control and finalization pin must resolve exactly.
@@ -198,20 +214,13 @@ impl LifecycleSettings {
                 || owner.is_none()
                 || self.control_policies[..index].contains(policy)
                 || !valid_identifier(&policy.owner_service)
-                || policy.owner_service != policy.owner_method.service
-                || !valid_identifier(&policy.owner_method.method)
-                || policy.owner_method.interface_major == 0
-                || policy.owner_method.schema_revision == 0
+                || !valid_control_method(&policy.owner_method, &policy.owner_service)
+                || !valid_control_method(&policy.status_method, &policy.owner_service)
                 || !valid_opaque_id(&policy.output_capability)
                 || !valid_schema_reference(&policy.argument_schema)
                 || !valid_schema_reference(&policy.output_schema)
                 || matches!(policy.max_access, ResourceAccess::Read)
-                || policy.mutation_domains.is_empty()
-                || policy.mutation_domains.len() > 32
-                || policy
-                    .mutation_domains
-                    .iter()
-                    .any(|domain| !valid_opaque_id(domain))
+                || !valid_domain_scope(policy.domain_scope, &policy.mutation_domains)
             {
                 return Err("invalid lifecycle control policy".into());
             }
@@ -230,10 +239,8 @@ impl LifecycleSettings {
                 .any(|p| p.provider == policy.owner_provider)
                 || self.finalize_policies[..index].contains(policy)
                 || !valid_identifier(&policy.owner_service)
-                || policy.owner_service != policy.method.service
-                || !valid_identifier(&policy.method.method)
-                || policy.method.interface_major == 0
-                || policy.method.schema_revision == 0
+                || !valid_control_method(&policy.method, &policy.owner_service)
+                || !valid_control_method(&policy.status_method, &policy.owner_service)
                 || !valid_opaque_id(&policy.output_capability)
                 || !valid_schema_reference(&policy.output_schema)
                 || !self
@@ -245,12 +252,7 @@ impl LifecycleSettings {
                     .selector_schemas
                     .contains(&policy.selector_schema)
                 || matches!(policy.required_access, ResourceAccess::Read)
-                || policy.mutation_domains.is_empty()
-                || policy.mutation_domains.len() > 32
-                || policy
-                    .mutation_domains
-                    .iter()
-                    .any(|domain| !valid_opaque_id(domain))
+                || !valid_domain_scope(policy.domain_scope, &policy.mutation_domains)
             {
                 return Err("invalid lifecycle finalize policy".into());
             }
@@ -890,7 +892,9 @@ mod tests {
         let document = r#"{"$id":"schema/1","$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#;
         let digest = format!("{:x}", Sha256::digest(document.as_bytes()));
         let schema = json!({"id":"schema/1","major":1,"minor":0,"digest":digest});
-        let policy = json!({"dependent_provider":"dependent","owner_provider":"owner","owner_service":"owner/1","owner_method":method,"argument_schema":schema,"output_capability":"display/output","output_schema":schema,"max_access":"exclusive","mutation_domains":["seat:0"]});
+        let effect_method = json!({"service":"owner/1","method":"apply","interface_major":2,"interface_minor":0,"schema_revision":1});
+        let status_method = json!({"service":"owner/1","method":"status","interface_major":2,"interface_minor":0,"schema_revision":1});
+        let policy = json!({"dependent_provider":"dependent","owner_provider":"owner","owner_service":"owner/1","owner_method":effect_method,"status_method":status_method,"argument_schema":schema,"output_capability":"display/output","output_schema":schema,"max_access":"exclusive","mutation_domains":["seat:0"]});
         let mut settings: LifecycleSettings = serde_json::from_value(json!({"journal_path":"/test", "consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector/1"]},"participants":[participant("dependent",json!(["owner"])),participant("owner",json!([]))],"control_policies":[policy], "schema_documents":[{"reference":schema,"document":document}]})).unwrap();
         assert!(settings.validate().is_ok());
         settings
@@ -912,9 +916,18 @@ mod tests {
         settings.control_policies[0].max_access = ResourceAccess::Exclusive;
         settings.control_policies[0].mutation_domains.clear();
         assert!(settings.validate().is_err());
+        settings.control_policies[0].domain_scope = DomainScope::Resource;
+        assert!(settings.validate().is_ok());
+        settings.control_policies[0]
+            .mutation_domains
+            .insert("seat:0".into());
+        assert!(settings.validate().is_err());
+        settings.control_policies[0].mutation_domains.clear();
+        settings.control_policies[0].status_method.service = "wrong/1".into();
+        assert!(settings.validate().is_err());
         settings.control_policies.clear();
         assert!(settings.validate().is_ok());
-        let finalize = json!({"owner_provider":"owner","owner_service":"owner/1","method":method,"output_capability":"display/output","output_schema":schema,"capture_provider":"capture","selector_schema":"selector/1","required_access":"exclusive","mutation_domains":["seat:0"]});
+        let finalize = json!({"owner_provider":"owner","owner_service":"owner/1","method":effect_method,"status_method":status_method,"output_capability":"display/output","output_schema":schema,"capture_provider":"capture","selector_schema":"selector/1","required_access":"exclusive","mutation_domains":["seat:0"]});
         settings.finalize_policies = vec![serde_json::from_value(finalize).unwrap()];
         assert!(settings.validate().is_ok());
         settings
@@ -933,9 +946,16 @@ mod tests {
         settings.finalize_policies[0].required_access = ResourceAccess::Exclusive;
         settings.finalize_policies[0].mutation_domains.clear();
         assert!(settings.validate().is_err());
+        settings.finalize_policies[0].domain_scope = DomainScope::Resource;
+        assert!(settings.validate().is_ok());
         settings.finalize_policies[0]
             .mutation_domains
             .insert("seat:0".into());
+        assert!(settings.validate().is_err());
+        settings.finalize_policies[0].mutation_domains.clear();
+        settings.finalize_policies[0].status_method.interface_major = 1;
+        assert!(settings.validate().is_err());
+        settings.finalize_policies[0].status_method.interface_major = 2;
         settings.finalize_policies[0].output_schema.digest = "f".repeat(64);
         assert!(settings.validate().is_err());
         settings.finalize_policies.clear();
