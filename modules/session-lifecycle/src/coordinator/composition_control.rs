@@ -637,7 +637,10 @@ impl Coordinator {
             &mut validate_applied,
             send,
         );
-        if outcome.is_ok() {
+        // Applied is durably persisted by the driver before advance succeeds.
+        // Settlement reconstructs from that state and does not need the
+        // in-memory effect driver, which must not pin a completed transition.
+        if outcome.is_ok() && !matches!(driver.state().phase, ControlPhase::Applied { .. }) {
             self.control_drivers.insert(runtime_key, driver);
         }
         outcome?;
