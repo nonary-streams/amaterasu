@@ -24,6 +24,9 @@ pub struct ActionTargetDescription {
     /// Canonical retained owner output, when available, independently verified by the coordinator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_output: Option<ResourceOutput>,
+    /// Generation authenticated from the selected owner's canonical root callback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_generation: Option<u64>,
     pub streams: Vec<ActionTargetStream>,
     pub obligations: Vec<ResourceObligation>,
     pub mutation_domains: BTreeMap<String, ActionTargetDomain>,
@@ -40,6 +43,17 @@ pub fn validate_action_target_description(
         || serde_json::to_vec(description).map_or(true, |bytes| bytes.len() > 16 * 1024)
     {
         return Err("invalid action target description".into());
+    }
+    if description
+        .resource_generation
+        .is_some_and(|generation| generation == 0)
+        || description.owner_output.is_some() != description.resource_generation.is_some()
+        || description
+            .admitted_plans
+            .iter()
+            .any(|plan| plan.resource_generation == Some(0))
+    {
+        return Err("invalid action resource generation".into());
     }
     if let Some(output) = &description.owner_output {
         crate::validate_resource_output(output)?;
@@ -107,6 +121,9 @@ pub struct ActionTargetAdmittedPlan {
     pub admission_id: String,
     pub target: LifecycleTarget,
     pub phase: LifecyclePhase,
+    /// Generation independently derived from this plan's retained root proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_generation: Option<u64>,
     pub plan: ResourcePlan,
 }
 
@@ -129,9 +146,15 @@ mod tests {
     }
     #[test]
     fn owner_output_must_match_provider_and_session_scope() {
-        let value = json!({"version":2,"status":"succeeded","provider":"example.display","target":{"kind":"session","host_epoch":"epoch","session_id":"session","expected_generation":3},"session_target":{"kind":"session","host_epoch":"epoch","session_id":"session","generation":3},"execution_domain":"seat","settings_revision":"snapshot","settings":{},"streams":[],"obligations":[],"mutation_domains":{},"admitted_plans":[],"resource_targets":[],"stale_mutation_domains":[],"owner_output":{"output_id":"output","capability":"example.display","schema":{"id":"example.schema","major":2,"minor":0,"digest":"a".repeat(64)},"producer":"example.display","producer_service":"example.display/2","origin":{"kind":"session","host_epoch":"epoch","session_id":"session","generation":3},"resource":{"provider":"example.display","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":null,"mutation_domains":[]},"data":{}}});
+        let value = json!({"version":2,"status":"succeeded","provider":"example.display","target":{"kind":"session","host_epoch":"epoch","session_id":"session","expected_generation":3},"session_target":{"kind":"session","host_epoch":"epoch","session_id":"session","generation":3},"execution_domain":"seat","settings_revision":"snapshot","settings":{},"streams":[],"obligations":[],"mutation_domains":{},"admitted_plans":[],"resource_targets":[],"stale_mutation_domains":[],"resource_generation":7,"owner_output":{"output_id":"output","capability":"example.display","schema":{"id":"example.schema","major":2,"minor":0,"digest":"a".repeat(64)},"producer":"example.display","producer_service":"example.display/2","origin":{"kind":"session","host_epoch":"epoch","session_id":"session","generation":3},"resource":{"provider":"example.display","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":null,"mutation_domains":[]},"data":{}}});
         let description: ActionTargetDescription = serde_json::from_value(value).unwrap();
         assert!(validate_action_target_description(&description).is_ok());
+        let mut missing = description.clone();
+        missing.resource_generation = None;
+        assert!(validate_action_target_description(&missing).is_err());
+        let mut zero = description.clone();
+        zero.resource_generation = Some(0);
+        assert!(validate_action_target_description(&zero).is_err());
         let mut foreign = description;
         foreign.owner_output.as_mut().unwrap().producer = "foreign".into();
         assert!(validate_action_target_description(&foreign).is_err());
