@@ -22,6 +22,21 @@ pub fn resolve(path: &str) -> Option<Route> {
             "extension_call",
             Some("account.self"),
         ),
+        ("session-extensions", action) => (
+            "amaterasu.extension-registry/1",
+            match action {
+                "list" => "list",
+                "describe" => "describe",
+                "settings_get" => "settings_get",
+                "settings_update" => "settings_update",
+                _ => return None,
+            },
+            Some(if action == "settings_update" {
+                "configuration.write"
+            } else {
+                "configuration.read"
+            }),
+        ),
         ("auth", "enroll") => ("amaterasu.authentication/1", "enroll_first_admin", None),
         ("auth", "change_password") => (
             "amaterasu.authentication/1",
@@ -471,13 +486,35 @@ pub fn payload(route: Route, bytes: &[u8]) -> Result<Value, &'static str> {
         return Err("the route defines the action");
     }
     crate::route_payload::validate(route, object)?;
-    object.insert("action".into(), route.action.into());
+    if route.service == "amaterasu.extension-registry/1" {
+        object.insert("operation".into(), route.action.into());
+    } else {
+        object.insert("action".into(), route.action.into());
+    }
     Ok(value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_extension_settings_only_accept_host_scope_and_server_action() {
+        let update = resolve("/v1/session-extensions/settings_update").unwrap();
+        assert_eq!(update.scope, Some("configuration.write"));
+        let valid = br#"{"provider":"example","scope":{"kind":"host"},"expected_revision":3,"values":{"enabled":false}}"#;
+        assert_eq!(
+            payload(update, valid).unwrap()["operation"],
+            "settings_update"
+        );
+        for invalid in [
+            br#"{"provider":"example","scope":{"kind":"session","id":"s"},"expected_revision":3,"values":{}}"#.as_slice(),
+            br#"{"provider":"example","scope":{"kind":"host"},"expected_revision":3,"values":{},"operation":"list"}"#,
+            br#"{"provider":"example","scope":{"kind":"host"},"values":{}}"#,
+        ] {
+            assert!(payload(update, invalid).is_err());
+        }
+    }
 
     #[test]
     fn portal_selection_routes_require_capture_scopes_and_bounded_fields() {

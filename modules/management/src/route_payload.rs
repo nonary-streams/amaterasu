@@ -35,6 +35,7 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         "amaterasu.management/1" if route.action == "package_selection_status" => {
             fields(object, &[], &[])
         }
+        "amaterasu.extension-registry/1" => session_extensions(route.action, object),
         "amaterasu.authentication/1" => authentication(route.action, object),
         "amaterasu.management/1" => management_settings(route.action, object),
         "amaterasu.host-configuration/1" => host_configuration(route.action, object),
@@ -364,6 +365,56 @@ fn video(action: &str, object: &Object) -> Result<(), &'static str> {
         || !operation_id.bytes().all(|byte| byte.is_ascii_graphic())
     {
         return Err(INVALID);
+    }
+    Ok(())
+}
+
+fn session_extensions(action: &str, object: &Object) -> Result<(), &'static str> {
+    match action {
+        "list" => {
+            fields(object, &[], &["after", "limit"])?;
+            if object.get("after").is_some_and(|value| {
+                !value.is_null()
+                    && !value
+                        .as_str()
+                        .is_some_and(|s| !s.is_empty() && s.len() <= 256)
+            }) || object
+                .get("limit")
+                .is_some_and(|value| !value.as_u64().is_some_and(|n| (1..=64).contains(&n)))
+            {
+                return Err(INVALID);
+            }
+        }
+        "describe" => {
+            fields(object, &["provider"], &[])?;
+            text(object, "provider")?;
+        }
+        "settings_get" | "settings_update" => {
+            if action == "settings_get" {
+                fields(object, &["provider", "scope"], &[])?;
+            } else {
+                fields(
+                    object,
+                    &["provider", "scope", "expected_revision", "values"],
+                    &[],
+                )?;
+            }
+            text(object, "provider")?;
+            // HTTP has not authenticated ownership of session/client targets.
+            if object.get("scope") != Some(&serde_json::json!({"kind":"host"})) {
+                return Err(INVALID);
+            }
+            if action == "settings_update"
+                && (object
+                    .get("expected_revision")
+                    .and_then(Value::as_u64)
+                    .is_none()
+                    || !object.get("values").is_some_and(Value::is_object))
+            {
+                return Err(INVALID);
+            }
+        }
+        _ => return Err(INVALID),
     }
     Ok(())
 }

@@ -8801,6 +8801,7 @@ var Amaterasu;
     Amaterasu.settingsSearchMatches = settingsSearchMatches;
     function renderSettings(context) {
         const area = Amaterasu.el("div", "settings-area-registered");
+        const sessionExtensionsArea = Amaterasu.el("div", "settings-area-session-extensions");
         const registeredLoads = new RegisteredConfigurationLoadGate();
         const authArea = Amaterasu.el("div", "settings-area-auth");
         const authLoads = new AuthTokenSettingsLoadGate();
@@ -8838,7 +8839,7 @@ var Amaterasu;
         const managementArea = Amaterasu.el("div", "settings-area-management");
         const csrfArea = Amaterasu.el("div", "settings-area-csrf");
         const categories = [
-            { id: "general", label: "General", description: "Host logging, updates, and registered settings.", areas: [area, hostLoggingArea, updaterArea, systemTrayArea] },
+            { id: "general", label: "General", description: "Host logging, updates, and registered settings.", areas: [area, sessionExtensionsArea, hostLoggingArea, updaterArea, systemTrayArea] },
             { id: "streaming", label: "Streaming", description: "Configure the host, capture, input, and session reporting.", areas: [hostArea, pipewireArea, inputArea, historyArea, metricsArea] },
             { id: "integrations", label: "Integrations", description: "Manage application providers and library imports.", areas: [steamArea, lutrisArea, playniteArea] },
             { id: "devices", label: "Devices", description: "Manage paired client settings.", areas: [pairingArea] },
@@ -10218,6 +10219,8 @@ var Amaterasu;
                     : Amaterasu.errorPanel(error, load));
             }
         }
+        if (typeof Amaterasu.renderSessionExtensionSettings === "function")
+            Amaterasu.renderSessionExtensionSettings(context, sessionExtensionsArea);
         void load();
         void loadAuth();
         void loadHostLogging();
@@ -15812,6 +15815,172 @@ var Amaterasu;
         }
     }
     Amaterasu.ExtensionPages = ExtensionPages;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
+    function extensionFieldEditor(definition, value) {
+        switch (definition.type) {
+            case "boolean": {
+                const control = Amaterasu.input("", "", "checkbox");
+                control.checked = value === true;
+                return { node: control, value: () => control.checked };
+            }
+            case "integer":
+            case "decimal": {
+                const control = Amaterasu.input("", String(value), "number");
+                control.step = definition.type === "integer" ? "1" : "any";
+                if (definition.minimum != null)
+                    control.min = String(definition.minimum);
+                if (definition.maximum != null)
+                    control.max = String(definition.maximum);
+                return { node: control, value: () => {
+                        if (!control.value || !control.validity.valid)
+                            throw new Error("Enter a valid number.");
+                        const number = Number(control.value);
+                        if (!Number.isFinite(number) || (definition.type === "integer" && !Number.isSafeInteger(number)))
+                            throw new Error("Enter a valid number.");
+                        return number;
+                    } };
+            }
+            case "string": {
+                const control = Amaterasu.input("", typeof value === "string" ? value : "");
+                if (definition.max_length != null)
+                    control.maxLength = definition.max_length;
+                return { node: control, value: () => control.value };
+            }
+            case "enum": {
+                const control = Amaterasu.el("select");
+                for (const option of definition.options ?? []) {
+                    const element = Amaterasu.el("option", "", option);
+                    element.value = option;
+                    control.append(element);
+                }
+                if (typeof value === "string")
+                    control.value = value;
+                return { node: control, value: () => control.value };
+            }
+            case "object": {
+                if (!definition.fields || !value || typeof value !== "object" || Array.isArray(value))
+                    throw new Error("Invalid object setting.");
+                const group = Amaterasu.el("fieldset", "extension-object");
+                const editors = Object.entries(definition.fields).map(([name, child]) => {
+                    const editor = extensionFieldEditor(child, value[name]);
+                    const label = Amaterasu.el("label", "field", Amaterasu.el("span", "field-label", name), editor.node);
+                    group.append(label);
+                    return [name, editor];
+                });
+                return { node: group, value: () => Object.fromEntries(editors.map(([name, editor]) => [name, editor.value()])) };
+            }
+            case "list": {
+                if (!definition.item || !Array.isArray(value))
+                    throw new Error("Invalid list setting.");
+                const itemDefinition = definition.item;
+                const group = Amaterasu.el("div", "extension-list");
+                const rows = Amaterasu.el("div");
+                const editors = [];
+                const append = (itemValue) => {
+                    const editor = extensionFieldEditor(itemDefinition, itemValue);
+                    const row = Amaterasu.el("div", "extension-list-item", editor.node);
+                    const remove = Amaterasu.button("Remove", () => {
+                        const index = editors.indexOf(editor);
+                        if (index >= 0)
+                            editors.splice(index, 1);
+                        row.remove();
+                    });
+                    row.append(remove);
+                    editors.push(editor);
+                    rows.append(row);
+                };
+                for (const item of value)
+                    append(item);
+                group.append(rows, Amaterasu.button("Add", () => append(structuredClone(itemDefinition.default))));
+                return { node: group, value: () => editors.map((editor) => editor.value()) };
+            }
+            default:
+                throw new Error(`Unsupported setting type: ${definition.type}`);
+        }
+    }
+    Amaterasu.extensionFieldEditor = extensionFieldEditor;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
+    function renderSessionExtensionSettings(context, area) {
+        let generation = 0;
+        async function load() {
+            const current = ++generation;
+            try {
+                const descriptors = [];
+                let after = null;
+                const seen = new Set();
+                do {
+                    const page = await context.api.post("session-extensions/list", { after, limit: 32 });
+                    if (!Array.isArray(page.items) || (page.next !== null && typeof page.next !== "string"))
+                        throw new Error("Invalid extension discovery response.");
+                    descriptors.push(...page.items);
+                    after = page.next;
+                    if (after && seen.has(after))
+                        throw new Error("Extension discovery cursor repeated.");
+                    if (after)
+                        seen.add(after);
+                    if (descriptors.length > 1024)
+                        throw new Error("Too many extensions.");
+                } while (after);
+                const settings = await Promise.all(descriptors.map((descriptor) => context.api.post("session-extensions/settings_get", { provider: descriptor.provider, scope: { kind: "host" } })));
+                if (current !== generation || !context.content.isConnected)
+                    return;
+                const panels = [];
+                descriptors.forEach((descriptor, index) => {
+                    const document = settings[index];
+                    if (!document || !Array.isArray(descriptor.options))
+                        throw new Error("Invalid extension settings response.");
+                    const options = descriptor.options.filter((option) => option.allowed_scopes.includes("host"));
+                    if (!options.length)
+                        return;
+                    const form = Amaterasu.el("form", "settings-form");
+                    const editors = new Map();
+                    for (const option of options) {
+                        const effective = document.effective[option.id];
+                        if (!effective)
+                            throw new Error("Missing effective extension setting.");
+                        const isOverride = Object.hasOwn(document.values, option.id);
+                        const editor = Amaterasu.extensionFieldEditor(option.definition, isOverride ? document.values[option.id] : effective.value);
+                        const inherit = Amaterasu.input("", "", "checkbox");
+                        inherit.checked = !isOverride;
+                        form.append(Amaterasu.el("div", "field", Amaterasu.el("span", "field-label", option.label), editor.node, Amaterasu.el("label", "", inherit, " Inherit default"), Amaterasu.el("small", "muted", `${option.help} · Applies: ${option.apply_policy} · Source: ${effective.source === null ? "default" : JSON.stringify(effective.source)}`)));
+                        editors.set(option.id, { inherit, editor });
+                    }
+                    const status = Amaterasu.el("div");
+                    const save = Amaterasu.el("button", "button primary", "Save extension settings");
+                    save.type = "submit";
+                    save.disabled = !context.api.allows("configuration.write");
+                    form.append(status, save);
+                    form.addEventListener("submit", (event) => {
+                        event.preventDefault();
+                        void Amaterasu.runAction(save, status, async () => {
+                            const values = { ...document.values };
+                            for (const [id, entry] of editors) {
+                                if (entry.inherit.checked)
+                                    delete values[id];
+                                else
+                                    values[id] = entry.editor.value();
+                            }
+                            await context.api.post("session-extensions/settings_update", { provider: descriptor.provider, scope: { kind: "host" }, expected_revision: document.revision, values });
+                            context.notify("Extension settings saved. Active sessions may use an earlier snapshot.");
+                            await load();
+                        });
+                    });
+                    panels.push(Amaterasu.panel(descriptor.provider, form));
+                });
+                area.replaceChildren(...panels);
+            }
+            catch (error) {
+                if (current === generation && context.content.isConnected)
+                    area.replaceChildren(Amaterasu.errorPanel(error, load));
+            }
+        }
+        void load();
+    }
+    Amaterasu.renderSessionExtensionSettings = renderSessionExtensionSettings;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {

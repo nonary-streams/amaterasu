@@ -39,6 +39,8 @@
     "src/tokens.ts",
     "src/maintenance.ts",
     "src/extensions.ts",
+    "src/extension_fields.ts",
+    "src/session_extensions.ts",
     "src/app.ts"
   ]
 }

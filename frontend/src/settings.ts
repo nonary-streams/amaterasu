@@ -3102,6 +3102,7 @@ namespace Amaterasu {
 
   export function renderSettings(context: PageContext): void {
     const area = el("div", "settings-area-registered");
+    const sessionExtensionsArea = el("div", "settings-area-session-extensions");
     const registeredLoads = new RegisteredConfigurationLoadGate();
     const authArea = el("div", "settings-area-auth");
     const authLoads = new AuthTokenSettingsLoadGate();
@@ -3139,7 +3140,7 @@ namespace Amaterasu {
     const managementArea = el("div", "settings-area-management");
     const csrfArea = el("div", "settings-area-csrf");
     const categories = [
-      { id: "general", label: "General", description: "Host logging, updates, and registered settings.", areas: [area, hostLoggingArea, updaterArea, systemTrayArea] },
+      { id: "general", label: "General", description: "Host logging, updates, and registered settings.", areas: [area, sessionExtensionsArea, hostLoggingArea, updaterArea, systemTrayArea] },
       { id: "streaming", label: "Streaming", description: "Configure the host, capture, input, and session reporting.", areas: [hostArea, pipewireArea, inputArea, historyArea, metricsArea] },
       { id: "integrations", label: "Integrations", description: "Manage application providers and library imports.", areas: [steamArea, lutrisArea, playniteArea] },
       { id: "devices", label: "Devices", description: "Manage paired client settings.", areas: [pairingArea] },
@@ -5144,6 +5145,8 @@ namespace Amaterasu {
         );
       }
     }
+    if (typeof Amaterasu.renderSessionExtensionSettings === "function")
+      Amaterasu.renderSessionExtensionSettings(context, sessionExtensionsArea);
     void load();
     void loadAuth();
     void loadHostLogging();
