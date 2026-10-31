@@ -28,6 +28,7 @@ struct Record {
     selected_provider: String,
     registry_revision: u64,
     descriptor: amaterasu_extension_api::ActionDescriptor,
+    dispatch: Option<crate::dispatch::Dispatch>,
 }
 
 #[derive(Default, Deserialize)]
@@ -106,6 +107,17 @@ enum Stage {
         epoch: Box<Epoch>,
         invoke: Box<ActionInvoke>,
     },
+    Plan(Box<PlanContext>),
+}
+struct PlanContext {
+    incoming: Incoming,
+    revision: u64,
+    metadata: Value,
+    epoch: Epoch,
+    invoke: ActionInvoke,
+    action: amaterasu_extension_api::ActionDescriptor,
+    provider: String,
+    registry_revision: u64,
 }
 struct Pending {
     request: u64,
@@ -218,12 +230,14 @@ impl ActionsModule {
             Stage::Read(incoming) => incoming.id,
             Stage::Write { parent, .. } => *parent,
             Stage::Descriptor { incoming, .. } => incoming.id,
+            Stage::Plan(context) => context.incoming.id,
         };
         let descriptor = matches!(stage, Stage::Descriptor { .. });
         let phase = match &stage {
             Stage::Read(_) => "read",
             Stage::Write { .. } => "write",
             Stage::Descriptor { .. } => "descriptor",
+            Stage::Plan(_) => "plan",
         };
         match self.runtime.send(Command::Request {
             service: if descriptor {
@@ -268,6 +282,7 @@ impl ActionsModule {
                         invoke,
                     } => self
                         .after_descriptor(incoming, revision, metadata, *epoch, *invoke, payload),
+                    Stage::Plan(context) => self.after_plan(*context, payload),
                     Stage::Write { parent, result } => {
                         if payload.get("ok") == Some(&Value::Bool(true)) {
                             self.complete(parent, result)
@@ -282,6 +297,7 @@ impl ActionsModule {
                     Stage::Read(incoming) => incoming.id,
                     Stage::Write { parent, .. } => parent,
                     Stage::Descriptor { incoming, .. } => incoming.id,
+                    Stage::Plan(context) => context.incoming.id,
                 };
                 self.complete(parent, failure("state_unavailable"))
             }
@@ -464,7 +480,7 @@ impl ActionsModule {
         incoming: Incoming,
         revision: u64,
         metadata: Value,
-        mut epoch: Epoch,
+        epoch: Epoch,
         invoke: ActionInvoke,
         response: Value,
     ) -> ModuleResult<()> {
@@ -514,6 +530,74 @@ impl ActionsModule {
         {
             return self.complete(incoming.id, failure("permission_denied"));
         }
+        let Some(method) = action.plan.clone() else {
+            return self.complete(incoming.id, failure("plan_unavailable"));
+        };
+        let payload = json!({"version":1,"operation_id":invoke.operation_id,"action_id":invoke.action_id,"target":invoke.target,"arguments":invoke.arguments,"expected_settings_revision":invoke.expected_settings_revision});
+        let request = Command::CallApi {
+            service: method.service,
+            method: method.method,
+            interface_major: method.interface_major,
+            interface_minor: method.interface_minor,
+            payload,
+            timeout_ms: 5_000,
+            operation_id: format!("actions-{}-plan", incoming.id),
+            parent: Some(incoming.id),
+        };
+        let parent = incoming.id;
+        let stage = Stage::Plan(Box::new(PlanContext {
+            incoming,
+            revision,
+            metadata,
+            epoch,
+            invoke,
+            action,
+            provider: provider.to_owned(),
+            registry_revision,
+        }));
+        match self.runtime.send(request)? {
+            Response::Accepted { id } => {
+                self.pending.push_back(Pending { request: id, stage });
+                Ok(())
+            }
+            _ => self.complete(parent, failure("plan_unavailable")),
+        }
+    }
+    fn after_plan(&mut self, context: PlanContext, response: Value) -> ModuleResult<()> {
+        let PlanContext {
+            incoming,
+            revision,
+            metadata,
+            mut epoch,
+            invoke,
+            action,
+            provider,
+            registry_revision,
+        } = context;
+        if response.get("status").and_then(Value::as_str) != Some("planned")
+            || response.get("operation_id").and_then(Value::as_str)
+                != Some(invoke.operation_id.as_str())
+            || response.get("action_id").and_then(Value::as_str) != Some(invoke.action_id.as_str())
+            || response.get("target") != serde_json::to_value(&invoke.target).ok().as_ref()
+        {
+            return self.complete(incoming.id, failure("invalid_plan"));
+        }
+        let Ok(mut dispatch) = crate::dispatch::Dispatch::new(
+            invoke.clone(),
+            action.clone(),
+            provider.clone(),
+            registry_revision,
+            incoming.caller.clone(),
+            incoming.initiator.clone(),
+        ) else {
+            return self.complete(incoming.id, failure("invalid_plan"));
+        };
+        if dispatch
+            .accept_plan(response.get("plan").cloned().unwrap_or(Value::Null))
+            .is_err()
+        {
+            return self.complete(incoming.id, failure("invalid_plan"));
+        }
         let receipt = json!({"status":"rejected","receipt_id":invoke.operation_id,"operation_id":invoke.operation_id,"result":null,"reason":"lifecycle_permit_unavailable"});
         let epoch_id = invoke.epoch.clone();
         epoch.receipts.insert(
@@ -521,9 +605,10 @@ impl ActionsModule {
             Record {
                 request: invoke,
                 receipt: receipt.clone(),
-                selected_provider: provider.to_owned(),
+                selected_provider: provider,
                 registry_revision,
                 descriptor: action,
+                dispatch: Some(dispatch),
             },
         );
         self.write(incoming.id, revision, metadata, &epoch_id, &epoch, receipt)
@@ -646,6 +731,14 @@ mod tests {
                         }
                     };
                     self.results.insert(self.next, value);
+                    Response::Accepted { id: self.next }
+                }
+                Command::CallApi {
+                    payload, parent, ..
+                } => {
+                    assert!(parent.is_some());
+                    self.next += 1;
+                    self.results.insert(self.next, json!({"status":"planned","operation_id":payload["operation_id"],"action_id":payload["action_id"],"target":payload["target"],"plan":{"mutation_domains":[]}}));
                     Response::Accepted { id: self.next }
                 }
                 Command::TakeResult { request } => Response::Result {
