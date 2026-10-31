@@ -106,6 +106,31 @@ impl AuthorityJournal for SessionPrepareWriter {
     }
 }
 
+/// Retain a dependent callback and its settled control permits together.
+struct DependentFinishWriter {
+    shared: Shared,
+    key: String,
+    provider: String,
+    state: PrepareState,
+}
+impl AuthorityJournal for DependentFinishWriter {
+    fn persist(&mut self, authority: &AuthorityState) -> ModuleResult<()> {
+        let mut next = self.shared.borrow().value.clone();
+        let admission = self
+            .state
+            .admission_id
+            .as_deref()
+            .ok_or("admission_missing")?;
+        if !authority.settled.contains_key(admission) {
+            return Err("dependent_admission_not_retained".into());
+        }
+        next.authority = authority.clone();
+        apply_participant(&mut next, &self.key, &self.provider, &self.state, true)?;
+        validate_journal(&next).map_err(|_| "invalid_dependent_journal")?;
+        save(&self.shared, next)
+    }
+}
+
 /// Atomically persist terminal cleanup evidence with participant progress.
 struct StreamReleaseWriter {
     shared: Shared,
@@ -159,7 +184,12 @@ fn apply_participant(
             || (allow_composition
                 && (state.request.version != 2
                     || (outputs.len() != 1
-                        && !(work.phase == LifecyclePhase::SessionPrepare && outputs.is_empty()))))
+                        && !(outputs.is_empty()
+                            && (work.phase == LifecyclePhase::SessionPrepare
+                                || work
+                                    .provider_graph
+                                    .as_ref()
+                                    .is_some_and(|graph| graph.order.len() > 1))))))
         {
             return Err("composition_response_not_supported".into());
         }
@@ -768,14 +798,20 @@ impl Coordinator {
                     self.fail_work(&key, "restart_requires_cleanup")?;
                     continue;
                 }
-                let standalone_stream = work.phase == LifecyclePhase::StreamPrepare
-                    && work.providers.len() == 1
-                    && self.settings.participants.iter().any(|participant| {
-                        participant.provider == work.providers[0]
-                            && participant.contract_version
-                                == amaterasu_extension_api::COMPOSITION_VERSION
+                let composition_stream = work.phase == LifecyclePhase::StreamPrepare
+                    && work
+                        .provider_graph
+                        .as_ref()
+                        .is_some_and(|graph| graph.order == work.providers)
+                    && self.settings.finalize_policies.iter().any(|policy| {
+                        work.providers.contains(&policy.owner_provider)
+                            && self.settings.participants.iter().any(|participant| {
+                                participant.provider == policy.owner_provider
+                                    && participant.contract_version
+                                        == amaterasu_extension_api::COMPOSITION_VERSION
+                            })
                     });
-                if standalone_stream && work.candidate.is_none() {
+                if composition_stream && work.candidate.is_none() {
                     let outcome = if work
                         .composition_progress
                         .as_ref()
@@ -1209,6 +1245,28 @@ impl Coordinator {
                 {
                     let admission = state.admission_id.as_deref().ok_or("admission_missing")?;
                     let writer = SessionPrepareWriter {
+                        shared: self.shared.clone(),
+                        key: key.clone(),
+                        provider: provider.clone(),
+                        state: state.clone(),
+                    };
+                    let mut finish = CoordinatorPrepareAuthority::new(
+                        self.shared.borrow().value.authority.clone(),
+                        self.work_selections(&work)?,
+                        writer,
+                    )?;
+                    if let Err(reason) = finish.finish_admission_retained(provider, admission) {
+                        self.fail_work(&key, &reason)?;
+                    }
+                    self.drivers.remove(&runtime_key);
+                    continue;
+                }
+                if composed_v2
+                    && work.phase == LifecyclePhase::StreamPrepare
+                    && matches!(&state.response, Some(ProviderResponse::Prepared { outputs, .. }) if outputs.is_empty())
+                {
+                    let admission = state.admission_id.as_deref().ok_or("admission_missing")?;
+                    let writer = DependentFinishWriter {
                         shared: self.shared.clone(),
                         key: key.clone(),
                         provider: provider.clone(),

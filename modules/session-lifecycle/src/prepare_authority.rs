@@ -752,6 +752,12 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
             let admission = state
                 .admissions
                 .get(&permit.request.admission_id)
+                .or_else(|| {
+                    permit
+                        .settled
+                        .then(|| state.settled.get(&permit.request.admission_id))
+                        .flatten()
+                })
                 .ok_or("orphaned control permit")?;
             if !valid_id(id)
                 || permit.request.permit_id != *id
@@ -768,7 +774,28 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
             {
                 return Err("invalid recovered control permit".into());
             }
-            validate_control_binding(admission, &permit.context, &permit.request, &state.snapshot)?;
+            if permit.settled {
+                let proposal = &permit.request.proposal;
+                if admission.provider != permit.context.policy.dependent_provider
+                    || !admission.plan.control_proposals.contains(proposal)
+                    || permit.context.target != permit.request.target
+                    || permit.context.transition_id != permit.request.transition_id
+                    || proposal.target != permit.request.target
+                    || proposal.owner_provider != permit.context.policy.owner_provider
+                    || proposal.resource != permit.context.output.resource
+                    || proposal.output_id != permit.context.output.output_id
+                {
+                    return Err("invalid settled control permit".into());
+                }
+                amaterasu_extension_api::validate_resource_control_request(&permit.request)?;
+            } else {
+                validate_control_binding(
+                    admission,
+                    &permit.context,
+                    &permit.request,
+                    &state.snapshot,
+                )?;
+            }
         }
         for (id, permit) in &state.finalize_permits {
             let admission = state
@@ -982,8 +1009,9 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
             next.refresh_required.insert(domain.clone());
         }
         next.admissions.remove(admission_id);
-        next.control_permits
-            .retain(|_, permit| permit.request.admission_id != admission_id);
+        next.control_permits.retain(|_, permit| {
+            permit.request.admission_id != admission_id || (retain_history && permit.settled)
+        });
         next.finalize_permits
             .retain(|_, permit| permit.request.admission_id != admission_id);
         if retain_output {
@@ -2331,8 +2359,23 @@ mod tests {
                 .is_err()
         );
         authority
-            .finish_admission("display", &request.admission_id)
+            .finish_admission_retained("display", &request.admission_id)
             .unwrap();
+        assert!(
+            authority
+                .state
+                .control_permits
+                .get(&request.permit_id)
+                .is_some_and(|permit| permit.consumed && permit.settled)
+        );
+        assert!(
+            CoordinatorPrepareAuthority::new(
+                authority.state.clone(),
+                vec![selected],
+                Journal::default()
+            )
+            .is_ok()
+        );
     }
 
     #[test]

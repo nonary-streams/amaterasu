@@ -28,6 +28,8 @@ mod finalize_result_verify;
 #[allow(dead_code)] // Finalization selection remains gated until composition sequencing is wired.
 mod finalize_selection;
 mod operations;
+#[allow(dead_code)]
+mod plan_observation;
 mod provider_observations;
 mod providers;
 mod recovery;
