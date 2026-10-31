@@ -10,6 +10,17 @@ use amaterasu_extension_api::{
 };
 use serde_json::{Value, json};
 
+/// Closed or expired stream scopes cannot authorize a new native effect.
+pub(super) fn ensure_effect_scope_open(
+    journal: &Journal,
+    target: &LifecycleTarget,
+) -> amaterasu_module_sdk::ModuleResult<()> {
+    if !journal.closed_streams.validate(journal) || journal.closed_streams.scope_fenced(target) {
+        return Err("closed_stream_effect_fenced".into());
+    }
+    Ok(())
+}
+
 /// A checkpoint and any original result for the same stream are ambiguous,
 /// including when the residual result belongs to the other query kind.
 pub(super) fn has_original_result(journal: &Journal, target: &LifecycleTarget) -> bool {
@@ -68,6 +79,18 @@ pub(super) fn control_settlement(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_scope_fences_effects_but_not_another_stream() {
+        use sha2::{Digest, Sha256};
+        let target: LifecycleTarget = serde_json::from_value(json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1})).unwrap();
+        let other: LifecycleTarget = serde_json::from_value(json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"other","generation":1})).unwrap();
+        let bytes = serde_json::to_vec(&json!(["closed-stream-scope-v1", target])).unwrap();
+        let digest = format!("{:x}", Sha256::digest(bytes));
+        let journal: Journal = serde_json::from_value(json!({"version":3,"host_epoch":"epoch","receipts":{},"sessions":{},"closed_streams":{"records":[],"expired_scopes":[digest]}})).unwrap();
+        assert!(ensure_effect_scope_open(&journal, &target).is_err());
+        assert!(ensure_effect_scope_open(&journal, &other).is_ok());
+    }
 
     #[test]
     fn missing_certificate_never_produces_an_authorized_response() {

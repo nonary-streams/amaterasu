@@ -326,6 +326,10 @@ impl FinalizeEndpointBackend for Backend<'_> {
         resolved: &ResolvedFinalize,
         request: &ResourceFinalizeRequest,
     ) -> ModuleResult<ControlPermitUse> {
+        super::checkpoint_queries::ensure_effect_scope_open(
+            &self.coordinator.shared.borrow().value,
+            &request.target,
+        )?;
         self.authority(request)?.consume_finalize_permit(
             owner,
             &resolved.participant,
@@ -339,6 +343,10 @@ impl FinalizeEndpointBackend for Backend<'_> {
         resolved: &ResolvedFinalize,
         request: &ResourceFinalizeRequest,
     ) -> ModuleResult<()> {
+        super::checkpoint_queries::ensure_effect_scope_open(
+            &self.coordinator.shared.borrow().value,
+            &request.target,
+        )?;
         self.authority(request)?.validate_finalize_permit(
             owner,
             &resolved.participant,

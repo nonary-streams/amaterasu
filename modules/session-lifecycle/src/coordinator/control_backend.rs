@@ -708,6 +708,10 @@ impl ControlEndpointBackend for Backend<'_> {
         resolved: &ResolvedControl,
         request: &ResourceControlRequest,
     ) -> ModuleResult<ControlPermitUse> {
+        super::checkpoint_queries::ensure_effect_scope_open(
+            &self.coordinator.shared.borrow().value,
+            &request.target,
+        )?;
         ensure_control_operation_unfenced(
             &self.coordinator.shared.borrow().value,
             owner,
@@ -728,6 +732,10 @@ impl ControlEndpointBackend for Backend<'_> {
         resolved: &ResolvedControl,
         request: &ResourceControlRequest,
     ) -> ModuleResult<()> {
+        super::checkpoint_queries::ensure_effect_scope_open(
+            &self.coordinator.shared.borrow().value,
+            &request.target,
+        )?;
         ensure_control_operation_unfenced(
             &self.coordinator.shared.borrow().value,
             owner,
