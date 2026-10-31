@@ -641,12 +641,32 @@ impl Coordinator {
         let Some(transfer) = &work.action_transfer else {
             return false;
         };
-        transfer.stage == ActionTransferStage::ReplanRequired
-            && journal
-                .actions
-                .execution_for_permit(&transfer.service, &transfer.permit)
-                .is_ok_and(|(provider, _, _)| provider == caller)
-            && super::action_release_proof::validate_replan_stage(journal, receipt, work, transfer)
+        let selected_owner = journal
+            .actions
+            .execution_for_permit(&transfer.service, &transfer.permit)
+            .is_ok_and(|(provider, _, _)| provider == caller);
+        selected_owner
+            && match transfer.stage {
+                ActionTransferStage::ReplanRequired => {
+                    super::action_release_proof::validate_replan_stage(
+                        journal, receipt, work, transfer,
+                    )
+                }
+                ActionTransferStage::Rebound => {
+                    journal.actions.claimed_effect_for(
+                        &transfer.service,
+                        &transfer.permit,
+                        &transfer.binding,
+                        caller,
+                    ) && super::action_endpoints::effect_rights_current(
+                        journal,
+                        &transfer.service,
+                        &transfer.permit,
+                        &transfer.binding,
+                    )
+                }
+                ActionTransferStage::CleanupPending => false,
+            }
     }
 }
 

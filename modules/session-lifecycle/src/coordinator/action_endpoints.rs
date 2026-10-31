@@ -1712,7 +1712,7 @@ fn active_provider_revision<'a>(
     Some(revision)
 }
 
-fn effect_rights_current(
+pub(super) fn effect_rights_current(
     journal: &super::Journal,
     service: &str,
     token: &str,

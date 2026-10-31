@@ -660,6 +660,29 @@ impl ActionAuthority {
         })
     }
 
+    /// Read-only proof that this exact selected provider has already claimed
+    /// the still-running transferred action. This grants no additional effect.
+    pub(crate) fn claimed_effect_for(
+        &self,
+        service: &str,
+        token: &str,
+        binding: &ActionBinding,
+        provider: &str,
+    ) -> bool {
+        self.validate().is_ok()
+            && self.reservations.get(&key(binding)).is_some_and(|item| {
+                item.action_service == service
+                    && item.permit_token == token
+                    && item.binding == *binding
+                    && item.transition_id.is_some()
+                    && item.transition_ready
+                    && matches!(item.state, ReservationState::Running)
+                    && item.execution.as_ref().is_some_and(|execution| {
+                        execution.claimed && execution.provider == provider
+                    })
+            })
+    }
+
     /// Read the approvals frozen for this service and permit. This does not
     /// grant effect rights; callers must separately verify the active transfer.
     pub fn approval_snapshot_for_permit(
@@ -1534,11 +1557,25 @@ mod tests {
             authority.binding_for_provider("display", &token),
             Ok(binding.clone())
         );
+        assert!(!authority.claimed_effect_for("action-service", &token, &binding, "display"));
         assert!(
             authority
                 .claim_effect("display", &token, &binding, &method)
                 .is_ok()
         );
+        assert!(authority.claimed_effect_for("action-service", &token, &binding, "display"));
+        assert!(!authority.claimed_effect_for("action-service", &token, &binding, "foreign"));
+        assert!(!authority.claimed_effect_for("action-service", "wrong", &binding, "display"));
+        let mut changed_binding = binding.clone();
+        changed_binding.target = ActionTarget::Host {
+            host_epoch: "epoch".into(),
+        };
+        assert!(!authority.claimed_effect_for(
+            "action-service",
+            &token,
+            &changed_binding,
+            "display"
+        ));
         assert!(
             authority
                 .inspect_effect("display", &token, &binding, &method)
