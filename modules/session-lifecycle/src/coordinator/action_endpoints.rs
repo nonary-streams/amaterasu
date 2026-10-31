@@ -16,9 +16,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-// An action transition currently retires consumers but does not run dependent
-// provider cleanup. Until it does, a persisted dependency graph must prove that
-// no provider depends on the provider whose resource the action will mutate.
+// Validate frozen dependency graphs before using them to schedule cleanup.
 fn valid_dependency_graph(
     order: &[String],
     dependencies: &BTreeMap<String, Vec<String>>,
@@ -395,6 +393,10 @@ impl Coordinator {
                         &journal,
                         &stream_target,
                         &selected.participant.provider,
+                    ) && !self.composed_action_ready(
+                        &journal,
+                        &stream_target,
+                        &selected.participant.provider,
                     ) {
                         return rejection("action_dependencies_unresolved");
                     }
@@ -587,7 +589,9 @@ impl Coordinator {
                     stream_id: stream_id.clone(),
                     generation: stream.generation,
                 };
-                if !action_dependencies_clear(&journal, &target, &provider) {
+                if !action_dependencies_clear(&journal, &target, &provider)
+                    && !self.composed_action_ready(&journal, &target, &provider)
+                {
                     return rejection("action_dependencies_unresolved");
                 }
                 let Some(provider_graph) = stream.provider_graph.clone() else {
@@ -1658,9 +1662,7 @@ fn rebind_borrower_scope(
     action_borrower_scope(&scope, target, provider, plan)
 }
 
-/// Preflight only: a future qualified cleanup scheduler may use this before
-/// transferring a composed action. It grants neither rights nor a release proof.
-#[allow(dead_code)]
+/// Preflight for a composed cleanup. It grants neither rights nor a release proof.
 pub(super) fn composed_action_preflight(
     journal: &super::Journal,
     target: &amaterasu_extension_api::LifecycleTarget,
@@ -1724,6 +1726,44 @@ pub(super) fn composed_action_preflight(
         session_graph,
         provider,
     )
+}
+
+impl Coordinator {
+    // The scheduler can release only the frozen graph of selected v2 providers.
+    // Match the installed settings and graph before accepting the transfer.
+    fn composed_action_ready(
+        &self,
+        journal: &super::Journal,
+        target: &amaterasu_extension_api::LifecycleTarget,
+        provider: &str,
+    ) -> bool {
+        if !composed_action_preflight(journal, target, provider) {
+            return false;
+        }
+        let Ok(snapshot) = capture_action_snapshot(journal, target) else {
+            return false;
+        };
+        if snapshot.stream_graph.order.len() < 2 {
+            return false;
+        }
+        [&snapshot.session_graph, &snapshot.stream_graph]
+            .iter()
+            .all(|graph| {
+                graph.order.iter().all(|id| {
+                    let Some(selection) = self.selections.get(id) else {
+                        return false;
+                    };
+                    let selected = &selection.participant;
+                    selected.contract_version == amaterasu_extension_api::COMPOSITION_VERSION
+                        && self
+                            .settings
+                            .participants
+                            .iter()
+                            .any(|installed| installed == selected)
+                        && graph.dependencies.get(id) == Some(&selected.depends_on)
+                })
+            })
+    }
 }
 
 fn action_dependencies_clear(
@@ -2054,6 +2094,119 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires active composed journal in AMATERASU_COMPOSED_ACTION_JOURNAL"]
+    fn captured_composed_preflight_requires_noop_and_exact_graph() {
+        let path = std::env::var("AMATERASU_COMPOSED_ACTION_JOURNAL").unwrap();
+        let mut value: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let journal: super::super::Journal = serde_json::from_value(value.clone()).unwrap();
+        let (session_id, session) = journal
+            .sessions
+            .iter()
+            .find(|(_, session)| {
+                session
+                    .streams
+                    .values()
+                    .any(|stream| stream.phase == StreamPhase::Active)
+            })
+            .unwrap();
+        let (stream_id, stream) = session
+            .streams
+            .iter()
+            .find(|(_, stream)| stream.phase == StreamPhase::Active)
+            .unwrap();
+        let target = amaterasu_extension_api::LifecycleTarget::Stream {
+            host_epoch: session.host_epoch.clone(),
+            session_id: session_id.clone(),
+            stream_id: stream_id.clone(),
+            generation: stream.generation,
+        };
+        let owner = &stream.binding_owner;
+        assert!(composed_action_preflight(&journal, &target, owner));
+        let path = std::env::temp_dir().join(format!(
+            "composed-preflight-{}",
+            super::super::identifier().unwrap()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut coordinator = Coordinator::open(&path.join("journal")).unwrap();
+        coordinator.selections.clear();
+        coordinator.settings.participants.clear();
+        for id in &session.provider_graph.as_ref().unwrap().order {
+            let selection = journal
+                .authority
+                .settled
+                .values()
+                .find(|entry| &entry.provider == id)
+                .unwrap()
+                .selection
+                .clone();
+            coordinator
+                .settings
+                .participants
+                .push(selection.participant.clone());
+            coordinator.selections.insert(id.clone(), selection);
+        }
+        assert!(coordinator.composed_action_ready(&journal, &target, owner));
+        let missing = coordinator.selections.remove(owner).unwrap();
+        assert!(!coordinator.composed_action_ready(&journal, &target, owner));
+        coordinator.selections.insert(owner.clone(), missing);
+        coordinator.settings.participants[0].contract_version = 1;
+        assert!(!coordinator.composed_action_ready(&journal, &target, owner));
+        drop(coordinator);
+        std::fs::remove_dir_all(path).unwrap();
+
+        let mut stale = target.clone();
+        if let amaterasu_extension_api::LifecycleTarget::Stream { generation, .. } = &mut stale {
+            *generation += 1;
+        }
+        assert!(!composed_action_preflight(&journal, &stale, owner));
+        let dependent = session
+            .provider_graph
+            .as_ref()
+            .unwrap()
+            .order
+            .iter()
+            .find(|id| *id != owner)
+            .unwrap();
+        let records = value["session_prepare_evidence"]["records"]
+            .as_array_mut()
+            .unwrap();
+        let evidence = records
+            .iter_mut()
+            .find(|item| item["proof"]["participant"]["provider"] == *dependent)
+            .unwrap();
+        let id = evidence["admission_id"].as_str().unwrap().to_owned();
+        evidence["proof"]["request"]["approved_plan"]["consumer_change"] =
+            json!("reconnect_required");
+        evidence["proof"]["terminal"]["call"]["arguments"]["approved_plan"]["consumer_change"] =
+            json!("reconnect_required");
+        value["authority"]["settled"][&id]["plan"]["consumer_change"] = json!("reconnect_required");
+        // A matching admitted plan with effects cannot count as a no-op.
+        let changed: super::super::Journal = serde_json::from_value(value).unwrap();
+        assert!(!composed_action_preflight(&changed, &target, owner));
+        let mut changed = journal.clone();
+        changed
+            .sessions
+            .get_mut(session_id)
+            .unwrap()
+            .streams
+            .get_mut(stream_id)
+            .unwrap()
+            .provider_graph
+            .as_mut()
+            .unwrap()
+            .dependencies
+            .get_mut(dependent)
+            .unwrap()
+            .push("missing".into());
+        assert!(!composed_action_preflight(&changed, &target, owner));
+    }
+
+    #[test]
     fn action_graph_requires_proven_independence() {
         let order = vec!["display".into(), "control".into(), "other".into()];
         let mut graph = BTreeMap::from([
@@ -2365,6 +2518,31 @@ mod tests {
             &stream_target,
             "display"
         ));
+        // Matching composed graphs are still fenced without authenticated,
+        // no-effect session preparation from the dependent provider.
+        let mut no_evidence = stream_only.clone();
+        no_evidence
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .provider_graph = no_evidence.sessions["session"].streams["stream"]
+            .provider_graph
+            .clone();
+        assert!(!composed_action_preflight(
+            &no_evidence,
+            &stream_target,
+            "display"
+        ));
+        assert!(!coordinator.composed_action_ready(&no_evidence, &stream_target, "display"));
+        let stale = amaterasu_extension_api::LifecycleTarget::Stream {
+            host_epoch: epoch.clone(),
+            session_id: "session".into(),
+            stream_id: "stream".into(),
+            generation: 3,
+        };
+        assert!(!composed_action_preflight(&no_evidence, &stale, "display"));
+        assert!(!coordinator.composed_action_ready(&no_evidence, &stale, "display"));
+
         let issued = coordinator.action_operation(&service, "service", &auth);
         assert_eq!(issued["status"], "succeeded");
         let mut request = json!({"operation":"consume_action_permit","operation_id":"op-transition","action_id":"display/remove","target":target,"plan_digest":auth["plan_digest"],"permit":issued["permit"]});
