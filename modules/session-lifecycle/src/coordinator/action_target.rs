@@ -3,6 +3,142 @@
 use super::*;
 use amaterasu_extension_api::ActionTarget;
 
+fn unique_admission_generation(generations: &[Option<u64>], root_generation: u64) -> Option<u64> {
+    (root_generation > 0 && generations == [Some(root_generation)]).then_some(root_generation)
+}
+
+/// Attach only generation values frozen in authenticated owner admission evidence.
+fn attach_admitted_generations(
+    journal: &Journal,
+    root: &super::composition::StoredOutput,
+    metadata: &mut Value,
+) -> ModuleResult<()> {
+    let root_generation = super::resource_generation::current_root_generation(journal, root)?;
+    let entries = metadata["admitted_plans"]
+        .as_array_mut()
+        .ok_or("admitted_plans_invalid")?;
+    for entry in entries {
+        let id = entry["admission_id"]
+            .as_str()
+            .ok_or("admission_id_missing")?;
+        let admission = journal
+            .authority
+            .settled
+            .get(id)
+            .ok_or("admission_unsettled")?;
+        if admission.provider != root.output.producer
+            || entry["plan"] != serde_json::to_value(&admission.plan).map_err(|_| "plan_invalid")?
+        {
+            return Err("admission_mismatch".into());
+        }
+        let mut generations = Vec::new();
+        if id == root.admission_id {
+            let proof = root
+                .callback_proof
+                .as_ref()
+                .ok_or("root_callback_missing")?;
+            generations.push(proof.request.resource_generation);
+        }
+        for stage in journal
+            .composition
+            .staged_outputs()
+            .filter(|stage| stage.admission_id == id)
+        {
+            if !journal.composition.validate_structure() {
+                return Err("stage_provenance_invalid".into());
+            }
+            if stage.before.producer != root.output.producer
+                || stage.before.output_id != root.output.output_id
+                || stage.before.origin != root.output.origin
+                || entry["target"]
+                    != serde_json::to_value(&stage.target).map_err(|_| "target_invalid")?
+                || entry["plan"] != serde_json::to_value(&stage.plan).map_err(|_| "plan_invalid")?
+            {
+                return Err("stage_admission_mismatch".into());
+            }
+            if stage.plan != admission.plan
+                || stage.callback_proof.participant != admission.selection.participant
+                || !super::composition::callback_approvals_valid(
+                    &stage.callback_proof,
+                    &admission.selection.approvals,
+                    &admission.provider,
+                )
+            {
+                return Err("stage_admission_unproven".into());
+            }
+            let previous = journal
+                .composition
+                .staged_outputs()
+                .take_while(|item| *item != stage)
+                .filter(|item| {
+                    item.after.producer == root.output.producer
+                        && item.after.output_id == root.output.output_id
+                        && item.after.origin == root.output.origin
+                })
+                .last();
+            let before_valid = match (previous, &stage.prior_release_admission) {
+                (None, None) => stage.before == root.output,
+                (Some(previous), Some(prior)) => journal
+                    .verified_released_output(&previous.target)
+                    .is_some_and(|(admission, output)| {
+                        admission == prior && output == &stage.before
+                    }),
+                _ => false,
+            };
+            if !before_valid {
+                return Err("stage_lineage_unproven".into());
+            }
+            generations.push(stage.callback_proof.request.resource_generation);
+        }
+        for result in journal
+            .finalize_results
+            .records()
+            .filter(|result| result.request.admission_id == id)
+        {
+            if result.selection.input != *root
+                || entry["target"]
+                    != serde_json::to_value(&result.request.target).map_err(|_| "target_invalid")?
+                || entry["plan"]
+                    != serde_json::to_value(&result.plan).map_err(|_| "plan_invalid")?
+            {
+                return Err("finalize_admission_mismatch".into());
+            }
+            let permit = journal
+                .authority
+                .finalize_permits
+                .get(&result.request.permit_id)
+                .ok_or("finalize_permit_missing")?;
+            if !result.validate_structure()
+                || !result.validate_control_chain(journal)
+                || !permit.consumed
+                || !permit.settled
+                || permit.request != result.request
+                || permit.context.target != result.request.target
+                || permit.context.transition_id != result.request.transition_id
+                || permit.context.policy != result.selection.policy
+                || permit.context.output != result.request.output
+                || permit.context.control_results != result.request.control_results
+                || result.plan != admission.plan
+                || !journal.authority.output_admissions.contains(id)
+                || result
+                    .plan_approval
+                    .as_ref()
+                    .is_none_or(|approval| !admission.selection.approvals.contains(approval))
+            {
+                return Err("finalize_admission_unproven".into());
+            }
+            generations.push(result.plan_request.resource_generation);
+        }
+        let generation = unique_admission_generation(&generations, root_generation)
+            .ok_or("admission_generation_unavailable")?;
+        entry
+            .as_object_mut()
+            .ok_or("admitted_plan_invalid")?
+            .insert("resource_generation".into(), json!(generation));
+    }
+    Ok(())
+}
+
 impl Coordinator {
     pub(super) fn describe_action_target(&self, caller: &str, payload: &Value) -> Value {
         match payload.get("version") {
@@ -341,7 +477,7 @@ impl Coordinator {
             }
             mutation_domains.insert(domain, state);
         }
-        let Ok(metadata) = super::provider_observations::session_metadata(
+        let Ok(mut metadata) = super::provider_observations::session_metadata(
             journal,
             session,
             caller,
@@ -349,6 +485,9 @@ impl Coordinator {
         ) else {
             return rejection("provider_metadata_unavailable");
         };
+        if attach_admitted_generations(journal, record, &mut metadata).is_err() {
+            return rejection("admission_generation_unavailable");
+        }
         let streams: Vec<_> = session.streams.iter().filter(|(_, stream)| stream.binding_owner == caller).map(|(stream_id, stream)| {
             json!({"target":{"kind":"stream","host_epoch":session.host_epoch,"session_id":session.id,"stream_id":stream_id,"expected_generation":stream.generation},"lifecycle_target":{"kind":"stream","host_epoch":session.host_epoch,"session_id":session.id,"stream_id":stream_id,"generation":stream.generation},"phase":stream.phase,"candidate":stream.candidate,"consumers_retired":stream.phase==StreamPhase::Retired || (stream.phase==StreamPhase::Quiescing && stream.retirements==stream.required)})
         }).collect();
@@ -413,5 +552,37 @@ impl Coordinator {
                 .execution_for_permit(&transfer.service, &transfer.permit)
                 .is_ok_and(|(provider, _, _)| provider == caller)
             && super::action_release_proof::validate_replan_stage(journal, receipt, work, transfer)
+    }
+}
+
+#[cfg(test)]
+mod admission_generation_tests {
+    use super::*;
+
+    #[test]
+    fn unavailable_root_generation_cannot_be_claimed() {
+        let journal: Journal = serde_json::from_value(
+            json!({"version":3,"host_epoch":"epoch","receipts":{},"sessions":{}}),
+        )
+        .unwrap();
+        let selected = super::super::finalize_selection::tests::fixture();
+        let mut metadata = json!({"admitted_plans":[{"admission_id":selected.input.admission_id,"target":selected.input.output.origin,"plan":selected.input.plan}]});
+        assert!(attach_admitted_generations(&journal, &selected.input, &mut metadata).is_err());
+        assert!(
+            metadata["admitted_plans"][0]
+                .get("resource_generation")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn generation_evidence_must_be_unique_present_and_current() {
+        assert_eq!(unique_admission_generation(&[Some(1)], 1), Some(1));
+        assert_eq!(unique_admission_generation(&[], 1), None);
+        assert_eq!(unique_admission_generation(&[None], 1), None);
+        assert_eq!(unique_admission_generation(&[Some(2)], 1), None);
+        assert_eq!(unique_admission_generation(&[Some(1), Some(1)], 1), None);
+        assert_eq!(unique_admission_generation(&[Some(1), Some(2)], 1), None);
+        assert_eq!(unique_admission_generation(&[Some(0)], 0), None);
     }
 }
