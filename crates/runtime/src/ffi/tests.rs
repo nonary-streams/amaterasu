@@ -155,3 +155,118 @@ fn ffi_sdk_binding_delivers_table_and_releases_without_holding_broker_lock() {
     }
     unsafe { destroy_runtime(runtime) };
 }
+
+#[test]
+fn input_extension_sdk_client_and_provider_round_trip_over_ffi_broker() {
+    use amaterasu_module_sdk::input::extensions::{
+        Capability, Direction, Endpoint as InputEndpoint, ExtensionAdapter, Message, Principal,
+        Route, RoutePolicy, SERVICE, SubmitError,
+    };
+    use serde_json::{Value, json};
+
+    struct Recorder(Vec<u8>);
+    impl InputEndpoint for Recorder {
+        fn supports(&self, capability: &Capability) -> bool {
+            capability.schema == "example.device.attributes"
+                && capability.version == 1
+                && capability.direction == Direction::ToDevice
+        }
+        fn submit(&mut self, message: &Message) -> Result<(), SubmitError> {
+            self.0 = message.payload.clone();
+            Ok(())
+        }
+    }
+    let config = RuntimeConfig {
+        principals: [
+            (
+                "adapter".into(),
+                Grants {
+                    call: [SERVICE.into()].into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "provider".into(),
+                Grants {
+                    provide: [SERVICE.into()].into(),
+                    ..Default::default()
+                },
+            ),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let config = serde_json::to_vec(&config).unwrap();
+    let mut runtime = std::ptr::null_mut();
+    // SAFETY: configuration and output remain live for runtime creation.
+    assert_eq!(
+        unsafe { create_runtime(BorrowedBytes::new(&config), &mut runtime) },
+        STATUS_OK
+    );
+    {
+        // SAFETY: clients are dropped before the runtime, and endpoints are runtime-owned.
+        let client = unsafe { RuntimeClient::from_endpoint(endpoint(runtime, "adapter")) };
+        let provider = unsafe { RuntimeClient::from_endpoint(endpoint(runtime, "provider")) };
+        provider
+            .require_success(Command::Register {
+                service: SERVICE.into(),
+            })
+            .unwrap();
+        let route = Route {
+            host_epoch: "epoch".into(),
+            session: "session".into(),
+            source: "source".into(),
+            device: "pad".into(),
+            generation: 1,
+        };
+        let capability = Capability {
+            schema: "example.device.attributes".into(),
+            version: 1,
+            direction: Direction::ToDevice,
+        };
+        let offer = [capability.clone()].into();
+        let mut adapter = ExtensionAdapter::new(
+            Recorder(Vec::new()),
+            vec![RoutePolicy {
+                route: route.clone(),
+                provider_offer: offer,
+                adapter_offer: [capability.clone()].into(),
+                required: [capability.clone()].into(),
+                to_device: vec![Principal {
+                    caller: "adapter".into(),
+                    initiator: "adapter".into(),
+                }],
+                to_client: vec![],
+            }],
+        )
+        .unwrap();
+        let message = Message {
+            route,
+            capability,
+            sequence: 1,
+            payload: vec![1, 2, 3],
+        };
+        let id = message
+            .submit(&client, 5000, "sdk-input-extension", None)
+            .unwrap();
+        let incoming = provider.poll_serialized().unwrap().unwrap();
+        provider
+            .require_success(Command::CheckRequest {
+                request: incoming.id,
+            })
+            .unwrap();
+        provider
+            .complete_serialized(incoming.id, &adapter.dispatch(&incoming))
+            .unwrap();
+        assert_eq!(
+            client.take_serialized::<Value>(id).unwrap(),
+            Some(json!({"ok":true,"accepted":true}))
+        );
+        client
+            .require_success(Command::ReleaseResult { request: id })
+            .unwrap();
+        assert_eq!(adapter.endpoint().0, vec![1, 2, 3]);
+    }
+    // SAFETY: all runtime-bound clients have stopped before destruction.
+    unsafe { destroy_runtime(runtime) };
+}

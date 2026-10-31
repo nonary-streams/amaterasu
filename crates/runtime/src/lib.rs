@@ -11,3 +11,6 @@ pub use broker::Broker;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod input_extension_tests;

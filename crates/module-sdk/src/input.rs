@@ -85,3 +85,6 @@ mod tests {
         );
     }
 }
+
+/// Optional, separately composed extension messages for input devices.
+pub mod extensions;
