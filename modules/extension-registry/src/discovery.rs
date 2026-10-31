@@ -11,14 +11,21 @@ pub fn approvals(
     runtime: &RuntimeClient,
     parent: u64,
 ) -> ModuleResult<(u64, Vec<ApiMethodApproval>)> {
+    approvals_with(parent, |command| runtime.send(command))
+}
+
+fn approvals_with(
+    parent: u64,
+    mut send: impl FnMut(Command) -> ModuleResult<Response>,
+) -> ModuleResult<(u64, Vec<ApiMethodApproval>)> {
     let mut result = Vec::new();
     let mut after = None;
     let mut snapshot_revision = None;
     loop {
-        match runtime.send(Command::ListApiApprovals {
+        match send(Command::ListApiApprovals {
             parent: Some(parent),
             after,
-            limit: 64,
+            limit: 16,
         })? {
             Response::ApiApprovals {
                 revision,
@@ -146,4 +153,68 @@ pub fn describe(
 
 pub fn failure(code: &str, message: &str) -> Value {
     json!({"ok":false,"status":"error","error":{"code":code,"message":message}})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use amaterasu_contracts::ApiApprovalCursor;
+
+    #[test]
+    fn discovery_obeys_broker_page_limit_and_preserves_snapshot_revision() {
+        let mut calls = 0;
+        let (revision, approvals) = approvals_with(42, |command| {
+            let Command::ListApiApprovals {
+                parent,
+                after,
+                limit,
+            } = command
+            else {
+                panic!("wrong broker command")
+            };
+            assert_eq!(parent, Some(42));
+            assert!((1..=16).contains(&limit));
+            calls += 1;
+            let next = if after.is_none() {
+                Some(ApiApprovalCursor {
+                    revision: 7,
+                    service: "svc".into(),
+                    method: "method".into(),
+                    interface_major: 1,
+                })
+            } else {
+                None
+            };
+            Ok(Response::ApiApprovals {
+                revision: 7,
+                approvals: vec![],
+                next,
+            })
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(revision, 7);
+        assert!(approvals.is_empty());
+        let mut calls = 0;
+        assert!(
+            approvals_with(42, |_| {
+                calls += 1;
+                Ok(Response::ApiApprovals {
+                    revision: calls,
+                    approvals: vec![],
+                    next: if calls == 1 {
+                        Some(ApiApprovalCursor {
+                            revision: 1,
+                            service: "svc".into(),
+                            method: "m".into(),
+                            interface_major: 1,
+                        })
+                    } else {
+                        None
+                    },
+                })
+            })
+            .is_err()
+        );
+    }
 }

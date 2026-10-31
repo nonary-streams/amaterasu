@@ -238,6 +238,13 @@ impl SettingsService {
                         ));
                         continue;
                     };
+                    if !matches!(payload.get("found"), Some(Value::Bool(_))) {
+                        completed.push((
+                            id,
+                            discovery::failure("invalid_state", "state found flag missing"),
+                        ));
+                        continue;
+                    }
                     let document = if payload.get("found") == Some(&Value::Bool(false)) {
                         Document {
                             revision: 0,
@@ -496,10 +503,10 @@ impl SettingsService {
             }
             if let Some(handle) = *child {
                 if outcome.is_none() {
-                    match runtime.send(Command::TakeResult { request: handle })? {
-                        Response::Pending => continue,
-                        Response::Result { payload } => *outcome = Some(payload),
-                        Response::Error { code, message } => {
+                    match runtime.send(Command::TakeResult { request: handle }) {
+                        Ok(Response::Pending) | Err(_) => continue,
+                        Ok(Response::Result { payload }) => *outcome = Some(payload),
+                        Ok(Response::Error { code, message }) => {
                             *outcome = Some(discovery::failure(&code, &message))
                         }
                         _ => {
@@ -510,9 +517,9 @@ impl SettingsService {
                         }
                     }
                 }
-                match runtime.send(Command::ReleaseResult { request: handle })? {
-                    Response::Ok => (),
-                    Response::Error { code, .. } if code == "not_found" => (),
+                match runtime.send(Command::ReleaseResult { request: handle }) {
+                    Ok(Response::Ok) => (),
+                    Ok(Response::Error { code, .. }) if code == "not_found" => (),
                     _ => continue,
                 }
                 let response = outcome.take().expect("result collected");
@@ -558,11 +565,12 @@ impl SettingsService {
                 timeout_ms: remaining_ms.max(1),
                 operation_id: format!("extension-registry.{id}.validate.{index}"),
                 parent: Some(*id),
-            })? {
-                Response::Accepted { id } => *child = Some(id),
-                Response::Error { code, message } => {
+            }) {
+                Ok(Response::Accepted { id }) => *child = Some(id),
+                Ok(Response::Error { code, message }) => {
                     completed.push((*id, discovery::failure(&code, &message)))
                 }
+                Err(_) => continue,
                 _ => completed.push((
                     *id,
                     discovery::failure("invalid_response", "validation submission failed"),
