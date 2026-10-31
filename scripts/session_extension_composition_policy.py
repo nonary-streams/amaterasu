@@ -13,6 +13,7 @@ import prepare_session_extension_profile as legacy
 
 ACTION_OWNER_OPERATIONS = {"describe_action_target", "inspect_action_effect",
                            "verify_action_effect", "check_action_effect"}
+ACTION_COORDINATOR_OPERATIONS = {"rebind_action_plan"}
 
 
 def method_ref(provider: str, name: str) -> dict:
@@ -180,6 +181,9 @@ def build_bootstrap(base: dict, selected: list[dict], entries: dict, lifecycle_s
     owner_operations = lifecycle.get("operation_grants", {}).get(check.OWNER, [])
     if enable_action and not ACTION_OWNER_OPERATIONS <= set(owner_operations):
         raise ValueError("owner action operation grants are incomplete")
+    action_operations = lifecycle.get("operation_grants", {}).get(legacy.ACTIONS, [])
+    if enable_action and not ACTION_COORDINATOR_OPERATIONS <= set(action_operations):
+        raise ValueError("action-service operation grants are incomplete")
     lifecycle["participants"] = copy.deepcopy(entries["participants"])
     lifecycle["input_actions"] = copy.deepcopy(entries["input_actions"])
     settings[legacy.LIFECYCLE] = lifecycle
@@ -253,7 +257,7 @@ def lifecycle_configuration(journal_path: str, graph: dict, additional_grants: d
         raise ValueError("an absolute lifecycle journal path is required")
     if set(graph) != {"control_policies", "finalize_policies", "schema_documents"}:
         raise ValueError("complete installed graph is required")
-    if set(additional_grants) != {check.OWNER, check.DISPLAY}:
+    if not {check.OWNER, check.DISPLAY} <= set(additional_grants) or not set(additional_grants) <= {check.OWNER, check.DISPLAY, legacy.ACTIONS, legacy.INPUT, legacy.STREAM}:
         raise ValueError("reviewed operations for both providers are required")
     operations = copy.deepcopy(legacy.OPERATIONS)
     # The old combined provider's operations do not transfer to either v2
