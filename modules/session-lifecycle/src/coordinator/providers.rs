@@ -742,6 +742,7 @@ impl Coordinator {
                     status_polls: 0,
                     last_sequence: sequence,
                     dispatch: None,
+                    terminal_dispatch: None,
                     response: None,
                 };
                 WorkWriter {

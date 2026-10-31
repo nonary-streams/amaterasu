@@ -50,6 +50,9 @@ pub struct PrepareState {
     pub status_polls: u32,
     pub last_sequence: u64,
     pub dispatch: Option<DispatchRecord>,
+    /// Exact broker-completed callback/status evidence retained for output provenance.
+    #[serde(default)]
+    pub terminal_dispatch: Option<DispatchRecord>,
     pub response: Option<ProviderResponse>,
 }
 
@@ -367,8 +370,12 @@ impl PrepareDriver {
         journal: &mut impl PrepareJournal,
     ) -> ModuleResult<()> {
         let response: ProviderResponse =
-            serde_json::from_value(payload).map_err(|_| "invalid provider response")?;
+            serde_json::from_value(payload.clone()).map_err(|_| "invalid provider response")?;
         api::validate_provider_response(&self.state.request, &response)?;
+        let terminal_response = matches!(
+            response,
+            ProviderResponse::Prepared { .. } | ProviderResponse::Cleanup { .. }
+        );
         let mut next = self.state.clone();
         match &response {
             ProviderResponse::Planned { plan }
@@ -456,6 +463,11 @@ impl PrepareDriver {
             }
             _ => return Err("provider response not valid for prepare".into()),
         }
+        if terminal_response {
+            next.terminal_dispatch = self.state.dispatch.as_ref().filter(|record| {
+                matches!(&record.state, DispatchState::Completed { payload: stored } if stored == &payload)
+            }).cloned();
+        }
         next.dispatch = None;
         if let Err(error) = journal.persist(&next) {
             self.journal_failed = true;
@@ -512,6 +524,7 @@ mod tests {
             status_polls: 0,
             last_sequence: 1,
             dispatch: None,
+            terminal_dispatch: None,
             response: None,
         };
         (settings, state)
@@ -657,6 +670,10 @@ mod tests {
             }
         }
         assert_eq!(driver.state.phase, PreparePhase::Prepared);
+        assert!(
+            matches!(driver.state.terminal_dispatch.as_ref().map(|record| &record.state),
+            Some(DispatchState::Completed { payload }) if payload["status"] == "prepared")
+        );
         assert!(callback_seen);
         assert!(
             journal

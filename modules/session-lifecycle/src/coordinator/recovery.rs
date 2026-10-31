@@ -170,6 +170,7 @@ mod tests {
             status_polls: 1,
             last_sequence: 4,
             dispatch: None,
+            terminal_dispatch: None,
             response: None,
         };
         let work = Work {
