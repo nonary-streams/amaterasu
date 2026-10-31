@@ -671,6 +671,7 @@ name = "amaterasu-rtsp"
 version = "0.1.0"
 dependencies = [
  "amaterasu-contracts",
+ "amaterasu-extension-api",
  "amaterasu-gamestream",
  "amaterasu-input-policy",
  "amaterasu-media",
