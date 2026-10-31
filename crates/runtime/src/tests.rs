@@ -519,6 +519,28 @@ fn host_state_context_is_available_only_to_trusted_state_consumers() {
     configuration
         .principals
         .insert("other".into(), Grants::default());
+    configuration.principals.insert(
+        "example.external".into(),
+        Grants {
+            call: names(&[HOST_STATE_CONTEXT_SERVICE]),
+            ..Default::default()
+        },
+    );
+    configuration.principals.insert(
+        "example.unrelated".into(),
+        Grants {
+            call: names(&[HOST_LIFECYCLE_SERVICE]),
+            ..Default::default()
+        },
+    );
+    let requested = Grants {
+        call: names(&[HOST_STATE_CONTEXT_SERVICE]),
+        ..Default::default()
+    };
+    configuration.principals.insert(
+        "example.unapproved".into(),
+        requested.intersect(&Grants::default()),
+    );
     configuration
         .principals
         .insert("amaterasu.management".into(), Grants::default());
@@ -537,6 +559,32 @@ fn host_state_context_is_available_only_to_trusted_state_consumers() {
     };
     assert_eq!(payload["schema"], 1);
     assert!(payload.get("package_root").is_none());
+    let Response::Result { payload } =
+        broker.dispatch("example.external", Command::GetHostContext {})
+    else {
+        panic!("approved external module did not receive host state context");
+    };
+    assert_eq!(payload, json!({"schema": 1, "state_root": state_root}));
+    assert!(matches!(
+        broker.dispatch("example.external", Command::GetPackageRoot {}),
+        Response::Error { code, .. } if code == "permission_denied"
+    ));
+    assert!(matches!(
+        broker.dispatch("example.external", Command::GetRunningPackageDigest {}),
+        Response::Error { code, .. } if code == "permission_denied"
+    ));
+    assert!(matches!(
+        broker.dispatch("example.unrelated", Command::GetHostContext {}),
+        Response::Error { code, .. } if code == "permission_denied"
+    ));
+    assert!(matches!(
+        broker.dispatch("example.unapproved", Command::GetHostContext {}),
+        Response::Error { code, .. } if code == "permission_denied"
+    ));
+    assert!(matches!(
+        broker.dispatch("unknown", Command::GetHostContext {}),
+        Response::Error { code, .. } if code == "permission_denied"
+    ));
     let audio_context = broker.dispatch("amaterasu.audio", Command::GetHostContext {});
     if cfg!(target_os = "linux") {
         let Response::Result { payload } = audio_context else {

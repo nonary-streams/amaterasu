@@ -9,6 +9,10 @@ use std::collections::{BTreeMap, BTreeSet};
 /// it may request that the trusted host restart or stop the selected runtime.
 pub const HOST_LIFECYCLE_SERVICE: &str = "amaterasu.host-lifecycle/1";
 
+/// Effective call grant allowing a module to read the host-selected state root.
+/// It does not grant access to package metadata or host lifecycle commands.
+pub const HOST_STATE_CONTEXT_SERVICE: &str = "amaterasu.host-state-context/1";
+
 /// Reserved runtime endpoint identity injected by the verified host. Package
 /// component identities cannot use this name because it is not a valid name.
 pub const HOST_LIFECYCLE_CONTROL_PRINCIPAL: &str = "@amaterasu.host-lifecycle";

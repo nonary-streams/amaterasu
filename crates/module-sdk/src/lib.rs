@@ -122,9 +122,10 @@ impl RuntimeClient {
     }
 
     /// Returns the state location chosen by the trusted host for this worker.
-    /// The control-plane runtime exposes it to the state module and, on Linux,
-    /// to audio for its cleanup journal. Callers cannot substitute a JSON
-    /// setting or a package-supplied path.
+    /// The runtime exposes it to modules with the effective
+    /// `amaterasu.host-state-context/1` call grant, as well as the legacy state
+    /// module and Linux audio cleanup. This grant does not expose package
+    /// metadata. Callers cannot substitute a setting or package-supplied path.
     pub fn runtime_state_root(&self) -> ModuleResult<std::path::PathBuf> {
         let Response::Result { payload } = self.send(Command::GetHostContext {})? else {
             return Err("host context request did not return a result".into());

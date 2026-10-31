@@ -7,8 +7,8 @@ mod requests;
 
 use amaterasu_contracts::{
     Command, DIAGNOSTICS_COMPONENT, Grants, HOST_LIFECYCLE_CONTROL_PRINCIPAL,
-    HOST_LIFECYCLE_SERVICE, HOST_LOG_SERVICE, HostLifecycleAction, HostLogEvent, Response,
-    RuntimeConfig,
+    HOST_LIFECYCLE_SERVICE, HOST_LOG_SERVICE, HOST_STATE_CONTEXT_SERVICE, HostLifecycleAction,
+    HostLogEvent, Response, RuntimeConfig,
 };
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -161,6 +161,7 @@ impl Broker {
                 // its own Pulse cleanup journal after a worker restart.
                 if caller != "amaterasu.state"
                     && !(cfg!(target_os = "linux") && caller == "amaterasu.audio")
+                    && !grants.call.contains(HOST_STATE_CONTEXT_SERVICE)
                 {
                     return errors::permission_denied();
                 }
