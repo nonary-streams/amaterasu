@@ -158,18 +158,101 @@ impl ClosedActionBook {
             .collect()
     }
 
-    /// Exact admission IDs covered by fully verified action cleanup.
-    pub(super) fn closed_admissions(&self, target: &LifecycleTarget) -> Option<BTreeSet<String>> {
+    /// Exact original tuples covered by authenticated Released outcomes.
+    pub(super) fn discharged_obligations(
+        &self,
+        admission: &str,
+        transition: &str,
+        owner: &str,
+        generation: u64,
+    ) -> Option<&[amaterasu_extension_api::ResourceObligation]> {
         if !self.validate() {
             return None;
         }
-        Some(
-            self.records
-                .iter()
-                .filter(|record| &record.session_target == target)
-                .flat_map(|record| record.closed_admissions.iter().cloned())
-                .collect(),
-        )
+        let mut records = self.records.iter().filter(|record| {
+            record.retired_admission == admission
+                && record.retired_transition == transition
+                && record.owner == owner
+                && record.resource_generation == generation
+        });
+        let record = records.next()?;
+        records
+            .next()
+            .is_none()
+            .then_some(record.discharged_obligations.as_slice())
+    }
+
+    pub(super) fn certifies_cleanup_plan(
+        &self,
+        root: &composition::StoredOutput,
+        generation: u64,
+    ) -> bool {
+        if !self.validate() {
+            return false;
+        }
+        let mut records = self.records.iter().filter(|record| {
+            record.retired_admission == root.admission_id
+                && record.retired_transition == root.transition_id
+                && record.owner == root.output.producer
+                && record.resource_generation == generation
+                && record.retired_root == root.output
+        });
+        let Some(record) = records.next() else {
+            return false;
+        };
+        records.next().is_none()
+            && record.original_obligations.as_ref() == Some(&root.plan.obligations)
+    }
+
+    /// Exact admission IDs covered by fully verified action cleanup.
+    pub(super) fn closed_admissions(
+        &self,
+        journal: &Journal,
+        target: &LifecycleTarget,
+    ) -> Option<BTreeSet<String>> {
+        if !self.validate() {
+            return None;
+        }
+        let mut closed = BTreeSet::new();
+        for record in self
+            .records
+            .iter()
+            .filter(|record| &record.session_target == target)
+        {
+            closed.extend(
+                record
+                    .closed_admissions
+                    .iter()
+                    .filter(|id| *id != &record.retired_admission)
+                    .cloned(),
+            );
+            let mut roots = journal
+                .composition
+                .records()
+                .filter(|root| root.admission_id == record.retired_admission);
+            let retained_matches = match roots.next() {
+                Some(root) => {
+                    roots.next().is_none()
+                        && root.transition_id == record.retired_transition
+                        && root.output == record.retired_root
+                        && record.original_obligations.as_ref() == Some(&root.plan.obligations)
+                }
+                None => true,
+            };
+            if retained_matches
+                && record
+                    .original_obligations
+                    .as_ref()
+                    .is_some_and(|original| {
+                        original
+                            .iter()
+                            .all(|item| record.discharged_obligations.contains(item))
+                    })
+            {
+                closed.insert(record.retired_admission.clone());
+            }
+        }
+        Some(closed)
     }
 
     /// A retired root may be used only as historical evidence, never as a live effect grant.
@@ -238,6 +321,11 @@ pub(super) struct ClosedActionCertificate {
     retired_transition: String,
     closed_admissions: BTreeSet<String>,
     retired_root: amaterasu_extension_api::ResourceOutput,
+    /// None is legacy evidence and cannot establish complete root cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    original_obligations: Option<Vec<amaterasu_extension_api::ResourceObligation>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    discharged_obligations: Vec<amaterasu_extension_api::ResourceObligation>,
     replacement_generation: u64,
     replacement_admission: String,
     replacement_commitment: String,
@@ -381,6 +469,27 @@ impl ClosedActionCertificate {
             && self.closed_admissions.len() <= 128
             && self.closed_admissions.contains(&self.retired_admission)
             && self.closed_admissions.iter().all(|id| valid_id(id))
+            && self.original_obligations.as_ref().is_none_or(|original| {
+                original.len() <= 128
+                    && self
+                        .discharged_obligations
+                        .iter()
+                        .all(|item| original.contains(item))
+            })
+            && (self.original_obligations.is_some() || self.discharged_obligations.is_empty())
+            && self.discharged_obligations.len() <= 128
+            && self
+                .discharged_obligations
+                .iter()
+                .enumerate()
+                .all(|(index, obligation)| {
+                    valid_id(&obligation.obligation_id)
+                        && obligation.provider == self.owner
+                        && obligation.resource_id == self.retired_root.resource.resource_id
+                        && !self.discharged_obligations[..index]
+                            .iter()
+                            .any(|old| old.obligation_id == obligation.obligation_id)
+                })
             && self.retired_root.producer == self.owner
             && self.retired_root.origin == self.session_target
             && amaterasu_extension_api::validate_resource_output(&self.retired_root).is_ok()
@@ -496,6 +605,9 @@ impl ClosedActionCertificate {
         {
             return Err("action_closure_admission_unsettled".into());
         }
+        let discharged_obligations =
+            action_disposition::released_root_obligations(journal, old_root, marker)
+                .ok_or("action_cleanup_result_invalid")?;
         Ok(Self {
             version: 1,
             session_target: marker.session_target.clone(),
@@ -505,6 +617,8 @@ impl ClosedActionCertificate {
             retired_transition: old_root.transition_id.clone(),
             closed_admissions,
             retired_root: old_root.output.clone(),
+            original_obligations: Some(old_root.plan.obligations.clone()),
+            discharged_obligations,
             replacement_generation,
             replacement_admission,
             replacement_commitment,
@@ -551,6 +665,8 @@ mod tests {
             retired_admission: "retired".into(),
             retired_transition: "prepare".into(),
             closed_admissions: BTreeSet::from(["retired".into()]),
+            original_obligations: Some(Vec::new()),
+            discharged_obligations: Vec::new(),
             retired_root: serde_json::from_value(json!({"output_id":"output","capability":"screen","schema":{"id":"screen","major":1,"minor":0,"digest":"a".repeat(64)},"producer":"owner","producer_service":"owner/2","origin":{"kind":"session","host_epoch":"epoch","session_id":"session","generation":1},"resource":{"provider":"owner","resource_id":"display","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":null,"mutation_domains":[]},"data":{}})).unwrap(),
             replacement_generation: 2,
             replacement_admission: "replacement".into(),
@@ -579,6 +695,48 @@ mod tests {
     fn certified_replaced_root_retires_atomically() {
         let (mut journal, _, mut root) = resource_generation::tests::fixture();
         journal.receipts.clear();
+        let obligation: amaterasu_extension_api::ResourceObligation = serde_json::from_value(json!({
+            "obligation_id":"old-obligation", "provider":"owner", "resource_id":"display",
+            "mutation_domain":null, "depends_on":[], "cleanup_method":{"service":"owner/2",
+            "method":"cleanup", "interface_major":2,"interface_minor":0,"schema_revision":1}, "payload":{}
+        })).unwrap();
+        root.plan.obligations.push(obligation.clone());
+        let old_callback = root.callback_proof.as_mut().unwrap();
+        old_callback.request.approved_plan = Some(root.plan.clone());
+        old_callback.terminal.call.arguments = serde_json::to_value(&old_callback.request).unwrap();
+        old_callback.terminal.state = crate::provider_dispatch::DispatchState::Completed {
+            payload: json!({"status":"prepared", "candidate":null, "obligations":[obligation], "outputs":[root.output]}),
+        };
+        journal.authority.settled.get_mut("root").unwrap().plan = root.plan.clone();
+        journal
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .obligations
+            .push(obligation.clone());
+        let mut encoded = serde_json::to_value(&journal).unwrap();
+        encoded["composition"]["outputs"][0] = serde_json::to_value(&root).unwrap();
+        journal = serde_json::from_value(encoded).unwrap();
+        assert_eq!(
+            action_disposition::selected_root_obligations(
+                &journal,
+                &root,
+                &["old-obligation".into()]
+            ),
+            Some(vec![obligation.clone()])
+        );
+        assert!(
+            action_disposition::selected_root_obligations(&journal, &root, &["foreign".into()])
+                .is_none()
+        );
+        assert!(
+            action_disposition::selected_root_obligations(
+                &journal,
+                &root,
+                &["old-obligation".into(), "old-obligation".into()]
+            )
+            .is_none()
+        );
         let input = crate::input_authority::ActiveBinding {
             host_epoch: "epoch".into(),
             session_id: "session".into(),
@@ -641,10 +799,63 @@ mod tests {
         cert.retired_transition = root.transition_id.clone();
         cert.closed_admissions = BTreeSet::from([root.admission_id.clone()]);
         cert.retired_root = root.output.clone();
+        cert.original_obligations = Some(vec![obligation.clone()]);
+        cert.discharged_obligations = vec![obligation.clone()];
         cert.replacement_generation = 0;
         cert.replacement_admission.clear();
         cert.replacement_commitment.clear();
         journal.closed_actions.records.push(cert);
+        assert!(action_disposition::root_cleanup_complete(
+            &journal, "session", "owner", 7
+        ));
+        let mut missing_outcome = journal.clone();
+        missing_outcome.closed_actions.records[0]
+            .discharged_obligations
+            .clear();
+        assert!(!action_disposition::root_cleanup_complete(
+            &missing_outcome,
+            "session",
+            "owner",
+            7
+        ));
+        assert!(
+            !missing_outcome
+                .closed_actions
+                .closed_admissions(&missing_outcome, &root.output.origin)
+                .unwrap()
+                .contains("root")
+        );
+        assert!(
+            journal
+                .closed_actions
+                .closed_admissions(&journal, &root.output.origin)
+                .unwrap()
+                .contains("root")
+        );
+        let mut legacy = journal.clone();
+        legacy.closed_actions.records[0].original_obligations = None;
+        legacy.closed_actions.records[0]
+            .discharged_obligations
+            .clear();
+        assert!(
+            !legacy
+                .closed_actions
+                .closed_admissions(&legacy, &root.output.origin)
+                .unwrap()
+                .contains("root")
+        );
+        let mut tampered = missing_outcome.clone();
+        tampered.closed_actions.records[0].original_obligations = Some(Vec::new());
+        assert!(
+            !tampered
+                .closed_actions
+                .closed_admissions(&tampered, &root.output.origin)
+                .unwrap()
+                .contains("root")
+        );
+        assert!(!action_disposition::root_cleanup_complete(
+            &tampered, "session", "owner", 7
+        ));
         let proof = root.callback_proof.as_ref().unwrap();
         let response = match &proof.terminal.state {
             crate::provider_dispatch::DispatchState::Completed { payload } => payload.clone(),
@@ -661,7 +872,11 @@ mod tests {
         replacement.transition_id = "new-prepare".into();
         replacement.output.output_id = "new-output".into();
         replacement.output.resource.incarnation = "new-native".into();
+        let mut new_obligation = obligation.clone();
+        new_obligation.obligation_id = "new-obligation".into();
+        replacement.plan.obligations = vec![new_obligation.clone()];
         let callback = replacement.callback_proof.as_mut().unwrap();
+        callback.request.approved_plan = Some(replacement.plan.clone());
         callback.request.resource_generation = Some(8);
         callback.request.admission_id = Some("new-root".into());
         callback.request.transition_id = "new-prepare".into();
@@ -669,7 +884,7 @@ mod tests {
         callback.terminal.call.operation_id = "new-call".into();
         callback.terminal.call.arguments = serde_json::to_value(&callback.request).unwrap();
         callback.terminal.state = crate::provider_dispatch::DispatchState::Completed {
-            payload: json!({"status":"prepared","candidate":null,"obligations":[],"outputs":[replacement.output]}),
+            payload: json!({"status":"prepared","candidate":null,"obligations":[new_obligation],"outputs":[replacement.output]}),
         };
         let selection = composition::OutputSelection {
             producer: "owner".into(),
@@ -686,12 +901,14 @@ mod tests {
                 &|_| true,
             )
             .unwrap();
-        let admission = journal.authority.settled.get("root").unwrap().clone();
+        let mut admission = journal.authority.settled.get("root").unwrap().clone();
+        admission.plan = replacement.plan.clone();
         journal
             .authority
             .settled
             .insert("new-root".into(), admission);
         let session = journal.sessions.get_mut("session").unwrap();
+        session.obligations.push(new_obligation.clone());
         session.resource_generations.insert("owner".into(), 8);
         session.admission_ids.insert("new-root".into());
         session
@@ -707,7 +924,7 @@ mod tests {
             resource_generation::current_root_generation(&journal, &replacement),
             Ok(8)
         );
-        for mutation in 0..3 {
+        for mutation in 0..5 {
             let mut denied = journal.clone();
             match mutation {
                 0 => {
@@ -723,6 +940,21 @@ mod tests {
                         .authority
                         .domain_locks
                         .insert("seat".into(), "root".into());
+                }
+                2 => {
+                    denied.closed_actions.records[0]
+                        .discharged_obligations
+                        .clear();
+                }
+                3 => {
+                    denied
+                        .authority
+                        .settled
+                        .get_mut("new-root")
+                        .unwrap()
+                        .plan
+                        .obligations
+                        .push(obligation.clone());
                 }
                 _ => {
                     denied.closed_actions.records[0]
@@ -745,6 +977,16 @@ mod tests {
         assert_eq!(serde_json::to_value(&journal).unwrap(), before);
         action_root_retirement::retire_one(&mut journal, "root", "prepare", "owner", 7).unwrap();
         assert!(!journal.authority.settled.contains_key("root"));
+        assert!(
+            !journal.sessions["session"]
+                .obligations
+                .contains(&obligation)
+        );
+        assert!(
+            journal.sessions["session"]
+                .obligations
+                .contains(&new_obligation)
+        );
         assert!(
             journal
                 .composition

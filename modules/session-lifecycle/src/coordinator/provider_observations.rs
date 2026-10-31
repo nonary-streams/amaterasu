@@ -170,7 +170,7 @@ pub(super) fn closed_admissions(
     closed.extend(
         journal
             .closed_actions
-            .closed_admissions(&target)
+            .closed_admissions(journal, &target)
             .ok_or("closed_action_invalid")?,
     );
     if session.phase == SessionPhase::Ended

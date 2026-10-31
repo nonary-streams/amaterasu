@@ -424,6 +424,15 @@ impl Coordinator {
                 if validate_effect_plan(&plan, &context).is_err() {
                     return rejection("plan_not_admitted");
                 }
+                if !root_obligation_claims_current(
+                    &journal,
+                    selection
+                        .map(|value| value.participant.provider.as_str())
+                        .unwrap_or(""),
+                    &plan,
+                ) {
+                    return rejection("action_cleanup_selection_invalid");
+                }
                 let binding = ActionBinding {
                     operation_id: operation_id.into(),
                     target: target.clone(),
@@ -1486,6 +1495,38 @@ pub(super) fn action_borrower_scope(
     Ok(result)
 }
 
+/// Reject foreign cleanup claims before consumers are disrupted.
+fn root_obligation_claims_current(
+    journal: &super::Journal,
+    provider: &str,
+    plan: &ResourcePlan,
+) -> bool {
+    let Some(disposition) = plan.resource_disposition.as_deref() else {
+        return true;
+    };
+    if disposition.cleanup_obligation_ids.is_empty() {
+        return true;
+    }
+    let mut roots = journal.composition.records().filter(|root| {
+        root.output.producer == provider
+            && root.output.origin == disposition.origin
+            && root.output.output_id == disposition.output_id
+            && root.state == super::composition::OutputState::Retained
+            && super::resource_generation::current_root_generation(journal, root).ok()
+                == Some(disposition.resource_generation)
+    });
+    let Some(root) = roots.next() else {
+        return false;
+    };
+    roots.next().is_none()
+        && super::action_disposition::selected_root_obligations(
+            journal,
+            root,
+            &disposition.cleanup_obligation_ids,
+        )
+        .is_some()
+}
+
 pub(super) fn rebind_root_current(
     journal: &super::Journal,
     target: &amaterasu_extension_api::LifecycleTarget,
@@ -1537,6 +1578,15 @@ pub(super) fn rebind_root_current(
     if roots.next().is_some()
         || super::resource_generation::current_root_generation(journal, root).ok()
             != Some(disposition.resource_generation)
+    {
+        return false;
+    }
+    if super::action_disposition::selected_root_obligations(
+        journal,
+        root,
+        &disposition.cleanup_obligation_ids,
+    )
+    .is_none()
     {
         return false;
     }

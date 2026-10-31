@@ -111,6 +111,9 @@ fn required_reprepare(
         }
         let marker = action_disposition::resolved_at(journal, &session.id, owner, generation)
             .ok_or("resource_removal_proof_missing")?;
+        if !action_disposition::root_cleanup_complete(journal, &session.id, owner, generation) {
+            return Err("resource_cleanup_unresolved".into());
+        }
         if marker.resource_generation != generation
             || marker.owner != *owner
             || session.application_retired

@@ -67,12 +67,47 @@ pub(super) fn retire_one(
     {
         return Err("action_replacement_invalid".into());
     }
-    if root
-        .plan
-        .obligations
-        .iter()
-        .any(|obligation| session.obligations.contains(obligation))
-        || journal.authority.admissions.contains_key(admission)
+    if !journal
+        .closed_actions
+        .certifies_cleanup_plan(&root, generation)
+    {
+        return Err("action_cleanup_plan_unproven".into());
+    }
+    let discharged = journal
+        .closed_actions
+        .discharged_obligations(admission, transition, owner, generation)
+        .ok_or("action_cleanup_certificate_missing")?;
+    if root.plan.obligations.iter().any(|obligation| {
+        !discharged.contains(obligation)
+            || session
+                .obligations
+                .iter()
+                .filter(|item| item.obligation_id == obligation.obligation_id)
+                .count()
+                > 1
+            || session
+                .obligations
+                .iter()
+                .any(|item| item.obligation_id == obligation.obligation_id && item != obligation)
+            || session
+                .admission_ids
+                .iter()
+                .filter(|id| id.as_str() != admission)
+                .any(|id| {
+                    journal
+                        .authority
+                        .admissions
+                        .get(id)
+                        .or_else(|| journal.authority.settled.get(id))
+                        .is_none_or(|other| {
+                            other
+                                .plan
+                                .obligations
+                                .iter()
+                                .any(|item| item.obligation_id == obligation.obligation_id)
+                        })
+                })
+    }) || journal.authority.admissions.contains_key(admission)
         || journal
             .authority
             .domain_locks
@@ -114,6 +149,9 @@ pub(super) fn retire_one(
         .sessions
         .get_mut(session_id)
         .ok_or("action_session_missing")?;
+    session
+        .obligations
+        .retain(|item| !root.plan.obligations.contains(item));
     if !session.admission_ids.remove(admission)
         || session.admission_targets.remove(admission).as_ref() != Some(&certified.origin)
         || session.admission_phases.remove(admission) != Some(LifecyclePhase::SessionPrepare)

@@ -63,6 +63,146 @@ pub(super) fn marker_key(session_id: &str, owner: &str, generation: u64) -> Stri
     serde_json::to_string(&(session_id, owner, generation)).expect("marker key serializes")
 }
 
+/// Resolve nominated cleanup IDs solely from the authenticated producer plan.
+/// IDs are claims until tied to unique full obligation tuples in this session.
+pub(super) fn selected_root_obligations(
+    journal: &Journal,
+    root: &composition::StoredOutput,
+    ids: &[String],
+) -> Option<Vec<amaterasu_extension_api::ResourceObligation>> {
+    if ids.len() > 128 || !ids.windows(2).all(|pair| pair[0] < pair[1]) {
+        return None;
+    }
+    let LifecycleTarget::Session { session_id, .. } = &root.output.origin else {
+        return None;
+    };
+    let session = journal.sessions.get(session_id)?;
+    let admission = journal.authority.settled.get(&root.admission_id)?;
+    if admission.provider != root.output.producer || admission.plan != root.plan {
+        return None;
+    }
+    let mut selected = Vec::new();
+    for id in ids {
+        let mut obligations = root
+            .plan
+            .obligations
+            .iter()
+            .filter(|item| &item.obligation_id == id);
+        let item = obligations.next()?;
+        if obligations.next().is_some()
+            || item.provider != root.output.producer
+            || item.resource_id != root.output.resource.resource_id
+            || session
+                .obligations
+                .iter()
+                .filter(|value| value.obligation_id == *id)
+                .count()
+                != 1
+            || !session.obligations.contains(item)
+            || session
+                .admission_ids
+                .iter()
+                .filter(|other| *other != &root.admission_id)
+                .any(|other| {
+                    journal
+                        .authority
+                        .admissions
+                        .get(other)
+                        .or_else(|| journal.authority.settled.get(other))
+                        .is_none_or(|admission| {
+                            admission
+                                .plan
+                                .obligations
+                                .iter()
+                                .any(|value| value.obligation_id == *id)
+                        })
+                })
+        {
+            return None;
+        }
+        selected.push(item.clone());
+    }
+    Some(selected)
+}
+
+/// Obtain only owner-attested Released outcomes from an already verified marker.
+pub(super) fn released_root_obligations(
+    journal: &Journal,
+    root: &composition::StoredOutput,
+    marker: &ReleasedActionMarker,
+) -> Option<Vec<amaterasu_extension_api::ResourceObligation>> {
+    let disposition = marker.plan.resource_disposition.as_deref()?;
+    let selected = selected_root_obligations(journal, root, &disposition.cleanup_obligation_ids)?;
+    let completed = action_dispatch_proof::validate_dispatch_proof(
+        &marker.dispatch_proof,
+        &marker.binding,
+        &marker.permit,
+        &marker.plan,
+        &marker.approval_snapshot,
+    )
+    .ok()?;
+    let result = completed.resource_disposition?;
+    Some(released_outcome_tuples(selected, &result.cleanup_outcomes))
+}
+
+fn released_outcome_tuples(
+    selected: Vec<amaterasu_extension_api::ResourceObligation>,
+    outcomes: &[amaterasu_extension_api::CleanupOutcome],
+) -> Vec<amaterasu_extension_api::ResourceObligation> {
+    selected
+        .into_iter()
+        .filter(|item| {
+            outcomes.iter().any(|outcome| {
+                outcome.obligation_id == item.obligation_id
+                    && outcome.state == amaterasu_extension_api::CleanupState::Released
+            })
+        })
+        .collect()
+}
+
+/// Reprepare may not hide unresolved cleanup of the removed root.
+pub(super) fn root_cleanup_complete(
+    journal: &Journal,
+    session_id: &str,
+    owner: &str,
+    generation: u64,
+) -> bool {
+    let mut roots = journal.composition.records().filter(|root| {
+        root.output.producer == owner && root.state == composition::OutputState::Released
+            && matches!(&root.output.origin, LifecycleTarget::Session { session_id: id, .. } if id == session_id)
+            && resource_generation::historical_generation(journal, root).ok() == Some(generation)
+    });
+    let Some(root) = roots.next() else {
+        return false;
+    };
+    if roots.next().is_some() {
+        return false;
+    }
+    let discharged = journal
+        .closed_actions
+        .certifies_cleanup_plan(root, generation)
+        .then(|| {
+            journal.closed_actions.discharged_obligations(
+                &root.admission_id,
+                &root.transition_id,
+                owner,
+                generation,
+            )
+        })
+        .flatten()
+        .map(<[_]>::to_vec)
+        .or_else(|| {
+            let marker = verified_marker_at(journal, session_id, owner, generation)?;
+            released_root_obligations(journal, root, marker)
+        });
+    discharged.is_some_and(|items| {
+        root.plan
+            .obligations
+            .iter()
+            .all(|item| items.contains(item))
+    })
+}
+
 /// Revalidate historical authenticated evidence. Current cursor and a new root
 /// are checked separately by reprepare; this remains valid after cursor advance.
 pub(super) fn verified_marker<'a>(
@@ -175,6 +315,8 @@ pub(super) fn verified_marker_at<'a>(
         return None;
     }
     let result = completed.resource_disposition?;
+    let disposition = marker.plan.resource_disposition.as_deref()?;
+    selected_root_obligations(journal, root, &disposition.cleanup_obligation_ids)?;
     if completed.status != ActionProviderCompletionStatus::Succeeded
         || result.state != ActionResourceDispositionState::Released
         || result.output_id != marker.output_id
@@ -193,6 +335,37 @@ pub(super) fn verified_marker_at<'a>(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn only_explicit_released_outcomes_discharge_selected_tuples() {
+        let obligation: amaterasu_extension_api::ResourceObligation = serde_json::from_value(json!({
+            "obligation_id":"old", "provider":"owner", "resource_id":"resource", "mutation_domain":null,
+            "depends_on":[], "cleanup_method":{"service":"owner/2", "method":"cleanup", "interface_major":2,
+            "interface_minor":0,"schema_revision":1}, "payload":{"original":true}
+        })).unwrap();
+        let outcome = |state| amaterasu_extension_api::CleanupOutcome {
+            obligation_id: "old".into(),
+            state,
+            reason: None,
+        };
+        assert!(released_outcome_tuples(vec![obligation.clone()], &[]).is_empty());
+        for state in [
+            amaterasu_extension_api::CleanupState::Pending,
+            amaterasu_extension_api::CleanupState::DeferredRestoration,
+            amaterasu_extension_api::CleanupState::EffectUnknown,
+        ] {
+            assert!(
+                released_outcome_tuples(vec![obligation.clone()], &[outcome(state)]).is_empty()
+            );
+        }
+        assert_eq!(
+            released_outcome_tuples(
+                vec![obligation.clone()],
+                &[outcome(amaterasu_extension_api::CleanupState::Released)]
+            ),
+            vec![obligation]
+        );
+    }
 
     #[test]
     fn unproven_marker_cannot_survive_recovery_validation() {
