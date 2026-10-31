@@ -13,6 +13,8 @@ mod control_endpoints;
 mod control_settlement;
 #[allow(dead_code)]
 mod finalize_dispatch;
+#[allow(dead_code)]
+mod finalize_result;
 #[allow(dead_code)] // Finalization selection remains gated until composition sequencing is wired.
 mod finalize_selection;
 mod operations;
@@ -280,6 +282,8 @@ struct Journal {
     composition: composition::CompositionBook,
     #[serde(default)]
     control_settlements: control_settlement::ControlSettlementBook,
+    #[serde(default)]
+    finalize_results: finalize_result::FinalizeResultBook,
     /// Immutable producing transition of each retained admission.
     #[serde(default)]
     admission_transitions: BTreeMap<String, String>,
@@ -287,7 +291,10 @@ struct Journal {
 
 impl Journal {
     fn references_admission(&self, id: &str) -> bool {
-        self.composition.references_admission(id)
+        self.finalize_results
+            .records()
+            .any(|item| item.request.admission_id == id)
+            || self.composition.references_admission(id)
             || self
                 .control_settlements
                 .records()
@@ -453,6 +460,57 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                         == Some(&selection.target))
             })
         })
+        || !journal.finalize_results.validate_structure()
+        || journal.finalize_results.records().any(|item| {
+            let request = &item.request;
+            let Some(permit) = journal.authority.finalize_permits.get(&request.permit_id) else {
+                return true;
+            };
+            let Some(admission) = journal
+                .authority
+                .admissions
+                .get(&request.admission_id)
+                .or_else(|| journal.authority.settled.get(&request.admission_id))
+            else {
+                return true;
+            };
+            let Some(selection) = journal.composition.finalize_selection(
+                &request.target,
+                &request.transition_id,
+                &item.selection.policy.owner_provider,
+                &request.output.output_id,
+            ) else {
+                return true;
+            };
+            let Ok((_, session_id, _, _)) = operations::target_parts(&request.target) else {
+                return true;
+            };
+            let Some(session) = journal.sessions.get(session_id) else {
+                return true;
+            };
+            !permit.consumed
+                || !permit.settled
+                || !journal
+                    .authority
+                    .output_admissions
+                    .contains(&request.admission_id)
+                || !session.admission_ids.contains(&request.admission_id)
+                || session.admission_targets.get(&request.admission_id) != Some(&request.target)
+                || session.admission_phases.get(&request.admission_id)
+                    != Some(&item.plan_request.phase)
+                || permit.request != *request
+                || permit.context.target != request.target
+                || permit.context.transition_id != request.transition_id
+                || permit.context.policy != item.selection.policy
+                || permit.context.output != request.output
+                || permit.context.control_results != request.control_results
+                || permit.context.parent_generation != item.selection.parent_generation
+                || selection != &item.selection
+                || admission.provider != item.selection.policy.owner_provider
+                || admission.plan != item.plan
+                || journal.admission_transitions.get(&request.admission_id)
+                    != Some(&request.transition_id)
+        })
         || !journal.control_settlements.validate_structure()
         || journal.control_settlements.records().any(|item| {
             let request = &item.settlement.request;
@@ -613,6 +671,7 @@ impl Coordinator {
             retention: Default::default(),
             composition: Default::default(),
             control_settlements: Default::default(),
+            finalize_results: Default::default(),
             admission_transitions: Default::default(),
         });
         validate_journal(&journal)?;

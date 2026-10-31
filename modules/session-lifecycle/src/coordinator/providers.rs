@@ -1236,6 +1236,10 @@ impl Coordinator {
                             || next.authority.settled.contains_key(admission)
                             || next.composition.references_admission(admission)
                             || next
+                                .finalize_results
+                                .records()
+                                .any(|record| &record.request.admission_id == admission)
+                            || next
                                 .control_settlements
                                 .records()
                                 .any(|record| &record.settlement.request.admission_id == admission)
@@ -1508,6 +1512,7 @@ mod admission_target_tests {
             retention: Default::default(),
             composition: Default::default(),
             control_settlements: Default::default(),
+            finalize_results: Default::default(),
             admission_transitions: Default::default(),
         };
         let target = LifecycleTarget::Stream {

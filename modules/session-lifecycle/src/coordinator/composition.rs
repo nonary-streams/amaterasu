@@ -847,7 +847,10 @@ fn valid_callback_proof(
     let DispatchState::Completed { payload } = &proof.terminal.state else {
         return false;
     };
-    if serde_json::to_value(response).ok().as_ref() != Some(payload)
+    if serde_json::from_value::<amaterasu_extension_api::ProviderResponse>(payload.clone())
+        .ok()
+        .as_ref()
+        != Some(response)
         || amaterasu_extension_api::validate_provider_response(&proof.request, response).is_err()
         || call
             .approval

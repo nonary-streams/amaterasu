@@ -184,12 +184,12 @@ fn valid_domain_scope(scope: DomainScope, allowed: &BTreeSet<String>, resource: 
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use serde_json::json;
     use sha2::{Digest, Sha256};
 
-    fn fixture() -> FinalizeSelectionSnapshot {
+    pub(crate) fn fixture() -> FinalizeSelectionSnapshot {
         let document = r#"{"$id":"output/1","$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"mode":{"type":"string"}},"required":["mode"],"additionalProperties":false}"#;
         let schema = json!({"id":"output/1","major":1,"minor":0,"digest":format!("{:x}",Sha256::digest(document.as_bytes()))});
         let effect = json!({"service":"owner/2","method":"finalize","interface_major":2,"interface_minor":0,"schema_revision":1});
