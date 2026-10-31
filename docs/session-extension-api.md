@@ -70,6 +70,14 @@ the owner performs authorized effects under coordinator-issued rights. Capture
 is published only after the dependent result and producer are validated and the
 consumer acknowledges the exact binding.
 
+The selected capability is `amaterasu.display-target`. Its frozen schema
+references are `display-target/1` (SHA-256
+`8bf521e3f660d38854c3044ab6388abe6d118b8b51065cd4b64e6a37418bf7dd`)
+and `display-control/1` (SHA-256
+`c2c3ce866277cb29bbd9fbd947899917538d46b1020df3197fbd264159607d87`).
+The owner service `nonary.virtual-screen/2` exposes the planned
+`resource_control`, `resource_finalize`, and `resource_status` methods.
+
 Release and rollback proceed in reverse dependency order. Independent cleanup
 continues after a failure, but an unresolved dependent effect or cleanup must
 fence release of its prerequisite. Recovery queries recorded operations rather
