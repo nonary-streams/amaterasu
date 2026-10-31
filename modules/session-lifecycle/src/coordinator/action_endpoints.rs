@@ -18,7 +18,7 @@ use std::{
 // An action transition currently retires consumers but does not run dependent
 // provider cleanup. Until it does, a persisted dependency graph must prove that
 // no provider depends on the provider whose resource the action will mutate.
-fn graph_proves_no_dependents(
+pub(super) fn graph_proves_no_dependents(
     order: &[String],
     dependencies: &BTreeMap<String, Vec<String>>,
     provider: &str,
