@@ -102,9 +102,16 @@ on those behaviors.
 
 ## Planned split-provider upgrade
 
-The planned composition separates `nonary.virtual-screen/2`, which owns virtual
-screen resources and native leases, from `nonary.display-settings/2`, which
-applies display policy. The existing profile and commands above still select the
+The planned composition separates `nonary.virtual-screen/2`, built in the
+[virtual-screen repository](https://github.com/nonary-streams/amaterasu-virtual-screen),
+from `nonary.display-settings/2`, built in the
+[display-settings repository](https://github.com/nonary-streams/amaterasu-display-settings).
+Virtual-screen owns the session-retained producer and native leases;
+display-settings applies stream configuration to its selected output. A resumed
+stream receives a fresh configuration while its session's producer may remain
+retained. Both candidate descriptors default `enabled` to `false`; activating
+either requires an explicit setting and a supported, approved composition. The
+v2 lifecycle methods and integrated profile remain pending. The existing profile and commands above still select the
 combined v1 provider; they do not install or migrate this split composition. The
 native `amaterasu.virtual-display/1` service remains a separate lower-level
 interface. V1 method schemas remain unchanged; a v2 provider requires its own

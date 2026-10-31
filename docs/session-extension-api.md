@@ -56,8 +56,13 @@ checks the common negotiated mode and exact binding identity.
 ### Planned dependent-provider composition
 
 The planned split uses separately approved `nonary.virtual-screen/2` and
-`nonary.display-settings/2` services. The former owns the producer and its native
-leases; the latter consumes its selected output and applies display policy. The
+`nonary.display-settings/2` services, built independently in the
+[virtual-screen](https://github.com/nonary-streams/amaterasu-virtual-screen) and
+[display-settings](https://github.com/nonary-streams/amaterasu-display-settings)
+repositories. Virtual-screen owns the session-retained producer and its native
+leases; display-settings consumes its selected output and applies configuration
+for the stream. A resumed stream receives a fresh configuration while the
+session's producer may be retained. The
 existing v1 provider contracts remain unchanged. This is a design target, not a
 claim that the current single-provider profile implements the split.
 
