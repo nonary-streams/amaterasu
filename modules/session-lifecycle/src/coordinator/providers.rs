@@ -621,10 +621,13 @@ impl Coordinator {
             .iter_mut()
             .find(|selection| selection.participant.provider == provider)
             .ok_or("provider_approval_unavailable")?;
-        selected.authorized_borrowers.clear();
-        if let amaterasu_extension_api::LifecycleTarget::Stream { stream_id, .. } = &work.target {
-            selected.authorized_borrowers.insert(stream_id.clone());
-        }
+        selected.authorized_borrowers = super::action_endpoints::action_borrower_scope(
+            &journal,
+            &work.target,
+            &provider,
+            &plan,
+        )
+        .map_err(str::to_owned)?;
         let participant = selected.participant.clone();
         let mut authority = CoordinatorPrepareAuthority::new(
             journal.authority.clone(),

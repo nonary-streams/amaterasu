@@ -295,36 +295,22 @@ impl Coordinator {
                 let cleanup = selection
                     .map(|selected| selected.cleanup_methods.as_slice())
                     .unwrap_or(&[]);
-                let mut borrowers = BTreeSet::new();
-                match &target {
-                    ActionTarget::Session { session_id, .. }
-                    | ActionTarget::Stream { session_id, .. } => {
-                        if let Some(session) = journal.sessions.get(session_id)
-                            && mutating
-                        {
-                            let active: Vec<_> = session
-                                .streams
-                                .iter()
-                                .filter(|(_, stream)| stream.phase == StreamPhase::Active)
-                                .map(|(id, _)| id.clone())
-                                .collect();
-                            if active.len() != 1
-                                || session.streams.iter().any(|(id, stream)| {
-                                    id != &active[0] && stream.phase != StreamPhase::Retired
-                                })
-                            {
-                                return rejection("action_target_ambiguous");
-                            }
-                            if let ActionTarget::Stream { stream_id, .. } = &target
-                                && stream_id != &active[0]
-                            {
-                                return rejection("action_target_ambiguous");
-                            }
-                            borrowers.insert(active[0].clone());
-                        }
+                let borrowers = if let Some(selected) = selection {
+                    let Some(stream_target) = action_stream_target(&journal, &target) else {
+                        return rejection("action_target_ambiguous");
+                    };
+                    match action_borrower_scope(
+                        &journal,
+                        &stream_target,
+                        &selected.participant.provider,
+                        &plan,
+                    ) {
+                        Ok(borrowers) => borrowers,
+                        Err(reason) => return rejection(reason),
                     }
-                    ActionTarget::Host { .. } => return rejection("target_not_active"),
-                }
+                } else {
+                    BTreeSet::new()
+                };
                 let context = AdmissionContext {
                     snapshot: &journal.authority.snapshot,
                     complete: true,
@@ -654,6 +640,155 @@ impl Coordinator {
             _ => rejection("unsupported_operation"),
         }
     }
+}
+
+/// Resolve the single stream that the action will retire; preparing or
+/// quiescing siblings keep the action fenced until independently retired.
+fn action_stream_target(
+    journal: &super::Journal,
+    target: &ActionTarget,
+) -> Option<amaterasu_extension_api::LifecycleTarget> {
+    let session_id = match target {
+        ActionTarget::Session { session_id, .. } | ActionTarget::Stream { session_id, .. } => {
+            session_id
+        }
+        ActionTarget::Host { .. } => return None,
+    };
+    let session = journal.sessions.get(session_id)?;
+    let active: Vec<_> = session
+        .streams
+        .iter()
+        .filter(|(_, stream)| stream.phase == StreamPhase::Active)
+        .collect();
+    if active.len() != 1
+        || session
+            .streams
+            .iter()
+            .any(|(id, stream)| id != active[0].0 && stream.phase != StreamPhase::Retired)
+    {
+        return None;
+    }
+    let (stream_id, stream) = active[0];
+    if let ActionTarget::Stream {
+        stream_id: requested,
+        ..
+    } = target
+        && requested != stream_id
+    {
+        return None;
+    }
+    Some(amaterasu_extension_api::LifecycleTarget::Stream {
+        host_epoch: session.host_epoch.clone(),
+        session_id: session.id.clone(),
+        stream_id: stream_id.clone(),
+        generation: stream.generation,
+    })
+}
+
+/// Only exact retained preparation admissions can authorize the owning session
+/// and retiring stream as cooperative borrowers of these resources.
+pub(super) fn action_borrower_scope(
+    journal: &super::Journal,
+    stream_target: &amaterasu_extension_api::LifecycleTarget,
+    provider: &str,
+    plan: &ResourcePlan,
+) -> Result<BTreeSet<String>, &'static str> {
+    use amaterasu_extension_api::{LifecyclePhase, LifecycleTarget};
+    let LifecycleTarget::Stream {
+        host_epoch,
+        session_id,
+        stream_id,
+        generation,
+    } = stream_target
+    else {
+        return Err("stream_target_required");
+    };
+    let session = journal.sessions.get(session_id).ok_or("unknown_session")?;
+    let stream = session.streams.get(stream_id).ok_or("unknown_stream")?;
+    if session.host_epoch != *host_epoch
+        || journal.host_epoch != *host_epoch
+        || stream.generation != *generation
+        || stream.binding_owner != provider
+        || !matches!(stream.phase, StreamPhase::Active | StreamPhase::Quiescing)
+        || session
+            .streams
+            .iter()
+            .any(|(id, other)| id != stream_id && other.phase != StreamPhase::Retired)
+    {
+        return Err("action_target_ambiguous");
+    }
+    if !plan.resources.is_empty() {
+        let candidate = stream.candidate.as_ref().ok_or("candidate_missing")?;
+        if plan.resources.iter().any(|resource| {
+            resource.provider != provider
+                || resource.resource_id != candidate.resource.resource_id
+                || resource.incarnation.as_deref() != Some(candidate.resource.incarnation.as_str())
+                || resource.execution_domain != candidate.resource.execution_domain
+        }) {
+            return Err("action_resource_mismatch");
+        }
+    }
+    let shares_resource = |old: &ResourcePlan| {
+        old.resources.iter().any(|owned| {
+            plan.resources.iter().any(|requested| {
+                owned.provider == provider
+                    && requested.provider == provider
+                    && owned.resource_id == requested.resource_id
+                    && owned.incarnation.as_ref().is_none_or(|incarnation| {
+                        requested.incarnation.as_ref() == Some(incarnation)
+                    })
+                    && owned.execution_domain == requested.execution_domain
+            })
+        })
+    };
+    let owns = |expected_target: &LifecycleTarget, expected_phase: LifecyclePhase| {
+        session.admission_ids.iter().any(|id| {
+            session.admission_targets.get(id) == Some(expected_target)
+                && session.admission_phases.get(id) == Some(&expected_phase)
+                && journal
+                    .authority
+                    .admissions
+                    .get(id)
+                    .or_else(|| journal.authority.settled.get(id))
+                    .is_some_and(|admission| {
+                        admission.provider == provider && shares_resource(&admission.plan)
+                    })
+        })
+    };
+    let session_target = LifecycleTarget::Session {
+        host_epoch: host_epoch.clone(),
+        session_id: session_id.clone(),
+        generation: session.generation,
+    };
+    let mut result = BTreeSet::new();
+    for domain in &plan.mutation_domains {
+        if journal
+            .authority
+            .domain_owners
+            .get(&domain.domain)
+            .map(String::as_str)
+            != Some(provider)
+            || journal.authority.refresh_required.contains(&domain.domain)
+        {
+            return Err("action_domain_unavailable");
+        }
+        for (borrower, revision) in &domain.borrowers {
+            if borrower == stream_id && *revision == stream.generation {
+                if !owns(stream_target, LifecyclePhase::StreamPrepare) {
+                    return Err("borrower_provenance_missing");
+                }
+                result.insert(stream_id.clone());
+            } else if borrower == session_id && *revision == session.generation {
+                if !owns(&session_target, LifecyclePhase::SessionPrepare) {
+                    return Err("borrower_provenance_missing");
+                }
+                result.insert(session_id.clone());
+            } else {
+                return Err("foreign_borrower");
+            }
+        }
+    }
+    Ok(result)
 }
 
 fn active_provider_revision<'a>(
@@ -1263,6 +1398,84 @@ mod tests {
                 streams,
                 obligations: vec![],
             },
+        );
+        // Prove that the parent session borrower belongs to the same provider,
+        // exact target generation and logical resource as the retiring stream.
+        let mut scoped = state.clone();
+        let plan: ResourcePlan = serde_json::from_value(json!({"plan_id":"plan","revision":1,"resources":[{"provider":"display","resource_id":"output","incarnation":"native","expected_revision":1,"execution_domain":"actual-seat","mutation_domains":["domain"],"access":"exclusive"}],"mutation_domains":[{"domain":"domain","expected_revision":6,"borrowers":{"session":3,"stream":4},"access":"exclusive"}],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"reconnect_required","candidate_constraint":null,"allowed_degradation":[]})).unwrap();
+        let selection = crate::prepare_authority::ProviderSelection {
+            participant: coordinator.settings.participants[0].clone(),
+            approvals: vec![],
+            capabilities: Default::default(),
+            cleanup_methods: vec![],
+            authorized_borrowers: Default::default(),
+        };
+        let session_target = amaterasu_extension_api::LifecycleTarget::Session {
+            host_epoch: epoch.clone(),
+            session_id: "session".into(),
+            generation: 3,
+        };
+        let stream_target = amaterasu_extension_api::LifecycleTarget::Stream {
+            host_epoch: epoch.clone(),
+            session_id: "session".into(),
+            stream_id: "stream".into(),
+            generation: 4,
+        };
+        for (id, target, phase) in [
+            (
+                "session-admission",
+                session_target,
+                amaterasu_extension_api::LifecyclePhase::SessionPrepare,
+            ),
+            (
+                "stream-admission",
+                stream_target.clone(),
+                amaterasu_extension_api::LifecyclePhase::StreamPrepare,
+            ),
+        ] {
+            let session = scoped.sessions.get_mut("session").unwrap();
+            session.admission_ids.insert(id.into());
+            session.admission_targets.insert(id.into(), target);
+            session.admission_phases.insert(id.into(), phase);
+            scoped.authority.settled.insert(
+                id.into(),
+                crate::prepare_authority::Admission {
+                    provider: "display".into(),
+                    selection: selection.clone(),
+                    plan: plan.clone(),
+                    rights: vec![],
+                },
+            );
+        }
+        assert_eq!(
+            action_borrower_scope(&scoped, &stream_target, "display", &plan).unwrap(),
+            ["session".into(), "stream".into()].into()
+        );
+        let mut foreign = plan.clone();
+        foreign.mutation_domains[0]
+            .borrowers
+            .insert("other-session".into(), 1);
+        assert_eq!(
+            action_borrower_scope(&scoped, &stream_target, "display", &foreign),
+            Err("foreign_borrower")
+        );
+        let mut stale = plan.clone();
+        stale.mutation_domains[0]
+            .borrowers
+            .insert("session".into(), 2);
+        assert_eq!(
+            action_borrower_scope(&scoped, &stream_target, "display", &stale),
+            Err("foreign_borrower")
+        );
+        scoped
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .admission_phases
+            .remove("session-admission");
+        assert_eq!(
+            action_borrower_scope(&scoped, &stream_target, "display", &plan),
+            Err("borrower_provenance_missing")
         );
         save(&coordinator.shared, state).unwrap();
         let request = json!({"operation":"describe_action_target","target":{"kind":"session","host_epoch":epoch,"session_id":"session","expected_generation":3},"operation_id":"op","action_id":"display/remove"});
