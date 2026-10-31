@@ -10,7 +10,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
+import stat
 import tempfile
 
 import check_session_extension_composition as check
@@ -45,10 +47,40 @@ def validated_selection(publisher: Path, repo: Path, library: Path, provider: st
             "library": library}
 
 
-def validated_runtime_configuration() -> dict:
+def validated_runtime_configuration(root: Path, selections: list[dict], enable_action: bool) -> dict:
     # The current lifecycle runtime rejects composition v2. Do not let a caller
     # opt out of this gate or provide a self-asserted support flag.
     raise RuntimeError("split composition runtime is not yet qualified")
+
+
+def create_journal_directory(root: Path, canonical_root: Path) -> None:
+    """Create only the new root's private journal directory without following links."""
+    if root.is_symlink() or root.resolve() != canonical_root:
+        raise ValueError("initialized root changed identity")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    root_fd = os.open(canonical_root, flags)
+    try:
+        data_fd = os.open("data", flags, dir_fd=root_fd)
+        try:
+            data = os.fstat(data_fd)
+            if data.st_uid != os.geteuid() or stat.S_IMODE(data.st_mode) != 0o700:
+                raise ValueError("root data directory must be owned by the current user and private")
+            previous_umask = os.umask(0o077)
+            try:
+                os.mkdir("session-lifecycle", mode=0o700, dir_fd=data_fd)
+            finally:
+                os.umask(previous_umask)
+            journal_fd = os.open("session-lifecycle", flags, dir_fd=data_fd)
+            try:
+                journal = os.fstat(journal_fd)
+                if journal.st_uid != os.geteuid() or stat.S_IMODE(journal.st_mode) != 0o700:
+                    raise ValueError("new lifecycle journal directory is not private and writable")
+            finally:
+                os.close(journal_fd)
+        finally:
+            os.close(data_fd)
+    finally:
+        os.close(root_fd)
 
 
 def pack_profile(publisher: Path, root: Path, artifacts: Path, package: Path, sequence: int,
@@ -61,9 +93,13 @@ def pack_profile(publisher: Path, root: Path, artifacts: Path, package: Path, se
     artifacts before reaching this function. Component snapshots and digest
     checks prevent packaging bytes different from those approved at preflight.
     """
-    lifecycle_settings = validated_runtime_configuration()
+    lifecycle_settings = validated_runtime_configuration(root, selections, enable_action)
     if root.exists() or root.is_symlink() or package.exists() or package.is_symlink():
         raise ValueError("root and package must be new paths")
+    canonical_root = root.resolve()
+    journal_directory = canonical_root / "data" / "session-lifecycle"
+    if lifecycle_settings.get("journal_path") != str(journal_directory / "journal.json"):
+        raise ValueError("lifecycle journal must use the new root's private directory")
     if any(option in {"--enable-virtual-display", "--enable-virtual-screen-capture", "--capture-output"}
            or option.startswith("--capture-output=") for option in linux_options):
         raise ValueError("select virtual display and PipeWire using the composition profile options")
@@ -84,6 +120,7 @@ def pack_profile(publisher: Path, root: Path, artifacts: Path, package: Path, se
             library.write_bytes(artifact)
             snapshots.append((component, library))
         legacy.run(publisher, "init-linux-session", root, *linux_options)
+        create_journal_directory(root, canonical_root)
         bootstrap_path = root / "bootstrap.json"
         bootstrap = json.loads(bootstrap_path.read_text())
         if enable_virtual_display:
