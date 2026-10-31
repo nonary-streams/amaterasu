@@ -162,7 +162,7 @@ impl CompositionSelectionSnapshot {
     }
 }
 
-fn approval_is_valid(approval: &MethodApproval, provider: &str) -> bool {
+pub(super) fn approval_is_valid(approval: &MethodApproval, provider: &str) -> bool {
     let method = &approval.method;
     let data = &approval.broker_approval;
     valid_text(&method.service)

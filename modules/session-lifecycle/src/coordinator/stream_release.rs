@@ -17,6 +17,8 @@ pub(super) struct StreamReleaseProof {
     required: BTreeSet<String>,
     retirements: BTreeSet<String>,
     callback: composition::ProducerCallbackProof,
+    #[serde(default)]
+    released_output: Option<amaterasu_extension_api::ResourceOutput>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -37,6 +39,26 @@ impl StreamReleaseBook {
                         .any(|old| old.target == proof.target)
             })
     }
+    pub fn released_output_for_admission(
+        &self,
+        admission_id: &str,
+    ) -> Option<&amaterasu_extension_api::ResourceOutput> {
+        self.proofs
+            .iter()
+            .find(|proof| proof.callback.request.admission_id.as_deref() == Some(admission_id))?
+            .released_output
+            .as_ref()
+    }
+    pub fn released_output_for_target(
+        &self,
+        target: &LifecycleTarget,
+    ) -> Option<(&str, &amaterasu_extension_api::ResourceOutput)> {
+        let proof = self.proofs.iter().find(|proof| &proof.target == target)?;
+        Some((
+            proof.callback.request.admission_id.as_deref()?,
+            proof.released_output.as_ref()?,
+        ))
+    }
     pub fn references_admission(&self, admission_id: &str) -> bool {
         self.proofs
             .iter()
@@ -53,6 +75,12 @@ impl StreamReleaseBook {
                 && proof.provider == provider
                 && proof.transition_id == transition_id
         })
+    }
+    pub fn has_valid_released(&self, journal: &Journal, target: &LifecycleTarget) -> bool {
+        self.proofs
+            .iter()
+            .find(|proof| &proof.target == target)
+            .is_some_and(|proof| validate_proof(journal, proof))
     }
     pub fn has_released(&self, target: &LifecycleTarget) -> bool {
         self.proofs.iter().any(|proof| &proof.target == target)
@@ -118,9 +146,26 @@ fn validate_proof(journal: &Journal, proof: &StreamReleaseProof) -> bool {
     let Ok(response) = serde_json::from_value::<ProviderResponse>(payload.clone()) else {
         return false;
     };
-    let ProviderResponse::Cleanup { outcomes, .. } = &response else {
+    let ProviderResponse::Cleanup { outcomes, outputs } = &response else {
         return false;
     };
+    let Some(released_output) = &proof.released_output else {
+        return false;
+    };
+    let amaterasu_extension_api::ResourceControlResponse::Applied {
+        output: finalized_output,
+        ..
+    } = &finalized.applied
+    else {
+        return false;
+    };
+    let catalog = amaterasu_extension_api::schemas::SchemaCatalog::compile(
+        finalized
+            .selection
+            .schema_documents
+            .iter()
+            .map(|doc| (doc.reference.clone(), doc.document.as_str())),
+    );
     let required_obligations = stage
         .plan
         .obligations
@@ -128,6 +173,18 @@ fn validate_proof(journal: &Journal, proof: &StreamReleaseProof) -> bool {
         .chain(&finalized.plan.obligations);
     session.host_epoch == epoch
         && stream.generation == generation
+        && outputs.as_slice() == [released_output.clone()]
+        && amaterasu_extension_api::validate_cleanup_output(
+            &proof.provider,
+            finalized_output,
+            released_output,
+        )
+        .is_ok()
+        && catalog.is_ok_and(|catalog| {
+            catalog
+                .validate(&released_output.schema, &released_output.data)
+                .is_ok()
+        })
         && stream.binding_owner == proof.provider
         && stream.required == proof.required
         && proof.required.is_subset(&proof.retirements)
@@ -141,6 +198,8 @@ fn validate_proof(journal: &Journal, proof: &StreamReleaseProof) -> bool {
         && proof.callback.request.phase == LifecyclePhase::StreamRelease
         && proof.callback.request.target == proof.target
         && proof.callback.request.transition_id == proof.transition_id
+        && proof.callback.request.dependency_inputs.as_slice()
+            == [finalized_output.as_ref().clone()]
         && proof.callback.request.approved_plan.as_ref() == Some(&admission.plan)
         && session.admission_ids.contains(admission_id)
         && session.admission_targets.get(admission_id) == Some(&proof.target)
@@ -286,6 +345,12 @@ pub(super) fn record_release_proof(
     if results.next().is_some() {
         return Err("finalize_result_ambiguous".into());
     }
+    let Some(ProviderResponse::Cleanup { outputs, .. }) = &state.response else {
+        return Err("cleanup_response_missing".into());
+    };
+    let [released_output] = outputs.as_slice() else {
+        return Err("cleanup_readback_required".into());
+    };
     let proof = StreamReleaseProof {
         target: work.target.clone(),
         transition_id: work.transition_id.clone(),
@@ -294,6 +359,7 @@ pub(super) fn record_release_proof(
         finalize_permit_id: finalized.request.permit_id.clone(),
         required: stream.required.clone(),
         retirements: stream.retirements.clone(),
+        released_output: Some(released_output.clone()),
         callback: composition::ProducerCallbackProof {
             participant: state.participant.clone(),
             request: state.request.clone(),
