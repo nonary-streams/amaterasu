@@ -159,6 +159,9 @@ def build_bootstrap(base: dict, selected: list[dict], entries: dict, lifecycle_s
         legacy.ACTIONS: [legacy.LIFECYCLE_SERVICE, legacy.REGISTRY_SERVICE, legacy.STATE, *services],
     })
     if enable_action:
+        # The action service confirms that the triggering input delivery was
+        # recorded before committing the reserved action.
+        calls[legacy.ACTIONS].append("amaterasu.input/1")
         for identity in (legacy.ACTIONS, legacy.MANAGEMENT, legacy.INPUT, legacy.STREAM):
             calls[identity].append("amaterasu.virtual-display/1")
     for identity, requested in calls.items():

@@ -102,6 +102,7 @@ class CompositionPolicyTest(unittest.TestCase):
             self.assertIn(check.OWNER + "/2", calls[identity])
             self.assertIn("amaterasu.virtual-display/1", calls[identity])
         self.assertIn(legacy.LIFECYCLE_SERVICE, calls[legacy.LIFECYCLE])
+        self.assertIn("amaterasu.input/1", calls[legacy.ACTIONS])
         self.assertEqual(bootstrap["policy"]["settings"][legacy.LIFECYCLE]["input_actions"],
                          [check.OWNER + "/remove-owned"])
         disabled_entries = policy.provider_entries(self.selected)
