@@ -2067,6 +2067,20 @@ mod tests {
             "succeeded"
         );
         request["operation"] = json!("begin_action_transition");
+        let active_state = coordinator.shared.borrow().value.clone();
+        let mut paused_state = active_state.clone();
+        let paused_session = paused_state.sessions.get_mut("session").unwrap();
+        paused_session.phase = SessionPhase::Paused;
+        paused_session.streams.clear();
+        save(&coordinator.shared, paused_state).unwrap();
+        assert_eq!(
+            coordinator.action_operation(&service, "service", &request)["reason"],
+            "target_not_active"
+        );
+        assert!(
+            coordinator.shared.borrow().value.sessions["session"].phase == SessionPhase::Paused
+        );
+        save(&coordinator.shared, active_state).unwrap();
         assert_eq!(
             coordinator.action_operation(&service, "service", &request)["status"],
             "pending"
