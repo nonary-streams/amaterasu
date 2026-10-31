@@ -38,10 +38,11 @@ namespace Amaterasu {
           if (after) seen.add(after);
           if (descriptors.length > 1024) throw new Error("Too many extensions.");
         } while (after);
-        const settings = await Promise.all(descriptors.map((descriptor) => context.api.post<SessionExtensionSettings>("session-extensions/settings_get", { provider: descriptor.provider, scope: { kind: "host" } })));
+        const hostDescriptors = descriptors.filter((descriptor) => Array.isArray(descriptor.options) && descriptor.options.some((option) => Array.isArray(option.allowed_scopes) && option.allowed_scopes.includes("host")));
+        const settings = await Promise.all(hostDescriptors.map((descriptor) => context.api.post<SessionExtensionSettings>("session-extensions/settings_get", { provider: descriptor.provider, scope: { kind: "host" } })));
         if (current !== generation || !context.content.isConnected) return;
         const panels: HTMLElement[] = [];
-        descriptors.forEach((descriptor, index) => {
+        hostDescriptors.forEach((descriptor, index) => {
           const document = settings[index];
           if (!document || !Array.isArray(descriptor.options)) throw new Error("Invalid extension settings response.");
           const options = descriptor.options.filter((option) => option.allowed_scopes.includes("host"));
