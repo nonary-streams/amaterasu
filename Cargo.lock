@@ -332,6 +332,7 @@ dependencies = [
  "getrandom 0.3.4",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -415,6 +416,7 @@ dependencies = [
 name = "amaterasu-input"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-extension-api",
  "amaterasu-gamestream",
  "amaterasu-input-companion",
  "amaterasu-input-policy",
