@@ -20,6 +20,9 @@ from pathlib import Path
 DISPLAY = "nonary.display-settings"
 VIRTUAL = "nonary.virtual-screen"
 MOVED = {"retention", "retention_seconds", "keepalive_while_paused", "enforce_while_paused"}
+SHORTCUT = "remove_owned_shortcut"
+FIXED_LIFECYCLE_DEFAULTS = {"retention": "until_session_ends", "retention_seconds": 300,
+                            "keepalive_while_paused": False, "enforce_while_paused": False}
 SCOPES = {"host", "application", "paired_client", "session"}
 
 
@@ -86,6 +89,10 @@ def validate_value(definition: object, value: object) -> None:
     elif kind == "string":
         low, high = definition.get("min_length"), definition.get("max_length")
         valid = type(low) is int and type(high) is int and isinstance(value, str) and low <= len(value) <= high
+    elif kind == "nullable":
+        # Split migration never imports a keybinding. The publisher validates
+        # the complete inner definition before any import plan is produced.
+        valid = value is None and definition.get("default") is None and isinstance(definition.get("inner"), dict)
     else:
         valid = False
     if not valid:
@@ -106,9 +113,17 @@ def split(document: object, source: object, display: object, virtual: object, ch
     old = descriptor_options(source, DISPLAY, 1)
     new = descriptor_options(display, DISPLAY, 2)
     owner = descriptor_options(virtual, VIRTUAL, 1)
-    if set(owner) != MOVED | {"enabled"} or set(old) != set(new) | MOVED or set(new) & MOVED or "enabled" not in new:
+    if set(owner) not in ({"enabled"}, {"enabled", SHORTCUT}, MOVED | {"enabled"}) or set(old) != set(new) | MOVED or set(new) & MOVED or "enabled" not in new:
         raise ValueError("unsupported split descriptor fields")
-    for name, destination in [(name, new[name]) for name in new] + [(name, owner[name]) for name in MOVED | {"enabled"}]:
+    fixed_lifecycle = not bool(set(owner) & MOVED)
+    if SHORTCUT in owner and (owner[SHORTCUT].get("presentation") != "keybinding"
+                              or owner[SHORTCUT]["definition"].get("type") != "nullable"
+                              or owner[SHORTCUT]["definition"].get("default") is not None):
+        raise ValueError("unsupported owner shortcut definition")
+    if fixed_lifecycle and any(old[name]["definition"].get("default") != value
+                               for name, value in FIXED_LIFECYCLE_DEFAULTS.items()):
+        raise ValueError("legacy lifecycle defaults do not match fixed owner behavior")
+    for name, destination in [(name, new[name]) for name in new] + [(name, owner[name]) for name in owner if name != SHORTCUT]:
         if old[name]["definition"] != destination["definition"] or set(old[name]["allowed_scopes"]) != set(destination["allowed_scopes"]):
             raise ValueError(f"incompatible destination schema: {name}")
     if not isinstance(document, dict) or set(document) != {"revision", "schema_revision", "layers"} or type(document["revision"]) is not int or not 0 <= document["revision"] < 2**64 or type(document["schema_revision"]) is not int or document["schema_revision"] != 1 or not isinstance(document["layers"], list) or len(document["layers"]) > 256:
@@ -141,7 +156,11 @@ def split(document: object, source: object, display: object, virtual: object, ch
         layer = layers.get(key, {"scope": choice["scope"], "values": {}})
         values = layer["values"]
         display_values = {name: value for name, value in values.items() if name not in MOVED}
-        virtual_values = {name: value for name, value in values.items() if name in MOVED}
+        lifecycle_values = {name: value for name, value in values.items() if name in MOVED}
+        if fixed_lifecycle and any(value != FIXED_LIFECYCLE_DEFAULTS[name]
+                                   for name, value in lifecycle_values.items()):
+            raise ValueError("non-default legacy lifecycle setting cannot be imported into fixed owner settings")
+        virtual_values = {} if fixed_lifecycle else lifecycle_values
         virtual_values["enabled"] = choice["enabled"]
         validate_layer(new, layer["scope"], display_values)
         validate_layer(owner, layer["scope"], virtual_values)

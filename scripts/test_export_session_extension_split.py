@@ -44,6 +44,51 @@ class SplitTest(unittest.TestCase):
         self.assertEqual(result["virtual_screen"]["layers"][1]["values"], {"retention": "after_disconnect", "enabled": False})
         self.assertEqual(result["virtual_screen"]["layers"][0]["values"], {"retention_seconds": 25, "enabled": False})
 
+    def test_enabled_only_owner_omits_fixed_defaults_at_every_scope(self):
+        self.virtual = {"provider": migration.VIRTUAL, "revision": 1, "options": [self.enabled]}
+        self.document["layers"][0]["values"]["retention"] = "until_session_ends"
+        self.document["layers"][1]["values"]["retention_seconds"] = 300
+        self.document["layers"][1]["values"]["enforce_while_paused"] = False
+        before = copy.deepcopy(self.document)
+        result = self.split()
+        self.assertEqual(self.document, before)
+        self.assertTrue(all(set(layer["values"]) == {"enabled"}
+                            for layer in result["virtual_screen"]["layers"]))
+        self.choices.pop()
+        with self.assertRaisesRegex(ValueError, "explicit enabled"):
+            self.split()
+
+    def test_enabled_only_owner_rejects_each_nondefault_even_if_overridden(self):
+        self.virtual = {"provider": migration.VIRTUAL, "revision": 1, "options": [self.enabled]}
+        for name, value in (("retention", "after_disconnect"), ("retention_seconds", 25),
+                            ("keepalive_while_paused", True), ("enforce_while_paused", True)):
+            self.document["layers"][0]["values"] = {name: value}
+            self.document["layers"][1]["values"] = {name: migration.FIXED_LIFECYCLE_DEFAULTS[name]}
+            with self.assertRaisesRegex(ValueError, "non-default legacy lifecycle"):
+                self.split()
+
+    def test_enabled_only_owner_rejects_incompatible_legacy_defaults(self):
+        self.virtual = {"provider": migration.VIRTUAL, "revision": 1, "options": [self.enabled]}
+        self.source = copy.deepcopy(self.source)
+        self.source["options"][3]["definition"]["default"] = 42
+        with self.assertRaisesRegex(ValueError, "legacy lifecycle defaults"):
+            self.split()
+
+    def test_nullable_shortcut_remains_unset_and_nondefault_lifecycle_rejected(self):
+        shortcut = {"id": migration.SHORTCUT, "presentation": "keybinding", "allowed_scopes": ["host", "session"],
+                    "definition": {"type": "nullable", "default": None, "inner": {"type": "object", "default": {}, "fields": {}}}}
+        self.virtual = {"provider": migration.VIRTUAL, "revision": 1, "options": [self.enabled, shortcut]}
+        with self.assertRaisesRegex(ValueError, "non-default legacy lifecycle"):
+            self.split()
+        self.document["layers"][0]["values"]["retention"] = "until_session_ends"
+        self.document["layers"][1]["values"]["retention_seconds"] = 300
+        result = self.split()
+        self.assertTrue(all(migration.SHORTCUT not in layer["values"]
+                            for layer in result["virtual_screen"]["layers"]))
+        shortcut["presentation"] = "text"
+        with self.assertRaisesRegex(ValueError, "unsupported owner shortcut"):
+            self.split()
+
     def test_missing_duplicate_and_invalid_choices_fail(self):
         self.choices.pop()
         with self.assertRaisesRegex(ValueError, "explicit enabled"):
