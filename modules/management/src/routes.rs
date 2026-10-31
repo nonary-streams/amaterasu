@@ -500,6 +500,10 @@ mod tests {
 
     #[test]
     fn session_extension_settings_only_accept_host_scope_and_server_action() {
+        let list = resolve("/v1/session-extensions/list").unwrap();
+        let next = br#"{"after":"example","limit":32,"revision":7}"#;
+        assert_eq!(payload(list, next).unwrap()["revision"], 7);
+        assert!(payload(list, br#"{"revision":"not-a-number"}"#).is_err());
         let update = resolve("/v1/session-extensions/settings_update").unwrap();
         assert_eq!(update.scope, Some("configuration.write"));
         let valid = br#"{"provider":"example","scope":{"kind":"host"},"expected_revision":3,"values":{"enabled":false}}"#;

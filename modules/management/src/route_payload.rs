@@ -372,7 +372,13 @@ fn video(action: &str, object: &Object) -> Result<(), &'static str> {
 fn session_extensions(action: &str, object: &Object) -> Result<(), &'static str> {
     match action {
         "list" => {
-            fields(object, &[], &["after", "limit"])?;
+            fields(object, &[], &["after", "limit", "revision"])?;
+            if object
+                .get("revision")
+                .is_some_and(|value| !value.is_null() && value.as_u64().is_none())
+            {
+                return Err(INVALID);
+            }
             if object.get("after").is_some_and(|value| {
                 !value.is_null()
                     && !value

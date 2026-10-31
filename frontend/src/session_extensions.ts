@@ -25,10 +25,13 @@ namespace Amaterasu {
       try {
         const descriptors: SessionExtensionDescriptor[] = [];
         let after: string | null = null;
+        let revision: number | null = null;
         const seen = new Set<string>();
         do {
-          const page: { items: SessionExtensionDescriptor[]; next: string | null } = await context.api.post("session-extensions/list", { after, limit: 32 });
+          const page: { items: SessionExtensionDescriptor[]; next: string | null; revision: number } = await context.api.post("session-extensions/list", { after, limit: 32, revision });
           if (!Array.isArray(page.items) || (page.next !== null && typeof page.next !== "string")) throw new Error("Invalid extension discovery response.");
+          if (!Number.isSafeInteger(page.revision) || page.revision < 0 || (revision !== null && page.revision !== revision)) throw new Error("Extension discovery changed. Refresh and try again.");
+          revision = page.revision;
           descriptors.push(...page.items);
           after = page.next;
           if (after && seen.has(after)) throw new Error("Extension discovery cursor repeated.");
