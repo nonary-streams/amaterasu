@@ -262,7 +262,8 @@ impl Coordinator {
                     } => (session_id, host_epoch),
                     ActionTarget::Host { .. } => return rejection("invalid_target"),
                 };
-                if reservation.binding.session_id != *target_session.0
+                if reservation.target.as_ref() != Some(&canonical)
+                    || reservation.binding.session_id != *target_session.0
                     || reservation.binding.host_epoch != *target_session.1
                     || reservation.operation_id != operation_id
                     || reservation.action_id != action_id
@@ -594,6 +595,7 @@ impl Coordinator {
                         return rejection("unknown_reservation");
                     };
                     if reservation.transferred_to.as_deref() != Some(caller)
+                        || reservation.target.as_ref() != Some(&binding.target)
                         || reservation.operation_id != binding.operation_id
                         || reservation.action_id != binding.action_id
                         || reservation.binding.session_id != session_id
