@@ -442,11 +442,25 @@ pub(super) fn new_session_domains(
                 })
                 || journal.sessions.values().any(|other| {
                     other.id != session.id
-                        && other.phase != SessionPhase::Ended
                         && other
                             .obligations
                             .iter()
                             .any(|o| o.mutation_domain.as_deref() == Some(domain.as_str()))
+                        && !(other.phase == SessionPhase::Ended
+                            && other
+                                .provider_graph
+                                .as_ref()
+                                .and_then(|graph| graph.order.first())
+                                .is_some_and(|owner| {
+                                    let target = LifecycleTarget::Session {
+                                        host_epoch: other.host_epoch.clone(),
+                                        session_id: other.id.clone(),
+                                        generation: other.generation,
+                                    };
+                                    journal
+                                        .session_releases
+                                        .has_valid_released(journal, &target, owner)
+                                }))
                 })
             {
                 continue;

@@ -2758,6 +2758,22 @@ pub(in crate::coordinator) mod tests {
             session_prepare_evidence::closed_prepare_callback(&journal, &work.target, &wrong[0])
                 .is_err()
         );
+        let mut unproven = compact.clone();
+        let mut old_session = journal.sessions["session"].clone();
+        old_session.id = "unproven".into();
+        let mut obligation = cert.root_admission.plan.obligations[0].clone();
+        obligation.mutation_domain = Some("shared".into());
+        old_session.obligations = vec![obligation];
+        unproven.sessions.insert("unproven".into(), old_session);
+        assert!(
+            super::provider_observations::new_session_domains(
+                &unproven,
+                &unproven.sessions["next"],
+                "owner"
+            )
+            .unwrap()
+            .is_empty()
+        );
         let before = serde_json::to_value(&journal).unwrap();
         assert!(
             session_prepare_evidence::retire_closed_prepares(&mut journal, &work.target, &wrong)
