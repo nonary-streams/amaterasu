@@ -268,6 +268,79 @@ pub(super) fn session_metadata(
     metadata_with_scope(journal, session, provider, Some(domains))
 }
 
+// A dependent can see a domain only through its exact settled control. Domain
+// ownership remains with the producer and this metadata grants no effect rights.
+fn settled_dependent_domain(
+    journal: &Journal,
+    session: &SessionRecord,
+    admission_id: &str,
+    admission: &crate::prepare_authority::Admission,
+    domain: &str,
+    owner: &str,
+) -> bool {
+    journal.control_settlements.records().any(|record| {
+        let request = &record.settlement.request;
+        let Some(permit) = journal.authority.control_permits.get(&request.permit_id) else {
+            return false;
+        };
+        let policy = &permit.context.policy;
+        let Some(selection) = journal.composition.selection(
+            &request.target,
+            &record.selection_transition_id,
+            &admission.provider,
+            owner,
+            &request.proposal.output_id,
+        ) else {
+            return false;
+        };
+        request.admission_id == admission_id
+            && session.admission_targets.get(admission_id) == Some(&request.target)
+            && journal.admission_transitions.get(admission_id) == Some(&request.transition_id)
+            && request.proposal.owner_provider == owner
+            && request
+                .proposal
+                .mutation_domains
+                .iter()
+                .any(|item| item == domain)
+            && admission.plan.control_proposals.contains(&request.proposal)
+            && policy.dependent_provider == admission.provider
+            && policy.owner_provider == owner
+            && selection.validate_structure()
+            && selection.control_policy == *policy
+            && permit.request == *request
+            && permit.consumed
+            && permit.settled
+            && record.owner_ack.is_some()
+            && record.valid_under_permit(permit)
+            && [
+                &selection.control_approval,
+                &selection.control_status_approval,
+            ]
+            .iter()
+            .any(|approval| {
+                approval.broker_approval == record.effect_dispatch.call.approval
+                    && super::composition::approval_matches_call(
+                        approval,
+                        &record.effect_dispatch.call,
+                    )
+            })
+            && record.effect_pending_proof.as_ref().is_none_or(|proof| {
+                proof.call.approval == selection.control_approval.broker_approval
+                    && super::composition::approval_matches_call(
+                        &selection.control_approval,
+                        &proof.call,
+                    )
+            })
+            && record.owner_dispatch.as_ref().is_some_and(|proof| {
+                proof.call.approval == selection.settlement_approval.broker_approval
+                    && super::composition::approval_matches_call(
+                        &selection.settlement_approval,
+                        &proof.call,
+                    )
+            })
+    })
+}
+
 fn metadata_with_scope(
     journal: &Journal,
     session: &SessionRecord,
@@ -362,12 +435,20 @@ fn metadata_with_scope(
                 if !selected_domains.contains(&domain.domain) {
                     continue;
                 }
-                if journal
+                let owner = journal
                     .authority
                     .domain_owners
                     .get(&domain.domain)
-                    .map(String::as_str)
-                    != Some(provider)
+                    .ok_or("domain_not_owned")?;
+                if owner != provider
+                    && !settled_dependent_domain(
+                        journal,
+                        candidate_session,
+                        id,
+                        admission,
+                        &domain.domain,
+                        owner,
+                    )
                 {
                     return Err("domain_not_owned".into());
                 }

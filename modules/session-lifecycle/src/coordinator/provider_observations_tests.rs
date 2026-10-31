@@ -780,3 +780,17 @@ fn forged_stream_proof_cannot_close_admissions() {
     }]})).unwrap();
     assert!(closed_stream_admissions(&journal, &journal.sessions["session-a"]).is_err());
 }
+
+#[test]
+fn foreign_domain_without_settled_selected_control_is_rejected() {
+    let fixture = Fixture::new();
+    let mut journal = fixture.coordinator.shared.borrow().value.clone();
+    journal
+        .authority
+        .domain_owners
+        .insert("shared".into(), "provider-b".into());
+    assert_eq!(
+        metadata(&journal, &journal.sessions["session-a"], "provider-a").unwrap_err(),
+        "domain_not_owned"
+    );
+}
