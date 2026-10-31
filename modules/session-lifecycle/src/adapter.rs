@@ -217,7 +217,6 @@ impl LifecycleSettings {
                 || !valid_control_method(&policy.owner_method, &policy.owner_service)
                 || !valid_control_method(&policy.status_method, &policy.owner_service)
                 || !valid_control_method(&policy.settlement_method, &policy.owner_service)
-                || !valid_control_method(&policy.settlement_status_method, &policy.owner_service)
                 || !valid_opaque_id(&policy.output_capability)
                 || !valid_schema_reference(&policy.argument_schema)
                 || !valid_schema_reference(&policy.output_schema)
@@ -896,7 +895,7 @@ mod tests {
         let schema = json!({"id":"schema/1","major":1,"minor":0,"digest":digest});
         let effect_method = json!({"service":"owner/1","method":"apply","interface_major":2,"interface_minor":0,"schema_revision":1});
         let status_method = json!({"service":"owner/1","method":"status","interface_major":2,"interface_minor":0,"schema_revision":1});
-        let policy = json!({"dependent_provider":"dependent","owner_provider":"owner","owner_service":"owner/1","owner_method":effect_method,"status_method":status_method,"settlement_method":effect_method,"settlement_status_method":status_method,"argument_schema":schema,"output_capability":"display/output","output_schema":schema,"max_access":"exclusive","mutation_domains":["seat:0"]});
+        let policy = json!({"dependent_provider":"dependent","owner_provider":"owner","owner_service":"owner/1","owner_method":effect_method,"status_method":status_method,"settlement_method":effect_method,"argument_schema":schema,"output_capability":"display/output","output_schema":schema,"max_access":"exclusive","mutation_domains":["seat:0"]});
         let mut settings: LifecycleSettings = serde_json::from_value(json!({"journal_path":"/test", "consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector/1"]},"participants":[participant("dependent",json!(["owner"])),participant("owner",json!([]))],"control_policies":[policy], "schema_documents":[{"reference":schema,"document":document}]})).unwrap();
         assert!(settings.validate().is_ok());
         settings
@@ -935,15 +934,11 @@ mod tests {
         settings.control_policies[0]
             .settlement_method
             .interface_major = 2;
-        settings.control_policies[0]
-            .settlement_status_method
-            .service = "wrong/1".into();
+        settings.control_policies[0].settlement_method.service = "wrong/1".into();
         assert!(settings.validate().is_err());
+        settings.control_policies[0].settlement_method.service = "owner/1".into();
         settings.control_policies[0]
-            .settlement_status_method
-            .service = "owner/1".into();
-        settings.control_policies[0]
-            .settlement_status_method
+            .settlement_method
             .schema_revision = 0;
         assert!(settings.validate().is_err());
         settings.control_policies.clear();
