@@ -123,7 +123,7 @@ pub(super) fn fence_session_receipts(
         }
         keys.push(key.clone());
     }
-    fence_exact_receipts(journal, &keys.into_iter().collect())
+    fence_exact_receipts(journal, session_target, &keys.into_iter().collect())
 }
 
 /// Fence exactly the receipt keys authenticated by the terminal root gate.
@@ -132,11 +132,26 @@ pub(super) fn fence_session_receipts(
 #[allow(dead_code, reason = "awaits atomic ended-session closure")]
 pub(super) fn fence_exact_receipts(
     journal: &mut Journal,
+    session_target: &LifecycleTarget,
     keys: &BTreeSet<String>,
 ) -> ModuleResult<()> {
+    let (epoch, session_id, None, _) = operations::target_parts(session_target)? else {
+        return Err("session_target_required".into());
+    };
     for key in keys {
         let receipt = journal.receipts.get(key).ok_or("session_receipt_changed")?;
-        if receipt.work.is_some()
+        let targets = [target(&receipt.request), target(&receipt.response)];
+        let belongs = targets.iter().flatten().any(|target| {
+            operations::target_parts(target)
+                .is_ok_and(|(host, id, _, _)| host == epoch && id == session_id)
+        }) || (receipt.request["operation"] == "prepare"
+            && receipt.response["session_id"].as_str() == Some(session_id));
+        if !belongs
+            || targets.iter().flatten().any(|target| {
+                !operations::target_parts(target)
+                    .is_ok_and(|(host, id, _, _)| host == epoch && id == session_id)
+            })
+            || receipt.work.is_some()
             || receipt.wait_target.is_some()
             || !matches!(
                 receipt.response["status"].as_str(),
@@ -580,6 +595,23 @@ mod tests {
         assert_eq!(journal.receipts.len(), 2);
         assert!(journal.retention.tombstones.is_empty());
         journal.recovery_sources.clear();
+        let foreign_key = receipt_key("caller", "caller", "foreign");
+        journal.receipts.insert(
+            foreign_key.clone(),
+            receipt(
+                json!({"operation":"unrelated","metadata":"one"}),
+                json!({"status":"succeeded"}),
+            ),
+        );
+        assert!(
+            fence_exact_receipts(
+                &mut journal,
+                &session,
+                &BTreeSet::from([foreign_key.clone()])
+            )
+            .is_err()
+        );
+        assert!(journal.receipts.remove(&foreign_key).is_some());
         let mut full = journal.clone();
         full.retention.tombstones = (0..MAX_TOMBSTONES)
             .map(|id| digest(&format!("old-{id}")))
