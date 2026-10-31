@@ -195,10 +195,12 @@ fn validate_obligations(
             .approved_cleanup_methods
             .contains(&obligation.cleanup_method)
             || !unique_valid(&obligation.depends_on)
-            || !plan
+            || plan
                 .resources
                 .iter()
-                .any(|resource| obligation_matches_resource(plan, context, obligation, resource))
+                .filter(|resource| obligation_matches_resource(plan, context, obligation, resource))
+                .count()
+                != 1
             || obligation.mutation_domain.as_ref().is_some_and(|domain| {
                 !plan
                     .mutation_domains
@@ -563,6 +565,53 @@ mod tests {
         let mut stale = binding.clone();
         stale.output.domain_observations[0].revision += 1;
         assert!(run(&plan, &[stale]).is_err());
+
+        // An obligation has no owner field separate from its dependent
+        // provider. Identical resource IDs from two owners must not let one
+        // cleanup record cover both merely because both proposals are valid.
+        let mut ambiguous_plan = plan.clone();
+        let mut second_resource = ambiguous_plan.resources[0].clone();
+        second_resource.provider = "other-owner".into();
+        ambiguous_plan.resources.push(second_resource);
+        let mut second_binding = binding.clone();
+        second_binding.policy.owner_provider = "other-owner".into();
+        second_binding.policy.owner_service = "other/2".into();
+        second_binding.policy.owner_method.service = "other/2".into();
+        second_binding.output.producer = "other-owner".into();
+        second_binding.output.producer_service = "other/2".into();
+        second_binding.output.output_id = "other-out".into();
+        second_binding.output.resource.provider = "other-owner".into();
+        let mut second_proposal = ambiguous_plan.control_proposals[0].clone();
+        second_proposal.proposal_id = "second".into();
+        second_proposal.owner_provider = "other-owner".into();
+        second_proposal.owner_service = "other/2".into();
+        second_proposal.output_id = "other-out".into();
+        second_proposal.method.service = "other/2".into();
+        second_proposal.resource.provider = "other-owner".into();
+        ambiguous_plan.control_proposals.push(second_proposal);
+        let mut ambiguous_snapshot = snapshot.clone();
+        let mut second_observed = ambiguous_snapshot.resources["display"]["output"].clone();
+        second_observed.provider = "other-owner".into();
+        ambiguous_snapshot.resources.insert(
+            "other-owner".into(),
+            [("output".into(), second_observed)].into(),
+        );
+        let bindings = [binding.clone(), second_binding];
+        assert!(
+            validate_effect_plan(
+                &ambiguous_plan,
+                &AdmissionContext {
+                    provider: "settings",
+                    approved_control_bindings: &bindings,
+                    snapshot: &ambiguous_snapshot,
+                    complete: true,
+                    approved_capabilities: &capabilities,
+                    approved_cleanup_methods: &methods,
+                    authorized_borrowers: &borrowers
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]
