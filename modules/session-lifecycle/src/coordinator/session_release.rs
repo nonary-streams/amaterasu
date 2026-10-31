@@ -88,6 +88,146 @@ impl SessionReleaseBook {
     }
 }
 
+/// Exact retained release lineage used by the coordinator's closure transaction.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ReleaseClosureEvidence {
+    pub target: LifecycleTarget,
+    pub graph: Value,
+    pub root_output: amaterasu_extension_api::ResourceOutput,
+    pub resource_generation: u64,
+    pub owner: String,
+    pub root_admission: String,
+    pub owner_release_admission: String,
+    pub transition_id: String,
+    pub dependents: Vec<DependentReleaseEvidence>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DependentReleaseEvidence {
+    pub provider: String,
+    pub prepare_admission: String,
+    pub prepare_transition: String,
+    pub release_admission: String,
+    pub transition_id: String,
+}
+
+/// Validate all exact retained release records before any closure mutation.
+pub(super) fn validated_release_closure(
+    journal: &Journal,
+    target: &LifecycleTarget,
+) -> ModuleResult<ReleaseClosureEvidence> {
+    let mut owners = journal
+        .session_releases
+        .proofs
+        .iter()
+        .filter(|proof| &proof.target == target);
+    let owner = owners.next().ok_or("session_release_proof_missing")?;
+    if owners.next().is_some() || !validate_proof(journal, owner) {
+        return Err("session_release_proof_invalid".into());
+    }
+    let owner_release_admission = owner
+        .callback
+        .request
+        .admission_id
+        .clone()
+        .ok_or("release_admission_missing")?;
+    let (_, session_id, None, _) = operations::target_parts(target)? else {
+        return Err("session_target_required".into());
+    };
+    let session = journal.sessions.get(session_id).ok_or("unknown_session")?;
+    let graph = session
+        .provider_graph
+        .as_ref()
+        .ok_or("provider_graph_missing")?;
+    let mut dependents = Vec::new();
+    for proof in journal
+        .session_releases
+        .noop_proofs
+        .iter()
+        .filter(|proof| &proof.target == target)
+    {
+        if !valid_noop_proof(journal, proof)
+            || proof.transition_id != owner.transition_id
+            || !graph
+                .order
+                .iter()
+                .skip(1)
+                .any(|provider| provider == &proof.provider)
+            || dependents
+                .iter()
+                .any(|entry: &DependentReleaseEvidence| entry.provider == proof.provider)
+        {
+            return Err("dependent_release_proof_invalid".into());
+        }
+        let (prepare_admission, prepare_transition) =
+            session_prepare_evidence::admission_for(journal, target, &proof.provider)
+                .ok_or("dependent_prepare_proof_missing")?;
+        dependents.push(DependentReleaseEvidence {
+            provider: proof.provider.clone(),
+            prepare_admission: prepare_admission.into(),
+            prepare_transition: prepare_transition.into(),
+            release_admission: proof
+                .callback
+                .request
+                .admission_id
+                .clone()
+                .ok_or("release_admission_missing")?,
+            transition_id: proof.transition_id.clone(),
+        });
+    }
+    if dependents.len() != graph.order.len().saturating_sub(1) {
+        return Err("dependent_release_proof_missing".into());
+    }
+    dependents.sort_by(|a, b| a.provider.cmp(&b.provider));
+    let mut roots = journal.composition.records().filter(|root| {
+        root.admission_id == owner.root_admission_id
+            && root.output.origin == *target
+            && root.output.producer == owner.provider
+    });
+    let root = roots.next().ok_or("session_root_missing")?;
+    if roots.next().is_some() {
+        return Err("session_root_ambiguous".into());
+    }
+    let resource_generation = root
+        .callback_proof
+        .as_ref()
+        .and_then(|proof| proof.request.resource_generation)
+        .filter(|generation| *generation > 0)
+        .ok_or("resource_generation_missing")?;
+    Ok(ReleaseClosureEvidence {
+        target: target.clone(),
+        graph: serde_json::to_value(graph).map_err(|_| "invalid_provider_graph")?,
+        root_output: root.output.clone(),
+        resource_generation,
+        owner: owner.provider.clone(),
+        root_admission: owner.root_admission_id.clone(),
+        owner_release_admission,
+        transition_id: owner.transition_id.clone(),
+        dependents,
+    })
+}
+
+/// Remove proof records only as part of the caller's atomic closure transaction.
+/// The caller must validate every other reference and mutate a private Journal clone.
+pub(super) fn retire_closed_release(
+    journal: &mut Journal,
+    target: &LifecycleTarget,
+    expected: &ReleaseClosureEvidence,
+) -> ModuleResult<()> {
+    if validated_release_closure(journal, target)? != *expected {
+        return Err("session_release_closure_changed".into());
+    }
+    journal
+        .session_releases
+        .proofs
+        .retain(|proof| &proof.target != target);
+    journal
+        .session_releases
+        .noop_proofs
+        .retain(|proof| &proof.target != target);
+    Ok(())
+}
+
 fn session_lineage_closed(journal: &Journal, target: &LifecycleTarget, provider: &str) -> bool {
     let Ok((epoch, session_id, None, generation)) = operations::target_parts(target) else {
         return false;
@@ -1523,6 +1663,29 @@ mod tests {
             &owner_work.target,
             "owner"
         ));
+        let evidence = validated_release_closure(&journal, &owner_work.target).unwrap();
+        assert_eq!(evidence.owner, "owner");
+        assert_eq!(evidence.root_admission, "root");
+        assert_eq!(evidence.owner_release_admission, "release-admission");
+        assert_eq!(evidence.resource_generation, 1);
+        assert_eq!(evidence.dependents.len(), 1);
+        assert_eq!(evidence.dependents[0].provider, "settings");
+        assert_eq!(evidence.dependents[0].prepare_admission, "settings-prepare");
+        assert_eq!(evidence.dependents[0].release_admission, "settings-release");
+        let mut next = journal.clone();
+        let before = serde_json::to_value(&next).unwrap();
+        let mut wrong = evidence.clone();
+        wrong.root_admission = "other".into();
+        assert!(retire_closed_release(&mut next, &owner_work.target, &wrong).is_err());
+        assert_eq!(serde_json::to_value(&next).unwrap(), before);
+        retire_closed_release(&mut next, &owner_work.target, &evidence).unwrap();
+        assert!(!next.session_releases.references_admission("root"));
+        assert!(
+            !next
+                .session_releases
+                .references_admission("settings-release")
+        );
+        assert!(journal.session_releases.references_admission("root"));
         let restored: Journal =
             serde_json::from_value(serde_json::to_value(journal).unwrap()).unwrap();
         assert!(restored.session_releases.validate(&restored));
