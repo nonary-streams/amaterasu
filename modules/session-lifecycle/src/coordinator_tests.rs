@@ -337,3 +337,63 @@ fn failed_launch_requires_the_frozen_operation_and_explicit_absence_fence() {
         "succeeded"
     );
 }
+
+#[test]
+fn transferred_action_fences_new_preparation_across_sessions_until_terminal() {
+    let dir = TestDirectory::new();
+    let mut coordinator = Coordinator::open(&dir.journal()).unwrap();
+    coordinator.configured = true;
+    let first = coordinator.handle(
+        "transport",
+        "client",
+        json!({"operation":"prepare","operation_id":"first"}),
+    );
+    assert_eq!(first["status"], "pending");
+    let key = receipt_key("transport", "client", "first");
+    let mut next = coordinator.shared.borrow().value.clone();
+    let work = next.receipts.get_mut(&key).unwrap().work.as_mut().unwrap();
+    work.action_transfer = Some(ActionTransfer {
+        service: "action-service".into(),
+        permit: "a".repeat(32),
+        binding: crate::action_authority::ActionBinding {
+            operation_id: "action".into(),
+            target: crate::action_authority::ActionTarget::Session {
+                host_epoch: first["host_epoch"].as_str().unwrap().into(),
+                session_id: first["session_id"].as_str().unwrap().into(),
+                expected_generation: 1,
+            },
+            action_id: "display/remove".into(),
+            plan_digest: "b".repeat(64),
+            source: crate::action_authority::Principal {
+                caller: "transport".into(),
+                initiator: "client".into(),
+            },
+        },
+        input_reservation_id: None,
+        admission_id: None,
+    });
+    save(&coordinator.shared, next).unwrap();
+    let rejected = coordinator.handle(
+        "other",
+        "other-client",
+        json!({"operation":"prepare","operation_id":"second"}),
+    );
+    assert_eq!(rejected["reason"], "action_transition_in_progress");
+    let mut next = coordinator.shared.borrow().value.clone();
+    next.receipts
+        .get_mut(&key)
+        .unwrap()
+        .work
+        .as_mut()
+        .unwrap()
+        .action_transfer = None;
+    save(&coordinator.shared, next).unwrap();
+    assert_eq!(
+        coordinator.handle(
+            "other",
+            "other-client",
+            json!({"operation":"prepare","operation_id":"second"})
+        )["status"],
+        "pending"
+    );
+}

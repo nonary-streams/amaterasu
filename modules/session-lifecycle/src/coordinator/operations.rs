@@ -132,6 +132,19 @@ impl Coordinator {
     ) -> ModuleResult<Value> {
         let mut next = self.shared.borrow().value.clone();
         let operation = payload["operation"].as_str().ok_or("invalid_request")?;
+        // A transferred action may mutate a domain shared across sessions. Its
+        // domain set is not known until fresh planning, so conservatively fence
+        // new preparation until the transfer completes or is reconciled.
+        if matches!(operation, "prepare" | "prepare_stream" | "resume_stream")
+            && next.receipts.values().any(|receipt| {
+                receipt
+                    .work
+                    .as_ref()
+                    .is_some_and(|work| work.action_transfer.is_some())
+            })
+        {
+            return Err("action_transition_in_progress".into());
+        }
         let mut work = None;
         let mut wait_target = None;
         let mut response;

@@ -837,8 +837,9 @@ impl Coordinator {
                     )
                     && super::operations::target_parts(&other.target).is_ok_and(
                         |(_, other_session, other_stream, _)| {
-                            other_session == id
-                                && (stream_id.is_none() || other_stream == stream_id)
+                            work.action_transfer.is_some()
+                                || (other_session == id
+                                    && (stream_id.is_none() || other_stream == stream_id))
                         },
                     )
                     && matches!(
