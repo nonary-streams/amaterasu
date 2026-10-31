@@ -37,6 +37,7 @@ def approved_action(descriptor: dict, enabled: bool) -> str:
             or action.get("execution") != "session_mutation"
             or set(action.get("allowed_targets", [])) != {"session", "stream"}
             or action.get("arguments") != {}
+            or action.get("required_capabilities") != []
             or action.get("plan") != method_ref(check.OWNER, "action_plan")
             or action.get("execute") != method_ref(check.OWNER, "action_execute")
             or action.get("status") != method_ref(check.OWNER, "action_status")):
