@@ -258,6 +258,9 @@ pub fn validate_candidate(
             != planned.mutation_domains.iter().collect::<BTreeSet<_>>()
         || candidate.generation != expected_generation
         || candidate.geometry_revision != expected_geometry_revision
+        || constraint
+            .geometry_revision
+            .is_some_and(|revision| revision != candidate.geometry_revision)
     {
         return Err("candidate violates approved binding".into());
     }
@@ -340,6 +343,19 @@ mod tests {
         let (plan, _, _) = fixture();
         let mut candidate: api::CaptureBinding = serde_json::from_value(json!({"capture_provider":"capture", "selector_schema":"selector/1", "selector":{}, "resource":{"provider":"display", "resource_id":"output", "incarnation":"native", "revision":4, "execution_domain":"seat", "mutation_domain":"topology", "mutation_domains":["topology"]}, "mode":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false}, "plan_revision":2, "geometry_revision":3, "generation":4})).unwrap();
         assert!(validate_candidate(&plan, &candidate, 4, 3).is_ok());
+        let mut frozen = plan.clone();
+        frozen
+            .candidate_constraint
+            .as_mut()
+            .unwrap()
+            .geometry_revision = Some(4);
+        assert!(validate_candidate(&frozen, &candidate, 4, candidate.geometry_revision).is_err());
+        frozen
+            .candidate_constraint
+            .as_mut()
+            .unwrap()
+            .geometry_revision = Some(3);
+        assert!(validate_candidate(&frozen, &candidate, 4, candidate.geometry_revision).is_ok());
         candidate.resource.revision = 5;
         assert!(validate_candidate(&plan, &candidate, 4, 3).is_ok());
         let mut read_only = plan.clone();
