@@ -18,6 +18,14 @@ pub struct Dispatch {
     pub stage: Stage,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) proof: Option<crate::dispatch_proof::DispatchProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) approvals: Option<FrozenApprovals>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FrozenApprovals {
+    pub execute: Value,
+    pub status: Option<Value>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -119,6 +127,7 @@ impl Dispatch {
             source: None,
             stage: Stage::Planning,
             proof: None,
+            approvals: None,
         })
     }
     pub fn accept_plan(&mut self, plan: Value) -> Result<(), &'static str> {
@@ -267,9 +276,53 @@ impl Dispatch {
         };
         Ok(plan)
     }
+    pub(crate) fn freeze_approvals(
+        &mut self,
+        execute: Value,
+        status: Option<Value>,
+    ) -> Result<(), &'static str> {
+        if !matches!(self.stage, Stage::AwaitingPermit { .. }) || self.approvals.is_some() {
+            return Err("invalid_phase");
+        }
+        let check = |approval: &Value, method: &amaterasu_extension_api::MethodRef| {
+            let call = amaterasu_module_sdk::Command::CallApi {
+                service: method.service.clone(),
+                method: method.method.clone(),
+                interface_major: method.interface_major,
+                interface_minor: method.interface_minor,
+                payload: Value::Null,
+                timeout_ms: 1,
+                operation_id: "approval-check".into(),
+                parent: None,
+            };
+            crate::dispatch_proof::ApprovedCall::new(
+                approval.clone(),
+                &call,
+                &self.selected_provider,
+                method,
+            )
+            .map(|_| ())
+        };
+        check(&execute, &self.descriptor.execute)?;
+        match (&self.descriptor.status, &status) {
+            (Some(method), Some(approval)) => check(approval, method)?,
+            (None, None) => (),
+            _ => return Err("status_approval_mismatch"),
+        }
+        self.approvals = Some(FrozenApprovals { execute, status });
+        Ok(())
+    }
+
     pub(crate) fn arm_effect(&mut self, approval: Value) -> Result<(), &'static str> {
         if !matches!(self.stage, Stage::Running { .. }) || self.proof.is_some() {
             return Err("invalid_phase");
+        }
+        if self
+            .approvals
+            .as_ref()
+            .is_none_or(|frozen| frozen.execute != approval)
+        {
+            return Err("execute_approval_changed");
         }
         let call = self.broker_call()?.ok_or("effect_call_missing")?;
         let effect = crate::dispatch_proof::ApprovedCall::new(
@@ -288,6 +341,14 @@ impl Dispatch {
     pub(crate) fn arm_status(&mut self, approval: Value) -> Result<(), &'static str> {
         if !matches!(self.stage, Stage::ProviderPending { .. }) {
             return Err("invalid_phase");
+        }
+        if self
+            .approvals
+            .as_ref()
+            .and_then(|frozen| frozen.status.as_ref())
+            != Some(&approval)
+        {
+            return Err("status_approval_changed");
         }
         let method = self
             .descriptor
@@ -354,7 +415,7 @@ impl Dispatch {
                 ))
             }
             Stage::AwaitingPermit { plan, digest } => {
-                let mut payload = json!({"operation":"authorize_action","operation_id":operation_id,"action_id":action_id,"target":target,"plan":plan,"plan_digest":digest,"provider":self.selected_provider,"execute_method":self.descriptor.execute,"source":source});
+                let mut payload = json!({"operation":"authorize_action","operation_id":operation_id,"action_id":action_id,"target":target,"plan":plan,"plan_digest":digest,"provider":self.selected_provider,"execute_method":self.descriptor.execute,"descriptor":self.descriptor,"execute_approval":self.approvals.as_ref().map(|a| &a.execute),"status_approval":self.approvals.as_ref().and_then(|a| a.status.as_ref()),"source":source});
                 if let Some(reservation) = &self.request.input_reservation_id {
                     payload["input_reservation_id"] = json!(reservation);
                 }

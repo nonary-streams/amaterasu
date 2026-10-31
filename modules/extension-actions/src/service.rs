@@ -1421,6 +1421,49 @@ impl ActionsModule {
         {
             return self.dispatch_unknown(key);
         }
+        if matches!(active.dispatch.stage, DispatchStage::AwaitingPermit { .. })
+            && active.dispatch.approvals.is_none()
+        {
+            let query = |method: &amaterasu_extension_api::MethodRef| {
+                self.runtime.send(Command::QueryApiApproval {
+                    service: method.service.clone(),
+                    method: method.method.clone(),
+                    interface_major: method.interface_major,
+                    min_minor: method.interface_minor,
+                })
+            };
+            let Ok(Response::Result { payload: execute }) =
+                query(&active.dispatch.descriptor.execute)
+            else {
+                return self.dispatch_unknown(key);
+            };
+            let status = if let Some(method) = &active.dispatch.descriptor.status {
+                let Ok(Response::Result { payload }) = query(method) else {
+                    return self.dispatch_unknown(key);
+                };
+                Some(payload)
+            } else {
+                None
+            };
+            let expected = active.dispatch.clone();
+            let mut replacement = expected.clone();
+            if replacement.freeze_approvals(execute, status).is_err() {
+                return self.dispatch_unknown(key);
+            }
+            let receipt = action_receipt(&replacement, "queued", None);
+            match self.worker.persist(
+                key.0.clone(),
+                expected,
+                replacement.clone(),
+                active.receipt.clone(),
+                receipt.clone(),
+                Instant::now() + Duration::from_secs(30),
+            ) {
+                Ok(()) => active.replacement = Some((replacement, receipt)),
+                Err(_) => active.recovery_unconfirmed = true,
+            }
+            return Ok(());
+        }
         if matches!(active.dispatch.stage, DispatchStage::ReadyToExecute { .. }) {
             let expected = active.dispatch.clone();
             let mut replacement = expected.clone();
@@ -1529,6 +1572,33 @@ impl ActionsModule {
                     operation_id.push_str(&format!("-{}", active.polls))
                 }
                 _ => {}
+            }
+        }
+        if matches!(
+            active.dispatch.stage,
+            DispatchStage::Running { .. } | DispatchStage::ProviderPending { .. }
+        ) {
+            let method = if matches!(active.dispatch.stage, DispatchStage::Running { .. }) {
+                &active.dispatch.descriptor.execute
+            } else {
+                let Some(method) = active.dispatch.descriptor.status.as_ref() else {
+                    return self.dispatch_unknown(key);
+                };
+                method
+            };
+            let expected = active
+                .dispatch
+                .proof
+                .as_ref()
+                .map(|proof| &proof.last().approval);
+            let fresh = self.runtime.send(Command::QueryApiApproval {
+                service: method.service.clone(),
+                method: method.method.clone(),
+                interface_major: method.interface_major,
+                min_minor: method.interface_minor,
+            });
+            if !matches!(fresh, Ok(Response::Result { payload }) if Some(&payload) == expected) {
+                return self.dispatch_unknown(key);
             }
         }
         if matches!(active.dispatch.stage, DispatchStage::Running { .. }) {
@@ -1895,6 +1965,11 @@ mod tests {
         effects: usize,
         provider_pending: bool,
         status_complete: bool,
+        drift_execute: bool,
+        drift_status: bool,
+        execute_approvals: usize,
+        status_approvals: usize,
+        status_calls: usize,
         cancellation_requests: usize,
         mutation_descriptor: bool,
         required_capability: bool,
@@ -1913,9 +1988,18 @@ mod tests {
                     method,
                     interface_major,
                     min_minor,
-                } => Response::Result {
-                    payload: json!({"provider":"example.provider","method":{"service":service,"method":method,"interface_major":interface_major,"interface_minor":min_minor}}),
-                },
+                } => {
+                    let changed = if method == "action_execute" {
+                        self.execute_approvals += 1;
+                        self.drift_execute && self.execute_approvals > 2
+                    } else {
+                        self.status_approvals += 1;
+                        self.drift_status && self.status_approvals > 2
+                    };
+                    Response::Result {
+                        payload: json!({"provider":"example.provider","method":{"service":service,"method":method,"interface_major":interface_major,"interface_minor":min_minor,"schema_marker":if changed {"changed"} else {"original"}}}),
+                    }
+                }
                 Command::Register { .. } | Command::ReleaseResult { .. } => Response::Ok,
                 Command::GetSettings {} => Response::Result {
                     payload: json!({"input_service":"input","grants":[{"principal":"input","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["read_only","session_mutation"]},{"principal":"management","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["read_only","session_mutation"]},{"principal":"alice","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["read_only","session_mutation"]},{"principal":"bob","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["read_only","session_mutation"]}]}),
@@ -2075,6 +2159,7 @@ mod tests {
                         assert!(parent.is_some());
                         json!({"status":"planned","operation_id":payload["operation_id"],"action_id":payload["action_id"],"target":payload["target"],"plan":{"plan_id":"p1","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]}})
                     } else if method == "action_status" {
+                        self.status_calls += 1;
                         if self.status_complete {
                             json!({"status":"succeeded","receipt":{"effect":"confirmed"}})
                         } else {
@@ -2269,6 +2354,36 @@ mod tests {
                     "succeeded"
                 }
             );
+        }
+    }
+    #[test]
+    fn approval_drift_fences_before_effect_or_status_call() {
+        for status_drift in [false, true] {
+            let mut host = Host {
+                allow_permit: true,
+                provider_pending: status_drift,
+                drift_execute: !status_drift,
+                drift_status: status_drift,
+                ..Host::default()
+            };
+            host.request(
+                1,
+                "alice",
+                json!({"operation":"open_epoch","operation_id":"open"}),
+            );
+            host.run();
+            let epoch = host.replies[0]["epoch"].as_str().unwrap().to_owned();
+            host.request(2, "alice", json!({"operation":"invoke","epoch":epoch,"sequence":1,"operation_id":format!("{epoch}:1"),"action_id":"example/action","target":{"kind":"session","host_epoch":"h","session_id":"s","expected_generation":1},"arguments":{},"expected_settings_revision":null}));
+            host.run();
+            assert_eq!(host.effects, usize::from(status_drift));
+            assert_eq!(host.status_calls, 0);
+            host.request(
+                3,
+                "alice",
+                json!({"operation":"status","epoch":epoch,"sequence":1}),
+            );
+            host.run();
+            assert_eq!(host.replies[2]["status"], "recovery_required");
         }
     }
     #[test]

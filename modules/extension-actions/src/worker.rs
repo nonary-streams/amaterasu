@@ -406,6 +406,14 @@ fn valid_transition(before: &Dispatch, after: &Dispatch) -> bool {
     }
     let result = match (&before.stage, &after.stage) {
         (Stage::Planning, Stage::AwaitingPermit { plan, .. }) => computed.accept_plan(plan.clone()),
+        (Stage::AwaitingPermit { .. }, Stage::AwaitingPermit { .. })
+            if before.approvals.is_none() =>
+        {
+            let frozen = after.approvals.as_ref().ok_or("approval_snapshot_missing");
+            frozen.and_then(|frozen| {
+                computed.freeze_approvals(frozen.execute.clone(), frozen.status.clone())
+            })
+        }
         (Stage::Planning, Stage::Cancelled) => computed.cancel_before_effect(),
         (
             Stage::AwaitingConsume { .. }
