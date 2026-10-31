@@ -135,6 +135,9 @@ pub(super) fn validated_release_closure(
         return Err("session_target_required".into());
     };
     let session = journal.sessions.get(session_id).ok_or("unknown_session")?;
+    if session.phase != SessionPhase::Ended {
+        return Err("session_not_ended".into());
+    }
     let graph = session
         .provider_graph
         .as_ref()
@@ -1663,6 +1666,11 @@ mod tests {
             &owner_work.target,
             "owner"
         ));
+        assert_eq!(
+            validated_release_closure(&journal, &owner_work.target).unwrap_err(),
+            "session_not_ended"
+        );
+        journal.sessions.get_mut("session").unwrap().phase = SessionPhase::Ended;
         let evidence = validated_release_closure(&journal, &owner_work.target).unwrap();
         assert_eq!(evidence.owner, "owner");
         assert_eq!(evidence.root_admission, "root");
