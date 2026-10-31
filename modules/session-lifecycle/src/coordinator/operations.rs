@@ -289,6 +289,12 @@ impl Coordinator {
                     let reprepare = required_reprepare(&next, &self.settings, session)?;
                     let mut current =
                         self.new_work(LifecyclePhase::StreamPrepare, target.clone(), &payload)?;
+                    if reprepare.is_some()
+                        && serde_json::to_value(&current.provider_graph).ok()
+                            != serde_json::to_value(&session.provider_graph).ok()
+                    {
+                        return Err("resource_reprepare_graph_changed".into());
+                    }
                     let mode = current.video.as_ref().ok_or("negotiated_video_required")?;
                     if mode.width == 0 || mode.height == 0 || mode.refresh_millihz == 0 {
                         return Err("invalid_video".into());
