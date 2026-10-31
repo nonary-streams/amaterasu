@@ -791,7 +791,7 @@ impl Coordinator {
             return Err("provider_metadata_too_large".into());
         }
         next.receipts.insert(
-            key,
+            key.clone(),
             Receipt {
                 caller: caller.into(),
                 initiator: initiator.into(),
@@ -801,6 +801,7 @@ impl Coordinator {
                 wait_target: None,
             },
         );
+        super::refresh_receipt::compact(&mut next, &key);
         save(&self.shared, next)?;
         Ok(response)
     }

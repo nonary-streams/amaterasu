@@ -46,6 +46,7 @@ mod plan_observation;
 mod provider_observations;
 mod providers;
 mod recovery;
+mod refresh_receipt;
 #[allow(dead_code)] // Generation lookup is gated on authenticated endpoints.
 mod resource_generation;
 mod retention;
@@ -1025,7 +1026,8 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                 !valid_id(id)
                     || *key != receipt_key(&receipt.caller, &receipt.initiator, id)
                     || receipt.response.get("operation_id").and_then(Value::as_str) != Some(id)
-            }) || receipt.caller.is_empty()
+            }) || !refresh_receipt::valid_compact(receipt)
+                || receipt.caller.is_empty()
                 || receipt.initiator.is_empty()
         })
     {
@@ -1275,7 +1277,7 @@ impl Coordinator {
                 .unwrap_or_else(|| json!({"status":"not_found"}));
         }
         if let Some(receipt) = journal.receipts.get(&key) {
-            return if receipt.request == payload {
+            return if refresh_receipt::matches(receipt, &payload) {
                 receipt.response.clone()
             } else {
                 rejection("operation_id_conflict")

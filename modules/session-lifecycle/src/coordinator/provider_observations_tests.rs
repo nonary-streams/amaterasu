@@ -794,3 +794,109 @@ fn foreign_domain_without_settled_selected_control_is_rejected() {
         "domain_not_owned"
     );
 }
+
+#[test]
+fn terminal_refresh_compacts_request_and_preserves_exact_retry() {
+    let mut fixture = Fixture::new();
+    let mut request = fixture.payload(json!([{"domain":"shared","revision":2,"borrowers":{}}]));
+    request["operation"] = json!("refresh_provider_observations");
+    request["opaque_padding"] = json!("x".repeat(4_000));
+    let key = receipt_key("provider-a", "provider-a", "refresh");
+    let response = fixture
+        .coordinator
+        .handle("provider-a", "provider-a", request.clone());
+    assert_eq!(response["status"], "succeeded");
+    {
+        let shared = fixture.coordinator.shared.borrow();
+        let stored = &shared.value.receipts[&key];
+        assert!(super::super::refresh_receipt::is_compact(stored));
+        assert_eq!(stored.response, response);
+        assert!(
+            serde_json::to_vec(&stored.request).unwrap().len() + 3_000
+                < serde_json::to_vec(&request).unwrap().len()
+        );
+        assert_eq!(
+            shared.value.authority.snapshot.domains["shared"].revision,
+            2
+        );
+    }
+    assert_eq!(
+        fixture
+            .coordinator
+            .handle("provider-a", "provider-a", request.clone()),
+        response
+    );
+    let mut forged = request.clone();
+    forged["domains"][0]["revision"] = json!(3);
+    assert_eq!(
+        fixture
+            .coordinator
+            .handle("provider-a", "provider-a", forged)["reason"],
+        "operation_id_conflict"
+    );
+    assert_eq!(
+        fixture.coordinator.handle(
+            "provider-a",
+            "provider-a",
+            json!({"operation":"lookup","operation_id":"refresh"})
+        ),
+        response
+    );
+    assert_eq!(
+        fixture
+            .coordinator
+            .shared
+            .borrow()
+            .value
+            .authority
+            .snapshot
+            .domains["shared"]
+            .revision,
+        2
+    );
+}
+
+#[test]
+fn refresh_compaction_requires_terminal_unreferenced_verified_authority() {
+    let mut fixture = Fixture::new();
+    let mut request = fixture.payload(json!([{"domain":"shared","revision":2,"borrowers":{}}]));
+    request["operation"] = json!("refresh_provider_observations");
+    request["opaque_padding"] = json!("x".repeat(512));
+    let key = receipt_key("provider-a", "provider-a", "refresh");
+    let response = fixture
+        .coordinator
+        .handle("provider-a", "provider-a", request.clone());
+    assert_eq!(response["status"], "succeeded");
+    let mut journal = fixture.coordinator.shared.borrow().value.clone();
+    journal.receipts.get_mut(&key).unwrap().request = request;
+    journal.recovery_sources.insert("alias".into(), key.clone());
+    assert!(!super::super::refresh_receipt::compact(&mut journal, &key));
+    journal.recovery_sources.clear();
+    journal.receipts.get_mut(&key).unwrap().response["status"] = json!("pending");
+    assert!(!super::super::refresh_receipt::compact(&mut journal, &key));
+    journal.receipts.get_mut(&key).unwrap().response = response.clone();
+    let work: Work = serde_json::from_value(json!({"phase":"session.prepare","target":response["target"],"intent":null,"reason":null,"video":null,"transition_id":"inflight","providers":[],"index":0,"states":{},"candidate":null,"waiting_retirement":false})).unwrap();
+    journal.receipts.get_mut(&key).unwrap().work = Some(work);
+    assert!(!super::super::refresh_receipt::compact(&mut journal, &key));
+    journal.receipts.get_mut(&key).unwrap().work = None;
+    journal.receipts.get_mut(&key).unwrap().wait_target =
+        serde_json::from_value(response["target"].clone()).ok();
+    assert!(!super::super::refresh_receipt::compact(&mut journal, &key));
+    journal.receipts.get_mut(&key).unwrap().wait_target = None;
+    journal
+        .authority
+        .snapshot
+        .domains
+        .get_mut("shared")
+        .unwrap()
+        .revision += 1;
+    assert!(!super::super::refresh_receipt::compact(&mut journal, &key));
+    journal
+        .authority
+        .snapshot
+        .domains
+        .get_mut("shared")
+        .unwrap()
+        .revision -= 1;
+    assert!(super::super::refresh_receipt::compact(&mut journal, &key));
+}

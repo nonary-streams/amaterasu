@@ -236,7 +236,12 @@ fn receipt_targets_match(
     receipt: &Receipt,
     stream_target: &LifecycleTarget,
 ) -> bool {
-    let Some(request_target) = target(&receipt.request) else {
+    let request_target = target(&receipt.request).or_else(|| {
+        super::refresh_receipt::is_compact(receipt)
+            .then(|| target(&receipt.response))
+            .flatten()
+    });
+    let Some(request_target) = request_target else {
         return true;
     };
     if request_target == *stream_target {
@@ -522,6 +527,11 @@ mod tests {
         receipt.request["target"] = json!({"kind":"stream","host_epoch":"epoch",
             "session_id":"session","stream_id":"other","generation":1});
         assert!(!receipt_targets_match(&journal, &receipt, &target));
+        receipt.request = json!({"operation":"refresh_provider_observations","operation_id":"refresh","request_sha256":"a".repeat(64)});
+        receipt.response["target"] = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"other","generation":1});
+        assert!(!receipt_targets_match(&journal, &receipt, &target));
+        receipt.response["target"] = json!(target);
+        assert!(receipt_targets_match(&journal, &receipt, &target));
     }
 
     fn insert_ended(journal: &mut Journal, id: usize, status: &str) -> String {

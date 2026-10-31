@@ -853,7 +853,10 @@ impl Coordinator {
             }
             let target = target_for(binding);
             for receipt in next.receipts.values_mut() {
-                if receipt.request["target"] == json!(target) {
+                if receipt.request["target"] == json!(target)
+                    || (super::refresh_receipt::is_compact(receipt)
+                        && receipt.response["target"] == json!(target))
+                {
                     receipt.response["status"] = json!("recovery_required");
                     receipt.response["reason"] = json!("input_retirement_unconfirmed");
                 }
