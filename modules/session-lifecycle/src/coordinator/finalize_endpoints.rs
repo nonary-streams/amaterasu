@@ -1,7 +1,7 @@
 //! Owner-authenticated finalization permit endpoint adapter. Finalization has a
 //! distinct authority and never reuses a control permit.
 use amaterasu_extension_api::{
-    ResourceFinalizeRequest, ResourceOutput, validate_resource_finalize_request,
+    LifecycleTarget, ResourceFinalizeRequest, ResourceOutput, validate_resource_finalize_request,
 };
 use amaterasu_module_sdk::ModuleResult;
 use serde::Deserialize;
@@ -28,6 +28,7 @@ enum Operation {
 pub(super) struct ResolvedFinalize {
     pub participant: ParticipantSettings,
     pub context: FinalizeContext,
+    pub session_target: LifecycleTarget,
 }
 
 /// Implementations must reconstruct trusted selected policy, authenticated
@@ -59,7 +60,9 @@ pub(super) fn finalize_endpoint(
     backend: &mut impl FinalizeEndpointBackend,
 ) -> Value {
     match authorize(caller, payload, backend) {
-        Ok(status) => json!({"status":status}),
+        Ok((status, resolved)) => {
+            json!({"status":status, "session_target":resolved.session_target, "target":resolved.context.target, "output":resolved.context.output})
+        }
         Err(_) => json!({"status":"rejected","reason":"resource_finalize_not_authorized"}),
     }
 }
@@ -68,7 +71,7 @@ fn authorize(
     caller: &str,
     payload: Value,
     backend: &mut impl FinalizeEndpointBackend,
-) -> ModuleResult<&'static str> {
+) -> ModuleResult<(&'static str, ResolvedFinalize)> {
     let envelope: Envelope =
         serde_json::from_value(payload).map_err(|_| "invalid_finalize_envelope")?;
     let request = &envelope.request;
@@ -78,6 +81,10 @@ fn authorize(
     }
     let resolved = backend.resolve(request)?;
     let context = &resolved.context;
+    if !matches!(&resolved.session_target, LifecycleTarget::Session { host_epoch, session_id, generation } if *generation > 0 && matches!(&context.target, LifecycleTarget::Stream { host_epoch: stream_epoch, session_id: stream_session, .. } if host_epoch == stream_epoch && session_id == stream_session) && context.parent_generation == Some(*generation))
+    {
+        return Err("finalize_session_mismatch".into());
+    }
     if caller != context.policy.owner_provider
         || resolved.participant.provider != caller
         || context.output != request.output
@@ -95,16 +102,17 @@ fn authorize(
     for result in &context.control_results {
         backend.validate_output(&result.output)?;
     }
-    match envelope.operation {
+    let status = match envelope.operation {
         Operation::VerifyResourceFinalize => match backend.consume(caller, &resolved, request)? {
-            ControlPermitUse::Execute => Ok("execute"),
-            ControlPermitUse::ReattachOnly => Ok("reattach_only"),
+            ControlPermitUse::Execute => "execute",
+            ControlPermitUse::ReattachOnly => "reattach_only",
         },
         Operation::ValidateResourceFinalize => {
             backend.validate(caller, &resolved, request)?;
-            Ok("valid")
+            "valid"
         }
-    }
+    };
+    Ok((status, resolved))
 }
 
 #[cfg(test)]
@@ -126,6 +134,7 @@ mod tests {
             Ok(ResolvedFinalize {
                 participant: self.resolved.participant.clone(),
                 context: self.resolved.context.clone(),
+                session_target: self.resolved.session_target.clone(),
             })
         }
         fn validate_output(&mut self, _: &ResourceOutput) -> ModuleResult<()> {
@@ -168,7 +177,7 @@ mod tests {
         let schema = json!({"id":"schema","major":1,"minor":0,"digest":"a".repeat(64)});
         let output = json!({"output_id":"out","capability":"display","schema":schema,"producer":"owner","producer_service":"owner/2","origin":target,"resource":resource,"data":{}});
         let method = json!({"service":"owner/2","method":"finalize","interface_major":2,"interface_minor":0,"schema_revision":1});
-        let context: FinalizeContext = serde_json::from_value(json!({"policy":{"owner_provider":"owner","owner_service":"owner/2","method":method,"output_capability":"display","output_schema":schema,"capture_provider":"capture","selector_schema":"selector","required_access":"shared","mutation_domains":[]},"output":output,"control_results":[],"target":target,"transition_id":"transition","parent_generation":1})).unwrap();
+        let context: FinalizeContext = serde_json::from_value(json!({"policy":{"owner_provider":"owner","owner_service":"owner/2","method":method,"status_method":method,"output_capability":"display","output_schema":schema,"capture_provider":"capture","selector_schema":"selector","required_access":"shared","mutation_domains":[]},"output":output,"control_results":[],"target":target,"transition_id":"transition","parent_generation":1})).unwrap();
         let participant: ParticipantSettings = serde_json::from_value(json!({"provider":"owner","plan_method":method,"callback_method":method,"status_method":method,"capabilities":[],"cleanup_methods":[],"settings_revision":"one","settings":{}})).unwrap();
         let request = json!({"version":2,"transition_id":"transition","operation_id":"finalize","provider_sequence":1,"target":target,"output":output,"control_results":[],"admission_id":"admission","permit_id":"permit","remaining_ms":5000});
         (
@@ -176,6 +185,7 @@ mod tests {
                 resolved: ResolvedFinalize {
                     participant,
                     context,
+                    session_target: serde_json::from_value(json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1})).unwrap(),
                 },
                 schema: true,
                 consumed: false,
@@ -188,10 +198,10 @@ mod tests {
     #[test]
     fn separate_finalize_permit_is_one_use_and_revalidated() {
         let (mut backend, mut payload) = fixture();
-        assert_eq!(
-            finalize_endpoint("owner", payload.clone(), &mut backend)["status"],
-            "execute"
-        );
+        let first = finalize_endpoint("owner", payload.clone(), &mut backend);
+        assert_eq!(first["status"], "execute");
+        assert_eq!(first["session_target"]["generation"], 1);
+        assert_eq!(first["output"]["output_id"], "out");
         assert_eq!(
             finalize_endpoint("owner", payload.clone(), &mut backend)["status"],
             "reattach_only"
