@@ -177,6 +177,12 @@ pub enum Operation {
         height: u32,
         refresh_millihz: u32,
         name: String,
+        #[serde(default)]
+        virtual_display_layout: Option<VirtualDisplayLayout>,
+        #[serde(default)]
+        expected_topology_revision: Option<u64>,
+        #[serde(default)]
+        expected_topology_domain_id: Option<String>,
         /// Stable caller-scoped reference for shared monitor ownership.
         #[serde(default)]
         reference_id: Option<String>,

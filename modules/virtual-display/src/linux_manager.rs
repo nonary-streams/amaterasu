@@ -6,7 +6,10 @@ mod layout;
 mod observer;
 mod worker;
 use crate::{
-    model::{Operation, Settings, Specification, failure, valid_identity, valid_reference_id},
+    model::{
+        Operation, Settings, Specification, VirtualDisplayLayout, failure, valid_identity,
+        valid_reference_id,
+    },
     scale::ScaleSetting,
 };
 use serde::{Deserialize, Serialize};
@@ -53,10 +56,12 @@ struct Monitor {
     output: Option<String>,
     error: Option<String>,
     references: Option<BTreeSet<String>>,
+    layout: VirtualDisplayLayout,
+    scale: ScaleSetting,
 }
 impl Monitor {
     fn response(&self, reference_id: Option<&str>) -> Value {
-        json!({"reference_owned":reference_id.is_some_and(|reference|self.references.as_ref().is_some_and(|references|references.contains(reference))),"specification":self.specification,"state":self.state,"output":self.output,"error":self.error,
+        json!({"reference_owned":reference_id.is_some_and(|reference|self.references.as_ref().is_some_and(|references|references.contains(reference))),"specification":self.specification,"virtual_display_layout":self.layout,"dd_virtual_display_scale":Manager::scale_value(self.scale),"state":self.state,"output":self.output,"error":self.error,
             "capture_output":self.output.as_ref().filter(|_|self.state=="ready").map(|output|format!("kwin:{output}")),
             "ready":self.output.as_ref().filter(|_|self.state=="ready").map(|output|json!({"device_path":output,"active":true}))})
     }
@@ -78,6 +83,7 @@ enum Work {
         specification: Specification,
         scale: ScaleSetting,
         references: Option<BTreeSet<String>>,
+        layout: VirtualDisplayLayout,
     },
     References {
         key: (String, String),
@@ -114,10 +120,22 @@ pub struct Manager {
     cleanup_pending: std::collections::BTreeSet<(String, String)>,
     observer: Option<observer::Observer>,
     borrows: BTreeMap<String, Borrow>,
+    domain_id: String,
+    topology_revision: u64,
+    pending_mutations: usize,
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl Manager {
     pub fn start(settings: Settings) -> Result<Self, String> {
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random).map_err(|_| "display domain identity unavailable")?;
+        let domain_id = format!(
+            "provider_session:{}",
+            random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
         let mut manager = Self {
             settings,
             monitors: BTreeMap::new(),
@@ -129,6 +147,9 @@ impl Manager {
             cleanup_pending: Default::default(),
             observer: None,
             borrows: BTreeMap::new(),
+            domain_id,
+            topology_revision: 0,
+            pending_mutations: 0,
             stopped: Default::default(),
         };
         if manager.settings.enabled {
@@ -177,11 +198,14 @@ impl Manager {
                                 output: Some(record.output),
                                 error: Some("restart_cleanup_failed".into()),
                                 references: record.references,
+                                layout: self.settings.virtual_display_layout,
+                                scale: self.settings.dd_virtual_display_scale,
                             },
                         );
                     }
                 }
                 Event::Created { key, result } => {
+                    self.pending_mutations = self.pending_mutations.saturating_sub(1);
                     if let Some(monitor) = self.monitors.get_mut(&key) {
                         match result {
                             Ok(record) => {
@@ -199,6 +223,7 @@ impl Manager {
                     }
                 }
                 Event::Removed { key, result } => {
+                    self.pending_mutations = self.pending_mutations.saturating_sub(1);
                     self.cleanup_pending.remove(&key);
                     match result {
                         Ok(()) => {
@@ -262,7 +287,18 @@ impl Manager {
                 name,
                 dd_virtual_display_scale,
                 reference_id,
+                virtual_display_layout,
+                expected_topology_revision,
+                expected_topology_domain_id,
             } => {
+                match (&expected_topology_domain_id, expected_topology_revision) {
+                    (None, None) => {}
+                    (Some(domain), Some(revision))
+                        if domain == &self.domain_id && revision == self.topology_revision => {}
+                    (Some(_), Some(_)) => return (failure("topology_changed"), None),
+                    _ => return (failure("invalid_request"), None),
+                }
+                let layout = virtual_display_layout.unwrap_or(self.settings.virtual_display_layout);
                 if reference_id
                     .as_deref()
                     .is_some_and(|reference| !valid_reference_id(reference))
@@ -296,7 +332,10 @@ impl Manager {
                 }
                 let key = (caller.to_owned(), specification.identity.clone());
                 if let Some(existing) = self.monitors.get(&key) {
-                    if existing.specification != specification {
+                    if existing.specification != specification
+                        || existing.layout != layout
+                        || existing.scale != scale
+                    {
                         return (failure("identity_conflict"), None);
                     }
                     let Some(reference) = reference_id.as_ref() else {
@@ -338,6 +377,12 @@ impl Manager {
                         }),
                     );
                 }
+                if !self.borrows.is_empty() {
+                    return (failure("topology_borrowed"), None);
+                }
+                if self.topology_revision == u64::MAX {
+                    return (failure("topology_revision_exhausted"), None);
+                }
                 if self.monitors.len() >= 8 {
                     return (failure("resource_exhausted"), None);
                 }
@@ -349,15 +394,20 @@ impl Manager {
                     specification: specification.clone(),
                     scale,
                     references: references.clone(),
+                    layout,
                 }) {
                     return (failure("busy"), None);
                 }
+                self.topology_revision += 1;
+                self.pending_mutations += 1;
                 let monitor = Monitor {
                     specification,
                     state: "creating",
                     output: None,
                     error: None,
                     references,
+                    layout,
+                    scale,
                 };
                 let response = json!({"ok":true,"monitor":monitor.response(reference_id.as_deref()),"reference_owned":reference_id.is_some()});
                 self.monitors.insert(key.clone(), monitor);
@@ -375,7 +425,9 @@ impl Manager {
     pub fn completion_lost(&mut self, admission: Option<Admission>) {
         if let Some(admission) = admission {
             if let Some(borrow_id) = admission.borrow_id {
-                self.borrows.remove(&borrow_id);
+                if self.borrows.remove(&borrow_id).is_some() {
+                    self.topology_revision = self.topology_revision.saturating_add(1);
+                }
                 return;
             }
             let _ = self.remove(
@@ -429,6 +481,18 @@ impl Manager {
         if !self.monitors.contains_key(&key) {
             return json!({"ok":true,"removed":true,"identity":identity});
         }
+        let removes_output = reference_id.is_none_or(|reference| {
+            self.monitors[&key]
+                .references
+                .as_ref()
+                .is_none_or(|refs| refs.is_empty() || (refs.len() == 1 && refs.contains(reference)))
+        });
+        if removes_output && !self.borrows.is_empty() {
+            return failure("topology_borrowed");
+        }
+        if removes_output && self.topology_revision == u64::MAX {
+            return failure("topology_revision_exhausted");
+        }
         if let Some(reference) = reference_id {
             let Some(references) = self.monitors[&key].references.as_ref() else {
                 return failure("reference_conflict");
@@ -451,6 +515,8 @@ impl Manager {
             if !self.enqueue(Work::Remove { key: key.clone() }) {
                 return failure("busy");
             }
+            self.topology_revision += 1;
+            self.pending_mutations += 1;
             self.cleanup_pending.insert(key.clone());
             self.monitors.get_mut(&key).unwrap().state = "removing";
         }
@@ -463,6 +529,12 @@ impl Manager {
         reference_id: &str,
     ) -> (Value, Option<Admission>) {
         let key = (caller.to_owned(), identity.to_owned());
+        if self.pending_mutations != 0 || !self.ready {
+            return (failure("topology_mutating"), None);
+        }
+        if self.topology_revision == u64::MAX {
+            return (failure("topology_revision_exhausted"), None);
+        }
         let Some(monitor) = self.monitors.get(&key) else {
             return (failure("not_found"), None);
         };
@@ -508,6 +580,7 @@ impl Manager {
             return (failure("random_unavailable"), None);
         }
         let borrow_id: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        self.topology_revision += 1;
         self.borrows.insert(
             borrow_id.clone(),
             Borrow {
@@ -517,7 +590,7 @@ impl Manager {
                 valid: true,
             },
         );
-        let result = json!({"ok":true,"borrow_id":borrow_id,"observed_output":Self::observation(&output, observation)});
+        let result = json!({"ok":true,"borrow_id":borrow_id,"observed_output":Self::observation(&output, observation),"mutation_domain":self.domain()});
         (
             result,
             Some(Admission {
@@ -587,7 +660,7 @@ impl Manager {
                 .valid = false;
             return failure("borrow_invalid");
         }
-        json!({"ok":true,"borrow_id":borrow_id,"observed_output":Self::observation(&output, expected)})
+        json!({"ok":true,"borrow_id":borrow_id,"observed_output":Self::observation(&output, expected),"mutation_domain":self.domain()})
     }
     fn release_borrow(
         &mut self,
@@ -601,10 +674,21 @@ impl Manager {
                 && borrow.reference_id == reference_id
         }) {
             self.borrows.remove(borrow_id);
-            json!({"ok":true,"released":true})
+            self.topology_revision = self.topology_revision.saturating_add(1);
+            json!({"ok":true,"released":true,"mutation_domain":self.domain()})
         } else {
             failure("borrow_invalid")
         }
+    }
+    fn scale_value(scale: ScaleSetting) -> i32 {
+        match scale {
+            ScaleSetting::Retain => 0,
+            ScaleSetting::Automatic => -1,
+            ScaleSetting::Fixed(value) => i32::from(value),
+        }
+    }
+    fn domain(&self) -> Value {
+        json!({"id":self.domain_id,"revision":self.topology_revision,"borrowers":self.borrows.len(),"pending_mutations":self.pending_mutations,"scope":"provider_session"})
     }
     fn status(
         &self,
@@ -640,7 +724,7 @@ impl Manager {
                 })
             });
         json!({"reference_owned":reference_id.map(|_|reference_owned),"ok":true,"enabled":self.settings.enabled,"native_supported":true,"driver":"libvirtualdisplay",
-            "ownership_authority":"unix_uid_broker","recovery_ready":self.ready,"recovery_error":self.recovery_error,"monitors":monitors,
+            "ownership_authority":"unix_uid_broker","mutation_domain":self.domain(),"settings":{"virtual_display_layout":self.settings.virtual_display_layout,"dd_virtual_display_scale":Self::scale_value(self.settings.dd_virtual_display_scale),"dd_activate_virtual_display":self.settings.dd_activate_virtual_display,"dd_use_sunshine_virtual_display_driver":self.settings.dd_use_sunshine_virtual_display_driver},"recovery_ready":self.ready,"recovery_error":self.recovery_error,"monitors":monitors,
             "activation_requested":self.settings.dd_activate_virtual_display,
             "configured_permanent_monitor_count":self.settings.dd_virtual_display_permanent_count,"permanent_monitor_runtime_supported":false})
     }

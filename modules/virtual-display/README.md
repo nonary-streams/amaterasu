@@ -290,3 +290,27 @@ compositor, so producer and consumer must use the same compositor. External
 replacement may occur between validations; consumers must stop on invalidation.
 A native binding to a privileged or uncooperative actor is not established.
 Windows reports `unsupported_binding` for these operations.
+
+### Linux layout and cooperative mutation domain
+
+`create` accepts optional `virtual_display_layout` (`exclusive` or `extended`)
+and the pair `expected_topology_domain_id` and `expected_topology_revision`. Omitting the layout retains the configured
+module default. The requested layout and scale are part of the active identity:
+reusing the same caller/UUID with different values returns `identity_conflict`.
+Unsupported layouts are rejected. This does not reconfigure module settings.
+
+Linux status returns `settings` and `mutation_domain`, which has an opaque
+provider-lifetime `id`, numeric `revision`, `borrowers`, `pending_mutations`, and
+`scope: "provider_session"`. Pass the exact domain ID and numeric revision together as
+`expected_topology_domain_id` and `expected_topology_revision` to reject a stale create. The random domain ID
+changes on provider restart. The revision advances on admitted native topology
+operations and borrow acquisition or release. A new create or final output
+removal is rejected while any borrow exists; acquiring a borrow is rejected
+while a provider native mutation is queued or running. Idempotent reuse and
+non-final reference releases do not require a native topology mutation. A
+caller must release its borrow after capture is retired before removal.
+
+This domain covers only changes admitted by this provider, not external KScreen
+or broker effects. The independent compositor/output observation and continuing
+validation remain necessary. Windows rejects explicit per-request layout or
+revision with `unsupported_topology_domain`; its prior requests remain valid.

@@ -354,7 +354,16 @@ impl<D: Driver> Manager<D> {
                 name,
                 reference_id,
                 dd_virtual_display_scale,
+                virtual_display_layout,
+                expected_topology_revision,
+                expected_topology_domain_id,
             } => {
+                if virtual_display_layout.is_some()
+                    || expected_topology_revision.is_some()
+                    || expected_topology_domain_id.is_some()
+                {
+                    return failure("unsupported_topology_domain");
+                }
                 if reference_id
                     .as_deref()
                     .is_some_and(|reference| !valid_reference_id(reference))

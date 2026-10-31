@@ -104,6 +104,9 @@ fn create() -> Operation {
         name: "Test display".into(),
         reference_id: None,
         dd_virtual_display_scale: None,
+        virtual_display_layout: None,
+        expected_topology_revision: None,
+        expected_topology_domain_id: None,
     }
 }
 fn create_with_scale(dd_virtual_display_scale: i32) -> Operation {
@@ -116,6 +119,9 @@ fn create_with_scale(dd_virtual_display_scale: i32) -> Operation {
         name: "Test display".into(),
         reference_id: None,
         dd_virtual_display_scale: Some(dd_virtual_display_scale),
+        virtual_display_layout: None,
+        expected_topology_revision: None,
+        expected_topology_domain_id: None,
     }
 }
 fn create_with_reference(reference_id: &str) -> Operation {
@@ -128,6 +134,9 @@ fn create_with_reference(reference_id: &str) -> Operation {
         name: "Test display".into(),
         reference_id: Some(reference_id.into()),
         dd_virtual_display_scale: Some(0),
+        virtual_display_layout: None,
+        expected_topology_revision: None,
+        expected_topology_domain_id: None,
     }
 }
 fn tick(manager: &mut Manager<Fake>) {

@@ -379,6 +379,38 @@ fn exclusive_streams_keep_peer_outputs_and_restore_the_pre_stream_desktop() {
     fs::remove_dir_all(root).unwrap();
 }
 #[test]
+fn per_request_layout_is_used_without_changing_the_controller_default() {
+    let (root, mut controller) = fixture();
+    let first = controller
+        .create_with_references(
+            "session".into(),
+            specification(FIRST),
+            ScaleSetting::Retain,
+            None,
+            VirtualDisplayLayout::Exclusive,
+        )
+        .unwrap();
+    let second = controller
+        .create(
+            "session".into(),
+            specification(SECOND),
+            ScaleSetting::Retain,
+        )
+        .unwrap();
+    assert_eq!(
+        controller.compositor.placements,
+        [
+            ("Virtual-2".into(), Placement::Exclusive { keep: vec![] }),
+            ("Virtual-3".into(), Placement::Extended),
+        ]
+    );
+    controller.remove(&second.key()).unwrap();
+    controller.remove(&first.key()).unwrap();
+    drop(controller);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn extended_streams_restore_the_layout_current_at_removal() {
     let (root, mut controller) = fixture();
     let record = controller
@@ -432,6 +464,9 @@ fn linux_shared_references_persist_and_release_only_the_last_connector_owner() {
         cleanup_pending: Default::default(),
         observer: None,
         borrows: Default::default(),
+        domain_id: "test-domain".into(),
+        topology_revision: 0,
+        pending_mutations: 0,
         stopped,
     };
     let create = |reference: Option<&str>| crate::model::Operation::Create {
@@ -443,6 +478,9 @@ fn linux_shared_references_persist_and_release_only_the_last_connector_owner() {
         name: "Amaterasu".into(),
         reference_id: reference.map(str::to_owned),
         dd_virtual_display_scale: None,
+        virtual_display_layout: None,
+        expected_topology_revision: None,
+        expected_topology_domain_id: None,
     };
     assert_eq!(
         manager.admit("session", create(Some("stream-a"))).0["ok"],
@@ -501,6 +539,51 @@ fn linux_shared_references_persist_and_release_only_the_last_connector_owner() {
         manager.status("session", None, Some("stream-a".into()))["ok"],
         false
     );
+    let domain = manager.domain();
+    assert_eq!(domain["scope"], "provider_session");
+    let revision = manager.topology_revision;
+    let request = |layout: &str, expected: u64| {
+        serde_json::from_value(serde_json::json!({
+            "action":"create", "identity":FIRST, "width":1920, "height":1080,
+            "refresh_millihz":60000, "name":"Amaterasu", "reference_id":"stream-a",
+            "virtual_display_layout":layout, "expected_topology_domain_id":"test-domain", "expected_topology_revision":expected
+        }))
+        .unwrap()
+    };
+    assert_eq!(
+        manager
+            .admit("session", request("exclusive", revision + 1))
+            .0["code"],
+        "topology_changed"
+    );
+    let mut partial = serde_json::json!({"action":"create", "identity":FIRST, "width":1920, "height":1080, "refresh_millihz":60000, "name":"Amaterasu", "expected_topology_revision":revision});
+    assert_eq!(
+        manager
+            .admit("session", serde_json::from_value(partial.clone()).unwrap())
+            .0["code"],
+        "invalid_request"
+    );
+    partial["expected_topology_domain_id"] = "provider_session:old-epoch".into();
+    assert_eq!(
+        manager
+            .admit("session", serde_json::from_value(partial).unwrap())
+            .0["code"],
+        "topology_changed"
+    );
+    assert_eq!(
+        manager.admit("session", request("extended", revision)).0["code"],
+        "identity_conflict"
+    );
+    manager.pending_mutations = 1;
+    let pending_borrow = crate::model::Operation::Borrow {
+        identity: FIRST.into(),
+        reference_id: "stream-a".into(),
+    };
+    assert_eq!(
+        manager.admit("session", pending_borrow).0["code"],
+        "topology_mutating"
+    );
+    manager.pending_mutations = 0;
     // A borrow pins its owner reference and cannot be released by another caller.
     manager.borrows.insert(
         "borrow-token".into(),
@@ -522,6 +605,36 @@ fn linux_shared_references_persist_and_release_only_the_last_connector_owner() {
         manager.remove("session", FIRST, Some("stream-a"))["code"],
         "display_borrowed"
     );
+    let other_create: crate::model::Operation = serde_json::from_value(serde_json::json!({
+        "action":"create", "identity":SECOND, "width":1920, "height":1080,
+        "refresh_millihz":60000, "name":"Amaterasu", "reference_id":"stream-other",
+        "virtual_display_layout":"extended", "expected_topology_domain_id":"test-domain", "expected_topology_revision":manager.topology_revision
+    }))
+    .unwrap();
+    assert_eq!(
+        manager.admit("session", other_create).0["code"],
+        "topology_borrowed"
+    );
+    manager.monitors.insert(
+        ("other-owner".into(), SECOND.into()),
+        Monitor {
+            specification: specification(SECOND),
+            state: "ready",
+            output: Some("Virtual-3".into()),
+            error: None,
+            references: Some(std::collections::BTreeSet::from(["other-ref".into()])),
+            layout: VirtualDisplayLayout::Extended,
+            scale: ScaleSetting::Retain,
+        },
+    );
+    assert_eq!(
+        manager.remove("other-owner", SECOND, Some("other-ref"))["code"],
+        "topology_borrowed"
+    );
+    manager
+        .monitors
+        .remove(&("other-owner".into(), SECOND.into()));
+
     // Failed revalidation does not drop the reference fence, and cannot
     // become valid again if an equivalent output later appears.
     assert_eq!(
@@ -574,6 +687,8 @@ fn linux_shared_references_persist_and_release_only_the_last_connector_owner() {
         output: Some("Virtual-2".into()),
         error: None,
         references: None,
+        layout: VirtualDisplayLayout::Exclusive,
+        scale: ScaleSetting::Retain,
     };
     manager
         .monitors
@@ -599,6 +714,7 @@ fn reference_ownership_survives_journal_reload_and_restart_cleanup() {
                 "stream-a".into(),
                 "stream-b".into(),
             ])),
+            VirtualDisplayLayout::Extended,
         )
         .unwrap();
     let broker = controller.broker.clone();

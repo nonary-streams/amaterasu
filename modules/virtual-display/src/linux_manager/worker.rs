@@ -33,14 +33,18 @@ struct Controller<B: Broker, C: Compositor, I: ConnectorInventory> {
     broker: B,
     compositor: C,
     connectors: I,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "default layout is used by test helpers")
+    )]
     layout: VirtualDisplayLayout,
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
     /// Exclusive placement leaves the outputs of other journaled Amaterasu
     /// streams enabled; only displays Amaterasu does not own are turned off.
-    fn placement(&self, owned: &str) -> Placement {
-        match self.layout {
+    fn placement(&self, owned: &str, layout: VirtualDisplayLayout) -> Placement {
+        match layout {
             VirtualDisplayLayout::Extended => Placement::Extended,
             VirtualDisplayLayout::Exclusive => Placement::Exclusive {
                 keep: self
@@ -91,7 +95,7 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
         specification: Specification,
         scale: ScaleSetting,
     ) -> Result<Record, String> {
-        self.create_with_references(owner, specification, scale, None)
+        self.create_with_references(owner, specification, scale, None, self.layout)
     }
     fn create_with_references(
         &mut self,
@@ -99,6 +103,7 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
         specification: Specification,
         scale: ScaleSetting,
         references: Option<std::collections::BTreeSet<String>>,
+        layout: VirtualDisplayLayout,
     ) -> Result<Record, String> {
         if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
             return Err("display manager stopping".into());
@@ -126,7 +131,7 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
             references,
         };
         record.layout = self.compositor.snapshot(&record.output)?;
-        let placement = self.placement(&record.output);
+        let placement = self.placement(&record.output, layout);
         self.journal.insert(record.clone())?;
         let result = (|| {
             self.broker.set_connected(&record.output, true)?;
@@ -199,6 +204,7 @@ pub(super) fn run<B: Broker, C: Compositor, I: ConnectorInventory>(
                 specification,
                 scale,
                 references,
+                layout,
             } => {
                 let key = (owner.clone(), specification.identity.clone());
                 Event::Created {
@@ -208,6 +214,7 @@ pub(super) fn run<B: Broker, C: Compositor, I: ConnectorInventory>(
                         specification,
                         scale,
                         references,
+                        layout,
                     ),
                 }
             }
