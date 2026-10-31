@@ -110,3 +110,79 @@ def provider_entries(selected: list[dict], enable_action: bool = False) -> dict:
     return {"registry_descriptors": registry, "api_methods": approvals,
             "participants": participants, "input_actions": [action_id] if enable_action else [],
             "action_grants": action_grants}
+
+
+def build_bootstrap(base: dict, selected: list[dict], entries: dict, lifecycle_settings: dict,
+                    enable_action: bool = False) -> tuple[dict, dict]:
+    """Assemble a new bootstrap after external graph and API approval validation.
+
+    The caller must validate the complete lifecycle settings, frozen method
+    schemas, descriptor digests and component templates before using this result.
+    Refuse existing extension policy instead of replacing an older installation.
+    """
+    bootstrap = copy.deepcopy(base)
+    policy = bootstrap["policy"]
+    principals = policy["principals"]
+    settings = policy["settings"]
+    providers = {item["descriptor"]["provider"]: item for item in selected}
+    if set(providers) != {check.OWNER, check.DISPLAY}:
+        raise ValueError("both providers are required")
+    for identity in (legacy.LIFECYCLE, legacy.REGISTRY, legacy.ACTIONS, check.OWNER, check.DISPLAY):
+        if identity in principals or identity in settings:
+            raise ValueError("existing extension policy requires explicit migration")
+    old_methods = policy.get("api_methods", [])
+    def method_identity(entry: dict) -> tuple:
+        method = entry["method"]
+        return method["service"], method["method"], method["interface_major"]
+    identities = [method_identity(item) for item in old_methods + entries["api_methods"]]
+    if len(identities) != len(set(identities)):
+        raise ValueError("provider API approval conflicts with existing policy")
+    for identity, service in ((legacy.LIFECYCLE, legacy.LIFECYCLE_SERVICE),
+                              (legacy.REGISTRY, legacy.REGISTRY_SERVICE),
+                              (legacy.ACTIONS, legacy.ACTIONS_SERVICE)):
+        principals[identity] = {"provide": [service], "call": []}
+    for identity, item in providers.items():
+        principals[identity] = copy.deepcopy(item["component"]["requested"])
+    services = [check.OWNER + "/2", check.DISPLAY + "/2"]
+    parent_chain = [legacy.NVHTTP, legacy.RTSP, legacy.STREAM, legacy.INPUT, legacy.MANAGEMENT]
+    calls = {identity: [legacy.LIFECYCLE_SERVICE, legacy.REGISTRY_SERVICE, legacy.ACTIONS_SERVICE,
+                        legacy.STATE, *services] for identity in parent_chain}
+    calls.update({
+        legacy.LIFECYCLE: ["amaterasu.launch/1", "amaterasu.input/1", legacy.LIFECYCLE_SERVICE,
+                           legacy.REGISTRY_SERVICE, legacy.STATE, "amaterasu.display/1",
+                           "amaterasu.virtual-display/1", *services],
+        legacy.REGISTRY: [legacy.LIFECYCLE_SERVICE, legacy.STATE, *services],
+        legacy.ACTIONS: [legacy.LIFECYCLE_SERVICE, legacy.REGISTRY_SERVICE, legacy.STATE, *services],
+    })
+    if enable_action:
+        for identity in (legacy.ACTIONS, legacy.MANAGEMENT, legacy.INPUT, legacy.STREAM):
+            calls[identity].append("amaterasu.virtual-display/1")
+    for identity, requested in calls.items():
+        principal = principals[identity]
+        principal["call"] = sorted(set(principal.get("call", [])) | set(requested))
+    principals[legacy.CONSOLE]["call"] = sorted(set(principals[legacy.CONSOLE].get("call", [])) |
+        {legacy.REGISTRY_SERVICE, legacy.ACTIONS_SERVICE, legacy.LIFECYCLE_SERVICE, legacy.STATE, *services})
+    policy["api_methods"] = old_methods + copy.deepcopy(entries["api_methods"])
+    settings[legacy.REGISTRY] = {"descriptors": copy.deepcopy(entries["registry_descriptors"])}
+    lifecycle = copy.deepcopy(lifecycle_settings)
+    if any(name in lifecycle for name in ("participants", "input_actions")):
+        raise ValueError("lifecycle settings must not override selected participants or actions")
+    lifecycle["participants"] = copy.deepcopy(entries["participants"])
+    lifecycle["input_actions"] = copy.deepcopy(entries["input_actions"])
+    settings[legacy.LIFECYCLE] = lifecycle
+    settings[legacy.ACTIONS] = {"input_service": legacy.INPUT, "grants": copy.deepcopy(entries["action_grants"])}
+    launch = settings.setdefault("amaterasu.launch", {})
+    observers = launch.setdefault("retirement_observers", [])
+    if not isinstance(observers, list) or any(not isinstance(item, str) for item in observers):
+        raise ValueError("invalid existing retirement observers")
+    if legacy.LIFECYCLE not in observers:
+        observers.append(legacy.LIFECYCLE)
+    nvhttp = settings[legacy.NVHTTP]
+    if "session_lifecycle_required" in nvhttp and nvhttp["session_lifecycle_required"] is not True:
+        raise ValueError("existing lifecycle configuration conflicts with the profile")
+    nvhttp["session_lifecycle_required"] = True
+    capture = nvhttp["streaming"]["capture"]
+    if "capture_provider" in capture and capture["capture_provider"] != "pipewire":
+        raise ValueError("existing capture selection conflicts with PipeWire")
+    capture["capture_provider"] = "pipewire"
+    return bootstrap, calls

@@ -5,6 +5,7 @@ import unittest
 
 import check_session_extension_composition as check
 import session_extension_composition_policy as policy
+import prepare_session_extension_profile as legacy
 
 
 def selection(provider, revision, methods):
@@ -61,6 +62,51 @@ class CompositionPolicyTest(unittest.TestCase):
         self.owner["component"]["requested"]["provide"] = [check.OWNER + "/1"]
         with self.assertRaisesRegex(ValueError, "selected v2"):
             policy.provider_entries(self.selected)
+
+    def test_bootstrap_assembly_preserves_existing_base_and_refuses_old_extension(self):
+        identities = [legacy.NVHTTP, legacy.RTSP, legacy.STREAM, legacy.INPUT,
+                      legacy.MANAGEMENT, legacy.CONSOLE]
+        base = {"policy": {"principals": {identity: {"call": []} for identity in identities},
+                           "settings": {legacy.NVHTTP: {"streaming": {"capture": {}}},
+                                        "amaterasu.launch": {"retirement_observers": ["other.observer"]}},
+                           "api_methods": []}}
+        before = copy.deepcopy(base)
+        entries = policy.provider_entries(self.selected)
+        lifecycle = {"journal_path": "/new-root/data/journal.json", "operation_grants": {}}
+        assembled, calls = policy.build_bootstrap(base, self.selected, entries, lifecycle)
+        self.assertEqual(base, before)
+        settings = assembled["policy"]["settings"]
+        self.assertEqual(settings[legacy.LIFECYCLE]["participants"][1]["depends_on"], [check.OWNER])
+        self.assertTrue(settings[legacy.NVHTTP]["session_lifecycle_required"])
+        self.assertEqual(settings[legacy.NVHTTP]["streaming"]["capture"]["capture_provider"], "pipewire")
+        self.assertEqual(settings["amaterasu.launch"]["retirement_observers"], ["other.observer", legacy.LIFECYCLE])
+        self.assertIn(check.OWNER + "/2", calls[legacy.LIFECYCLE])
+        self.assertIn(check.DISPLAY + "/2", calls[legacy.REGISTRY])
+        base["policy"]["settings"][legacy.REGISTRY] = {"descriptors": [{"old": True}]}
+        with self.assertRaisesRegex(ValueError, "explicit migration"):
+            policy.build_bootstrap(base, self.selected, entries, lifecycle)
+        self.assertEqual(base["policy"]["settings"][legacy.REGISTRY], {"descriptors": [{"old": True}]})
+
+    def test_bootstrap_refuses_duplicate_approvals_and_graph_override(self):
+        identities = [legacy.NVHTTP, legacy.RTSP, legacy.STREAM, legacy.INPUT,
+                      legacy.MANAGEMENT, legacy.CONSOLE]
+        base = {"policy": {"principals": {identity: {"call": []} for identity in identities},
+                           "settings": {legacy.NVHTTP: {"streaming": {"capture": {}}}},
+                           "api_methods": []}}
+        entries = policy.provider_entries(self.selected)
+        base["policy"]["api_methods"].append(copy.deepcopy(entries["api_methods"][0]))
+        with self.assertRaisesRegex(ValueError, "approval conflicts"):
+            policy.build_bootstrap(base, self.selected, entries, {})
+        base["policy"]["api_methods"] = []
+        with self.assertRaisesRegex(ValueError, "must not override"):
+            policy.build_bootstrap(base, self.selected, entries, {"participants": []})
+        base["policy"]["settings"][legacy.NVHTTP]["streaming"]["capture"]["capture_provider"] = "kms"
+        with self.assertRaisesRegex(ValueError, "capture selection conflicts"):
+            policy.build_bootstrap(base, self.selected, entries, {})
+        base["policy"]["settings"][legacy.NVHTTP]["streaming"]["capture"]["capture_provider"] = "pipewire"
+        base["policy"]["settings"][legacy.NVHTTP]["session_lifecycle_required"] = False
+        with self.assertRaisesRegex(ValueError, "lifecycle configuration conflicts"):
+            policy.build_bootstrap(base, self.selected, entries, {})
 
 
 if __name__ == "__main__":
