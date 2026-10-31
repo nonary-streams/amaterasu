@@ -4,8 +4,8 @@ use super::composition::approval_matches_call;
 use super::finalize_selection::FinalizeSelectionSnapshot;
 use crate::provider_dispatch::{DispatchRecord, DispatchState};
 use amaterasu_extension_api::{
-    self as api, ProviderOperation, ProviderRequest, ProviderResponse, ResourceControlResponse,
-    ResourceFinalizeRequest, ResourcePlan,
+    self as api, ProviderOperation, ProviderRequest, ProviderResponse, ProviderStatusRequest,
+    ResourceControlResponse, ResourceFinalizeRequest, ResourcePlan,
 };
 use serde::{Deserialize, Serialize};
 
@@ -25,6 +25,8 @@ pub(super) struct FinalizeResultRecord {
     pub applied: ResourceControlResponse,
     pub terminal: DispatchRecord,
     pub pending_receipt: Option<String>,
+    #[serde(default)]
+    pub pending_proof: Option<DispatchRecord>,
 }
 
 impl FinalizeResultRecord {
@@ -73,6 +75,25 @@ impl FinalizeResultRecord {
             && call.approval == effect.broker_approval
             && call.operation_id == request.operation_id
             && serde_json::to_value(request).ok().as_ref() == Some(&call.arguments);
+        let status_match = self.pending_receipt.as_ref().is_some_and(|receipt| {
+            let status = &selection.finalize_status_approval;
+            approval_matches_call(status, call)
+                && call.approval == status.broker_approval
+                && call.operation_id != request.operation_id
+                && serde_json::from_value::<ProviderStatusRequest>(call.arguments.clone()).is_ok_and(|query| {
+                    query.provider_sequence == request.provider_sequence
+                        && query.operation_id == request.operation_id
+                        && query.transition_id == request.transition_id
+                        && query.receipt_id == *receipt
+                })
+                && self.pending_proof.as_ref().is_some_and(|proof| {
+                    approval_matches_call(effect, &proof.call)
+                        && proof.call.approval == effect.broker_approval
+                        && proof.call.operation_id == request.operation_id
+                        && serde_json::to_value(request).ok().as_ref() == Some(&proof.call.arguments)
+                        && matches!(&proof.state, DispatchState::Completed { payload } if matches!(serde_json::from_value::<ResourceControlResponse>(payload.clone()), Ok(ResourceControlResponse::Pending { receipt_id }) if receipt_id == *receipt))
+                })
+        });
         let planned = ProviderResponse::Planned {
             plan: self.plan.clone(),
         };
@@ -98,8 +119,8 @@ impl FinalizeResultRecord {
                 .ok()
                 .as_ref()
                 == Some(&self.applied)
-            && effect_match
-            && self.pending_receipt.is_none()
+            && ((effect_match && self.pending_receipt.is_none() && self.pending_proof.is_none())
+                || status_match)
             && request.control_results.is_empty()
             && candidate.geometry_revision == geometry
             && candidate.plan_revision == constraint.plan_revision
@@ -115,7 +136,7 @@ impl FinalizeResultRecord {
             && constraint
                 .mode
                 .as_ref()
-                .is_none_or(|mode| mode == &candidate.mode)
+                .is_some_and(|mode| mode == &candidate.mode)
             && schema.is_ok_and(|catalog| catalog.validate(&output.schema, &output.data).is_ok())
     }
 }
@@ -270,6 +291,18 @@ pub(super) fn record_finalize_result(
         })
         .cloned()
         .ok_or("finalize_plan_approval_missing")?;
+    let pending_receipt = dispatch
+        .pending_proof
+        .as_ref()
+        .and_then(|proof| match &proof.state {
+            DispatchState::Completed { payload } => {
+                match serde_json::from_value::<ResourceControlResponse>(payload.clone()) {
+                    Ok(ResourceControlResponse::Pending { receipt_id }) => Some(receipt_id),
+                    _ => None,
+                }
+            }
+            _ => None,
+        });
     let record = FinalizeResultRecord {
         selection: selected.clone(),
         plan_request: progress.owner_plan.request.clone(),
@@ -282,7 +315,8 @@ pub(super) fn record_finalize_result(
             .dispatch
             .clone()
             .ok_or("finalize_terminal_proof_missing")?,
-        pending_receipt: None,
+        pending_receipt,
+        pending_proof: dispatch.pending_proof.clone(),
     };
     let ResourceControlResponse::Applied {
         candidate: Some(candidate),
@@ -328,8 +362,35 @@ mod tests {
             applied: serde_json::from_value(applied).unwrap(),
             terminal: serde_json::from_value(terminal).unwrap(),
             pending_receipt: None,
+            pending_proof: None,
         }
     }
+    #[test]
+    fn pending_status_requires_exact_effect_receipt_and_selected_status() {
+        let mut record = fixture();
+        let mut pending = record.terminal.clone();
+        pending.state = DispatchState::Completed {
+            payload: json!({"status":"pending","receipt_id":"receipt"}),
+        };
+        let status = &record.selection.finalize_status_approval;
+        record.terminal.call.service = status.method.service.clone();
+        record.terminal.call.method = status.method.method.clone();
+        record.terminal.call.interface_major = status.method.interface_major;
+        record.terminal.call.interface_minor = status.method.interface_minor;
+        record.terminal.call.approval = status.broker_approval.clone();
+        record.terminal.call.operation_id = "status-poll".into();
+        record.terminal.call.arguments = json!({"provider_sequence":record.request.provider_sequence,"operation_id":record.request.operation_id,"transition_id":record.request.transition_id,"receipt_id":"receipt"});
+        record.pending_receipt = Some("receipt".into());
+        record.pending_proof = Some(pending);
+        assert!(record.validate_structure());
+        let mut changed = record.clone();
+        changed.pending_receipt = Some("foreign".into());
+        assert!(!changed.validate_structure());
+        let mut changed = record;
+        changed.terminal.call.approval["provider"] = json!("foreign");
+        assert!(!changed.validate_structure());
+    }
+
     #[test]
     fn pins_geometry_and_completed_owner_response() {
         let record = fixture();
