@@ -25,8 +25,30 @@ impl ClosedActionBook {
                     && !self.records[..i].iter().any(|old| {
                         old.caller == record.caller && old.binding == record.binding
                             || old.permit_commitment == record.permit_commitment
+                            || old.retired_admission == record.retired_admission
                     })
             })
+    }
+
+    /// Recover the immutable old root only as read-only historical evidence.
+    pub(super) fn historical_root(
+        &self,
+        admission: &str,
+        transition: &str,
+        owner: &str,
+        generation: u64,
+    ) -> Option<&amaterasu_extension_api::ResourceOutput> {
+        if !self.validate() {
+            return None;
+        }
+        let mut records = self.records.iter().filter(|record| {
+            record.retired_admission == admission
+                && record.retired_transition == transition
+                && record.owner == owner
+                && record.resource_generation == generation
+        });
+        let record = records.next()?;
+        records.next().is_none().then_some(&record.retired_root)
     }
 
     /// Read-only lookup; this never recovers permission to execute an effect.
@@ -63,6 +85,7 @@ impl ClosedActionBook {
             || self.records.iter().any(|old| {
                 old.caller == record.caller && old.binding == record.binding
                     || old.permit_commitment == record.permit_commitment
+                    || old.retired_admission == record.retired_admission
             })
         {
             return Err("closed_action_conflict".into());
@@ -79,6 +102,9 @@ pub(super) struct ClosedActionCertificate {
     session_target: LifecycleTarget,
     owner: String,
     resource_generation: u64,
+    retired_admission: String,
+    retired_transition: String,
+    retired_root: amaterasu_extension_api::ResourceOutput,
     replacement_generation: u64,
     replacement_admission: String,
     replacement_commitment: String,
@@ -138,6 +164,11 @@ impl ClosedActionCertificate {
             && valid_id(&self.owner)
             && valid_id(&self.caller)
             && valid_id(&self.replacement_admission)
+            && valid_id(&self.retired_admission)
+            && valid_id(&self.retired_transition)
+            && self.retired_root.producer == self.owner
+            && self.retired_root.origin == self.session_target
+            && amaterasu_extension_api::validate_resource_output(&self.retired_root).is_ok()
             && valid_id(&self.binding.operation_id)
             && valid_id(&self.binding.action_id)
             && valid_id(&self.binding.source.caller)
@@ -161,6 +192,19 @@ impl ClosedActionCertificate {
             .ok_or("action_closure_marker_unproven")?;
         if marker.resource_generation != generation {
             return Err("action_closure_generation_mismatch".into());
+        }
+        let mut old_roots = journal.composition.records().filter(|root| {
+            root.admission_id == marker.root_admission_id
+                && root.output.origin == marker.session_target
+                && root.output.producer == owner
+        });
+        let old_root = old_roots.next().ok_or("retired_root_missing")?;
+        if old_roots.next().is_some()
+            || old_root.state != composition::OutputState::Released
+            || resource_generation::historical_generation(journal, old_root).ok()
+                != Some(generation)
+        {
+            return Err("retired_root_unproven".into());
         }
         let session = journal.sessions.get(session_id).ok_or("unknown_session")?;
         let current = *session
@@ -192,6 +236,9 @@ impl ClosedActionCertificate {
             session_target: marker.session_target.clone(),
             owner: owner.into(),
             resource_generation: generation,
+            retired_admission: old_root.admission_id.clone(),
+            retired_transition: old_root.transition_id.clone(),
+            retired_root: old_root.output.clone(),
             replacement_generation: current,
             replacement_admission: replacement.admission_id.clone(),
             replacement_commitment: commitment(replacement)
@@ -236,6 +283,9 @@ mod tests {
             },
             owner: "owner".into(),
             resource_generation: 1,
+            retired_admission: "retired".into(),
+            retired_transition: "prepare".into(),
+            retired_root: serde_json::from_value(json!({"output_id":"output","capability":"screen","schema":{"id":"screen","major":1,"minor":0,"digest":"a".repeat(64)},"producer":"owner","producer_service":"owner/2","origin":{"kind":"session","host_epoch":"epoch","session_id":"session","generation":1},"resource":{"provider":"owner","resource_id":"display","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":null,"mutation_domains":[]},"data":{}})).unwrap(),
             replacement_generation: 2,
             replacement_admission: "replacement".into(),
             replacement_commitment: "a".repeat(64),
@@ -300,6 +350,25 @@ mod tests {
         let restored: ClosedActionBook =
             serde_json::from_slice(&serde_json::to_vec(&book).unwrap()).unwrap();
         assert!(restored.validate());
+        assert_eq!(
+            restored.historical_root("retired", "prepare", "owner", 1),
+            Some(&certificate.retired_root)
+        );
+        assert!(
+            restored
+                .historical_root("retired", "wrong", "owner", 1)
+                .is_none()
+        );
+        assert!(
+            restored
+                .historical_root("retired", "prepare", "foreign", 1)
+                .is_none()
+        );
+        assert!(
+            restored
+                .historical_root("retired", "prepare", "owner", 2)
+                .is_none()
+        );
         assert_eq!(
             restored.matching_retry("actions", "permit", &json!({"receipt":"done"})),
             Some(&certificate.binding)
