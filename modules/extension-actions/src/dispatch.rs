@@ -526,7 +526,13 @@ impl Dispatch {
     /// Only a coordinator-confirmed permit cancellation may use this before the
     /// provider request is sent. The caller must persist it before reporting it.
     pub fn confirm_cancelled_before_effect(&mut self) -> Result<(), &'static str> {
-        if !matches!(self.stage, Stage::Running { .. }) {
+        if !matches!(
+            self.stage,
+            Stage::AwaitingConsume { .. }
+                | Stage::AwaitingTransition { .. }
+                | Stage::ReadyToExecute { .. }
+                | Stage::Running { .. }
+        ) {
             return Err("invalid_phase");
         }
         self.stage = Stage::Cancelled;

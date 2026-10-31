@@ -240,6 +240,23 @@ impl ManagedModule for ActionsModule {
         if !matches!(self.recovery, Recovery::Done | Recovery::Blocked) {
             return Ok(());
         }
+        if matches!(self.recovery, Recovery::Done) && self.pending.len() < 24 {
+            let idle = self.active.iter().find_map(|(key, work)| {
+                let has_call = self.pending.iter().any(|pending| matches!(&pending.stage, Stage::DispatchReply { key: in_flight } | Stage::CancelReply { key: in_flight } if in_flight == key));
+                (!has_call && work.replacement.is_none() && !work.recovery_unconfirmed).then(|| key.clone())
+            });
+            if let Some(key) = idle {
+                if self
+                    .active
+                    .get(&key)
+                    .is_some_and(|work| work.cancel_parent.is_some())
+                {
+                    self.persist_cancellation(key)?;
+                } else {
+                    self.drive(key)?;
+                }
+            }
+        }
         // Keep status and cancellation responsive while other requests wait on
         // broker calls. The broker retains backpressure when this bound is full.
         if self.pending.len() >= 32 {
@@ -279,6 +296,14 @@ impl ActionsModule {
             .get("operation")
             .and_then(Value::as_str)
             .unwrap_or("");
+        if self.pending.len() >= 24
+            && matches!(
+                operation,
+                "invoke" | "reserve_input" | "commit_input" | "open_epoch"
+            )
+        {
+            return self.complete(incoming.id, failure("capacity"));
+        }
         if matches!(operation, "invoke" | "reserve_input" | "commit_input")
             && !matches!(self.recovery, Recovery::Done)
         {
@@ -1202,6 +1227,9 @@ impl ActionsModule {
         self.drive(key)
     }
     fn drive(&mut self, key: (String, u64)) -> ModuleResult<()> {
+        if self.pending.len() >= 24 {
+            return Ok(());
+        }
         let Some(active) = self.active.get_mut(&key) else {
             return Ok(());
         };
@@ -1212,7 +1240,10 @@ impl ActionsModule {
             && !active.cancel_sent
         {
             let permit = match &active.dispatch.stage {
-                DispatchStage::Running { permit, .. }
+                DispatchStage::AwaitingConsume { permit, .. }
+                | DispatchStage::AwaitingTransition { permit, .. }
+                | DispatchStage::ReadyToExecute { permit, .. }
+                | DispatchStage::Running { permit, .. }
                 | DispatchStage::ProviderPending { permit, .. } => Some(permit.clone()),
                 _ => None,
             };
@@ -1236,7 +1267,13 @@ impl ActionsModule {
             }
         }
         if active.receipt.get("cancellation_requested") == Some(&Value::Bool(true))
-            && matches!(active.dispatch.stage, DispatchStage::Running { .. })
+            && matches!(
+                active.dispatch.stage,
+                DispatchStage::AwaitingConsume { .. }
+                    | DispatchStage::AwaitingTransition { .. }
+                    | DispatchStage::ReadyToExecute { .. }
+                    | DispatchStage::Running { .. }
+            )
             && !active.effect_started
         {
             return self.dispatch_unknown(key);
@@ -1300,7 +1337,13 @@ impl ActionsModule {
         let Some(active) = self.active.get_mut(&key) else {
             return Ok(());
         };
-        if matches!(active.dispatch.stage, DispatchStage::Running { .. }) && !active.effect_started
+        if matches!(
+            active.dispatch.stage,
+            DispatchStage::AwaitingConsume { .. }
+                | DispatchStage::AwaitingTransition { .. }
+                | DispatchStage::ReadyToExecute { .. }
+                | DispatchStage::Running { .. }
+        ) && !active.effect_started
         {
             if payload.get("status").and_then(Value::as_str) != Some("cancelled")
                 || payload.get("operation_id").and_then(Value::as_str)
@@ -1340,6 +1383,9 @@ impl ActionsModule {
             return self.dispatch_unknown(key);
         }
         if replacement == expected {
+            if active.cancel_parent.is_some() {
+                return self.persist_cancellation(key);
+            }
             return self.drive(key);
         }
         let status = match &replacement.stage {
@@ -1429,7 +1475,10 @@ impl ActionsModule {
         }
         if !matches!(
             active.dispatch.stage,
-            DispatchStage::Running { .. }
+            DispatchStage::AwaitingConsume { .. }
+                | DispatchStage::AwaitingTransition { .. }
+                | DispatchStage::ReadyToExecute { .. }
+                | DispatchStage::Running { .. }
                 | DispatchStage::ProviderPending { .. }
                 | DispatchStage::Completing { .. }
         ) {

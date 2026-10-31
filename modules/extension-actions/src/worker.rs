@@ -348,7 +348,12 @@ fn valid_cancellation(
     if before != after
         || !matches!(
             before.stage,
-            Stage::Running { .. } | Stage::ProviderPending { .. } | Stage::Completing { .. }
+            Stage::AwaitingConsume { .. }
+                | Stage::AwaitingTransition { .. }
+                | Stage::ReadyToExecute { .. }
+                | Stage::Running { .. }
+                | Stage::ProviderPending { .. }
+                | Stage::Completing { .. }
         )
     {
         return false;
@@ -380,7 +385,13 @@ fn valid_transition(before: &Dispatch, after: &Dispatch) -> bool {
     let result = match (&before.stage, &after.stage) {
         (Stage::Planning, Stage::AwaitingPermit { plan, .. }) => computed.accept_plan(plan.clone()),
         (Stage::Planning, Stage::Cancelled) => computed.cancel_before_effect(),
-        (Stage::Running { .. }, Stage::Cancelled) => computed.confirm_cancelled_before_effect(),
+        (
+            Stage::AwaitingConsume { .. }
+            | Stage::AwaitingTransition { .. }
+            | Stage::ReadyToExecute { .. }
+            | Stage::Running { .. },
+            Stage::Cancelled,
+        ) => computed.confirm_cancelled_before_effect(),
         (Stage::AwaitingPermit { .. }, Stage::AwaitingConsume { digest, permit, .. }) => computed
             .accept_permit(
                 &before.request.operation_id,
@@ -786,6 +797,44 @@ mod tests {
         assert!(!valid_cancellation(
             &running, &running, &requested, &requested
         ));
+    }
+
+    #[test]
+    fn pre_effect_cancellation_requires_exact_confirmed_transition() {
+        let (ready, _, _) = fixture();
+        let Stage::ReadyToExecute {
+            plan,
+            digest,
+            permit,
+        } = &ready.stage
+        else {
+            panic!("expected ready dispatch")
+        };
+        let mut consume = ready.clone();
+        consume.stage = Stage::AwaitingConsume {
+            plan: plan.clone(),
+            digest: digest.clone(),
+            permit: permit.clone(),
+        };
+        let mut transition = consume.clone();
+        transition
+            .confirm_consume(
+                &ready.request.operation_id,
+                &ready.request.target,
+                digest,
+                permit,
+            )
+            .unwrap();
+        let old = json!({"status":"running"});
+        let flagged = json!({"status":"running","cancellation_requested":true});
+        for before in [consume, transition, ready] {
+            assert!(valid_cancellation(&before, &before, &old, &flagged));
+            let mut cancelled = before.clone();
+            cancelled.confirm_cancelled_before_effect().unwrap();
+            assert!(valid_transition(&before, &cancelled));
+            cancelled.request.operation_id = "forged".into();
+            assert!(!valid_transition(&before, &cancelled));
+        }
     }
     #[test]
     fn confirmed_pre_effect_cancellation_persists_only_exact_dispatch() {
