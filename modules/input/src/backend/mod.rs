@@ -85,7 +85,7 @@ pub trait Backend {
 }
 #[cfg(windows)]
 mod windows;
-#[cfg(windows)]
+#[cfg(all(windows, not(feature = "qualification-fake-backend")))]
 pub use windows::WindowsBackend as NativeBackend;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -97,17 +97,26 @@ mod linux_router;
 mod owned_devices;
 #[cfg(any(windows, target_os = "linux", test))]
 mod owned_keys;
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(feature = "qualification-fake-backend")))]
 pub use linux_router::LinuxBackendRouter as NativeBackend;
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(all(
+    not(any(windows, target_os = "linux")),
+    not(feature = "qualification-fake-backend")
+))]
 pub struct NativeBackend;
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(all(
+    not(any(windows, target_os = "linux")),
+    not(feature = "qualification-fake-backend")
+))]
 impl NativeBackend {
     pub fn new(_: String) -> Self {
         Self
     }
 }
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(all(
+    not(any(windows, target_os = "linux")),
+    not(feature = "qualification-fake-backend")
+))]
 impl Backend for NativeBackend {
     fn name(&self) -> &'static str {
         std::env::consts::OS
@@ -134,10 +143,18 @@ impl Backend for NativeBackend {
         Ok(())
     }
 }
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(all(
+    not(any(windows, target_os = "linux")),
+    not(feature = "qualification-fake-backend")
+))]
 fn unsupported() -> InputResult<()> {
     Err(crate::model::InputError::new(
         "unsupported_platform",
         "native input injection is implemented only for Windows and Linux",
     ))
 }
+
+#[cfg(feature = "qualification-fake-backend")]
+mod qualification;
+#[cfg(feature = "qualification-fake-backend")]
+pub use qualification::QualificationBackend as NativeBackend;

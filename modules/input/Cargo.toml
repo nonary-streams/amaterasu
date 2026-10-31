@@ -7,6 +7,10 @@ rust-version.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Produces an isolated qualification artifact with no native input backend.
+qualification-fake-backend = []
+
 [dependencies]
 amaterasu-extension-api.workspace = true
 amaterasu-configuration-schema.workspace = true
