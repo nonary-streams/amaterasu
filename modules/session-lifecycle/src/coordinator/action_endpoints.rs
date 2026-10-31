@@ -1334,7 +1334,7 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn mutating_action_waits_for_retirement_then_guards_and_finalizes_once() {
+    fn mutating_action_fences_unimplemented_provider_cleanup() {
         use crate::adapter::{MethodSettings, ParticipantSettings};
         use crate::prepare_authority::{MethodApproval, ProviderSelection};
         let root = std::env::temp_dir().join(format!(
@@ -1543,127 +1543,36 @@ mod tests {
             .insert("capture".into());
         save(&coordinator.shared, state).unwrap();
         coordinator
-            .advance_work(&mut |_| panic!("action barrier is coordinator-only"))
+            .advance_work(&mut |_| panic!("cleanup must remain fenced"))
             .unwrap();
-        assert_eq!(
-            coordinator.action_operation(&service, "service", &request)["status"],
-            "succeeded"
-        );
+        let stopped = coordinator.action_operation(&service, "service", &request);
+        assert_eq!(stopped["status"], "recovery_required");
+        assert_eq!(stopped["reason"], "action_provider_cleanup_not_implemented");
         let mut verify = request.clone();
         verify["operation"] = json!("verify_action_effect");
         verify["provider"] = json!("display");
         verify["execute_method"] = execute;
-        let mut missing_graph = coordinator.shared.borrow().value.clone();
-        missing_graph
-            .sessions
-            .get_mut("session")
-            .unwrap()
-            .provider_graph = None;
-        save(&coordinator.shared, missing_graph).unwrap();
-        assert_eq!(
-            coordinator.action_operation("display", "display", &verify)["reason"],
-            "action_effect_not_authorized"
-        );
-        let mut restored_graph = coordinator.shared.borrow().value.clone();
-        restored_graph
-            .sessions
-            .get_mut("session")
-            .unwrap()
-            .provider_graph = Some(super::super::ProviderGraph {
-            order: vec!["display".into()],
-            dependencies: [("display".into(), vec![])].into(),
-        });
-        save(&coordinator.shared, restored_graph).unwrap();
-        let mut changed = coordinator.shared.borrow().value.clone();
-        changed
-            .sessions
-            .get_mut("session")
-            .unwrap()
-            .streams
-            .get_mut("stream")
-            .unwrap()
-            .provider_settings
-            .get_mut("display")
-            .unwrap()
-            .revision = "changed".into();
-        save(&coordinator.shared, changed).unwrap();
         assert_eq!(
             coordinator.action_operation("display", "display", &verify)["status"],
             "rejected"
         );
-        let mut restored = coordinator.shared.borrow().value.clone();
-        restored
-            .sessions
-            .get_mut("session")
-            .unwrap()
-            .streams
-            .get_mut("stream")
-            .unwrap()
-            .provider_settings
-            .get_mut("display")
-            .unwrap()
-            .revision = "rev".into();
-        save(&coordinator.shared, restored).unwrap();
-        assert_eq!(
-            coordinator.action_operation("display", "display", &verify)["status"],
-            "succeeded"
-        );
-        assert_eq!(
-            coordinator.action_operation("display", "display", &verify)["status"],
-            "rejected"
-        );
-        verify["operation"] = json!("check_action_effect");
-        verify["guard_nonce"] = json!("step-1");
-        assert_eq!(
-            coordinator.action_operation("display", "display", &verify)["status"],
-            "succeeded"
-        );
-        assert_eq!(
-            coordinator.action_operation("display", "display", &verify)["status"],
-            "rejected"
-        );
-        let ending = coordinator.handle("transport", "user", json!({"operation":"end_session", "operation_id":"end-while-action", "target":{"kind":"session", "host_epoch":auth["target"]["host_epoch"], "session_id":"session", "generation":3}}));
-        assert_eq!(ending["status"], "pending");
-        assert!(
-            coordinator.shared.borrow().value.sessions["session"].phase == SessionPhase::Ending
-        );
-        let mut complete = request;
-        complete["operation"] = json!("complete_action");
-        complete["outcome"] = json!("succeeded");
-        complete["provider_receipt"] = json!({});
-        assert_eq!(
-            coordinator.action_operation(&service, "service", &complete)["status"],
-            "succeeded"
-        );
-        assert!(
-            coordinator.shared.borrow().value.sessions["session"].phase == SessionPhase::Ending
-        );
-        let mut state = coordinator.shared.borrow().value.clone();
-        state.sessions.get_mut("session").unwrap().phase = SessionPhase::Ready;
-        state.sessions.get_mut("session").unwrap().streams.insert(
-            "resumed".into(),
-            super::super::StreamRecord {
-                provider_graph: None,
-                generation: 1,
-                phase: StreamPhase::Active,
-                candidate: None,
-                required: Default::default(),
-                acknowledgements: Default::default(),
-                retirements: Default::default(),
-                binding_owner: String::new(),
-                preparation_transition: String::new(),
-                provider_settings: Default::default(),
-            },
-        );
-        save(&coordinator.shared, state).unwrap();
-        assert_eq!(
-            coordinator.action_operation(&service, "service", &complete)["status"],
-            "succeeded"
-        );
-        assert!(
-            coordinator.shared.borrow().value.sessions["session"].streams["resumed"].phase
-                == StreamPhase::Active
-        );
+        {
+            let journal = &coordinator.shared.borrow().value;
+            let key = super::super::receipt_key(&service, "action-transition", "op-transition");
+            assert!(
+                journal.receipts[&key]
+                    .work
+                    .as_ref()
+                    .unwrap()
+                    .action_transfer
+                    .is_some()
+            );
+            assert!(
+                journal.sessions["session"].streams["stream"].phase
+                    == StreamPhase::RecoveryRequired
+            );
+            assert!(journal.sessions["session"].phase == SessionPhase::Ready);
+        }
         drop(coordinator);
         std::fs::remove_dir_all(root).unwrap();
     }
