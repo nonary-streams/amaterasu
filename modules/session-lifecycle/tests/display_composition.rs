@@ -468,6 +468,45 @@ impl Fixture {
                 let value = store.values.get(p["key"].as_str().unwrap());
                 json!({"ok":true,"revision":store.revision,"found":value.is_some(),"value":value})
             }
+            "snapshot" => {
+                let cursor = p.get("cursor").filter(|cursor| !cursor.is_null());
+                if cursor.is_some_and(|cursor| cursor["revision"] != store.revision) {
+                    return json!({"ok":false,"error":{"code":"revision_conflict"},"revision":store.revision});
+                }
+                let after = cursor.and_then(|cursor| cursor["after"].as_str());
+                let limit = p["limit"].as_u64().unwrap_or(128) as usize;
+                assert!((1..=128).contains(&limit));
+                let mut remaining = store
+                    .values
+                    .iter()
+                    .filter(|(key, _)| after.is_none_or(|after| key.as_str() > after))
+                    .peekable();
+                let mut values = BTreeMap::new();
+                let mut result =
+                    json!({"ok":true,"revision":store.revision,"values":values,"next_cursor":null});
+                while let Some((key, value)) = remaining.next() {
+                    values.insert(key.clone(), value.clone());
+                    let next = remaining
+                        .peek()
+                        .map(|_| json!({"revision":store.revision,"after":key}));
+                    let candidate = json!({"ok":true,"revision":store.revision,"values":values,"next_cursor":next});
+                    if serde_json::to_vec(&candidate).unwrap().len() > 16_384 {
+                        assert!(values.len() > 1, "snapshot entry exceeds state limit");
+                        break;
+                    }
+                    result = candidate;
+                    if values.len() == limit {
+                        break;
+                    }
+                }
+                result
+            }
+            "delete" => {
+                assert_eq!(p["expected_revision"], store.revision);
+                let deleted = store.values.remove(p["key"].as_str().unwrap()).is_some();
+                store.revision += 1;
+                json!({"ok":true,"revision":store.revision,"deleted":deleted})
+            }
             "set" => {
                 assert_eq!(p["expected_revision"], store.revision);
                 store
