@@ -274,3 +274,6 @@ fn unavailable() -> Response {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod encoder_sdk_tests;

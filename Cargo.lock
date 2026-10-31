@@ -294,6 +294,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "amaterasu-encoder-source"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-abi",
+ "amaterasu-media",
+ "amaterasu-module-sdk",
+ "serde_json",
+]
+
+[[package]]
 name = "amaterasu-extension-example"
 version = "0.1.0"
 dependencies = [

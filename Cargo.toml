@@ -25,6 +25,7 @@ members = [
     "fixtures/autonomous-video-probe",
     "fixtures/stream-source",
     "fixtures/capture-source",
+    "fixtures/encoder-source",
     "fixtures/input-probe",
     "modules/state",
     "modules/session",

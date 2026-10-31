@@ -119,6 +119,8 @@ pub const FRAME_MATRIX_BT709: u32 = 2;
 pub const FRAME_MATRIX_BT2020_NCL: u32 = 3;
 pub const FRAME_RANGE_FULL: u32 = 1;
 pub const FRAME_RANGE_LIMITED: u32 = 2;
+/// Force a codec recovery point on the submitted frame, or reject without consuming.
+pub const FRAME_RESOURCE_SUBMIT_FORCE_IDR: u32 = 1;
 pub const FRAME_CLOCK_UNKNOWN: u32 = 0;
 pub const FRAME_CLOCK_STREAM_RELATIVE: u32 = 1;
 pub const FRAME_CLOCK_HOST_MONOTONIC: u32 = 2;
@@ -239,6 +241,8 @@ pub struct CaptureApiV1_8 {
 /// Configure must copy any offer data needed after it returns. Configure first,
 /// then select the producer; if selection fails, do not submit, and reconfigure
 /// after re-enumeration. Configure success alone never commits producer selection.
+/// FORCE_IDR must force codec recovery or return UNSUPPORTED without consumption;
+/// unknown flag bits likewise return UNSUPPORTED without consumption.
 /// Submit receives a synchronous borrow; before returning it must finish all
 /// accesses or retain a reference for each asynchronous use. Failed submit must
 /// not retain work; a successful asynchronous submit releases each retained

@@ -1,5 +1,6 @@
 //! Safe module-facing API. ABI ownership and panic containment live in `exports`.
 pub mod capture;
+pub mod encode;
 pub mod exports;
 pub mod media;
 mod native;

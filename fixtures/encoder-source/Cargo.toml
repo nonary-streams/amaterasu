@@ -1,0 +1,17 @@
+[package]
+name = "amaterasu-encoder-source"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+amaterasu-abi.workspace = true
+amaterasu-media.workspace = true
+amaterasu-module-sdk.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

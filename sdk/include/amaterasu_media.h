@@ -435,13 +435,15 @@ typedef struct {
     AmaterasuStatus (*read_resource_frame)(void *, uint64_t, AmaterasuCaptureResourceFrameSink);
 } AmaterasuCaptureApiV1_8;
 #define AMATERASU_CAPTURE_API_V1_8_SIZE ((uint32_t)sizeof(AmaterasuCaptureApiV1_8))
+#define AMATERASU_FRAME_RESOURCE_SUBMIT_FORCE_IDR 1u
 /* An independently bound consumer (e.g. encoder). Its offer IDs and generation
  * belong to its own stream. Configure verifies the producer offer and both
  * schemas; incompatible/stale returns UNSUPPORTED with configuration unchanged.
  * Producer generation and offer are borrowed during configure; copy needed
  * data before returning. Configure first, then select the producer; if select
  * fails, do not submit and re-enumerate/reconfigure. Submit's final
- * argument is nonzero to request an IDR when applicable. Submit finishes access
+ * flags FORCE_IDR force codec recovery or return UNSUPPORTED without consuming;
+ * unknown bits also return UNSUPPORTED without consuming. Submit finishes access
  * before returning or retains for asynchronous work; failed submit retains no
  * work. Cancel stops admission and retires retained references and work. */
 typedef struct {
