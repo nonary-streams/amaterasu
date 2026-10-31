@@ -1,5 +1,6 @@
 //! Serialized extension contracts. References select resources; they never confer authority.
 mod composition;
+pub mod schemas;
 pub use composition::*;
 
 use serde::{Deserialize, Serialize};
