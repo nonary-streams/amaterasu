@@ -261,7 +261,9 @@ pub(super) fn closed_admissions(
             .release_proof
             .as_ref()
             .ok_or("historical_release_unproven")?;
-        closed.insert(marker.root_admission_id.clone());
+        if marker_root_is_closed(journal, session, marker) {
+            closed.insert(marker.root_admission_id.clone());
+        }
         closed.extend(snapshot.stream_admissions.keys().cloned());
         closed.extend(
             proof
@@ -285,6 +287,19 @@ pub(super) fn closed_admissions(
         return Err("historical_release_conflicts_with_active_admission".into());
     }
     Ok(closed)
+}
+
+fn marker_root_is_closed(
+    journal: &Journal,
+    session: &SessionRecord,
+    marker: &super::action_disposition::ReleasedActionMarker,
+) -> bool {
+    super::action_disposition::root_cleanup_complete(
+        journal,
+        &session.id,
+        &marker.owner,
+        marker.resource_generation,
+    )
 }
 
 // The released root remains evidence for observing its domain, never authority

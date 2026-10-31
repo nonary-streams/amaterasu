@@ -819,6 +819,19 @@ mod tests {
             7
         ));
         assert!(
+            !provider_observations::closed_admissions(
+                &missing_outcome,
+                &missing_outcome.sessions["session"]
+            )
+            .unwrap()
+            .contains("root")
+        );
+        assert!(
+            provider_observations::closed_admissions(&journal, &journal.sessions["session"])
+                .unwrap()
+                .contains("root")
+        );
+        assert!(
             !missing_outcome
                 .closed_actions
                 .closed_admissions(&missing_outcome, &root.output.origin)
