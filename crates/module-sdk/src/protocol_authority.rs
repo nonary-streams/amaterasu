@@ -155,6 +155,69 @@ impl CompletedEffect {
     }
 }
 
+/// Evidence of a completed shared-authority recovery. The coordinator must obtain
+/// these responses in order from the selected authenticated authority endpoint,
+/// after retiring old workers and transport, and keep new admission closed until
+/// the journal CAS commits. JSON alone is not an authentication mechanism.
+pub struct ConfirmedEpochRotation {
+    previous: String,
+    current: String,
+}
+impl ConfirmedEpochRotation {
+    pub fn from_authority_responses(
+        previous: &str,
+        old_status: &Value,
+        recovery: &Value,
+        new_status: &Value,
+        new_owner_epoch: &str,
+    ) -> Result<Self, &'static str> {
+        let token = |value: &str| {
+            !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+        };
+        let current = recovery
+            .get("epoch")
+            .and_then(Value::as_str)
+            .ok_or("invalid_rotation")?;
+        let status_clear = |v: &Value| {
+            v.get("ok").and_then(Value::as_bool) == Some(true)
+                && v.get("drain_required").and_then(Value::as_bool) == Some(false)
+                && v.get("in_flight").and_then(Value::as_u64) == Some(0)
+        };
+        if !token(previous)
+            || !token(current)
+            || !token(new_owner_epoch)
+            || previous == current
+            || !status_clear(old_status)
+            || !old_status
+                .get("owner_epoch")
+                .and_then(Value::as_str)
+                .is_some_and(token)
+            || old_status.get("epoch").and_then(Value::as_str) != Some(previous)
+            || !old_status
+                .get("fence_generation")
+                .and_then(Value::as_u64)
+                .is_some_and(|v| v > 0)
+            || recovery.get("ok").and_then(Value::as_bool) != Some(true)
+            || !status_clear(new_status)
+            || new_status.get("epoch").and_then(Value::as_str) != Some(current)
+            || new_status.get("owner_epoch").and_then(Value::as_str) != Some(new_owner_epoch)
+            || new_status.get("fence_generation").and_then(Value::as_u64) != Some(0)
+        {
+            return Err("invalid_rotation");
+        }
+        Ok(Self {
+            previous: previous.into(),
+            current: current.into(),
+        })
+    }
+    pub fn previous(&self) -> &str {
+        &self.previous
+    }
+    pub fn current(&self) -> &str {
+        &self.current
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

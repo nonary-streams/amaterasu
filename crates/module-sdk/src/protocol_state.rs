@@ -4,9 +4,13 @@
 //! with its authenticated State endpoint, waits for the terminal service result,
 //! and never treats local queue admission as persistence. Production must select
 //! and verify a State provider that implements durable CAS. This module cannot
-//! prove that a provider's durability declaration is true.
+//! prove that a provider's durability declaration is true. The journal holds at
+//! most eight operation identities per authority epoch, including tombstones.
+//! Confirmed cleanup and shared-authority epoch retirement are required before
+//! those identities can be compacted. No time-based eviction is performed.
 use crate::{
     protocol::{ObligationStore, PendingEffect, Reservation},
+    protocol_authority::ConfirmedEpochRotation,
     state::{self, StateLookup, StateMutation, StateRequest},
 };
 use serde::{Deserialize, Serialize};
@@ -78,12 +82,14 @@ pub struct Entry {
 #[serde(deny_unknown_fields)]
 struct Journal {
     version: u8,
+    authority_epoch: Option<String>,
     entries: Vec<Entry>,
 }
 impl Default for Journal {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
+            authority_epoch: None,
             entries: Vec::new(),
         }
     }
@@ -97,7 +103,7 @@ fn read_journal(value: &Value) -> Result<(u64, Journal), &'static str> {
     } else {
         Journal::default()
     };
-    if journal.version != 1
+    if journal.version != 2
         || journal.entries.len() > MAX_ENTRIES
         || serde_json::to_vec(&journal)
             .map_err(|_| "invalid_journal")?
@@ -106,7 +112,16 @@ fn read_journal(value: &Value) -> Result<(u64, Journal), &'static str> {
     {
         return Err("invalid_journal");
     }
+    if journal.authority_epoch.as_ref().is_some_and(|epoch| {
+        epoch.is_empty() || epoch.len() > 128 || epoch.chars().any(char::is_control)
+    }) || (!journal.entries.is_empty() && journal.authority_epoch.is_none())
+    {
+        return Err("invalid_journal");
+    }
     for (index, entry) in journal.entries.iter().enumerate() {
+        if Some(&entry.effect.context.authority_epoch) != journal.authority_epoch.as_ref() {
+            return Err("invalid_journal");
+        }
         CleanupReference::new(entry.cleanup.id.clone())?;
         if journal.entries[..index].iter().any(|old| {
             old.effect.caller == entry.effect.caller
@@ -150,6 +165,15 @@ pub fn prepare_reservation(
 ) -> Result<ReservationPlan, &'static str> {
     CleanupReference::new(cleanup.id.clone())?;
     let (revision, mut journal) = read_journal(response)?;
+    let epoch = &effect.context.authority_epoch;
+    if epoch.is_empty() || epoch.len() > 128 || epoch.chars().any(char::is_control) {
+        return Err("invalid_authority_epoch");
+    }
+    match &journal.authority_epoch {
+        Some(current) if current != epoch => return Err("stale_authority_epoch"),
+        None => journal.authority_epoch = Some(epoch.clone()),
+        _ => {}
+    }
     if let Some(prior) = journal
         .entries
         .iter()
@@ -229,5 +253,33 @@ pub fn prepare_cleanup(
         .find(|e| &e.effect == effect && &e.cleanup == cleanup)
         .ok_or("unknown_obligation")?;
     entry.cleaned = true;
+    set_journal(revision, &journal)
+}
+
+/// Current persisted epoch for lost-commit reconciliation. A missing journal has
+/// no epoch. This is State data, not proof of the authority's current epoch.
+pub fn journal_epoch(response: &Value) -> Result<Option<String>, &'static str> {
+    Ok(read_journal(response)?.1.authority_epoch)
+}
+
+/// Atomically retire an entire drained authority epoch after every cleanup is
+/// independently confirmed. Pending or uncertain entries always block retirement.
+/// The authority must reject old epochs before provider admission and admission to
+/// the new epoch must remain closed until this CAS is confirmed or reconciled.
+/// Do not reuse legacy v1 journals without a separate safe migration.
+pub fn prepare_epoch_retirement(
+    _binding: &DurableStateBinding,
+    response: &Value,
+    rotation: &ConfirmedEpochRotation,
+) -> Result<StateRequest, &'static str> {
+    let (revision, mut journal) = read_journal(response)?;
+    if journal.authority_epoch.as_deref() != Some(rotation.previous()) {
+        return Err("stale_authority_epoch");
+    }
+    if journal.entries.iter().any(|entry| !entry.cleaned) {
+        return Err("cleanup_unconfirmed");
+    }
+    journal.entries.clear();
+    journal.authority_epoch = Some(rotation.current().into());
     set_journal(revision, &journal)
 }

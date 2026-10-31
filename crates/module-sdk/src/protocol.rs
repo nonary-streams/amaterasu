@@ -43,11 +43,14 @@ pub struct Route {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionContext {
+    /// Epoch issued by the selected shared effect authority.
+    pub authority_epoch: String,
     pub target: LifecycleTarget,
     pub peer_ref: String,
 }
 
-/// The trusted authority checks current authenticated identity, stream generation,
+/// The trusted authority checks the exact current `context.authority_epoch`,
+/// authenticated identity, stream generation,
 /// negotiated capability and purpose-specific permission together. Its guard must
 /// fence revocation through broker admission. Providers must revalidate before an
 /// effect; this guard does not authorize work after the admission call returns.
@@ -304,7 +307,8 @@ fn valid_name(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
 }
 fn valid_context(context: &SessionContext) -> bool {
-    matches!(&context.target, LifecycleTarget::Stream { host_epoch, session_id, stream_id, generation }
+    valid_name(&context.authority_epoch)
+        && matches!(&context.target, LifecycleTarget::Stream { host_epoch, session_id, stream_id, generation }
         if valid_name(host_epoch) && valid_name(session_id) && valid_name(stream_id) && *generation > 0)
         && valid_name(&context.peer_ref)
 }

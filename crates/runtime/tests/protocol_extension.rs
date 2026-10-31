@@ -80,6 +80,7 @@ fn route(provider: &str, service: &str) -> Route {
 }
 fn context(peer: &str) -> SessionContext {
     SessionContext {
+        authority_epoch: "authority.epoch".into(),
         target: LifecycleTarget::Stream {
             host_epoch: "epoch".into(),
             session_id: "session".into(),
@@ -896,4 +897,53 @@ fn state_reservation_receipt_matches_production_router_effect_and_is_one_use() {
             .unwrap_err(),
         "reservation_mismatch"
     );
+}
+
+#[test]
+fn stale_authority_epoch_is_rejected_before_provider_admission() {
+    let selection = route("example.provider_a", "example.a/1");
+    let mut broker = setup(std::slice::from_ref(&selection));
+    let router = ProtocolRouter::new(vec![selection]).unwrap();
+    let mut ledger = Ledger::default();
+    let auth = Authority {
+        negotiated: true,
+        permitted: true,
+    };
+    let mut stale = context("verified");
+    stale.authority_epoch = "retired.epoch".into();
+    assert_eq!(
+        consume(
+            &router,
+            &auth,
+            &mut ledger,
+            &mut broker,
+            &stale,
+            b"hello",
+            "stale"
+        )
+        .unwrap_err(),
+        "unauthorized"
+    );
+    let mut stale_generation = context("verified");
+    if let LifecycleTarget::Stream { generation, .. } = &mut stale_generation.target {
+        *generation = 2;
+    }
+    assert_eq!(
+        consume(
+            &router,
+            &auth,
+            &mut ledger,
+            &mut broker,
+            &stale_generation,
+            b"hello",
+            "stale-generation"
+        )
+        .unwrap_err(),
+        "unauthorized"
+    );
+    assert!(ledger.0.is_empty());
+    assert!(matches!(
+        broker.dispatch("example.provider_a", Command::Poll {}),
+        Response::Pending
+    ));
 }
