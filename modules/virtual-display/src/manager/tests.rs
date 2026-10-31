@@ -1634,3 +1634,23 @@ fn typed_adapter_routes_real_manager_through_broker_without_legacy_regression() 
             == true
     );
 }
+
+#[test]
+fn create_effect_classification_preserves_noop_and_pre_effect_rejection() {
+    use crate::service_adapter::MutationEffect;
+    let (mut manager, calls) = setup(true);
+    let first = manager.admit_with_effect("owner", create_with_reference("stream"));
+    assert_eq!(first.effect, MutationEffect::Attempted);
+    assert!(first.admission.is_some());
+    let duplicate = manager.admit_with_effect("owner", create_with_reference("stream"));
+    assert_eq!(duplicate.effect, MutationEffect::Unchanged);
+    assert!(duplicate.admission.is_none());
+    let mut conflict = create_with_reference("stream");
+    if let Operation::Create { name, .. } = &mut conflict {
+        *name = "different".into();
+    }
+    let rejected = manager.admit_with_effect("owner", conflict);
+    assert_eq!(rejected.effect, MutationEffect::Unchanged);
+    assert_eq!(rejected.response["code"], "identity_conflict");
+    assert_eq!(calls.borrow().creates.len(), 1);
+}

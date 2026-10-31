@@ -207,6 +207,7 @@ pub struct Manager {
     domain_id: String,
     topology_revision: u64,
     pending_mutations: usize,
+    request_may_mutate: bool,
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl Manager {
@@ -235,6 +236,7 @@ impl Manager {
             domain_id,
             topology_revision: 0,
             pending_mutations: 0,
+            request_may_mutate: false,
             stopped: Default::default(),
         };
         if manager.settings.enabled {
@@ -367,6 +369,24 @@ impl Manager {
             }
         }
     }
+    pub(crate) fn admit_with_effect(
+        &mut self,
+        caller: &str,
+        operation: Operation,
+    ) -> crate::service_adapter::MutationResult<Admission> {
+        self.request_may_mutate = false;
+        let (response, admission) = self.admit(caller, operation);
+        crate::service_adapter::MutationResult {
+            response,
+            admission,
+            effect: if self.request_may_mutate {
+                crate::service_adapter::MutationEffect::Attempted
+            } else {
+                crate::service_adapter::MutationEffect::Unchanged
+            },
+        }
+    }
+
     pub fn admit(&mut self, caller: &str, operation: Operation) -> (Value, Option<Admission>) {
         self.tick();
         match operation {
@@ -616,6 +636,7 @@ impl Manager {
                 }) {
                     return (failure("busy"), None);
                 }
+                self.request_may_mutate = true;
                 self.topology_revision += 1;
                 self.pending_mutations += 1;
                 let monitor = Monitor {
@@ -663,6 +684,10 @@ impl Manager {
     fn persist_references(&mut self, key: &(String, String), references: BTreeSet<String>) -> bool {
         // The actor serializes updates behind creation and acknowledges the durable
         // journal replacement before this caller can observe ownership success.
+        let changed = self
+            .monitors
+            .get(key)
+            .is_some_and(|monitor| monitor.references.as_ref() != Some(&references));
         let (reply, result) = mpsc::sync_channel(1);
         if !self.enqueue(Work::References {
             key: key.clone(),
@@ -670,6 +695,9 @@ impl Manager {
             reply,
         }) {
             return false;
+        }
+        if changed {
+            self.request_may_mutate = true;
         }
         if !matches!(result.recv(), Ok(Ok(()))) {
             return false;
@@ -691,8 +719,20 @@ impl Manager {
         identity: &str,
         reference_id: &str,
     ) -> crate::service_adapter::RemovalOutcome {
+        self.request_may_mutate = false;
         self.tick();
-        self.remove_outcome(caller, identity, Some(reference_id))
+        match self.remove_outcome(caller, identity, Some(reference_id)) {
+            crate::service_adapter::RemovalOutcome::Attempted(value)
+                if !self.request_may_mutate =>
+            {
+                if value["ok"] == true {
+                    crate::service_adapter::RemovalOutcome::Unchanged(value)
+                } else {
+                    crate::service_adapter::RemovalOutcome::Rejected(value)
+                }
+            }
+            outcome => outcome,
+        }
     }
 
     fn remove_outcome(
@@ -763,6 +803,7 @@ impl Manager {
             if !self.enqueue(Work::Remove { key: key.clone() }) {
                 return Attempted(failure("busy"));
             }
+            self.request_may_mutate = true;
             self.topology_revision += 1;
             self.pending_mutations += 1;
             self.cleanup_pending.insert(key.clone());
@@ -1033,6 +1074,7 @@ impl Manager {
         if !self.enqueue(work) {
             return failure("busy");
         }
+        self.request_may_mutate = true;
         self.borrows
             .get_mut(&borrow_id)
             .expect("verified borrow")

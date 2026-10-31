@@ -4,6 +4,7 @@ use amaterasu_contracts::{ApiMethodApproval, Command, Grants, RuntimeConfig};
 use amaterasu_module_sdk::{
     RuntimeClient,
     abi::{AbiHeader, BorrowedBytes, HostApi, ReplySink, STATUS_OK},
+    requests::RequestOptions,
     service::{CallOptions, ServiceMethod},
     virtual_display_service::{
         self as display, DisplayService, EffectState, Layout, Mode, ModeAcceptance, OwnerReference,
@@ -144,6 +145,13 @@ impl Backend for TransientInspection<'_> {
     fn completion_lost(&mut self, admission: Option<Admission>) {
         self.manager.completion_lost(admission);
     }
+    fn admit_with_effect(
+        &mut self,
+        caller: &str,
+        operation: Operation,
+    ) -> crate::service_adapter::MutationResult<Admission> {
+        self.manager.admit_with_effect(caller, operation)
+    }
     fn remove_owned(
         &mut self,
         caller: &str,
@@ -174,6 +182,20 @@ impl Backend for CancelAfterCreate<'_> {
     fn completion_lost(&mut self, admission: Option<Admission>) {
         self.manager.completion_lost(admission);
     }
+    fn admit_with_effect(
+        &mut self,
+        caller: &str,
+        operation: Operation,
+    ) -> crate::service_adapter::MutationResult<Admission> {
+        let creating = matches!(operation, Operation::Create { .. });
+        let result = self.manager.admit_with_effect(caller, operation);
+        if creating {
+            self.client
+                .require_success(Command::Cancel { request: self.id })
+                .unwrap();
+        }
+        result
+    }
     fn remove_owned(
         &mut self,
         caller: &str,
@@ -199,7 +221,7 @@ fn production_linux_manager_routes_fenced_requests_to_fake_worker_via_broker() {
         config.principals.insert(
             name.into(),
             Grants {
-                call: [method.service.clone()].into(),
+                call: [method.service.clone(), crate::SERVICE.into()].into(),
                 ..Default::default()
             },
         );
@@ -226,6 +248,11 @@ fn production_linux_manager_routes_fenced_requests_to_fake_worker_via_broker() {
     let alice = client(&a);
     let bob = client(&b);
     display::register(&provider).unwrap();
+    provider
+        .require_success(Command::Register {
+            service: crate::SERVICE.into(),
+        })
+        .unwrap();
     let mut manager = Manager::start(Settings::default()).unwrap();
     manager.settings.enabled = true;
     manager.ready = true;
@@ -263,6 +290,29 @@ fn production_linux_manager_routes_fenced_requests_to_fake_worker_via_broker() {
         let reply = call.poll().unwrap().unwrap().reply;
         assert!(call.release().is_ok());
         reply
+    };
+    let exchange_legacy = |manager: &mut Manager,
+                           adapter: &mut crate::service_adapter::Adapter,
+                           id: &str,
+                           operation: Operation| {
+        let token = alice
+            .request_serialized(
+                RequestOptions {
+                    service: crate::SERVICE,
+                    timeout_ms: 5000,
+                    operation_id: id,
+                    parent: None,
+                },
+                &operation,
+            )
+            .unwrap();
+        let incoming = provider.poll_serialized().unwrap().unwrap();
+        crate::handle_legacy(&provider, manager, adapter, incoming).unwrap();
+        let response = alice.take_serialized::<Value>(token).unwrap().unwrap();
+        alice
+            .require_success(Command::ReleaseResult { request: token })
+            .unwrap();
+        response
     };
     let caps = exchange(
         &mut manager,
@@ -420,6 +470,119 @@ fn production_linux_manager_routes_fenced_requests_to_fake_worker_via_broker() {
         ),
         ready
     );
+    // A new operation ID for the same reference is an idempotent manager no-op.
+    let Reply::Capabilities { capabilities } = exchange(
+        &mut manager,
+        &mut adapter,
+        &alice,
+        "noop-caps",
+        Request::Capabilities,
+    ) else {
+        panic!("missing capabilities")
+    };
+    let current = capabilities.topology.unwrap();
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "typed-noop",
+            create(first.clone(), "duplicate", current.clone())
+        ),
+        Reply::Effect {
+            state: EffectState::Pending,
+            ..
+        }
+    ));
+    assert_eq!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "old-after-noop",
+            Request::Recover {
+                owner: first.clone(),
+                operation_id: "first".into()
+            }
+        ),
+        ready
+    );
+    assert_eq!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "release-duplicate",
+            Request::ReleaseOperation {
+                owner: first.clone(),
+                operation_id: "duplicate".into()
+            }
+        ),
+        Reply::OperationReleased
+    );
+    let mut rejected_create = create(first.clone(), "rejected-new-id", current.clone());
+    if let Request::Create { name, .. } = &mut rejected_create {
+        *name = "conflicting specification".into();
+    }
+    assert_eq!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "typed-rejected",
+            rejected_create
+        ),
+        Reply::Conflict
+    );
+    let legacy_create = Operation::Create {
+        hdr_enabled: false,
+        identity: first.identity.clone(),
+        width: 1920,
+        height: 1080,
+        refresh_millihz: 60000,
+        name: "Display".into(),
+        virtual_display_layout: Some(VirtualDisplayLayout::Extended),
+        expected_topology_revision: None,
+        expected_topology_domain_id: None,
+        reference_id: Some(first.reference_id.clone()),
+        dd_virtual_display_scale: Some(0),
+    };
+    assert_eq!(
+        exchange_legacy(
+            &mut manager,
+            &mut adapter,
+            "legacy-noop",
+            legacy_create.clone()
+        )["ok"],
+        true
+    );
+    let mut legacy_conflict = legacy_create;
+    if let Operation::Create { name, .. } = &mut legacy_conflict {
+        *name = "legacy conflict".into();
+    }
+    assert_eq!(
+        exchange_legacy(
+            &mut manager,
+            &mut adapter,
+            "legacy-rejected",
+            legacy_conflict
+        )["code"],
+        "identity_conflict"
+    );
+    assert_eq!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "old-after-rejections",
+            Request::Recover {
+                owner: first.clone(),
+                operation_id: "first".into()
+            }
+        ),
+        ready
+    );
+    assert!(observed.try_recv().is_err());
     let mut conflicting = create(first.clone(), "first", initial.clone());
     if let Request::Create { name, .. } = &mut conflicting {
         *name = "Changed".into();
@@ -570,6 +733,19 @@ fn production_linux_manager_routes_fenced_requests_to_fake_worker_via_broker() {
             ..
         }
     ));
+    assert_eq!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "release-original",
+            Request::ReleaseOperation {
+                owner: first.clone(),
+                operation_id: "first".into()
+            }
+        ),
+        Reply::OperationReleased
+    );
     let (release, _) = manager.admit(
         "alice",
         Operation::ReleaseBorrow {
@@ -588,6 +764,36 @@ fn production_linux_manager_routes_fenced_requests_to_fake_worker_via_broker() {
     ) else {
         panic!("missing capabilities")
     };
+    let watch_topology = capabilities.topology.clone().unwrap();
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "create-watch",
+            create(first.clone(), "watch", watch_topology)
+        ),
+        Reply::Effect {
+            state: EffectState::Pending,
+            ..
+        }
+    ));
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "watch-ready",
+            Request::Recover {
+                owner: first.clone(),
+                operation_id: "watch".into()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Applied,
+            ..
+        }
+    ));
     let removal_topology = capabilities.topology.unwrap();
     let removal = Request::Remove {
         owner: first.clone(),
@@ -610,6 +816,35 @@ fn production_linux_manager_routes_fenced_requests_to_fake_worker_via_broker() {
     assert_eq!(
         observed.recv_timeout(Duration::from_secs(1)).unwrap(),
         "remove"
+    );
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "watch-fenced",
+            Request::Recover {
+                owner: first.clone(),
+                operation_id: "watch".into()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Unknown,
+            ..
+        }
+    ));
+    assert_eq!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "watch-not-releasable",
+            Request::ReleaseOperation {
+                owner: first.clone(),
+                operation_id: "watch".into()
+            }
+        ),
+        Reply::OperationNotSettled
     );
     assert_eq!(
         exchange(
@@ -738,6 +973,19 @@ fn production_linux_manager_routes_fenced_requests_to_fake_worker_via_broker() {
         ),
         Reply::OperationReleased
     );
+    assert_eq!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "release-settled-watch",
+            Request::ReleaseOperation {
+                owner: first.clone(),
+                operation_id: "watch".into()
+            }
+        ),
+        Reply::OperationReleased
+    );
     let Reply::Capabilities { capabilities } = exchange(
         &mut manager,
         &mut adapter,
@@ -814,6 +1062,12 @@ fn production_linux_manager_routes_fenced_requests_to_fake_worker_via_broker() {
         Reply::OperationNotSettled
     );
     events
+        .send(Event::Created {
+            key: ("alice".into(), second.identity.clone()),
+            result: Err("cancelled fake creation".into()),
+        })
+        .unwrap();
+    events
         .send(Event::Removed {
             key: ("alice".into(), second.identity.clone()),
             result: Ok(()),
@@ -848,5 +1102,212 @@ fn production_linux_manager_routes_fenced_requests_to_fake_worker_via_broker() {
         ),
         Reply::OperationReleased
     );
+    // A genuinely admitted legacy removal fences an older typed create, then
+    // confirmed absence makes that old record safely releasable.
+    let Reply::Capabilities { capabilities } = exchange(
+        &mut manager,
+        &mut adapter,
+        &alice,
+        "third-caps",
+        Request::Capabilities,
+    ) else {
+        panic!("missing capabilities")
+    };
+    let third = owner("00000000-0000-0000-0000-000000000003");
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "third-create",
+            create(third.clone(), "third", capabilities.topology.unwrap())
+        ),
+        Reply::Effect {
+            state: EffectState::Pending,
+            ..
+        }
+    ));
+    assert_eq!(
+        observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "create"
+    );
+    events
+        .send(Event::Created {
+            key: ("alice".into(), third.identity.clone()),
+            result: Ok(Record {
+                owner: "alice".into(),
+                specification: Specification {
+                    hdr_enabled: false,
+                    identity: third.identity.clone(),
+                    width: 1920,
+                    height: 1080,
+                    refresh_millihz: 60000,
+                    name: "Display".into(),
+                },
+                output: "virtual-3".into(),
+                layout: None,
+                references: Some(["stream".into()].into()),
+                transition: None,
+            }),
+        })
+        .unwrap();
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "third-ready",
+            Request::Recover {
+                owner: third.clone(),
+                operation_id: "third".into()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Applied,
+            ..
+        }
+    ));
+    assert_eq!(
+        exchange_legacy(
+            &mut manager,
+            &mut adapter,
+            "legacy-remove",
+            Operation::Remove {
+                identity: third.identity.clone(),
+                reference_id: Some(third.reference_id.clone())
+            }
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "remove"
+    );
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "third-fenced",
+            Request::Recover {
+                owner: third.clone(),
+                operation_id: "third".into()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Unknown,
+            ..
+        }
+    ));
+    assert_eq!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "third-pending-release",
+            Request::ReleaseOperation {
+                owner: third.clone(),
+                operation_id: "third".into()
+            }
+        ),
+        Reply::OperationNotSettled
+    );
+    events
+        .send(Event::Removed {
+            key: ("alice".into(), third.identity.clone()),
+            result: Ok(()),
+        })
+        .unwrap();
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "third-absent",
+            Request::Recover {
+                owner: third.clone(),
+                operation_id: "third".into()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Absent,
+            ..
+        }
+    ));
+    assert_eq!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "third-release",
+            Request::ReleaseOperation {
+                owner: third,
+                operation_id: "third".into()
+            }
+        ),
+        Reply::OperationReleased
+    );
     drop(manager); // Joins the fake worker without touching OS display state.
+}
+
+#[test]
+fn manager_classifies_noop_rejection_and_lost_persistence_ack_without_error_strings() {
+    use crate::service_adapter::MutationEffect;
+    let mut manager = Manager::start(Settings::default()).unwrap();
+    manager.settings.enabled = true;
+    manager.ready = true;
+    let identity = "00000000-0000-0000-0000-000000000010";
+    manager.monitors.insert(
+        ("alice".into(), identity.into()),
+        Monitor {
+            specification: Specification {
+                hdr_enabled: false,
+                identity: identity.into(),
+                width: 1920,
+                height: 1080,
+                refresh_millihz: 60000,
+                name: "Display".into(),
+            },
+            state: "ready",
+            output: Some("virtual-10".into()),
+            error: None,
+            references: Some(["stream".into()].into()),
+            layout: VirtualDisplayLayout::Extended,
+            scale: ScaleSetting::Retain,
+        },
+    );
+    let (sender, jobs) = mpsc::sync_channel(4);
+    manager.sender = Some(sender);
+    manager.worker = Some(std::thread::spawn(move || {
+        while let Ok(job) = jobs.recv() {
+            match job {
+                Work::References { reply, .. } => drop(reply),
+                _ => panic!("unexpected fake job"),
+            }
+        }
+    }));
+    let legacy = |reference: &str, name: &str| Operation::Create {
+        hdr_enabled: false,
+        identity: identity.into(),
+        width: 1920,
+        height: 1080,
+        refresh_millihz: 60000,
+        name: name.into(),
+        reference_id: Some(reference.into()),
+        virtual_display_layout: Some(VirtualDisplayLayout::Extended),
+        dd_virtual_display_scale: Some(0),
+        expected_topology_domain_id: None,
+        expected_topology_revision: None,
+    };
+    let duplicate = manager.admit_with_effect("alice", legacy("stream", "Display"));
+    assert_eq!(duplicate.effect, MutationEffect::Unchanged);
+    assert_eq!(duplicate.response["ok"], true);
+    let rejected = manager.admit_with_effect("alice", legacy("stream", "Different"));
+    assert_eq!(rejected.effect, MutationEffect::Unchanged);
+    assert_eq!(rejected.response["code"], "identity_conflict");
+    let lost_ack = manager.admit_with_effect("alice", legacy("new-reference", "Display"));
+    assert_eq!(lost_ack.effect, MutationEffect::Attempted);
+    assert_eq!(lost_ack.response["code"], "journal_unavailable");
+    assert!(lost_ack.admission.is_none());
+    drop(manager);
 }

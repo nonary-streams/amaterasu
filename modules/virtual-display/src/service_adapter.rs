@@ -11,11 +11,32 @@ use std::collections::BTreeMap;
 
 const MAX_OPERATIONS: usize = 128;
 
+/// Whether this request changed, or may have changed, owned display state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MutationEffect {
+    Unchanged,
+    Attempted,
+}
+
+pub struct MutationResult<A> {
+    pub response: Value,
+    pub admission: Option<A>,
+    pub effect: MutationEffect,
+}
+
 /// Manager-owned classification, independent of human-readable error codes.
 /// `Rejected` guarantees no ownership or display mutation was attempted;
 /// `Attempted` may have changed state even when its response is an error.
 pub enum RemovalOutcome {
     Rejected(Value),
+    #[cfg_attr(
+        not(amaterasu_libvirtualdisplay),
+        allow(
+            dead_code,
+            reason = "only the topology-capable Linux manager admits typed removal"
+        )
+    )]
+    Unchanged(Value),
     #[cfg_attr(
         all(not(amaterasu_libvirtualdisplay), not(test)),
         expect(
@@ -29,7 +50,7 @@ impl RemovalOutcome {
     #[cfg(amaterasu_libvirtualdisplay)]
     pub fn into_response(self) -> Value {
         match self {
-            Self::Rejected(value) | Self::Attempted(value) => value,
+            Self::Rejected(value) | Self::Unchanged(value) | Self::Attempted(value) => value,
         }
     }
 }
@@ -38,6 +59,11 @@ pub trait Backend {
     type Admission;
     fn admit(&mut self, caller: &str, operation: Operation) -> (Value, Option<Self::Admission>);
     fn completion_lost(&mut self, admission: Option<Self::Admission>);
+    fn admit_with_effect(
+        &mut self,
+        caller: &str,
+        operation: Operation,
+    ) -> MutationResult<Self::Admission>;
     fn remove_owned(&mut self, caller: &str, owner: &OwnerReference) -> RemovalOutcome;
 }
 
@@ -49,6 +75,13 @@ impl<D: crate::backend::Driver> Backend for crate::manager::Manager<D> {
     }
     fn completion_lost(&mut self, admission: Option<Self::Admission>) {
         self.completion_lost(admission);
+    }
+    fn admit_with_effect(
+        &mut self,
+        caller: &str,
+        operation: Operation,
+    ) -> MutationResult<Self::Admission> {
+        self.admit_with_effect(caller, operation)
     }
     fn remove_owned(&mut self, _: &str, _: &OwnerReference) -> RemovalOutcome {
         RemovalOutcome::Rejected(crate::model::failure("unsupported_topology_domain"))
@@ -62,6 +95,13 @@ impl Backend for crate::linux_manager::Manager {
     }
     fn completion_lost(&mut self, admission: Option<Self::Admission>) {
         self.completion_lost(admission);
+    }
+    fn admit_with_effect(
+        &mut self,
+        caller: &str,
+        operation: Operation,
+    ) -> MutationResult<Self::Admission> {
+        self.admit_with_effect(caller, operation)
     }
     fn remove_owned(&mut self, caller: &str, owner: &OwnerReference) -> RemovalOutcome {
         self.admit_removal(caller, &owner.identity, &owner.reference_id)
@@ -292,6 +332,34 @@ impl<B: Backend> Invocation<'_, B> {
         Self::effect(state, topology)
     }
 
+    fn fenced_creation_status(&mut self, caller: &str, request: &Request) -> Reply {
+        let Request::Create {
+            owner, expected, ..
+        } = request
+        else {
+            return Self::effect(EffectState::Unknown, None);
+        };
+        let status = self.status(caller, Some(owner));
+        let topology = Self::topology(&status);
+        let same_domain = topology.as_ref().is_some_and(|current| {
+            current.domain_id == expected.domain_id && current.revision >= expected.revision
+        });
+        let settled = status["ok"] == true
+            && status["recovery_ready"] == true
+            && same_domain
+            && status["reference_owned"] == false
+            && status["monitors"].as_array().is_some_and(Vec::is_empty)
+            && status["mutation_domain"]["pending_mutations"].as_u64() == Some(0);
+        Self::effect(
+            if settled {
+                EffectState::Absent
+            } else {
+                EffectState::Unknown
+            },
+            topology,
+        )
+    }
+
     fn recover(&mut self, caller: &str, owner: &OwnerReference, operation_id: &str) -> Reply {
         let key = (caller.to_owned(), operation_id.to_owned());
         let Some(record) = self.adapter.operations.get(&key).cloned() else {
@@ -305,7 +373,19 @@ impl<B: Backend> Invocation<'_, B> {
             return Self::effect(EffectState::Unknown, None);
         }
         if record.creation_fenced && !record.cleanup {
-            return Self::effect(EffectState::Unknown, None);
+            let reply = self.fenced_creation_status(caller, &record.request);
+            if matches!(
+                reply,
+                Reply::Effect {
+                    state: EffectState::Absent,
+                    ..
+                }
+            ) && let Some(saved) = self.adapter.operations.get_mut(&key)
+            {
+                saved.reply = reply.clone();
+                saved.creation_fenced = false;
+            }
+            return reply;
         }
         let reply = match &record.reply {
             Reply::Effect {
@@ -390,14 +470,17 @@ impl<B: Backend> Invocation<'_, B> {
         }
         let result = match self.backend.remove_owned(caller, owner) {
             RemovalOutcome::Rejected(result) => return failure(&result),
-            RemovalOutcome::Attempted(result) => result,
+            RemovalOutcome::Unchanged(result) => result,
+            RemovalOutcome::Attempted(result) => {
+                self.adapter.observe_mutation(
+                    caller,
+                    &owner.identity,
+                    Some(&owner.reference_id),
+                    Some(operation_id),
+                );
+                result
+            }
         };
-        self.adapter.observe_mutation(
-            caller,
-            &owner.identity,
-            Some(&owner.reference_id),
-            Some(operation_id),
-        );
         let state = if result["ok"] == true && Self::release_confirmed(&result) {
             EffectState::Completed
         } else if result["ok"] == true {
@@ -488,23 +571,18 @@ impl<B: Backend> Invocation<'_, B> {
             _ => return Reply::Unavailable,
         };
         let cleanup = matches!(request, Request::Remove { .. });
-        let result = if cleanup {
+        let (result, effect) = if cleanup {
             match self.backend.remove_owned(caller, owner) {
                 RemovalOutcome::Rejected(result) => return failure(&result),
-                RemovalOutcome::Attempted(result) => result,
+                RemovalOutcome::Unchanged(result) => (result, MutationEffect::Unchanged),
+                RemovalOutcome::Attempted(result) => (result, MutationEffect::Attempted),
             }
         } else {
-            self.adapter.observe_mutation(
-                caller,
-                &owner.identity,
-                Some(&owner.reference_id),
-                Some(operation_id),
-            );
-            let (result, admission) = self.backend.admit(caller, operation);
-            self.admission = admission;
-            result
+            let outcome = self.backend.admit_with_effect(caller, operation);
+            self.admission = outcome.admission;
+            (outcome.response, outcome.effect)
         };
-        if cleanup {
+        if effect == MutationEffect::Attempted {
             self.adapter.observe_mutation(
                 caller,
                 &owner.identity,
@@ -512,7 +590,9 @@ impl<B: Backend> Invocation<'_, B> {
                 Some(operation_id),
             );
         }
-        if result["ok"] != true && !cleanup {
+        let uncertain_create =
+            !cleanup && effect == MutationEffect::Attempted && result["ok"] != true;
+        if result["ok"] != true && !cleanup && !uncertain_create {
             return failure(&result);
         }
         let state = if result["ok"] != true {
@@ -529,7 +609,7 @@ impl<B: Backend> Invocation<'_, B> {
                 request: request.clone(),
                 reply: reply.clone(),
                 cleanup,
-                creation_fenced: false,
+                creation_fenced: uncertain_create,
             },
         );
         if cleanup && state == EffectState::Completed {
@@ -665,6 +745,7 @@ mod tests {
         revision: u64,
         partial_failure: bool,
         shared: bool,
+        uncertain_create: bool,
         remove_calls: usize,
     }
     impl FakeBackend {
@@ -675,6 +756,7 @@ mod tests {
                 revision: 7,
                 partial_failure: false,
                 shared: false,
+                uncertain_create: false,
                 remove_calls: 0,
             }
         }
@@ -712,6 +794,21 @@ mod tests {
             }
         }
         fn completion_lost(&mut self, _: Option<()>) {}
+        fn admit_with_effect(&mut self, caller: &str, operation: Operation) -> MutationResult<()> {
+            if self.uncertain_create && matches!(operation, Operation::Create { .. }) {
+                return MutationResult {
+                    response: json!({"ok":false,"code":"journal_unavailable"}),
+                    admission: None,
+                    effect: MutationEffect::Attempted,
+                };
+            }
+            let (response, admission) = self.admit(caller, operation);
+            MutationResult {
+                response,
+                admission,
+                effect: MutationEffect::Unchanged,
+            }
+        }
         fn remove_owned(&mut self, caller: &str, owner: &OwnerReference) -> RemovalOutcome {
             let (result, _) = self.admit(
                 caller,
@@ -856,6 +953,72 @@ mod tests {
             ),
             Reply::OperationReleased
         );
+    }
+
+    #[test]
+    fn uncertain_create_fences_older_reference_and_retains_unknown_record() {
+        let mut backend = FakeBackend::new();
+        backend.uncertain_create = true;
+        let mut adapter = Adapter::default();
+        let request = Request::Create {
+            owner: owner(),
+            operation_id: "old-create".into(),
+            expected: topology(7),
+            mode: amaterasu_module_sdk::virtual_display_service::Mode {
+                width: 1920,
+                height: 1080,
+                refresh_millihz: 60000,
+                hdr: false,
+            },
+            acceptance: amaterasu_module_sdk::virtual_display_service::ModeAcceptance {
+                max_refresh_delta_ppm: 0,
+                require_hdr_match: true,
+            },
+            name: "Display".into(),
+            layout: Layout::Extended,
+            scale: Some(0),
+        };
+        adapter.operations.insert(
+            ("alice".into(), "old-create".into()),
+            OperationRecord {
+                request: request.clone(),
+                reply: Invocation::<FakeBackend>::effect(EffectState::Pending, None),
+                cleanup: false,
+                creation_fenced: false,
+            },
+        );
+        let mut next = request;
+        if let Request::Create { operation_id, .. } = &mut next {
+            *operation_id = "uncertain-create".into();
+        }
+        assert!(has_state(
+            run(&mut adapter, &mut backend, &next),
+            EffectState::Unknown
+        ));
+        for operation_id in ["old-create", "uncertain-create"] {
+            assert!(has_state(
+                run(
+                    &mut adapter,
+                    &mut backend,
+                    &Request::Recover {
+                        owner: owner(),
+                        operation_id: operation_id.into()
+                    }
+                ),
+                EffectState::Unknown
+            ));
+            assert_eq!(
+                run(
+                    &mut adapter,
+                    &mut backend,
+                    &Request::ReleaseOperation {
+                        owner: owner(),
+                        operation_id: operation_id.into()
+                    }
+                ),
+                Reply::OperationNotSettled
+            );
+        }
     }
 
     #[test]

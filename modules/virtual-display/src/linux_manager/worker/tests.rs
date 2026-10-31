@@ -810,6 +810,7 @@ fn linux_shared_references_persist_and_release_only_the_last_connector_owner() {
         domain_id: "test-domain".into(),
         topology_revision: 0,
         pending_mutations: 0,
+        request_may_mutate: false,
         stopped,
     };
     let create = |reference: Option<&str>| crate::model::Operation::Create {

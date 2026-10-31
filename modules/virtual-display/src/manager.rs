@@ -77,6 +77,7 @@ pub struct Manager<D: Driver> {
     monitors: BTreeMap<(String, String), Monitor>,
     journal: Option<Journal>,
     cursor: usize,
+    request_may_mutate: bool,
 }
 
 impl<D: Driver> Manager<D> {
@@ -87,6 +88,7 @@ impl<D: Driver> Manager<D> {
             monitors: BTreeMap::new(),
             journal: None,
             cursor: 0,
+            request_may_mutate: false,
         }
     }
 
@@ -250,6 +252,24 @@ impl<D: Driver> Manager<D> {
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn admit_with_effect(
+        &mut self,
+        caller: &str,
+        operation: Operation,
+    ) -> crate::service_adapter::MutationResult<Admission> {
+        self.request_may_mutate = false;
+        let (response, admission) = self.admit(caller, operation);
+        crate::service_adapter::MutationResult {
+            response,
+            admission,
+            effect: if self.request_may_mutate {
+                crate::service_adapter::MutationEffect::Attempted
+            } else {
+                crate::service_adapter::MutationEffect::Unchanged
+            },
+        }
     }
 
     pub fn admit(&mut self, caller: &str, operation: Operation) -> (Value, Option<Admission>) {
@@ -600,6 +620,7 @@ impl<D: Driver> Manager<D> {
             if references.len() >= 64 {
                 return failure("reference_limit");
             }
+            self.request_may_mutate = true;
             let monitor = self.monitors.get_mut(&key).expect("existing monitor");
             monitor
                 .references
@@ -663,6 +684,7 @@ impl<D: Driver> Manager<D> {
             next_feed: now + FEED_INTERVAL,
             remove_attempts: 0,
         };
+        self.request_may_mutate = true;
         if let Some(journal) = &mut self.journal
             && journal.upsert(monitor.record(&key.0)).is_err()
         {
@@ -719,6 +741,9 @@ impl<D: Driver> Manager<D> {
                 let released = references.remove(reference_id);
                 (released, references.is_empty())
             };
+            if released {
+                self.request_may_mutate = true;
+            }
             if let Some(journal) = &mut self.journal
                 && journal.upsert(monitor.record(&key.0)).is_err()
             {
@@ -742,6 +767,9 @@ impl<D: Driver> Manager<D> {
             }
         } else if let Some(references) = &mut monitor.references {
             let previous = references.clone();
+            if !previous.is_empty() {
+                self.request_may_mutate = true;
+            }
             references.clear();
             if let Some(journal) = &mut self.journal
                 && journal.upsert(monitor.record(&key.0)).is_err()
@@ -750,6 +778,7 @@ impl<D: Driver> Manager<D> {
                 return failure("journal_unavailable");
             }
         }
+        self.request_may_mutate = true;
         monitor.begin_cleanup(None);
         monitor.response(reference_id)
     }

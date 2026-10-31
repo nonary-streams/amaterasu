@@ -91,53 +91,28 @@ impl ManagedModule for VirtualDisplayModule {
                 payload,
                 remaining_ms,
             } => {
-                if service == display::SERVICE {
-                    return handle_display_api(
+                let request = IncomingRequest {
+                    id,
+                    caller,
+                    initiator,
+                    service,
+                    payload,
+                    remaining_ms,
+                };
+                if request.service == display::SERVICE {
+                    handle_display_api(
                         &self.runtime,
                         &mut self.manager,
                         &mut self.display_adapter,
-                        IncomingRequest {
-                            id,
-                            caller,
-                            initiator,
-                            service,
-                            payload,
-                            remaining_ms,
-                        },
-                    );
-                }
-                let operation = serde_json::from_value::<Operation>(payload);
-                let (response, admission) = match operation {
-                    Ok(operation) => {
-                        // Check the provider-owned request immediately before native effects.
-                        if matches!(
-                            self.runtime.send(Command::CheckRequest { request: id })?,
-                            Response::Ok
-                        ) {
-                            self.display_adapter
-                                .observe_legacy_mutation(&caller, &operation);
-                            self.manager.admit(&caller, operation)
-                        } else {
-                            (failure("request_ended"), None)
-                        }
-                    }
-                    Err(_) => (failure("invalid_request"), None),
-                };
-                let completion = self.runtime.send(Command::Complete {
-                    request: id,
-                    payload: response,
-                });
-                if !matches!(&completion, Ok(Response::Ok)) {
-                    self.manager.completion_lost(admission);
-                }
-                match completion? {
-                    Response::Ok => Ok(()),
-                    Response::Error { code, .. }
-                        if code == "request_ended" || code == "not_found" =>
-                    {
-                        Ok(())
-                    }
-                    _ => Err("virtual display completion failed".into()),
+                        request,
+                    )
+                } else {
+                    handle_legacy(
+                        &self.runtime,
+                        &mut self.manager,
+                        &mut self.display_adapter,
+                        request,
+                    )
                 }
             }
             _ => Err("virtual display polling failed".into()),
@@ -146,6 +121,53 @@ impl ManagedModule for VirtualDisplayModule {
 }
 
 amaterasu_module_sdk::export_module!(VirtualDisplayModule);
+
+fn handle_legacy<B: service_adapter::Backend>(
+    runtime: &RuntimeClient,
+    manager: &mut B,
+    adapter: &mut service_adapter::Adapter,
+    request: IncomingRequest<serde_json::Value>,
+) -> ModuleResult<()> {
+    let operation = serde_json::from_value::<Operation>(request.payload);
+    let mut admitted_operation = None;
+    let (response, admission) = match operation {
+        Ok(operation) => {
+            if matches!(
+                runtime.send(Command::CheckRequest {
+                    request: request.id
+                })?,
+                Response::Ok
+            ) {
+                let outcome = manager.admit_with_effect(&request.caller, operation.clone());
+                if outcome.effect == service_adapter::MutationEffect::Attempted {
+                    adapter.observe_legacy_mutation(&request.caller, &operation);
+                }
+                admitted_operation = Some(operation);
+                (outcome.response, outcome.admission)
+            } else {
+                (failure("request_ended"), None)
+            }
+        }
+        Err(_) => (failure("invalid_request"), None),
+    };
+    let completion = runtime.send(Command::Complete {
+        request: request.id,
+        payload: response,
+    });
+    if !matches!(&completion, Ok(Response::Ok)) {
+        if admission.is_some()
+            && let Some(operation) = admitted_operation.as_ref()
+        {
+            adapter.observe_legacy_mutation(&request.caller, operation);
+        }
+        manager.completion_lost(admission);
+    }
+    match completion? {
+        Response::Ok => Ok(()),
+        Response::Error { code, .. } if code == "request_ended" || code == "not_found" => Ok(()),
+        _ => Err("virtual display completion failed".into()),
+    }
+}
 
 fn handle_display_api<B: service_adapter::Backend>(
     runtime: &RuntimeClient,
