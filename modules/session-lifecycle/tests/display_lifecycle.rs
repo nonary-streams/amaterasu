@@ -99,6 +99,7 @@ struct Fixture {
     lifecycle: RunningModule,
     display: RunningModule,
     library: *mut c_void,
+    lifecycle_library: *mut c_void,
     root: PathBuf,
     next: u64,
     state_revision: u64,
@@ -111,6 +112,8 @@ struct Fixture {
     borrows: BTreeMap<String, String>,
     domain_revision: u64,
     borrow_sequence: u32,
+    mode: (u64, u64, u64),
+    reconfigurations: BTreeMap<String, Value>,
 }
 impl Fixture {
     fn new() -> Self {
@@ -153,6 +156,7 @@ impl Fixture {
             COORDINATOR:{"provide":[LIFECYCLE],"call":[LIFECYCLE,DISPLAY_SERVICE,"amaterasu.virtual-display/1","amaterasu.state/1"]},
             DISPLAY:{"provide":[DISPLAY_SERVICE],"call":[LIFECYCLE,"amaterasu.virtual-display/1","amaterasu.state/1"]},
             "transport":{"call":[LIFECYCLE]}, "capture":{"call":[LIFECYCLE]}, "amaterasu.extension-registry":{"call":[DISPLAY_SERVICE]},
+            "amaterasu.extension-actions":{"call":[DISPLAY_SERVICE]},
             "amaterasu.management":{"call":[DISPLAY_SERVICE]},
             "virtual":{"provide":["amaterasu.virtual-display/1"]}, "state":{"provide":["amaterasu.state/1"]}
         },"api_methods":approvals["api_methods"],"settings":{COORDINATOR:{
@@ -190,13 +194,28 @@ impl Fixture {
         let entry: abi::ModuleEntry = unsafe { std::mem::transmute(symbol) };
         let display_api = unsafe { *entry() };
         let display = RunningModule::new(display_api, broker.clone(), DISPLAY);
-        let lifecycle_api = unsafe { *amaterasu_session_lifecycle::amaterasu_module_v1() };
+        let mut lifecycle_library = std::ptr::null_mut();
+        let lifecycle_api = if let Some(path) = std::env::var_os("AMATERASU_LIFECYCLE_PLUGIN") {
+            let path = CString::new(path.as_encoded_bytes()).unwrap();
+            // SAFETY: this opt-in test retains the explicitly supplied trusted library until after module destruction.
+            lifecycle_library = unsafe { dlopen(path.as_ptr(), 2) };
+            assert!(!lifecycle_library.is_null(), "lifecycle dlopen failed");
+            let symbol = CString::new("amaterasu_module_v1").unwrap();
+            let address = unsafe { dlsym(lifecycle_library, symbol.as_ptr()) };
+            assert!(!address.is_null());
+            // SAFETY: the symbol is the documented entry point of the selected lifecycle module.
+            let entry: abi::ModuleEntry = unsafe { std::mem::transmute(address) };
+            unsafe { *entry() }
+        } else {
+            unsafe { *amaterasu_session_lifecycle::amaterasu_module_v1() }
+        };
         let lifecycle = RunningModule::new(lifecycle_api, broker.clone(), COORDINATOR);
         Self {
             broker,
             lifecycle,
             display,
             library,
+            lifecycle_library,
             root,
             next: 0,
             state_revision: 0,
@@ -209,6 +228,8 @@ impl Fixture {
             borrows: BTreeMap::new(),
             domain_revision: 1,
             borrow_sequence: 0,
+            mode: (1920, 1080, 60000),
+            reconfigurations: BTreeMap::new(),
         }
     }
     fn tick(&mut self) {
@@ -288,7 +309,7 @@ impl Fixture {
                 });
                 let monitors = previous.map_or_else(
                     || json!([]),
-                    |call| json!([{"reference_owned":reference_owned.unwrap_or(false),"specification":{"identity":call["identity"],"width":1920,"height":1080,"refresh_millihz":60000,"name":"Amaterasu","hdr_enabled":false},"state":"ready","output":"Virtual-1","error":null,"virtual_display_layout":"extended","dd_virtual_display_scale":0,"capture_output":"kwin:Virtual-1","ready":{"device_path":"Virtual-1","active":true}}]),
+                    |call| json!([{"reference_owned":reference_owned.unwrap_or(false),"specification":{"identity":call["identity"],"width":self.mode.0,"height":self.mode.1,"refresh_millihz":self.mode.2,"name":"Amaterasu","hdr_enabled":false},"state":"ready","output":"Virtual-1","error":null,"virtual_display_layout":"extended","dd_virtual_display_scale":0,"capture_output":"kwin:Virtual-1","ready":{"device_path":"Virtual-1","active":true}}]),
                 );
                 json!({"ok":true,"enabled":true,"native_supported":true,"driver":"libvirtualdisplay","ownership_authority":"unix_uid_broker","recovery_ready":true,"reference_owned":reference_owned,"monitors":monitors,"mutation_domain":domain(self.domain_revision,self.borrows.len()),"settings":{"virtual_display_layout":"extended","dd_virtual_display_scale":0}})
             }
@@ -305,7 +326,9 @@ impl Fixture {
                     p["reference_id"].as_str().unwrap().into(),
                     p["identity"].as_str().unwrap().into(),
                 );
-                json!({"ok":true,"reference_owned":true,"monitor":{"specification":{"identity":p["identity"],"width":1920,"height":1080,"refresh_millihz":60000,"name":"Amaterasu","hdr_enabled":false},"virtual_display_layout":"extended","dd_virtual_display_scale":0,"state":"ready","error":null,"ready":{"device_path":"Virtual-1","active":true},"capture_output":"kwin:Virtual-1"}})
+                assert_eq!(p["width"], self.mode.0);
+                assert_eq!(p["height"], self.mode.1);
+                json!({"ok":true,"reference_owned":true,"monitor":{"specification":{"identity":p["identity"],"width":self.mode.0,"height":self.mode.1,"refresh_millihz":self.mode.2,"name":"Amaterasu","hdr_enabled":false},"virtual_display_layout":"extended","dd_virtual_display_scale":0,"state":"ready","error":null,"ready":{"device_path":"Virtual-1","active":true},"capture_output":"kwin:Virtual-1"}})
             }
             "borrow" => {
                 let reference = p["reference_id"].as_str().unwrap().to_owned();
@@ -314,14 +337,14 @@ impl Fixture {
                 let borrow_id = format!("{:064x}", self.borrow_sequence);
                 self.borrows.insert(reference, borrow_id.clone());
                 self.domain_revision += 1;
-                json!({"ok":true,"borrow_id":borrow_id,"observed_output":{"version":1,"protocol":"wayland-wl-output","compositor_id":"b".repeat(64),"registry_global":4,"output_name":"Virtual-1","width":1920,"height":1080,"refresh_millihz":60000},"mutation_domain":domain(self.domain_revision,self.borrows.len())})
+                json!({"ok":true,"borrow_id":borrow_id,"observed_output":{"version":1,"protocol":"wayland-wl-output","compositor_id":"b".repeat(64),"registry_global":4,"output_name":"Virtual-1","width":self.mode.0,"height":self.mode.1,"refresh_millihz":self.mode.2},"mutation_domain":domain(self.domain_revision,self.borrows.len())})
             }
             "validate_borrow" => {
                 assert_eq!(
                     self.borrows.get(p["reference_id"].as_str().unwrap()),
                     p["borrow_id"].as_str().map(str::to_owned).as_ref()
                 );
-                json!({"ok":true,"borrow_id":p["borrow_id"],"observed_output":{"version":1,"protocol":"wayland-wl-output","compositor_id":"b".repeat(64),"registry_global":4,"output_name":"Virtual-1","width":1920,"height":1080,"refresh_millihz":60000},"mutation_domain":domain(self.domain_revision,self.borrows.len())})
+                json!({"ok":true,"borrow_id":p["borrow_id"],"observed_output":{"version":1,"protocol":"wayland-wl-output","compositor_id":"b".repeat(64),"registry_global":4,"output_name":"Virtual-1","width":self.mode.0,"height":self.mode.1,"refresh_millihz":self.mode.2},"mutation_domain":domain(self.domain_revision,self.borrows.len())})
             }
             "release_borrow" => {
                 let reference = p["reference_id"].as_str().unwrap();
@@ -332,6 +355,35 @@ impl Fixture {
                 self.borrows.remove(reference);
                 self.domain_revision += 1;
                 json!({"ok":true,"released":true,"mutation_domain":domain(self.domain_revision,self.borrows.len())})
+            }
+            "reconfigure" => {
+                let operation = p["operation_id"].as_str().unwrap().to_owned();
+                if let Some(result) = self.reconfigurations.get(&operation) {
+                    return result.clone();
+                }
+                let reference = p["reference_id"].as_str().unwrap();
+                assert_eq!(
+                    self.borrows.len(),
+                    1,
+                    "resize requires retirement of other borrowers"
+                );
+                assert_eq!(
+                    self.borrows.get(reference),
+                    p["borrow_id"].as_str().map(str::to_owned).as_ref()
+                );
+                assert_eq!(p["expected_topology_revision"], self.domain_revision);
+                self.mode = (
+                    p["width"].as_u64().unwrap(),
+                    p["height"].as_u64().unwrap(),
+                    p["refresh_millihz"].as_u64().unwrap(),
+                );
+                self.domain_revision += 1;
+                self.borrow_sequence += 1;
+                let new_borrow = format!("{:064x}", self.borrow_sequence);
+                self.borrows.insert(reference.into(), new_borrow.clone());
+                let completed = json!({"ok":true,"state":"succeeded","operation_id":operation,"borrow_id":new_borrow,"observed_output":{"version":1,"protocol":"wayland-wl-output","compositor_id":"b".repeat(64),"registry_global":4,"output_name":"Virtual-1","width":self.mode.0,"height":self.mode.1,"refresh_millihz":self.mode.2},"mutation_domain":domain(self.domain_revision,self.borrows.len())});
+                self.reconfigurations.insert(operation.clone(), completed);
+                json!({"ok":true,"state":"pending","operation_id":operation})
             }
             "remove" => {
                 let reference = p["reference_id"].as_str().unwrap();
@@ -363,13 +415,21 @@ impl Fixture {
         };
         for _ in 0..200 {
             self.tick();
-            match self
+            let response = self
                 .broker
                 .borrow_mut()
-                .dispatch(caller, Command::TakeResult { request: id })
-            {
+                .dispatch(caller, Command::TakeResult { request: id });
+            match response {
                 Response::Pending => {}
-                Response::Result { payload } => return payload,
+                Response::Result { payload } => {
+                    assert!(matches!(
+                        self.broker
+                            .borrow_mut()
+                            .dispatch(caller, Command::ReleaseResult { request: id }),
+                        Response::Ok
+                    ));
+                    return payload;
+                }
                 r => panic!("request result: {r:?}"),
             }
         }
@@ -390,21 +450,33 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
+        let evidence = json!({"values":self.values,"entries":self.entries,"metadata":self.metadata,"native_calls":self.native_calls});
+        std::fs::write(
+            self.root.join("simulated-backend.json"),
+            serde_json::to_vec_pretty(&evidence).unwrap(),
+        )
+        .unwrap();
         // The library must remain loaded until its module instance is destroyed.
         unsafe { (self.display.api.destroy)(self.display.instance) };
         self.display.instance = std::ptr::null_mut();
         // SAFETY: the plugin instance has been destroyed and no callbacks remain.
         unsafe { dlclose(self.library) };
         self.library = std::ptr::null_mut();
+        if !self.lifecycle_library.is_null() {
+            // SAFETY: lifecycle calls have stopped and its instance is destroyed before unloading.
+            unsafe { (self.lifecycle.api.destroy)(self.lifecycle.instance) };
+            self.lifecycle.instance = std::ptr::null_mut();
+            unsafe { dlclose(self.lifecycle_library) };
+            self.lifecycle_library = std::ptr::null_mut();
+        }
         eprintln!(
             "cross-ABI test evidence retained at {}",
             self.root.display()
         );
     }
 }
-#[test]
-#[ignore = "requires an independently built display module and its example approvals"]
-fn real_display_and_lifecycle_round_trip_with_simulated_backends() {
+fn display_round_trip(resizes: usize) {
+    let changed_mode = resizes > 0;
     let mut f = Fixture::new();
     let video = json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false});
     let prepared =
@@ -472,7 +544,12 @@ fn real_display_and_lifecycle_round_trip_with_simulated_backends() {
     );
     assert_eq!(f.references.len(), 1, "pause retains the session reference");
     assert_eq!(f.borrows.len(), 1, "pause retires only the stream borrow");
-    let resume=f.call(json!({"operation":"resume_stream","operation_id":"resume","target":ready["target"],"intent":"resume","requested_video":video,"consumer_requirements":["capture"]}));
+    let resume_video = if changed_mode {
+        json!({"width":1280,"height":720,"refresh_millihz":60000,"hdr":false})
+    } else {
+        video.clone()
+    };
+    let resume=f.call(json!({"operation":"resume_stream","operation_id":"resume","target":ready["target"],"intent":"resume","requested_video":resume_video,"consumer_requirements":["capture"]}));
     assert_eq!(resume["status"], "pending", "{resume}");
     let resumed = f.settled("resume");
     assert_eq!(
@@ -480,10 +557,14 @@ fn real_display_and_lifecycle_round_trip_with_simulated_backends() {
         "{resumed}; native calls: {:?}",
         f.native_calls
     );
-    let resumed_target = resumed["target"].clone();
+    let mut resumed_target = resumed["target"].clone();
     assert_ne!(resumed_target["stream_id"], target["stream_id"]);
     let resumed_candidate = resumed["candidate"].clone();
-    let resumed_ack=f.call_as("capture",json!({"operation":"ack_binding","operation_id":"resume-ack","target":resumed_target,"consumer":"capture","plan_revision":resumed_candidate["plan_revision"],"candidate":resumed_candidate,"observed_capture":observed}));
+    assert_eq!(resumed_candidate["mode"], resume_video);
+    let mut resumed_observation = observed.clone();
+    resumed_observation["width"] = resume_video["width"].clone();
+    resumed_observation["height"] = resume_video["height"].clone();
+    let resumed_ack=f.call_as("capture",json!({"operation":"ack_binding","operation_id":"resume-ack","target":resumed_target,"consumer":"capture","plan_revision":resumed_candidate["plan_revision"],"candidate":resumed_candidate,"observed_capture":resumed_observation}));
     assert_eq!(resumed_ack["status"], "pending", "{resumed_ack}");
     let mut result = Value::Null;
     for _ in 0..500 {
@@ -500,6 +581,55 @@ fn real_display_and_lifecycle_round_trip_with_simulated_backends() {
         json!({"operation":"start_stream","operation_id":"resume-start","target":resumed_target}),
     );
     assert_eq!(restarted["status"], "succeeded", "{restarted}");
+    for cycle in 1..resizes {
+        let pause_id = format!("cycle-{cycle}-pause");
+        let fenced = f.call(
+            json!({"operation":"pause_stream","operation_id":pause_id,"target":resumed_target}),
+        );
+        assert_eq!(fenced["status"], "pending", "{fenced}");
+        let retired=f.call_as("capture",json!({"operation":"retire_stream","operation_id":format!("cycle-{cycle}-retire"),"target":resumed_target,"consumer":"capture","retirement_receipt":{"response":{"status":"not_found"}}}));
+        assert_eq!(retired["status"], "pending", "{retired}");
+        let paused = f.settled(&pause_id);
+        assert_eq!(paused["status"], "succeeded", "{paused}");
+        let video = if cycle % 2 == 1 {
+            json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false})
+        } else {
+            json!({"width":1280,"height":720,"refresh_millihz":60000,"hdr":false})
+        };
+        let resume_id = format!("cycle-{cycle}-resume");
+        let requested=f.call(json!({"operation":"resume_stream","operation_id":resume_id,"target":ready["target"],"intent":"resume","requested_video":video,"consumer_requirements":["capture"]}));
+        assert_eq!(requested["status"], "pending", "{requested}");
+        let prepared = f.settled(&resume_id);
+        assert_eq!(
+            prepared["status"], "succeeded",
+            "{prepared}; native calls: {:?}",
+            f.native_calls
+        );
+        let next_target = prepared["target"].clone();
+        assert_ne!(next_target["stream_id"], resumed_target["stream_id"]);
+        let candidate = prepared["candidate"].clone();
+        assert_eq!(candidate["mode"], video);
+        let mut observation = observed.clone();
+        observation["width"] = video["width"].clone();
+        observation["height"] = video["height"].clone();
+        let ack_id = format!("cycle-{cycle}-ack");
+        let ack=f.call_as("capture",json!({"operation":"ack_binding","operation_id":ack_id,"target":next_target,"consumer":"capture","plan_revision":candidate["plan_revision"],"candidate":candidate,"observed_capture":observation}));
+        assert_eq!(ack["status"], "pending", "{ack}");
+        let mut ack_result = Value::Null;
+        for _ in 0..500 {
+            ack_result = f.call_as(
+                "capture",
+                json!({"operation":"lookup","operation_id":ack_id}),
+            );
+            if ack_result["status"] != "pending" {
+                break;
+            }
+        }
+        assert_eq!(ack_result["status"], "succeeded", "{ack_result}");
+        let started=f.call(json!({"operation":"start_stream","operation_id":format!("cycle-{cycle}-start"),"target":next_target}));
+        assert_eq!(started["status"], "succeeded", "{started}");
+        resumed_target = next_target;
+    }
     let end =
         f.call(json!({"operation":"end_session","operation_id":"end","target":ready["target"]}));
     assert_eq!(end["status"], "pending", "{end}");
@@ -515,6 +645,25 @@ fn real_display_and_lifecycle_round_trip_with_simulated_backends() {
     );
     assert!(f.references.is_empty());
     assert!(f.borrows.is_empty());
+    assert_eq!(f.reconfigurations.len(), resizes);
+}
+
+#[test]
+#[ignore = "requires an independently built display module and its example approvals"]
+fn real_display_and_lifecycle_round_trip_with_simulated_backends() {
+    display_round_trip(0);
+}
+
+#[test]
+#[ignore = "requires a display module with native resize support and its example approvals"]
+fn real_display_resumes_with_changed_mode() {
+    display_round_trip(1);
+}
+
+#[test]
+#[ignore = "requires a display module with native resize support and its example approvals"]
+fn real_display_repeats_changed_mode_beyond_checkpoint() {
+    display_round_trip(10);
 }
 
 #[test]
