@@ -24,6 +24,8 @@ pub struct ResourceRef {
     pub revision: u64,
     pub execution_domain: String,
     pub mutation_domain: Option<String>,
+    #[serde(default)]
+    pub mutation_domains: Vec<String>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +36,8 @@ pub struct CaptureBinding {
     pub resource: ResourceRef,
     pub mode: VideoMode,
     pub plan_revision: u64,
+    pub geometry_revision: u64,
+    pub generation: u64,
     #[serde(default)]
     pub fallback: CaptureFallback,
 }
@@ -136,6 +140,193 @@ pub enum ExecutionClass {
     HostMutation,
 }
 
+/// A provider-owned cleanup obligation retained separately from live handles.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourceObligation {
+    pub obligation_id: String,
+    pub provider: String,
+    pub resource_id: String,
+    pub mutation_domain: Option<String>,
+    pub depends_on: Vec<String>,
+    pub cleanup_method: MethodRef,
+    pub payload: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceAccess {
+    Read,
+    Shared,
+    Exclusive,
+}
+
+/// Expected shared-domain revision and borrowers are rechecked at effect time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MutationDomainPlan {
+    pub domain: String,
+    pub expected_revision: u64,
+    pub borrowers: std::collections::BTreeMap<String, u64>,
+    pub access: ResourceAccess,
+}
+
+/// A plan may name a resource before its native incarnation exists. Refinement
+/// must stay within the selected provider, logical ID and execution domain.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannedResource {
+    pub provider: String,
+    pub resource_id: String,
+    pub incarnation: Option<String>,
+    pub expected_revision: Option<u64>,
+    pub execution_domain: String,
+    pub mutation_domains: Vec<String>,
+    pub access: ResourceAccess,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResourcePlan {
+    pub plan_id: String,
+    pub revision: u64,
+    pub resources: Vec<PlannedResource>,
+    pub mutation_domains: Vec<MutationDomainPlan>,
+    pub required_capabilities: Vec<String>,
+    /// Provider-specific constraints interpreted under an approved schema.
+    pub constraints: Value,
+    pub obligations: Vec<ResourceObligation>,
+    pub affected_consumers: Vec<String>,
+    pub consumer_change: ConsumerChange,
+    pub candidate_constraint: Option<BindingConstraint>,
+    pub allowed_degradation: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsumerChange {
+    Live,
+    RestartPipeline,
+    ReconnectRequired,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BindingConstraint {
+    pub capture_provider: String,
+    pub selector_schema: String,
+    pub resource_provider: String,
+    pub resource_id: String,
+    pub incarnation: Option<String>,
+    pub execution_domain: String,
+    pub mode: Option<VideoMode>,
+    pub plan_revision: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderStatusRequest {
+    pub operation_id: String,
+    pub transition_id: String,
+    pub receipt_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupState {
+    Released,
+    Pending,
+    DeferredRestoration,
+    EffectUnknown,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CleanupOutcome {
+    pub obligation_id: String,
+    pub state: CleanupState,
+    pub reason: Option<String>,
+}
+
+/// Calls use the coordinator's broker identity after durable admission. The
+/// admission ID identifies a recorded plan; the ID alone is not authority.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRequest {
+    pub operation: ProviderOperation,
+    pub version: u32,
+    pub transition_id: String,
+    pub operation_id: String,
+    pub target: LifecycleTarget,
+    pub phase: LifecyclePhase,
+    pub settings_revision: String,
+    pub settings: amaterasu_configuration_schema::Values,
+    pub intent: Option<StreamIntent>,
+    pub reason: Option<ReleaseReason>,
+    pub requested_video: Option<VideoMode>,
+    pub remaining_ms: u64,
+    pub plan_revision: Option<u64>,
+    pub admission_id: Option<String>,
+    pub approved_plan: Option<ResourcePlan>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderOperation {
+    ResourcePlan,
+    LifecycleCallback,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LifecyclePhase {
+    #[serde(rename = "session.prepare")]
+    SessionPrepare,
+    #[serde(rename = "stream.prepare")]
+    StreamPrepare,
+    #[serde(rename = "stream.release")]
+    StreamRelease,
+    #[serde(rename = "session.release")]
+    SessionRelease,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamIntent {
+    Initial,
+    Resume,
+    Reconfigure,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseReason {
+    Pause,
+    End,
+    FailedStart,
+    Reconfigure,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProviderResponse {
+    Planned {
+        plan: ResourcePlan,
+    },
+    Prepared {
+        candidate: Option<CaptureBinding>,
+        obligations: Vec<ResourceObligation>,
+    },
+    Pending {
+        receipt_id: String,
+    },
+    Rejected {
+        reason: String,
+    },
+    Cleanup {
+        outcomes: Vec<CleanupOutcome>,
+    },
+    Failed {
+        reason: String,
+    },
+    RecoveryRequired {
+        reason: String,
+    },
+}
+
 /// An explicit editor hint; consumers never infer keybindings from object shape.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -185,11 +376,16 @@ pub struct Keybinding {
 }
 
 /// Validate shape and action arguments; authorization and chord conflicts are separate.
+/// The selected input adapter must also validate platform-specific key-code support.
 pub fn validate_keybinding(binding: &Keybinding, action: &ActionDescriptor) -> Result<(), String> {
     if !valid_opaque_id(&binding.id)
         || !valid_opaque_id(&binding.context)
         || binding.action_id != action.id
         || binding.modifiers.len() > 8
+        || binding
+            .modifiers
+            .iter()
+            .any(|key| std::mem::discriminant(key) != std::mem::discriminant(&binding.trigger))
         || binding.modifiers.contains(&binding.trigger)
         || binding
             .modifiers
@@ -261,6 +457,133 @@ pub struct ExtensionDescriptor {
     pub settings_validate: MethodRef,
 }
 
+/// Check a provider request's shape before processing it. The broker caller,
+/// admitted plan and installed grants must still be checked by the coordinator.
+pub fn validate_provider_request(request: &ProviderRequest) -> Result<(), String> {
+    if request.version != CONTRACT_VERSION
+        || !valid_opaque_id(&request.transition_id)
+        || !valid_opaque_id(&request.operation_id)
+        || !valid_opaque_id(&request.settings_revision)
+        || request.remaining_ms == 0
+        || serde_json::to_vec(request)
+            .map_err(|error| error.to_string())?
+            .len()
+            > 12 * 1024
+    {
+        return Err("invalid provider request".into());
+    }
+    match request.operation {
+        ProviderOperation::ResourcePlan => {
+            if request.approved_plan.is_some() || request.admission_id.is_some() {
+                return Err("planning does not authorize effects".into());
+            }
+        }
+        ProviderOperation::LifecycleCallback => {
+            let plan = request
+                .approved_plan
+                .as_ref()
+                .ok_or("missing admitted plan")?;
+            if !request.admission_id.as_deref().is_some_and(valid_opaque_id)
+                || request.plan_revision != Some(plan.revision)
+            {
+                return Err("missing or mismatched admission".into());
+            }
+            validate_resource_plan(plan)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate structural plan bounds and dependency identities. The coordinator
+/// must separately compare observed revisions, borrowers and installed grants.
+pub fn validate_resource_plan(plan: &ResourcePlan) -> Result<(), String> {
+    use std::collections::BTreeSet;
+    if !valid_opaque_id(&plan.plan_id)
+        || plan.revision == 0
+        || plan.resources.len() > 128
+        || plan.mutation_domains.len() > 128
+        || plan.obligations.len() > 128
+        || plan.affected_consumers.len() > 128
+        || plan.required_capabilities.len() > 128
+        || plan.allowed_degradation.len() > 128
+        || !plan.constraints.is_object()
+        || serde_json::to_vec(plan)
+            .map_err(|error| error.to_string())?
+            .len()
+            > 12 * 1024
+    {
+        return Err("invalid resource plan".into());
+    }
+    let mut domains = BTreeSet::new();
+    for domain in &plan.mutation_domains {
+        if !valid_opaque_id(&domain.domain)
+            || !domains.insert(&domain.domain)
+            || domain.borrowers.len() > 128
+            || domain.borrowers.keys().any(|id| !valid_opaque_id(id))
+        {
+            return Err("invalid mutation domain".into());
+        }
+    }
+    let mut resources = BTreeSet::new();
+    for resource in &plan.resources {
+        if !valid_identifier(&resource.provider)
+            || !valid_opaque_id(&resource.resource_id)
+            || !valid_opaque_id(&resource.execution_domain)
+            || resource
+                .incarnation
+                .as_ref()
+                .is_some_and(|id| !valid_opaque_id(id))
+            || !resources.insert((&resource.provider, &resource.resource_id))
+            || resource
+                .mutation_domains
+                .iter()
+                .any(|domain| !domains.contains(domain))
+        {
+            return Err("invalid planned resource".into());
+        }
+    }
+    let mut obligations = BTreeSet::new();
+    for obligation in &plan.obligations {
+        if !valid_opaque_id(&obligation.obligation_id)
+            || !obligations.insert(&obligation.obligation_id)
+            || !valid_identifier(&obligation.provider)
+            || !valid_opaque_id(&obligation.resource_id)
+            || !obligation.payload.is_object()
+            || obligation.depends_on.len() > 128
+        {
+            return Err("invalid resource obligation".into());
+        }
+        validate_method(&obligation.cleanup_method)?;
+    }
+    for obligation in &plan.obligations {
+        if obligation.depends_on.iter().any(|dependency| {
+            dependency == &obligation.obligation_id || !obligations.contains(dependency)
+        }) {
+            return Err("invalid obligation dependency".into());
+        }
+    }
+    let mut retired = BTreeSet::new();
+    loop {
+        let previous = retired.len();
+        for obligation in &plan.obligations {
+            if obligation
+                .depends_on
+                .iter()
+                .all(|dependency| retired.contains(dependency))
+            {
+                retired.insert(obligation.obligation_id.clone());
+            }
+        }
+        if retired.len() == plan.obligations.len() {
+            break;
+        }
+        if retired.len() == previous {
+            return Err("cyclic obligation dependency".into());
+        }
+    }
+    Ok(())
+}
+
 /// Validate an exact candidate before any consumer opens it. Authorization,
 /// provider availability, and actual capture acknowledgement are separate checks.
 pub fn validate_capture_binding(binding: &CaptureBinding) -> Result<(), String> {
@@ -276,8 +599,14 @@ pub fn validate_capture_binding(binding: &CaptureBinding) -> Result<(), String> 
             .as_ref()
             .is_some_and(|domain| !valid_opaque_id(domain))
         || !binding.selector.is_object()
+        || resource
+            .mutation_domains
+            .iter()
+            .any(|domain| !valid_opaque_id(domain))
         || resource.revision == 0
         || binding.plan_revision == 0
+        || binding.geometry_revision == 0
+        || binding.generation == 0
         || binding.mode.width == 0
         || binding.mode.height == 0
         || binding.mode.refresh_millihz == 0
@@ -423,6 +752,66 @@ mod tests {
     }
 
     #[test]
+    fn plans_reject_cycles_and_callbacks_require_admission() {
+        let method = MethodRef {
+            service: "example.provider/1".into(),
+            method: "cleanup".into(),
+            interface_major: 1,
+            interface_minor: 0,
+            schema_revision: 1,
+        };
+        let obligation = |id: &str, dependency: &str| ResourceObligation {
+            obligation_id: id.into(),
+            provider: "example.provider".into(),
+            resource_id: "resource".into(),
+            mutation_domain: None,
+            depends_on: vec![dependency.into()],
+            cleanup_method: method.clone(),
+            payload: json!({}),
+        };
+        let mut plan = ResourcePlan {
+            plan_id: "plan".into(),
+            revision: 1,
+            resources: vec![],
+            mutation_domains: vec![],
+            required_capabilities: vec![],
+            constraints: json!({}),
+            obligations: vec![obligation("a", "b"), obligation("b", "a")],
+            affected_consumers: vec![],
+            consumer_change: ConsumerChange::Live,
+            candidate_constraint: None,
+            allowed_degradation: vec![],
+        };
+        assert!(validate_resource_plan(&plan).is_err());
+        plan.obligations[1].depends_on.clear();
+        assert!(validate_resource_plan(&plan).is_ok());
+        let mut request = ProviderRequest {
+            operation: ProviderOperation::LifecycleCallback,
+            version: 1,
+            transition_id: "transition".into(),
+            operation_id: "operation".into(),
+            target: LifecycleTarget::Validation {
+                host_epoch: "epoch".into(),
+                validation_id: "probe".into(),
+                generation: 1,
+            },
+            phase: LifecyclePhase::StreamPrepare,
+            settings_revision: "settings".into(),
+            settings: Default::default(),
+            intent: None,
+            reason: None,
+            requested_video: None,
+            remaining_ms: 100,
+            plan_revision: Some(1),
+            admission_id: None,
+            approved_plan: Some(plan),
+        };
+        assert!(validate_provider_request(&request).is_err());
+        request.admission_id = Some("admitted".into());
+        assert!(validate_provider_request(&request).is_ok());
+    }
+
+    #[test]
     fn keybindings_reject_duplicate_modifiers_and_invalid_arguments() {
         let method = MethodRef {
             service: "example.provider/1".into(),
@@ -484,7 +873,7 @@ mod tests {
 
     #[test]
     fn capture_binding_defaults_to_exact_selection() {
-        let value = json!({"capture_provider":"capture", "selector_schema":"selector/1", "selector":{}, "resource":{"provider":"display", "resource_id":"resource", "incarnation":"instance", "revision":1, "execution_domain":"desktop", "mutation_domain":null}, "mode":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false}, "plan_revision":3});
+        let value = json!({"capture_provider":"capture", "selector_schema":"selector/1", "selector":{}, "resource":{"provider":"display", "resource_id":"resource", "incarnation":"instance", "revision":1, "execution_domain":"desktop", "mutation_domain":null}, "mode":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false}, "plan_revision":3, "geometry_revision":2, "generation":1});
         let binding: CaptureBinding = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(binding.fallback, CaptureFallback::Forbidden);
         assert!(validate_capture_binding(&binding).is_ok());
