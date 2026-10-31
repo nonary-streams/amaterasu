@@ -13,22 +13,22 @@ const MAX_EPOCH_BYTES: usize = 8_000;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Epoch {
-    caller: String,
-    initiator: String,
-    open_index: String,
-    closed: bool,
-    receipts: BTreeMap<u64, Record>,
+pub(crate) struct Epoch {
+    pub(crate) caller: String,
+    pub(crate) initiator: String,
+    pub(crate) open_index: String,
+    pub(crate) closed: bool,
+    pub(crate) receipts: BTreeMap<u64, Record>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Record {
-    request: ActionInvoke,
-    receipt: Value,
-    selected_provider: String,
-    registry_revision: u64,
-    descriptor: amaterasu_extension_api::ActionDescriptor,
-    dispatch: Option<crate::dispatch::Dispatch>,
+pub(crate) struct Record {
+    pub(crate) request: ActionInvoke,
+    pub(crate) receipt: Value,
+    pub(crate) selected_provider: String,
+    pub(crate) registry_revision: u64,
+    pub(crate) descriptor: amaterasu_extension_api::ActionDescriptor,
+    pub(crate) dispatch: Option<crate::dispatch::Dispatch>,
 }
 
 #[derive(Default, Deserialize)]

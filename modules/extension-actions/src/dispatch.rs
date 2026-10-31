@@ -34,8 +34,15 @@ pub enum Stage {
         permit: String,
     },
     Running {
+        plan: Value,
         digest: String,
         permit: String,
+    },
+    ProviderPending {
+        plan: Value,
+        digest: String,
+        permit: String,
+        provider_receipt: Value,
     },
     Completing {
         digest: String,
@@ -170,17 +177,212 @@ impl Dispatch {
         };
         let plan = plan.clone();
         self.stage = Stage::Running {
+            plan: plan.clone(),
             digest: digest.clone(),
             permit: permit.clone(),
         };
         Ok(plan)
+    }
+    /// Build the next broker operation from a durably persisted phase. The
+    /// caller must never reissue a Running effect after an uncertain send.
+    pub fn broker_call(&self) -> Result<Option<amaterasu_module_sdk::Command>, &'static str> {
+        use amaterasu_module_sdk::Command;
+        use serde_json::json;
+        let operation_id = &self.request.operation_id;
+        let action_id = &self.request.action_id;
+        let target = &self.request.target;
+        let request = |payload: Value, suffix: &str| Command::Request {
+            service: amaterasu_extension_api::SESSION_LIFECYCLE_SERVICE.into(),
+            payload,
+            timeout_ms: 5_000,
+            operation_id: format!("{operation_id}:{suffix}"),
+            parent: None,
+        };
+        let api = |method: &amaterasu_extension_api::MethodRef, payload: Value, suffix: &str| {
+            Command::CallApi {
+                service: method.service.clone(),
+                method: method.method.clone(),
+                interface_major: method.interface_major,
+                interface_minor: method.interface_minor,
+                payload,
+                timeout_ms: 5_000,
+                operation_id: format!("{operation_id}:{suffix}"),
+                parent: None,
+            }
+        };
+        Ok(match &self.stage {
+            Stage::Planning => {
+                let method = self.descriptor.plan.as_ref().ok_or("plan_unavailable")?;
+                Some(api(
+                    method,
+                    json!({"version":1,"operation_id":operation_id,"action_id":action_id,"target":target,"arguments":self.request.arguments,"expected_settings_revision":self.request.expected_settings_revision}),
+                    "plan",
+                ))
+            }
+            Stage::AwaitingPermit { digest, .. } => Some(request(
+                json!({"operation":"authorize_action","operation_id":operation_id,"action_id":action_id,"target":target,"plan_digest":digest,"source":{"caller":self.caller,"initiator":self.initiator}}),
+                "authorize",
+            )),
+            Stage::AwaitingConsume { digest, permit, .. } => Some(request(
+                json!({"operation":"consume_action_permit","operation_id":operation_id,"action_id":action_id,"target":target,"plan_digest":digest,"permit":permit}),
+                "consume",
+            )),
+            Stage::Running {
+                plan,
+                digest,
+                permit,
+            } => Some(api(
+                &self.descriptor.execute,
+                json!({"version":1,"operation_id":operation_id,"action_id":action_id,"target":target,"arguments":self.request.arguments,"expected_settings_revision":self.request.expected_settings_revision,"plan":plan,"plan_digest":digest,"permit":permit}),
+                "execute",
+            )),
+            Stage::ProviderPending {
+                digest,
+                provider_receipt,
+                ..
+            } => {
+                let method = self
+                    .descriptor
+                    .status
+                    .as_ref()
+                    .ok_or("status_unavailable")?;
+                Some(api(
+                    method,
+                    json!({"version":1,"operation_id":operation_id,"action_id":action_id,"target":target,"plan_digest":digest,"provider_receipt":provider_receipt}),
+                    "status",
+                ))
+            }
+            Stage::Completing {
+                digest,
+                permit,
+                outcome,
+                provider_receipt,
+            } => Some(request(
+                json!({"operation":"complete_action","operation_id":operation_id,"action_id":action_id,"target":target,"plan_digest":digest,"permit":permit,"outcome":outcome,"provider_receipt":provider_receipt}),
+                "complete",
+            )),
+            Stage::ReadyToExecute { .. }
+            | Stage::Finished { .. }
+            | Stage::RecoveryRequired
+            | Stage::Cancelled => None,
+        })
+    }
+
+    /// Advance only on a matching, explicit result; transport failures and
+    /// unknown native outcomes must be handled as recovery, never as replay.
+    pub fn accept_reply(&mut self, reply: Value) -> Result<(), &'static str> {
+        let status = reply
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or("invalid_reply")?;
+        match self.stage.clone() {
+            Stage::Planning => {
+                if status != "planned"
+                    || reply.get("operation_id").and_then(Value::as_str)
+                        != Some(self.request.operation_id.as_str())
+                    || reply.get("action_id").and_then(Value::as_str)
+                        != Some(self.request.action_id.as_str())
+                    || reply.get("target")
+                        != serde_json::to_value(&self.request.target).ok().as_ref()
+                {
+                    return Err("invalid_reply");
+                }
+                self.accept_plan(reply.get("plan").cloned().ok_or("invalid_reply")?)
+            }
+            Stage::AwaitingPermit { digest, .. } => {
+                if status != "succeeded"
+                    || reply.get("operation_id").and_then(Value::as_str)
+                        != Some(self.request.operation_id.as_str())
+                    || reply.get("target")
+                        != serde_json::to_value(&self.request.target).ok().as_ref()
+                {
+                    return Err("permit_denied");
+                }
+                let permit = reply
+                    .get("permit")
+                    .and_then(Value::as_str)
+                    .ok_or("invalid_reply")?
+                    .to_owned();
+                let target = self.request.target.clone();
+                let id = self.request.operation_id.clone();
+                self.accept_permit(&id, &target, &digest, permit)
+            }
+            Stage::AwaitingConsume { digest, permit, .. } => {
+                if status != "succeeded"
+                    || reply.get("operation_id").and_then(Value::as_str)
+                        != Some(self.request.operation_id.as_str())
+                    || reply.get("target")
+                        != serde_json::to_value(&self.request.target).ok().as_ref()
+                    || reply.get("plan_digest").and_then(Value::as_str) != Some(digest.as_str())
+                {
+                    return Err("permit_denied");
+                }
+                let target = self.request.target.clone();
+                let id = self.request.operation_id.clone();
+                self.confirm_consume(&id, &target, &digest, &permit)
+            }
+            Stage::Running { .. } | Stage::ProviderPending { .. } => {
+                let receipt = reply.get("receipt").cloned().ok_or("invalid_reply")?;
+                match status {
+                    "pending" => self.provider_pending(receipt),
+                    "succeeded" => self.provider_result(Outcome::Succeeded, receipt),
+                    "failed" if reply.get("cleanup_complete") == Some(&Value::Bool(true)) => {
+                        self.provider_result(Outcome::Failed, receipt)
+                    }
+                    "failed" | "recovery_required" => {
+                        self.provider_result(Outcome::RecoveryRequired, receipt)
+                    }
+                    _ => Err("invalid_reply"),
+                }
+            }
+            Stage::Completing { .. } => {
+                if status != "succeeded"
+                    || reply.get("operation_id").and_then(Value::as_str)
+                        != Some(self.request.operation_id.as_str())
+                {
+                    return Err("completion_unknown");
+                }
+                self.confirm_completion()
+            }
+            _ => Err("invalid_phase"),
+        }
+    }
+
+    pub fn provider_pending(&mut self, receipt: Value) -> Result<(), &'static str> {
+        let (Stage::Running {
+            plan,
+            digest,
+            permit,
+        }
+        | Stage::ProviderPending {
+            plan,
+            digest,
+            permit,
+            ..
+        }) = &self.stage
+        else {
+            return Err("invalid_phase");
+        };
+        if serde_json::to_vec(&receipt).map_or(true, |bytes| bytes.len() > 2_000) {
+            self.stage = Stage::RecoveryRequired;
+            return Err("receipt_too_large");
+        }
+        self.stage = Stage::ProviderPending {
+            plan: plan.clone(),
+            digest: digest.clone(),
+            permit: permit.clone(),
+            provider_receipt: receipt,
+        };
+        Ok(())
     }
     pub fn provider_result(
         &mut self,
         outcome: Outcome,
         receipt: Value,
     ) -> Result<(), &'static str> {
-        let Stage::Running { digest, permit } = &self.stage else {
+        let (Stage::Running { digest, permit, .. } | Stage::ProviderPending { digest, permit, .. }) =
+            &self.stage
+        else {
             return Err("invalid_phase");
         };
         if serde_json::to_vec(&receipt).map_or(true, |bytes| bytes.len() > 2_000) {
@@ -222,6 +424,7 @@ impl Dispatch {
                 | Stage::AwaitingConsume { .. }
                 | Stage::ReadyToExecute { .. }
                 | Stage::Running { .. }
+                | Stage::ProviderPending { .. }
                 | Stage::Completing { .. }
         ) {
             self.stage = Stage::RecoveryRequired;
@@ -348,5 +551,45 @@ mod tests {
         operation.fence_after_restart();
         assert_eq!(operation.stage, Stage::RecoveryRequired);
         assert!(operation.begin_effect().is_err());
+    }
+    #[test]
+    fn broker_wire_requires_explicit_permit_and_completion() {
+        let mut operation = fixture();
+        let target = serde_json::to_value(&operation.request.target).unwrap();
+        assert!(matches!(
+            operation.broker_call().unwrap(),
+            Some(amaterasu_module_sdk::Command::CallApi { .. })
+        ));
+        operation.accept_reply(json!({"status":"planned","operation_id":"e:1","action_id":"example/action","target":target,"plan":{"mutation_domains":[]}})).unwrap();
+        let Stage::AwaitingPermit { digest, .. } = &operation.stage else {
+            panic!()
+        };
+        let digest = digest.clone();
+        operation.accept_reply(json!({"status":"succeeded","operation_id":"e:1","target":target,"permit":"opaque"})).unwrap();
+        assert!(operation.accept_reply(json!({"status":"succeeded","operation_id":"e:1","target":target,"plan_digest":"wrong"})).is_err());
+        operation.accept_reply(json!({"status":"succeeded","operation_id":"e:1","target":target,"plan_digest":digest})).unwrap();
+        assert!(operation.broker_call().unwrap().is_none());
+        operation.begin_effect().unwrap();
+        assert!(matches!(
+            operation.broker_call().unwrap(),
+            Some(amaterasu_module_sdk::Command::CallApi { .. })
+        ));
+        operation
+            .accept_reply(json!({"status":"succeeded","receipt":{"id":"r"}}))
+            .unwrap();
+        assert!(matches!(
+            operation.broker_call().unwrap(),
+            Some(amaterasu_module_sdk::Command::Request { .. })
+        ));
+        operation
+            .accept_reply(json!({"status":"succeeded","operation_id":"e:1"}))
+            .unwrap();
+        assert!(matches!(
+            operation.stage,
+            Stage::Finished {
+                outcome: Outcome::Succeeded,
+                ..
+            }
+        ));
     }
 }
