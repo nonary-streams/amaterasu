@@ -1,4 +1,4 @@
-//! Coordinator-owned selection for standalone v2 finalization.
+//! Coordinator-owned selection and planning for v2 finalization.
 //!
 //! A selected policy or serialized output never grants authority. The scheduler
 //! must persist this snapshot and acquire fresh finalization rights before any
@@ -28,8 +28,8 @@ fn approval_for(
     Ok(matches[0].clone())
 }
 
-/// Build only the single-owner, no-dependent-control selection. Broader graphs
-/// require the control/settlement sequencer and are intentionally rejected here.
+/// Select one owner from the frozen graph. Composed graphs additionally require
+/// a completed, authenticated control and owner-acknowledgement chain.
 pub(super) fn standalone_selection(
     journal: &Journal,
     settings: &LifecycleSettings,
@@ -54,32 +54,37 @@ pub(super) fn standalone_selection(
         .provider_graph
         .as_ref()
         .ok_or("provider_dependency_graph_missing")?;
-    if graph.order.len() != 1
-        || graph.dependencies.len() != 1
-        || graph
-            .dependencies
-            .get(&graph.order[0])
-            .is_none_or(|deps| !deps.is_empty())
-    {
-        return Err("standalone_graph_required".into());
+    if graph.order.is_empty() || graph.order != work.providers {
+        return Err("finalize_graph_incomplete".into());
     }
-    let owner = &graph.order[0];
-    if settings
-        .control_policies
-        .iter()
-        .any(|policy| policy.owner_provider == *owner)
+    if graph.order.len() > 1
+        && (work.index < work.providers.len()
+            || graph.order.iter().any(|provider| {
+                work.states.get(provider).is_none_or(|state| {
+                    state.phase != crate::prepare_driver::PreparePhase::Prepared
+                })
+            }))
     {
-        return Err("dependent_controls_require_sequencing".into());
+        return Err("finalize_graph_incomplete".into());
     }
     let policies: Vec<_> = settings
         .finalize_policies
         .iter()
-        .filter(|policy| policy.owner_provider == *owner)
+        .filter(|policy| graph.order.contains(&policy.owner_provider))
         .collect();
     if policies.len() != 1 {
         return Err("finalize_policy_ambiguous".into());
     }
     let policy = policies[0];
+    let owner = &policy.owner_provider;
+    if graph.order.len() == 1
+        && settings
+            .control_policies
+            .iter()
+            .any(|policy| policy.owner_provider == *owner)
+    {
+        return Err("dependent_controls_require_sequencing".into());
+    }
     let selection = selections.get(owner).ok_or("finalize_owner_unavailable")?;
     let selected = OutputSelection {
         producer: owner.clone(),
@@ -121,7 +126,25 @@ pub(super) fn standalone_selection(
     } else {
         None
     };
-    let output = stage.as_ref().map_or(&input.output, |stage| &stage.after);
+    let snapshot = FinalizeSelectionSnapshot {
+        target: work.target.clone(),
+        parent_generation: Some(session.generation),
+        transition_id: work.transition_id.clone(),
+        input,
+        stage,
+        policy: policy.clone(),
+        finalize_approval: approval_for(selection, &policy.method)?,
+        finalize_status_approval: approval_for(selection, &policy.status_method)?,
+        schema_documents: settings.schema_documents.clone(),
+    };
+    if !snapshot.validate_structure() {
+        return Err("invalid_finalize_selection".into());
+    }
+    let output = if graph.order.len() > 1 {
+        super::composition_finalize::resolve_control_chain(journal, work, &snapshot)?.0
+    } else {
+        snapshot.current_output().clone()
+    };
     if require_current {
         let observed = journal
             .authority
@@ -163,20 +186,6 @@ pub(super) fn standalone_selection(
                 return Err("finalize_domain_stale".into());
             }
         }
-    }
-    let snapshot = FinalizeSelectionSnapshot {
-        target: work.target.clone(),
-        parent_generation: Some(session.generation),
-        transition_id: work.transition_id.clone(),
-        input,
-        stage,
-        policy: policy.clone(),
-        finalize_approval: approval_for(selection, &policy.method)?,
-        finalize_status_approval: approval_for(selection, &policy.status_method)?,
-        schema_documents: settings.schema_documents.clone(),
-    };
-    if !snapshot.validate_structure() {
-        return Err("invalid_finalize_selection".into());
     }
     Ok(snapshot)
 }
@@ -246,6 +255,15 @@ impl Coordinator {
             work,
             false,
         )?;
+        let (output, controls) = if work.providers.len() > 1 {
+            super::composition_finalize::resolve_control_chain(
+                &self.shared.borrow().value,
+                work,
+                &snapshot,
+            )?
+        } else {
+            (snapshot.current_output().clone(), vec![])
+        };
         let settings = self.effective_settings(work)?;
         let participant = settings
             .participants
@@ -287,8 +305,8 @@ impl Coordinator {
             plan_revision: None,
             admission_id: None,
             approved_plan: None,
-            dependency_inputs: vec![snapshot.current_output().clone()],
-            control_results: vec![],
+            dependency_inputs: vec![output],
+            control_results: controls,
         };
         amaterasu_extension_api::validate_provider_request(&request)?;
         let owner_plan = crate::prepare_driver::PrepareState {
@@ -316,19 +334,25 @@ impl Coordinator {
             .ok_or("transition_no_longer_active")?;
         if current.transition_id != work.transition_id
             || current.target != work.target
-            || current.composition_progress.is_some()
+            || current
+                .composition_progress
+                .as_ref()
+                .is_some_and(|progress| progress.finalize.is_some())
         {
             return Err("finalization_changed".into());
         }
-        current.composition_progress = Some(super::composition_progress::CompositionProgress {
-            inputs: vec![snapshot.input.clone()],
-            selections: vec![],
-            controls: vec![],
-            finalize: Some(super::composition_progress::FinalizeProgress {
-                selection: snapshot,
-                owner_plan,
-                dispatch: None,
-            }),
+        let progress = current.composition_progress.get_or_insert_with(|| {
+            super::composition_progress::CompositionProgress {
+                inputs: vec![snapshot.input.clone()],
+                selections: vec![],
+                controls: vec![],
+                finalize: None,
+            }
+        });
+        progress.finalize = Some(super::composition_progress::FinalizeProgress {
+            selection: snapshot,
+            owner_plan,
+            dispatch: None,
         });
         save(&self.shared, next)
     }
@@ -360,9 +384,18 @@ impl Coordinator {
             work,
             false,
         )?;
+        let (output, controls) = if work.providers.len() > 1 {
+            super::composition_finalize::resolve_control_chain(
+                &self.shared.borrow().value,
+                work,
+                &current,
+            )?
+        } else {
+            (current.current_output().clone(), vec![])
+        };
         if current != finalize.selection
-            || finalize.owner_plan.request.dependency_inputs != [current.current_output().clone()]
-            || !finalize.owner_plan.request.control_results.is_empty()
+            || finalize.owner_plan.request.dependency_inputs != [output]
+            || finalize.owner_plan.request.control_results != controls
         {
             return Err("finalize_selection_changed".into());
         }
@@ -443,6 +476,20 @@ impl Coordinator {
         if selection != finalize.selection {
             return Err("finalize_selection_changed".into());
         }
+        let (output, controls) = if work.providers.len() > 1 {
+            super::composition_finalize::resolve_control_chain(
+                &self.shared.borrow().value,
+                work,
+                &selection,
+            )?
+        } else {
+            (selection.current_output().clone(), vec![])
+        };
+        if finalize.owner_plan.request.dependency_inputs != [output.clone()]
+            || finalize.owner_plan.request.control_results != controls
+        {
+            return Err("finalize_inputs_changed".into());
+        }
         let plan = finalize
             .owner_plan
             .plan
@@ -467,8 +514,8 @@ impl Coordinator {
             .ok_or("finalize_admission_missing")?;
         let context = crate::prepare_authority::FinalizeContext {
             policy: selection.policy.clone(),
-            output: selection.current_output().clone(),
-            control_results: vec![],
+            output: output.clone(),
+            control_results: controls.clone(),
             target: work.target.clone(),
             transition_id: work.transition_id.clone(),
             parent_generation: selection.parent_generation,
@@ -487,8 +534,8 @@ impl Coordinator {
             operation_id: operation_id.clone(),
             provider_sequence: sequence,
             target: work.target.clone(),
-            output: selection.current_output().clone(),
-            control_results: vec![],
+            output,
+            control_results: controls,
             admission_id,
             permit_id: String::new(),
             remaining_ms: 30_000,
