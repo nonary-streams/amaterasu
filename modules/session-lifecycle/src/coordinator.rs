@@ -409,21 +409,21 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
             receipt.work.as_ref().is_some_and(|work| {
                 !observation_scheduler::validate_work_observations(journal, work)
                     || work.action_transfer.as_ref().is_some_and(|transfer| {
-                    transfer.snapshot.as_ref().is_some_and(|snapshot| {
-                        !action_endpoints::action_snapshot_matches(
-                            journal, receipt, work, transfer, snapshot,
-                        )
-                    }) || match transfer.stage {
-                        ActionTransferStage::CleanupPending => transfer.release_proof.is_some(),
-                        ActionTransferStage::ReplanRequired => {
-                            !action_release_proof::validate_replan_stage(
-                                journal, receipt, work, transfer,
+                        transfer.snapshot.as_ref().is_some_and(|snapshot| {
+                            !action_endpoints::action_snapshot_matches(
+                                journal, receipt, work, transfer, snapshot,
                             )
+                        }) || match transfer.stage {
+                            ActionTransferStage::CleanupPending => transfer.release_proof.is_some(),
+                            ActionTransferStage::ReplanRequired => {
+                                !action_release_proof::validate_replan_stage(
+                                    journal, receipt, work, transfer,
+                                )
+                            }
+                            // The rebind writer is not installed; do not accept a claimed stage.
+                            ActionTransferStage::Rebound => true,
                         }
-                        // The rebind writer is not installed; do not accept a claimed stage.
-                        ActionTransferStage::Rebound => true,
-                    }
-                })
+                    })
             })
         })
         || journal.sessions.values().any(|session| {
