@@ -195,6 +195,15 @@ impl NativeServices {
         if !self.permitted(caller, service, false) {
             return Err(denied());
         }
+        // A selected service has an explicit contract identity. A size and
+        // version alone cannot identify it, and provider legacy approvals do
+        // not authorize a consumer to omit its requested contract.
+        if contract.is_none() && matches!(self.selections.native.get(service), Some(Some(_))) {
+            return Err(Response::error(
+                "native_contract_mismatch",
+                "selected native services require a typed binding",
+            ));
+        }
         let mut registry = self.registry.lock().map_err(|_| unavailable())?;
         let factory =
             registry.factories.get(service).cloned().ok_or_else(|| {

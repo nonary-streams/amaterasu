@@ -24,6 +24,8 @@ provider advertises. Major versions match exactly. Native minor versions are a
 minimum; raw and API minors match exactly. API requirements also require an
 existing installed user API method approval for that exact version and consumer.
 The installed approval and runtime method/schema checks remain authoritative.
+Raw declarations cannot use a service reserved by installed API approvals,
+including when a raw requirement is optional or a route is disabled.
 
 A missing selection for an optional requirement yields an absence diagnostic and
 a disabled runtime entry. Required absence and any explicit invalid selection
@@ -36,8 +38,11 @@ The broker and native registry check the selected provider before registration;
 the native registry also checks the typed contract before reading its pointer.
 Legacy untyped native registration works for selected services only through its
 existing explicitly approved legacy contract mapping. There is no live provider
-replacement. A raw broker route has no runtime typed contract proof. Signed
-metadata describes provider claims; it does not prove implementation, native
+replacement. Consumers of a selected native service must use typed binding; a
+provider's legacy registration mapping is not a consumer contract mapping.
+Unselected services retain legacy untyped binding. A raw broker route has no
+runtime typed contract proof. Signed metadata describes provider claims; it does
+not prove implementation, native
 capabilities or delivery. Native bind negotiation still checks the contract,
 major/minor and table size, and a provider can fail to register or bind despite
 passing metadata validation. Native code is trusted, and grants are not a sandbox.

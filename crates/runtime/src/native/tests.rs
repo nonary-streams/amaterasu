@@ -500,3 +500,118 @@ fn startup_selection_checks_identity_before_reading_factory_and_keeps_disabled_c
     assert_eq!(context.binds.load(Ordering::SeqCst), 1);
     assert_eq!(context.releases.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn selected_native_binding_requires_contract_even_for_same_sized_families() {
+    use amaterasu_contracts::SelectedService;
+    // Distinct families can advertise exactly the same ABI prefix and size.
+    #[repr(C)]
+    struct OtherFamily {
+        base: NativeInterface,
+        context: *const Context,
+    }
+    assert_eq!(size_of::<Table>(), size_of::<OtherFamily>());
+    let grants = BTreeMap::from([
+        (
+            "provider".into(),
+            Grants {
+                native_provide: ["frames/1".into()].into(),
+                ..Default::default()
+            },
+        ),
+        (
+            "consumer".into(),
+            Grants {
+                native_use: ["frames/1".into()].into(),
+                ..Default::default()
+            },
+        ),
+    ]);
+    let selections = ServiceSelections {
+        native: [(
+            "frames/1".into(),
+            Some(SelectedService {
+                provider: "provider".into(),
+                contract: "example.frames/1".into(),
+            }),
+        )]
+        .into(),
+        ..Default::default()
+    };
+    // A provider-side legacy registration mapping is not consumer authorization.
+    let legacy = BTreeMap::from([(
+        "provider".into(),
+        BTreeMap::from([("frames/1".into(), "example.frames/1".into())]),
+    )]);
+    let services = NativeServices::with_selections(grants, legacy, selections);
+    let context = context(&services, false);
+    let descriptor = factory(&context);
+    assert!(matches!(
+        unsafe {
+            services.dispatch(
+                "provider",
+                Command::NativeRegister {
+                    service: "frames/1".into(),
+                    factory: &descriptor as *const _ as usize,
+                },
+            )
+        },
+        Response::Ok
+    ));
+    assert!(
+        matches!(unsafe { services.dispatch("consumer", query()) }, Response::Error { code, .. } if code == "native_contract_mismatch")
+    );
+    assert!(
+        matches!(unsafe { services.dispatch("consumer", Command::NativeBindTyped { service: "frames/1".into(), interface_major: 1, min_minor: 0, min_size: size_of::<OtherFamily>() as u32, contract: "example.other/1".into() }) }, Response::Error { code, .. } if code == "native_contract_mismatch")
+    );
+    assert_eq!(context.binds.load(Ordering::SeqCst), 0);
+    let result = unsafe {
+        services.dispatch(
+            "consumer",
+            Command::NativeBindTyped {
+                service: "frames/1".into(),
+                interface_major: 1,
+                min_minor: 0,
+                min_size: size_of::<Table>() as u32,
+                contract: "example.frames/1".into(),
+            },
+        )
+    };
+    let Response::NativeBound { binding, .. } = result else {
+        panic!("correct contract must bind")
+    };
+    assert!(matches!(
+        unsafe { services.dispatch("consumer", Command::NativeRelease { binding }) },
+        Response::Ok
+    ));
+    assert_eq!(context.binds.load(Ordering::SeqCst), 1);
+    assert_eq!(context.releases.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn unselected_native_service_retains_legacy_untyped_binding() {
+    let services = services();
+    let context = context(&services, false);
+    let descriptor = factory(&context);
+    assert!(matches!(
+        unsafe {
+            services.dispatch(
+                "provider",
+                Command::NativeRegisterTyped {
+                    service: "frames/1".into(),
+                    factory: &descriptor as *const _ as usize,
+                    contract: "example.frames/1".into(),
+                },
+            )
+        },
+        Response::Ok
+    ));
+    let Response::NativeBound { binding, .. } = (unsafe { services.dispatch("consumer", query()) })
+    else {
+        panic!("legacy untyped bind must remain available")
+    };
+    assert!(matches!(
+        unsafe { services.dispatch("consumer", Command::NativeRelease { binding }) },
+        Response::Ok
+    ));
+}

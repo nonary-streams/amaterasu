@@ -29,6 +29,7 @@ pub(super) fn resolve(
         }
         let mut offers = BTreeSet::new();
         for offer in &component.service_provides {
+            reject_raw_api_collision(offer.transport, &offer.service, runtime)?;
             validate_descriptor(
                 offer.transport,
                 &offer.service,
@@ -43,6 +44,7 @@ pub(super) fn resolve(
         }
         let mut requirements = BTreeSet::new();
         for requirement in &component.service_requires {
+            reject_raw_api_collision(requirement.transport, &requirement.service, runtime)?;
             validate_descriptor(
                 requirement.transport,
                 &requirement.service,
@@ -181,6 +183,24 @@ pub(super) fn resolve(
     }
     runtime.service_selections = selections;
     Ok(diagnostics)
+}
+
+fn reject_raw_api_collision(
+    transport: ServiceTransport,
+    service: &str,
+    runtime: &RuntimeConfig,
+) -> PackageResult<()> {
+    if transport == ServiceTransport::Raw
+        && runtime
+            .api_methods
+            .iter()
+            .any(|approval| approval.method.service == service)
+    {
+        return Err(format!(
+            "raw service {service} is reserved by installed API approvals"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_descriptor(

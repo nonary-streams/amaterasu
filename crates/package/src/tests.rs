@@ -555,3 +555,44 @@ fn optional_api_absence_preserves_approval_but_disables_its_route() {
         ServiceTransport::Api
     );
 }
+
+#[test]
+fn raw_service_declarations_cannot_collide_with_installed_api_routes() {
+    let mut package = service_selection_package(ServiceTransport::Api);
+    package.manifest.components[1].service_provides[0].transport = ServiceTransport::Raw;
+    package.manifest.components[1].service_provides[0].method = None;
+    package.manifest.components[2].service_requires[0].transport = ServiceTransport::Raw;
+    package.manifest.components[2].service_requires[0].method = None;
+    package.write_signed_manifest();
+    assert_rejected(package.verify(), "raw service example.echo/1 is reserved");
+
+    // Optional absence and an explicit disabled route must not mask a collision.
+    package.manifest.components[2].service_requires[0].optional = true;
+    package
+        .bootstrap
+        .policy
+        .service_selections
+        .broker
+        .insert("example.echo/1".into(), None);
+    package.write_signed_manifest();
+    assert_rejected(package.verify(), "raw service example.echo/1 is reserved");
+
+    // Offers and requirements are each checked independently.
+    package.manifest.components[1].service_provides.clear();
+    package.write_signed_manifest();
+    assert_rejected(package.verify(), "raw service example.echo/1 is reserved");
+    package.manifest.components[2].service_requires.clear();
+    package.manifest.components[1]
+        .service_provides
+        .push(ServiceOffer {
+            transport: ServiceTransport::Raw,
+            service: "example.echo/1".into(),
+            contract: "example.echo.contract/1".into(),
+            method: None,
+            major: 1,
+            minor: 2,
+            capabilities: Default::default(),
+        });
+    package.write_signed_manifest();
+    assert_rejected(package.verify(), "raw service example.echo/1 is reserved");
+}

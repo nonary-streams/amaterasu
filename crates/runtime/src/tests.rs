@@ -2196,3 +2196,74 @@ fn startup_broker_selection_cannot_override_installed_api_approval() {
     );
     assert!(Broker::new(config).is_err());
 }
+
+#[test]
+fn selected_api_approval_reserves_service_from_raw_registration_and_requests() {
+    let (mut config, method) = synthetic_api(ApiPrivilege::User);
+    config.service_selections.broker.insert(
+        method.service.clone(),
+        Some(SelectedService {
+            provider: "org.example.provider".into(),
+            contract: "org.example.paint.contract/1".into(),
+        }),
+    );
+    let mut broker = Broker::new(config).unwrap();
+    assert_error_code(
+        broker.dispatch(
+            "org.example.provider",
+            Command::Register {
+                service: method.service.clone(),
+            },
+        ),
+        "permission_denied",
+    );
+    assert_error_code(
+        broker.dispatch(
+            "org.example.client",
+            Command::Request {
+                service: method.service.clone(),
+                payload: json!({}),
+                timeout_ms: 1000,
+                operation_id: "raw-selection".into(),
+                parent: None,
+            },
+        ),
+        "permission_denied",
+    );
+    assert!(matches!(
+        broker.dispatch(
+            "org.example.provider",
+            Command::RegisterApi {
+                method: method.clone()
+            }
+        ),
+        Response::Ok
+    ));
+    let call = Command::CallApi {
+        service: method.service,
+        method: method.method,
+        interface_major: 1,
+        interface_minor: 2,
+        payload: json!({"size": 4}),
+        timeout_ms: 1000,
+        operation_id: "api-selection".into(),
+        parent: None,
+    };
+    let id = accepted_id(broker.dispatch("org.example.client", call));
+    assert!(
+        matches!(broker.dispatch("org.example.provider", Command::Poll {}), Response::Request { id: delivered, .. } if delivered == id)
+    );
+    assert!(matches!(
+        broker.dispatch(
+            "org.example.provider",
+            Command::Complete {
+                request: id,
+                payload: json!({"done": true})
+            }
+        ),
+        Response::Ok
+    ));
+    assert!(
+        matches!(broker.dispatch("org.example.client", Command::TakeResult { request: id }), Response::Result { payload } if payload == json!({"done": true}))
+    );
+}
