@@ -22,6 +22,13 @@ pub(super) fn allowed(session: &SessionRecord, caller: &str, initiator: &str) ->
     (session.owner.caller == caller && session.owner.initiator == initiator)
         || (caller == initiator && session.delegates.contains(caller))
 }
+
+fn require_unused_stream_id(session: &SessionRecord, stream_id: &str) -> ModuleResult<()> {
+    if session.streams.contains_key(stream_id) {
+        return Err("stream_identifier_collision".into());
+    }
+    Ok(())
+}
 pub(super) fn checked_target<'a>(
     journal: &'a Journal,
     target: &LifecycleTarget,
@@ -301,6 +308,7 @@ impl Coordinator {
                         return Err("invalid_video".into());
                     }
                     let stream_id = identifier()?;
+                    require_unused_stream_id(session, &stream_id)?;
                     current.target = LifecycleTarget::Stream {
                         host_epoch: next.host_epoch.clone(),
                         session_id: session_id.clone(),
@@ -584,6 +592,21 @@ impl Coordinator {
 #[cfg(test)]
 mod reprepare_tests {
     use super::*;
+
+    #[test]
+    fn existing_stream_identifier_cannot_be_replaced() {
+        let session: SessionRecord = serde_json::from_value(json!({
+            "host_epoch":"epoch", "id":"session", "generation":1, "phase":"paused",
+            "owner":{"caller":"caller","initiator":"client"}, "delegates":[],
+            "application_ref":null, "settings_revision":"one", "application_retired":false,
+            "streams":{"existing":{"generation":1,"phase":"retired","candidate":null,
+                "required":[],"acknowledgements":[],"retirements":[]}}
+        }))
+        .unwrap();
+        assert!(require_unused_stream_id(&session, "existing").is_err());
+        assert!(require_unused_stream_id(&session, "new").is_ok());
+        assert_eq!(session.streams.len(), 1);
+    }
 
     #[test]
     fn missing_removal_proof_fences_reprepare_without_changing_cursor() {
