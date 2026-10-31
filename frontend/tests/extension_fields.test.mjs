@@ -55,7 +55,7 @@ test("invalid numbers and unsupported schemas fail closed", () => {
 
 test("keybinding editor retains provider key identities and action parameters", () => {
   const { extensionKeybindingEditor } = editorEnvironment();
-  const binding = { id: "remove", enabled: true, source: "session_input", context: "stream", target: "current_session", propagation: "consume_trigger", action_id: "example/remove", arguments: { force: false }, trigger: { platform: "windows_scan", code: 30, extended: true }, modifiers: [{ platform: "linux_evdev", code: 29 }] };
+  const binding = { id: "remove", enabled: true, source: "session_input", context: "stream", target: "current_session", propagation: "consume_trigger", action_id: "example/remove", arguments: { force: false }, trigger: { platform: "windows_scan", code: 30, extended: true }, modifiers: [{ platform: "windows_scan", code: 29, extended: false }] };
   const editor = extensionKeybindingEditor(binding);
   assert.deepEqual(normalized(editor.value()), binding);
 });
@@ -69,4 +69,11 @@ test("tagged union renders and preserves the selected variant", () => {
   } };
   const editor = create(definition, { platform: "windows", code: 42, extended: true });
   assert.deepEqual(normalized(editor.value()), { platform: "windows", code: 42, extended: true });
+});
+
+
+test("keybinding rejects chords mixing provider encodings", () => {
+  const { extensionKeybindingEditor } = editorEnvironment();
+  const editor = extensionKeybindingEditor({ id: "x", enabled: true, source: "session_input", context: "stream", target: "current_session", propagation: "forward", action_id: "example/action", arguments: {}, trigger: { platform: "windows_scan", code: 30, extended: false }, modifiers: [{ platform: "linux_evdev", code: 29 }] });
+  assert.throws(() => editor.value(), /same key encoding/);
 });

@@ -202,13 +202,26 @@ namespace Amaterasu {
     group.append(field("Binding ID", id), el("label", "field", enabled, " Enabled"), field("Context", context),
       field("Source", source), field("Target", target), field("Propagation", propagation), field("Action ID", action),
       field("Action arguments (JSON object)", args), trigger.node, modifierContainer,
-      button("Add modifier", () => addModifier({ platform: "linux_evdev", code: 29 })));
+      button("Add modifier", () => {
+        const selected = trigger.value() as BindingKey;
+        addModifier(selected.platform === "windows_scan"
+          ? { platform: "windows_scan", code: 29, extended: false }
+          : selected.platform === "moonlight_vk"
+            ? { platform: "moonlight_vk", code: 17, normalized: true }
+            : { platform: "linux_evdev", code: 29 });
+      }));
     return { node: group, value: () => {
       let parsed: unknown;
       try { parsed = JSON.parse(args.value); } catch { throw new Error("Enter valid action arguments as a JSON object."); }
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("Action arguments must be a JSON object.");
+      const selectedTrigger = trigger.value() as BindingKey;
+      const selectedModifiers = modifiers.map((item) => item.value() as BindingKey);
+      if (selectedModifiers.some((modifier) => modifier.platform !== selectedTrigger.platform))
+        throw new Error("Trigger and modifiers must use the same key encoding.");
+      const keys = [selectedTrigger, ...selectedModifiers].map((key) => JSON.stringify(key));
+      if (new Set(keys).size !== keys.length) throw new Error("A chord cannot repeat a key.");
       return { id: id.value, enabled: enabled.checked, source: source.value, context: context.value,
-        trigger: trigger.value(), modifiers: modifiers.map((item) => item.value()), propagation: propagation.value,
+        trigger: selectedTrigger, modifiers: selectedModifiers, propagation: propagation.value,
         action_id: action.value, arguments: parsed, target: target.value };
     } };
   }
