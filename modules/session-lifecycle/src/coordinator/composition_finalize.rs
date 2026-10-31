@@ -179,13 +179,10 @@ fn resolve_chain(
         current = result.output.clone();
         results.push((**result).clone());
     }
-    // Each dependent callback must have consumed its own acknowledged controls.
+    // Every participant, including a no-op, must have an authenticated callback.
     for provider in &graph.order {
         let state = &work.states[provider];
         let plan = state.plan.as_ref().ok_or("composition_plan_missing")?;
-        if plan.control_proposals.is_empty() {
-            continue;
-        }
         let own: Vec<_> = progress
             .controls
             .iter()

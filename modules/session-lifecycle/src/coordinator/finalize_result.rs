@@ -35,7 +35,19 @@ pub(super) struct FinalizeResultRecord {
 impl FinalizeResultRecord {
     pub fn validate_control_chain(&self, journal: &super::Journal) -> bool {
         let Some(work) = &self.chain_work else {
-            return self.request.control_results.is_empty();
+            if !self.request.control_results.is_empty() {
+                return false;
+            }
+            return match super::operations::target_parts(&self.request.target) {
+                Ok((_, session_id, Some(stream_id), _)) => journal
+                    .sessions
+                    .get(session_id)
+                    .and_then(|session| session.streams.get(stream_id))
+                    .and_then(|stream| stream.provider_graph.as_ref())
+                    .is_some_and(|graph| graph.order.len() == 1),
+                Ok((_, _, None, _)) => true,
+                Err(_) => false,
+            };
         };
         let Ok((_, session_id, Some(stream_id), generation)) =
             super::operations::target_parts(&self.request.target)
@@ -146,7 +158,7 @@ impl FinalizeResultRecord {
             && request.target == selection.target
             && request.transition_id == selection.transition_id
             && if request.control_results.is_empty() {
-                self.chain_work.is_none() && request.output == *selection.current_output()
+                request.output == *selection.current_output()
             } else {
                 self.chain_work.is_some()
             }
@@ -256,7 +268,11 @@ pub(super) fn record_finalize_result(
     {
         return Err("finalize_context_mismatch".into());
     }
-    let chain_work = if dispatch.request.control_results.is_empty() {
+    let composed_graph = work
+        .provider_graph
+        .as_ref()
+        .is_some_and(|graph| graph.order.len() > 1);
+    let chain_work = if dispatch.request.control_results.is_empty() && !composed_graph {
         if dispatch.request.output != *selected.current_output() {
             return Err("finalize_output_mismatch".into());
         }
@@ -414,6 +430,29 @@ mod tests {
             pending_proof: None,
         }
     }
+    #[test]
+    fn zero_control_graph_snapshot_roundtrips_but_needs_canonical_evidence() {
+        let mut record = fixture();
+        let work: super::super::Work = serde_json::from_value(json!({
+            "phase":"stream.prepare", "target":record.request.target,
+            "intent":null, "reason":null, "video":null,
+            "transition_id":record.request.transition_id,
+            "providers":["owner","dependent"],
+            "provider_graph":{"order":["owner","dependent"],"dependencies":{"owner":[],"dependent":["owner"]}},
+            "index":2, "states":{}, "candidate":null, "waiting_retirement":false
+        })).unwrap();
+        record.chain_work = Some(Box::new(work));
+        assert!(record.validate_structure());
+        let recovered: FinalizeResultRecord =
+            serde_json::from_value(serde_json::to_value(record).unwrap()).unwrap();
+        assert!(recovered.chain_work.is_some());
+        let journal: super::super::Journal = serde_json::from_value(
+            json!({"version":3,"host_epoch":"epoch","receipts":{},"sessions":{}}),
+        )
+        .unwrap();
+        assert!(!recovered.validate_control_chain(&journal));
+    }
+
     #[test]
     fn control_result_requires_durable_chain_evidence() {
         let mut record = fixture();

@@ -220,9 +220,8 @@ fn verify(journal: &Journal, proof: &Proof) -> ModuleResult<()> {
     {
         return Err("release_finalize_provenance_invalid".into());
     }
-    // The original prepared work is retained with a nonempty settled control
-    // chain. Without it a no-op participant cannot be distinguished from an
-    // unrecorded callback, so unsupported histories remain fenced.
+    // The original prepared work must be retained even without controls. A
+    // missing callback is never evidence that a participant had no effect.
     let source = finalized
         .chain_work
         .as_ref()
