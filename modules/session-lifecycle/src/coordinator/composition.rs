@@ -54,13 +54,28 @@ impl CompositionBook {
     /// policy before relying on it after recovery. Stored observations are not
     /// evidence that a native resource remains present after restart.
     pub fn validate(&self, verify_schema: &impl Fn(&ResourceOutput) -> bool) -> bool {
+        self.validate_structure() && self.outputs.iter().all(|item| verify_schema(&item.output))
+    }
+
+    /// Structural checks do not authorize outputs or validate schema semantics.
+    pub fn validate_structure(&self) -> bool {
         self.outputs.len() <= MAX_OUTPUTS
             && self.outputs.iter().enumerate().all(|(index, item)| {
-                valid_stored(item, verify_schema)
+                valid_stored(item)
                     && !self.outputs[..index]
                         .iter()
                         .any(|old| same_key(&old.output, &item.output))
             })
+    }
+
+    pub fn records(&self) -> impl Iterator<Item = &StoredOutput> {
+        self.outputs.iter()
+    }
+
+    pub fn references_admission(&self, admission_id: &str) -> bool {
+        self.outputs
+            .iter()
+            .any(|item| item.admission_id == admission_id)
     }
 
     /// Verify the response against the exact selected producer and admitted
@@ -79,7 +94,8 @@ impl CompositionBook {
             || item.output.producer_service != selected.service
             || item.output.capability != selected.capability
             || item.output.schema != selected.schema
-            || !valid_stored(&item, verify_schema)
+            || !valid_stored(&item)
+            || !verify_schema(&item.output)
         {
             return Err("invalid_provider_output");
         }
@@ -193,7 +209,7 @@ fn same_key(a: &ResourceOutput, b: &ResourceOutput) -> bool {
 fn valid_text(value: &str) -> bool {
     !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
 }
-fn valid_stored(item: &StoredOutput, verify_schema: &impl Fn(&ResourceOutput) -> bool) -> bool {
+fn valid_stored(item: &StoredOutput) -> bool {
     let output = &item.output;
     if !valid_text(&item.admission_id)
         || !valid_text(&item.transition_id)
@@ -224,7 +240,6 @@ fn valid_stored(item: &StoredOutput, verify_schema: &impl Fn(&ResourceOutput) ->
         || output.resource.provider != output.producer
         || !output.data.is_object()
         || !serde_json::to_vec(output).is_ok_and(|v| v.len() <= MAX_BYTES)
-        || !verify_schema(output)
         || amaterasu_extension_api::validate_resource_plan(&item.plan).is_err()
     {
         return false;
@@ -412,5 +427,17 @@ mod tests {
             Err("provider_output_conflict")
         );
         assert!(book.inputs(&target(), &[selection(), selection()]).is_err());
+    }
+
+    #[test]
+    fn rejects_journal_output_without_admission_provenance() {
+        let mut book = CompositionBook::default();
+        book.record(record(), &selection(), &target(), &|_| true)
+            .unwrap();
+        let journal: super::super::Journal = serde_json::from_value(json!({
+            "version":3,"host_epoch":"epoch","receipts":{},"sessions":{},"composition":book
+        }))
+        .unwrap();
+        assert!(super::super::validate_journal(&journal).is_err());
     }
 }

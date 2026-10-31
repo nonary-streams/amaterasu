@@ -2,6 +2,8 @@
 mod action_endpoints;
 mod action_target;
 mod application;
+#[allow(dead_code)] // Admission and control remain disabled until schema verification is wired.
+mod composition;
 mod operations;
 mod provider_observations;
 mod providers;
@@ -258,6 +260,11 @@ struct Journal {
     input_boot_epochs: BTreeMap<String, String>,
     #[serde(default)]
     retention: retention::Retention,
+    #[serde(default)]
+    composition: composition::CompositionBook,
+    /// Immutable producing transition of each retained admission.
+    #[serde(default)]
+    admission_transitions: BTreeMap<String, String>,
 }
 
 struct SharedJournal {
@@ -294,6 +301,52 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
         || journal.receipts.len() > MAX_RECEIPTS
         || journal.sessions.len() > MAX_SESSIONS
         || !retention::validate(journal)
+        || journal.admission_transitions.len() > 128
+        || journal
+            .admission_transitions
+            .iter()
+            .any(|(id, transition)| {
+                !valid_id(id)
+                    || !valid_id(transition)
+                    || (!journal.authority.admissions.contains_key(id)
+                        && !journal.authority.settled.contains_key(id))
+            })
+        || !journal.composition.validate_structure()
+        || journal.composition.records().any(|record| {
+            let target = &record.output.origin;
+            let session_id = match target {
+                LifecycleTarget::Session { session_id, .. }
+                | LifecycleTarget::Stream { session_id, .. } => session_id,
+                LifecycleTarget::Validation { .. } => return true,
+            };
+            let Some(session) = journal.sessions.get(session_id) else {
+                return true;
+            };
+            let Some(admission) = journal
+                .authority
+                .admissions
+                .get(&record.admission_id)
+                .or_else(|| journal.authority.settled.get(&record.admission_id))
+            else {
+                return true;
+            };
+            !session.admission_ids.contains(&record.admission_id)
+                || session.admission_targets.get(&record.admission_id) != Some(target)
+                || admission.provider != record.output.producer
+                || admission.plan != record.plan
+                || journal.admission_transitions.get(&record.admission_id)
+                    != Some(&record.transition_id)
+                || !matches!(
+                    (target, session.admission_phases.get(&record.admission_id)),
+                    (
+                        LifecycleTarget::Session { .. },
+                        Some(LifecyclePhase::SessionPrepare)
+                    ) | (
+                        LifecycleTarget::Stream { .. },
+                        Some(LifecyclePhase::StreamPrepare)
+                    )
+                )
+        })
         || !journal.inputs.validate()
         || journal.actions.validate().is_err()
         || journal
@@ -350,6 +403,8 @@ impl Coordinator {
             recovery_sources: BTreeMap::new(),
             input_boot_epochs: BTreeMap::new(),
             retention: Default::default(),
+            composition: Default::default(),
+            admission_transitions: Default::default(),
         });
         validate_journal(&journal)?;
         journal.version = 3;
@@ -370,6 +425,7 @@ impl Coordinator {
             }
         }
         journal.inputs.recover_after_restart();
+        journal.composition.fence_after_restart();
         journal.input_bindings.clear();
         journal.input_boot_epochs.clear();
         journal.revoked_inputs.clear();

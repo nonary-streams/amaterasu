@@ -73,6 +73,12 @@ fn matches_target(target: &LifecycleTarget, session_id: &str, stream_id: Option<
         LifecycleTarget::Validation { .. } => false,
     }
 }
+fn has_composition_output(journal: &Journal, session_id: &str, stream_id: Option<&str>) -> bool {
+    journal
+        .composition
+        .records()
+        .any(|record| matches_target(&record.output.origin, session_id, stream_id))
+}
 fn unresolved_receipt(receipt: &Receipt, session_id: &str, stream_id: Option<&str>) -> bool {
     let matches = receipt
         .work
@@ -145,6 +151,7 @@ pub(super) fn compact(journal: &mut Journal) {
             .collect();
         for (id, epoch) in &sessions {
             if !journal.sessions[id].obligations.is_empty()
+                || has_composition_output(journal, id, None)
                 || !matches!(
                     journal.sessions[id].phase,
                     SessionPhase::Paused | SessionPhase::Ended
@@ -193,6 +200,7 @@ pub(super) fn compact(journal: &mut Journal) {
                     && session.obligations.is_empty()
                     && session.streams.is_empty()
                     && !journal.inputs.has_unresolved_session(epoch, id)
+                    && !has_composition_output(journal, id, None)
                     && !journal.actions.has_unresolved_session(epoch, id)
                     && !journal
                         .input_bindings
@@ -315,6 +323,22 @@ mod tests {
             },
         );
         key
+    }
+
+    #[test]
+    fn retained_output_fences_session_and_stream_compaction() {
+        let mut journal = journal();
+        for id in 0..40 {
+            insert_ended(&mut journal, id, "succeeded");
+        }
+        journal.composition = serde_json::from_value(json!({"outputs":[{
+            "output":{"output_id":"output","capability":"screen","schema":{"id":"schema","major":1,"minor":0,"digest":"a".repeat(64)},"producer":"provider","producer_service":"provider/1","origin":{"kind":"session","host_epoch":"epoch","session_id":"session-0","generation":1},"resource":{"provider":"provider","resource_id":"display","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":null},"data":{}},
+            "admission_id":"admission","transition_id":"transition","state":"retained",
+            "plan":{"plan_id":"plan","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]}
+        }]})).unwrap();
+        compact(&mut journal);
+        assert!(journal.sessions.contains_key("session-0"));
+        assert!(journal.sessions.len() <= KEEP_ENDED_SESSIONS + 1);
     }
 
     #[test]
