@@ -762,6 +762,69 @@ impl Pipeline {
                     "durable_recovery":false
                 }),
             ),
+            Operation::PreflightLibrary {
+                operation_id,
+                application,
+                revision,
+            } => {
+                if !self.records.current_epoch_operation(&operation_id) {
+                    return complete(send, request, error("stale_operation_epoch"));
+                }
+                let Some(route) = self
+                    .library_routes
+                    .get(&application.library)
+                    .filter(|route| {
+                        caller == initiator
+                            && route.callers.contains(caller)
+                            && route.policy_service.is_some()
+                    })
+                else {
+                    return complete(send, request, error("permission_denied"));
+                };
+                let selection = crate::library::Selection {
+                    application,
+                    revision,
+                    service: route.service.clone(),
+                };
+                if let Ok(record) = self.records.owned_operation(caller, &operation_id)
+                    && (record.library_selection.as_ref() != Some(&selection)
+                        || record.preflight_token.is_none())
+                {
+                    return complete(send, request, error("operation_conflict"));
+                }
+                match self.records.start(
+                    caller,
+                    initiator,
+                    operation_id,
+                    selection.application.id.clone(),
+                    CatalogSelection::Library,
+                    GlobalPreparation::default(),
+                ) {
+                    Ok((id, true)) => {
+                        let token = match random_display_admission_token() {
+                            Ok(token) => token,
+                            Err(code) => {
+                                self.records.values.remove(&id);
+                                return complete(send, request, error(code));
+                            }
+                        };
+                        let record = self.records.values.get_mut(&id).expect("preflight record");
+                        record.preflight_token = Some(token);
+                        record.library_selection = Some(selection);
+                        let mut workflow = Workflow::launch(id, request, remaining_ms);
+                        workflow.step = Step::Library;
+                        self.job = Some(workflow);
+                        Ok(())
+                    }
+                    Ok((id, false)) if self.records.values[&id].preflight_ready => complete(
+                        send,
+                        request,
+                        self.records.values[&id].library_preflight_response(),
+                    ),
+                    Ok(_) => complete(send, request, error("preflight_unavailable")),
+                    Err(code) => complete(send, request, error(code)),
+                }
+            }
             Operation::LaunchLibrary {
                 operation_id,
                 application,
@@ -781,7 +844,8 @@ impl Pipeline {
                 };
                 // A changed revision/reference cannot reuse an accepted operation.
                 if let Ok(record) = self.records.owned_operation(caller, &operation_id)
-                    && record.library_selection.as_ref() != Some(&selection)
+                    && (record.library_selection.as_ref() != Some(&selection)
+                        || record.preflight_token.is_some())
                 {
                     return complete(send, request, error("operation_conflict"));
                 }
@@ -1575,6 +1639,16 @@ impl Pipeline {
                     },
                 );
                 record.library_policy_revision = Some(revision);
+                if record.preflight_token.is_some() {
+                    record.preflight_deadline = Some(Instant::now() + Duration::from_secs(120));
+                    record.preflight_ready = true;
+                    let response = record.library_preflight_response();
+                    return complete(
+                        send,
+                        job.request.expect("library preflight request"),
+                        response,
+                    );
+                }
                 job.step = Step::CreateSession;
             }
             Step::Catalog => {

@@ -24,6 +24,7 @@ impl ManagedModule for LaunchModule {
             serde_json::from_value(payload).map_err(|_| "invalid launch settings")?;
         settings.validate().map_err(str::to_owned)?;
         let enable_library_launch = !settings.library_routes.is_empty();
+        let enable_library_preflight = settings.enable_library_preflight;
         let mut pipeline = Pipeline::new(settings.environment).map_err(str::to_owned)?;
         pipeline.set_retirement_observers(settings.retirement_observers);
         pipeline.set_provider_routes(settings.provider_routes);
@@ -34,6 +35,11 @@ impl ManagedModule for LaunchModule {
         if enable_library_launch {
             runtime.require_success(Command::Register {
                 service: amaterasu_module_sdk::application_library::v2::LAUNCH_SERVICE.into(),
+            })?;
+        }
+        if enable_library_preflight {
+            runtime.require_success(Command::Register {
+                service: amaterasu_module_sdk::application_library::preflight::SERVICE.into(),
             })?;
         }
         Ok(Self { runtime, pipeline })

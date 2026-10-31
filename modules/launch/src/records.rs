@@ -189,6 +189,11 @@ impl Record {
     pub fn response(&self) -> Value {
         json!({"ok":true,"launch":self})
     }
+    pub fn library_preflight_response(&self) -> Value {
+        json!({"ok":true,"preflight_token":self.preflight_token,
+            "policy_identity":self.library_policy_identity,"admission_capable":false,
+            "reason":"display_and_rtsp_preflight_unavailable"})
+    }
     pub fn preflight_response(&self) -> Value {
         json!({"ok":true,"preflight_token":self.preflight_token,"app_id":self.app_id,"catalog_revision":self.catalog_revision,"config_overrides":self.config_overrides.clone().unwrap_or_default(),"application_display_overrides":self.application_display_overrides,"application_display_settings":self.application_display_settings,"executable_path":self.executable_path,"cleanup_budget_ms":self.cleanup_budget_ms})
     }

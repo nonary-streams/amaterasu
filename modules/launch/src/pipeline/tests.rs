@@ -5392,3 +5392,128 @@ fn selected_policy_mismatch_fails_before_session_or_executor_effects() {
     assert!(!harness.generic_started);
     assert!(harness.preparations.is_empty());
 }
+
+#[test]
+fn library_preview_freezes_opaque_policy_without_admitting_session_or_display() {
+    let mut harness = Harness::new();
+    let mut pipeline = pipeline();
+    pipeline.set_library_routes(serde_json::from_value(json!({"games":{
+        "service":"selected.library/2","callers":["alice"],"executors":{"runner":"example.provider/1"},
+        "policy_service":"selected.policy/1","require_application_policy":true
+    }})).unwrap());
+    let operation = format!("ale1:{}:preview", pipeline.records.operation_epoch());
+    let request = json!({"action":"prepare","operation_id":operation,"application":{"library":"games","id":"opaque/game"},"entry_revision":"v1"});
+    let service = amaterasu_module_sdk::application_library::preflight::SERVICE;
+    let preview =
+        harness.request_service(&mut pipeline, service, "alice", "alice", request.clone());
+    assert_eq!(preview["ok"], true, "{preview}");
+    assert_eq!(preview["admission_capable"], false);
+    assert_eq!(preview["policy_identity"]["source"], "library");
+    assert_eq!(preview["policy_identity"]["entry_revision"], "v1");
+    assert_eq!(
+        preview["policy_identity"]["policy_revision"],
+        "policy:opaque-v1"
+    );
+    assert_eq!(preview["preflight_token"].as_str().unwrap().len(), 64);
+    assert!(harness.sessions.is_empty());
+    assert!(harness.preparations.is_empty());
+    assert!(!harness.generic_started);
+    assert_eq!(
+        harness.request_service(&mut pipeline, service, "alice", "alice", request.clone()),
+        preview
+    );
+    assert_eq!(
+        harness.request_service(&mut pipeline, service, "proxy", "alice", request.clone())["code"],
+        "permission_denied"
+    );
+    assert_eq!(
+        harness.request_service(
+            &mut pipeline,
+            service,
+            "mallory",
+            "mallory",
+            request.clone()
+        )["code"],
+        "permission_denied"
+    );
+    let mut changed = request.clone();
+    changed["entry_revision"] = json!("other");
+    assert_eq!(
+        harness.request_service(&mut pipeline, service, "alice", "alice", changed)["code"],
+        "operation_conflict"
+    );
+    let mut direct = selected_library_request(&operation);
+    assert_eq!(
+        harness.request_service(
+            &mut pipeline,
+            "amaterasu.launch/2",
+            "alice",
+            "alice",
+            direct.clone()
+        )["code"],
+        "operation_conflict"
+    );
+    direct["operation_id"] = json!("other");
+    assert_eq!(
+        harness.request_service(&mut pipeline, service, "alice", "alice", direct)["code"],
+        "invalid_request"
+    );
+    pipeline
+        .records
+        .values
+        .values_mut()
+        .next()
+        .unwrap()
+        .preflight_deadline = Some(Instant::now() - Duration::from_secs(1));
+    assert_eq!(
+        harness.request_service(&mut pipeline, service, "alice", "alice", request)["code"],
+        "operation_unconfirmed"
+    );
+}
+
+#[test]
+fn library_preview_requires_selected_policy_and_current_operation_epoch() {
+    let mut harness = Harness::new();
+    let mut pipeline = selected_library_pipeline();
+    let service = amaterasu_module_sdk::application_library::preflight::SERVICE;
+    let operation = format!("ale1:{}:preview", pipeline.records.operation_epoch());
+    let request = json!({"action":"prepare","operation_id":operation,"application":{"library":"games","id":"opaque/game"},"entry_revision":"v1"});
+    assert_eq!(
+        harness.request_service(&mut pipeline, service, "alice", "alice", request.clone())["code"],
+        "permission_denied"
+    );
+    let mut stale = request;
+    stale["operation_id"] = json!("ale1:stale:preview");
+    assert_eq!(
+        harness.request_service(&mut pipeline, service, "alice", "alice", stale)["code"],
+        "stale_operation_epoch"
+    );
+    assert!(harness.sessions.is_empty());
+}
+
+#[test]
+fn library_preview_rejects_stale_policy_before_effects() {
+    let mut harness = Harness::new();
+    harness.policy_reply = Some(
+        json!({"ok":true,"policy":{"application":{"library":"games","id":"opaque/game"},
+        "entry_revision":"outdated","policy_revision":"policy","preparation":[]}}),
+    );
+    let mut pipeline = pipeline();
+    pipeline.set_library_routes(serde_json::from_value(json!({"games":{
+        "service":"selected.library/2","callers":["alice"],"executors":{"runner":"example.provider/1"},
+        "policy_service":"selected.policy/1","require_application_policy":true
+    }})).unwrap());
+    let operation = format!("ale1:{}:stale", pipeline.records.operation_epoch());
+    let result = harness.request_service(
+        &mut pipeline,
+        amaterasu_module_sdk::application_library::preflight::SERVICE,
+        "alice",
+        "alice",
+        json!({"action":"prepare","operation_id":operation,
+            "application":{"library":"games","id":"opaque/game"},"entry_revision":"v1"}),
+    );
+    assert_ne!(result["ok"], true);
+    assert!(harness.sessions.is_empty());
+    assert!(harness.preparations.is_empty());
+    assert!(!harness.generic_started);
+}
