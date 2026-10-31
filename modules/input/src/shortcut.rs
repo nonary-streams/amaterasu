@@ -3,7 +3,10 @@
 //! This state machine does not authorize actions or perform effects. The caller
 //! must stage a whole input batch against a cloned matcher, durably admit all
 //! intents together with the input receipt, and only then publish the clone.
-use crate::model::{Key, KeyState};
+use crate::model::{Event, Key, KeyState};
+use amaterasu_extension_api::{
+    BindingPropagation, BindingSource, BindingTarget, KeyIdentity, Keybinding,
+};
 use serde_json::Value;
 
 const MAX_BINDINGS: usize = 128;
@@ -11,7 +14,9 @@ const MAX_CHORD_KEYS: usize = 8;
 const MAX_HELD_KEYS: usize = 128;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Binding {
+struct Binding {
+    pub binding_id: String,
+    pub target: BindingTarget,
     pub trigger: Key,
     pub modifiers: Vec<Key>,
     pub action_id: String,
@@ -21,6 +26,8 @@ pub struct Binding {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Intent {
+    pub binding_id: String,
+    pub target: BindingTarget,
     pub action_id: String,
     pub arguments: Value,
 }
@@ -45,8 +52,53 @@ pub struct Matcher {
 }
 
 impl Matcher {
+    /// Select already-approved bindings for one source/context. This does not
+    /// grant authority: the caller must authenticate the source and validate
+    /// the action descriptor and arguments before supplying these bindings.
+    pub fn replace_approved_bindings(
+        &mut self,
+        bindings: &[Keybinding],
+        source: BindingSource,
+        context: &str,
+    ) -> Result<(), &'static str> {
+        let mut selected = Vec::new();
+        for binding in bindings.iter().filter(|binding| {
+            binding.enabled && binding.source == source && binding.context == context
+        }) {
+            if source == BindingSource::SessionInput && binding.target == BindingTarget::Host {
+                return Err("remote input cannot target host actions");
+            }
+            let trigger = key_identity(&binding.trigger);
+            let modifiers: Vec<Key> = binding.modifiers.iter().map(key_identity).collect();
+            if std::iter::once(&trigger).chain(&modifiers).any(|key| {
+                Event::Key {
+                    key: key.clone(),
+                    state: KeyState::Down,
+                }
+                .validate()
+                .is_err()
+            }) || modifiers
+                .iter()
+                .any(|key| key.encoding() != trigger.encoding())
+            {
+                return Err("unsupported shortcut key identity");
+            }
+            selected.push(Binding {
+                binding_id: binding.id.clone(),
+                target: binding.target.clone(),
+                trigger,
+                modifiers,
+                action_id: binding.action_id.clone(),
+                arguments: serde_json::to_value(&binding.arguments)
+                    .map_err(|_| "invalid action arguments")?,
+                consume: binding.propagation == BindingPropagation::ConsumeTrigger,
+            });
+        }
+        self.replace_bindings(selected)
+    }
+
     /// Replace bindings only after validating the entire proposed set.
-    pub fn replace_bindings(&mut self, bindings: Vec<Binding>) -> Result<(), &'static str> {
+    fn replace_bindings(&mut self, bindings: Vec<Binding>) -> Result<(), &'static str> {
         if bindings.len() > MAX_BINDINGS {
             return Err("too many shortcut bindings");
         }
@@ -125,6 +177,8 @@ impl Matcher {
                     };
                     admit(
                         &Intent {
+                            binding_id: binding.binding_id.clone(),
+                            target: binding.target.clone(),
                             action_id: binding.action_id.clone(),
                             arguments: binding.arguments.clone(),
                         },
@@ -173,6 +227,22 @@ pub enum EdgeError<E> {
     Admission(E),
 }
 
+fn key_identity(identity: &KeyIdentity) -> Key {
+    match identity {
+        KeyIdentity::LinuxEvdev { code } => Key::LinuxEvdev { code: *code },
+        KeyIdentity::WindowsScan { code, extended } => Key::WindowsScan {
+            code: *code,
+            extended: *extended,
+        },
+        KeyIdentity::MoonlightVk { code, normalized } => Key::MoonlightVk {
+            code: *code,
+            normalized: *normalized,
+            repeat_modifiers: 0,
+            temporary_modifier: false,
+        },
+    }
+}
+
 fn same_key(a: &Key, b: &Key) -> bool {
     match (a, b) {
         (
@@ -212,6 +282,8 @@ mod tests {
     }
     fn binding() -> Binding {
         Binding {
+            binding_id: "binding".into(),
+            target: BindingTarget::CurrentSession,
             trigger: key(2),
             modifiers: vec![key(1)],
             action_id: "test/remove".into(),
@@ -222,6 +294,43 @@ mod tests {
     fn edge(m: &mut Matcher, key: u16, state: KeyState) -> Disposition {
         m.edge(&self::key(key), state, |_, _| Ok::<_, ()>(()))
             .unwrap()
+    }
+
+    #[test]
+    fn approved_session_binding_rejects_host_scope_and_preserves_intent_identity() {
+        let mut matcher = Matcher::default();
+        let mut binding = Keybinding {
+            id: "remove-binding".into(),
+            enabled: true,
+            source: BindingSource::SessionInput,
+            context: "game".into(),
+            trigger: KeyIdentity::LinuxEvdev { code: 2 },
+            modifiers: vec![KeyIdentity::LinuxEvdev { code: 1 }],
+            propagation: BindingPropagation::ConsumeTrigger,
+            action_id: "test/remove".into(),
+            arguments: Default::default(),
+            target: BindingTarget::Host,
+        };
+        assert!(
+            matcher
+                .replace_approved_bindings(&[binding.clone()], BindingSource::SessionInput, "game")
+                .is_err()
+        );
+        binding.target = BindingTarget::CurrentSession;
+        matcher
+            .replace_approved_bindings(&[binding], BindingSource::SessionInput, "game")
+            .unwrap();
+        edge(&mut matcher, 1, KeyState::Down);
+        let mut intent = None;
+        matcher
+            .edge(&key(2), KeyState::Down, |value, _| {
+                intent = Some(value.clone());
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        let intent = intent.unwrap();
+        assert_eq!(intent.binding_id, "remove-binding");
+        assert_eq!(intent.target, BindingTarget::CurrentSession);
     }
 
     #[test]
