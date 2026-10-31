@@ -14,7 +14,7 @@ def selection(provider, revision, methods):
                   "settings_validate": policy.method_ref(provider, "settings_validate"),
                   "options": [{"id": "enabled", "definition": {"type": "boolean", "default": False}}]}
     component = {"id": provider, "runtime": False, "requires": {"amaterasu.runtime": "0.1.0"},
-                 "requested": {"provide": [service], "call": []}}
+                 "requested": {"provide": [service], "call": sorted(check.PROVIDER_CALLS[provider])}}
     approvals = [{"provider": provider, "callers": ["untrusted"], "method": {
         "service": service, "method": name, "interface_major": 2, "interface_minor": 0, "privilege": "user",
         "request": {"required": {}, "optional": {}, "allow_extra": False},

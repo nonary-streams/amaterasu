@@ -18,7 +18,7 @@ class CompositionPreflightTest(unittest.TestCase):
                                                  "interface_major": 2, "interface_minor": 0, "schema_revision": 1},
                            "options": [{"id": "enabled", "definition": {"type": "boolean", "default": False}}]}
         self.component = {"id": self.provider, "runtime": False, "requires": {"amaterasu.runtime": "0.1.0"},
-                          "requested": {"provide": [service], "call": []}}
+                          "requested": {"provide": [service], "call": sorted(check.PROVIDER_CALLS[self.provider])}}
         self.approvals = [{"provider": self.provider, "method": {"service": service, "method": name,
                           "interface_major": 2, "interface_minor": 0, "privilege": "user",
                           "request": {"required": {}, "optional": {}, "allow_extra": False},
@@ -38,6 +38,11 @@ class CompositionPreflightTest(unittest.TestCase):
         self.component["requested"]["provide"] = [self.provider + "/2"]
         self.descriptor["options"][0]["definition"]["default"] = True
         with self.assertRaisesRegex(ValueError, "start disabled"):
+            self.check()
+
+    def test_unapproved_service_calls_fail(self):
+        self.component["requested"]["call"].append("unexpected.service/1")
+        with self.assertRaisesRegex(ValueError, "unexpected service calls"):
             self.check()
 
     def test_missing_extra_and_duplicate_approval_fail(self):

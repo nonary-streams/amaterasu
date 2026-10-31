@@ -24,6 +24,10 @@ DISPLAY_METHODS = {"settings_validate", "resource_plan", "lifecycle_callback", "
 OWNER_METHODS = {"settings_validate", "resource_plan", "lifecycle_callback", "lifecycle_status",
                  "binding_validate", "resource_control", "resource_finalize", "resource_status",
                  "action_plan", "action_execute", "action_status"}
+PROVIDER_CALLS = {
+    DISPLAY: {"amaterasu.session-lifecycle/1"},
+    OWNER: {"amaterasu.state/1", "amaterasu.session-lifecycle/1", "amaterasu.virtual-display/1"},
+}
 FIELD_KINDS = {"any", "null", "boolean", "integer", "number", "string", "array", "object"}
 
 
@@ -62,6 +66,9 @@ def check_provider(descriptor: dict, component: dict, approvals: list, provider:
     requested = component.get("requested")
     if not isinstance(requested, dict) or requested.get("provide") != [service]:
         raise ValueError("provider must request exactly its selected v2 service")
+    calls = requested.get("call", [])
+    if not isinstance(calls, list) or any(not isinstance(call, str) for call in calls) or len(calls) != len(set(calls)) or set(calls) != PROVIDER_CALLS[provider]:
+        raise ValueError("provider requested unexpected service calls")
     if not isinstance(component.get("requires"), dict) or "amaterasu.runtime" not in component["requires"]:
         raise ValueError("provider must declare a runtime dependency")
     method = descriptor.get("settings_validate")
