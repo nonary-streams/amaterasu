@@ -731,6 +731,42 @@ impl Coordinator {
                     {
                         return Err("control_input_changed".into());
                     }
+                    // A delegated control may retire only the canonical parent
+                    // borrow and the stream currently being prepared. Other
+                    // owner streams must already be retired before mutation.
+                    if session.streams.values().all(|stream| {
+                        stream.binding_owner != *owner
+                            || stream.phase == StreamPhase::Retired
+                            || (stream.phase == StreamPhase::Quiescing
+                                && stream.retirements == stream.required)
+                    }) {
+                        if matches!(&output.origin, LifecycleTarget::Session { host_epoch, session_id, generation }
+                            if host_epoch == &session.host_epoch && session_id == &session.id && *generation == session.generation)
+                            && output.domain_observations.iter().any(|observation| {
+                                observation.complete
+                                    && observation.borrowers.get(&session.id)
+                                        == Some(&session.generation)
+                            })
+                        {
+                            selected.authorized_borrowers.insert(session.id.clone());
+                        }
+                        if let LifecycleTarget::Stream {
+                            stream_id,
+                            generation,
+                            ..
+                        } = &work.target
+                            && session.streams.get(stream_id).is_some_and(|stream| {
+                                stream.generation == *generation
+                                    && stream.phase == StreamPhase::Preparing
+                            })
+                            && output.domain_observations.iter().any(|observation| {
+                                observation.complete
+                                    && observation.borrowers.get(stream_id) == Some(generation)
+                            })
+                        {
+                            selected.authorized_borrowers.insert(stream_id.clone());
+                        }
+                    }
                     selected.approved_control_bindings.push(
                         crate::plan_validation::ApprovedControlBinding {
                             policy: policy.clone(),
