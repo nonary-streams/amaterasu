@@ -48,6 +48,13 @@ revocation, retirement, failed cleanup and host epoch changes fence admission;
 existing owned work must still be drained through the existing retirement path.
 An input bridge must recheck these conditions at its own final effect boundary.
 
+Lifecycle fencing follows NVHTTP's revocation and cleanup asynchronously. The
+binding response alone cannot prove that the certificate and its launch grant
+are still current at the instant of an input effect. Source-scoped extension
+effects must remain disabled until a trusted protocol-owned live authorization
+check or an acknowledged cross-service revocation barrier closes that interval.
+Neither the source ID nor repeated lifecycle validation supplies that proof.
+
 This profile does not authenticate arbitrary payloads from clients, change
 `paired_client` settings resolution, or establish real hardware or transport
 support. Native modules remain trusted OS code; grants are not a sandbox.
