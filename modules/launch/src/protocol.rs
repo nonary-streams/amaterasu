@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 
 const MAX_PREPARATION_STEPS: usize = 8;
 const MAX_RAW_PREPARATION_COMMAND_BYTES: usize = 2_048;
-const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 10_000;
+#[cfg(test)]
+const DEFAULT_COMMAND_TIMEOUT_MS: u64 =
+    amaterasu_module_sdk::application_library::policy::DEFAULT_COMMAND_TIMEOUT_MS;
 const MAX_COMMAND_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_AUTO_DETACH: bool = true;
 const DEFAULT_WAIT_ALL: bool = true;
@@ -469,13 +471,9 @@ pub enum CatalogLaunch {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PreparationStep {
-    pub run: ConfiguredCommand,
-    #[serde(default)]
-    pub undo: Option<ConfiguredCommand>,
-}
+pub use amaterasu_module_sdk::application_library::policy::{
+    CommandSpec as ConfiguredCommand, PreparationStep,
+};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -495,20 +493,6 @@ pub struct LegacyPreparationCommand {
 pub enum PlannedPreparationStep {
     Structured(PreparationStep),
     Legacy(LegacyPreparationCommand),
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConfiguredCommand {
-    pub executable: String,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub environment: BTreeMap<String, String>,
-    #[serde(default)]
-    pub cwd: Option<String>,
-    #[serde(default = "default_command_timeout_ms")]
-    pub timeout_ms: u64,
 }
 
 /// Catalog entries retain both the original string and the typed per-command form.
@@ -571,10 +555,6 @@ fn valid_detached_text(command: &str) -> bool {
     !command.is_empty()
         && command.len() <= MAX_DETACHED_COMMAND_BYTES
         && !command.chars().any(char::is_control)
-}
-
-fn default_command_timeout_ms() -> u64 {
-    DEFAULT_COMMAND_TIMEOUT_MS
 }
 
 pub(crate) const MAX_EXIT_TIMEOUT_SECONDS: u64 = 300;

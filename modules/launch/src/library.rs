@@ -12,6 +12,9 @@ pub struct Route {
     pub service: String,
     pub callers: BTreeSet<String>,
     pub executors: BTreeMap<String, String>,
+    /// Optional independently selected private policy resolver.
+    #[serde(default)]
+    pub policy_service: Option<String>,
     /// Policies are selected by the library-local application ID, never by an
     /// executor response. They are supplied by trusted startup composition.
     #[serde(default)]
@@ -59,6 +62,13 @@ pub fn validate_routes(routes: &BTreeMap<String, Route>) -> Result<(), &'static 
                         || service == crate::SERVICE
                 })
                 || route.application_policies.len() > 256
+                || route.policy_service.as_ref().is_some_and(|service| {
+                    service.strip_suffix("/1").is_none_or(|name| !key(name))
+                        || service == crate::SERVICE
+                        || service == &route.service
+                        || route.executors.values().any(|executor| executor == service)
+                        || !route.application_policies.is_empty()
+                })
                 || route.application_policies.iter().any(|(id, policy)| {
                     ApplicationReference {
                         library: name.clone(),
@@ -154,7 +164,7 @@ pub fn resolve_target(
         .target
         .validate_for(&selection.application.id, &selection.revision)?;
     let policy = route.application_policies.get(&selection.application.id);
-    if route.require_application_policy && policy.is_none() {
+    if route.require_application_policy && policy.is_none() && route.policy_service.is_none() {
         return Err("application_policy_unavailable");
     }
     if policy.is_some_and(|policy| policy.revision != selection.revision) {
@@ -198,6 +208,70 @@ pub fn resolve_target(
     ))
 }
 
+/// Apply only the exact response from the startup-selected resolver. Provider
+/// payloads cannot select an executor or inject an application identity.
+pub fn apply_policy(
+    selection: &Selection,
+    target: &mut crate::protocol::LaunchTarget,
+    payload: Value,
+) -> Result<String, &'static str> {
+    use amaterasu_module_sdk::application_library::policy::{
+        MAX_POLICY_BYTES, Request, ResolveAction, Snapshot,
+    };
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Reply {
+        ok: bool,
+        policy: Snapshot,
+    }
+    if !serde_json::to_vec(&payload).is_ok_and(|bytes| bytes.len() <= MAX_POLICY_BYTES) {
+        return Err("invalid_policy_response");
+    }
+    let reply: Reply = serde_json::from_value(payload).map_err(|_| "invalid_policy_response")?;
+    let request = Request {
+        action: ResolveAction::Resolve,
+        application: selection.application.clone(),
+        entry_revision: selection.revision.clone(),
+    };
+    if !reply.ok
+        || reply.policy.validate_for(&request).is_err()
+        || reply
+            .policy
+            .working_directory
+            .as_deref()
+            .is_some_and(|path| !crate::protocol::valid_native_path(path))
+        || !crate::protocol::valid_preparation(&reply.policy.preparation)
+    {
+        return Err("invalid_policy_response");
+    }
+    let crate::protocol::LaunchTarget::Provider {
+        preparation,
+        working_directory,
+        exit_timeout_seconds,
+        ..
+    } = target
+    else {
+        return Err("invalid_policy_target");
+    };
+    let steps = reply
+        .policy
+        .preparation
+        .into_iter()
+        .map(crate::protocol::PlannedPreparationStep::Structured)
+        .collect();
+    *preparation = crate::protocol::merge_preparation_plan(
+        &[],
+        &[],
+        steps,
+        vec![],
+        false,
+        reply.policy.working_directory.as_deref(),
+    )?;
+    *working_directory = reply.policy.working_directory;
+    *exit_timeout_seconds = reply.policy.exit_timeout_seconds;
+    Ok(reply.policy.policy_revision)
+}
+
 pub fn rejection_code(payload: &Value) -> &'static str {
     match payload.pointer("/error/code").and_then(Value::as_str) {
         Some("revision_conflict") => "revision_conflict",
@@ -219,6 +293,7 @@ mod tests {
             service: "selected.library/2".into(),
             callers: ["consumer".into()].into(),
             executors: BTreeMap::from([("runner".into(), "selected.executor/1".into())]),
+            policy_service: None,
             application_policies: BTreeMap::new(),
             require_application_policy: false,
         }
@@ -367,6 +442,33 @@ mod tests {
         }))
         .unwrap();
         route.application_policies.insert("opaque".into(), policy);
+        assert!(validate_routes(&BTreeMap::from([("games".into(), route)])).is_err());
+    }
+
+    #[test]
+    fn selected_resolver_snapshot_cannot_change_reference_or_inject_a_route() {
+        let mut route = route();
+        route.policy_service = Some("selected.policy/1".into());
+        route.require_application_policy = true;
+        assert!(validate_routes(&BTreeMap::from([("games".into(), route.clone())])).is_ok());
+        let (mut target, _, _) =
+            resolve_target(&selection("opaque"), &route, reply("opaque")).unwrap();
+        let response = json!({"ok":true,"policy":{"application":{"library":"games","id":"opaque"},
+            "entry_revision":"v1","policy_revision":"policy-v2","exit_timeout_seconds":9,"preparation":[]}});
+        assert_eq!(
+            apply_policy(&selection("opaque"), &mut target, response.clone()).unwrap(),
+            "policy-v2"
+        );
+        for (field, value) in [
+            ("entry_revision", json!("stale")),
+            ("policy_revision", json!("")),
+            ("service", json!("forged/1")),
+        ] {
+            let mut forged = response.clone();
+            forged["policy"][field] = value;
+            assert!(apply_policy(&selection("opaque"), &mut target, forged).is_err());
+        }
+        route.policy_service = Some("selected.executor/1".into());
         assert!(validate_routes(&BTreeMap::from([("games".into(), route)])).is_err());
     }
 }

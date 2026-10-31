@@ -12,6 +12,7 @@ pub const LUTRIS: &str = "amaterasu.lutris/1";
 pub enum Step {
     Catalog,
     Library,
+    LibraryPolicy,
     LutrisStatus,
     LutrisPreSpawn,
     CreateSession,
@@ -120,6 +121,20 @@ impl Workflow {
                     &selection.service,
                     json!({"action":"resolve_launch",
                     "id":selection.application.id,"revision":selection.revision}),
+                )
+            }
+            Step::LibraryPolicy => {
+                let selection = record
+                    .library_selection
+                    .as_ref()
+                    .ok_or("invalid_workflow")?;
+                let service = record
+                    .library_policy_service
+                    .as_deref()
+                    .ok_or("invalid_workflow")?;
+                (
+                    service,
+                    json!({"action":"resolve","application":selection.application,"entry_revision":selection.revision}),
                 )
             }
             Step::LutrisStatus | Step::LutrisPreSpawn => (LUTRIS, json!({"action":"status"})),
