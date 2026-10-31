@@ -436,7 +436,14 @@ impl Coordinator {
                 .find(|p| &p.provider == provider)
                 .cloned()
             else {
-                self.fail_work(&key, "provider_unavailable")?;
+                if matches!(
+                    work.phase,
+                    LifecyclePhase::StreamRelease | LifecyclePhase::SessionRelease
+                ) {
+                    self.cleanup_failure(&key, "provider_unavailable")?;
+                } else {
+                    self.fail_work(&key, "provider_unavailable")?;
+                }
                 continue;
             };
             let runtime_key = format!("{key}/{}", work.index);
@@ -841,6 +848,15 @@ impl Coordinator {
                     session.obligations.push(obligation.clone());
                 }
             }
+        }
+        if matches!(
+            &state.response,
+            Some(ProviderResponse::Cleanup { outcomes }) if outcomes.iter().any(|outcome|
+                outcome.state == amaterasu_extension_api::CleanupState::DeferredRestoration)
+        ) {
+            // Runtime retirement is complete, but restoration still depends on
+            // this provider's prerequisites remaining available.
+            work.cleanup_blockers.insert(provider.into());
         }
         work.states.insert(provider.into(), state.clone());
         work.index += 1;

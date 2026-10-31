@@ -74,12 +74,30 @@ impl Harness {
                 } => {
                     let provider = service.strip_suffix("/1").unwrap().to_owned();
                     let result = if method == "plan" {
-                        json!({"status":"planned","plan":{"plan_id":"plan","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]}})
+                        let deferred = *uncertain_phase == "deferred"
+                            && provider == "b"
+                            && payload["phase"] == "session.release";
+                        let resources = if deferred {
+                            json!([{"provider":"b","resource_id":"output","incarnation":null,"expected_revision":null,"execution_domain":"seat","mutation_domains":[],"access":"read"}])
+                        } else {
+                            json!([])
+                        };
+                        let obligations = if deferred {
+                            json!([{"obligation_id":"restore","provider":"b","resource_id":"output","mutation_domain":null,"depends_on":[],"cleanup_method":{"service":"b/1","method":"cleanup","interface_major":1,"interface_minor":0,"schema_revision":1},"payload":{}}])
+                        } else {
+                            json!([])
+                        };
+                        json!({"status":"planned","plan":{"plan_id":"plan","revision":1,"resources":resources,"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":obligations,"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]}})
                     } else if method == "callback" {
                         let phase = payload["phase"].as_str().unwrap().to_owned();
                         callbacks.push((provider.clone(), phase.clone()));
                         if provider == "b" && phase == *uncertain_phase {
                             json!({"status":"recovery_required","reason":"unknown_effect"})
+                        } else if provider == "b"
+                            && phase == "session.release"
+                            && *uncertain_phase == "deferred"
+                        {
+                            json!({"status":"cleanup","outcomes":[{"obligation_id":"restore","state":"deferred_restoration","reason":"waiting"}]})
                         } else if phase == "session.release" {
                             json!({"status":"cleanup","outcomes":[]})
                         } else {
@@ -133,7 +151,7 @@ impl Drop for Harness {
 
 fn participant(provider: &str, depends_on: &[&str]) -> ParticipantSettings {
     let method = |name: &str| json!({"service":format!("{provider}/1"),"method":name,"interface_major":1,"interface_minor":0,"schema_revision":1});
-    serde_json::from_value(json!({"provider":provider,"depends_on":depends_on,"plan_method":method("plan"),"callback_method":method("callback"),"status_method":method("status"),"capabilities":[],"cleanup_methods":[],"settings_revision":"initial","settings":{}})).unwrap()
+    serde_json::from_value(json!({"provider":provider,"depends_on":depends_on,"plan_method":method("plan"),"callback_method":method("callback"),"status_method":method("status"),"capabilities":[],"cleanup_methods":[{"service":format!("{provider}/1"),"method":"cleanup","interface_major":1,"interface_minor":0,"schema_revision":1}],"settings_revision":"initial","settings":{}})).unwrap()
 }
 
 #[test]
@@ -178,6 +196,75 @@ fn uncertain_dependent_prepare_never_releases_its_prerequisite() {
         json!({"operation":"prepare","operation_id":"prepare"}),
     );
     assert_eq!(h.run("prepare")["status"], "recovery_required");
+    let releases: Vec<_> = h
+        .callbacks
+        .iter()
+        .filter(|(_, phase)| phase == "session.release")
+        .map(|(provider, _)| provider.as_str())
+        .collect();
+    assert_eq!(releases, ["c"]);
+}
+
+#[test]
+fn deferred_dependent_restoration_blocks_prerequisite_but_not_independent() {
+    let mut h = Harness::new("deferred");
+    let started = h.coordinator.handle(
+        "caller",
+        "initiator",
+        json!({"operation":"prepare","operation_id":"prepare"}),
+    );
+    assert_eq!(h.run("prepare")["status"], "succeeded");
+    h.coordinator
+        .shared
+        .borrow_mut()
+        .value
+        .sessions
+        .get_mut(started["session_id"].as_str().unwrap())
+        .unwrap()
+        .application_retired = true;
+    h.coordinator.handle(
+        "caller",
+        "initiator",
+        json!({"operation":"end_session","operation_id":"end","target":started["target"]}),
+    );
+    assert_eq!(h.run("end")["status"], "recovery_required");
+    let releases: Vec<_> = h
+        .callbacks
+        .iter()
+        .filter(|(_, phase)| phase == "session.release")
+        .map(|(provider, _)| provider.as_str())
+        .collect();
+    assert_eq!(releases, ["b", "c"]);
+}
+
+#[test]
+fn missing_dependent_provider_blocks_prerequisite_but_not_independent() {
+    let mut h = Harness::new("none");
+    let started = h.coordinator.handle(
+        "caller",
+        "initiator",
+        json!({"operation":"prepare","operation_id":"prepare"}),
+    );
+    assert_eq!(h.run("prepare")["status"], "succeeded");
+    h.coordinator
+        .shared
+        .borrow_mut()
+        .value
+        .sessions
+        .get_mut(started["session_id"].as_str().unwrap())
+        .unwrap()
+        .application_retired = true;
+    h.coordinator
+        .settings
+        .participants
+        .retain(|participant| participant.provider != "b");
+    h.coordinator.selections.remove("b");
+    h.coordinator.handle(
+        "caller",
+        "initiator",
+        json!({"operation":"end_session","operation_id":"end","target":started["target"]}),
+    );
+    assert_eq!(h.run("end")["status"], "recovery_required");
     let releases: Vec<_> = h
         .callbacks
         .iter()
