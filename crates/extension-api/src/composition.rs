@@ -155,7 +155,15 @@ fn valid_target(target: &LifecycleTarget) -> bool {
                 && crate::valid_opaque_id(stream_id)
                 && *generation > 0
         }
-        LifecycleTarget::Validation { .. } => false,
+        LifecycleTarget::Validation {
+            host_epoch,
+            validation_id,
+            generation,
+        } => {
+            crate::valid_opaque_id(host_epoch)
+                && crate::valid_opaque_id(validation_id)
+                && *generation > 0
+        }
     }
 }
 
@@ -487,6 +495,25 @@ mod tests {
         let request: ResourceControlRequest = serde_json::from_value(json!({"version":2,"transition_id":"transition","operation_id":"operation","provider_sequence":1,"target":stream,"proposal":proposal,"admission_id":"admission","permit_id":"permit","remaining_ms":5000})).unwrap();
         let finalize: ResourceFinalizeRequest = serde_json::from_value(json!({"version":2,"transition_id":"transition","operation_id":"finalize","provider_sequence":2,"target":stream,"output":output,"control_results":[],"admission_id":"admission","permit_id":"permit","remaining_ms":5000})).unwrap();
         (output, request, finalize)
+    }
+
+    #[test]
+    fn sessionless_validation_output_requires_exact_scope() {
+        let (mut output, _, _) = fixture();
+        let target = LifecycleTarget::Validation {
+            host_epoch: "epoch".into(),
+            validation_id: "probe".into(),
+            generation: 1,
+        };
+        output.origin = target.clone();
+        assert!(validate_resource_output(&output).is_ok());
+        assert!(output_in_scope(&output, &target));
+        let other = LifecycleTarget::Validation {
+            host_epoch: "epoch".into(),
+            validation_id: "other".into(),
+            generation: 1,
+        };
+        assert!(!output_in_scope(&output, &other));
     }
 
     #[test]
