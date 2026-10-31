@@ -4,6 +4,8 @@ mod action_target;
 mod application;
 #[allow(dead_code)] // Admission and control remain disabled until schema verification is wired.
 mod composition;
+#[allow(dead_code)] // Controls stay gated until sequencing is qualified.
+mod composition_control;
 mod composition_prepare;
 mod composition_progress;
 mod control_backend;
@@ -27,6 +29,7 @@ mod providers;
 mod recovery;
 mod retention;
 mod security;
+mod session_prepare_evidence;
 #[allow(dead_code)]
 mod session_release;
 mod settings_scope;
@@ -318,6 +321,8 @@ struct Journal {
     stream_releases: stream_release::StreamReleaseBook,
     #[serde(default)]
     session_releases: session_release::SessionReleaseBook,
+    #[serde(default)]
+    session_prepare_evidence: session_prepare_evidence::SessionPrepareEvidence,
     /// Immutable producing transition of each retained admission.
     #[serde(default)]
     admission_transitions: BTreeMap<String, String>,
@@ -325,7 +330,8 @@ struct Journal {
 
 impl Journal {
     fn references_admission(&self, id: &str) -> bool {
-        self.session_releases.references_admission(id)
+        self.session_prepare_evidence.references_admission(id)
+            || self.session_releases.references_admission(id)
             || self.stream_releases.references_admission(id)
             || self
                 .finalize_results
@@ -508,46 +514,75 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                         == Some(&selection.target))
             })
         })
-        || journal.composition.staged_outputs().any(|stage| {
-            let Ok((epoch, session_id, Some(stream_id), generation)) =
-                operations::target_parts(&stage.target)
-            else {
-                return true;
-            };
-            let Some(session) = journal.sessions.get(session_id) else {
-                return true;
-            };
-            let Some(stream) = session.streams.get(stream_id) else {
-                return true;
-            };
-            let Some(admission) = journal
-                .authority
-                .admissions
-                .get(&stage.admission_id)
-                .or_else(|| journal.authority.settled.get(&stage.admission_id))
-            else {
-                return true;
-            };
-            session.host_epoch != epoch
-                || session.generation != stage.parent_generation
-                || stream.generation != generation
-                || !session.admission_ids.contains(&stage.admission_id)
-                || session.admission_targets.get(&stage.admission_id) != Some(&stage.target)
-                || session.admission_phases.get(&stage.admission_id)
-                    != Some(&LifecyclePhase::StreamPrepare)
-                || journal.admission_transitions.get(&stage.admission_id)
-                    != Some(&stage.transition_id)
-                || admission.provider != stage.after.producer
-                || admission.plan != stage.plan
-                || admission.selection.participant != stage.callback_proof.participant
-                || !admission.selection.approvals.iter().any(|approval| {
-                    approval.broker_approval == stage.callback_proof.terminal.call.approval
-                        && composition::approval_matches_call(
-                            approval,
-                            &stage.callback_proof.terminal.call,
-                        )
-                })
-        })
+        || journal
+            .composition
+            .staged_outputs()
+            .enumerate()
+            .any(|(index, stage)| {
+                let previous = journal
+                    .composition
+                    .staged_outputs()
+                    .take(index)
+                    .filter(|old| {
+                        old.after.producer == stage.before.producer
+                            && old.after.output_id == stage.before.output_id
+                            && old.after.origin == stage.before.origin
+                    })
+                    .last();
+                let prior_release_valid = match (&stage.prior_release_admission, previous) {
+                    (None, None) => true,
+                    (Some(admission), Some(previous)) => {
+                        journal
+                            .stream_releases
+                            .released_output_for_target(&previous.target)
+                            .is_some_and(|(id, output)| id == admission && output == &stage.before)
+                            && journal
+                                .stream_releases
+                                .has_valid_released(journal, &previous.target)
+                    }
+                    _ => false,
+                };
+                let Ok((epoch, session_id, Some(stream_id), generation)) =
+                    operations::target_parts(&stage.target)
+                else {
+                    return true;
+                };
+                let Some(session) = journal.sessions.get(session_id) else {
+                    return true;
+                };
+                let Some(stream) = session.streams.get(stream_id) else {
+                    return true;
+                };
+                let Some(admission) = journal
+                    .authority
+                    .admissions
+                    .get(&stage.admission_id)
+                    .or_else(|| journal.authority.settled.get(&stage.admission_id))
+                else {
+                    return true;
+                };
+                !prior_release_valid
+                    || session.host_epoch != epoch
+                    || session.generation != stage.parent_generation
+                    || stream.generation != generation
+                    || !session.admission_ids.contains(&stage.admission_id)
+                    || session.admission_targets.get(&stage.admission_id) != Some(&stage.target)
+                    || session.admission_phases.get(&stage.admission_id)
+                        != Some(&LifecyclePhase::StreamPrepare)
+                    || journal.admission_transitions.get(&stage.admission_id)
+                        != Some(&stage.transition_id)
+                    || admission.provider != stage.after.producer
+                    || admission.plan != stage.plan
+                    || admission.selection.participant != stage.callback_proof.participant
+                    || !admission.selection.approvals.iter().any(|approval| {
+                        approval.broker_approval == stage.callback_proof.terminal.call.approval
+                            && composition::approval_matches_call(
+                                approval,
+                                &stage.callback_proof.terminal.call,
+                            )
+                    })
+            })
+        || !journal.session_prepare_evidence.validate(journal)
         || !journal.session_releases.validate(journal)
         || !journal.stream_releases.validate(journal)
         || !journal.finalize_results.validate_structure()
@@ -756,6 +791,8 @@ pub struct Coordinator {
     approval_cursor: usize,
     drivers: BTreeMap<String, PrepareDriver>,
     finalize_drivers: BTreeMap<String, finalize_dispatch::FinalizeDispatch>,
+    control_drivers: BTreeMap<String, control_dispatch::ControlDispatch>,
+    settlement_drivers: BTreeMap<String, settlement_dispatch::SettlementDispatch>,
     validations: BTreeMap<String, security::ValidationJob>,
     revocations: BTreeMap<String, security::RevocationJob>,
     application_jobs: BTreeMap<String, application::ApplicationJob>,
@@ -786,6 +823,7 @@ impl Coordinator {
             finalize_results: Default::default(),
             stream_releases: Default::default(),
             session_releases: Default::default(),
+            session_prepare_evidence: Default::default(),
             admission_transitions: Default::default(),
         });
         validate_journal(&journal)?;
@@ -828,6 +866,8 @@ impl Coordinator {
             approval_cursor: 0,
             drivers: BTreeMap::new(),
             finalize_drivers: BTreeMap::new(),
+            control_drivers: BTreeMap::new(),
+            settlement_drivers: BTreeMap::new(),
             validations: BTreeMap::new(),
             revocations: BTreeMap::new(),
             application_jobs: BTreeMap::new(),
@@ -855,6 +895,15 @@ impl Coordinator {
         };
         if operation == "snapshot" {
             return self.snapshot(caller, initiator);
+        }
+        if matches!(
+            operation,
+            "describe_resource_control" | "verify_resource_control" | "validate_resource_control"
+        ) {
+            return self.control_operation(caller, payload);
+        }
+        if operation == "verify_control_settlement" {
+            return self.verify_control_settlement(caller, payload);
         }
         if operation == "verify_provider_epoch" {
             return self.verify_provider(caller, &payload);

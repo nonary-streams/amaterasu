@@ -271,6 +271,7 @@ pub(super) mod tests {
         let stage = StagedOutputRefinement {
             target: selection.target.clone(),
             parent_generation: 3,
+            prior_release_admission: None,
             admission_id: "stage-admission".into(),
             transition_id: selection.transition_id.clone(),
             plan,

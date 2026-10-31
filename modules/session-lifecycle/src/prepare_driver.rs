@@ -28,6 +28,8 @@ pub enum PreparePhase {
     Callback,
     PlanStatus,
     CallbackStatus,
+    /// A validated v2 plan awaits independently acknowledged owner controls.
+    ControlsPending,
     /// Fresh owner finalization plan is durably admitted; no effect was sent.
     FinalizePlanAdmitted,
     Prepared,
@@ -102,13 +104,14 @@ pub struct PrepareDriver {
     state: PrepareState,
     dispatcher: Option<ProviderDispatcher>,
     journal_failed: bool,
+    allow_controls: bool,
 }
 
 impl PrepareDriver {
     /// Caller must durably reserve the operation and matching provider sequence
     /// before constructing this driver. No plan or effect is implied by creation.
     pub fn new(state: PrepareState, settings: &LifecycleSettings) -> ModuleResult<Self> {
-        Self::new_inner(state, settings, false, false, false)
+        Self::new_inner(state, settings, false, false, false, false)
     }
 
     /// Only the coordinator may call this after validating the pinned owner,
@@ -119,7 +122,7 @@ impl PrepareDriver {
         state: PrepareState,
         settings: &LifecycleSettings,
     ) -> ModuleResult<Self> {
-        Self::new_inner(state, settings, true, false, false)
+        Self::new_inner(state, settings, true, false, false, false)
     }
 
     /// Coordinator-only v2 producer prepare with no dependency controls. The
@@ -129,7 +132,7 @@ impl PrepareDriver {
         state: PrepareState,
         settings: &LifecycleSettings,
     ) -> ModuleResult<Self> {
-        Self::new_inner(state, settings, false, true, false)
+        Self::new_inner(state, settings, false, true, false, false)
     }
 
     /// Release requires the coordinator's exact consumer-retirement and
@@ -138,7 +141,17 @@ impl PrepareDriver {
         state: PrepareState,
         settings: &LifecycleSettings,
     ) -> ModuleResult<Self> {
-        Self::new_inner(state, settings, false, false, true)
+        Self::new_inner(state, settings, false, false, true, false)
+    }
+
+    /// Used only after the coordinator freezes the direct dependency graph and
+    /// installed control selections; pending controls never invoke a callback.
+    #[allow(dead_code)]
+    pub(crate) fn new_composed(
+        state: PrepareState,
+        settings: &LifecycleSettings,
+    ) -> ModuleResult<Self> {
+        Self::new_inner(state, settings, false, false, false, true)
     }
 
     fn new_inner(
@@ -147,11 +160,13 @@ impl PrepareDriver {
         finalize_plan: bool,
         standalone_prepare: bool,
         standalone_release: bool,
+        composed: bool,
     ) -> ModuleResult<Self> {
         // Regular v2 prepare/control remains fenced until all stages are wired.
         if (!finalize_plan
             && !standalone_prepare
             && !standalone_release
+            && !composed
             && state.request.version != 1)
             || (standalone_prepare
                 && (state.request.version != api::COMPOSITION_VERSION
@@ -201,6 +216,24 @@ impl PrepareDriver {
                             | PreparePhase::Rejected
                             | PreparePhase::RecoveryRequired
                     )))
+            || (composed
+                && (state.request.version != api::COMPOSITION_VERSION
+                    || !matches!(
+                        state.request.operation,
+                        ProviderOperation::ResourcePlan | ProviderOperation::LifecycleCallback
+                    )
+                    || !matches!(
+                        state.phase,
+                        PreparePhase::Plan
+                            | PreparePhase::PlanStatus
+                            | PreparePhase::ControlsPending
+                            | PreparePhase::Callback
+                            | PreparePhase::CallbackStatus
+                            | PreparePhase::Prepared
+                            | PreparePhase::CleanupSettled
+                            | PreparePhase::Rejected
+                            | PreparePhase::RecoveryRequired
+                    )))
             || (finalize_plan
                 && (state.request.version != api::COMPOSITION_VERSION
                     || state.request.operation != ProviderOperation::ResourceFinalizePlan
@@ -215,7 +248,7 @@ impl PrepareDriver {
         {
             return Err("provider composition is not supported".into());
         }
-        if (finalize_plan || standalone_prepare || standalone_release)
+        if (finalize_plan || standalone_prepare || standalone_release || composed)
             && (state.participant.contract_version != api::COMPOSITION_VERSION
                 || state.participant.plan_method.interface_major != api::COMPOSITION_VERSION
                 || state.participant.callback_method.interface_major != api::COMPOSITION_VERSION
@@ -254,6 +287,7 @@ impl PrepareDriver {
             state,
             dispatcher,
             journal_failed: false,
+            allow_controls: composed,
         })
     }
     pub fn state(&self) -> &PrepareState {
@@ -278,6 +312,7 @@ impl PrepareDriver {
         if matches!(
             self.state.phase,
             PreparePhase::Prepared
+                | PreparePhase::ControlsPending
                 | PreparePhase::FinalizePlanAdmitted
                 | PreparePhase::CleanupSettled
                 | PreparePhase::Rejected
@@ -471,7 +506,7 @@ impl PrepareDriver {
                 // Control proposals require coordinator-owned, schema-validated
                 // execution. Version 1 has no such protocol; never admit a plan
                 // whose proposed controls would otherwise be silently skipped.
-                if !plan.control_proposals.is_empty() {
+                if !plan.control_proposals.is_empty() && !self.allow_controls {
                     return Err("resource control proposals are not supported".into());
                 }
                 let admission = authority.admit_plan(participant, plan)?;
@@ -482,6 +517,8 @@ impl PrepareDriver {
                 next.admission_id = Some(admission);
                 next.phase = if next.request.operation == ProviderOperation::ResourceFinalizePlan {
                     PreparePhase::FinalizePlanAdmitted
+                } else if !plan.control_proposals.is_empty() {
+                    PreparePhase::ControlsPending
                 } else {
                     PreparePhase::Callback
                 };

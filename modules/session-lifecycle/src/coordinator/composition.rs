@@ -58,6 +58,9 @@ pub struct ProducerCallbackProof {
 pub struct StagedOutputRefinement {
     pub target: LifecycleTarget,
     pub parent_generation: u64,
+    /// Exact preceding release admission, absent only for the first stage.
+    #[serde(default)]
+    pub prior_release_admission: Option<String>,
     pub admission_id: String,
     pub transition_id: String,
     pub plan: ResourcePlan,
@@ -348,11 +351,24 @@ impl CompositionBook {
         else {
             return false;
         };
-        let prior = self.staged_outputs[..index]
+        let prior_stage = self.staged_outputs[..index]
             .iter()
             .rev()
-            .find(|old| same_key(&old.after, &stage.before))
-            .map_or(&root.output, |old| &old.after);
+            .find(|old| same_key(&old.after, &stage.before));
+        let prior_valid = match (prior_stage, &stage.prior_release_admission) {
+            (None, None) => root.output == stage.before,
+            (Some(previous), Some(admission)) => {
+                valid_text(admission)
+                    && previous.target != stage.target
+                    && amaterasu_extension_api::validate_cleanup_output(
+                        &stage.before.producer,
+                        &previous.after,
+                        &stage.before,
+                    )
+                    .is_ok()
+            }
+            _ => false,
+        };
         let proof = &stage.callback_proof;
         let Ok(response) = serde_json::from_value::<amaterasu_extension_api::ProviderResponse>(
             match &proof.terminal.state {
@@ -365,7 +381,7 @@ impl CompositionBook {
         host_epoch == epoch
             && session_id == session
             && *generation == stage.parent_generation
-            && prior == &stage.before
+            && prior_valid
             && amaterasu_extension_api::validate_output_refinement(&stage.before, &stage.after)
                 .is_ok()
             && (stage.before.data == stage.after.data
@@ -1008,11 +1024,33 @@ pub(super) fn collect_verified_outputs(
             let root = next
                 .get(provider, &output.output_id, &output.origin)
                 .ok_or("stage_root_missing")?;
-            let before = next
+            let existing = next
+                .staged_outputs()
+                .find(|old| old.admission_id == admission_id);
+            let (prior_release_admission, before) = if let Some(existing) = existing {
+                (
+                    existing.prior_release_admission.clone(),
+                    existing.before.clone(),
+                )
+            } else if let Some(previous) = next
                 .staged_outputs()
                 .rev()
                 .find(|old| same_key(&old.after, output))
-                .map_or_else(|| root.output.clone(), |old| old.after.clone());
+            {
+                let (id, released) = journal
+                    .stream_releases
+                    .released_output_for_target(&previous.target)
+                    .ok_or("prior_stream_release_readback_missing")?;
+                if !journal
+                    .stream_releases
+                    .has_valid_released(journal, &previous.target)
+                {
+                    return Err("prior_stream_release_unverified".into());
+                }
+                (Some(id.to_owned()), released.clone())
+            } else {
+                (None, root.output.clone())
+            };
             let LifecycleTarget::Session {
                 generation: parent_generation,
                 ..
@@ -1023,6 +1061,7 @@ pub(super) fn collect_verified_outputs(
             let stage = StagedOutputRefinement {
                 target: work.target.clone(),
                 parent_generation: *parent_generation,
+                prior_release_admission,
                 admission_id: admission_id.into(),
                 transition_id: work.transition_id.clone(),
                 plan: plan.clone(),
@@ -1342,6 +1381,7 @@ mod tests {
         let stage = StagedOutputRefinement {
             target: serde_json::from_value(stream).unwrap(),
             parent_generation: 1,
+            prior_release_admission: None,
             admission_id: "stage-admission".into(),
             transition_id: "stage-transition".into(),
             plan,

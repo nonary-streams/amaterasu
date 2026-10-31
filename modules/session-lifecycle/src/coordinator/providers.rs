@@ -50,6 +50,9 @@ impl AuthorityJournal for WorkFinishWriter {
             .get(&self.key)
             .and_then(|receipt| receipt.work.clone())
             .ok_or("unknown_transition")?;
+        if work.phase == LifecyclePhase::SessionPrepare {
+            super::session_prepare_evidence::record(&mut next, &work, &self.provider, &self.state)?;
+        }
         composition::collect_verified_outputs(
             &mut next,
             &self.settings,
@@ -72,6 +75,37 @@ impl AuthorityJournal for WorkFinishWriter {
         save(&self.shared, next)
     }
 }
+/// Persist a direct session prepare callback even if it has no output.
+struct SessionPrepareWriter {
+    shared: Shared,
+    key: String,
+    provider: String,
+    state: PrepareState,
+}
+impl AuthorityJournal for SessionPrepareWriter {
+    fn persist(&mut self, authority: &AuthorityState) -> ModuleResult<()> {
+        let mut next = self.shared.borrow().value.clone();
+        let work = next
+            .receipts
+            .get(&self.key)
+            .and_then(|receipt| receipt.work.clone())
+            .ok_or("unknown_transition")?;
+        super::session_prepare_evidence::record(&mut next, &work, &self.provider, &self.state)?;
+        let admission = self
+            .state
+            .admission_id
+            .as_deref()
+            .ok_or("admission_missing")?;
+        if !authority.settled.contains_key(admission) {
+            return Err("session_admission_not_retained".into());
+        }
+        next.authority = authority.clone();
+        apply_participant(&mut next, &self.key, &self.provider, &self.state, true)?;
+        validate_journal(&next).map_err(|_| "invalid_session_prepare_journal")?;
+        save(&self.shared, next)
+    }
+}
+
 /// Atomically persist terminal cleanup evidence with participant progress.
 struct StreamReleaseWriter {
     shared: Shared,
@@ -122,7 +156,10 @@ fn apply_participant(
     }) = &state.response
     {
         if (!allow_composition && (state.request.version != 1 || !outputs.is_empty()))
-            || (allow_composition && (state.request.version != 2 || outputs.len() != 1))
+            || (allow_composition
+                && (state.request.version != 2
+                    || (outputs.len() != 1
+                        && !(work.phase == LifecyclePhase::SessionPrepare && outputs.is_empty()))))
         {
             return Err("composition_response_not_supported".into());
         }
@@ -868,7 +905,20 @@ impl Coordinator {
                     .filter(|policy| policy.owner_provider == participant.provider)
                     .count()
                     == 1;
-            if participant.contract_version != 1 && !standalone_v2 {
+            // Qualification startup remains fenced for dependent graphs until
+            // composition, cleanup and recovery pass end-to-end tests.
+            let composed_v2 = participant.contract_version
+                == amaterasu_extension_api::COMPOSITION_VERSION
+                && matches!(
+                    work.phase,
+                    LifecyclePhase::SessionPrepare | LifecyclePhase::StreamPrepare
+                )
+                && work.provider_graph.as_ref().is_some_and(|graph| {
+                    graph.order.len() > 1
+                        && graph.order.contains(provider)
+                        && graph.dependencies.contains_key(provider)
+                });
+            if participant.contract_version != 1 && !standalone_v2 && !composed_v2 {
                 self.fail_work(&key, "composition_path_not_supported")?;
                 continue;
             }
@@ -892,7 +942,23 @@ impl Coordinator {
                 Err(_) => continue,
             };
             if !work.states.contains_key(provider) {
-                let dependency_inputs = if standalone_v2
+                let has_dependencies = work
+                    .provider_graph
+                    .as_ref()
+                    .and_then(|graph| graph.dependencies.get(provider))
+                    .is_some_and(|dependencies| !dependencies.is_empty());
+                let dependency_inputs = if composed_v2
+                    && work.phase == LifecyclePhase::StreamPrepare
+                    && has_dependencies
+                {
+                    match self.freeze_dependent_inputs(&key, &work, provider) {
+                        Ok(inputs) => inputs,
+                        Err(reason) => {
+                            self.fail_work(&key, &reason)?;
+                            continue;
+                        }
+                    }
+                } else if (standalone_v2 || composed_v2)
                     && work.phase == LifecyclePhase::StreamPrepare
                 {
                     let resolved = {
@@ -976,8 +1042,43 @@ impl Coordinator {
                 .persist(&state)?;
                 work.states.insert(provider.clone(), state);
             }
+            if composed_v2 && work.states[provider].phase == PreparePhase::ControlsPending {
+                match self.advance_dependent_controls(&key, &work, provider, send) {
+                    Ok(Some(results)) => {
+                        let mut state = work.states[provider].clone();
+                        state.request.operation = ProviderOperation::LifecycleCallback;
+                        state.request.approved_plan = state.plan.clone();
+                        state.request.plan_revision = state.plan.as_ref().map(|plan| plan.revision);
+                        state.request.admission_id = state.admission_id.clone();
+                        state.request.control_results = results;
+                        amaterasu_extension_api::validate_provider_request(&state.request)?;
+                        state.phase = PreparePhase::Callback;
+                        WorkWriter {
+                            shared: self.shared.clone(),
+                            key: key.clone(),
+                            provider: provider.clone(),
+                        }
+                        .persist(&state)?;
+                        self.drivers.remove(&runtime_key);
+                    }
+                    Ok(None) => {}
+                    Err(reason) => {
+                        let mut next = self.shared.borrow().value.clone();
+                        let receipt = next
+                            .receipts
+                            .get_mut(&key)
+                            .ok_or("transition_no_longer_active")?;
+                        receipt.response["status"] = json!("recovery_required");
+                        receipt.response["reason"] = json!(reason);
+                        save(&self.shared, next)?;
+                    }
+                }
+                continue;
+            }
             if !self.drivers.contains_key(&runtime_key) {
-                let driver = if standalone_v2 && work.phase == LifecyclePhase::StreamRelease {
+                let driver = if composed_v2 {
+                    PrepareDriver::new_composed(work.states[provider].clone(), &effective_settings)?
+                } else if standalone_v2 && work.phase == LifecyclePhase::StreamRelease {
                     PrepareDriver::new_standalone_release(
                         work.states[provider].clone(),
                         &effective_settings,
@@ -1064,6 +1165,32 @@ impl Coordinator {
                     if let Err(reason) =
                         finish.finish_admission_with_output(provider, admission, resource)
                     {
+                        self.fail_work(&key, &reason)?;
+                    }
+                    self.drivers.remove(&runtime_key);
+                    continue;
+                }
+                if state.request.version == amaterasu_extension_api::COMPOSITION_VERSION
+                    && work.phase == LifecyclePhase::SessionPrepare
+                    && work
+                        .provider_graph
+                        .as_ref()
+                        .is_some_and(|graph| graph.order.len() > 1)
+                    && matches!(&state.response, Some(ProviderResponse::Prepared { outputs, .. }) if outputs.is_empty())
+                {
+                    let admission = state.admission_id.as_deref().ok_or("admission_missing")?;
+                    let writer = SessionPrepareWriter {
+                        shared: self.shared.clone(),
+                        key: key.clone(),
+                        provider: provider.clone(),
+                        state: state.clone(),
+                    };
+                    let mut finish = CoordinatorPrepareAuthority::new(
+                        self.shared.borrow().value.authority.clone(),
+                        self.work_selections(&work)?,
+                        writer,
+                    )?;
+                    if let Err(reason) = finish.finish_admission_retained(provider, admission) {
                         self.fail_work(&key, &reason)?;
                     }
                     self.drivers.remove(&runtime_key);
@@ -1796,6 +1923,7 @@ mod admission_target_tests {
             finalize_results: Default::default(),
             stream_releases: Default::default(),
             session_releases: Default::default(),
+            session_prepare_evidence: Default::default(),
             admission_transitions: Default::default(),
         };
         let target = LifecycleTarget::Stream {
