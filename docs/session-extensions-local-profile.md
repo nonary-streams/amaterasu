@@ -118,11 +118,22 @@ transferred by copying settings or a resource identifier. Existing combined
 state or owned resources must block the new composition until resolved; an
 unknown or failed cleanup is not proof of retirement.
 
-Settings transfer requires an explicit, non-mutating export and mapping:
-display configuration belongs to display-settings, while retention and lifecycle
-policy belongs to virtual-screen. Validate both resulting documents before
-enabling effects, preserving scopes and unrelated existing global settings.
-The current preparer configures no registry migration plans and supplies no
-cross-provider export or import command. The exact mapping, migration tooling,
-and fail-closed upgrade checks require implementation and validation before this
-is an executable upgrade procedure.
+`scripts/export_session_extension_split.py` prepares a non-mutating,
+reviewable mapping from an exported v1 registry document and its descriptor to
+the two candidate descriptors. It moves `retention`, `retention_seconds`,
+`keepalive_while_paused`, and `enforce_while_paused` to virtual-screen, retains
+the other settings with display-settings, and requires an explicit virtual-screen
+`enabled` choice for each source scope and the host scope. It preserves the
+source bytes and digest, pins descriptor digests, and validates the proposed
+settings against the supplied schemas. Its ordered settings-update plans require
+an empty destination and compare-and-set revisions starting at zero.
+
+The tool does not contact the registry or apply its plans. It cannot migrate an
+existing state root: display-settings retains its provider ID, so an existing v1
+document needs an explicit migration and ordinary v2 updates reject it. The plans
+require scope authorization, approved descriptors, provider validation, and cleanup
+by the old owner before effects. The current preparer configures no registry
+migration plans. The export has been tested with synthetic split descriptors;
+the final descriptors, live import, and fail-closed upgrade checks still require
+validation before this is an executable upgrade procedure. Preserve unrelated
+global settings and validate both resulting documents before enabling effects.
