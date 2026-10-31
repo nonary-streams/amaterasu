@@ -31,7 +31,11 @@ fn authorize_output_borrowers(
             ..
         } = &work.target
             && session.streams.get(stream_id).is_some_and(|stream| {
-                stream.generation == *generation && stream.phase == StreamPhase::Preparing
+                stream.generation == *generation
+                    && (stream.phase == StreamPhase::Preparing
+                        || (work.phase == LifecyclePhase::StreamRelease
+                            && stream.phase == StreamPhase::Quiescing
+                            && stream.retirements == stream.required))
             })
             && output.domain_observations.iter().any(|observation| {
                 observation.complete && observation.borrowers.get(stream_id) == Some(generation)
@@ -761,7 +765,9 @@ impl Coordinator {
             }
             let provider = &selected.participant.provider;
             selected.approved_control_bindings.clear();
-            if let Some(progress) = &work.composition_progress {
+            if work.phase != LifecyclePhase::StreamRelease
+                && let Some(progress) = &work.composition_progress
+            {
                 for frozen in progress
                     .selections
                     .iter()
@@ -829,6 +835,96 @@ impl Coordinator {
                     selected.approved_control_bindings.push(
                         crate::plan_validation::ApprovedControlBinding {
                             policy: policy.clone(),
+                            output,
+                            target: work.target.clone(),
+                        },
+                    );
+                }
+            }
+            if work.phase == LifecyclePhase::StreamRelease
+                && work.providers.get(work.index) == Some(provider)
+                && work
+                    .provider_graph
+                    .as_ref()
+                    .is_some_and(|graph| graph.order.len() > 1)
+            {
+                let graph = work
+                    .provider_graph
+                    .as_ref()
+                    .ok_or("provider_graph_missing")?;
+                let dependencies = graph
+                    .dependencies
+                    .get(provider)
+                    .ok_or("provider_graph_missing")?;
+                let admitted = work
+                    .states
+                    .get(provider)
+                    .and_then(|state| state.admission_id.as_ref().map(|id| (state, id)));
+                if let Some((state, id)) = admitted {
+                    let admission = journal
+                        .authority
+                        .admissions
+                        .get(id)
+                        .ok_or("release_admission_missing")?;
+                    if admission.provider != *provider
+                        || state.plan.as_ref() != Some(&admission.plan)
+                        || session.admission_targets.get(id) != Some(&work.target)
+                        || session.admission_phases.get(id) != Some(&work.phase)
+                        || journal.admission_transitions.get(id) != Some(&work.transition_id)
+                        || admission.selection.participant != selected.participant
+                        || admission.selection.approvals != selected.approvals
+                        || admission.selection.capabilities != selected.capabilities
+                        || admission.selection.cleanup_methods != selected.cleanup_methods
+                        || admission
+                            .selection
+                            .approved_control_bindings
+                            .iter()
+                            .any(|binding| {
+                                binding.target != work.target
+                                    || !self.settings.control_policies.contains(&binding.policy)
+                                    || !state.request.dependency_inputs.contains(&binding.output)
+                                    || !work.composition_progress.as_ref().is_some_and(|progress| {
+                                        progress.selections.iter().any(|selection| {
+                                            selection.control_policy == binding.policy
+                                        })
+                                    })
+                            })
+                    {
+                        return Err("release_admission_changed".into());
+                    }
+                    selected.authorized_borrowers =
+                        admission.selection.authorized_borrowers.clone();
+                    selected.approved_control_bindings =
+                        admission.selection.approved_control_bindings.clone();
+                } else if dependencies.is_empty() {
+                    let output = self.resolve_owner_release_input(work, provider)?;
+                    authorize_output_borrowers(
+                        &mut selected.authorized_borrowers,
+                        session,
+                        work,
+                        provider,
+                        &output,
+                    );
+                } else if let Some(state) = work.states.get(provider) {
+                    let (frozen, output) = self.resolve_release_binding(work, provider)?;
+                    if !work
+                        .composition_progress
+                        .as_ref()
+                        .is_some_and(|progress| progress.selections.contains(&frozen))
+                        || state.request.dependency_inputs != [output.clone()]
+                    {
+                        return Err("release_selection_changed".into());
+                    }
+                    authorize_output_borrowers(
+                        &mut selected.authorized_borrowers,
+                        session,
+                        work,
+                        &frozen.control_policy.owner_provider,
+                        &output,
+                    );
+                    selected.approved_control_bindings.push(
+                        crate::plan_validation::ApprovedControlBinding {
+                            policy: frozen.control_policy,
                             output,
                             target: work.target.clone(),
                         },
@@ -1171,6 +1267,7 @@ impl Coordinator {
                     LifecyclePhase::SessionPrepare
                         | LifecyclePhase::StreamPrepare
                         | LifecyclePhase::SessionRelease
+                        | LifecyclePhase::StreamRelease
                 )
                 && work.provider_graph.as_ref().is_some_and(|graph| {
                     graph.order.len() > 1
@@ -1210,6 +1307,19 @@ impl Coordinator {
                 }
             }
             if composed_v2
+                && work.phase == LifecyclePhase::StreamRelease
+                && !work.states.contains_key(provider)
+            {
+                match self.advance_release_observation(&key, &work, provider, send) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(reason) => {
+                        self.cleanup_failure(&key, &reason)?;
+                        continue;
+                    }
+                }
+            }
+            if composed_v2
                 && work.phase == LifecyclePhase::StreamPrepare
                 && !work.states.contains_key(provider)
                 && work
@@ -1246,6 +1356,26 @@ impl Coordinator {
                     .and_then(|graph| graph.dependencies.get(provider))
                     .is_some_and(|dependencies| !dependencies.is_empty());
                 let dependency_inputs = if composed_v2
+                    && work.phase == LifecyclePhase::StreamRelease
+                {
+                    if has_dependencies {
+                        match self.freeze_release_inputs(&key, &work, provider) {
+                            Ok(inputs) => inputs,
+                            Err(reason) => {
+                                self.cleanup_failure(&key, &reason)?;
+                                continue;
+                            }
+                        }
+                    } else {
+                        match self.resolve_owner_release_input(&work, provider) {
+                            Ok(output) => vec![output],
+                            Err(reason) => {
+                                self.cleanup_failure(&key, &reason)?;
+                                continue;
+                            }
+                        }
+                    }
+                } else if composed_v2
                     && work.phase == LifecyclePhase::StreamPrepare
                     && has_dependencies
                 {
@@ -1574,6 +1704,32 @@ impl Coordinator {
                     )?;
                     if let Err(reason) = finish.finish_admission_retained(provider, admission) {
                         self.fail_work(&key, &reason)?;
+                    }
+                    self.drivers.remove(&runtime_key);
+                    continue;
+                }
+                if composed_v2 && work.phase == LifecyclePhase::StreamRelease {
+                    let released = matches!(&state.response, Some(ProviderResponse::Cleanup { outcomes, .. })
+                        if outcomes.iter().all(|outcome| outcome.state == amaterasu_extension_api::CleanupState::Released));
+                    if !released {
+                        self.cleanup_failure(&key, "dependent_cleanup_unresolved")?;
+                        self.drivers.remove(&runtime_key);
+                        continue;
+                    }
+                    let admission = state.admission_id.as_deref().ok_or("admission_missing")?;
+                    let writer = DependentFinishWriter {
+                        shared: self.shared.clone(),
+                        key: key.clone(),
+                        provider: provider.clone(),
+                        state: state.clone(),
+                    };
+                    let mut finish = CoordinatorPrepareAuthority::new(
+                        self.shared.borrow().value.authority.clone(),
+                        self.work_selections(&work)?,
+                        writer,
+                    )?;
+                    if let Err(reason) = finish.finish_admission_retained(provider, admission) {
+                        self.cleanup_failure(&key, &reason)?;
                     }
                     self.drivers.remove(&runtime_key);
                     continue;

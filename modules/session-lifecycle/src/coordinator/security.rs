@@ -129,15 +129,33 @@ impl Coordinator {
                     finalize.owner_plan.request.operation_id
                         == payload["operation_id"].as_str().unwrap_or("")
                 });
-            let observation = work.owner_observations.values().find(|observation| {
+            let observation = work.owner_observations.iter().find(|(_, observation)| {
                 observation.request.operation_id == payload["operation_id"].as_str().unwrap_or("")
             });
-            let (request, participant, provider) = if let Some(observation) = observation {
+            let (request, participant, provider) = if let Some((observation_key, observation)) =
+                observation
+            {
                 let Some(dispatch) = observation.dispatch.as_ref() else {
                     continue;
                 };
                 let selected = self.selections.get(caller);
-                if observation.participant.provider != caller
+                let release_context_valid = if work.phase == LifecyclePhase::StreamRelease {
+                    work.providers.get(work.index).is_some_and(|step| {
+                        serde_json::from_str::<(String, String)>(observation_key)
+                            .ok()
+                            .as_ref()
+                            == Some(&(step.clone(), caller.to_owned()))
+                            && self
+                                .resolve_release_observation_binding(work, step)
+                                .is_ok_and(|(_, output)| {
+                                    observation.request.dependency_inputs == [output]
+                                })
+                    })
+                } else {
+                    true
+                };
+                if !release_context_valid
+                    || observation.participant.provider != caller
                     || observation.phase != super::plan_observation::PlanObservationPhase::Ready
                     || !matches!(
                         dispatch.state,

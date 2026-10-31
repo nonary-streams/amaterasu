@@ -53,7 +53,10 @@ impl PlanObservationDriver {
         api::validate_provider_request(&state.request)?;
         if state.request.version != api::COMPOSITION_VERSION
             || state.request.operation != ProviderOperation::ResourcePlan
-            || state.request.phase != LifecyclePhase::StreamPrepare
+            || !matches!(
+                state.request.phase,
+                LifecyclePhase::StreamPrepare | LifecyclePhase::StreamRelease
+            )
             || !matches!(state.request.target, api::LifecycleTarget::Stream { .. })
             || state.participant.contract_version != api::COMPOSITION_VERSION
             || state.request.settings_revision != state.participant.settings_revision
