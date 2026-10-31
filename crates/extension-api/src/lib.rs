@@ -308,6 +308,8 @@ pub struct ProviderRequest {
 #[serde(rename_all = "snake_case")]
 pub enum ProviderOperation {
     ResourcePlan,
+    /// Read-only v2 planning for finalizing a staged owner output.
+    ResourceFinalizePlan,
     LifecycleCallback,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -552,6 +554,32 @@ pub fn validate_provider_request(request: &ProviderRequest) -> Result<(), String
                 return Err("planning does not authorize effects".into());
             }
         }
+        ProviderOperation::ResourceFinalizePlan => {
+            if request.version != COMPOSITION_VERSION
+                || request.dependency_inputs.len() != 1
+                || request.approved_plan.is_some()
+                || request.admission_id.is_some()
+                || request.plan_revision.is_some()
+            {
+                return Err("invalid finalize planning request".into());
+            }
+            let current = &request.dependency_inputs[0];
+            let mut seen = std::collections::BTreeSet::new();
+            for result in &request.control_results {
+                if !valid_opaque_id(&result.proposal_id) || !seen.insert(&result.proposal_id) {
+                    return Err("invalid finalize control result".into());
+                }
+                validate_output_refinement(&result.output, current)?;
+                if let Some(candidate) = &result.candidate {
+                    validate_capture_binding(candidate)?;
+                    if candidate.resource != result.output.resource
+                        || !matches!(&request.target, LifecycleTarget::Stream { generation, .. } if candidate.generation == *generation)
+                    {
+                        return Err("finalize control candidate mismatch".into());
+                    }
+                }
+            }
+        }
         ProviderOperation::LifecycleCallback => {
             let plan = request
                 .approved_plan
@@ -604,6 +632,7 @@ pub fn validate_resource_plan(plan: &ResourcePlan) -> Result<(), String> {
     }
     let mut resources = BTreeSet::new();
     for resource in &plan.resources {
+        let resource_domains: BTreeSet<_> = resource.mutation_domains.iter().collect();
         if !valid_identifier(&resource.provider)
             || !valid_opaque_id(&resource.resource_id)
             || !valid_opaque_id(&resource.execution_domain)
@@ -612,6 +641,7 @@ pub fn validate_resource_plan(plan: &ResourcePlan) -> Result<(), String> {
                 .as_ref()
                 .is_some_and(|id| !valid_opaque_id(id))
             || !resources.insert((&resource.provider, &resource.resource_id))
+            || resource_domains.len() != resource.mutation_domains.len()
             || resource
                 .mutation_domains
                 .iter()
@@ -822,6 +852,41 @@ pub fn validate_provider_response(
             validate_composition_plan(request, plan)?;
             validate_consumer_requirements(plan, &request.consumer_requirements)
         }
+        ProviderResponse::Planned { plan }
+            if request.operation == ProviderOperation::ResourceFinalizePlan =>
+        {
+            validate_resource_plan(plan)?;
+            validate_consumer_requirements(plan, &request.consumer_requirements)?;
+            let output = &request.dependency_inputs[0];
+            if !plan.control_proposals.is_empty()
+                || !plan.resources.iter().any(|resource| {
+                    resource.provider == output.resource.provider
+                        && resource.resource_id == output.resource.resource_id
+                        && resource.incarnation.as_deref() == Some(&output.resource.incarnation)
+                        && resource.expected_revision == Some(output.resource.revision)
+                        && resource.execution_domain == output.resource.execution_domain
+                        && resource
+                            .mutation_domains
+                            .iter()
+                            .collect::<std::collections::BTreeSet<_>>()
+                            == output
+                                .domain_observations
+                                .iter()
+                                .map(|entry| &entry.domain)
+                                .collect()
+                })
+                || output.domain_observations.iter().any(|observed| {
+                    !plan.mutation_domains.iter().any(|domain| {
+                        domain.domain == observed.domain
+                            && domain.expected_revision == observed.revision
+                            && domain.borrowers == observed.borrowers
+                    })
+                })
+            {
+                return Err("finalize plan outside selected output".into());
+            }
+            Ok(())
+        }
         ProviderResponse::Prepared {
             candidate,
             obligations,
@@ -840,12 +905,23 @@ pub fn validate_provider_response(
             let mut output_ids = std::collections::BTreeSet::new();
             for output in outputs {
                 validate_resource_output(output)?;
+                let output_domains: std::collections::BTreeSet<_> = output
+                    .resource
+                    .mutation_domains
+                    .iter()
+                    .chain(output.resource.mutation_domain.iter())
+                    .collect();
                 if !output_in_scope(output, &request.target)
                     || !output_ids.insert((&output.producer, &output.output_id))
                     || !plan.resources.iter().any(|resource| {
                         resource.provider == output.resource.provider
                             && resource.resource_id == output.resource.resource_id
                             && resource.execution_domain == output.resource.execution_domain
+                            && resource
+                                .mutation_domains
+                                .iter()
+                                .collect::<std::collections::BTreeSet<_>>()
+                                == output_domains
                             && resource
                                 .incarnation
                                 .as_ref()
@@ -1102,6 +1178,78 @@ mod tests {
             candidate: None,
         });
         assert!(validate_provider_request(&request).is_ok());
+    }
+
+    #[test]
+    fn prepared_output_domains_must_equal_admitted_resource_domains() {
+        let target =
+            json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1});
+        let resource = json!({"provider":"example.owner","resource_id":"resource","incarnation":"instance","revision":4,"execution_domain":"seat","mutation_domain":"domain","mutation_domains":["domain"]});
+        let output: ResourceOutput = serde_json::from_value(json!({"output_id":"selected","capability":"example.target","schema":{"id":"example.schema/1","major":1,"minor":0,"digest":"a".repeat(64)},"producer":"example.owner","producer_service":"example.owner/2","origin":target,"resource":resource,"domain_observations":[{"domain":"domain","revision":1,"borrowers":{},"complete":true}],"data":{}})).unwrap();
+        let plan: ResourcePlan = serde_json::from_value(json!({"plan_id":"plan","revision":1,"resources":[{"provider":"example.owner","resource_id":"resource","incarnation":"instance","expected_revision":4,"execution_domain":"seat","mutation_domains":["domain"],"access":"exclusive"}],"mutation_domains":[{"domain":"domain","expected_revision":1,"borrowers":{},"access":"exclusive"}],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]})).unwrap();
+        let request: ProviderRequest = serde_json::from_value(json!({"version":2,"provider_sequence":1,"operation":"lifecycle_callback","transition_id":"transition","operation_id":"operation","target":target,"phase":"session.prepare","settings_revision":"settings","settings":{},"intent":"initial","reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector/1"]},"remaining_ms":5000,"plan_revision":1,"admission_id":"admitted","approved_plan":plan})).unwrap();
+        let response = |output| ProviderResponse::Prepared {
+            candidate: None,
+            obligations: vec![],
+            outputs: vec![output],
+        };
+        assert!(validate_provider_response(&request, &response(output.clone())).is_ok());
+        let mut foreign = output.clone();
+        foreign.resource.mutation_domains.push("foreign".into());
+        foreign.domain_observations.push(DomainObservation {
+            domain: "foreign".into(),
+            revision: 1,
+            borrowers: Default::default(),
+            complete: true,
+        });
+        assert!(validate_resource_output(&foreign).is_ok());
+        assert!(validate_provider_response(&request, &response(foreign)).is_err());
+        let mut omitted = output;
+        omitted.resource.mutation_domain = None;
+        omitted.resource.mutation_domains.clear();
+        omitted.domain_observations.clear();
+        assert!(validate_provider_response(&request, &response(omitted)).is_err());
+        let mut duplicate_plan = request.approved_plan.unwrap();
+        duplicate_plan.resources[0]
+            .mutation_domains
+            .push("domain".into());
+        assert!(validate_resource_plan(&duplicate_plan).is_err());
+    }
+
+    #[test]
+    fn finalize_planning_binds_current_output_and_prior_controls() {
+        let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":2});
+        let resource = json!({"provider":"example.owner","resource_id":"resource","incarnation":"instance","revision":4,"execution_domain":"seat","mutation_domain":"domain","mutation_domains":["domain"]});
+        let output = json!({"output_id":"selected","capability":"example.target","schema":{"id":"example.schema/1","major":1,"minor":0,"digest":"a".repeat(64)},"producer":"example.owner","producer_service":"example.owner/2","origin":{"kind":"session","host_epoch":"epoch","session_id":"session","generation":1},"resource":resource,"domain_observations":[{"domain":"domain","revision":3,"borrowers":{"stream":2},"complete":true}],"data":{}});
+        let request: ProviderRequest = serde_json::from_value(json!({"version":2,"provider_sequence":1,"operation":"resource_finalize_plan","transition_id":"transition","operation_id":"operation","target":target,"phase":"stream.prepare","settings_revision":"settings","settings":{},"intent":"initial","reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector/1"]},"remaining_ms":5000,"plan_revision":null,"admission_id":null,"approved_plan":null,"dependency_inputs":[output],"control_results":[{"proposal_id":"control","output":output,"candidate":null}]})).unwrap();
+        let plan: ResourcePlan = serde_json::from_value(json!({"plan_id":"final-plan","revision":1,"resources":[{"provider":"example.owner","resource_id":"resource","incarnation":"instance","expected_revision":4,"execution_domain":"seat","mutation_domains":["domain"],"access":"read"}],"mutation_domains":[{"domain":"domain","expected_revision":3,"borrowers":{"stream":2},"access":"read"}],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]})).unwrap();
+        assert!(validate_provider_request(&request).is_ok());
+        assert!(
+            validate_provider_response(&request, &ProviderResponse::Planned { plan: plan.clone() })
+                .is_ok()
+        );
+        let mut old = request.clone();
+        old.version = CONTRACT_VERSION;
+        assert!(validate_provider_request(&old).is_err());
+        let mut extra = request.clone();
+        extra.admission_id = Some("admission".into());
+        assert!(validate_provider_request(&extra).is_err());
+        let mut extra = request.clone();
+        extra.dependency_inputs.clear();
+        assert!(validate_provider_request(&extra).is_err());
+        let mut stale = plan.clone();
+        stale.mutation_domains[0].expected_revision -= 1;
+        assert!(
+            validate_provider_response(&request, &ProviderResponse::Planned { plan: stale })
+                .is_err()
+        );
+        let mut substituted = request.clone();
+        substituted.control_results[0].output.resource.incarnation = "other".into();
+        assert!(validate_provider_request(&substituted).is_err());
+        let mut previous = request.clone();
+        previous.control_results[0].output.resource.revision -= 1;
+        previous.control_results[0].output.domain_observations[0].revision -= 1;
+        assert!(validate_provider_request(&previous).is_ok());
     }
 
     #[test]
