@@ -923,7 +923,7 @@ pub(super) fn record_session_release_proof(
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::coordinator) mod tests {
     use super::*;
     use serde_json::json;
 
@@ -938,7 +938,7 @@ mod tests {
         (journal, work)
     }
 
-    fn complete_fixture() -> (Journal, Work, PrepareState) {
+    pub(in crate::coordinator) fn complete_fixture() -> (Journal, Work, PrepareState) {
         use crate::prepare_authority::{Admission, MethodApproval, ProviderSelection};
         use crate::provider_dispatch::{DispatchRecord, DispatchState, ProviderCall};
         let (mut journal, work) = fixture();

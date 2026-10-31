@@ -443,12 +443,12 @@ impl<J: ControlJournal> DispatchJournal for JournalBridge<'_, J> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::coordinator) mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::VecDeque;
 
-    fn fixture() -> ControlDispatchState {
+    pub(in crate::coordinator) fn fixture() -> ControlDispatchState {
         let target = json!({"kind":"stream","host_epoch":"e","session_id":"s","stream_id":"t","generation":7});
         let resource = json!({"provider":"display","resource_id":"r","incarnation":"i","revision":1,"execution_domain":"seat","mutation_domain":null,"mutation_domains":[]});
         let schema = json!({"id":"output","major":1,"minor":0,"digest":"digest"});
