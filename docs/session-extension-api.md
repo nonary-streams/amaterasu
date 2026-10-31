@@ -96,6 +96,13 @@ queries before subsequent native effects. Completion releases rights and retains
 any outstanding cleanup obligations. The initial mutation implementation requires
 a single active stream; unsupported target or borrower combinations are rejected.
 
+When an invocation supplies `expected_settings_revision`, the action service
+compares that decimal revision with the provider's current registry document
+before planning. This is a point-in-time check: a concurrent settings save can
+occur after the comparison, because admission does not reserve that revision.
+Execution separately binds the selected session or stream's frozen settings
+snapshot; the comparison does not replace that binding.
+
 Keyboard actions run through the normal action service. The input module retains
 press/release ownership, records delivery before committing an action, and uses a
 lifecycle reservation. A transferred action may outlive its triggering input
