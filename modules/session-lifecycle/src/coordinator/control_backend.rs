@@ -786,6 +786,31 @@ impl Coordinator {
             if caller.is_empty() || caller != tuple.request.proposal.owner_provider {
                 return Err("settlement_owner_mismatch".into());
             }
+            if !preflight {
+                let shared = self.shared.borrow();
+                let journal = &shared.value;
+                if journal
+                    .closed_streams
+                    .contains_target(&tuple.request.target)
+                {
+                    // An original record and a checkpoint for the same stream
+                    // are ambiguous even if only one matches this tuple.
+                    if super::checkpoint_queries::has_original_result(
+                        journal,
+                        &tuple.request.target,
+                    ) {
+                        return Err("ambiguous_settlement_history".into());
+                    }
+                    return super::checkpoint_queries::control_settlement(
+                        &journal.closed_streams,
+                        journal,
+                        &self.settings,
+                        caller,
+                        &tuple,
+                    )
+                    .ok_or_else(|| "settlement_checkpoint_unavailable".into());
+                }
+            }
             if !preflight && let Some(result) = self.verify_historical_settlement(caller, &tuple)? {
                 return Ok(result);
             }

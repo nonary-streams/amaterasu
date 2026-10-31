@@ -29,6 +29,25 @@ impl Coordinator {
         if !journal.finalize_results.validate_structure() {
             return Err("invalid_finalize_result_book".into());
         }
+        if journal
+            .closed_streams
+            .contains_target(&query.request.target)
+        {
+            // A closed scope must have one source of truth. Never use a
+            // checkpoint while an original finalization for the target remains.
+            if super::checkpoint_queries::has_original_result(journal, &query.request.target) {
+                return Err("ambiguous_finalize_history".into());
+            }
+            return super::checkpoint_queries::finalize_result(
+                &journal.closed_streams,
+                journal,
+                &self.settings,
+                caller,
+                &query.request,
+                &query.response,
+            )
+            .ok_or_else(|| "finalize_checkpoint_unavailable".into());
+        }
         let mut matches = journal
             .finalize_results
             .records()

@@ -5,9 +5,23 @@
 use super::{Journal, closed_stream::ClosedStreamBook};
 use crate::adapter::LifecycleSettings;
 use amaterasu_extension_api::{
-    ResourceControlResponse, ResourceControlSettlementRequest, ResourceFinalizeRequest,
+    LifecycleTarget, ResourceControlResponse, ResourceControlSettlementRequest,
+    ResourceFinalizeRequest,
 };
 use serde_json::{Value, json};
+
+/// A checkpoint and any original result for the same stream are ambiguous,
+/// including when the residual result belongs to the other query kind.
+pub(super) fn has_original_result(journal: &Journal, target: &LifecycleTarget) -> bool {
+    journal
+        .finalize_results
+        .records()
+        .any(|record| &record.request.target == target)
+        || journal
+            .control_settlements
+            .records()
+            .any(|record| &record.settlement.request.target == target)
+}
 
 /// Project an exact, authenticated historical finalization into the existing
 /// `verify_finalize_result` response. This does not validate an effect permit.
