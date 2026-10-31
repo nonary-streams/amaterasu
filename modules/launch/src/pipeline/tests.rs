@@ -107,6 +107,7 @@ struct Harness {
     generic_lost_start: bool,
     generic_bad_proof: bool,
     drop_prepare_result: bool,
+    policy_reply: Option<Value>,
 }
 impl Harness {
     fn new() -> Self {
@@ -184,6 +185,7 @@ impl Harness {
             generic_lost_start: false,
             generic_bad_proof: false,
             drop_prepare_result: false,
+            policy_reply: None,
         }
     }
     fn session_reply(session: &TestSession) -> Value {
@@ -591,6 +593,10 @@ impl Harness {
                         "id":payload["id"],"revision":payload["revision"],
                         "executor":"runner","application_id":"fixture-game"
                     }}),
+                    "selected.policy/1" => self.policy_reply.clone().unwrap_or_else(|| json!({"ok":true,"policy":{
+                        "application":payload["application"],"entry_revision":payload["entry_revision"],
+                        "policy_revision":"policy:opaque-v1","preparation":[{"run":{"executable":std::env::current_exe().unwrap()}}]
+                    }})),
                     crate::workflow::CATALOG => {
                         assert_eq!(parent, Some(7));
                         assert!(matches!(
@@ -5254,4 +5260,87 @@ fn selected_library_cancel_after_preparation_retires_lease() {
             .iter()
             .all(|session| session.lease.is_none())
     );
+}
+
+#[test]
+fn independently_selected_policy_is_frozen_before_session_and_provider_effects() {
+    let mut harness = Harness::new();
+    let mut pipeline = pipeline();
+    let routes = serde_json::from_value(json!({"games":{
+        "service":"selected.library/2","callers":["alice"],
+        "executors":{"runner":"example.provider/1"},"policy_service":"selected.policy/1",
+        "require_application_policy":true
+    }}))
+    .unwrap();
+    pipeline.set_library_routes(routes);
+    let started = harness.request_service(
+        &mut pipeline,
+        "amaterasu.launch/2",
+        "alice",
+        "alice",
+        selected_library_request("resolved-policy"),
+    );
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    let policy = harness
+        .commands
+        .iter()
+        .position(|(service, _, _)| service == "selected.policy/1")
+        .unwrap();
+    let session = harness
+        .commands
+        .iter()
+        .position(|(service, payload, _)| {
+            service == crate::workflow::SESSION && payload["action"] == "create"
+        })
+        .unwrap();
+    let preparation = harness
+        .commands
+        .iter()
+        .position(|(service, payload, _)| {
+            service == crate::workflow::APPLICATION && payload["action"] == "prepare"
+        })
+        .unwrap();
+    assert!(policy < session && session < preparation);
+    assert_eq!(
+        pipeline
+            .records
+            .values
+            .values()
+            .next()
+            .unwrap()
+            .library_policy_revision
+            .as_deref(),
+        Some("policy:opaque-v1")
+    );
+    let stopped = harness.request(
+        &mut pipeline,
+        "alice",
+        json!({"action":"stop","launch_id":started["launch"]["launch_id"]}),
+    );
+    assert_eq!(stopped["launch"]["state"], "stopped");
+}
+
+#[test]
+fn selected_policy_mismatch_fails_before_session_or_executor_effects() {
+    let mut harness = Harness::new();
+    harness.policy_reply = Some(
+        json!({"ok":true,"policy":{"application":{"library":"games","id":"opaque/game"},
+        "entry_revision":"old","policy_revision":"policy-v1","preparation":[]}}),
+    );
+    let mut pipeline = pipeline();
+    pipeline.set_library_routes(serde_json::from_value(json!({"games":{
+        "service":"selected.library/2","callers":["alice"],"executors":{"runner":"example.provider/1"},
+        "policy_service":"selected.policy/1","require_application_policy":true
+    }})).unwrap());
+    let result = harness.request_service(
+        &mut pipeline,
+        "amaterasu.launch/2",
+        "alice",
+        "alice",
+        selected_library_request("stale-policy"),
+    );
+    assert_eq!(result["launch"]["state"], "failed", "{result}");
+    assert!(harness.sessions.is_empty());
+    assert!(!harness.generic_started);
+    assert!(harness.preparations.is_empty());
 }

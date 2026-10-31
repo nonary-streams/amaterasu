@@ -12,12 +12,54 @@ use amaterasu_module_sdk::application_library::v2::{
 };
 use amaterasu_runtime::Broker;
 use serde_json::{Value, json};
-use std::{cell::RefCell, ffi::c_void, rc::Rc};
+use std::{cell::RefCell, collections::BTreeSet, ffi::c_void, rc::Rc};
 
 const LIBRARY: &str = "example.independent-library/2";
 const LAUNCH: &str = "amaterasu.launch";
 const SESSION: &str = "amaterasu.session/1";
 const APPLICATION: &str = "amaterasu.application/1";
+const POLICY: &str = "fixture.policy/1";
+
+struct FixturePolicy(bool);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResolverSelection {
+    First,
+    Second,
+    MissingInitiatorGrant,
+}
+impl amaterasu_module_sdk::application_library::policy::PolicyProvider for FixturePolicy {
+    fn resolve(
+        &mut self,
+        _: &amaterasu_module_sdk::application_library::policy::Identity<'_>,
+        request: &amaterasu_module_sdk::application_library::policy::Request,
+    ) -> Result<amaterasu_module_sdk::application_library::policy::Snapshot, &'static str> {
+        use amaterasu_module_sdk::application_library::policy::{
+            CommandSpec, PreparationStep, Snapshot,
+        };
+        Ok(Snapshot {
+            application: request.application.clone(),
+            entry_revision: request.entry_revision.clone(),
+            policy_revision: if self.0 {
+                "independent-policy"
+            } else {
+                "first-policy"
+            }
+            .into(),
+            working_directory: None,
+            exit_timeout_seconds: 10,
+            preparation: vec![PreparationStep {
+                run: CommandSpec {
+                    executable: std::env::current_exe().unwrap().to_string_lossy().into(),
+                    args: vec![],
+                    environment: Default::default(),
+                    cwd: None,
+                    timeout_ms: 10000,
+                },
+                undo: None,
+            }],
+        })
+    }
+}
 
 #[derive(Default)]
 struct Session {
@@ -34,6 +76,7 @@ struct Shared {
     session: Session,
     preparation: Option<(String, &'static str)>,
     fail_preparation: bool,
+    policy_revisions: Vec<String>,
 }
 struct Endpoint {
     name: &'static str,
@@ -46,6 +89,12 @@ unsafe extern "C" fn invoke(context: *mut c_void, input: BorrowedBytes, sink: Re
     // SAFETY: the SDK lends readable input until this synchronous invocation returns.
     let mut command: Command = serde_json::from_slice(unsafe { input.read().unwrap() }).unwrap();
     let mut shared = endpoint.shared.borrow_mut();
+    if endpoint.name == "policy"
+        && let Command::Complete { payload, .. } = &command
+        && let Some(revision) = payload["policy"]["policy_revision"].as_str()
+    {
+        shared.policy_revisions.push(revision.into());
+    }
     if endpoint.name == LAUNCH
         && let Command::TakeResult { request } = &command
         && shared.lose_start_reply
@@ -275,6 +324,8 @@ struct Composition {
     library: SelectedLibrary,
     provider: Module,
     application: Option<ArtifactLibrary>,
+    policy: Option<amaterasu_module_sdk::application_library::policy::PolicyAdapter<FixturePolicy>>,
+    policy_artifact: Option<ArtifactLibrary>,
     // HostApi context pointers must survive moving endpoints into this vector.
     #[allow(clippy::vec_box)]
     _endpoints: Vec<Box<Endpoint>>,
@@ -302,6 +353,7 @@ impl Composition {
             fail_preparation,
             None,
             false,
+            None,
         )
     }
 
@@ -312,6 +364,7 @@ impl Composition {
         fail_preparation: bool,
         real_preparation_log: Option<&std::path::Path>,
         hold_preparation: bool,
+        resolver: Option<ResolverSelection>,
     ) -> Self {
         let mut config = RuntimeConfig::default();
         for principal in ["alice", "mallory"] {
@@ -330,6 +383,24 @@ impl Composition {
                 &["amaterasu.launch/1", v2::LAUNCH_SERVICE],
             ),
         );
+        if resolver.is_some() {
+            for principal in ["alice", LAUNCH] {
+                if principal == "alice"
+                    && resolver == Some(ResolverSelection::MissingInitiatorGrant)
+                {
+                    continue;
+                }
+                config
+                    .principals
+                    .get_mut(principal)
+                    .unwrap()
+                    .call
+                    .insert(POLICY.into());
+            }
+            config
+                .principals
+                .insert("policy".into(), grants(&[], &[POLICY]));
+        }
         config
             .principals
             .insert("library".into(), grants(&[], &[LIBRARY]));
@@ -372,7 +443,8 @@ impl Composition {
             LAUNCH.into(),
             json!({"library_routes":{"games":{
             "service":LIBRARY,"callers":["alice"],"executors":{"runner":SERVICE},
-            "require_application_policy":use_preparation,"application_policies":policy}}}),
+            "require_application_policy":use_preparation || resolver.is_some(),"application_policies":policy,
+            "policy_service":resolver.map(|_| POLICY)}}}),
         );
         config.settings.insert(
             "provider".into(),
@@ -382,7 +454,29 @@ impl Composition {
             "callers":{"alice":{"initiators":["alice"],"read":true},LAUNCH:{"initiators":["alice"],"resolve_launch":true}},
             "revision":"snapshot-v1","entries":[entry("opaque/library/game"),entry("unrelated")],
             "targets":[target("opaque/library/game")]}));
+        let selected_policy_artifact = resolver
+            .filter(|variant| *variant == ResolverSelection::Second)
+            .and_then(|_| std::env::var_os("AMATERASU_POLICY_ARTIFACT"));
         let mut broker = Broker::new(config).unwrap();
+        let policy = resolver
+            .filter(|_| selected_policy_artifact.is_none())
+            .map(|variant| {
+                assert!(matches!(
+                    broker.dispatch(
+                        "policy",
+                        Command::Register {
+                            service: POLICY.into()
+                        }
+                    ),
+                    Response::Ok
+                ));
+                amaterasu_module_sdk::application_library::policy::PolicyAdapter::new(
+                    FixturePolicy(variant == ResolverSelection::Second),
+                    POLICY.into(),
+                    BTreeMap::from([(LAUNCH.into(), BTreeSet::from(["alice".into()]))]),
+                )
+                .unwrap()
+            });
         assert!(matches!(
             broker.dispatch(
                 "session",
@@ -412,11 +506,13 @@ impl Composition {
             session: Session::default(),
             preparation: None,
             fail_preparation,
+            policy_revisions: vec![],
         }));
         let mut launch_endpoint = endpoint(LAUNCH, shared.clone());
         let mut library_endpoint = endpoint("library", shared.clone());
         let mut provider_endpoint = endpoint("provider", shared.clone());
         let mut application_endpoint = endpoint("application", shared.clone());
+        let mut policy_endpoint = endpoint("policy", shared.clone());
         let launch = LaunchModule::start(client(&mut launch_endpoint)).unwrap();
         let library = if let Some(path) = artifact {
             SelectedLibrary::Artifact(ArtifactLibrary::load(path, &mut library_endpoint))
@@ -443,17 +539,23 @@ impl Composition {
                 .expect("independently built application artifact");
             ArtifactLibrary::load(std::path::Path::new(&path), &mut application_endpoint)
         });
+        let policy_artifact = selected_policy_artifact
+            .as_deref()
+            .map(|path| ArtifactLibrary::load(std::path::Path::new(path), &mut policy_endpoint));
         Self {
             shared,
             launch,
             library,
             provider,
             application,
+            policy,
+            policy_artifact,
             _endpoints: vec![
                 launch_endpoint,
                 library_endpoint,
                 provider_endpoint,
                 application_endpoint,
+                policy_endpoint,
             ],
             request_sequence: 0,
         }
@@ -463,6 +565,10 @@ impl Composition {
         self.launch.tick().unwrap();
         self.library.tick();
         self.provider.tick().unwrap();
+        if let Some(policy) = &mut self.policy_artifact {
+            // SAFETY: the selected artifact and its instance outlive this serialized tick.
+            assert_eq!(unsafe { (policy.api.tick)(policy.instance) }, STATUS_OK);
+        }
         if let Some(application) = &mut self.application {
             // SAFETY: the loaded artifact and its instance remain live and are
             // accessed serially until the composition has been dropped.
@@ -472,6 +578,39 @@ impl Composition {
             );
         }
         let mut shared = self.shared.borrow_mut();
+        if let Some(policy) = &mut self.policy
+            && let Response::Request {
+                id,
+                caller,
+                initiator,
+                service,
+                payload,
+                remaining_ms,
+            } = shared.broker.dispatch("policy", Command::Poll {})
+        {
+            let incoming = amaterasu_module_sdk::requests::IncomingRequest {
+                id,
+                caller,
+                initiator,
+                service,
+                payload,
+                remaining_ms,
+            };
+            let response = policy.dispatch(&incoming);
+            if let Some(revision) = response["policy"]["policy_revision"].as_str() {
+                shared.policy_revisions.push(revision.into());
+            }
+            assert!(matches!(
+                shared.broker.dispatch(
+                    "policy",
+                    Command::Complete {
+                        request: id,
+                        payload: response
+                    }
+                ),
+                Response::Ok
+            ));
+        }
         if self.application.is_none()
             && let Response::Request { id, payload, .. } =
                 shared.broker.dispatch("application", Command::Poll {})
@@ -723,6 +862,117 @@ fn selected_preparation_is_preserved_across_library_replacements_and_failure() {
 }
 
 #[test]
+fn unchanged_consumer_uses_selected_policy_variants_through_real_broker() {
+    for variant in [false, true] {
+        let mut composition = Composition::configure(
+            false,
+            None,
+            false,
+            false,
+            None,
+            false,
+            Some(if variant {
+                ResolverSelection::Second
+            } else {
+                ResolverSelection::First
+            }),
+        );
+        let request = composition.selection();
+        let started = composition.request("alice", v2::LAUNCH_SERVICE, request);
+        assert_eq!(started["launch"]["state"], "active", "{started}");
+        let stopped = composition.request(
+            "alice",
+            v2::LAUNCH_SERVICE,
+            json!({"action":"stop","launch_id":started["launch"]["launch_id"]}),
+        );
+        assert_eq!(stopped["launch"]["state"], "stopped", "{stopped}");
+        let state = composition.shared.borrow();
+        let policy = state
+            .requests
+            .iter()
+            .position(|(service, _, _)| service == POLICY)
+            .unwrap();
+        let prepare = state
+            .requests
+            .iter()
+            .position(|(service, payload, _)| {
+                service == APPLICATION && payload["action"] == "prepare"
+            })
+            .unwrap();
+        assert!(policy < prepare);
+        assert!(state.requests[policy].2.is_some());
+        assert!(state.session.lease.is_none());
+    }
+}
+
+#[test]
+fn missing_parent_policy_grant_fails_before_preparation_or_executor() {
+    let mut composition = Composition::configure(
+        false,
+        None,
+        false,
+        false,
+        None,
+        false,
+        Some(ResolverSelection::MissingInitiatorGrant),
+    );
+    let request = composition.selection();
+    let result = composition.request("alice", v2::LAUNCH_SERVICE, request);
+    assert_eq!(result["launch"]["state"], "failed", "{result}");
+    let state = composition.shared.borrow();
+    assert!(state.policy_revisions.is_empty());
+    assert!(state.session.key.is_empty());
+    assert!(
+        !state
+            .requests
+            .iter()
+            .any(|(service, payload, _)| (service == APPLICATION
+                && payload["action"] == "prepare")
+                || (service == SERVICE && payload["action"] == "launch"))
+    );
+}
+
+#[test]
+#[ignore = "requires AMATERASU_POLICY_ARTIFACT pointing to the independently built policy cdylib"]
+fn independently_built_policy_replaces_the_selected_resolver() {
+    assert!(std::env::var_os("AMATERASU_POLICY_ARTIFACT").is_some());
+    for (variant, expected_revision) in [(false, "first-policy"), (true, "artifact-policy-v1")] {
+        let mut composition = Composition::configure(
+            false,
+            None,
+            false,
+            false,
+            None,
+            false,
+            Some(if variant {
+                ResolverSelection::Second
+            } else {
+                ResolverSelection::First
+            }),
+        );
+        assert_eq!(composition.policy_artifact.is_some(), variant);
+        let request = composition.selection();
+        let started = composition.request("alice", v2::LAUNCH_SERVICE, request);
+        assert_eq!(started["launch"]["state"], "active", "{started}");
+        let stopped = composition.request(
+            "alice",
+            v2::LAUNCH_SERVICE,
+            json!({"action":"stop","launch_id":started["launch"]["launch_id"]}),
+        );
+        assert_eq!(stopped["launch"]["state"], "stopped", "{stopped}");
+        let state = composition.shared.borrow();
+        assert_eq!(state.policy_revisions, [expected_revision]);
+        assert!(
+            state
+                .requests
+                .iter()
+                .any(|(service, _, parent)| service == POLICY && parent.is_some())
+        );
+        assert!(state.session.lease.is_none());
+    }
+}
+
+#[test]
 #[ignore = "subprocess fixture invoked by real_preparation_is_retired_after_failure_and_stop"]
 fn preparation_subprocess() {
     use std::io::Write;
@@ -763,7 +1013,7 @@ fn real_preparation_is_retired_after_failure_and_stop() {
                 artifact.as_deref().map(std::path::Path::new)
             };
             let mut composition =
-                Composition::configure(generated, artifact, true, fail, Some(&log), false);
+                Composition::configure(generated, artifact, true, fail, Some(&log), false, None);
             let launch = composition.selection();
             let result = composition.request("alice", v2::LAUNCH_SERVICE, launch);
             if fail {
@@ -805,7 +1055,7 @@ fn real_preparation_cancellation_undoes_completed_steps_before_lease_release() {
     let dir = std::env::temp_dir().join(unique);
     std::fs::create_dir(&dir).unwrap();
     let log = dir.join("steps.log");
-    let mut composition = Composition::configure(false, None, true, false, Some(&log), true);
+    let mut composition = Composition::configure(false, None, true, false, Some(&log), true, None);
     let launch = composition.selection();
     let Response::Accepted { id } = composition.shared.borrow_mut().broker.dispatch(
         "alice",

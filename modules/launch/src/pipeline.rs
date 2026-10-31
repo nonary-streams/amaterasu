@@ -1540,7 +1540,28 @@ impl Pipeline {
                     .map_err(|_| "cleanup budget exceeds protocol range")?;
                 record.target = Some(target);
                 record.generic_provider_service = Some(service);
+                record.library_policy_service = route.policy_service.clone();
                 record.resource = Some(resource);
+                job.step = if route.policy_service.is_some() {
+                    Step::LibraryPolicy
+                } else {
+                    Step::CreateSession
+                };
+            }
+            Step::LibraryPolicy => {
+                let Some(selection) = record.library_selection.as_ref() else {
+                    return self.dependency_failed(job, "invalid_policy_response", send);
+                };
+                let Some(target) = record.target.as_mut() else {
+                    return self.dependency_failed(job, "invalid_policy_response", send);
+                };
+                let revision = match crate::library::apply_policy(selection, target, payload) {
+                    Ok(revision) => revision,
+                    Err(code) => return self.dependency_failed(job, code, send),
+                };
+                record.cleanup_budget_ms = u64::try_from(cleanup_budget(Some(target)).as_millis())
+                    .map_err(|_| "cleanup budget exceeds protocol range")?;
+                record.library_policy_revision = Some(revision);
                 job.step = Step::CreateSession;
             }
             Step::Catalog => {

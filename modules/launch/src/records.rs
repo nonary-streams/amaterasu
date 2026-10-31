@@ -70,6 +70,10 @@ pub struct Record {
     #[serde(skip)]
     pub generic_provider_service: Option<String>,
     #[serde(skip)]
+    pub library_policy_service: Option<String>,
+    #[serde(skip)]
+    pub library_policy_revision: Option<String>,
+    #[serde(skip)]
     pub generic_provider_incarnation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_overrides: Option<ApplicationConfigOverrides>,
@@ -296,6 +300,8 @@ impl Records {
                 legacy_global_preparation,
                 provider_ticket: None,
                 generic_provider_service: None,
+                library_policy_service: None,
+                library_policy_revision: None,
                 generic_provider_incarnation: None,
                 config_overrides: None,
                 application_display_settings: None,

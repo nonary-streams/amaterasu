@@ -139,8 +139,24 @@ Preparation runs before the executor starts; confirmed provider retirement
 precedes preparation cleanup and session lease release. Failure or cancellation
 uses the existing application preparation lease and cleanup reconciliation. The
 policy has no raw or elevated command form, and settings cannot be changed live.
-This does not implement global preparation, client-specific preparation, a
-versioned policy resolver or NVHTTP preflight for `/2`.
+This static policy does not implement global or client-specific preparation,
+and it does not add NVHTTP preflight for `/2`.
+
+A route can instead specify `"policy_service":"example.policy/1"` and omit
+`application_policies`. Launch requests a private snapshot from that exact
+startup-selected service before creating a session. The SDK's
+`application_library::policy` defines the versioned request, bounded snapshot,
+provider trait and caller/initiator-checking adapter. The resolver echoes the
+logical application and opaque entry revision and supplies a separate opaque
+`policy_revision`, working directory, exit timeout and structured preparation.
+Launch validates the identity and command plan and retains that policy revision
+with its owned launch. A missing, rejected, malformed or mismatched response
+fails before session or executor effects; there is no static fallback. The
+selected consumer and Launch each need the exact resolver call grant for a
+parented request, and the provider must independently authorize the broker
+caller and initiator. These are test/operator composition choices, not new
+default or installed grants. This `/2` route still does not offer streaming
+preflight, display admission, or a client-authenticated policy context.
 
 The provider example has opt-in preparation tests using the real runtime
 broker, the Launch module, a separately built Application module, and two

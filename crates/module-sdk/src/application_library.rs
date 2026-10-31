@@ -418,6 +418,8 @@ mod provider_tests {
 
 /// Startup-selected opaque artwork routing and shared wire validation.
 pub mod artwork;
+/// Private, selected application-policy resolver profile.
+pub mod policy;
 /// Adapter for a broker-registered provider service. Host-side routing and
 /// lifecycle ownership remain separate responsibilities.
 pub mod provider_adapter;
