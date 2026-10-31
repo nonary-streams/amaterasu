@@ -2172,6 +2172,52 @@ pub(in crate::coordinator) mod tests {
                 wait_target: None,
             },
         );
+        let scheduler_path =
+            std::env::temp_dir().join(format!("ended-scheduler-{}", identifier().unwrap()));
+        std::fs::create_dir(&scheduler_path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&scheduler_path, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let mut scheduler = Coordinator::open(&scheduler_path.join("journal.json")).unwrap();
+        save(&scheduler.shared, journal.clone()).unwrap();
+        let before = serde_json::to_value(&scheduler.shared.borrow().value).unwrap();
+        assert!(!scheduler.retire_ended_sessions_if_idle().unwrap());
+        assert_eq!(
+            serde_json::to_value(&scheduler.shared.borrow().value).unwrap(),
+            before
+        );
+        save(&scheduler.shared, with_end.clone()).unwrap();
+        scheduler.ephemeral.insert(
+            "busy".into(),
+            (
+                with_end.receipts[&end_key].clone(),
+                std::time::Instant::now(),
+            ),
+        );
+        let before = serde_json::to_value(&scheduler.shared.borrow().value).unwrap();
+        assert!(!scheduler.retire_ended_sessions_if_idle().unwrap());
+        assert_eq!(
+            serde_json::to_value(&scheduler.shared.borrow().value).unwrap(),
+            before
+        );
+        scheduler.ephemeral.clear();
+        assert!(scheduler.retire_ended_sessions_if_idle().unwrap());
+        assert!(scheduler.shared.borrow().value.sessions.is_empty());
+        assert_eq!(
+            scheduler.handle("transport", "client", end_request.clone()),
+            end_response
+        );
+        drop(scheduler);
+        let mut reopened = Coordinator::open(&scheduler_path.join("journal.json")).unwrap();
+        assert_eq!(
+            reopened.handle("transport", "client", end_request.clone()),
+            end_response
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(scheduler_path).unwrap();
         let mut retired = with_end;
         super::session_closure::retire_ended_session(&mut retired, &work.target).unwrap();
         assert_eq!(

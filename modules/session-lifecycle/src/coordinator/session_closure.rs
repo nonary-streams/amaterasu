@@ -316,3 +316,149 @@ mod tests {
         assert!(!same_root_resource(&refined, &output));
     }
 }
+
+impl Coordinator {
+    /// Retire at most one eligible session per scheduler turn. This hook is
+    /// intentionally not scheduled until all terminal fences are integrated.
+    #[allow(dead_code, reason = "scheduler activation awaits terminal fences")]
+    pub(super) fn retire_ended_sessions_if_idle(&mut self) -> ModuleResult<bool> {
+        if !self.drivers.is_empty()
+            || !self.finalize_drivers.is_empty()
+            || !self.observation_drivers.is_empty()
+            || !self.control_drivers.is_empty()
+            || !self.settlement_drivers.is_empty()
+            || !self.validations.is_empty()
+            || !self.revocations.is_empty()
+            || !self.application_jobs.is_empty()
+            || !self.settings_jobs.is_empty()
+            || !self.ephemeral.is_empty()
+            || !self.retirement_approvals_complete()
+        {
+            return Ok(false);
+        }
+        let mut draft = self.shared.borrow().value.clone();
+        let targets: Vec<_> = draft
+            .sessions
+            .values()
+            .filter(|session| session.phase == SessionPhase::Ended)
+            .map(|session| LifecycleTarget::Session {
+                host_epoch: session.host_epoch.clone(),
+                session_id: session.id.clone(),
+                generation: session.generation,
+            })
+            .collect();
+        for target in targets {
+            let Ok(certificate) =
+                session_closed_history::EndedSessionCertificate::from_verified(&draft, &target)
+            else {
+                continue;
+            };
+            if certificate.end_receipt.is_none() {
+                continue;
+            }
+            if retire_ended_session(&mut draft, &target).is_err() {
+                continue;
+            }
+            save(&self.shared, draft)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn retirement_approvals_complete(&self) -> bool {
+        let has_method = |provider: &str, method: &crate::adapter::MethodSettings| {
+            self.selections.get(provider).is_some_and(|selection| {
+                selection
+                    .approvals
+                    .iter()
+                    .any(|approval| &approval.method == method)
+            })
+        };
+        let has_ref = |provider: &str, method: &amaterasu_extension_api::MethodRef| {
+            has_method(
+                provider,
+                &crate::adapter::MethodSettings {
+                    service: method.service.clone(),
+                    method: method.method.clone(),
+                    interface_major: method.interface_major,
+                    interface_minor: method.interface_minor,
+                    schema_revision: method.schema_revision,
+                },
+            )
+        };
+        self.selections.len() == self.settings.participants.len()
+            && self.settings.participants.iter().all(|participant| {
+                [
+                    &participant.plan_method,
+                    &participant.callback_method,
+                    &participant.status_method,
+                ]
+                .iter()
+                .all(|method| has_method(&participant.provider, method))
+                    && participant
+                        .binding_validate_method
+                        .as_ref()
+                        .is_none_or(|method| has_method(&participant.provider, method))
+            })
+            && self.settings.control_policies.iter().all(|policy| {
+                [
+                    &policy.owner_method,
+                    &policy.status_method,
+                    &policy.settlement_method,
+                ]
+                .iter()
+                .all(|method| has_ref(&policy.owner_provider, method))
+            })
+            && self.settings.finalize_policies.iter().all(|policy| {
+                [&policy.method, &policy.status_method]
+                    .iter()
+                    .all(|method| has_ref(&policy.owner_provider, method))
+            })
+    }
+}
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn ineligible_ended_session_and_pending_ephemeral_are_not_retired() {
+        let path = std::env::temp_dir().join(format!(
+            "session-retirement-scheduler-{}",
+            identifier().unwrap()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut coordinator = Coordinator::open(&path.join("journal.json")).unwrap();
+        let epoch = coordinator.shared.borrow().value.host_epoch.clone();
+        let session: SessionRecord = serde_json::from_value(json!({"host_epoch":epoch,"id":"session","generation":1,"phase":"ended","owner":{"caller":"transport","initiator":"transport"},"delegates":[],"application_ref":{},"settings_revision":"one","application_retired":false,"streams":{}})).unwrap();
+        coordinator
+            .shared
+            .borrow_mut()
+            .value
+            .sessions
+            .insert("session".into(), session);
+        let before = serde_json::to_value(&coordinator.shared.borrow().value).unwrap();
+        assert!(!coordinator.retire_ended_sessions_if_idle().unwrap());
+        assert_eq!(
+            serde_json::to_value(&coordinator.shared.borrow().value).unwrap(),
+            before
+        );
+        let receipt: Receipt = serde_json::from_value(json!({"caller":"transport","initiator":"transport","request":{"operation_id":"op"},"response":{"status":"pending","operation_id":"op"},"work":null})).unwrap();
+        coordinator
+            .ephemeral
+            .insert("op".into(), (receipt, Instant::now()));
+        assert!(!coordinator.retire_ended_sessions_if_idle().unwrap());
+        assert_eq!(
+            serde_json::to_value(&coordinator.shared.borrow().value).unwrap(),
+            before
+        );
+        drop(coordinator);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+}
