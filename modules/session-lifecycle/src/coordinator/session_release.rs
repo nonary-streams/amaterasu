@@ -333,6 +333,18 @@ fn valid_owner_completion(journal: &Journal, proof: &SessionReleaseProof) -> boo
         && proof.callback.request.transition_id == proof.transition_id
         && proof.callback.request.approved_plan.as_ref() == Some(&admission.plan)
         && proof.callback.request.dependency_inputs == [root.output.clone()]
+        && proof
+            .callback
+            .request
+            .resource_generation
+            .is_some_and(|generation| {
+                generation > 0
+                    && root
+                        .callback_proof
+                        .as_ref()
+                        .and_then(|source| source.request.resource_generation)
+                        == Some(generation)
+            })
         && proof.callback.request.control_results.is_empty()
         && session.admission_ids.contains(release_id)
         && session.admission_targets.get(release_id) == Some(&proof.target)
@@ -400,6 +412,7 @@ pub(super) fn validate_session_release_preflight(
     if roots.next().is_some() || !valid_root_provenance(journal, root) {
         return Err("session_root_missing_or_ambiguous".into());
     }
+    resource_generation::current_root_generation(journal, root)?;
     if graph.order.len() == 2 {
         if !session_prepare_evidence::all_dependent_session_prepares_noop(
             journal,
@@ -629,7 +642,14 @@ mod tests {
             },
             state: DispatchState::Completed { payload: response },
         };
-        let root_request = request("session.prepare", "root", "prepare", "root-call");
+        let mut root_request = request("session.prepare", "root", "prepare", "root-call");
+        root_request.resource_generation = Some(1);
+        journal
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .resource_generations
+            .insert("owner".into(), 1);
         let root_terminal = terminal(
             &root_request,
             json!({"status":"prepared","candidate":null,"obligations":plan.obligations,"outputs":[output]}),
@@ -692,6 +712,7 @@ mod tests {
             "release-call",
         );
         release_request.dependency_inputs = vec![output];
+        release_request.resource_generation = Some(1);
         let response = json!({"status":"cleanup","outcomes":[{"obligation_id":"cleanup","state":"released","reason":null}],"outputs":[]});
         let release_terminal = terminal(&release_request, response.clone());
         let state = PrepareState {
@@ -1165,6 +1186,7 @@ mod tests {
         let mut state = root_state.clone();
         state.provider = "settings".into();
         state.request.dependency_inputs.clear();
+        state.request.resource_generation = None;
         state.participant = participant;
         state.plan = Some(plan.clone());
         state.request.approved_plan = Some(plan.clone());
@@ -1429,6 +1451,17 @@ mod tests {
         record_noop_session_release(&mut journal, &work, "settings", &state).unwrap();
         assert!(journal.session_releases.validate(&journal));
         assert!(validate_session_release_preflight(&journal, &owner_work, "owner").is_ok());
+        let mut stale = journal.clone();
+        stale
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .resource_generations
+            .insert("owner".into(), 2);
+        assert_eq!(
+            validate_session_release_preflight(&stale, &owner_work, "owner").unwrap_err(),
+            "resource_generation_stale"
+        );
         journal.receipts.get_mut("receipt").unwrap().work = Some(owner_work.clone());
         record_session_release_proof(&mut journal, &owner_work, "owner", &root_state).unwrap();
         assert!(journal.session_releases.validate(&journal));
@@ -1464,6 +1497,32 @@ mod tests {
             "owner"
         ));
         assert!(!substituted.session_releases.validate(&substituted));
+        let mut wrong_generation = journal.clone();
+        let callback = &mut wrong_generation.session_releases.proofs[0].callback;
+        callback.request.resource_generation = Some(2);
+        callback.terminal.call.arguments = serde_json::to_value(&callback.request).unwrap();
+        assert!(
+            !wrong_generation
+                .session_releases
+                .has_valid_owner_completion(&wrong_generation, &owner_work.target, "owner")
+        );
+        assert!(
+            !wrong_generation
+                .session_releases
+                .validate(&wrong_generation)
+        );
+        let mut advanced_cursor = journal.clone();
+        advanced_cursor
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .resource_generations
+            .insert("owner".into(), 2);
+        assert!(advanced_cursor.session_releases.has_valid_owner_completion(
+            &advanced_cursor,
+            &owner_work.target,
+            "owner"
+        ));
         let restored: Journal =
             serde_json::from_value(serde_json::to_value(journal).unwrap()).unwrap();
         assert!(restored.session_releases.validate(&restored));
