@@ -3,13 +3,36 @@
 from __future__ import annotations
 
 import json
+import queue
 from pathlib import Path
 import tempfile
+import time
 
 from test_component_updates import CARGO, WORKSPACE, run
 from test_host_service import Console
 from test_management_api import Api
 from test_platform_modules import PlatformHarness
+
+
+class DomainConsole(Console):
+    def request(self, service, payload):
+        self.sequence += 1
+        self.send({"op": "request", "service": service, "payload": payload,
+                   "timeout_ms": 15000, "operation_id": f"host-test.{self.sequence}"})
+        result = self.receive()
+        assert result["kind"] == "result", result
+        return result["payload"]
+
+    def receive(self):
+        try:
+            reply = self.replies.get(timeout=60)
+        except queue.Empty as error:
+            raise AssertionError(
+                f"signed host did not reply within 60 seconds; "
+                f"exit={self.process.poll()}, stderr={''.join(self.errors)}"
+            ) from error
+        assert reply is not None, "".join(self.errors)
+        return reply
 
 
 def token(console, scopes):
@@ -22,12 +45,13 @@ def token(console, scopes):
 
 def test_pairing(console, api):
     fixtures = WORKSPACE / "modules/pairing/tests/fixtures"
-    identity = console.request("amaterasu.pairing/1", {
-        "action": "import_identity",
-        "certificate_pem": (fixtures / "host-cert.pem").read_text(),
-        "private_key_pem": (fixtures / "host-key.pem").read_text(),
-    })
-    assert identity["ok"], identity
+    deadline = time.monotonic() + 90
+    while True:
+        identity = console.request("amaterasu.pairing/1", {"action": "initialize"})
+        if identity.get("ok"):
+            break
+        assert time.monotonic() < deadline, identity
+        time.sleep(0.1)
     administrator = token(console, ["pairing.admin"])
     unauthorized = token(console, ["catalog.read"])
     assert api.post("/v1/pairing/identity", token=unauthorized)[0] == 403
@@ -62,6 +86,52 @@ def test_pairing(console, api):
     status, clients, _ = api.post("/v1/pairing/list_clients", token=administrator)
     assert status == 200 and len(clients["clients"]) == 1, clients
     certificate_id = clients["clients"][0]["certificate_id"]
+    assert clients["permission_mode_enabled"] is False, clients
+    assert all(clients["clients"][0]["permissions"].values()), clients
+    permissions = {"list_apps": True, "view_streams": True,
+                   "launch_apps": False, "terminate_streams": False}
+    update = {"certificate_id": certificate_id, "expected_revision": clients["revision"],
+              "permissions": permissions}
+    mode = {"enabled": True, "expected_revision": clients["revision"]}
+    for path, body in (("update_client_permissions", update), ("set_permission_mode", mode)):
+        assert api.post("/v1/pairing/" + path, body, unauthorized)[0] == 403
+
+    status, login, _ = api.post("/v1/auth/login", {
+        "username": "administrator", "password": "local-test-password-only",
+    })
+    assert status == 200 and login["ok"], login
+    status, created, _ = api.post("/v1/accounts/create", {
+        "username": "viewer", "password": "viewer-test-password-only", "role": "viewer",
+    }, login["bearer"])
+    assert status == 200 and created["ok"], created
+    status, viewer, _ = api.post("/v1/auth/login", {
+        "username": "viewer", "password": "viewer-test-password-only",
+    })
+    assert status == 200 and viewer["ok"], viewer
+    for path, body in (("list_clients", {}), ("update_client_permissions", update),
+                       ("set_permission_mode", mode)):
+        assert api.post("/v1/pairing/" + path, body, viewer["bearer"])[0] == 403
+
+    status, changed, _ = api.post("/v1/pairing/update_client_permissions", update, administrator)
+    assert status == 200 and changed["ok"], changed
+    status, conflict, _ = api.post("/v1/pairing/update_client_permissions", update, administrator)
+    assert not conflict["ok"] and conflict.get("code", conflict.get("error", {}).get("code")) == "revision_conflict", conflict
+    status, conflict, _ = api.post("/v1/pairing/set_permission_mode", mode, administrator)
+    assert not conflict["ok"] and conflict.get("code", conflict.get("error", {}).get("code")) == "revision_conflict", conflict
+    status, clients, _ = api.post("/v1/pairing/list_clients", token=administrator)
+    assert status == 200 and clients["clients"][0]["permissions"] == permissions, clients
+    assert clients["permission_mode_enabled"] is False, clients
+    mode["expected_revision"] = clients["revision"]
+    status, enabled, _ = api.post("/v1/pairing/set_permission_mode", mode, administrator)
+    assert status == 200 and enabled["ok"] and enabled["permission_mode_enabled"], enabled
+    status, clients, _ = api.post("/v1/pairing/list_clients", token=administrator)
+    assert status == 200 and clients["permission_mode_enabled"] is True, clients
+    mode = {"enabled": False, "expected_revision": clients["revision"]}
+    status, disabled, _ = api.post("/v1/pairing/set_permission_mode", mode, administrator)
+    assert status == 200 and disabled["ok"] and not disabled["permission_mode_enabled"], disabled
+    status, clients, _ = api.post("/v1/pairing/list_clients", token=administrator)
+    assert status == 200 and clients["permission_mode_enabled"] is False, clients
+    assert clients["clients"][0]["permissions"] == permissions, clients
     assert api.post("/v1/pairing/unpair", {"certificate_id": certificate_id}, unauthorized)[0] == 403
     status, removed, _ = api.post("/v1/pairing/unpair", {"certificate_id": certificate_id}, administrator)
     assert status == 200 and removed["ok"], removed
@@ -108,8 +178,15 @@ def main():
         bootstrap = json.loads(path.read_text())
         bootstrap["policy"]["settings"]["amaterasu.management"].update(enabled=True, bind="127.0.0.1:0")
         path.write_text(json.dumps(bootstrap))
+        credentials = harness.root / "data" / "state" / "credentials"
+        credentials.mkdir(parents=True, exist_ok=True)
+        fixtures = WORKSPACE / "modules/pairing/tests/fixtures"
+        for source, name in (("host-cert.pem", "cacert.pem"), ("host-key.pem", "cakey.pem")):
+            target = credentials / name
+            target.write_bytes((fixtures / source).read_bytes())
+            target.chmod(0o600)
         harness.stage(harness.package(1))
-        console = Console(harness)
+        console = DomainConsole(harness)
         try:
             assert console.request("amaterasu.authentication/1", {
                 "action": "setup", "username": "administrator", "password": "local-test-password-only",
