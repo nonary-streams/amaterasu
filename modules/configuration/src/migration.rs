@@ -1,7 +1,7 @@
 //! Declarative schema replacement: preserve values unless the request explicitly
 //! renames, removes or replaces them. No executable migration hooks are involved.
 use crate::protocol::{Document, error};
-use crate::schema::{Fields, Values, defaults, validate_values};
+use amaterasu_configuration_schema::{Fields, Values, defaults, validate_values};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};

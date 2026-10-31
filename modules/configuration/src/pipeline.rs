@@ -3,7 +3,7 @@ use crate::protocol::{
     Change, Document, Operation, ProductChange, ProductDocument, apply, apply_product, error,
     product_success, success,
 };
-use crate::schema::{defaults, validate_values};
+use amaterasu_configuration_schema::{defaults, validate_values};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::{Value, json};
 use std::collections::VecDeque;

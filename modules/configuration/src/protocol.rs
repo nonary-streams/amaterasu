@@ -1,4 +1,4 @@
-use crate::schema::{Fields, Values, defaults, validate_values};
+use amaterasu_configuration_schema::{Fields, Values, defaults, validate_values};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
