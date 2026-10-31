@@ -56,6 +56,10 @@ struct Harness {
     provider_accepts: bool,
     provider_hangs: bool,
     conflict_on_set: bool,
+    scope_allow: bool,
+    scope_spoof: bool,
+    scope_calls: usize,
+    scope_source: Option<Value>,
 }
 
 impl Harness {
@@ -82,9 +86,9 @@ impl Harness {
         };
         let method = json!({"service":"example.demo/1","method":"settings_validate","interface_major":1,"interface_minor":0,"request":{"required":{"values":"object"},"optional":{},"allow_extra":false},"response":{"required":{"ok":"boolean","valid":"boolean"},"optional":{},"allow_extra":false},"privilege":"user"});
         let configuration = serde_json::from_value(json!({
-            "principals": { COORDINATOR:{"provide":[SERVICE],"call":["example.demo/1","amaterasu.state/1"]}, "amaterasu.state":{"provide":["amaterasu.state/1"]}, "example.demo":{"provide":["example.demo/1"]}, "management":{"call":[SERVICE,"example.demo/1","amaterasu.state/1"]}, "outsider":{"call":[SERVICE,"example.demo/1"]} },
+            "principals": { COORDINATOR:{"provide":[SERVICE],"call":["example.demo/1","amaterasu.state/1","amaterasu.session-lifecycle/1"]}, "amaterasu.state":{"provide":["amaterasu.state/1"]}, "lifecycle":{"provide":["amaterasu.session-lifecycle/1"]}, "example.demo":{"provide":["example.demo/1"]}, "management":{"call":[SERVICE,"example.demo/1","amaterasu.state/1","amaterasu.session-lifecycle/1","input/1"]}, "input":{"provide":["input/1"],"call":[SERVICE,"amaterasu.session-lifecycle/1","example.demo/1","amaterasu.state/1"]}, "outsider":{"call":[SERVICE,"example.demo/1"]} },
             "api_methods":[{"provider":"example.demo","callers":[COORDINATOR,"management"],"method":method}],
-            "settings": {COORDINATOR:{"descriptors":[{"descriptor":descriptor,"descriptor_sha256":descriptor_hash,"approved_methods":[method],"grants":[{"caller":"management","scope":{"kind":"host"},"read":true,"write":true},{"caller":"outsider","scope":{"kind":"host"},"read":true,"write":false}],"migrations":migrations}]}}
+            "settings": {COORDINATOR:{"descriptors":[{"descriptor":descriptor,"descriptor_sha256":descriptor_hash,"approved_methods":[method],"grants":[{"caller":"management","scope":{"kind":"host"},"read":true,"write":true},{"caller":"input","scope":{"kind":"host"},"read":true,"write":false},{"caller":"outsider","scope":{"kind":"host"},"read":true,"write":false}],"migrations":migrations}]}}
         })).unwrap();
         let mut broker = Broker::new(configuration).unwrap();
         let method = serde_json::from_value(method).unwrap();
@@ -97,6 +101,24 @@ impl Harness {
                 "amaterasu.state",
                 Command::Register {
                     service: "amaterasu.state/1".into()
+                }
+            ),
+            Response::Ok
+        ));
+        assert!(matches!(
+            broker.dispatch(
+                "lifecycle",
+                Command::Register {
+                    service: "amaterasu.session-lifecycle/1".into()
+                }
+            ),
+            Response::Ok
+        ));
+        assert!(matches!(
+            broker.dispatch(
+                "input",
+                Command::Register {
+                    service: "input/1".into()
                 }
             ),
             Response::Ok
@@ -123,6 +145,10 @@ impl Harness {
             provider_accepts: true,
             provider_hangs: false,
             conflict_on_set: false,
+            scope_allow: true,
+            scope_spoof: false,
+            scope_calls: 0,
+            scope_source: None,
         };
         harness.start();
         harness
@@ -149,6 +175,43 @@ impl Harness {
     }
 
     fn pump_providers(&mut self) {
+        let scope_request = self
+            .broker
+            .borrow_mut()
+            .dispatch("lifecycle", Command::Poll {});
+        if let Response::Request {
+            id,
+            caller,
+            initiator,
+            payload,
+            ..
+        } = scope_request
+        {
+            self.scope_calls += 1;
+            self.scope_source = Some(payload["source"].clone());
+            assert_eq!(caller, COORDINATOR);
+            assert_eq!(initiator, "management");
+            assert_eq!(payload["source"]["initiator"], "management");
+            assert!(
+                payload["source"]["caller"] == "management"
+                    || payload["source"]["caller"] == "input"
+            );
+            let result = if self.scope_allow {
+                json!({"status":"succeeded","target":payload["target"],"scope":payload["scope"],"scope_id":if self.scope_spoof {"other"} else {payload["scope_id"].as_str().unwrap()}})
+            } else {
+                json!({"status":"rejected"})
+            };
+            assert!(matches!(
+                self.broker.borrow_mut().dispatch(
+                    "lifecycle",
+                    Command::Complete {
+                        request: id,
+                        payload: result
+                    }
+                ),
+                Response::Ok
+            ));
+        }
         let state_request = self
             .broker
             .borrow_mut()
@@ -348,4 +411,93 @@ fn installed_migration_plan_validates_and_commits_through_broker() {
     assert_eq!(success["ok"], true);
     assert_eq!(success["revision"], 4);
     assert_eq!(harness.state.as_ref().unwrap()["schema_revision"], 2);
+}
+
+#[test]
+fn dynamic_scope_requires_matching_lifecycle_authority() {
+    let mut harness = Harness::new();
+    let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":7});
+    let request = || json!({"operation":"settings_get","provider":"example.demo","scope":{"kind":"session","id":"session"},"application":"app","paired_client":null,"session":"session","target":target,"input_binding":"token"});
+    let result = harness.call("management", request());
+    assert_eq!(result["ok"], true);
+    assert_eq!(harness.scope_calls, 2);
+    harness.scope_spoof = true;
+    let rejected = harness.call("management", request());
+    assert_eq!(rejected["error"]["code"], "permission_denied");
+    harness.scope_spoof = false;
+    harness.scope_allow = false;
+    let rejected = harness.call("management", request());
+    assert_eq!(rejected["error"]["code"], "permission_denied");
+    let mut forged = request();
+    forged["source"] = json!({"caller":"input","initiator":"other"});
+    assert_eq!(
+        harness.call("management", forged)["error"]["code"],
+        "invalid_request"
+    );
+    let mut no_target = request();
+    no_target.as_object_mut().unwrap().remove("target");
+    assert_eq!(
+        harness.call("management", no_target)["error"]["code"],
+        "invalid_request"
+    );
+    let before = harness.scope_calls;
+    let rejected=harness.call("management",json!({"operation":"settings_get","provider":"example.demo","scope":{"kind":"session","id":"session"},"application":null,"paired_client":"client","session":"session","target":target,"input_binding":"token"}));
+    assert_eq!(rejected["error"]["code"], "permission_denied");
+    assert_eq!(before, harness.scope_calls);
+}
+
+#[test]
+fn delegated_input_source_is_attested_by_broker_not_request_payload() {
+    let mut harness = Harness::new();
+    let parent = harness.broker.borrow_mut().dispatch(
+        "management",
+        Command::Request {
+            service: "input/1".into(),
+            payload: json!({}),
+            timeout_ms: 5_000,
+            operation_id: "input.parent".into(),
+            parent: None,
+        },
+    );
+    let Response::Accepted { id: parent } = parent else {
+        panic!("input parent rejected")
+    };
+    assert!(
+        matches!(harness.broker.borrow_mut().dispatch("input",Command::Poll {}), Response::Request {id,..} if id==parent)
+    );
+    let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":7});
+    let payload = json!({"operation":"settings_get","provider":"example.demo","scope":{"kind":"session","id":"session"},"application":null,"paired_client":null,"session":"session","target":target,"input_binding":"token"});
+    let child = harness.broker.borrow_mut().dispatch(
+        "input",
+        Command::Request {
+            service: SERVICE.into(),
+            payload,
+            timeout_ms: 5_000,
+            operation_id: "input.child".into(),
+            parent: Some(parent),
+        },
+    );
+    let Response::Accepted { id: child } = child else {
+        panic!("registry request rejected: {child:?}")
+    };
+    let mut result = None;
+    for _ in 0..100 {
+        harness.tick();
+        harness.pump_providers();
+        if let Response::Result { payload } = harness
+            .broker
+            .borrow_mut()
+            .dispatch("input", Command::TakeResult { request: child })
+        {
+            result = Some(payload);
+            break;
+        }
+    }
+    let result = result.unwrap();
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(harness.scope_calls, 1);
+    assert_eq!(
+        harness.scope_source,
+        Some(json!({"caller":"input","initiator":"management"}))
+    );
 }

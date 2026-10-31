@@ -21,11 +21,14 @@ bounded to 64 combinations and fails closed beyond that budget. Migration plans
 are installed policy and must explicitly rename, remove, or replace changed
 values. `write_outcome_unknown` requires reloading before any further update.
 
-Dynamic paired-client and session ownership is not yet resolved by an
-authoritative lifecycle service. Current policy therefore supports those scopes
-only when the precise identifiers are preauthorized, and is not general dynamic
-session authorization. Provider validation and migration have not yet been
-qualified through an end-to-end installed host fixture.
+Dynamic application and session reads may include a `target` (tagged
+`LifecycleTarget`) and optional `input_binding`. The registry requests lifecycle
+authorization for every selected scope, relaying only the caller and initiator
+provided by the broker. It accepts only the coordinator's matching canonical
+target and scope. Input-token authorization requires a configured trusted input
+consumer and a current token bound to the exact active stream. Dynamic paired
+client reads and dynamic writes remain unavailable. Provider validation and
+migration have not yet been qualified through an installed host fixture.
 
 For example, the following bootstrap settings pin one minimal provider. Its
 `settings_validate` method must also be installed and registered with an

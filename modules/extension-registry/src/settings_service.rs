@@ -6,7 +6,7 @@ use crate::{
     settings::{self, Document, Scope},
 };
 use amaterasu_configuration_schema::{Fields, Values};
-use amaterasu_extension_api::{MethodRef, SettingScope};
+use amaterasu_extension_api::{LifecycleTarget, MethodRef, SettingScope};
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -29,6 +29,10 @@ pub enum SettingsOperation {
         application: Option<String>,
         paired_client: Option<String>,
         session: Option<String>,
+        #[serde(default)]
+        target: Option<LifecycleTarget>,
+        #[serde(default)]
+        input_binding: Option<String>,
     },
     #[serde(rename = "settings_migrate")]
     Migrate {
@@ -55,10 +59,20 @@ struct Pending {
     schema_revision: u64,
     migrations: Vec<crate::policy::MigrationPlan>,
     writable_scopes: BTreeSet<Scope>,
+    source_caller: String,
+    source_initiator: String,
     stage: Stage,
 }
 
 enum Stage {
+    Authorizing {
+        target: LifecycleTarget,
+        input_binding: Option<String>,
+        scopes: Vec<Scope>,
+        index: usize,
+        child: Option<u64>,
+        outcome: Option<Value>,
+    },
     Loading,
     Validating {
         document: Document,
@@ -106,23 +120,49 @@ impl SettingsService {
             } => (provider, scope, true),
             SettingsOperation::Migrate { provider, .. } => (provider, &host_scope, true),
         };
+        if matches!(
+            &operation,
+            SettingsOperation::Get {
+                target: None,
+                input_binding: Some(_),
+                ..
+            }
+        ) {
+            return Err(discovery::failure(
+                "invalid_request",
+                "input binding requires target",
+            ));
+        }
+        let dynamic = matches!(
+            &operation,
+            SettingsOperation::Get {
+                target: Some(_),
+                ..
+            }
+        );
         let item = policy
             .descriptors
             .iter()
             .find(|item| {
                 item.descriptor.provider == *provider
-                    && item.allows(initiator, scope, write)
-                    && item.allows(caller, scope, write)
+                    && if dynamic {
+                        item.allows(initiator, &Scope::Host, false)
+                            && item.allows(caller, &Scope::Host, false)
+                    } else {
+                        item.allows(initiator, scope, write) && item.allows(caller, scope, write)
+                    }
             })
             .ok_or_else(|| discovery::failure("permission_denied", "scope is not authorized"))?;
+        let mut dynamic_scopes = BTreeSet::new();
         if let SettingsOperation::Get {
             application,
             paired_client,
             session,
+            target,
             ..
         } = &operation
         {
-            for selected in application
+            let selected = application
                 .as_ref()
                 .map(|id| Scope::Application(id.clone()))
                 .into_iter()
@@ -132,8 +172,20 @@ impl SettingsService {
                         .map(|id| Scope::PairedClient(id.clone())),
                 )
                 .chain(session.as_ref().map(|id| Scope::Session(id.clone())))
-            {
-                if !item.allows(initiator, &selected, false)
+                .chain(std::iter::once(scope.clone()));
+            for selected in selected {
+                if selected == Scope::Host {
+                    continue;
+                }
+                if target.is_some() {
+                    if matches!(selected, Scope::PairedClient(_)) {
+                        return Err(discovery::failure(
+                            "permission_denied",
+                            "client scope authority unavailable",
+                        ));
+                    }
+                    dynamic_scopes.insert(selected);
+                } else if !item.allows(initiator, &selected, false)
                     || !item.allows(caller, &selected, false)
                 {
                     return Err(discovery::failure(
@@ -189,8 +241,33 @@ impl SettingsService {
             })
             .collect();
         let deadline = Instant::now() + Duration::from_millis(remaining_ms.min(30_000));
-        self.store
-            .get(parent, format!("extensions/{provider}"), deadline)?;
+        let stage = match &operation {
+            SettingsOperation::Get {
+                target: Some(target),
+                input_binding,
+                ..
+            } => {
+                if dynamic_scopes.is_empty() {
+                    return Err(discovery::failure(
+                        "invalid_request",
+                        "dynamic target requires scoped selector",
+                    ));
+                }
+                Stage::Authorizing {
+                    target: target.clone(),
+                    input_binding: input_binding.clone(),
+                    scopes: dynamic_scopes.into_iter().collect(),
+                    index: 0,
+                    child: None,
+                    outcome: None,
+                }
+            }
+            _ => {
+                self.store
+                    .get(parent, format!("extensions/{provider}"), deadline)?;
+                Stage::Loading
+            }
+        };
         self.pending.insert(
             parent,
             Pending {
@@ -213,7 +290,9 @@ impl SettingsService {
                     })
                     .map(|grant| grant.scope.clone())
                     .collect(),
-                stage: Stage::Loading,
+                source_caller: caller.to_owned(),
+                source_initiator: initiator.to_owned(),
+                stage,
             },
         );
         Ok(())
@@ -495,7 +574,7 @@ impl SettingsService {
                     completed.push((id, json!({"ok":true,"status":"ok","revision":revision})));
                     continue;
                 }
-                Stage::Validating { .. } => {
+                Stage::Authorizing { .. } | Stage::Validating { .. } => {
                     completed.push((
                         id,
                         discovery::failure("invalid_state", "unexpected persistence result"),
@@ -504,6 +583,135 @@ impl SettingsService {
                 }
             }
             self.pending.insert(id, pending);
+        }
+        for (id, pending) in &mut self.pending {
+            let Stage::Authorizing {
+                target,
+                input_binding,
+                scopes,
+                index,
+                child,
+                outcome,
+            } = &mut pending.stage
+            else {
+                continue;
+            };
+            if Instant::now() >= pending.deadline {
+                if let Some(handle) = *child {
+                    let _ = runtime.send(Command::Cancel { request: handle });
+                    let _ = runtime.send(Command::ReleaseResult { request: handle });
+                }
+                completed.push((
+                    *id,
+                    discovery::failure("deadline_exceeded", "scope authorization expired"),
+                ));
+                continue;
+            }
+            if let Some(handle) = *child {
+                if outcome.is_none() {
+                    match runtime.send(Command::TakeResult { request: handle }) {
+                        Ok(Response::Pending) | Err(_) => continue,
+                        Ok(Response::Result { payload }) => *outcome = Some(payload),
+                        _ => *outcome = Some(Value::Null),
+                    }
+                }
+                match runtime.send(Command::ReleaseResult { request: handle }) {
+                    Ok(Response::Ok) => (),
+                    Ok(Response::Error { code, .. }) if code == "not_found" => (),
+                    _ => continue,
+                }
+                let reply = outcome.take().expect("scope reply present");
+                *child = None;
+                let (kind, scope_id) = match &scopes[*index] {
+                    Scope::Application(id) => ("application", id),
+                    Scope::Session(id) => ("session", id),
+                    _ => unreachable!(),
+                };
+                if reply.get("status").and_then(Value::as_str) != Some("succeeded")
+                    || reply.get("scope").and_then(Value::as_str) != Some(kind)
+                    || reply.get("scope_id").and_then(Value::as_str) != Some(scope_id.as_str())
+                    || serde_json::to_value(&*target).ok().as_ref() != reply.get("target")
+                {
+                    completed.push((
+                        *id,
+                        discovery::failure("permission_denied", "scope authorization failed"),
+                    ));
+                    continue;
+                }
+                // Consume the coordinator-returned selector rather than retaining
+                // the request field as the source of effective settings identity.
+                let canonical = reply["scope_id"]
+                    .as_str()
+                    .expect("validated scope")
+                    .to_owned();
+                if let SettingsOperation::Get {
+                    scope,
+                    application,
+                    session,
+                    ..
+                } = &mut pending.operation
+                {
+                    match kind {
+                        "application" => {
+                            if application.is_some() {
+                                *application = Some(canonical.clone());
+                            }
+                            if matches!(scope, Scope::Application(_)) {
+                                *scope = Scope::Application(canonical.clone());
+                                pending.scope = scope.clone();
+                            }
+                        }
+                        "session" => {
+                            if session.is_some() {
+                                *session = Some(canonical.clone());
+                            }
+                            if matches!(scope, Scope::Session(_)) {
+                                *scope = Scope::Session(canonical.clone());
+                                pending.scope = scope.clone();
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                *index += 1;
+            }
+            if *index == scopes.len() {
+                match self.store.get(
+                    *id,
+                    format!("extensions/{}", pending.provider),
+                    pending.deadline,
+                ) {
+                    Ok(()) => pending.stage = Stage::Loading,
+                    Err(error) => completed.push((*id, error)),
+                }
+                continue;
+            }
+            let (kind, scope_id) = match &scopes[*index] {
+                Scope::Application(id) => ("application", id),
+                Scope::Session(id) => ("session", id),
+                _ => unreachable!(),
+            };
+            let operation_id = format!("registry.scope.{id}.{index}");
+            let remaining_ms = pending
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .min(30_000) as u64;
+            let payload = json!({"operation":"resolve_settings_scope","operation_id":operation_id,"target":target,"scope":kind,"scope_id":scope_id,"access":"read","source":{"caller":pending.source_caller,"initiator":pending.source_initiator},"input_binding":input_binding});
+            match runtime.send(Command::Request {
+                service: "amaterasu.session-lifecycle/1".into(),
+                payload,
+                timeout_ms: remaining_ms.max(1),
+                operation_id,
+                parent: Some(*id),
+            }) {
+                Ok(Response::Accepted { id }) => *child = Some(id),
+                Err(_) => continue,
+                _ => completed.push((
+                    *id,
+                    discovery::failure("permission_denied", "scope authority unavailable"),
+                )),
+            }
         }
         for (id, pending) in &mut self.pending {
             let Stage::Validating {
