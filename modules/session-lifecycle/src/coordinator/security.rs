@@ -95,11 +95,16 @@ impl Coordinator {
                     || state.request.transition_id != work.transition_id
                     || selection.target != work.target
                     || selection.transition_id != work.transition_id
-                    || state.request.dependency_inputs != vec![selection.input.output.clone()]
+                    || state.request.dependency_inputs != vec![selection.current_output().clone()]
                     || state.request.settings_revision != state.participant.settings_revision
                     || serde_json::to_value(&state.request.settings).ok().as_ref()
                         != Some(&state.participant.settings)
                     || !selection.validate_structure()
+                    || super::finalize_backend::authenticated_current_output(
+                        &journal.composition,
+                        selection,
+                    )
+                    .is_err()
                     || journal.composition.finalize_selection(
                         &selection.target,
                         &selection.transition_id,

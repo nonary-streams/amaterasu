@@ -462,8 +462,14 @@ fn nested_finalize_plan_refresh_checks_exact_owner_and_request() {
     let proof = json!({"participant":participant,"request":callback,"terminal":{"call":call("callback",callback.clone(),"source-op"),"state":{"state":"completed","payload":prepared}},"pending_receipt":null});
     let stored = json!({"output":output,"admission_id":"source","transition_id":"source-transition","plan":source_plan,"state":"retained","callback_proof":proof});
     let policy = json!({"owner_provider":"owner","owner_service":"owner/2","method":method("finalize"),"status_method":method("status"),"output_capability":"display","output_schema":schema,"capture_provider":"capture","selector_schema":"selector","required_access":"exclusive","domain_scope":"resource","mutation_domains":[]});
-    let frozen = json!({"target":stream,"parent_generation":1,"transition_id":"transition","input":stored,"policy":policy,"finalize_approval":approval("finalize"),"finalize_status_approval":approval("status"),"schema_documents":[{"reference":schema,"document":document}]});
-    let plan_request = json!({"version":2,"provider_sequence":2,"operation":"resource_finalize_plan","transition_id":"transition","operation_id":"plan-op","target":stream,"phase":"stream.prepare","settings_revision":"one","settings":{},"intent":"initial","reason":null,"requested_video":null,"consumer_requirements":requirements,"remaining_ms":5000,"plan_revision":null,"admission_id":null,"approved_plan":null,"dependency_inputs":[output],"control_results":[]});
+    let mut staged_output = output.clone();
+    staged_output["resource"]["revision"] = json!(2);
+    let stage_request = json!({"version":2,"provider_sequence":2,"operation":"lifecycle_callback","transition_id":"transition","operation_id":"stage-op","target":stream,"phase":"stream.prepare","settings_revision":"one","settings":{},"intent":"initial","reason":null,"requested_video":null,"consumer_requirements":requirements,"remaining_ms":5000,"plan_revision":1,"admission_id":"stage-admission","approved_plan":source_plan});
+    let stage_response = json!({"status":"prepared","candidate":null,"obligations":[obligation],"outputs":[staged_output]});
+    let stage_proof = json!({"participant":participant,"request":stage_request,"terminal":{"call":call("callback",stage_request.clone(),"stage-op"),"state":{"state":"completed","payload":stage_response}},"pending_receipt":null});
+    let stage = json!({"target":stream,"parent_generation":1,"admission_id":"stage-admission","transition_id":"transition","plan":source_plan,"before":output,"after":staged_output,"callback_proof":stage_proof});
+    let frozen = json!({"target":stream,"parent_generation":1,"transition_id":"transition","input":stored,"stage":stage,"policy":policy,"finalize_approval":approval("finalize"),"finalize_status_approval":approval("status"),"schema_documents":[{"reference":schema,"document":document}]});
+    let plan_request = json!({"version":2,"provider_sequence":2,"operation":"resource_finalize_plan","transition_id":"transition","operation_id":"plan-op","target":stream,"phase":"stream.prepare","settings_revision":"one","settings":{},"intent":"initial","reason":null,"requested_video":null,"consumer_requirements":requirements,"remaining_ms":5000,"plan_revision":null,"admission_id":null,"approved_plan":null,"dependency_inputs":[staged_output],"control_results":[]});
     let request: amaterasu_extension_api::ResourceFinalizeRequest = serde_json::from_value(json!({"version":2,"transition_id":"transition","operation_id":"effect","provider_sequence":3,"target":stream,"output":output,"control_results":[],"admission_id":"fresh","permit_id":"permit","remaining_ms":5000})).unwrap();
     let context = json!({"policy":policy,"output":output,"control_results":[],"target":stream,"transition_id":"transition","parent_generation":1});
     let effect_call = call(
@@ -488,7 +494,7 @@ fn nested_finalize_plan_refresh_checks_exact_owner_and_request() {
     );
     journal.receipts.insert("work".into(), serde_json::from_value(json!({"caller":"transport","initiator":"transport","request":{},"response":{"status":"pending"},"work":work})).unwrap());
     journal.composition = serde_json::from_value(
-        json!({"outputs":[stored],"selections":[],"finalize_selections":[frozen],"refinements":[]}),
+        json!({"outputs":[stored],"staged_outputs":[stage],"selections":[],"finalize_selections":[frozen],"refinements":[]}),
     )
     .unwrap();
     journal
@@ -518,6 +524,49 @@ fn nested_finalize_plan_refresh_checks_exact_owner_and_request() {
     journal.authority.domain_locks.clear();
     journal.authority.refresh_required.insert("domain".into());
     save(&coordinator.shared, journal).unwrap();
+    let verification = |request: &Value| {
+        let request: amaterasu_extension_api::ProviderRequest =
+            serde_json::from_value(request.clone()).unwrap();
+        json!({"host_epoch":epoch,"provider_sequence":request.provider_sequence,"operation_id":request.operation_id,"transition_id":request.transition_id,"target":request.target,"fingerprint":super::super::security::fingerprint(&request).unwrap()})
+    };
+    assert_eq!(
+        coordinator.verify_provider("owner", &verification(&plan_request))["status"],
+        "succeeded"
+    );
+    let original = coordinator.shared.borrow().value.clone();
+    let mut root_request = plan_request.clone();
+    root_request["dependency_inputs"] = json!([output]);
+    let mut tampered = original.clone();
+    tampered
+        .receipts
+        .get_mut("work")
+        .unwrap()
+        .work
+        .as_mut()
+        .unwrap()
+        .composition_progress
+        .as_mut()
+        .unwrap()
+        .finalize
+        .as_mut()
+        .unwrap()
+        .owner_plan
+        .request = serde_json::from_value(root_request.clone()).unwrap();
+    save(&coordinator.shared, tampered).unwrap();
+    assert_eq!(
+        coordinator.verify_provider("owner", &verification(&root_request))["status"],
+        "rejected"
+    );
+    let mut missing_stage = original.clone();
+    let mut encoded = serde_json::to_value(&missing_stage.composition).unwrap();
+    encoded["staged_outputs"] = json!([]);
+    missing_stage.composition = serde_json::from_value(encoded).unwrap();
+    save(&coordinator.shared, missing_stage).unwrap();
+    assert_eq!(
+        coordinator.verify_provider("owner", &verification(&plan_request))["status"],
+        "rejected"
+    );
+    save(&coordinator.shared, original).unwrap();
     let mut payload = json!({"operation_id":"refresh", "target":stream, "provider_request":plan_request, "domains":[{"domain":"domain","revision":2,"borrowers":{}}],"resources":[]});
     payload["provider_request"]["provider_sequence"] = json!(99);
     assert_eq!(
