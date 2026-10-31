@@ -44,6 +44,7 @@ fn settings() -> Settings {
     Settings {
         administrator_principals: BTreeSet::from(["console".into()]),
         transport_principals: BTreeSet::from(["nvhttp".into()]),
+        effect_authority: None,
     }
 }
 
@@ -3324,4 +3325,210 @@ fn uncertain_write_recovery_observes_committed_unpair() {
             .unwrap()
             .verify_client(&client, now())
     );
+}
+
+#[test]
+fn pairing_mutation_fences_and_waits_for_effect_owner_completion() {
+    let (mut pipeline, mut harness, certificate_id) = paired_native_client();
+    pipeline.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        protocol_owner: "nvhttp".into(),
+        effect_owner: "input".into(),
+    });
+    let source = json!({"version":1,"id":"ab".repeat(16),"generation":1,
+        "host_epoch":"host","session_id":"session","stream_id":"stream",
+        "stream_generation":1,"device":"device","device_generation":1,
+        "effect_owner_epoch":"input-boot"});
+    let startup_epoch = pipeline.effect_gate.as_ref().unwrap().epoch().to_owned();
+    let recover = pipeline
+        .apply_effect_request(
+            "input",
+            "input",
+            json!({"action":"recover","epoch":startup_epoch,"owner_epoch":"input-boot"}),
+            now(),
+        )
+        .unwrap();
+    let epoch = recover["epoch"].as_str().unwrap().to_owned();
+    pipeline
+        .apply_effect_request(
+            "nvhttp",
+            "nvhttp",
+            json!({"action":"bind","epoch":epoch,"certificate_pem":CLIENT_CERT,"source":source}),
+            now(),
+        )
+        .unwrap();
+    let admission = pipeline
+        .apply_effect_request(
+            "input",
+            "input",
+            json!({"action":"admit","epoch":epoch,"source":source,"operation_id":"send-1","sequence":1}),
+            now(),
+        )
+        .unwrap();
+    let ticket = admission["ticket"].as_str().unwrap().to_owned();
+    let writes = harness.writes;
+    harness.enqueue("console", json!({"action":"unpair","certificate_id":certificate_id,"expected_revision":harness.revision}));
+    pipeline
+        .tick_at(now(), |command| harness.send(command))
+        .unwrap();
+    assert_eq!(harness.writes, writes);
+    assert!(pipeline.deferred_effect_mutation.is_some());
+    assert_eq!(
+        pipeline.apply_effect_request(
+            "input",
+            "input",
+            json!({"action":"admit","epoch":epoch,"source":source,"operation_id":"send-2","sequence":2}),
+            now()
+        ),
+        Err("source_denied")
+    );
+    let lookup = pipeline
+        .apply_effect_request(
+            "input",
+            "input",
+            json!({"action":"lookup","epoch":epoch,"operation_id":"send-1"}),
+            now(),
+        )
+        .unwrap();
+    assert_eq!(lookup["ticket"], ticket);
+    assert_eq!(lookup["fenced"], true);
+    harness.incoming = Some(Response::Request {
+        id: 8,
+        caller: "input".into(),
+        initiator: "input".into(),
+        service: EFFECT_SERVICE.into(),
+        remaining_ms: 30_000,
+        payload: json!({"action":"complete","epoch":epoch,"operation_id":"send-1","ticket":ticket}),
+    });
+    let mut receipt = None;
+    pipeline
+        .tick_at(now(), |command| match command {
+            Command::Complete {
+                request: 8,
+                payload,
+            } => {
+                receipt = Some(payload);
+                Ok(Response::Ok)
+            }
+            command => harness.send(command),
+        })
+        .unwrap();
+    assert_eq!(receipt.unwrap()["ok"], true);
+    assert_eq!(harness.writes, writes);
+    let generation = pipeline.effect_gate.as_ref().unwrap().fence_generation();
+    pipeline
+        .apply_effect_request(
+            "input",
+            "input",
+            json!({"action":"drain","epoch":epoch,"fence_generation":generation}),
+            now(),
+        )
+        .unwrap();
+    for _ in 0..5 {
+        pipeline
+            .tick_at(now(), |command| harness.send(command))
+            .unwrap();
+        if harness.output.is_some() {
+            break;
+        }
+    }
+    assert_eq!(harness.output.unwrap()["ok"], true);
+    assert_eq!(harness.writes, writes + 1);
+}
+
+#[test]
+fn pairing_effect_service_checks_broker_identity_and_current_certificate() {
+    let (mut pipeline, _harness, _) = paired_native_client();
+    pipeline.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        protocol_owner: "nvhttp".into(),
+        effect_owner: "input".into(),
+    });
+    let startup_epoch = pipeline.effect_gate.as_ref().unwrap().epoch().to_owned();
+    let recover = json!({"action":"recover","epoch":startup_epoch,"owner_epoch":"owner"});
+    assert_eq!(
+        pipeline.apply_effect_request("input", "foreign", recover.clone(), now()),
+        Err("forbidden")
+    );
+    assert_eq!(
+        pipeline.apply_effect_request("nvhttp", "nvhttp", recover.clone(), now()),
+        Err("forbidden")
+    );
+    let response = pipeline
+        .apply_effect_request("input", "input", recover, now())
+        .unwrap();
+    let epoch = response["epoch"].as_str().unwrap().to_owned();
+    let source = json!({"version":1,"id":"ab".repeat(16),"generation":1,
+        "host_epoch":"host","session_id":"session","stream_id":"stream",
+        "stream_generation":1,"device":"device","device_generation":1,
+        "effect_owner_epoch":"owner"});
+    assert_eq!(
+        pipeline.apply_effect_request(
+            "nvhttp",
+            "nvhttp",
+            json!({"action":"bind","epoch":epoch,"certificate_pem":HOST_CERT,"source":source}),
+            now()
+        ),
+        Err("source_denied")
+    );
+    pipeline
+        .apply_effect_request(
+            "nvhttp",
+            "nvhttp",
+            json!({"action":"bind","epoch":epoch,"certificate_pem":CLIENT_CERT,"source":source}),
+            now(),
+        )
+        .unwrap();
+    pipeline.identity.invalidate();
+    assert_eq!(
+        pipeline.apply_effect_request(
+            "input",
+            "input",
+            json!({"action":"admit","epoch":epoch,"source":source,"operation_id":"op","sequence":1}),
+            now()
+        ),
+        Err("source_denied")
+    );
+}
+
+#[test]
+fn canceled_pairing_mutation_does_not_release_inflight_effects() {
+    let (mut pipeline, mut harness, certificate_id) = paired_native_client();
+    let gate = pipeline.effect_gate.as_mut().unwrap();
+    gate.recover("owner").unwrap();
+    let source = crate::effect_gate::Source {
+        version: 1,
+        id: "ab".repeat(16),
+        generation: 1,
+        host_epoch: "host".into(),
+        session_id: "session".into(),
+        stream_id: "stream".into(),
+        stream_generation: 1,
+        device: "device".into(),
+        device_generation: 1,
+        effect_owner_epoch: "owner".into(),
+    };
+    gate.bind(source.clone()).unwrap();
+    let ticket = gate.admit(&source, "send", 1).unwrap().to_owned();
+    let epoch = gate.epoch().to_owned();
+    let writes = harness.writes;
+    harness.enqueue("console", json!({"action":"unpair","certificate_id":certificate_id,"expected_revision":harness.revision}));
+    pipeline
+        .tick_at(now(), |command| harness.send(command))
+        .unwrap();
+    harness.check_cancelled = true;
+    pipeline
+        .tick_at(now(), |command| harness.send(command))
+        .unwrap();
+    assert_eq!(harness.output.unwrap()["code"], "request_ended");
+    assert_eq!(harness.writes, writes);
+    let gate = pipeline.effect_gate.as_mut().unwrap();
+    assert_eq!(gate.admit(&source, "new", 2), Err("admission_denied"));
+    assert_eq!(
+        gate.acknowledge_drain(&epoch, gate.fence_generation()),
+        Err("effects_in_flight")
+    );
+    gate.complete(&epoch, "send", &ticket).unwrap();
+    assert!(!gate.drained());
+    gate.acknowledge_drain(&epoch, gate.fence_generation())
+        .unwrap();
+    assert!(gate.drained());
 }

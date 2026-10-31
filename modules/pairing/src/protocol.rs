@@ -11,6 +11,13 @@ const MAX_FRAME_LIMITER_FPS: f64 = 1_000.0;
 pub struct Settings {
     pub administrator_principals: BTreeSet<String>,
     pub transport_principals: BTreeSet<String>,
+    pub effect_authority: Option<EffectAuthoritySettings>,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectAuthoritySettings {
+    pub protocol_owner: String,
+    pub effect_owner: String,
 }
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -18,6 +25,14 @@ impl Settings {
             if principals.len() > 16 || principals.iter().any(|value| !identifier(value, 128)) {
                 return Err("invalid_settings");
             }
+        }
+        if self.effect_authority.as_ref().is_some_and(|settings| {
+            !identifier(&settings.protocol_owner, 128)
+                || !identifier(&settings.effect_owner, 128)
+                || !self.transport_principals.contains(&settings.protocol_owner)
+                || settings.protocol_owner == settings.effect_owner
+        }) {
+            return Err("invalid_settings");
         }
         Ok(())
     }
