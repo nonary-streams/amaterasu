@@ -60,12 +60,12 @@ def main() -> None:
         component["requires"].update({"amaterasu.catalog": "0.1.0", "amaterasu.state": "0.1.0"})
         template.write_text(json.dumps(component))
         bootstrap_path.write_text(json.dumps(bootstrap))
-        args = [publisher, "pack-linux-session", root, artifacts, package, "1",
+        package_args = [publisher, "pack-linux-session", root, artifacts, package, "1",
                 "--external-component", template, artifact, "--replace-library", COMPONENT]
-        run(*args, fail=True)
+        run(*package_args, fail=True)
         policy["principals"][COMPONENT] = {"provide": [LIBRARY], "call": [CATALOG, STATE]}
         bootstrap_path.write_text(json.dumps(bootstrap))
-        run(*args)
+        run(*package_args)
         run(publisher, "verify", root, package)
         selected = json.loads((package / "manifest.json").read_text())["components"]
         ids = {entry["id"] for entry in selected}
