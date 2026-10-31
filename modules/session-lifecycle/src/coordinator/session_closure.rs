@@ -29,8 +29,8 @@ fn same_root_resource(
         && output.resource.resource_id == root.resource.resource_id
 }
 
-fn unresolved_receipt(receipt: &Receipt, session_id: &str) -> bool {
-    let belongs = receipt
+fn receipt_belongs(receipt: &Receipt, session_id: &str) -> bool {
+    receipt
         .work
         .as_ref()
         .is_some_and(|work| target_in_session(&work.target, session_id))
@@ -43,8 +43,11 @@ fn unresolved_receipt(receipt: &Receipt, session_id: &str) -> bool {
                 .get("target")
                 .and_then(|value| serde_json::from_value::<LifecycleTarget>(value.clone()).ok())
                 .is_some_and(|target| target_in_session(&target, session_id))
-        });
-    belongs
+        })
+}
+
+fn unresolved_receipt(receipt: &Receipt, session_id: &str) -> bool {
+    receipt_belongs(receipt, session_id)
         && (receipt.work.is_some()
             || receipt.wait_target.is_some()
             || !matches!(
@@ -83,6 +86,14 @@ pub(super) fn preflight(
             .receipts
             .values()
             .any(|receipt| unresolved_receipt(receipt, id))
+        || journal.recovery_sources.iter().any(|(alias, original)| {
+            [alias, original].iter().any(|key| {
+                journal
+                    .receipts
+                    .get(*key)
+                    .is_none_or(|receipt| receipt_belongs(receipt, id))
+            })
+        })
         || journal
             .action_dispositions
             .values()

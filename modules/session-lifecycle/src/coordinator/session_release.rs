@@ -2284,6 +2284,22 @@ mod tests {
             },
         );
         assert!(super::session_closure::preflight(&pending, &work.target).is_err());
+        let mut aliased = journal.clone();
+        let source = receipt_key("transport", "client", "source");
+        let alias = receipt_key("transport", "client", "alias");
+        for (key, operation) in [(&source, "source"), (&alias, "alias")] {
+            aliased.receipts.insert(key.clone(), Receipt {
+                caller: "transport".into(), initiator: "client".into(),
+                request: json!({"operation_id":operation,"target":work.target}),
+                response: json!({"operation_id":operation,"status":"succeeded","target":work.target}),
+                work: None, wait_target: None,
+            });
+        }
+        aliased.recovery_sources.insert(alias, source);
+        assert_eq!(
+            super::session_closure::preflight(&aliased, &work.target).unwrap_err(),
+            "session_has_live_references"
+        );
         let mut external = journal.clone();
         external.authority.settled.insert(
             "external".into(),
