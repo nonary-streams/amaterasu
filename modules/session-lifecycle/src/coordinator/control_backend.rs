@@ -646,4 +646,113 @@ mod tests {
         drop(coordinator);
         std::fs::remove_dir_all(path).unwrap();
     }
+    #[test]
+    fn historical_owner_ack_requires_exact_durable_tuple() {
+        use sha2::{Digest, Sha256};
+        let path = std::env::temp_dir().join(format!(
+            "amaterasu-historical-settlement-{}-{}",
+            std::process::id(),
+            identifier().unwrap()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut coordinator = Coordinator::open(&path.join("journal.json")).unwrap();
+        let epoch = coordinator.shared.borrow().value.host_epoch.clone();
+        let session =
+            json!({"kind":"session","host_epoch":epoch,"session_id":"session","generation":1});
+        let target = json!({"kind":"stream","host_epoch":epoch,"session_id":"session","stream_id":"stream","generation":1});
+        let document = r#"{"$id":"example.schema/1","$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","additionalProperties":false}"#;
+        let schema = json!({"id":"example.schema/1","major":1,"minor":0,"digest":format!("{:x}", Sha256::digest(document.as_bytes()))});
+        let resource = json!({"provider":"owner","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":"domain","mutation_domains":["domain"]});
+        let output = json!({"output_id":"out","capability":"display","schema":schema,"producer":"owner","producer_service":"owner/2","origin":session,"resource":resource,"domain_observations":[{"domain":"domain","revision":1,"borrowers":{},"complete":true}],"data":{}});
+        let method = |name: &str| json!({"service":"owner/2","method":name,"interface_major":2,"interface_minor":0,"schema_revision":1});
+        let approval = |name: &str| json!({"method":method(name),"broker_approval":{"provider":"owner","method":{"service":"owner/2","method":name,"interface_major":2,"interface_minor":0}}});
+        let proposal = json!({"proposal_id":"proposal","output_id":"out","owner_provider":"owner","owner_service":"owner/2","target":target,"resource":resource,"method":method("control"),"argument_schema":schema,"arguments":{},"access":"exclusive","mutation_domains":["domain"]});
+        let source_plan = json!({"plan_id":"source","revision":1,"resources":[{"provider":"owner","resource_id":"output","incarnation":"native","expected_revision":1,"execution_domain":"seat","mutation_domains":["domain"],"access":"read"}],"mutation_domains":[{"domain":"domain","expected_revision":1,"borrowers":{},"access":"read"}],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]});
+        let participant = |name: &str| json!({"provider":name,"plan_method":method("plan"),"callback_method":method("callback"),"status_method":method("status"),"capabilities":[],"cleanup_methods":[],"settings_revision":"one","settings":{}});
+        let source_request = json!({"version":2,"provider_sequence":1,"operation":"lifecycle_callback","transition_id":"source-transition","operation_id":"source-op","target":session,"phase":"session.prepare","settings_revision":"one","settings":{},"intent":null,"reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector"]},"remaining_ms":1000,"plan_revision":1,"admission_id":"source","approved_plan":source_plan});
+        let prepared =
+            json!({"status":"prepared","candidate":null,"obligations":[],"outputs":[output]});
+        let callback_call = json!({"service":"owner/2","method":"callback","interface_major":2,"interface_minor":0,"approval":approval("callback")["broker_approval"],"arguments":source_request,"timeout_ms":1000,"operation_id":"source-op"});
+        let proof = json!({"participant":participant("owner"),"request":source_request,"terminal":{"call":callback_call,"state":{"state":"completed","payload":prepared}},"pending_receipt":null});
+        let stored = json!({"output":output,"admission_id":"source","transition_id":"source-transition","plan":source_plan,"state":"retained","callback_proof":proof});
+        let policy = json!({"dependent_provider":"dependent","owner_provider":"owner","owner_service":"owner/2","owner_method":method("control"),"status_method":method("status"),"settlement_method":method("settle"),"argument_schema":schema,"output_capability":"display","output_schema":schema,"max_access":"exclusive","domain_scope":"resource","mutation_domains":[]});
+        let final_policy = json!({"owner_provider":"owner","owner_service":"owner/2","method":method("finalize"),"status_method":method("status"),"output_capability":"display","output_schema":schema,"capture_provider":"capture","selector_schema":"selector","required_access":"exclusive","domain_scope":"resource","mutation_domains":[]});
+        let frozen = json!({"target":target,"transition_id":"selection-transition","input":stored,"control_policy":policy,"finalize_policy":final_policy,"control_approval":approval("control"),"control_status_approval":approval("status"),"settlement_approval":approval("settle"),"finalize_approval":approval("finalize"),"finalize_status_approval":approval("status"),"schema_documents":[{"reference":schema,"document":document}]});
+        let request = json!({"version":2,"transition_id":"control-transition","operation_id":"effect","provider_sequence":1,"target":target,"proposal":proposal,"admission_id":"dependent-admission","permit_id":"permit","remaining_ms":1000});
+        let tuple = json!({"request":request,"output":output,"settlement_id":"settlement"});
+        let applied = json!({"status":"applied","output":output,"candidate":null});
+        let call = |name: &str, args: Value, id: &str| json!({"service":"owner/2","method":name,"interface_major":2,"interface_minor":0,"approval":approval(name)["broker_approval"],"arguments":args,"timeout_ms":1000,"operation_id":id});
+        let record = json!({"settlement":tuple,"selection_transition_id":"selection-transition","confirmed":{"proposal_id":"proposal","output":output,"candidate":null},"applied":applied,"effect_dispatch":{"call":call("control",request.clone(),"effect"),"state":{"state":"completed","payload":applied}},"owner_receipt_id":null,"owner_ack":applied,"owner_dispatch":{"call":call("settle",tuple.clone(),"effect.settle"),"state":{"state":"completed","payload":applied}}});
+        let dependent_plan = json!({"plan_id":"dependent","revision":1,"resources":[],"mutation_domains":[{"domain":"domain","expected_revision":1,"borrowers":{},"access":"exclusive"}],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[],"control_proposals":[proposal]});
+        let selection = |name: &str| json!({"participant":participant(name),"approvals":[approval("plan"),approval("callback"),approval("status")],"capabilities":[],"cleanup_methods":[],"authorized_borrowers":[]});
+        let admission = |provider: &str, plan: Value| json!({"provider":provider,"selection":selection(provider),"plan":plan,"rights":[]});
+        let permit = json!({"context":{"policy":policy,"output":output,"target":target,"transition_id":"control-transition","parent_generation":1},"request":request,"consumed":true,"settled":true});
+        let session_record = json!({"host_epoch":epoch,"id":"session","generation":1,"phase":"ready","owner":{"caller":"transport","initiator":"transport"},"delegates":[],"application_ref":{},"settings_revision":"one","application_retired":false,"streams":{"stream":{"generation":1,"phase":"active","candidate":null,"required":[],"acknowledgements":[],"retirements":[],"provider_graph":{"order":["owner","dependent"],"dependencies":{"owner":[],"dependent":["owner"]}}}},"admission_ids":["source"],"admission_targets":{"source":session},"admission_phases":{"source":"session.prepare"}});
+        let mut journal = coordinator.shared.borrow().value.clone();
+        journal.sessions.insert(
+            "session".into(),
+            serde_json::from_value(session_record).unwrap(),
+        );
+        journal.composition = serde_json::from_value(json!({"outputs":[stored],"selections":[frozen],"finalize_selections":[],"refinements":[]})).unwrap();
+        journal.control_settlements = serde_json::from_value(json!({"records":[record]})).unwrap();
+        journal.authority.settled.insert(
+            "source".into(),
+            serde_json::from_value(admission("owner", source_plan)).unwrap(),
+        );
+        journal.authority.settled.insert(
+            "dependent-admission".into(),
+            serde_json::from_value(admission("dependent", dependent_plan)).unwrap(),
+        );
+        journal
+            .authority
+            .control_permits
+            .insert("permit".into(), serde_json::from_value(permit).unwrap());
+        journal
+            .admission_transitions
+            .insert("source".into(), "source-transition".into());
+        coordinator
+            .settings
+            .control_policies
+            .push(serde_json::from_value(policy).unwrap());
+        coordinator
+            .settings
+            .schema_documents
+            .push(serde_json::from_value(json!({"reference":schema,"document":document})).unwrap());
+        let key = receipt_key("transport", "transport", "selection-op");
+        journal.receipts.insert(key, serde_json::from_value(json!({"caller":"transport","initiator":"transport","request":{"operation_id":"selection-op"},"response":{"status":"succeeded","operation_id":"selection-op","transition_id":"selection-transition","target":target},"work":null})).unwrap());
+        assert!(
+            journal
+                .receipts
+                .values()
+                .all(|receipt| receipt.work.is_none()),
+            "the original Work has completed"
+        );
+        assert!(journal.control_settlements.validate_structure());
+        validate_journal(&journal).expect("historical graph must survive journal validation");
+        save(&coordinator.shared, journal).unwrap();
+        let persisted: Journal =
+            serde_json::from_slice(&std::fs::read(path.join("journal.json")).unwrap()).unwrap();
+        validate_journal(&persisted).expect("persisted graph must retain valid provenance");
+        let mut envelope = tuple.clone();
+        envelope["operation"] = json!("verify_control_settlement");
+        let valid = coordinator.verify_control_settlement("owner", envelope.clone());
+        assert_eq!(valid["status"], "valid", "{valid}");
+        assert_eq!(
+            coordinator.verify_control_settlement("foreign", envelope.clone())["status"],
+            "rejected"
+        );
+        let mut changed = envelope;
+        changed["output"]["resource"]["revision"] = json!(2);
+        assert_eq!(
+            coordinator.verify_control_settlement("owner", changed)["status"],
+            "rejected"
+        );
+        drop(coordinator);
+        std::fs::remove_dir_all(path).unwrap();
+    }
 }
