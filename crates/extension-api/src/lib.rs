@@ -293,6 +293,9 @@ pub struct ProviderRequest {
     pub transition_id: String,
     pub operation_id: String,
     pub target: LifecycleTarget,
+    /// Coordinator-selected resource generation; this value does not confer authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_generation: Option<u64>,
     pub phase: LifecyclePhase,
     pub settings_revision: String,
     pub settings: amaterasu_configuration_schema::Values,
@@ -509,6 +512,9 @@ pub struct ExtensionDescriptor {
 pub fn validate_provider_request(request: &ProviderRequest) -> Result<(), String> {
     if request.provider_sequence == 0
         || !matches!(request.version, CONTRACT_VERSION | COMPOSITION_VERSION)
+        || request
+            .resource_generation
+            .is_some_and(|generation| request.version != COMPOSITION_VERSION || generation == 0)
         || !valid_opaque_id(&request.transition_id)
         || !valid_opaque_id(&request.operation_id)
         || !valid_opaque_id(&request.settings_revision)
@@ -1533,6 +1539,7 @@ mod tests {
                 validation_id: "probe".into(),
                 generation: 1,
             },
+            resource_generation: None,
             phase: LifecyclePhase::StreamPrepare,
             settings_revision: "settings".into(),
             settings: Default::default(),
@@ -1554,6 +1561,24 @@ mod tests {
         assert!(validate_provider_request(&request).is_err());
         request.admission_id = Some("admitted".into());
         assert!(validate_provider_request(&request).is_ok());
+        assert!(
+            serde_json::to_value(&request)
+                .unwrap()
+                .get("resource_generation")
+                .is_none()
+        );
+        request.resource_generation = Some(3);
+        assert!(validate_provider_request(&request).is_err());
+        request.version = COMPOSITION_VERSION;
+        assert!(validate_provider_request(&request).is_ok());
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["resource_generation"],
+            3
+        );
+        request.resource_generation = Some(0);
+        assert!(validate_provider_request(&request).is_err());
+        request.resource_generation = None;
+        request.version = CONTRACT_VERSION;
         request.provider_sequence = 0;
         assert!(validate_provider_request(&request).is_err());
         request.provider_sequence = 1;
