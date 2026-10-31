@@ -8,6 +8,11 @@ use std::ffi::c_void;
 pub const SERVICE: &str = "amaterasu.identity/1";
 pub const INTERFACE_MAJOR: u32 = 1;
 pub const INTERFACE_MINOR: u32 = 0;
+/// Minor version required for the appended permission query.
+pub const INTERFACE_MINOR_PERMISSIONS: u32 = 1;
+pub const PERMISSION_LIST: u32 = 1;
+pub const PERMISSION_LAUNCH: u32 = 2;
+pub const PERMISSION_VIEW: u32 = 3;
 pub const MAX_MESSAGE_BYTES: usize = 65536;
 pub const MAX_CERTIFICATE_BYTES: usize = 8192;
 pub const MAX_SIGNATURE_BYTES: usize = 512;
@@ -37,6 +42,21 @@ pub struct IdentityApi {
     pub verify_client: unsafe extern "C" fn(*mut c_void, BorrowedBytes) -> Status,
 }
 
+/// Version 1.1 extends the unchanged 1.0 prefix. Request minor version 1 and
+/// this table's full size before accessing the appended callback.
+#[repr(C)]
+pub struct IdentityApiV1_1 {
+    pub v1_0: IdentityApi,
+    /// Checks exact DER membership, certificate validity and current committed
+    /// policy synchronously. List is allowed by list, view or launch; view by
+    /// view or launch. Returns STATUS_OK only when allowed, IDENTITY_UNTRUSTED
+    /// for an invalid or unpaired certificate, IDENTITY_FORBIDDEN for a denied
+    /// permission, STATUS_INVALID_ARGUMENT for an unknown selector, and
+    /// IDENTITY_UNAVAILABLE when committed policy cannot be consulted. Callers
+    /// must deny on every non-OK status and separately verify TLS possession.
+    pub check_permission: unsafe extern "C" fn(*mut c_void, BorrowedBytes, u32) -> Status,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,5 +67,8 @@ mod tests {
         assert_eq!(std::mem::offset_of!(IdentityApi, certificate), 32);
         assert_eq!(std::mem::offset_of!(IdentityApi, sign), 40);
         assert_eq!(std::mem::offset_of!(IdentityApi, verify_client), 48);
+        assert_eq!(size_of::<IdentityApiV1_1>(), 64);
+        assert_eq!(std::mem::offset_of!(IdentityApiV1_1, v1_0), 0);
+        assert_eq!(std::mem::offset_of!(IdentityApiV1_1, check_permission), 56);
     }
 }

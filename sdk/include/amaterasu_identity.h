@@ -9,6 +9,10 @@ extern "C" {
 #define AMATERASU_IDENTITY_FORBIDDEN 21
 #define AMATERASU_IDENTITY_UNSUPPORTED 22
 #define AMATERASU_IDENTITY_UNTRUSTED 23
+#define AMATERASU_IDENTITY_MINOR_PERMISSIONS 1
+#define AMATERASU_IDENTITY_PERMISSION_LIST 1
+#define AMATERASU_IDENTITY_PERMISSION_LAUNCH 2
+#define AMATERASU_IDENTITY_PERMISSION_VIEW 3
 #define AMATERASU_TLS_RSA_PKCS1_SHA256 0x0401
 #define AMATERASU_TLS_RSA_PKCS1_SHA384 0x0501
 #define AMATERASU_TLS_RSA_PKCS1_SHA512 0x0601
@@ -27,6 +31,17 @@ typedef struct {
     AmaterasuStatus (*sign)(void *context, uint32_t scheme, AmaterasuBorrowedBytes message, AmaterasuReplySink reply);
     AmaterasuStatus (*verify_client)(void *context, AmaterasuBorrowedBytes certificate_der);
 } AmaterasuIdentityApi;
+
+/* Bind major 1, minor 1 and request this full size before using the appended
+ * callback. Its unchanged prefix remains usable by version 1.0 consumers.
+ * The callback checks current committed trust, validity and policy; list is
+ * implied by view or launch, and view by launch. Only STATUS_OK grants access.
+ * Unknown selectors return INVALID_ARGUMENT; unavailable state fails closed.
+ * As with verify_client, TLS possession must be verified separately. */
+typedef struct {
+    AmaterasuIdentityApi v1_0;
+    AmaterasuStatus (*check_permission)(void *context, AmaterasuBorrowedBytes certificate_der, uint32_t permission);
+} AmaterasuIdentityApiV1_1;
 
 #ifdef __cplusplus
 }
