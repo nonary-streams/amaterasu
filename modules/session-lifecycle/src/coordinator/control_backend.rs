@@ -4,7 +4,9 @@ use super::*;
 use crate::prepare_authority::{
     AuthorityJournal, ControlContext, ControlPermitUse, CoordinatorPrepareAuthority,
 };
-use amaterasu_extension_api::{ResourceControlRequest, SchemaRef};
+use amaterasu_extension_api::{
+    ResourceControlRequest, ResourceControlSettlementRequest, SchemaRef,
+};
 
 struct Writer(Shared);
 impl AuthorityJournal for Writer {
@@ -51,8 +53,12 @@ impl Backend<'_> {
     }
 }
 
-impl ControlEndpointBackend for Backend<'_> {
-    fn resolve(&mut self, request: &ResourceControlRequest) -> ModuleResult<ResolvedControl> {
+impl Backend<'_> {
+    fn resolve_control(
+        &mut self,
+        request: &ResourceControlRequest,
+        settlement: Option<&ResourceControlSettlementRequest>,
+    ) -> ModuleResult<ResolvedControl> {
         let journal = &self.coordinator.shared.borrow().value;
         let admission = journal
             .authority
@@ -122,9 +128,22 @@ impl ControlEndpointBackend for Backend<'_> {
             return Err("control_selection_mismatch".into());
         }
         let mut controls = progress.controls.iter().filter(|control| {
-            control.request == *request
-                && control.dependency == selection.input.output
-                && matches!(control.phase, super::control_dispatch::ControlPhase::Effect)
+            control.dispatch.request == *request
+                && control.dispatch.dependency == selection.input.output
+                && match (&control.dispatch.phase, settlement) {
+                    (super::control_dispatch::ControlPhase::Effect, None) => true,
+                    (super::control_dispatch::ControlPhase::Applied { result }, Some(tuple)) => {
+                        result.output == tuple.output
+                            && control.settlement.as_ref().is_some_and(|stage| {
+                                stage.request == *tuple
+                                    && stage.policy == selection.control_policy
+                                    && matches!(stage.phase, super::settlement_dispatch::SettlementPhase::Ready)
+                                    && stage.owner_ack.is_none()
+                                    && stage.dispatch.as_ref().is_some_and(|dispatch| dispatch.state == crate::provider_dispatch::DispatchState::OutcomeUnknown)
+                            })
+                    }
+                    _ => false,
+                }
         });
         if controls.next().is_none()
             || controls.next().is_some()
@@ -188,6 +207,27 @@ impl ControlEndpointBackend for Backend<'_> {
         {
             return Err("owner_approval_changed".into());
         }
+        if settlement.is_some() {
+            let stage = progress
+                .controls
+                .iter()
+                .find(|control| control.dispatch.request == *request)
+                .and_then(|control| control.settlement.as_ref())
+                .ok_or("settlement_stage_unavailable")?;
+            if !approved.approvals.iter().any(|approval| {
+                approval.method.service == selection.control_policy.settlement_method.service
+                    && approval.method.method == selection.control_policy.settlement_method.method
+                    && approval.method.interface_major
+                        == selection.control_policy.settlement_method.interface_major
+                    && approval.method.interface_minor
+                        == selection.control_policy.settlement_method.interface_minor
+                    && approval.method.schema_revision
+                        == selection.control_policy.settlement_method.schema_revision
+                    && approval.broker_approval == stage.call.approval
+            }) {
+                return Err("settlement_approval_unavailable".into());
+            }
+        }
         let (epoch, session_id, stream_id, generation) =
             super::operations::target_parts(&work.target)?;
         let session = journal.sessions.get(session_id).ok_or("unknown_session")?;
@@ -223,6 +263,8 @@ impl ControlEndpointBackend for Backend<'_> {
             .validate(&output.schema, &output.data)?;
         Ok(ResolvedControl {
             participant: admission.selection.participant.clone(),
+            consumers_retired: work.phase == LifecyclePhase::StreamRelease
+                && stream.retirements == stream.required,
             session_target: LifecycleTarget::Session {
                 host_epoch: session.host_epoch.clone(),
                 session_id: session.id.clone(),
@@ -236,6 +278,12 @@ impl ControlEndpointBackend for Backend<'_> {
                 parent_generation: Some(session.generation),
             },
         })
+    }
+}
+
+impl ControlEndpointBackend for Backend<'_> {
+    fn resolve(&mut self, request: &ResourceControlRequest) -> ModuleResult<ResolvedControl> {
+        self.resolve_control(request, None)
     }
     fn validate_arguments(&mut self, schema: &SchemaRef, arguments: &Value) -> ModuleResult<()> {
         self.coordinator
@@ -294,6 +342,53 @@ impl Coordinator {
     /// Called only with the broker-authenticated immediate owner principal.
     pub(super) fn control_operation(&mut self, caller: &str, payload: Value) -> Value {
         control_endpoint(caller, payload, &mut Backend { coordinator: self })
+    }
+
+    /// Owner CAS verification. The tuple must already be durably recorded in
+    /// the selected pending work and a matching authenticated refinement.
+    pub(super) fn verify_control_settlement(&mut self, caller: &str, mut payload: Value) -> Value {
+        let result = (|| -> ModuleResult<Value> {
+            let object = payload
+                .as_object_mut()
+                .ok_or("invalid_settlement_envelope")?;
+            if object.remove("operation") != Some(json!("verify_control_settlement")) {
+                return Err("invalid_settlement_operation".into());
+            }
+            let tuple: ResourceControlSettlementRequest =
+                serde_json::from_value(payload).map_err(|_| "invalid_settlement_request")?;
+            amaterasu_extension_api::validate_resource_control_settlement_request(&tuple)?;
+            if caller.is_empty() || caller != tuple.request.proposal.owner_provider {
+                return Err("settlement_owner_mismatch".into());
+            }
+            let mut backend = Backend { coordinator: self };
+            let resolved = backend.resolve_control(&tuple.request, Some(&tuple))?;
+            {
+                let shared = backend.coordinator.shared.borrow();
+                let refinements: Vec<_> = shared
+                    .value
+                    .composition
+                    .refinements()
+                    .filter(|item| item.request == tuple.request)
+                    .collect();
+                if refinements.is_empty() || refinements.iter().any(|item| {
+                item.confirmed.output != tuple.output
+                    || amaterasu_extension_api::validate_resource_control_response(&item.request, &item.owner_result).is_err()
+                    || !matches!(&item.owner_result, amaterasu_extension_api::ResourceControlResponse::Applied { output, candidate } if **output == item.confirmed.output && candidate.as_deref() == item.confirmed.candidate.as_ref())
+                }) { return Err("settlement_refinement_unavailable".into()); }
+            }
+            backend.validate(caller, &resolved, &tuple.request)?;
+            backend
+                .coordinator
+                .settings
+                .schema_catalog()?
+                .validate(&tuple.output.schema, &tuple.output.data)?;
+            Ok(
+                json!({"status":"valid", "session_target":resolved.session_target, "target":resolved.context.target, "output":tuple.output, "consumers_retired":resolved.consumers_retired}),
+            )
+        })();
+        result.unwrap_or_else(
+            |_| json!({"status":"rejected","reason":"resource_control_not_authorized"}),
+        )
     }
 }
 
@@ -372,6 +467,12 @@ mod tests {
             }
             .resolve(&request)
             .is_err()
+        );
+        let output = json!({"output_id":"out","capability":"display","schema":request.proposal.argument_schema,"producer":"owner","producer_service":"owner/2","origin":target,"resource":request.proposal.resource,"data":{},"domain_observations":[]});
+        let envelope = json!({"operation":"verify_control_settlement","request":request,"output":output,"settlement_id":"invented"});
+        assert_eq!(
+            coordinator.verify_control_settlement("owner", envelope)["status"],
+            "rejected"
         );
         assert!(
             coordinator

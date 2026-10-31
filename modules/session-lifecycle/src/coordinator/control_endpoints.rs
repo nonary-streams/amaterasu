@@ -39,6 +39,8 @@ pub(super) struct ResolvedControl {
     pub context: ControlContext,
     /// Read from the coordinator's canonical session record.
     pub session_target: LifecycleTarget,
+    /// True only after the exact affected stream's consumers have retired.
+    pub consumers_retired: bool,
 }
 
 /// Trusted coordinator implementation. It must re-read current state for each
@@ -83,7 +85,7 @@ pub(super) fn control_endpoint(
 ) -> Value {
     match authorize(caller, payload, backend) {
         Ok((status, resolved)) => {
-            json!({"status":status, "session_target":resolved.session_target, "target":resolved.context.target, "output":resolved.context.output})
+            json!({"status":status, "session_target":resolved.session_target, "target":resolved.context.target, "output":resolved.context.output, "consumers_retired":resolved.consumers_retired})
         }
         Err(_) => json!({"status":"rejected","reason":"resource_control_not_authorized"}),
     }
@@ -160,6 +162,7 @@ mod tests {
                 participant: self.resolved.participant.clone(),
                 context: self.resolved.context.clone(),
                 session_target: self.resolved.session_target.clone(),
+                consumers_retired: self.resolved.consumers_retired,
             })
         }
         fn validate_arguments(&mut self, _: &SchemaRef, arguments: &Value) -> ModuleResult<()> {
@@ -213,7 +216,7 @@ mod tests {
         let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1});
         let resource = json!({"provider":"owner","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":null,"mutation_domains":[]});
         let schema = json!({"id":"schema","major":1,"minor":0,"digest":"a".repeat(64)});
-        let context: ControlContext = serde_json::from_value(json!({"policy":{"dependent_provider":"consumer","owner_provider":"owner","owner_service":"owner/2","owner_method":method,"status_method":method,"settlement_method":method,"settlement_status_method":method,"argument_schema":schema,"output_capability":"display","output_schema":schema,"max_access":"exclusive","mutation_domains":[]},"output":{"output_id":"out","capability":"display","schema":schema,"producer":"owner","producer_service":"owner/2","origin":target,"resource":resource,"data":{}},"target":target,"transition_id":"transition","parent_generation":1})).unwrap();
+        let context: ControlContext = serde_json::from_value(json!({"policy":{"dependent_provider":"consumer","owner_provider":"owner","owner_service":"owner/2","owner_method":method,"status_method":method,"settlement_method":method,"argument_schema":schema,"output_capability":"display","output_schema":schema,"max_access":"exclusive","mutation_domains":[]},"output":{"output_id":"out","capability":"display","schema":schema,"producer":"owner","producer_service":"owner/2","origin":target,"resource":resource,"data":{}},"target":target,"transition_id":"transition","parent_generation":1})).unwrap();
         let participant: ParticipantSettings = serde_json::from_value(json!({"provider":"consumer","plan_method":method,"callback_method":method,"status_method":method,"capabilities":[],"cleanup_methods":[],"settings_revision":"one","settings":{}})).unwrap();
         let request = json!({"version":2,"transition_id":"transition","operation_id":"effect","provider_sequence":1,"target":target,"proposal":{"proposal_id":"proposal","output_id":"out","owner_provider":"owner","owner_service":"owner/2","target":target,"resource":resource,"method":method,"argument_schema":schema,"arguments":{"width":1920},"access":"exclusive","mutation_domains":[]},"admission_id":"admission","permit_id":"permit","remaining_ms":5000});
         (
@@ -222,6 +225,7 @@ mod tests {
                     participant,
                     context,
                     session_target: serde_json::from_value(json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1})).unwrap(),
+                    consumers_retired: false,
                 },
                 schema_available: true,
                 consumed: false,
@@ -245,6 +249,7 @@ mod tests {
         assert_eq!(first["status"], "execute");
         assert_eq!(first["session_target"]["generation"], 1);
         assert_eq!(first["output"]["output_id"], "out");
+        assert_eq!(first["consumers_retired"], false);
         assert_eq!(
             control_endpoint("owner", payload.clone(), &mut backend)["status"],
             "reattach_only"
