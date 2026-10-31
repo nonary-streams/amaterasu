@@ -25,7 +25,8 @@ fn attach_admitted_generations(
             .authority
             .settled
             .get(id)
-            .ok_or("admission_unsettled")?;
+            .or_else(|| journal.authority.admissions.get(id))
+            .ok_or("admission_unavailable")?;
         if admission.provider != root.output.producer
             || entry["plan"] != serde_json::to_value(&admission.plan).map_err(|_| "plan_invalid")?
         {
@@ -136,6 +137,9 @@ fn attach_admitted_generations(
             }
             generations.push(result.plan_request.resource_generation);
         }
+        if journal.authority.admissions.contains_key(id) {
+            generations.push(rebound_action_generation(journal, root, entry, id));
+        }
         let generation = unique_admission_generation(&generations, root_generation)
             .ok_or("admission_generation_unavailable")?;
         entry
@@ -144,6 +148,56 @@ fn attach_admitted_generations(
             .insert("resource_generation".into(), json!(generation));
     }
     Ok(())
+}
+
+// A live action admission has no lifecycle callback. Its generation is usable
+// only through the exact claimed rebind, its cleanup proof and current rights.
+fn rebound_action_generation(
+    journal: &Journal,
+    root: &super::composition::StoredOutput,
+    entry: &Value,
+    admission_id: &str,
+) -> Option<u64> {
+    let mut matching = journal.receipts.values().filter_map(|receipt| {
+        let work = receipt.work.as_ref()?;
+        let transfer = work.action_transfer.as_ref()?;
+        (transfer.stage == ActionTransferStage::Rebound
+            && transfer.admission_id.as_deref() == Some(admission_id))
+        .then_some((receipt, work, transfer))
+    });
+    let (receipt, work, transfer) = matching.next()?;
+    if matching.next().is_some()
+        || receipt.caller != transfer.service
+        || journal.admission_transitions.get(admission_id) != Some(&work.transition_id)
+        || serde_json::to_value(&work.target).ok().as_ref() != entry.get("target")
+        || !journal.actions.claimed_effect_for(
+            &transfer.service,
+            &transfer.permit,
+            &transfer.binding,
+            &root.output.producer,
+        )
+        || !super::action_endpoints::effect_rights_current(
+            journal,
+            &transfer.service,
+            &transfer.permit,
+            &transfer.binding,
+        )
+    {
+        return None;
+    }
+    let (owner, _, plan) = journal
+        .actions
+        .execution_for_permit(&transfer.service, &transfer.permit)
+        .ok()?;
+    let disposition = plan.resource_disposition.as_deref()?;
+    if owner != root.output.producer
+        || disposition.origin != root.output.origin
+        || disposition.output_id != root.output.output_id
+        || serde_json::to_value(&plan).ok().as_ref() != entry.get("plan")
+    {
+        return None;
+    }
+    Some(disposition.resource_generation)
 }
 
 impl Coordinator {
@@ -688,6 +742,54 @@ mod admission_generation_tests {
                 .get("resource_generation")
                 .is_none()
         );
+    }
+
+    #[test]
+    #[ignore = "requires captured claimed-rebind journal specified by AMATERASU_ACTION_JOURNAL"]
+    fn captured_claimed_rebind_requires_current_exact_proof() {
+        let path = std::env::var("AMATERASU_ACTION_JOURNAL").unwrap();
+        let journal: Journal = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let (work, transfer) = journal
+            .receipts
+            .values()
+            .find_map(|receipt| {
+                let work = receipt.work.as_ref()?;
+                let transfer = work.action_transfer.as_ref()?;
+                (transfer.stage == ActionTransferStage::Rebound).then_some((work, transfer))
+            })
+            .unwrap();
+        let admission_id = transfer.admission_id.as_ref().unwrap();
+        let admission = &journal.authority.admissions[admission_id];
+        let disposition = admission.plan.resource_disposition.as_deref().unwrap();
+        let root = journal
+            .composition
+            .records()
+            .find(|root| {
+                root.output.output_id == disposition.output_id
+                    && root.output.origin == disposition.origin
+            })
+            .unwrap();
+        let entry = json!({"admission_id":admission_id,"target":work.target,"plan":admission.plan});
+        let mut metadata = json!({"admitted_plans":[entry.clone()]});
+        attach_admitted_generations(&journal, root, &mut metadata).unwrap();
+        assert_eq!(
+            metadata["admitted_plans"][0]["resource_generation"],
+            disposition.resource_generation
+        );
+        let mut changed = journal.clone();
+        changed
+            .admission_transitions
+            .insert(admission_id.clone(), "forged".into());
+        assert!(rebound_action_generation(&changed, root, &entry, admission_id).is_none());
+        let mut changed = journal.clone();
+        changed.authority.domain_locks.clear();
+        assert!(rebound_action_generation(&changed, root, &entry, admission_id).is_none());
+        let mut forged = entry.clone();
+        forged["target"] = json!({"kind":"host","host_epoch":"forged"});
+        assert!(rebound_action_generation(&journal, root, &forged, admission_id).is_none());
+        let mut forged = entry;
+        forged["plan"]["revision"] = json!(999);
+        assert!(rebound_action_generation(&journal, root, &forged, admission_id).is_none());
     }
 
     #[test]
