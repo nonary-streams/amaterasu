@@ -81,6 +81,7 @@ impl Harness {
     }
     fn send(&mut self, command: Command) -> Transport {
         Ok(match command {
+            Command::CheckRequest { request: 8 } => Response::Ok,
             Command::CheckRequest { request: 7 } => {
                 if self.check_cancelled {
                     Response::error("request_ended", "cancelled")
@@ -3531,4 +3532,517 @@ fn canceled_pairing_mutation_does_not_release_inflight_effects() {
     gate.acknowledge_drain(&epoch, gate.fence_generation())
         .unwrap();
     assert!(gate.drained());
+}
+
+#[test]
+fn identity_invalidation_fences_effects_and_blocks_republication_until_drain() {
+    let (mut pipeline, harness, _) = paired_native_client();
+    let snapshot = pipeline.identity.get(now()).unwrap();
+    let gate = pipeline.effect_gate.as_mut().unwrap();
+    gate.recover("owner").unwrap();
+    let source = crate::effect_gate::Source {
+        version: 1,
+        id: "ab".repeat(16),
+        generation: 1,
+        host_epoch: "host".into(),
+        session_id: "session".into(),
+        stream_id: "stream".into(),
+        stream_generation: 1,
+        device: "device".into(),
+        device_generation: 1,
+        effect_owner_epoch: "owner".into(),
+    };
+    gate.bind(source.clone()).unwrap();
+    let ticket = gate.admit(&source, "send", 1).unwrap().to_owned();
+    let epoch = gate.epoch().to_owned();
+    pipeline.invalidate_identity();
+    assert!(!pipeline.identity.current(&snapshot, now()));
+    assert_eq!(
+        pipeline.publish_identity(harness.revision, Some(snapshot.clone())),
+        Err("effect_retirement_pending")
+    );
+    let gate = pipeline.effect_gate.as_mut().unwrap();
+    assert_eq!(gate.admit(&source, "other", 2), Err("admission_denied"));
+    gate.complete(&epoch, "send", &ticket).unwrap();
+    assert_eq!(
+        pipeline.publish_identity(harness.revision, Some(snapshot.clone())),
+        Err("effect_retirement_pending")
+    );
+    let gate = pipeline.effect_gate.as_mut().unwrap();
+    gate.acknowledge_drain(&epoch, gate.fence_generation())
+        .unwrap();
+    pipeline
+        .publish_identity(harness.revision, Some(snapshot))
+        .unwrap();
+}
+
+#[test]
+fn configured_authority_restart_requires_owner_retirement_before_unpair_commit() {
+    let (_old, mut harness, certificate_id) = paired_native_client();
+    let mut configured = settings();
+    configured.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        protocol_owner: "nvhttp".into(),
+        effect_owner: "input".into(),
+    });
+    let mut restarted = Pipeline::new(configured);
+    let writes = harness.writes;
+    let epoch = restarted.effect_gate.as_ref().unwrap().epoch().to_owned();
+    assert!(!restarted.effect_gate.as_ref().unwrap().drained());
+    harness.enqueue("console", json!({"action":"unpair","certificate_id":certificate_id,"expected_revision":harness.revision}));
+    restarted
+        .tick_at(now(), |command| harness.send(command))
+        .unwrap();
+    assert_eq!(harness.writes, writes);
+    assert!(restarted.deferred_effect_mutation.is_some());
+    harness.incoming = Some(Response::Request {
+        id: 8,
+        caller: "input".into(),
+        initiator: "input".into(),
+        service: EFFECT_SERVICE.into(),
+        remaining_ms: 30_000,
+        payload: json!({"action":"recover","epoch":epoch,"owner_epoch":"retired-old-owner"}),
+    });
+    let mut result = None;
+    restarted
+        .tick_at(now(), |command| match command {
+            Command::Complete {
+                request: 8,
+                payload,
+            } => {
+                result = Some(payload);
+                Ok(Response::Ok)
+            }
+            command => harness.send(command),
+        })
+        .unwrap();
+    assert_eq!(result.unwrap()["ok"], true);
+    assert_eq!(harness.writes, writes);
+    for _ in 0..5 {
+        restarted
+            .tick_at(now(), |command| harness.send(command))
+            .unwrap();
+        if harness.output.is_some() {
+            break;
+        }
+    }
+    assert_eq!(harness.output.unwrap()["ok"], true);
+    assert_eq!(harness.writes, writes + 1);
+}
+
+#[test]
+fn unavailable_configured_authority_cannot_bypass_unpair_fence() {
+    let (mut pipeline, mut harness, certificate_id) = paired_native_client();
+    pipeline.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        protocol_owner: "nvhttp".into(),
+        effect_owner: "input".into(),
+    });
+    pipeline.effect_gate = None;
+    assert!(!pipeline.authority_available());
+    let writes = harness.writes;
+    harness.enqueue("console", json!({"action":"unpair","certificate_id":certificate_id,"expected_revision":harness.revision}));
+    pipeline
+        .tick_at(now(), |command| harness.send(command))
+        .unwrap();
+    assert_eq!(harness.output.unwrap()["code"], "authority_unavailable");
+    assert_eq!(harness.writes, writes);
+}
+
+#[test]
+fn request_canceled_after_delivery_cannot_fence_a_trust_mutation() {
+    let (mut pipeline, mut harness, certificate_id) = paired_native_client();
+    pipeline.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        protocol_owner: "nvhttp".into(),
+        effect_owner: "input".into(),
+    });
+    let gate = pipeline.effect_gate.as_mut().unwrap();
+    gate.recover("owner").unwrap();
+    let source = crate::effect_gate::Source {
+        version: 1,
+        id: "ab".repeat(16),
+        generation: 1,
+        host_epoch: "host".into(),
+        session_id: "session".into(),
+        stream_id: "stream".into(),
+        stream_generation: 1,
+        device: "device".into(),
+        device_generation: 1,
+        effect_owner_epoch: "owner".into(),
+    };
+    gate.bind(source.clone()).unwrap();
+    let writes = harness.writes;
+    harness.enqueue("console", json!({"action":"unpair","certificate_id":certificate_id,"expected_revision":harness.revision}));
+    harness.check_cancelled = true;
+    pipeline
+        .tick_at(now(), |command| harness.send(command))
+        .unwrap();
+    assert_eq!(harness.output.unwrap()["code"], "request_ended");
+    assert_eq!(harness.writes, writes);
+    assert!(
+        pipeline
+            .effect_gate
+            .as_mut()
+            .unwrap()
+            .admit(&source, "after-cancel", 1)
+            .is_ok()
+    );
+}
+
+#[test]
+fn canceled_effect_request_cannot_admit_or_acknowledge_drain() {
+    let (mut pipeline, mut harness, _) = paired_native_client();
+    pipeline.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        protocol_owner: "nvhttp".into(),
+        effect_owner: "input".into(),
+    });
+    let snapshot = pipeline.identity.get(now()).unwrap();
+    let certificate = crypto_certificate_der(CLIENT_CERT);
+    let gate = pipeline.effect_gate.as_mut().unwrap();
+    gate.recover("owner").unwrap();
+    let source = crate::effect_gate::Source {
+        version: 1,
+        id: "ab".repeat(16),
+        generation: 1,
+        host_epoch: "host".into(),
+        session_id: "session".into(),
+        stream_id: "stream".into(),
+        stream_generation: 1,
+        device: "device".into(),
+        device_generation: 1,
+        effect_owner_epoch: "owner".into(),
+    };
+    gate.bind(source.clone()).unwrap();
+    let epoch = gate.epoch().to_owned();
+    pipeline
+        .effect_bindings
+        .insert(source.clone(), (snapshot, certificate));
+    let mut request = Some(Response::Request {
+        id: 8,
+        caller: "input".into(),
+        initiator: "input".into(),
+        service: EFFECT_SERVICE.into(),
+        remaining_ms: 30_000,
+        payload: json!({"action":"admit","epoch":epoch,"source":source,"operation_id":"cancelled","sequence":1}),
+    });
+    let mut output = None;
+    pipeline
+        .tick_at(now(), |command| match command {
+            Command::Poll {} => Ok(request.take().unwrap_or(Response::Pending)),
+            Command::CheckRequest { request: 8 } => {
+                Ok(Response::error("request_ended", "cancelled"))
+            }
+            Command::Complete {
+                request: 8,
+                payload,
+            } => {
+                output = Some(payload);
+                Ok(Response::Ok)
+            }
+            command => harness.send(command),
+        })
+        .unwrap();
+    assert_eq!(output.unwrap()["code"], "request_ended");
+    assert_eq!(pipeline.effect_gate.as_ref().unwrap().in_flight(), 0);
+    let allowed = pipeline.apply_effect_request("input", "input", json!({"action":"admit","epoch":epoch,"source":source,"operation_id":"valid","sequence":1}), now()).unwrap();
+    let ticket = allowed["ticket"].as_str().unwrap().to_owned();
+    let gate = pipeline.effect_gate.as_mut().unwrap();
+    gate.complete(&epoch, "valid", &ticket).unwrap();
+    gate.fence();
+    let generation = gate.fence_generation();
+    let mut request = Some(Response::Request {
+        id: 8,
+        caller: "input".into(),
+        initiator: "input".into(),
+        service: EFFECT_SERVICE.into(),
+        remaining_ms: 30_000,
+        payload: json!({"action":"drain","epoch":epoch,"fence_generation":generation}),
+    });
+    pipeline
+        .tick_at(now(), |command| match command {
+            Command::Poll {} => Ok(request.take().unwrap_or(Response::Pending)),
+            Command::CheckRequest { request: 8 } => {
+                Ok(Response::error("request_ended", "cancelled"))
+            }
+            Command::Complete { request: 8, .. } => Ok(Response::Ok),
+            command => harness.send(command),
+        })
+        .unwrap();
+    assert!(pipeline.effect_gate.as_ref().unwrap().drain_required());
+}
+
+fn authority_broker() -> amaterasu_runtime::Broker {
+    use amaterasu_contracts::{Grants, RuntimeConfig};
+    let mut configuration = RuntimeConfig::default();
+    configuration.principals.insert(
+        "pairing".into(),
+        Grants {
+            provide: [SERVICE.into(), EFFECT_SERVICE.into()].into(),
+            call: [STATE_SERVICE.into()].into(),
+            ..Default::default()
+        },
+    );
+    configuration.principals.insert(
+        "state".into(),
+        Grants {
+            provide: [STATE_SERVICE.into()].into(),
+            ..Default::default()
+        },
+    );
+    configuration.principals.insert(
+        "console".into(),
+        Grants {
+            call: [SERVICE.into(), STATE_SERVICE.into()].into(),
+            ..Default::default()
+        },
+    );
+    configuration.principals.insert(
+        "input".into(),
+        Grants {
+            call: [EFFECT_SERVICE.into()].into(),
+            ..Default::default()
+        },
+    );
+    let mut broker = amaterasu_runtime::Broker::new(configuration).unwrap();
+    for (principal, service) in [
+        ("pairing", SERVICE),
+        ("pairing", EFFECT_SERVICE),
+        ("state", STATE_SERVICE),
+    ] {
+        assert!(matches!(
+            broker.dispatch(
+                principal,
+                Command::Register {
+                    service: service.into()
+                }
+            ),
+            Response::Ok
+        ));
+    }
+    broker
+}
+
+#[test]
+fn real_broker_startup_recovery_blocks_pairing_mutation_until_owner_retires() {
+    let (_old, harness, certificate_id) = paired_native_client();
+    let mut document = harness.document.unwrap();
+    let mut revision = harness.revision;
+    let mut configured = settings();
+    configured.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        protocol_owner: "nvhttp".into(),
+        effect_owner: "input".into(),
+    });
+    let mut pipeline = Pipeline::new(configured);
+    let mut broker = authority_broker();
+    let Response::Accepted { id: request } = broker.dispatch("console", Command::Request {
+        service: SERVICE.into(), payload: json!({"action":"unpair","certificate_id":certificate_id,"expected_revision":revision}),
+        timeout_ms: 30_000, operation_id: "unpair-real".into(), parent: None,
+    }) else { panic!("pairing request not accepted") };
+    pipeline
+        .tick_at(now(), |command| Ok(broker.dispatch("pairing", command)))
+        .unwrap();
+    assert!(matches!(
+        broker.dispatch("console", Command::TakeResult { request }),
+        Response::Pending
+    ));
+    assert!(matches!(
+        broker.dispatch("state", Command::Poll {}),
+        Response::Pending
+    ));
+    let epoch = pipeline.effect_gate.as_ref().unwrap().epoch().to_owned();
+    let Response::Accepted { id: recovery } = broker.dispatch(
+        "input",
+        Command::Request {
+            service: EFFECT_SERVICE.into(),
+            payload: json!({"action":"recover","epoch":epoch,"owner_epoch":"retired-owner"}),
+            timeout_ms: 30_000,
+            operation_id: "recover-real".into(),
+            parent: None,
+        },
+    ) else {
+        panic!("recovery not accepted")
+    };
+    pipeline
+        .tick_at(now(), |command| Ok(broker.dispatch("pairing", command)))
+        .unwrap();
+    assert!(
+        matches!(broker.dispatch("input", Command::TakeResult {request:recovery}), Response::Result { payload } if payload["ok"] == true)
+    );
+    let mut writes = 0;
+    let mut answer = None;
+    for _ in 0..16 {
+        pipeline
+            .tick_at(now(), |command| Ok(broker.dispatch("pairing", command)))
+            .unwrap();
+        if let Response::Request { id, payload, .. } = broker.dispatch("state", Command::Poll {}) {
+            let response = if payload["action"] == "get" {
+                json!({"ok":true,"revision":revision,"found":true,"value":document})
+            } else {
+                assert_eq!(payload["expected_revision"], revision);
+                writes += 1;
+                document = payload["value"].clone();
+                revision += 1;
+                json!({"ok":true,"revision":revision})
+            };
+            assert!(matches!(
+                broker.dispatch(
+                    "state",
+                    Command::Complete {
+                        request: id,
+                        payload: response
+                    }
+                ),
+                Response::Ok
+            ));
+        }
+        if let Response::Result { payload } =
+            broker.dispatch("console", Command::TakeResult { request })
+        {
+            answer = Some(payload);
+            break;
+        }
+    }
+    assert_eq!(answer.unwrap()["ok"], true);
+    assert_eq!(writes, 1);
+    assert!(document["clients"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn real_broker_cancel_between_delivery_and_check_preserves_open_authority() {
+    let (mut pipeline, _harness, certificate_id) = paired_native_client();
+    pipeline.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        protocol_owner: "nvhttp".into(),
+        effect_owner: "input".into(),
+    });
+    let gate = pipeline.effect_gate.as_mut().unwrap();
+    gate.recover("owner").unwrap();
+    let source = crate::effect_gate::Source {
+        version: 1,
+        id: "ab".repeat(16),
+        generation: 1,
+        host_epoch: "host".into(),
+        session_id: "session".into(),
+        stream_id: "stream".into(),
+        stream_generation: 1,
+        device: "device".into(),
+        device_generation: 1,
+        effect_owner_epoch: "owner".into(),
+    };
+    gate.bind(source.clone()).unwrap();
+    let mut broker = authority_broker();
+    let Response::Accepted { id } = broker.dispatch(
+        "console",
+        Command::Request {
+            service: SERVICE.into(),
+            payload: json!({"action":"unpair","certificate_id":certificate_id}),
+            timeout_ms: 30_000,
+            operation_id: "cancel-after-delivery".into(),
+            parent: None,
+        },
+    ) else {
+        panic!("pairing request not accepted")
+    };
+    let mut canceled = false;
+    pipeline
+        .tick_at(now(), |command| {
+            let result = broker.dispatch("pairing", command);
+            if matches!(&result, Response::Request { id: delivered, .. } if *delivered == id) {
+                assert!(matches!(
+                    broker.dispatch("console", Command::Cancel { request: id }),
+                    Response::Ok
+                ));
+                canceled = true;
+            }
+            Ok(result)
+        })
+        .unwrap();
+    assert!(canceled);
+    assert!(matches!(
+        broker.dispatch("state", Command::Poll {}),
+        Response::Pending
+    ));
+    assert!(
+        pipeline
+            .effect_gate
+            .as_mut()
+            .unwrap()
+            .admit(&source, "still-authorized", 1)
+            .is_ok()
+    );
+}
+
+#[test]
+fn real_broker_cancelled_effect_requests_cannot_admit_or_acknowledge_drain() {
+    let (mut pipeline, _harness, _) = paired_native_client();
+    pipeline.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        protocol_owner: "nvhttp".into(),
+        effect_owner: "input".into(),
+    });
+    let snapshot = pipeline.identity.get(now()).unwrap();
+    let certificate = crypto_certificate_der(CLIENT_CERT);
+    let gate = pipeline.effect_gate.as_mut().unwrap();
+    gate.recover("owner").unwrap();
+    let source = crate::effect_gate::Source {
+        version: 1,
+        id: "ab".repeat(16),
+        generation: 1,
+        host_epoch: "host".into(),
+        session_id: "session".into(),
+        stream_id: "stream".into(),
+        stream_generation: 1,
+        device: "device".into(),
+        device_generation: 1,
+        effect_owner_epoch: "owner".into(),
+    };
+    gate.bind(source.clone()).unwrap();
+    let epoch = gate.epoch().to_owned();
+    pipeline
+        .effect_bindings
+        .insert(source.clone(), (snapshot, certificate));
+    let mut broker = authority_broker();
+    let Response::Accepted {id} = broker.dispatch("input", Command::Request { service:EFFECT_SERVICE.into(),
+        payload:json!({"action":"admit","epoch":epoch,"source":source,"operation_id":"cancelled","sequence":1}),
+        timeout_ms:30_000, operation_id:"cancel-admission".into(), parent:None }) else { panic!("request rejected") };
+    pipeline
+        .tick_at(now(), |command| {
+            let result = broker.dispatch("pairing", command);
+            if matches!(&result, Response::Request {id:delivered, ..} if *delivered == id) {
+                assert!(matches!(
+                    broker.dispatch("input", Command::Cancel { request: id }),
+                    Response::Ok
+                ));
+            }
+            Ok(result)
+        })
+        .unwrap();
+    assert_eq!(pipeline.effect_gate.as_ref().unwrap().in_flight(), 0);
+    let admitted = pipeline.apply_effect_request("input", "input", json!({"action":"admit","epoch":epoch,"source":source,"operation_id":"valid","sequence":1}), now()).unwrap();
+    let ticket = admitted["ticket"].as_str().unwrap();
+    let gate = pipeline.effect_gate.as_mut().unwrap();
+    gate.complete(&epoch, "valid", ticket).unwrap();
+    gate.fence();
+    let generation = gate.fence_generation();
+    let Response::Accepted { id: drain } = broker.dispatch(
+        "input",
+        Command::Request {
+            service: EFFECT_SERVICE.into(),
+            payload: json!({"action":"drain","epoch":epoch,"fence_generation":generation}),
+            timeout_ms: 30_000,
+            operation_id: "cancel-drain".into(),
+            parent: None,
+        },
+    ) else {
+        panic!("drain rejected")
+    };
+    pipeline
+        .tick_at(now(), |command| {
+            let result = broker.dispatch("pairing", command);
+            if matches!(&result, Response::Request {id:delivered, ..} if *delivered == drain) {
+                assert!(matches!(
+                    broker.dispatch("input", Command::Cancel { request: drain }),
+                    Response::Ok
+                ));
+            }
+            Ok(result)
+        })
+        .unwrap();
+    assert!(pipeline.effect_gate.as_ref().unwrap().drain_required());
 }

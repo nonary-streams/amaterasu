@@ -41,13 +41,14 @@ impl ManagedModule for PairingModule {
         // SAFETY: boxed factory context is stable; signed dependency order stops
         // native consumers before pairing destruction. Callbacks share immutable data.
         unsafe { runtime.register_native(amaterasu_identity::SERVICE, &factory.api) }?;
+        let pipeline =
+            Pipeline::with_host_configuration(settings, shared, host_configuration_enabled);
+        if !pipeline.authority_available() {
+            return Err("effect authority initialization failed".into());
+        }
         Ok(Self {
             runtime,
-            pipeline: Pipeline::with_host_configuration(
-                settings,
-                shared,
-                host_configuration_enabled,
-            ),
+            pipeline,
             _identity_factory: factory,
         })
     }

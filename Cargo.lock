@@ -686,9 +686,11 @@ name = "amaterasu-pairing"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "amaterasu-contracts",
  "amaterasu-identity",
  "amaterasu-input-policy",
  "amaterasu-module-sdk",
+ "amaterasu-runtime",
  "amaterasu-storage",
  "getrandom 0.3.4",
  "rand_chacha 0.3.1",

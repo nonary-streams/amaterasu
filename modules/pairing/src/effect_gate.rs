@@ -31,6 +31,7 @@ pub struct EffectGate {
     fenced: bool,
     fence_generation: u64,
     drain_required: bool,
+    startup_recovery_required: bool,
 }
 
 impl EffectGate {
@@ -46,11 +47,15 @@ impl EffectGate {
             fenced: true,
             fence_generation: 0,
             drain_required: false,
+            startup_recovery_required: true,
         })
     }
 
     pub fn epoch(&self) -> &str {
         &self.epoch
+    }
+    pub fn startup_recovery_required(&self) -> bool {
+        self.startup_recovery_required
     }
     pub fn owner_epoch(&self) -> Option<&str> {
         self.owner_epoch.as_deref()
@@ -82,6 +87,7 @@ impl EffectGate {
         self.fence_generation = 0;
         self.drain_required = false;
         self.owner_epoch = Some(owner_epoch.into());
+        self.startup_recovery_required = false;
         self.fenced = false;
         Ok(())
     }
@@ -222,7 +228,10 @@ impl EffectGate {
         self.operations.values().filter(|a| !a.complete).count()
     }
     pub fn drained(&self) -> bool {
-        self.fenced && self.in_flight() == 0 && !self.drain_required
+        self.fenced
+            && self.in_flight() == 0
+            && !self.drain_required
+            && !self.startup_recovery_required
     }
 }
 
