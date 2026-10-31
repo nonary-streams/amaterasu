@@ -19,6 +19,7 @@ pub mod state;
 pub mod transport;
 pub mod video;
 pub mod virtual_display;
+pub mod virtual_display_service;
 pub use native::NativeBinding;
 
 pub use amaterasu_abi as abi;
