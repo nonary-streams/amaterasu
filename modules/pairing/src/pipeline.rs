@@ -1,15 +1,18 @@
+use crate::effect_gate::{EffectGate, Request as EffectRequest, Source as EffectSource};
 use crate::engine::{Change, Engine};
 use crate::identity::{
     ConfiguredIdentity, IMPORTED_IDENTITY_MIGRATION_KEY, ImportedIdentityReconciliation, Shared,
     Snapshot,
 };
 use crate::identity_generation::{Generator, IdentityWorker};
-use crate::protocol::{Document, Identity, Operation, Settings, error};
-use crate::{SERVICE, STATE_SERVICE};
+use crate::protocol::{Document, EffectAuthoritySettings, Identity, Operation, Settings, error};
+use crate::{EFFECT_SERVICE, SERVICE, STATE_SERVICE};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use x509_cert::der::Encode;
 
 const STATE_KEY: &str = "pairing/v1";
 const SYSTEM_TRAY_SERVICE: &str = "amaterasu.system-tray/1";
@@ -68,6 +71,10 @@ struct IdentityGeneration {
 
 pub struct Pipeline {
     engine: Engine,
+    effect_gate: Option<EffectGate>,
+    effect_authority: Option<EffectAuthoritySettings>,
+    effect_bindings: BTreeMap<EffectSource, (Arc<Snapshot>, Vec<u8>)>,
+    deferred_effect_mutation: Option<(Request, Operation)>,
     identity_generation: Option<IdentityGeneration>,
     #[cfg(test)]
     identity_generator: Option<Generator>,
@@ -136,8 +143,13 @@ impl Pipeline {
         } else {
             HostConfigurationState::Disabled
         };
+        let effect_authority = settings.effect_authority.clone();
         Self {
             engine: Engine::new(settings),
+            effect_gate: EffectGate::new().ok(),
+            effect_authority,
+            effect_bindings: BTreeMap::new(),
+            deferred_effect_mutation: None,
             identity_generation: None,
             #[cfg(test)]
             identity_generator: None,
@@ -268,7 +280,9 @@ impl Pipeline {
         match &self.host_configuration {
             HostConfigurationState::Disabled => return Ok(true),
             HostConfigurationState::Ready { refresh_at, .. }
-                if now < *refresh_at || self.pending.is_some() =>
+                if now < *refresh_at
+                    || self.pending.is_some()
+                    || self.deferred_effect_mutation.is_some() =>
             {
                 return Ok(true);
             }
@@ -763,6 +777,33 @@ impl Pipeline {
         if let Some(pending) = self.pending.take() {
             return self.advance(pending, now, &mut send);
         }
+        if let Some((request, operation)) = self.deferred_effect_mutation.take() {
+            if Instant::now() >= request.deadline {
+                return complete(&mut send, request.id, error("deadline_exceeded"));
+            }
+            if !matches!(
+                send(Command::CheckRequest {
+                    request: request.id
+                })?,
+                Response::Ok
+            ) {
+                return complete(&mut send, request.id, error("request_ended"));
+            }
+            if self
+                .effect_gate
+                .as_ref()
+                .is_some_and(|gate| !gate.drained())
+            {
+                self.deferred_effect_mutation = Some((request, operation));
+                return self.poll_effect_completion(now, &mut send);
+            }
+            return self.submit(
+                request,
+                Stage::Loading(Box::new(operation)),
+                json!({"action":"get","key":STATE_KEY}),
+                &mut send,
+            );
+        }
         // One request at a time: state CAS operations cannot race internally and
         // identity writes and pairing commits are serialized without stale caches.
         let incoming = match self.deferred_import.take() {
@@ -788,6 +829,7 @@ impl Pipeline {
             Response::Request {
                 id,
                 caller,
+                initiator,
                 service,
                 payload,
                 remaining_ms,
@@ -795,6 +837,10 @@ impl Pipeline {
             } => {
                 if let Some((_, stale, _)) = &mut self.recovery_request {
                     *stale = true;
+                }
+                if service == EFFECT_SERVICE {
+                    return self
+                        .handle_effect_request(id, &caller, &initiator, payload, now, &mut send);
                 }
                 if service != SERVICE {
                     return complete(&mut send, id, error("invalid_service"));
@@ -825,15 +871,27 @@ impl Pipeline {
                         error("identity_managed_by_host_configuration"),
                     );
                 }
-                if operation.may_write() && !is_client_configuration_update(&operation) {
-                    self.identity.invalidate();
-                    self.recovery_needed = true;
-                }
                 let request = Request {
                     id,
                     caller,
                     deadline: Instant::now() + Duration::from_millis(remaining_ms.min(30_000)),
                 };
+                if operation.may_write() && !is_client_configuration_update(&operation) {
+                    if let Some(gate) = &mut self.effect_gate {
+                        gate.fence();
+                    }
+                    self.effect_bindings.clear();
+                    self.identity.invalidate();
+                    self.recovery_needed = true;
+                    if self
+                        .effect_gate
+                        .as_ref()
+                        .is_some_and(|gate| !gate.drained())
+                    {
+                        self.deferred_effect_mutation = Some((request, operation));
+                        return Ok(());
+                    }
+                }
                 self.submit(
                     request,
                     Stage::Loading(Box::new(operation)),
@@ -842,6 +900,178 @@ impl Pipeline {
                 )
             }
             _ => Err("pairing poll failure".into()),
+        }
+    }
+
+    fn poll_effect_completion(
+        &mut self,
+        now: u64,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<()> {
+        match send(Command::Poll {})? {
+            Response::Pending => Ok(()),
+            Response::Request {
+                id,
+                caller,
+                initiator,
+                service,
+                payload,
+                ..
+            } if service == EFFECT_SERVICE
+                && matches!(
+                    payload["action"].as_str(),
+                    Some("complete" | "lookup" | "acknowledge" | "status" | "drain")
+                ) =>
+            {
+                self.handle_effect_request(id, &caller, &initiator, payload, now, send)
+            }
+            Response::Request { id, .. } => complete(send, id, error("authority_draining")),
+            _ => Err("pairing poll failure".into()),
+        }
+    }
+
+    fn handle_effect_request(
+        &mut self,
+        id: u64,
+        caller: &str,
+        initiator: &str,
+        payload: Value,
+        now: u64,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<()> {
+        let response = self.apply_effect_request(caller, initiator, payload, now);
+        complete(
+            send,
+            id,
+            match response {
+                Ok(value) => value,
+                Err(code) => error(code),
+            },
+        )
+    }
+
+    fn apply_effect_request(
+        &mut self,
+        caller: &str,
+        initiator: &str,
+        payload: Value,
+        now: u64,
+    ) -> Result<Value, &'static str> {
+        let policy = self
+            .effect_authority
+            .as_ref()
+            .ok_or("authority_unavailable")?;
+        if caller != initiator
+            || !serde_json::to_vec(&payload).is_ok_and(|bytes| bytes.len() <= 12_000)
+        {
+            return Err("forbidden");
+        }
+        let request: EffectRequest =
+            serde_json::from_value(payload).map_err(|_| "invalid_request")?;
+        let permitted = match request {
+            EffectRequest::Bind { .. } => caller == policy.protocol_owner,
+            EffectRequest::Status {} => {
+                caller == policy.protocol_owner || caller == policy.effect_owner
+            }
+            _ => caller == policy.effect_owner,
+        };
+        if !permitted {
+            return Err("forbidden");
+        }
+        let gate = self.effect_gate.as_mut().ok_or("authority_unavailable")?;
+        match request {
+            EffectRequest::Recover { epoch, owner_epoch } => {
+                gate.require_epoch(&epoch)?;
+                gate.recover(&owner_epoch)?;
+                self.effect_bindings.clear();
+                Ok(json!({"ok":true,"epoch":gate.epoch()}))
+            }
+            EffectRequest::Bind {
+                epoch,
+                certificate_pem,
+                source,
+            } => {
+                // The protocol-to-lifecycle source join has not been wired yet.
+                // Keep the production endpoint closed until its integration and
+                // final-effect tests prove that the assertion is authentic.
+                gate.require_epoch(&epoch)?;
+                if !source_join_available() {
+                    return Err("source_attestation_unavailable");
+                }
+                let certificate = crate::crypto::parse_certificate(&certificate_pem, Some(now))
+                    .map_err(|_| "source_denied")?;
+                let der = certificate
+                    .certificate
+                    .to_der()
+                    .map_err(|_| "source_denied")?;
+                let snapshot = self.identity.get(now).map_err(|_| "source_denied")?;
+                snapshot
+                    .check_permission(&der, now, amaterasu_identity::PERMISSION_LAUNCH)
+                    .map_err(|_| "source_denied")?;
+                if !self.identity.current(&snapshot, now) {
+                    return Err("source_denied");
+                }
+                gate.bind(source.clone())?;
+                self.effect_bindings.insert(source, (snapshot, der));
+                Ok(json!({"ok":true,"epoch":gate.epoch()}))
+            }
+            EffectRequest::Admit {
+                epoch,
+                source,
+                operation_id,
+                sequence,
+            } => {
+                gate.require_epoch(&epoch)?;
+                let (snapshot, certificate) =
+                    self.effect_bindings.get(&source).ok_or("source_denied")?;
+                if !self.identity.current(snapshot, now)
+                    || snapshot
+                        .check_permission(certificate, now, amaterasu_identity::PERMISSION_LAUNCH)
+                        .is_err()
+                {
+                    return Err("source_denied");
+                }
+                let ticket = gate.admit(&source, &operation_id, sequence)?.to_owned();
+                Ok(
+                    json!({"ok":true,"epoch":gate.epoch(),"operation_id":operation_id,"ticket":ticket}),
+                )
+            }
+            EffectRequest::Status {} => Ok(
+                json!({"ok":true,"epoch":gate.epoch(),"owner_epoch":gate.owner_epoch(),"fence_generation":gate.fence_generation(),"drain_required":gate.drain_required(),"in_flight":gate.in_flight()}),
+            ),
+            EffectRequest::Drain {
+                epoch,
+                fence_generation,
+            } => {
+                gate.acknowledge_drain(&epoch, fence_generation)?;
+                Ok(json!({"ok":true,"epoch":gate.epoch(),"fence_generation":fence_generation}))
+            }
+            EffectRequest::Lookup {
+                epoch,
+                operation_id,
+            } => {
+                gate.require_epoch(&epoch)?;
+                let (ticket, fenced) = gate.lookup(&operation_id)?;
+                Ok(
+                    json!({"ok":true,"epoch":gate.epoch(),"operation_id":operation_id,"ticket":ticket,"fenced":fenced}),
+                )
+            }
+            EffectRequest::Acknowledge {
+                epoch,
+                operation_id,
+                ticket,
+            } => {
+                gate.acknowledge(&epoch, &operation_id, &ticket)?;
+                Ok(json!({"ok":true,"epoch":gate.epoch(),"operation_id":operation_id}))
+            }
+            EffectRequest::Complete {
+                epoch,
+                operation_id,
+                ticket,
+            } => {
+                gate.complete(&epoch, &operation_id, &ticket)?;
+                Ok(json!({"ok":true,"epoch":gate.epoch(),"operation_id":operation_id}))
+            }
         }
     }
 
@@ -1425,6 +1655,10 @@ impl Pipeline {
             snapshot,
         )
     }
+}
+
+fn source_join_available() -> bool {
+    cfg!(test)
 }
 
 fn is_client_configuration_update(operation: &Operation) -> bool {

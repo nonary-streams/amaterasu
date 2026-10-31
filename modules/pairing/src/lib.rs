@@ -1,5 +1,6 @@
 //! Moonlight Gen7 host pairing cryptographic state machine.
 mod crypto;
+pub mod effect_gate;
 mod engine;
 mod identity;
 mod identity_generation;
@@ -13,6 +14,7 @@ use pipeline::Pipeline;
 use protocol::Settings;
 pub const SERVICE: &str = "amaterasu.pairing/1";
 const STATE_SERVICE: &str = "amaterasu.state/1";
+pub const EFFECT_SERVICE: &str = amaterasu_module_sdk::effect_authority::SERVICE;
 
 pub struct PairingModule {
     runtime: RuntimeClient,
@@ -29,6 +31,11 @@ impl ManagedModule for PairingModule {
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
+        if settings.effect_authority.is_some() {
+            runtime.require_success(Command::Register {
+                service: EFFECT_SERVICE.into(),
+            })?;
+        }
         let shared = std::sync::Arc::new(identity::Shared::default());
         let factory = identity::Factory::new(shared.clone(), settings.transport_principals.clone());
         // SAFETY: boxed factory context is stable; signed dependency order stops
