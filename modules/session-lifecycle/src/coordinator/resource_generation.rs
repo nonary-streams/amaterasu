@@ -34,8 +34,7 @@ fn root_generation(journal: &Journal, root: &StoredOutput) -> ModuleResult<u64> 
         .resource_generation
         .filter(|value| *value > 0)
         .ok_or("resource_generation_missing")?;
-    if journal.host_epoch != *host_epoch
-        || session.host_epoch != *host_epoch
+    if session.host_epoch != *host_epoch
         || session.id != *session_id
         || session.generation != *generation
         || !session.admission_ids.contains(&root.admission_id)
@@ -67,6 +66,12 @@ pub(super) fn historical_generation(journal: &Journal, root: &StoredOutput) -> M
 pub(super) fn current_root_generation(journal: &Journal, root: &StoredOutput) -> ModuleResult<u64> {
     if root.state != OutputState::Retained {
         return Err("resource_root_not_active".into());
+    }
+    let LifecycleTarget::Session { host_epoch, .. } = &root.output.origin else {
+        return Err("resource_root_not_session".into());
+    };
+    if journal.host_epoch != *host_epoch {
+        return Err("resource_root_stale_epoch".into());
     }
     let generation = historical_generation(journal, root)?;
     let LifecycleTarget::Session { session_id, .. } = &root.output.origin else {

@@ -645,6 +645,21 @@ impl ActionAuthority {
         Ok(())
     }
 
+    /// Check the retained terminal receipt without granting any execution right.
+    pub fn terminal_succeeded_for(
+        &self,
+        caller: &str,
+        token: &str,
+        binding: &ActionBinding,
+        receipt: &Value,
+    ) -> bool {
+        self.validate().is_ok() && self.reservations.get(&key(binding)).is_some_and(|item| {
+            item.action_service == caller && item.permit_token == token && item.binding == *binding
+                && item.execution.as_ref().is_some_and(|execution| execution.claimed)
+                && matches!(&item.state, ReservationState::Succeeded { receipt: saved } if saved == receipt)
+        })
+    }
+
     /// Read the approvals frozen for this service and permit. This does not
     /// grant effect rights; callers must separately verify the active transfer.
     pub fn approval_snapshot_for_permit(

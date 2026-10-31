@@ -2302,6 +2302,7 @@ mod admission_target_tests {
             stream_releases: Default::default(),
             session_releases: Default::default(),
             session_prepare_evidence: Default::default(),
+            action_dispositions: Default::default(),
             admission_transitions: Default::default(),
         };
         let target = LifecycleTarget::Stream {

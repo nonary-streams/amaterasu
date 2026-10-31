@@ -2,6 +2,7 @@
 #[allow(dead_code)]
 // Frozen dispatch evidence is not authority until cleanup and cursor checks are wired.
 mod action_dispatch_proof;
+mod action_disposition;
 mod action_endpoints;
 #[allow(dead_code)] // Action replan remains fenced until all proof writers are wired.
 mod action_release_proof;
@@ -353,6 +354,8 @@ struct Journal {
     session_releases: session_release::SessionReleaseBook,
     #[serde(default)]
     session_prepare_evidence: session_prepare_evidence::SessionPrepareEvidence,
+    #[serde(default)]
+    action_dispositions: BTreeMap<String, action_disposition::ReleasedActionMarker>,
     /// Immutable producing transition of each retained admission.
     #[serde(default)]
     admission_transitions: BTreeMap<String, String>,
@@ -360,7 +363,20 @@ struct Journal {
 
 impl Journal {
     fn references_admission(&self, id: &str) -> bool {
-        self.session_prepare_evidence.references_admission(id)
+        self.action_dispositions.values().any(|marker| {
+            marker.root_admission_id == id
+                || marker
+                    .cleanup_work
+                    .action_transfer
+                    .as_ref()
+                    .is_some_and(|transfer| {
+                        transfer.admission_id.as_deref() == Some(id)
+                            || transfer.snapshot.as_ref().is_some_and(|snapshot| {
+                                snapshot.session_admissions.contains_key(id)
+                                    || snapshot.stream_admissions.contains_key(id)
+                            })
+                    })
+        }) || self.session_prepare_evidence.references_admission(id)
             || self.session_releases.references_admission(id)
             || self.stream_releases.references_admission(id)
             || self
@@ -438,6 +454,14 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                     .resource_generations
                     .iter()
                     .any(|(provider, generation)| !valid_id(provider) || *generation == 0)
+        })
+        || journal.action_dispositions.len() > MAX_SESSIONS * 32
+        || journal.action_dispositions.iter().any(|(key, marker)| {
+            let LifecycleTarget::Session { session_id, .. } = &marker.session_target else {
+                return true;
+            };
+            key != &action_disposition::marker_key(session_id, &marker.owner)
+                || action_disposition::verified_marker(journal, session_id, &marker.owner).is_none()
         })
         || !retention::validate(journal)
         || journal.admission_transitions.len() > 128
@@ -874,6 +898,7 @@ impl Coordinator {
             stream_releases: Default::default(),
             session_releases: Default::default(),
             session_prepare_evidence: Default::default(),
+            action_dispositions: Default::default(),
             admission_transitions: Default::default(),
         });
         validate_journal(&journal)?;
