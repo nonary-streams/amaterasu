@@ -126,6 +126,15 @@ pub(super) fn preflight(
     }
     let release = session_release::validated_release_closure(journal, target)?;
     let prepares = session_prepare_evidence::validated_closed_prepares(journal, target)?;
+    if journal
+        .composition
+        .records()
+        .filter(|record| record.output.origin == *target)
+        .count()
+        != 1
+    {
+        return Err("session_root_lineage_not_compactable".into());
+    }
     if !prepares
         .iter()
         .any(|item| item.provider == release.owner && item.admission_id == release.root_admission)

@@ -2725,6 +2725,7 @@ mod admission_target_tests {
             recovery_sources: Default::default(),
             input_boot_epochs: Default::default(),
             retention: Default::default(),
+            ended_session_history: Default::default(),
             composition: Default::default(),
             closed_streams: Default::default(),
             control_settlements: Default::default(),

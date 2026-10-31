@@ -231,6 +231,48 @@ pub(super) fn retire_closed_release(
     Ok(())
 }
 
+/// Copy exact terminal callbacks only after the complete retained release
+/// lineage has been revalidated against the private journal.
+#[allow(
+    dead_code,
+    reason = "used by the ended-session certificate constructor"
+)]
+pub(super) fn validated_release_callbacks(
+    journal: &Journal,
+    target: &LifecycleTarget,
+    expected: &ReleaseClosureEvidence,
+) -> ModuleResult<(
+    composition::ProducerCallbackProof,
+    Vec<(String, composition::ProducerCallbackProof)>,
+)> {
+    if validated_release_closure(journal, target)? != *expected {
+        return Err("session_release_closure_changed".into());
+    }
+    let owner = journal
+        .session_releases
+        .proofs
+        .iter()
+        .find(|proof| &proof.target == target && proof.provider == expected.owner)
+        .ok_or("session_release_proof_missing")?;
+    let mut dependents = Vec::new();
+    for dependent in &expected.dependents {
+        let proof = journal
+            .session_releases
+            .noop_proofs
+            .iter()
+            .find(|proof| {
+                &proof.target == target
+                    && proof.provider == dependent.provider
+                    && proof.callback.request.admission_id.as_deref()
+                        == Some(dependent.release_admission.as_str())
+                    && proof.transition_id == dependent.transition_id
+            })
+            .ok_or("dependent_release_proof_missing")?;
+        dependents.push((dependent.provider.clone(), proof.callback.clone()));
+    }
+    Ok((owner.callback.clone(), dependents))
+}
+
 fn session_lineage_closed(journal: &Journal, target: &LifecycleTarget, provider: &str) -> bool {
     let Ok((epoch, session_id, None, generation)) = operations::target_parts(target) else {
         return false;
@@ -1947,7 +1989,15 @@ mod tests {
     #[test]
     fn session_prepare_closure_requires_exact_authenticated_set() {
         let (mut journal, work, mut state) = complete_fixture();
-        let release_state = state.clone();
+        let mut release_state = state.clone();
+        release_state.request.provider_sequence = 2;
+        release_state.last_sequence = 2;
+        release_state
+            .terminal_dispatch
+            .as_mut()
+            .unwrap()
+            .call
+            .arguments = serde_json::to_value(&release_state.request).unwrap();
         let root = journal.composition.records().next().unwrap().clone();
         let proof = root.callback_proof.unwrap();
         state.request = proof.request.clone();
@@ -1981,7 +2031,127 @@ mod tests {
                 target: work.target.clone(),
             });
         journal.receipts.clear();
+        journal.authority.sequences.insert("owner".into(), 2);
+        journal.authority.operation_counter = 1;
+        journal.authority.issued_operation_ids =
+            BTreeSet::from(["root-call".into(), "release-call".into()]);
         assert!(super::session_closure::preflight(&journal, &work.target).is_ok());
+        let session = &journal.sessions["session"];
+        let root = journal.composition.records().next().unwrap().clone();
+        let terminal = journal.session_releases.proofs[0].callback.clone();
+        let cert = super::session_closed_history::EndedSessionCertificate {
+            version: 1,
+            target: work.target.clone(),
+            owner: session.owner.clone(),
+            graph: session.provider_graph.clone().unwrap(),
+            application_ref: session.application_ref.clone(),
+            application: session.application.clone(),
+            application_operation_id: session.application_operation_id.clone(),
+            application_proof: session.application_retirement_proof.clone().unwrap(),
+            producer: "owner".into(),
+            resource_generation: 1,
+            root,
+            root_admission: journal.authority.settled["root"].clone(),
+            owner_release: super::session_closed_history::TerminalCallbackEvidence {
+                admission_id: "release-admission".into(),
+                admission: journal.authority.settled["release-admission"].clone(),
+                callback: terminal,
+            },
+            dependents: vec![],
+            closed_children: 0,
+            provider_sequences: BTreeMap::from([("owner".into(), 2)]),
+            operation_counter: 1,
+            legacy_operation_ids: BTreeSet::from(["root-call".into(), "release-call".into()]),
+        };
+        assert!(cert.validate());
+        let constructed = super::session_closed_history::EndedSessionCertificate::from_verified(
+            &journal,
+            &work.target,
+        )
+        .unwrap();
+        assert!(constructed == cert);
+        let mut substituted = journal.clone();
+        let mut value = serde_json::to_value(&substituted.composition).unwrap();
+        value["outputs"][0]["callback_proof"]["request"]["operation_id"] =
+            json!("alternate-root-call");
+        value["outputs"][0]["callback_proof"]["terminal"]["call"]["operation_id"] =
+            json!("alternate-root-call");
+        value["outputs"][0]["callback_proof"]["terminal"]["call"]["arguments"]["operation_id"] =
+            json!("alternate-root-call");
+        substituted.composition = serde_json::from_value(value).unwrap();
+        substituted
+            .authority
+            .issued_operation_ids
+            .insert("alternate-root-call".into());
+        assert!(
+            super::session_closed_history::EndedSessionCertificate::from_verified(
+                &substituted,
+                &work.target
+            )
+            .is_err()
+        );
+        let restored: super::session_closed_history::EndedSessionCertificate =
+            serde_json::from_slice(&serde_json::to_vec(&cert).unwrap()).unwrap();
+        assert!(restored.validate());
+        let mut forged = restored.clone();
+        forged.owner_release.callback.terminal.call.approval["provider"] = json!("foreign");
+        assert!(!forged.validate());
+        let mut forged = restored.clone();
+        forged.resource_generation = 2;
+        assert!(!forged.validate());
+        let mut forged = restored.clone();
+        forged.closed_children = 1;
+        assert!(!forged.validate());
+        let mut forged = restored.clone();
+        forged.owner_release.callback.request.provider_sequence = 1;
+        forged.owner_release.callback.terminal.call.arguments =
+            serde_json::to_value(&forged.owner_release.callback.request).unwrap();
+        assert!(!forged.validate());
+        let mut checkpoint: Journal = serde_json::from_value(
+            json!({"version":3,"host_epoch":"epoch","receipts":{},"sessions":{}}),
+        )
+        .unwrap();
+        checkpoint.authority.sequences.insert("owner".into(), 2);
+        checkpoint.authority.operation_counter = 1;
+        checkpoint.authority.issued_operation_ids =
+            BTreeSet::from(["root-call".into(), "release-call".into()]);
+        retention::fence_closed_session(&mut checkpoint, &work.target).unwrap();
+        checkpoint
+            .ended_session_history
+            .stage_verified(&journal, &work.target)
+            .unwrap();
+        assert!(validate_journal(&checkpoint).is_ok());
+        let mut stale = checkpoint.clone();
+        stale.authority.sequences.insert("owner".into(), 0);
+        assert!(validate_journal(&stale).is_err());
+        let mut unfenced = checkpoint.clone();
+        unfenced.retention = Default::default();
+        assert!(validate_journal(&unfenced).is_err());
+        let directory = std::env::temp_dir().join(format!(
+            "amaterasu-ended-certificate-{}",
+            identifier().unwrap()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = directory.join("journal.json");
+        let mut store = LifecycleStore::new(path.clone()).unwrap();
+        store.replace(&checkpoint).unwrap();
+        drop(store);
+        let reopened = Coordinator::open(&path).unwrap();
+        assert!(
+            reopened
+                .shared
+                .borrow()
+                .value
+                .ended_session_history
+                .validate(&reopened.shared.borrow().value)
+        );
+        drop(reopened);
+        std::fs::remove_dir_all(directory).unwrap();
         let mut legacy = journal.clone();
         legacy
             .sessions
@@ -2016,8 +2186,16 @@ mod tests {
             session_prepare_evidence::validated_closed_prepares(&journal, &work.target).unwrap();
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].admission_id, "root");
+        let callback =
+            session_prepare_evidence::closed_prepare_callback(&journal, &work.target, &evidence[0])
+                .unwrap();
+        assert_eq!(callback.request.admission_id.as_deref(), Some("root"));
         let mut wrong = evidence.clone();
         wrong[0].transition_id = "foreign".into();
+        assert!(
+            session_prepare_evidence::closed_prepare_callback(&journal, &work.target, &wrong[0])
+                .is_err()
+        );
         let before = serde_json::to_value(&journal).unwrap();
         assert!(
             session_prepare_evidence::retire_closed_prepares(&mut journal, &work.target, &wrong)
@@ -2031,6 +2209,97 @@ mod tests {
                 .session_prepare_evidence
                 .references_admission("root")
         );
+    }
+
+    #[test]
+    fn ended_certificate_independently_verifies_dependent_noops() {
+        use super::session_closed_history::{
+            DependentTerminalEvidence, EndedSessionCertificate, TerminalCallbackEvidence,
+        };
+        let (journal, work, mut owner, mut dependent) = dependent_fixture();
+        let mut root = journal.composition.records().next().unwrap().clone();
+        root.state = composition::OutputState::Released;
+        owner.request.provider_sequence = 2;
+        owner.terminal_dispatch.as_mut().unwrap().call.arguments =
+            serde_json::to_value(&owner.request).unwrap();
+        let mut prepare = dependent.clone();
+        prepare.request.phase = LifecyclePhase::SessionPrepare;
+        prepare.request.transition_id = root.transition_id.clone();
+        prepare.request.operation_id = "settings-prepare-call".into();
+        prepare.request.provider_sequence = 1;
+        prepare.request.admission_id = Some("settings-prepare".into());
+        prepare
+            .terminal_dispatch
+            .as_mut()
+            .unwrap()
+            .call
+            .operation_id = prepare.request.operation_id.clone();
+        prepare.terminal_dispatch.as_mut().unwrap().call.arguments =
+            serde_json::to_value(&prepare.request).unwrap();
+        prepare.terminal_dispatch.as_mut().unwrap().state =
+            crate::provider_dispatch::DispatchState::Completed {
+                payload: json!({"status":"prepared","candidate":null,"obligations":[],"outputs":[]}),
+            };
+        dependent.request.provider_sequence = 2;
+        dependent.terminal_dispatch.as_mut().unwrap().call.arguments =
+            serde_json::to_value(&dependent.request).unwrap();
+        let callback = |id: &str, state: &PrepareState| TerminalCallbackEvidence {
+            admission_id: id.into(),
+            admission: journal.authority.settled[id].clone(),
+            callback: composition::ProducerCallbackProof {
+                participant: state.participant.clone(),
+                request: state.request.clone(),
+                terminal: state.terminal_dispatch.clone().unwrap(),
+                pending_receipt: None,
+                pending_dispatch: None,
+            },
+        };
+        let session = &journal.sessions["session"];
+        let mut certificate = EndedSessionCertificate {
+            version: 1,
+            target: work.target.clone(),
+            owner: session.owner.clone(),
+            graph: session.provider_graph.clone().unwrap(),
+            application_ref: json!({"kind":"desktop"}),
+            application: None,
+            application_operation_id: None,
+            application_proof: application::ApplicationRetirementProof::Desktop {
+                target: work.target.clone(),
+            },
+            producer: "owner".into(),
+            resource_generation: 1,
+            root,
+            root_admission: journal.authority.settled["root"].clone(),
+            owner_release: callback("release-admission", &owner),
+            dependents: vec![DependentTerminalEvidence {
+                provider: "settings".into(),
+                prepare: callback("settings-prepare", &prepare),
+                release: callback("settings-release", &dependent),
+            }],
+            closed_children: 0,
+            provider_sequences: BTreeMap::from([("owner".into(), 2), ("settings".into(), 2)]),
+            operation_counter: 1,
+            legacy_operation_ids: BTreeSet::from([
+                "root-call".into(),
+                "release-call".into(),
+                "settings-prepare-call".into(),
+                "settings-release-call".into(),
+            ]),
+        };
+        assert!(certificate.validate());
+        certificate.dependents[0]
+            .release
+            .callback
+            .request
+            .provider_sequence = 1;
+        certificate.dependents[0]
+            .release
+            .callback
+            .terminal
+            .call
+            .arguments =
+            serde_json::to_value(&certificate.dependents[0].release.callback.request).unwrap();
+        assert!(!certificate.validate());
     }
 
     #[test]

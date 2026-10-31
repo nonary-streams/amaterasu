@@ -50,6 +50,7 @@ mod recovery;
 mod resource_generation;
 mod retention;
 mod security;
+mod session_closed_history;
 mod session_closure;
 mod session_prepare_evidence;
 #[allow(dead_code)]
@@ -450,6 +451,8 @@ struct Journal {
     #[serde(default)]
     retention: retention::Retention,
     #[serde(default)]
+    ended_session_history: session_closed_history::EndedSessionBook,
+    #[serde(default)]
     composition: composition::CompositionBook,
     #[serde(default)]
     closed_streams: closed_stream::ClosedStreamBook,
@@ -615,6 +618,7 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
             .is_none()
         })
         || !retention::validate(journal)
+        || !journal.ended_session_history.validate(journal)
         || journal.admission_transitions.len() > 128
         || journal
             .admission_transitions
@@ -1053,6 +1057,7 @@ impl Coordinator {
             recovery_sources: BTreeMap::new(),
             input_boot_epochs: BTreeMap::new(),
             retention: Default::default(),
+            ended_session_history: Default::default(),
             composition: Default::default(),
             closed_streams: Default::default(),
             control_settlements: Default::default(),

@@ -144,6 +144,32 @@ pub(super) fn retire_closed_prepares(
     Ok(())
 }
 
+/// Recover the exact callback transcript only after revalidating its source.
+#[allow(
+    dead_code,
+    reason = "used by the ended-session certificate constructor"
+)]
+pub(super) fn closed_prepare_callback(
+    journal: &Journal,
+    target: &LifecycleTarget,
+    expected: &ClosedPrepareEvidence,
+) -> ModuleResult<composition::ProducerCallbackProof> {
+    let all = validated_closed_prepares(journal, target)?;
+    if !all.contains(expected) {
+        return Err("session_prepare_not_in_closure".into());
+    }
+    let mut records = journal
+        .session_prepare_evidence
+        .records
+        .iter()
+        .filter(|record| &record.target == target && record.admission_id == expected.admission_id);
+    let record = records.next().ok_or("session_prepare_evidence_missing")?;
+    if records.next().is_some() || !valid_record(journal, record) {
+        return Err("session_prepare_evidence_ambiguous".into());
+    }
+    Ok(record.proof.clone())
+}
+
 fn valid_record(journal: &Journal, record: &Evidence) -> bool {
     let Ok((epoch, session_id, None, generation)) = operations::target_parts(&record.target) else {
         return false;
