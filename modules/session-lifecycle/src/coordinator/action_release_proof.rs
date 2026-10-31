@@ -327,6 +327,11 @@ fn validate_graph_callbacks_inner(
 /// Require exactly one independently verified release proof for the frozen
 /// owner, target and transition. Composed and standalone books may not overlap.
 pub(super) fn validate_owner_release(journal: &Journal, work: &Work, owner: &str) -> bool {
+    if journal.stream_releases.has_released(&work.target)
+        && journal.composed_releases.contains_target(&work.target)
+    {
+        return false;
+    }
     let standalone =
         journal
             .stream_releases
@@ -355,6 +360,9 @@ pub(super) fn proof_from_composed_release(
     work: &Work,
 ) -> Option<ActionReleaseProof> {
     let transfer = work.action_transfer.as_ref()?;
+    if journal.stream_releases.has_released(&work.target) {
+        return None;
+    }
     let snapshot = transfer.snapshot.as_ref()?;
     let released =
         journal
