@@ -60,6 +60,17 @@ impl Fixture {
             effect,
         )
     }
+    pub fn lose_completion_reply(&mut self, effect: &EffectTicket) {
+        let Request::Complete {
+            epoch,
+            operation_id,
+            ticket,
+        } = effect.completion_request().unwrap()
+        else {
+            panic!("expected completion")
+        };
+        self.gate.complete(&epoch, &operation_id, &ticket).unwrap();
+    }
     pub fn fence(&mut self) {
         self.gate.fence();
         assert_eq!(
@@ -105,9 +116,18 @@ impl Fixture {
             .unwrap();
     }
     pub fn drain(&mut self) {
+        let generation = self.gate.fence_generation();
         self.gate
-            .acknowledge_drain(&self.epoch, self.gate.fence_generation())
+            .acknowledge_drain(&self.epoch, generation)
             .unwrap();
+        // A lost drain reply is safe to reconcile with the same epoch and fence.
+        self.gate
+            .acknowledge_drain(&self.epoch, generation)
+            .unwrap();
+        assert_eq!(
+            self.gate.acknowledge_drain(&self.epoch, generation + 1),
+            Err("stale_fence")
+        );
         assert!(self.gate.drained());
     }
 }

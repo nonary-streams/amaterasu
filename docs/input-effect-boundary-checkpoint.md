@@ -60,15 +60,45 @@ join. `stop_discards_busy_feedback_before_transport_retry` covers a separate
 plane queue. Lost admission, cancellation and mismatched receipts are covered by
 SDK state-machine tests.
 
-The authority accepts only one selected direct effect owner. That owner must
-retain a ticket while an input request runs through the broker and while any
-feedback remains in the selected transport. Holding each feedback ticket until
-whole-stream retirement is safe but exhausts the authority's 256-record limit
-in normal operation. Production activation therefore requires an independently
-verified bounded completion or cancellation mechanism (or another coherent
-batching design), and a real broker integration proving the complete fence,
-worker and transport drain barrier. Keep the route disabled until then. Tests
-must use loopback or injected socket fakes and cannot claim remote delivery.
+The authority accepts only one selected direct effect owner. `FeedbackLease`
+holds a single aggregate ticket for a source, stream, device generation and
+fixed set of locally negotiated feedback capability identities. Messages are
+ordered work under that lease; they do not consume one pairing record per block.
+`Plane::send_source_feedback` checks the native stream handle, controller slot
+and message kind against the immutable lease scope before calling the transport.
+These local schema identifiers are not client-wire negotiation tokens. A
+protocol adapter must verify the negotiated intersection and install the scope.
+
+The local lease accepts a bounded exact retry record for one busy message. A
+later message cannot overtake it, and a retry with altered bytes, capability or
+identity is rejected. Known-busy work can be explicitly cancelled; a terminal
+or uncertain send consumes its sequence and the lease continues to cover any
+queued work. The owner must bound all upstream queues and keep stop controls
+until accepted or explicitly cancelled during retirement. The owner must bind
+exactly one lease per authorized source/stream, deduplicate operation identity,
+and fence locally when status requests drain or an authority/owner epoch changes.
+Polling can delay observation: the trust mutation remains uncommitted during
+that interval. On observing the fence the owner stops new messages, joins active
+callbacks, resolves pending busy work, retires the whole stream, reconciles the
+aggregate ticket and acknowledges the matching pairing drain. Already handed-off
+packets cannot be recalled.
+
+The real-ledger/native-callback tests drive 300 feedback enqueues through one
+pairing record, busy stop retry and cancellation, mismatched capability/slot,
+replay, a stale status, a lost completion response and a blocked native call
+during revocation. Those tests use a synthetic retirement receipt. A separate
+control-provider test combines the real ledger, lease and actual provider
+retirement receipt while staged datagrams and reliable ENet work are discarded.
+The other control-provider tests cover an in-flight local network handoff. These
+tests do not establish the full broker/lifecycle/transport integration.
+
+The current pairing `Admit` does not record or return the capability and stream
+scope. The exact additive request and response needed from the pairing owner are
+in [the authority request](input-feedback-lease-authority-request.md). Until it
+is implemented and the SDK checks its response, the local lease scope is a
+trusted test assertion and source binding stays closed. Production also needs
+the authenticated lifecycle join, the selected owner's revoke/worker-retirement
+handshake, restart recovery and an independent review before activation.
 
 `amaterasu_module_sdk::input::extensions::source_label::observe` parses the
 negotiated lifecycle source label against an expected stream target only. It is

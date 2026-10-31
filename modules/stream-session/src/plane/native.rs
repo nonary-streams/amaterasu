@@ -230,6 +230,10 @@ impl Backend for NativeBackend {
         output.finish(status, DeliveryLane::Control)
     }
 
+    fn feedback_stream(&self) -> Option<u64> {
+        Some(self.handles.control_transport)
+    }
+
     fn send_feedback(&mut self, message: &HostFeedbackMessage) -> PlaneResult<bool> {
         // SAFETY: the owned binding and message allocation remain live through
         // the synchronous provider call. The transport copies accepted bytes.

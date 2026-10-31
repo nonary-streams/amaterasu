@@ -515,3 +515,92 @@ fn whole_stream_retirement_fails_closed_without_provider_epoch() {
     );
     assert!(controller.owned("alice", id).is_ok());
 }
+
+#[path = "../../../input/src/controller/effect_authority_test.rs"]
+mod effect_authority_test;
+
+#[test]
+fn aggregate_feedback_lease_drains_against_actual_control_retirement_receipt() {
+    use amaterasu_media::{CONTROL_RELIABLE, ControlMessage, MEDIA_CLOSED};
+    use amaterasu_module_sdk::effect_authority::consumer::{FeedbackLease, TransportRetirement};
+    use amaterasu_module_sdk::input::extensions::{Capability, Direction};
+    use amaterasu_module_sdk::transport::control_retirement::Receipt;
+    use std::io;
+    let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+    receiver.set_nonblocking(true).unwrap();
+    let mut controller = configured();
+    let opened = controller.open("alice", request()).unwrap();
+    let stream = opened.created.unwrap();
+    let provider_epoch = opened.payload["retirement_epoch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (mut authority, aggregate) = effect_authority_test::Fixture::admitted();
+    let capability = Capability {
+        schema: "org.amaterasu.feedback.rumble".into(),
+        version: 1,
+        direction: Direction::ToClient,
+    };
+    let mut lease = FeedbackLease::new(
+        aggregate,
+        TransportRetirement {
+            stream,
+            operation_id: "revoke".into(),
+            provider_epoch: provider_epoch.clone(),
+        },
+        7,
+        [capability.clone()].into(),
+    )
+    .unwrap_or_else(|_| panic!("lease"));
+    let queued = lease
+        .enqueue(&capability, 1, "feedback", b"queued", || {
+            let transport = controller.streams.get_mut(&stream).unwrap();
+            transport.stage_pending_datagram_for_test(
+                receiver.local_addr().unwrap(),
+                b"queued".to_vec(),
+            );
+            transport.stage_reliable_enet_for_test(
+                receiver.local_addr().unwrap(),
+                request().connect_data,
+            );
+            Ok::<_, ()>(true)
+        })
+        .unwrap()
+        .unwrap();
+    assert!(queued);
+    authority.fence();
+    lease.fence();
+    // A lost retirement reply is reconciled by the exact provider operation.
+    controller
+        .retire("alice", stream, "revoke", &provider_epoch)
+        .unwrap();
+    let response = controller
+        .retirement_status("alice", stream, "revoke", &provider_epoch)
+        .unwrap();
+    let receipt: Receipt = serde_json::from_value(response).unwrap();
+    let mut aggregate = lease
+        .retire(&receipt)
+        .unwrap_or_else(|_| panic!("retirement"));
+    authority.complete(&mut aggregate);
+    authority.drain();
+    let message = ControlMessage {
+        message_type: 1,
+        channel: 0,
+        delivery: CONTROL_RELIABLE,
+        reserved: 0,
+        data: std::ptr::null(),
+        len: 0,
+        sequence: 0,
+    };
+    // SAFETY: a zero-length message is valid for the synchronous call.
+    assert_eq!(
+        unsafe { controller.send("alice", stream, &message) },
+        MEDIA_CLOSED
+    );
+    controller.tick();
+    let mut data = [0; 64];
+    assert_eq!(
+        receiver.recv_from(&mut data).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+}

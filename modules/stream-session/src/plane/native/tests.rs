@@ -579,3 +579,185 @@ fn authority_ticket_spans_native_feedback_and_awaits_transport_retirement() {
     authority.complete(&mut ticket);
     authority.drain();
 }
+
+fn scoped_rumble(controller: u16) -> HostFeedback {
+    HostFeedback::Rumble {
+        controller,
+        low_frequency: 0,
+        high_frequency: 0,
+    }
+}
+
+#[test]
+fn source_feedback_lease_handles_sustained_traffic_busy_and_revocation() {
+    use amaterasu_module_sdk::effect_authority::consumer::{FeedbackLease, TransportRetirement};
+    use amaterasu_module_sdk::transport::control_retirement::Receipt;
+    let (mut authority, aggregate) = effect_authority_test::Fixture::admitted();
+    let retirement = TransportRetirement {
+        stream: 50,
+        operation_id: "retire".into(),
+        provider_epoch: "c".repeat(32),
+    };
+    let capability = feedback_scope(&scoped_rumble(7)).1;
+    let mut lease = FeedbackLease::new(aggregate, retirement, 7, [capability].into())
+        .unwrap_or_else(|_| panic!("lease"));
+    let valid_status = serde_json::json!({"ok":true,"epoch":authority.epoch,"owner_epoch":"owner","drain_required":false});
+    lease.observe_status(&valid_status).unwrap();
+    let mut host = Host::new();
+    let backend = NativeBackend::new(
+        &host.runtime(),
+        handles(),
+        &crate::providers::ProviderServices::default(),
+    )
+    .unwrap();
+    let mut pump = Pump::new(backend);
+    for sequence in 1..=300 {
+        assert!(
+            pump.send_source_feedback(
+                &mut lease,
+                sequence,
+                &format!("message-{sequence}"),
+                scoped_rumble(7)
+            )
+            .unwrap()
+        );
+    }
+    assert_eq!(authority.gate.in_flight(), 1);
+    assert_eq!(host.provider.sent_control.len(), 300);
+    assert!(
+        pump.send_source_feedback(&mut lease, 300, "message-300", scoped_rumble(7))
+            .is_err()
+    );
+    assert!(
+        pump.send_source_feedback(&mut lease, 301, "wrong-slot", scoped_rumble(8))
+            .is_err()
+    );
+    let wrong_capability = HostFeedback::RgbLed {
+        controller: 7,
+        red: 1,
+        green: 2,
+        blue: 3,
+    };
+    assert!(
+        pump.send_source_feedback(&mut lease, 301, "wrong-cap", wrong_capability)
+            .is_err()
+    );
+
+    host.provider.send_busy = true;
+    assert!(
+        !pump
+            .send_source_feedback(&mut lease, 301, "stop", scoped_rumble(7))
+            .unwrap()
+    );
+    let before = host.provider.sent_control.len();
+    assert!(
+        pump.send_source_feedback(&mut lease, 302, "later", scoped_rumble(7))
+            .is_err()
+    );
+    let altered = HostFeedback::Rumble {
+        controller: 7,
+        low_frequency: 9,
+        high_frequency: 0,
+    };
+    assert!(
+        pump.send_source_feedback(&mut lease, 301, "stop", altered)
+            .is_err()
+    );
+    assert_eq!(host.provider.sent_control.len(), before);
+    host.provider.send_busy = false;
+    assert!(
+        pump.send_source_feedback(&mut lease, 301, "stop", scoped_rumble(7))
+            .unwrap()
+    );
+    host.provider.send_busy = true;
+    assert!(
+        !pump
+            .send_source_feedback(&mut lease, 302, "cancel", scoped_rumble(7))
+            .unwrap()
+    );
+    lease.cancel_retry(302, "cancel").unwrap();
+    host.provider.send_busy = false;
+    authority.fence();
+    assert_eq!(authority.gate.recover("owner"), Err("recovery_required"));
+    let stale_status = serde_json::json!({"ok":true,"epoch":"f".repeat(32),"owner_epoch":"owner","drain_required":false});
+    assert!(lease.observe_status(&stale_status).is_err());
+    assert!(lease.observe_status(&valid_status).is_err());
+    let before = host.provider.sent_control.len();
+    assert!(
+        pump.send_source_feedback(&mut lease, 303, "late", scoped_rumble(7))
+            .is_err()
+    );
+    assert_eq!(host.provider.sent_control.len(), before);
+    let mut receipt = Receipt {
+        ok: true,
+        state: "retired".into(),
+        scope: "whole_control_stream".into(),
+        stream: 51,
+        operation_id: "retire".into(),
+        provider_epoch: "c".repeat(32),
+    };
+    assert!(lease.retire(&receipt).is_err());
+    receipt.stream = 50;
+    let mut aggregate = lease
+        .retire(&receipt)
+        .unwrap_or_else(|_| panic!("retirement"));
+    authority.lose_completion_reply(&aggregate);
+    authority.complete(&mut aggregate);
+    authority.drain();
+}
+
+#[test]
+fn source_feedback_lease_holds_authority_during_blocked_native_enqueue() {
+    use amaterasu_module_sdk::effect_authority::consumer::{FeedbackLease, TransportRetirement};
+    use amaterasu_module_sdk::transport::control_retirement::Receipt;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let (mut authority, aggregate) = effect_authority_test::Fixture::admitted();
+    let retirement = TransportRetirement {
+        stream: 50,
+        operation_id: "retire".into(),
+        provider_epoch: "c".repeat(32),
+    };
+    let mut lease = FeedbackLease::new(
+        aggregate,
+        retirement,
+        7,
+        [feedback_scope(&scoped_rumble(7)).1].into(),
+    )
+    .unwrap_or_else(|_| panic!("lease"));
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut host = Host::new();
+        host.provider.blocked_send = Some((entered_tx, resume_rx));
+        let backend = NativeBackend::new(
+            &host.runtime(),
+            handles(),
+            &crate::providers::ProviderServices::default(),
+        )
+        .unwrap();
+        let mut pump = Pump::new(backend);
+        let result = pump.send_source_feedback(&mut lease, 1, "blocked", scoped_rumble(7));
+        (lease, result)
+    });
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    authority.fence();
+    assert_eq!(authority.gate.in_flight(), 1);
+    resume_tx.send(()).unwrap();
+    let (mut lease, result) = worker.join().unwrap();
+    assert_eq!(result, Ok(true));
+    lease.fence();
+    let receipt = Receipt {
+        ok: true,
+        state: "retired".into(),
+        scope: "whole_control_stream".into(),
+        stream: 50,
+        operation_id: "retire".into(),
+        provider_epoch: "c".repeat(32),
+    };
+    let mut aggregate = lease
+        .retire(&receipt)
+        .unwrap_or_else(|_| panic!("retirement"));
+    authority.complete(&mut aggregate);
+    authority.drain();
+}

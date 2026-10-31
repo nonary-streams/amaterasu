@@ -42,7 +42,7 @@ pub struct Capability {
 }
 
 impl Capability {
-    fn valid(&self) -> bool {
+    pub fn valid(&self) -> bool {
         valid_name(&self.schema) && self.schema.contains('.') && self.version != 0
     }
 }

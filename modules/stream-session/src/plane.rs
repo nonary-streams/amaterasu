@@ -155,6 +155,21 @@ impl Plane {
         self.pump.enqueue_feedback(feedback)
     }
 
+    /// Send source feedback under a pairing admission and an aggregate transport
+    /// lease. The owner retains a busy message and ticket for ordered retry.
+    /// Source routing remains closed until the lifecycle join is installed.
+    #[allow(dead_code)]
+    pub fn send_source_feedback(
+        &mut self,
+        lease: &mut amaterasu_module_sdk::effect_authority::consumer::FeedbackLease,
+        sequence: u64,
+        operation_id: &str,
+        feedback: HostFeedback,
+    ) -> PlaneResult<bool> {
+        self.pump
+            .send_source_feedback(lease, sequence, operation_id, feedback)
+    }
+
     /// Stops new PCM capture and cancels pending feedback. The pipeline separately
     /// drains the video provider.
     pub fn stop(&mut self) {
@@ -173,12 +188,45 @@ impl Plane {
     }
 }
 
+// These are local contract identities, not client wire-negotiation tokens.
+// The protocol adapter must establish the offered intersection before install.
+fn feedback_scope(
+    feedback: &HostFeedback,
+) -> (u16, amaterasu_module_sdk::input::extensions::Capability) {
+    use amaterasu_module_sdk::input::extensions::{Capability, Direction};
+    let (slot, name) = match feedback {
+        HostFeedback::Rumble { controller, .. } => (*controller, "org.amaterasu.feedback.rumble"),
+        HostFeedback::TriggerRumble { controller, .. } => {
+            (*controller, "org.amaterasu.feedback.trigger_rumble")
+        }
+        HostFeedback::Motion { controller, .. } => (*controller, "org.amaterasu.feedback.motion"),
+        HostFeedback::RgbLed { controller, .. } => (*controller, "org.amaterasu.feedback.rgb_led"),
+        HostFeedback::AdaptiveTriggers { controller, .. } => {
+            (*controller, "org.amaterasu.feedback.adaptive_triggers")
+        }
+        HostFeedback::HapticsPcm { controller, .. } => {
+            (*controller, "org.amaterasu.feedback.haptics_pcm")
+        }
+    };
+    (
+        slot,
+        Capability {
+            schema: name.into(),
+            version: 1,
+            direction: Direction::ToClient,
+        },
+    )
+}
+
 trait Backend {
     fn desktop_geometry(&mut self) -> PlaneResult<Option<CaptureGeometry>> {
         Ok(None)
     }
     fn control(&mut self) -> PlaneResult<Option<ControlRecord>>;
     fn send_feedback(&mut self, message: &HostFeedbackMessage) -> PlaneResult<bool>;
+    fn feedback_stream(&self) -> Option<u64> {
+        None
+    }
     fn send_rumble(&mut self, command: RumbleCommand) -> PlaneResult<bool>;
     fn video(&mut self) -> PlaneResult<Option<VideoPacket>>;
     fn video_unit(
@@ -313,6 +361,38 @@ impl<B: Backend> Pump<B> {
             };
         }
         Ok(progress)
+    }
+
+    fn send_source_feedback(
+        &mut self,
+        lease: &mut amaterasu_module_sdk::effect_authority::consumer::FeedbackLease,
+        sequence: u64,
+        operation_id: &str,
+        feedback: HostFeedback,
+    ) -> PlaneResult<bool> {
+        if self.stopping || self.failure.is_some() {
+            return Err("source_feedback_stopped");
+        }
+        if self.backend.feedback_stream() != Some(lease.stream()) {
+            return Err("source_feedback_stream_mismatch");
+        }
+        let (slot, capability) = feedback_scope(&feedback);
+        if lease.controller_slot() != slot {
+            return Err("source_feedback_device_mismatch");
+        }
+        let message = encode_host_feedback(feedback).map_err(|_| "invalid_feedback")?;
+        let mut exact_message = message.message_type.to_le_bytes().to_vec();
+        exact_message.push(message.channel);
+        exact_message.push(match message.delivery {
+            HostFeedbackDelivery::Reliable => 0,
+            HostFeedbackDelivery::SequencedUnreliable => 1,
+        });
+        exact_message.extend_from_slice(&message.payload);
+        lease
+            .enqueue(&capability, sequence, operation_id, &exact_message, || {
+                self.backend.send_feedback(&message)
+            })
+            .map_err(|_| "source_feedback_denied")?
     }
 
     fn enqueue_feedback(

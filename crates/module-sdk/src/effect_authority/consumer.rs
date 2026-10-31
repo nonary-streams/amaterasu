@@ -15,6 +15,7 @@ pub enum State {
     Ready,
     Running,
     AwaitTransportRetirement,
+    HoldingTransport,
     NeedsCompletion,
     NeedsAcknowledgment,
     Done,
@@ -235,6 +236,176 @@ impl EffectTicket {
     }
 }
 
+/// A single admitted source/stream lease with a fixed negotiated capability set.
+///
+/// The selected owner must derive this immutable scope from authenticated
+/// lifecycle and protocol state, never a client assertion. The current pairing
+/// API does not yet attest capability scope; production composition stays closed
+/// until it can check the exact scope and signal revocation to this owner.
+#[must_use = "dropping a lease leaves its authority ticket unresolved"]
+pub struct FeedbackLease {
+    aggregate: Option<EffectTicket>,
+    retirement: TransportRetirement,
+    capabilities: std::collections::BTreeSet<crate::input::extensions::Capability>,
+    controller_slot: u16,
+    fenced: bool,
+    last_sequence: u64,
+    pending_retry: Option<PendingFeedback>,
+}
+
+struct PendingFeedback {
+    sequence: u64,
+    operation_id: String,
+    capability: crate::input::extensions::Capability,
+    bytes: Vec<u8>,
+}
+
+impl FeedbackLease {
+    pub fn new(
+        mut aggregate: EffectTicket,
+        retirement: TransportRetirement,
+        controller_slot: u16,
+        capabilities: std::collections::BTreeSet<crate::input::extensions::Capability>,
+    ) -> Result<Self, Box<(EffectTicket, &'static str)>> {
+        use crate::input::extensions::{Direction, MAX_CAPABILITIES};
+        if aggregate.state != State::Ready
+            || retirement.stream == 0
+            || !valid_token(&retirement.operation_id)
+            || !valid_ticket(&retirement.provider_epoch)
+            || capabilities.is_empty()
+            || capabilities.len() > MAX_CAPABILITIES
+            || capabilities
+                .iter()
+                .any(|cap| !cap.valid() || cap.direction != Direction::ToClient)
+        {
+            return Err(Box::new((aggregate, "invalid_effect_state")));
+        }
+        aggregate.state = State::HoldingTransport;
+        Ok(Self {
+            aggregate: Some(aggregate),
+            retirement,
+            capabilities,
+            controller_slot,
+            fenced: false,
+            last_sequence: 0,
+            pending_retry: None,
+        })
+    }
+
+    pub fn stream(&self) -> u64 {
+        self.retirement.stream
+    }
+    pub fn controller_slot(&self) -> u16 {
+        self.controller_slot
+    }
+
+    /// The owner calls this as soon as it observes the authority's revoke fence.
+    pub fn fence(&mut self) {
+        self.fenced = true;
+    }
+
+    /// Consume an authenticated authority status. Any epoch/owner change,
+    /// malformed response or drain request closes this local lease permanently.
+    /// The owner must also stop and retire its workers after this returns an
+    /// error; polling latency is not itself a revocation barrier.
+    pub fn observe_status(&mut self, response: &Value) -> Result<(), &'static str> {
+        let Some(aggregate) = self.aggregate.as_ref() else {
+            self.fenced = true;
+            return Err("invalid_effect_state");
+        };
+        let current = response.get("ok").and_then(Value::as_bool) == Some(true)
+            && response.get("epoch").and_then(Value::as_str) == Some(aggregate.epoch.as_str())
+            && response.get("owner_epoch").and_then(Value::as_str)
+                == Some(aggregate.source.effect_owner_epoch.as_str())
+            && response.get("drain_required").and_then(Value::as_bool) == Some(false);
+        if !current || self.fenced {
+            self.fenced = true;
+            return Err("feedback_lease_fenced");
+        }
+        Ok(())
+    }
+
+    /// Perform ordered local work under the fixed lease scope. `Ok(false)` must
+    /// prove no admission; it retains that exact message for retry. `Err` may
+    /// mean admission occurred, so it is never replayed and the lease remains
+    /// outstanding until the transport is retired.
+    pub fn enqueue<E>(
+        &mut self,
+        capability: &crate::input::extensions::Capability,
+        sequence: u64,
+        operation_id: &str,
+        exact_message: &[u8],
+        send: impl FnOnce() -> Result<bool, E>,
+    ) -> Result<Result<bool, E>, &'static str> {
+        let aggregate = self.aggregate.as_ref().ok_or("invalid_effect_state")?;
+        if self.fenced
+            || aggregate.state != State::HoldingTransport
+            || !self.capabilities.contains(capability)
+            || sequence == 0
+            || !valid_token(operation_id)
+            || exact_message.len() > crate::input::extensions::MAX_PAYLOAD_BYTES
+        {
+            return Err("invalid_effect_state");
+        }
+        match &self.pending_retry {
+            Some(pending)
+                if pending.sequence == sequence
+                    && pending.operation_id == operation_id
+                    && &pending.capability == capability
+                    && pending.bytes == exact_message => {}
+            Some(_) => return Err("feedback_retry_pending"),
+            None if sequence <= self.last_sequence => return Err("feedback_sequence_replayed"),
+            None => {
+                self.pending_retry = Some(PendingFeedback {
+                    sequence,
+                    operation_id: operation_id.into(),
+                    capability: capability.clone(),
+                    bytes: exact_message.to_vec(),
+                })
+            }
+        }
+        let outcome = send();
+        if !matches!(outcome, Ok(false)) {
+            self.last_sequence = sequence;
+            self.pending_retry = None;
+        }
+        Ok(outcome)
+    }
+
+    /// Explicitly discard only a known-busy message; this never recalls work.
+    pub fn cancel_retry(&mut self, sequence: u64, operation_id: &str) -> Result<(), &'static str> {
+        if self
+            .pending_retry
+            .as_ref()
+            .map(|pending| (pending.sequence, pending.operation_id.as_str()))
+            != Some((sequence, operation_id))
+        {
+            return Err("invalid_effect_state");
+        }
+        self.last_sequence = sequence;
+        self.pending_retry = None;
+        Ok(())
+    }
+
+    /// Call after local workers quiesce and the selected provider confirms whole
+    /// stream retirement. Only then can the aggregate ticket be completed.
+    pub fn retire(&mut self, receipt: &Receipt) -> Result<EffectTicket, &'static str> {
+        if !self.fenced
+            || self.pending_retry.is_some()
+            || !receipt.matches(
+                self.retirement.stream,
+                &self.retirement.operation_id,
+                &self.retirement.provider_epoch,
+            )
+        {
+            return Err("invalid_retirement_receipt");
+        }
+        let mut aggregate = self.aggregate.take().ok_or("invalid_effect_state")?;
+        aggregate.state = State::NeedsCompletion;
+        Ok(aggregate)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,5 +522,58 @@ mod tests {
         let mut bad = ticket();
         assert!(bad.accept_lookup(&admission()).is_err());
         assert!(bad.accept_admission(&lookup).is_err());
+    }
+    #[test]
+    fn scoped_feedback_rejects_capability_expansion_and_changed_busy_retries() {
+        use crate::input::extensions::{Capability, Direction};
+        let capability = Capability {
+            schema: "org.example.rumble".into(),
+            version: 1,
+            direction: Direction::ToClient,
+        };
+        let other = Capability {
+            schema: "org.example.speaker".into(),
+            version: 1,
+            direction: Direction::ToClient,
+        };
+        let mut aggregate = ticket();
+        aggregate.accept_admission(&admission()).unwrap();
+        let mut lease = FeedbackLease::new(aggregate, retirement(), 7, [capability.clone()].into())
+            .unwrap_or_else(|_| panic!("lease"));
+        assert!(
+            lease
+                .enqueue(&other, 1, "one", b"stop", || -> Result<bool, ()> {
+                    panic!("unnegotiated")
+                })
+                .is_err()
+        );
+        assert_eq!(
+            lease
+                .enqueue(&capability, 1, "one", b"stop", || Ok::<_, ()>(false))
+                .unwrap(),
+            Ok(false)
+        );
+        assert!(
+            lease
+                .enqueue(&capability, 1, "one", b"start", || -> Result<bool, ()> {
+                    panic!("changed retry")
+                })
+                .is_err()
+        );
+        assert!(
+            lease
+                .enqueue(&capability, 2, "two", b"stop", || -> Result<bool, ()> {
+                    panic!("out of order")
+                })
+                .is_err()
+        );
+        assert!(lease.retire(&receipt()).is_err());
+        lease.fence();
+        assert!(lease.retire(&receipt()).is_err());
+        lease.cancel_retry(1, "one").unwrap();
+        let aggregate = lease
+            .retire(&receipt())
+            .unwrap_or_else(|_| panic!("retirement"));
+        assert_eq!(aggregate.state(), State::NeedsCompletion);
     }
 }
