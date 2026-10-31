@@ -87,8 +87,8 @@ impl Harness {
                     "consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["example/1"]},
                     "trusted_callers": ["transport", "other-transport"],
                     "operation_grants": {
-                        "transport": ["prepare", "lookup", "snapshot"],
-                        "other-transport": ["prepare", "lookup", "snapshot"]
+                        "transport": ["prepare", "lookup", "snapshot", "describe_resource_control", "verify_resource_control", "validate_resource_control"],
+                        "other-transport": ["prepare", "lookup", "snapshot", "describe_resource_control", "verify_resource_control", "validate_resource_control"]
                     }
                 }
             }
@@ -242,6 +242,28 @@ impl Drop for Harness {
             self.instance = std::ptr::null_mut();
         }
         std::fs::remove_dir_all(&self.root).unwrap();
+    }
+}
+
+#[test]
+fn control_routes_reject_unadmitted_and_foreign_callers_through_broker() {
+    let mut harness = Harness::new();
+    let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1});
+    let method = json!({"service":"transport/2","method":"resource_control","interface_major":2,"interface_minor":0,"schema_revision":1});
+    let resource = json!({"provider":"transport","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":null,"mutation_domains":[]});
+    let schema = json!({"id":"schema","major":1,"minor":0,"digest":"a".repeat(64)});
+    let request = json!({"version":2,"transition_id":"transition","operation_id":"effect","provider_sequence":1,"target":target,"proposal":{"proposal_id":"proposal","output_id":"out","owner_provider":"transport","owner_service":"transport/2","target":target,"resource":resource,"method":method,"argument_schema":schema,"arguments":{},"access":"exclusive","mutation_domains":[]},"admission_id":"missing","permit_id":"missing","remaining_ms":5000});
+    for operation in [
+        "describe_resource_control",
+        "verify_resource_control",
+        "validate_resource_control",
+    ] {
+        let payload = json!({"operation":operation,"request":request});
+        for caller in ["transport", "other-transport"] {
+            let response = harness.call(caller, payload.clone());
+            assert_eq!(response["status"], "rejected");
+            assert_eq!(response["reason"], "resource_control_not_authorized");
+        }
     }
 }
 

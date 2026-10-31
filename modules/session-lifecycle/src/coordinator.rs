@@ -5,8 +5,10 @@ mod application;
 #[allow(dead_code)] // Admission and control remain disabled until schema verification is wired.
 mod composition;
 mod composition_progress;
+mod control_backend;
 #[allow(dead_code)] // Control dispatch remains gated until coordinator sequencing is wired.
 mod control_dispatch;
+mod control_endpoints;
 mod operations;
 mod provider_observations;
 mod providers;
@@ -611,6 +613,12 @@ impl Coordinator {
         }
         if operation == "describe_action_target" {
             return self.describe_action_target(caller, &payload);
+        }
+        if matches!(
+            operation,
+            "describe_resource_control" | "verify_resource_control" | "validate_resource_control"
+        ) {
+            return self.control_operation(caller, payload);
         }
         if matches!(
             operation,
