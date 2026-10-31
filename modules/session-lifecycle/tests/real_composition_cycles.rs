@@ -615,9 +615,7 @@ fn start_capture(f: &mut Fixture, result: &Value, video: &Value, prefix: &str) -
     target
 }
 
-#[test]
-#[ignore = "requires both independently built v2 plugins, matching lifecycle artifact and approved composition configuration"]
-fn real_participants_prepare_resume_and_release_in_dependency_order() {
+fn run_composition(paused_end: bool) {
     let mut f = Fixture::new();
     let initial = json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false});
     let prepared = f.call(json!({"operation":"prepare","operation_id":"session","requested_video":initial,"application_ref":{"kind":"desktop"}}));
@@ -631,7 +629,7 @@ fn real_participants_prepare_resume_and_release_in_dependency_order() {
     assert_eq!(stream["candidate"]["resource"]["provider"], SCREEN);
     let mut target = start_capture(&mut f, &stream, &initial, "initial");
     let mut warmup_full_records = None;
-    for cycle in 0..10 {
+    for cycle in 0..if paused_end { 0 } else { 10 } {
         let pause_id = format!("pause-{cycle}");
         let paused =
             f.call(json!({"operation":"pause_stream","operation_id":pause_id,"target":target}));
@@ -683,43 +681,56 @@ fn real_participants_prepare_resume_and_release_in_dependency_order() {
             );
         }
     }
+    if paused_end {
+        let pause = f
+            .call(json!({"operation":"pause_stream","operation_id":"pause-final","target":target}));
+        assert_eq!(pause["status"], "pending", "{pause}");
+        let retired = f.call_as("capture", json!({"operation":"retire_stream","operation_id":"pause-retire","target":target,"consumer":"capture","retirement_receipt":{"response":{"status":"not_found"}}}));
+        assert_eq!(retired["status"], "pending", "{retired}");
+        let pause = f.settled("pause-final");
+        assert_eq!(pause["status"], "succeeded", "{pause}");
+    }
     let end =
         f.call(json!({"operation":"end_session","operation_id":"end","target":session["target"]}));
     assert_eq!(end["status"], "pending", "{end}");
-    let retired = f.call_as("capture", json!({"operation":"retire_stream","operation_id":"final-retire","target":target,"consumer":"capture","retirement_receipt":{"response":{"status":"not_found"}}}));
-    assert_eq!(retired["status"], "pending", "{retired}");
+    if !paused_end {
+        let retired = f.call_as("capture", json!({"operation":"retire_stream","operation_id":"final-retire","target":target,"consumer":"capture","retirement_receipt":{"response":{"status":"not_found"}}}));
+        assert_eq!(retired["status"], "pending", "{retired}");
+    }
     let app = f.call(json!({"operation":"application_retired","operation_id":"app-retired","target":session["target"]}));
     assert_eq!(app["status"], "succeeded", "{app}");
     let ended = f.settled("end");
     assert_eq!(ended["status"], "succeeded", "{ended}");
     assert!(f.references.is_empty());
     assert!(f.borrows.is_empty());
-    // Keep the same broker, state and native topology domain for a fresh session.
-    let second = f.call(json!({"operation":"prepare","operation_id":"second-session","requested_video":initial,"application_ref":{"kind":"desktop"}}));
-    assert_eq!(second["status"], "pending", "{second}");
-    let second = f.settled("second-session");
-    assert_eq!(second["status"], "succeeded", "{second}");
-    assert_ne!(
-        second["target"]["session_id"],
-        session["target"]["session_id"]
-    );
-    let next = f.call(json!({"operation":"prepare_stream","operation_id":"second-stream","target":second["target"],"intent":"initial","requested_video":initial,"consumer_requirements":["capture"]}));
-    assert_eq!(next["status"], "pending", "{next}");
-    let next = f.settled("second-stream");
-    assert_eq!(next["status"], "succeeded", "{next}");
-    let next_target = start_capture(&mut f, &next, &initial, "second");
-    let end = f.call(
+    if !paused_end {
+        // Keep the same broker, state and native topology domain for a fresh session.
+        let second = f.call(json!({"operation":"prepare","operation_id":"second-session","requested_video":initial,"application_ref":{"kind":"desktop"}}));
+        assert_eq!(second["status"], "pending", "{second}");
+        let second = f.settled("second-session");
+        assert_eq!(second["status"], "succeeded", "{second}");
+        assert_ne!(
+            second["target"]["session_id"],
+            session["target"]["session_id"]
+        );
+        let next = f.call(json!({"operation":"prepare_stream","operation_id":"second-stream","target":second["target"],"intent":"initial","requested_video":initial,"consumer_requirements":["capture"]}));
+        assert_eq!(next["status"], "pending", "{next}");
+        let next = f.settled("second-stream");
+        assert_eq!(next["status"], "succeeded", "{next}");
+        let next_target = start_capture(&mut f, &next, &initial, "second");
+        let end = f.call(
         json!({"operation":"end_session","operation_id":"second-end","target":second["target"]}),
     );
-    assert_eq!(end["status"], "pending", "{end}");
-    let retired = f.call_as("capture", json!({"operation":"retire_stream","operation_id":"second-retire","target":next_target,"consumer":"capture","retirement_receipt":{"response":{"status":"not_found"}}}));
-    assert_eq!(retired["status"], "pending", "{retired}");
-    let app = f.call(json!({"operation":"application_retired","operation_id":"second-app-retired","target":second["target"]}));
-    assert_eq!(app["status"], "succeeded", "{app}");
-    let ended = f.settled("second-end");
-    assert_eq!(ended["status"], "succeeded", "{ended}");
-    assert!(f.references.is_empty(), "second session leaked references");
-    assert!(f.borrows.is_empty(), "second session leaked borrows");
+        assert_eq!(end["status"], "pending", "{end}");
+        let retired = f.call_as("capture", json!({"operation":"retire_stream","operation_id":"second-retire","target":next_target,"consumer":"capture","retirement_receipt":{"response":{"status":"not_found"}}}));
+        assert_eq!(retired["status"], "pending", "{retired}");
+        let app = f.call(json!({"operation":"application_retired","operation_id":"second-app-retired","target":second["target"]}));
+        assert_eq!(app["status"], "succeeded", "{app}");
+        let ended = f.settled("second-end");
+        assert_eq!(ended["status"], "succeeded", "{ended}");
+        assert!(f.references.is_empty(), "second session leaked references");
+        assert!(f.borrows.is_empty(), "second session leaked borrows");
+    }
     let trace = f.trace.borrow();
     let calls: Vec<_> = trace
         .iter()
@@ -767,4 +778,16 @@ fn real_participants_prepare_resume_and_release_in_dependency_order() {
         .expect("owner did not report preservation proof");
     assert_eq!(proof["kind"], "mode_only_preserved");
     assert_eq!(proof["before_digest"], proof["after_digest"]);
+}
+
+#[test]
+#[ignore = "requires matching real composition providers and approved policy"]
+fn alternating_resumes_and_second_session() {
+    run_composition(false);
+}
+
+#[test]
+#[ignore = "requires matching real composition providers and approved policy"]
+fn end_after_pause_with_real_state() {
+    run_composition(true);
 }
