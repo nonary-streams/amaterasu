@@ -248,6 +248,9 @@ impl Harness {
                         Response::Ok
                     ));
                 } else if payload["method"] == "binding_validate" {
+                    // Producer incarnation is not a consumer's native borrow token.
+                    assert!(args.get("borrow_id").is_none());
+                    assert_eq!(args["binding"]["resource"]["incarnation"], "native");
                     let result = json!({"status":"succeeded","target":args["target"],"binding":args["binding"],"observation":args["observation"],"plan_revision":args["plan_revision"]});
                     assert!(matches!(
                         self.broker.borrow_mut().dispatch(

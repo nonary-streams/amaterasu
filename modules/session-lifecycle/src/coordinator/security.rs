@@ -357,7 +357,7 @@ impl Coordinator {
                     [stream.unwrap()]
                 .preparation_transition
                 .clone();
-                let payload = json!({"operation_id":job.operation_id,"transition_id":transition,"target":job.target,"plan_revision":job.binding.plan_revision,"borrow_id":job.binding.resource.incarnation,"binding":job.binding,"observation":job.observation});
+                let payload = json!({"operation_id":job.operation_id,"transition_id":transition,"target":job.target,"plan_revision":job.binding.plan_revision,"binding":job.binding,"observation":job.observation});
                 match send(Command::CallApi {
                     service: method.service.clone(),
                     method: method.method.clone(),
