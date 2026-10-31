@@ -133,7 +133,18 @@ impl Coordinator {
         self.settings
             .schema_catalog()?
             .validate(&output.schema, &output.data)?;
-        Ok(json!({"status":"valid","target":request.target,"result_id":request.permit_id}))
+        let resource_generation =
+            super::resource_generation::current_root_generation(journal, &selection.input)?;
+        if record.plan_request.resource_generation != Some(resource_generation)
+            || selection.stage.as_ref().is_some_and(|stage| {
+                stage.callback_proof.request.resource_generation != Some(resource_generation)
+            })
+        {
+            return Err("finalize_result_generation_mismatch".into());
+        }
+        Ok(
+            json!({"status":"valid","target":request.target,"result_id":request.permit_id,"resource_generation":resource_generation}),
+        )
     }
 }
 

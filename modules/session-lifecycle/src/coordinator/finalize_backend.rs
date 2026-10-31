@@ -456,17 +456,17 @@ mod tests {
         final_plan["plan_id"] = json!("final");
         final_plan["candidate_constraint"] = json!({"capture_provider":"capture","selector_schema":"selector","resource_provider":"owner","resource_id":"output","incarnation":"native","execution_domain":"seat","mode":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false},"plan_revision":1,"geometry_revision":2});
         let requirements = json!({"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector"]});
-        let callback = json!({"version":2,"provider_sequence":1,"operation":"lifecycle_callback","transition_id":"source-transition","operation_id":"source-op","target":session,"phase":"session.prepare","settings_revision":"one","settings":{},"intent":null,"reason":null,"requested_video":null,"consumer_requirements":requirements,"remaining_ms":5000,"plan_revision":1,"admission_id":"source","approved_plan":source_plan});
+        let callback = json!({"version":2,"provider_sequence":1,"operation":"lifecycle_callback","transition_id":"source-transition","operation_id":"source-op","target":session,"resource_generation":7,"phase":"session.prepare","settings_revision":"one","settings":{},"intent":null,"reason":null,"requested_video":null,"consumer_requirements":requirements,"remaining_ms":5000,"plan_revision":1,"admission_id":"source","approved_plan":source_plan});
         let prepared = json!({"status":"prepared","candidate":null,"obligations":[obligation],"outputs":[output]});
         let call = |name: &str, args: Value, operation: &str| json!({"service":"owner/2","method":name,"interface_major":2,"interface_minor":0,"approval":approval(name)["broker_approval"],"arguments":args,"timeout_ms":5000,"operation_id":operation});
         let proof = json!({"participant":participant,"request":callback,"terminal":{"call":call("callback",callback.clone(),"source-op"),"state":{"state":"completed","payload":prepared}},"pending_receipt":null});
         let stored = json!({"output":output,"admission_id":"source","transition_id":"source-transition","plan":source_plan,"state":"retained","callback_proof":proof});
         let policy = json!({"owner_provider":"owner","owner_service":"owner/2","method":method("finalize"),"status_method":method("status"),"output_capability":"display","output_schema":schema,"capture_provider":"capture","selector_schema":"selector","required_access":"exclusive","domain_scope":"resource","mutation_domains":[]});
-        let stage_request = json!({"version":2,"provider_sequence":2,"operation":"lifecycle_callback","transition_id":"transition","operation_id":"stage-op","target":stream,"phase":"stream.prepare","settings_revision":"one","settings":{},"intent":"initial","reason":null,"requested_video":null,"consumer_requirements":requirements,"remaining_ms":5000,"plan_revision":1,"admission_id":"stage","approved_plan":source_plan});
+        let stage_request = json!({"version":2,"provider_sequence":2,"operation":"lifecycle_callback","transition_id":"transition","operation_id":"stage-op","target":stream,"resource_generation":7,"phase":"stream.prepare","settings_revision":"one","settings":{},"intent":"initial","reason":null,"requested_video":null,"consumer_requirements":requirements,"remaining_ms":5000,"plan_revision":1,"admission_id":"stage","approved_plan":source_plan});
         let stage_proof = json!({"participant":participant,"request":stage_request,"terminal":{"call":call("callback",stage_request.clone(),"stage-op"),"state":{"state":"completed","payload":prepared}},"pending_receipt":null});
         let stage = json!({"target":stream,"parent_generation":1,"admission_id":"stage","transition_id":"transition","plan":source_plan,"before":output,"after":output,"callback_proof":stage_proof});
         let frozen = json!({"target":stream,"parent_generation":1,"transition_id":"transition","input":stored,"stage":stage,"policy":policy,"finalize_approval":approval("finalize"),"finalize_status_approval":approval("status"),"schema_documents":[{"reference":schema,"document":document}]});
-        let plan_request = json!({"version":2,"provider_sequence":3,"operation":"resource_finalize_plan","transition_id":"transition","operation_id":"plan-op","target":stream,"phase":"stream.prepare","settings_revision":"one","settings":{},"intent":"initial","reason":null,"requested_video":null,"consumer_requirements":requirements,"remaining_ms":5000,"plan_revision":null,"admission_id":null,"approved_plan":null,"dependency_inputs":[output],"control_results":[]});
+        let plan_request = json!({"version":2,"provider_sequence":3,"operation":"resource_finalize_plan","transition_id":"transition","operation_id":"plan-op","target":stream,"resource_generation":7,"phase":"stream.prepare","settings_revision":"one","settings":{},"intent":"initial","reason":null,"requested_video":null,"consumer_requirements":requirements,"remaining_ms":5000,"plan_revision":null,"admission_id":null,"approved_plan":null,"dependency_inputs":[output],"control_results":[]});
         let request: ResourceFinalizeRequest = serde_json::from_value(json!({"version":2,"transition_id":"transition","operation_id":"effect","provider_sequence":4,"target":stream,"output":output,"control_results":[],"admission_id":"fresh","permit_id":"permit","remaining_ms":5000})).unwrap();
         let context = json!({"policy":policy,"output":output,"control_results":[],"target":stream,"transition_id":"transition","parent_generation":1});
         let effect_call = call(
@@ -481,8 +481,8 @@ mod tests {
         dispatch["phase"] = json!("effect");
         let owner_plan = json!({"provider":"owner","participant":participant,"request":plan_request,"phase":"finalize_plan_admitted","plan":final_plan,"admission_id":"fresh","pending_receipt":null,"status_polls":0,"last_sequence":3,"dispatch":null,"terminal_dispatch":null,"response":null});
         let progress = json!({"inputs":[stored],"selections":[],"controls":[],"finalize":{"selection":frozen,"owner_plan":owner_plan,"dispatch":dispatch}});
-        let work = json!({"composition_progress":progress,"phase":"stream.prepare","target":stream,"intent":"initial","reason":null,"video":null,"transition_id":"transition","providers":[],"index":0,"states":{},"candidate":null,"waiting_retirement":false});
-        let session_record = json!({"host_epoch":epoch,"id":"session","generation":1,"phase":"ready","owner":{"caller":"transport","initiator":"transport"},"delegates":[],"application_ref":{},"settings_revision":"one","application_retired":false,"streams":{"stream":{"generation":1,"phase":"preparing","candidate":null,"required":[],"acknowledgements":[],"retirements":[]}},"admission_ids":["source","stage","fresh"],"admission_targets":{"source":session,"stage":stream,"fresh":stream},"admission_phases":{"source":"session.prepare","stage":"stream.prepare","fresh":"stream.prepare"}});
+        let work = json!({"composition_progress":progress,"phase":"stream.prepare","target":stream,"intent":"initial","reason":null,"video":null,"transition_id":"transition","providers":["owner"],"index":1,"provider_graph":{"order":["owner"],"dependencies":{"owner":[]}},"states":{"owner":{"provider":"owner","participant":participant,"request":stage_request,"phase":"prepared","plan":source_plan,"admission_id":"stage","pending_receipt":null,"status_polls":0,"last_sequence":2,"dispatch":null,"terminal_dispatch":stage_proof["terminal"],"response":prepared}},"candidate":null,"waiting_retirement":false});
+        let session_record = json!({"host_epoch":epoch,"id":"session","generation":1,"phase":"ready","owner":{"caller":"transport","initiator":"transport"},"delegates":[],"application_ref":{},"settings_revision":"one","application_retired":false,"streams":{"stream":{"generation":1,"phase":"preparing","candidate":null,"required":[],"acknowledgements":[],"retirements":[],"provider_graph":{"order":["owner"],"dependencies":{"owner":[]}}}},"admission_ids":["source","stage","fresh"],"admission_targets":{"source":session,"stage":stream,"fresh":stream},"admission_phases":{"source":"session.prepare","stage":"stream.prepare","fresh":"stream.prepare"},"resource_generations":{"owner":7}});
         let admission = |plan: Value| json!({"provider":"owner","selection":selection,"plan":plan,"rights":[["domain","Exclusive"]]});
         let mut journal = coordinator.shared.borrow().value.clone();
         journal.sessions.insert(
@@ -603,6 +603,29 @@ mod tests {
         let result = coordinator.verify_finalize_result("owner", proof.clone());
         assert_eq!(result["status"], "valid", "{result}");
         assert_eq!(result["result_id"], "permit");
+        assert_eq!(result["resource_generation"], 7);
+        coordinator
+            .shared
+            .borrow_mut()
+            .value
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .resource_generations
+            .insert("owner".into(), 8);
+        assert_eq!(
+            coordinator.verify_finalize_result("owner", proof.clone())["status"],
+            "rejected"
+        );
+        coordinator
+            .shared
+            .borrow_mut()
+            .value
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .resource_generations
+            .insert("owner".into(), 7);
         assert_eq!(
             coordinator.verify_finalize_result("other", proof.clone())["status"],
             "rejected"
