@@ -653,6 +653,7 @@ dependencies = [
  "amaterasu-abi",
  "amaterasu-capture-authority",
  "amaterasu-contracts",
+ "amaterasu-extension-api",
  "amaterasu-nvhttp",
  "amaterasu-package",
  "amaterasu-runtime",
