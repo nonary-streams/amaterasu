@@ -288,11 +288,15 @@ fn reprepare_domains(
         .states
         .get(provider)
         .ok_or("reprepare_observation_unproven")?;
+    // Once the replacement plan is admitted, ordinary metadata comes from its
+    // new admission; the released-root observation exception has expired.
+    if state.request.operation != amaterasu_extension_api::ProviderOperation::ResourcePlan {
+        return Ok(BTreeMap::new());
+    }
     if state.provider != provider
         || state.request.target != work.target
         || state.request.transition_id != work.transition_id
         || state.request.phase != LifecyclePhase::SessionPrepare
-        || state.request.operation != amaterasu_extension_api::ProviderOperation::ResourcePlan
         || state.request.version != amaterasu_extension_api::COMPOSITION_VERSION
         || state.request.resource_generation != session.resource_generations.get(provider).copied()
         || !matches!(
