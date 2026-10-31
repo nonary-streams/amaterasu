@@ -7,6 +7,17 @@ use super::composition_progress::CompositionProgress;
 use super::*;
 use amaterasu_extension_api::{MethodRef, ResourceOutput};
 
+fn ensure_control_operation_unfenced(
+    book: &super::control_settlement::ControlSettlementBook,
+    owner: &str,
+    operation_id: &str,
+) -> ModuleResult<()> {
+    if book.operation_fenced(owner, operation_id) {
+        return Err("control_operation_retired".into());
+    }
+    Ok(())
+}
+
 fn approval_for(
     selected: &ProviderSelection,
     method: &MethodRef,
@@ -327,6 +338,11 @@ impl Coordinator {
             .find(|entry| entry.participant.provider == proposal.owner_provider)
             .ok_or("owner_unavailable")?;
         let (sequence, operation_id) = authority.allocate(&proposal.owner_provider)?;
+        ensure_control_operation_unfenced(
+            &self.shared.borrow().value.control_settlements,
+            &proposal.owner_provider,
+            &operation_id,
+        )?;
         let mut request = ResourceControlRequest {
             version: amaterasu_extension_api::COMPOSITION_VERSION,
             transition_id: work.transition_id.clone(),
@@ -503,6 +519,19 @@ impl Coordinator {
             .ok_or("control_not_reserved")?;
         let permit = control.dispatch.request.permit_id.clone();
         let runtime_key = format!("{key}/control/{permit}");
+        if matches!(control.dispatch.phase, ControlPhase::Effect)
+            && control
+                .dispatch
+                .dispatch
+                .as_ref()
+                .is_none_or(|record| record.state == crate::provider_dispatch::DispatchState::Ready)
+        {
+            ensure_control_operation_unfenced(
+                &self.shared.borrow().value.control_settlements,
+                &control.dispatch.request.proposal.owner_provider,
+                &control.dispatch.request.operation_id,
+            )?;
+        }
         match &control.dispatch.phase {
             ControlPhase::Applied { .. } => {
                 self.control_drivers.remove(&runtime_key);
@@ -972,6 +1001,20 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retired_control_operation_cannot_be_dispatched_again() {
+        use sha2::{Digest, Sha256};
+        let digest = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&["operation", "owner", "old-op"]).unwrap())
+        );
+        let book: super::super::control_settlement::ControlSettlementBook =
+            serde_json::from_value(json!({"records":[],"replay_fences":[digest]})).unwrap();
+        assert!(ensure_control_operation_unfenced(&book, "owner", "old-op").is_err());
+        assert!(ensure_control_operation_unfenced(&book, "owner", "new-op").is_ok());
+        assert!(ensure_control_operation_unfenced(&book, "other", "old-op").is_ok());
+    }
 
     #[test]
     fn selection_never_starts_for_unretired_or_wrong_phase_work() {
