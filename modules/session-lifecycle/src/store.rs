@@ -77,7 +77,7 @@ impl LifecycleStore {
             ));
         }
         let value = serde_json::to_value(value).map_err(io::Error::other)?;
-        let bytes = serde_json::to_vec_pretty(&value).map_err(io::Error::other)?;
+        let bytes = serde_json::to_vec(&value).map_err(io::Error::other)?;
         if bytes.len() as u64 > MAX_DOCUMENT_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -87,7 +87,7 @@ impl LifecycleStore {
         let result = (|| {
             validate_parent(self.path.parent().expect("validated parent"))?;
             validate_file(&self.path)?;
-            amaterasu_storage::write_json_atomically(&self.path, &value).map_err(io::Error::other)
+            amaterasu_storage::write_atomically(&self.path, &bytes).map_err(io::Error::other)
         })();
         if result.is_err() {
             self.poisoned = true;
@@ -265,6 +265,32 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn journal_budget_counts_stored_data_and_rejects_oversize_without_replacement() {
+        let root = test_dir();
+        let path = root.join("journal.json");
+        let mut store = LifecycleStore::new(path.clone()).unwrap();
+        let history = serde_json::json!(vec![serde_json::json!({"closed": true}); 40_000]);
+        assert!(serde_json::to_vec_pretty(&history).unwrap().len() as u64 > MAX_DOCUMENT_BYTES);
+        store.replace(&history).unwrap();
+        assert!(fs::metadata(&path).unwrap().len() <= MAX_DOCUMENT_BYTES);
+        assert_eq!(
+            store.load::<serde_json::Value>().unwrap(),
+            Some(history.clone())
+        );
+
+        let oversized = "x".repeat(MAX_DOCUMENT_BYTES as usize);
+        assert_eq!(
+            store.replace(&oversized).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(store.load::<serde_json::Value>().unwrap(), Some(history));
+        store.replace(&1).unwrap();
+        assert_eq!(store.load::<u64>().unwrap(), Some(1));
+        drop(store);
         fs::remove_dir_all(root).unwrap();
     }
 
