@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Prepare an opt-in two-provider Linux session package in new paths.
 
-The v2 runtime gate currently refuses preparation until coordinator dispatch
-and owner control/finalization are implemented and qualified.
-No activation, installation, service restart, or desktop operation is performed.
+The selected providers, schema bytes and operation grants are checked before
+creating output paths. No activation, installation, service restart, or desktop
+operation is performed.
 """
 from __future__ import annotations
 
@@ -42,15 +42,42 @@ def validated_selection(publisher: Path, repo: Path, library: Path, provider: st
             raise ValueError("selected descriptor changed during validation")
     selected = {"descriptor": descriptor, "descriptor_digest": report["descriptor_sha256"],
                 "component": component, "approvals": approvals["api_methods"]}
+    schemas = {}
+    if provider == check.OWNER:
+        for name, digest in (("display-target-v1.json", check.TARGET_DIGEST),
+                             ("display-control-v1.json", check.CONTROL_DIGEST)):
+            document = (repo / "schemas" / name).read_bytes()
+            if len(document) > 12000 or hashlib.sha256(document).hexdigest() != digest:
+                raise ValueError("selected composition schema changed during validation")
+            schemas[name] = document
     return {"selected": selected, "report": report, "descriptor_bytes": descriptor_bytes,
             "component_bytes": component_bytes, "approval_bytes": approval_bytes,
-            "library": library}
+            "library": library, "schemas": schemas}
 
 
 def validated_runtime_configuration(root: Path, selections: list[dict], enable_action: bool) -> dict:
-    # The current lifecycle runtime rejects composition v2. Do not let a caller
-    # opt out of this gate or provide a self-asserted support flag.
-    raise RuntimeError("split composition runtime is not yet qualified")
+    selected = [item["selected"] for item in selections]
+    composition.provider_entries(selected, enable_action)
+    owners = [item for item in selections if item["selected"]["descriptor"]["provider"] == check.OWNER]
+    if len(owners) != 1:
+        raise ValueError("one selected owner is required")
+    owner = owners[0]
+    schemas = owner["schemas"]
+    graph = composition.lifecycle_graph(owner["selected"]["approvals"],
+        schemas["display-target-v1.json"], schemas["display-control-v1.json"],
+        {"control": "resource_control", "control_status": "resource_status",
+         "settlement": "resource_control_settle", "finalize": "resource_finalize",
+         "finalize_status": "lifecycle_status"})
+    owner_operations = {"verify_provider_epoch", "describe_resource_control", "verify_resource_control",
+        "validate_resource_control", "verify_control_settlement", "describe_resource_finalize",
+        "verify_resource_finalize", "validate_resource_finalize", "verify_finalize_stage",
+        "verify_finalize_result", "refresh_provider_observations"} | composition.CORE_OWNER_OPERATIONS
+    grants = {check.OWNER: sorted(owner_operations), check.DISPLAY: ["verify_provider_epoch"]}
+    if enable_action:
+        grants[check.OWNER] = sorted(owner_operations | composition.ACTION_OWNER_OPERATIONS)
+        grants[legacy.ACTIONS] = sorted(composition.ACTION_COORDINATOR_OPERATIONS)
+    journal = root.resolve() / "data/session-lifecycle/journal.json"
+    return composition.lifecycle_configuration(str(journal), graph, grants)
 
 
 def create_journal_directory(root: Path, canonical_root: Path) -> None:
@@ -88,9 +115,8 @@ def pack_profile(publisher: Path, root: Path, artifacts: Path, package: Path, se
                  enable_action: bool = False, enable_virtual_display: bool = False) -> None:
     """Construct and verify a development package from already validated inputs.
 
-    Invoked only after the release-controlled runtime qualification gate.
-    The caller must validate lifecycle policy, selected method digests and all
-    artifacts before reaching this function. Component snapshots and digest
+    The caller must validate selected method digests and all artifacts before
+    reaching this function. Component snapshots and digest
     checks prevent packaging bytes different from those approved at preflight.
     """
     lifecycle_settings = validated_runtime_configuration(root, selections, enable_action)
@@ -171,7 +197,7 @@ def main() -> None:
                                     2, check.DISPLAY_METHODS, args.approved_display_methods_sha256)]
     entries = composition.provider_entries([item["selected"] for item in selected], args.enable_display_actions)
     del entries
-    # This non-overridable gate runs before creating root or package paths.
+    # Validation and immutable artifact snapshots precede root creation.
     options = args.linux_options[1:] if args.linux_options[:1] == ["--"] else args.linux_options
     pack_profile(args.publisher, args.root, args.artifacts, args.package, args.sequence,
                  selected, options, args.enable_display_actions, args.enable_virtual_display)

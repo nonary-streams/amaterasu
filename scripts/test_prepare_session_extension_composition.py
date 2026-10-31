@@ -14,16 +14,47 @@ from test_session_extension_composition_policy import selection
 
 
 class PrepareCompositionTest(unittest.TestCase):
-    def test_runtime_gate_cannot_be_bypassed_by_configuration(self):
-        with self.assertRaisesRegex(RuntimeError, "not yet qualified"):
+    def test_invalid_selections_fail_before_creating_paths(self):
+        with self.assertRaisesRegex(ValueError, "both selected providers"):
             prepare.validated_runtime_configuration(Path("/unused"), [], False)
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             root, package = directory / "root", directory / "package"
-            with self.assertRaisesRegex(RuntimeError, "not yet qualified"):
+            with self.assertRaisesRegex(ValueError, "both selected providers"):
                 prepare.pack_profile(Path("release"), root, directory, package, 1, [], [])
             self.assertFalse(root.exists())
             self.assertFalse(package.exists())
+
+    def test_runtime_configuration_pins_graph_and_rejects_changed_schema(self):
+        owner = selection(check.OWNER, 1, check.OWNER_METHODS)
+        display = selection(check.DISPLAY, 2, check.DISPLAY_METHODS)
+        target, control = b'{"target":true}\n', b'{"control":true}\n'
+        selected = [{"selected": owner, "schemas": {"display-target-v1.json": target,
+                    "display-control-v1.json": control}}, {"selected": display}]
+        with mock.patch.object(check, "TARGET_DIGEST", hashlib.sha256(target).hexdigest()), \
+             mock.patch.object(check, "CONTROL_DIGEST", hashlib.sha256(control).hexdigest()):
+            settings = prepare.validated_runtime_configuration(Path("/fresh"), selected, False)
+            self.assertEqual(settings["control_policies"][0]["dependent_provider"], check.DISPLAY)
+            self.assertEqual(settings["finalize_policies"][0]["owner_provider"], check.OWNER)
+            self.assertIn("lookup_stream_closure", settings["operation_grants"][check.OWNER])
+            self.assertIn("finish_input_action", settings["operation_grants"][legacy.INPUT])
+            self.assertNotIn("describe_action_target", settings["operation_grants"][check.OWNER])
+            action = {"id": check.OWNER + "/remove-owned", "execution": "session_mutation",
+                      "allowed_targets": ["stream"], "arguments": {}, "required_capabilities": [],
+                      "plan": prepare.composition.method_ref(check.OWNER, "action_plan"),
+                      "execute": prepare.composition.method_ref(check.OWNER, "action_execute"),
+                      "status": prepare.composition.method_ref(check.OWNER, "action_status")}
+            owner["descriptor"]["actions"] = [action]
+            for name in sorted(check.ACTION_METHODS):
+                approval = json.loads(json.dumps(owner["approvals"][0]))
+                approval["method"]["method"] = name
+                owner["approvals"].append(approval)
+            enabled = prepare.validated_runtime_configuration(Path("/fresh"), selected, True)
+            self.assertIn("describe_action_target", enabled["operation_grants"][check.OWNER])
+            self.assertIn("rebind_action_plan", enabled["operation_grants"][legacy.ACTIONS])
+            selected[0]["schemas"]["display-target-v1.json"] += b" "
+            with self.assertRaisesRegex(ValueError, "schema bytes"):
+                prepare.validated_runtime_configuration(Path("/fresh"), selected, False)
 
     def test_pack_uses_two_selected_immutable_snapshots(self):
         with tempfile.TemporaryDirectory() as temporary:

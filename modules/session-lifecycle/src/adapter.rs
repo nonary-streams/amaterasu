@@ -89,7 +89,7 @@ pub struct SchemaDocument {
 #[serde(deny_unknown_fields)]
 pub struct ParticipantSettings {
     pub provider: String,
-    /// Wire contract version. Version 2 is restricted to the owner-only session qualification profile.
+    /// Wire contract version selected by the installed participant.
     #[serde(default = "default_contract_version")]
     pub contract_version: u32,
     /// Required participants that must prepare before this provider.
@@ -268,23 +268,35 @@ impl LifecycleSettings {
         Ok(())
     }
 
-    /// Version 2 currently supports only one independently selected producer.
-    /// Coordinator phase admission separately fences unsupported lifecycle work.
+    /// Bind versioned policy endpoints to the selected participant contracts.
+    /// Graph, schema, and installed approval checks remain independent checks.
     fn validate_contract_profile(&self) -> ModuleResult<()> {
         let uses_v2 = self.participants.iter().any(|p| p.contract_version == 2);
         if !uses_v2 {
             return Ok(());
         }
-        let [participant] = self.participants.as_slice() else {
-            return Err("unsupported v2 lifecycle profile".into());
+        let selected_owner = |provider: &str, service: &str| {
+            self.participants.iter().any(|participant| {
+                participant.provider == provider
+                    && participant.contract_version == 2
+                    && participant.plan_method.service == service
+                    && participant.callback_method.service == service
+                    && participant.status_method.service == service
+            })
         };
-        let [finalize] = self.finalize_policies.as_slice() else {
-            return Err("unsupported v2 lifecycle profile".into());
-        };
-        if participant.contract_version != 2
-            || !participant.depends_on.is_empty()
-            || !self.control_policies.is_empty()
-            || finalize.owner_provider != participant.provider
+        if self
+            .participants
+            .iter()
+            .any(|participant| participant.contract_version != 2)
+            || self.finalize_policies.is_empty()
+            || self
+                .control_policies
+                .iter()
+                .any(|policy| !selected_owner(&policy.owner_provider, &policy.owner_service))
+            || self
+                .finalize_policies
+                .iter()
+                .any(|policy| !selected_owner(&policy.owner_provider, &policy.owner_service))
         {
             return Err("unsupported v2 lifecycle profile".into());
         }
@@ -1017,7 +1029,7 @@ mod tests {
         assert!(settings.validate().is_err());
     }
     #[test]
-    fn v2_qualification_requires_one_owner_exact_finalize_and_v2_methods() {
+    fn v2_graph_requires_selected_owner_exact_schemas_and_v2_methods() {
         use sha2::{Digest, Sha256};
         let document = r#"{"$id":"output/1","$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#;
         let schema = json!({"id":"output/1","major":1,"minor":0,"digest":format!("{:x}",Sha256::digest(document.as_bytes()))});
@@ -1029,9 +1041,37 @@ mod tests {
         let mut invalid = settings.clone();
         invalid.finalize_policies.clear();
         assert!(invalid.validate().is_err());
-        let mut invalid = settings.clone();
-        invalid.participants.push(invalid.participants[0].clone());
-        invalid.participants[1].provider = "other".into();
+        let mut composed = settings.clone();
+        let mut dependent = composed.participants[0].clone();
+        dependent.provider = "dependent".into();
+        dependent.depends_on = vec!["owner".into()];
+        for method in [
+            &mut dependent.plan_method,
+            &mut dependent.callback_method,
+            &mut dependent.status_method,
+        ] {
+            method.service = "dependent/2".into();
+        }
+        composed.participants.push(dependent);
+        let control = json!({"owner_provider":"owner","owner_service":"owner/2","dependent_provider":"dependent","owner_method":method,"status_method":method,"settlement_method":method,"output_capability":"display/output","output_schema":schema,"argument_schema":schema,"max_access":"exclusive","domain_scope":"resource","mutation_domains":[]});
+        composed
+            .control_policies
+            .push(serde_json::from_value(control).unwrap());
+        assert!(composed.validate().is_ok());
+        let mut invalid = composed.clone();
+        invalid.participants[1].depends_on.clear();
+        assert!(invalid.validate().is_err());
+        let mut invalid = composed.clone();
+        invalid.control_policies[0].owner_service = "wrong/2".into();
+        assert!(invalid.validate().is_err());
+        let mut invalid = composed.clone();
+        invalid.control_policies[0].argument_schema.digest = "f".repeat(64);
+        assert!(invalid.validate().is_err());
+        let mut invalid = composed;
+        invalid.participants[1].contract_version = 1;
+        invalid.participants[1].plan_method.interface_major = 1;
+        invalid.participants[1].callback_method.interface_major = 1;
+        invalid.participants[1].status_method.interface_major = 1;
         assert!(invalid.validate().is_err());
         let mut invalid = settings.clone();
         invalid.participants[0].callback_method.interface_major = 1;
