@@ -78,8 +78,7 @@ an intended on, off, or retained state is not proof of native readback.
 Disconnect retires the stream and its configuration while retaining
 the application and eligible session resource. Session end additionally requires
 application retirement and release of the root resource after its dependents.
-Cleanup and action wiring for this split must be qualified before relying on
-these semantics in a running host.
+The test coverage and its native-effect limits are described under Validation.
 
 The coordinator must validate the installed dependency graph, schemas, and
 method approvals before effects. It must persist the producer's selected output
@@ -103,8 +102,8 @@ continues after a failure, but an unresolved dependent effect or cleanup must
 fence release of its prerequisite. Recovery queries recorded operations rather
 than replaying unknown effects. The selected graph, settings snapshots, and
 inputs must remain stable for recovery; there is no silent provider substitution
-after effects. These requirements need integrated tests and separate live
-platform and hardware qualification.
+after effects. Live platform and hardware qualification remain separate from
+the simulated integration tests.
 
 The first consumer adapter accepts Linux KDE/Wayland SDR bindings through
 `amaterasu.capture-pipewire/1` and `amaterasu.kwin-wl-output/1`, with PipeWire
@@ -232,8 +231,7 @@ The owner's result reports `released`, `retained`, or `unknown`. The coordinator
 must authenticate the owner and admission and resolve dependent cleanup; the
 typed result alone is not authorization or proof of retirement. A confirmed
 release followed by resume requires a new resource generation rather than reuse
-of the released generation. End-to-end action release and new-generation resume
-remain subject to qualification.
+of the released generation.
 
 `ActionResourceDispositionPlan.cleanup_obligation_ids` may nominate up to 128
 sorted, unique IDs; an omitted or empty list claims no implicit cleanup. The
@@ -249,8 +247,7 @@ The `nonary.virtual-screen/remove-owned` action is restricted to an
 active stream target. A session target, including a paused session without an
 active stream, is unsupported. Its intended shortcut behavior is to retire the
 stream and remove the owned producer while retaining the application; a later
-resume must obtain a fresh resource generation. The target restriction and this
-end-to-end path require integration and validation before use.
+resume must obtain a fresh resource generation.
 
 When an invocation supplies `expected_settings_revision`, the action service
 compares that decimal revision with the provider's current registry document
@@ -346,7 +343,11 @@ hardware qualification. Windows virtual-screen owner startup is fenced while
 its DACL and process-lock security remain incomplete. Building the public plugin
 repositories currently requires a compatible private Amaterasu SDK checkout.
 
-The explicit test-gated Linux run using real state and fake native effects covered
-ten varying-mode cycles, active and paused session end, and a second session in
-the same mutation domain. It does not establish live hardware behavior. Two
-keyboard action cycles remain to be qualified.
+An unpatched Linux run through the real broker and state service with simulated
+native and capture peers covered ten alternating 720p90 and 1080p60 cycles,
+active and paused session end, and a second session in the same mutation domain.
+A separate real-broker run with simulated native, state, and input peers covered
+two keyboard removals, fresh resource generations and resume through generation
+three, session end, and an exact retry after a lost completion reply without
+native replay or injected input. These runs do not establish live hardware or
+full host-restart behavior.

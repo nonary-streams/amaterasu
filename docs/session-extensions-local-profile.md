@@ -117,6 +117,17 @@ native `amaterasu.virtual-display/1` service remains a separate lower-level
 interface. V1 method schemas remain unchanged; a v2 provider requires its own
 approved methods and schemas.
 
+The split profile is prepared with `scripts/prepare_session_extension_composition.py`.
+It requires new root and package paths, compatible independently built provider
+libraries, the explicitly selected PipeWire capture provider, and operator-pinned
+SHA-256 digests for both providers' method approvals. Use `--enable-display-actions`
+only to authorize the stream-targeted removal action; no shortcut is selected by
+default. The preparer signs and verifies the package but does not stage, activate,
+install, or start it. Run it with `--help` for its arguments. Signed default and
+action-opt-in profiles have passed isolated host startup and discovery with both
+providers disabled and native effects disabled. The opt-in grants target streams;
+startup alone does not establish live display or hardware behavior.
+
 The intended upgrade starts with a fresh isolated profile. Preserve the old
 registry document or an export of it, and retire any old virtual resources
 through their original owner before moving to the new composition. Native
