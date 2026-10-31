@@ -50,6 +50,13 @@ This starts a temporary worker with loopback listeners and capture, input, and
 display effects disabled. It checks registry discovery and host settings
 persistence, then removes its temporary root.
 
+The new Linux root starts with no explicit legacy display policy or virtual
+output list; those defaults resolve to disabled. If configuring product settings,
+keep `dd_configuration_option` and `virtual_display_mode` set to `disabled` via
+the supported product-settings UI/API. Application or client overrides can also
+request legacy display behavior; the lifecycle path rejects conflicting policy.
+The preparer does not edit the product state database directly.
+
 Bootstrap policy is trusted local operator configuration; it is not covered by
 the component-set signature. The signed manifest binds each selected component,
 its bytes, dependencies, and requested routing grants. The installed policy and
