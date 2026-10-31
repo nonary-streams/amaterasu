@@ -38,6 +38,7 @@ members = [
     "modules/configuration",
     "modules/host-configuration",
     "modules/catalog",
+    "modules/library",
     "modules/application",
     "modules/diagnostics",
     "modules/steam",
