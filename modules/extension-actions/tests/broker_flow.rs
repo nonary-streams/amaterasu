@@ -51,6 +51,7 @@ struct Harness {
     consumptions: usize,
     revoke_consume: bool,
     allow_authorize: bool,
+    lifecycle_hangs: bool,
     observed_delegated_registry: bool,
     observed_delegated_plan: bool,
 }
@@ -126,6 +127,7 @@ impl Harness {
             consumptions: 0,
             revoke_consume: false,
             allow_authorize: true,
+            lifecycle_hangs: false,
             observed_delegated_registry: false,
             observed_delegated_plan: false,
         };
@@ -157,6 +159,9 @@ impl Harness {
         // SAFETY: instance is live and calls are serialized on the test thread.
         assert_eq!(unsafe { (self.api.tick)(self.instance) }, abi::STATUS_OK);
         for principal in ["state", "registry", "lifecycle", "provider"] {
+            if principal == "lifecycle" && self.lifecycle_hangs {
+                continue;
+            }
             let request = self
                 .broker
                 .borrow_mut()
@@ -277,6 +282,21 @@ impl Harness {
             self.complete(principal, id, response);
         }
     }
+    fn restart(&mut self) {
+        // SAFETY: destroy the existing instance before creating a replacement on the same endpoint.
+        unsafe { (self.api.destroy)(self.instance) };
+        self.instance = std::ptr::null_mut();
+        let host = abi::HostApi {
+            header: abi::AbiHeader::of::<abi::HostApi>(),
+            context: (&mut *self.endpoint as *mut Endpoint).cast(),
+            invoke,
+        };
+        // SAFETY: the boxed endpoint outlives the replacement instance.
+        assert_eq!(
+            unsafe { (self.api.create)(&host, &mut self.instance) },
+            abi::STATUS_OK
+        );
+    }
     fn call(&mut self, payload: Value) -> Value {
         self.sequence += 1;
         let response = self.broker.borrow_mut().dispatch(
@@ -385,5 +405,24 @@ fn missing_lifecycle_grant_denies_authorization_and_effect() {
     }
     assert!(harness.observed_delegated_registry && harness.observed_delegated_plan);
     assert_eq!(harness.authorizations, 0);
+    assert_eq!(harness.effects, 0);
+}
+
+#[test]
+fn restart_fences_admitted_action_without_replaying_effect() {
+    let mut harness = Harness::new();
+    harness.lifecycle_hangs = true;
+    let epoch = harness.invoke_action();
+    for _ in 0..20 {
+        harness.pump();
+    }
+    assert_eq!(harness.effects, 0);
+    harness.restart();
+    for _ in 0..150 {
+        harness.pump();
+    }
+    let record = &harness.state[&format!("epoch/{epoch}")]["receipts"]["1"];
+    assert_eq!(record["receipt"]["status"], "recovery_required");
+    assert_eq!(record["dispatch"]["stage"]["phase"], "recovery_required");
     assert_eq!(harness.effects, 0);
 }
