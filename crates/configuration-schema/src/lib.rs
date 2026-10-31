@@ -15,6 +15,11 @@ const MAX_SCHEMA_DEPTH: usize = 16;
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Definition {
+    /// An explicit unset value around an independently validated definition.
+    Nullable {
+        default: Value,
+        inner: Box<Definition>,
+    },
     Boolean {
         default: bool,
     },
@@ -57,6 +62,7 @@ pub enum Definition {
 impl Definition {
     fn default_value(&self) -> Value {
         match self {
+            Self::Nullable { default, .. } => default.clone(),
             Self::Boolean { default } => (*default).into(),
             Self::Integer { default, .. } => (*default).into(),
             Self::Decimal { default, .. } => Number::from_f64(*default)
@@ -75,6 +81,7 @@ impl Definition {
 
     fn accepts(&self, value: &Value) -> bool {
         match self {
+            Self::Nullable { inner, .. } => value.is_null() || inner.accepts(value),
             Self::Boolean { .. } => value.is_boolean(),
             Self::Integer {
                 minimum, maximum, ..
@@ -183,6 +190,12 @@ fn validate_definition(
     }
 
     match definition {
+        Definition::Nullable { inner, .. } => {
+            if depth == MAX_SCHEMA_DEPTH {
+                return Err(format!("schema exceeds maximum nesting depth: {path}"));
+            }
+            validate_definition(inner, path, depth + 1, remaining_fields)?;
+        }
         Definition::Boolean { .. } | Definition::Integer { .. } => {}
         Definition::Decimal {
             minimum, maximum, ..
@@ -298,6 +311,38 @@ pub fn validate_values(fields: &Fields, values: &Values) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn nullable_values_are_explicit_and_inner_schema_is_always_validated() {
+        let wire = json!({"hotkey":{"type":"nullable","default":null,"inner":{"type":"object","default":{"key":"K"},"fields":{"key":{"type":"string","default":"K","min_length":1,"max_length":8}}}}});
+        let fields: Fields = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&fields).unwrap(), wire);
+        assert_eq!(defaults(&fields).unwrap()["hotkey"], Value::Null);
+        for value in [json!(null), json!({"key":"A"})] {
+            assert!(validate_values(&fields, &[("hotkey".into(), value)].into()).is_ok());
+        }
+        for value in [
+            json!("A"),
+            json!({"key":""}),
+            json!({"key":"A","extra":true}),
+        ] {
+            assert!(validate_values(&fields, &[("hotkey".into(), value)].into()).is_err());
+        }
+        let bad: Fields = serde_json::from_value(json!({"hotkey":{"type":"nullable","default":null,"inner":{"type":"string","default":"x","min_length":3,"max_length":1}}})).unwrap();
+        assert!(defaults(&bad).is_err());
+        let bad_default: Fields = serde_json::from_value(json!({"hotkey":{"type":"nullable","default":2,"inner":{"type":"boolean","default":false}}})).unwrap();
+        assert!(defaults(&bad_default).is_err());
+        let mut nested = json!({"type":"boolean","default":false});
+        for _ in 0..=MAX_SCHEMA_DEPTH {
+            nested = json!({"type":"nullable","default":null,"inner":nested});
+        }
+        let deep: Fields = serde_json::from_value(json!({"hotkey":nested})).unwrap();
+        assert!(defaults(&deep).is_err());
+        let legacy = json!({"type":"boolean","default":false});
+        let legacy_decoded: Definition = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&legacy_decoded).unwrap(), legacy);
+        assert!(!legacy_decoded.accepts(&Value::Null));
+    }
 
     #[test]
     fn tagged_union_validates_selected_variant_and_round_trips() {

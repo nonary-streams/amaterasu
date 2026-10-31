@@ -421,6 +421,7 @@ pub enum BindingPropagation {
 #[serde(rename_all = "snake_case")]
 pub enum BindingTarget {
     CurrentSession,
+    CurrentStream,
     Host,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -442,7 +443,9 @@ pub struct Keybinding {
 /// Validate shape and action arguments; authorization and chord conflicts are separate.
 /// The selected input adapter must also validate platform-specific key-code support.
 pub fn validate_keybinding(binding: &Keybinding, action: &ActionDescriptor) -> Result<(), String> {
-    if !valid_opaque_id(&binding.id)
+    if (binding.target == BindingTarget::CurrentStream
+        && !action.allowed_targets.contains(&TargetKind::Stream))
+        || !valid_opaque_id(&binding.id)
         || !valid_opaque_id(&binding.context)
         || binding.action_id != action.id
         || binding.modifiers.len() > 8
@@ -1705,6 +1708,17 @@ mod tests {
             target: BindingTarget::CurrentSession,
         };
         assert!(validate_keybinding(&binding, &action).is_ok());
+        let wire = serde_json::to_value(&binding).unwrap();
+        assert_eq!(wire["target"], "current_session");
+        binding.target = BindingTarget::CurrentStream;
+        assert!(validate_keybinding(&binding, &action).is_err());
+        let mut stream_action = action.clone();
+        stream_action.allowed_targets.push(TargetKind::Stream);
+        assert!(validate_keybinding(&binding, &stream_action).is_ok());
+        let wire = serde_json::to_value(&binding).unwrap();
+        assert_eq!(wire["target"], "current_stream");
+        assert_eq!(serde_json::from_value::<Keybinding>(wire).unwrap(), binding);
+        binding.target = BindingTarget::CurrentSession;
         binding.modifiers.push(modifier);
         assert!(validate_keybinding(&binding, &action).is_err());
         binding.modifiers.clear();
