@@ -498,7 +498,7 @@ pub struct ExtensionDescriptor {
 /// admitted plan and installed grants must still be checked by the coordinator.
 pub fn validate_provider_request(request: &ProviderRequest) -> Result<(), String> {
     if request.provider_sequence == 0
-        || request.version != CONTRACT_VERSION
+        || !matches!(request.version, CONTRACT_VERSION | COMPOSITION_VERSION)
         || !valid_opaque_id(&request.transition_id)
         || !valid_opaque_id(&request.operation_id)
         || !valid_opaque_id(&request.settings_revision)
@@ -525,9 +525,29 @@ pub fn validate_provider_request(request: &ProviderRequest) -> Result<(), String
     {
         return Err("invalid provider request".into());
     }
+    if request.dependency_inputs.len() > 32
+        || request.control_results.len() > 32
+        || (request.version == CONTRACT_VERSION
+            && (!request.dependency_inputs.is_empty() || !request.control_results.is_empty()))
+    {
+        return Err("invalid composition fields".into());
+    }
+    let mut selected = std::collections::BTreeSet::new();
+    for input in &request.dependency_inputs {
+        validate_resource_output(input)?;
+        if !output_in_scope(input, &request.target)
+            || input.resource.execution_domain != request.consumer_requirements.execution_domain
+            || !selected.insert((&input.producer, &input.output_id))
+        {
+            return Err("invalid dependency input".into());
+        }
+    }
     match request.operation {
         ProviderOperation::ResourcePlan => {
-            if request.approved_plan.is_some() || request.admission_id.is_some() {
+            if request.approved_plan.is_some()
+                || request.admission_id.is_some()
+                || !request.control_results.is_empty()
+            {
                 return Err("planning does not authorize effects".into());
             }
         }
@@ -542,6 +562,8 @@ pub fn validate_provider_request(request: &ProviderRequest) -> Result<(), String
                 return Err("missing or mismatched admission".into());
             }
             validate_resource_plan(plan)?;
+            validate_composition_plan(request, plan)?;
+            validate_composition_results(request, plan)?;
             validate_consumer_requirements(plan, &request.consumer_requirements)?;
         }
     }
@@ -560,6 +582,7 @@ pub fn validate_resource_plan(plan: &ResourcePlan) -> Result<(), String> {
         || plan.affected_consumers.len() > 128
         || plan.required_capabilities.len() > 128
         || plan.allowed_degradation.len() > 128
+        || plan.control_proposals.len() > 32
         || !plan.constraints.is_object()
         || serde_json::to_vec(plan)
             .map_err(|error| error.to_string())?
@@ -639,6 +662,28 @@ pub fn validate_resource_plan(plan: &ResourcePlan) -> Result<(), String> {
     {
         return Err("invalid binding constraint".into());
     }
+    let mut proposals = BTreeSet::new();
+    for proposal in &plan.control_proposals {
+        validate_resource_control_proposal(proposal)?;
+        if !proposals.insert(&proposal.proposal_id)
+            || proposal.mutation_domains.iter().any(|domain| {
+                !plan.mutation_domains.iter().any(|declared| {
+                    declared.domain == *domain
+                        && matches!(
+                            (&declared.access, &proposal.access),
+                            (ResourceAccess::Exclusive, _)
+                                | (
+                                    ResourceAccess::Shared,
+                                    ResourceAccess::Shared | ResourceAccess::Read
+                                )
+                                | (ResourceAccess::Read, ResourceAccess::Read)
+                        )
+                })
+            })
+        {
+            return Err("invalid control proposal".into());
+        }
+    }
     let mut retired = BTreeSet::new();
     loop {
         let previous = retired.len();
@@ -656,6 +701,80 @@ pub fn validate_resource_plan(plan: &ResourcePlan) -> Result<(), String> {
         }
         if retired.len() == previous {
             return Err("cyclic obligation dependency".into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_composition_plan(request: &ProviderRequest, plan: &ResourcePlan) -> Result<(), String> {
+    if request.version == CONTRACT_VERSION && !plan.control_proposals.is_empty() {
+        return Err("v1 control proposals unavailable".into());
+    }
+    for proposal in &plan.control_proposals {
+        if proposal.target != request.target
+            || !request.dependency_inputs.iter().any(|input| {
+                input.output_id == proposal.output_id
+                    && input.producer == proposal.owner_provider
+                    && input.producer_service == proposal.owner_service
+                    && input.resource == proposal.resource
+            })
+        {
+            return Err("control proposal outside selected inputs".into());
+        }
+    }
+    Ok(())
+}
+
+fn validate_composition_results(
+    request: &ProviderRequest,
+    plan: &ResourcePlan,
+) -> Result<(), String> {
+    if request.version == COMPOSITION_VERSION
+        && request.control_results.len() != plan.control_proposals.len()
+    {
+        return Err("control results incomplete".into());
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for result in &request.control_results {
+        if !seen.insert(&result.proposal_id) {
+            return Err("duplicate control result".into());
+        }
+        let proposal = plan
+            .control_proposals
+            .iter()
+            .find(|p| p.proposal_id == result.proposal_id)
+            .ok_or("unadmitted control result")?;
+        validate_resource_output(&result.output)?;
+        let original = request
+            .dependency_inputs
+            .iter()
+            .find(|input| {
+                input.output_id == proposal.output_id && input.producer == proposal.owner_provider
+            })
+            .ok_or("missing original input")?;
+        if result.output.output_id != original.output_id
+            || result.output.producer != original.producer
+            || result.output.producer_service != original.producer_service
+            || result.output.origin != original.origin
+            || result.output.schema != original.schema
+            || result.output.capability != original.capability
+            || result.output.resource.provider != original.resource.provider
+            || result.output.resource.resource_id != original.resource.resource_id
+            || result.output.resource.incarnation != original.resource.incarnation
+            || result.output.resource.execution_domain != original.resource.execution_domain
+            || result.output.resource.mutation_domain != original.resource.mutation_domain
+            || result.output.resource.mutation_domains != original.resource.mutation_domains
+            || result.output.resource.revision < original.resource.revision
+        {
+            return Err("control result outside admitted resource".into());
+        }
+        if let Some(candidate) = &result.candidate {
+            validate_capture_binding(candidate)?;
+            if candidate.resource != result.output.resource
+                || !matches!(&request.target, LifecycleTarget::Stream { generation, .. } if candidate.generation == *generation)
+            {
+                return Err("control candidate mismatch".into());
+            }
         }
     }
     Ok(())
@@ -685,6 +804,7 @@ pub fn validate_provider_response(
     request: &ProviderRequest,
     response: &ProviderResponse,
 ) -> Result<(), String> {
+    validate_provider_request(request)?;
     if serde_json::to_vec(response)
         .map_err(|error| error.to_string())?
         .len()
@@ -697,17 +817,45 @@ pub fn validate_provider_response(
             if request.operation == ProviderOperation::ResourcePlan =>
         {
             validate_resource_plan(plan)?;
+            validate_composition_plan(request, plan)?;
             validate_consumer_requirements(plan, &request.consumer_requirements)
         }
         ProviderResponse::Prepared {
             candidate,
             obligations,
-            outputs: _,
+            outputs,
         } if request.operation == ProviderOperation::LifecycleCallback => {
             let plan = request
                 .approved_plan
                 .as_ref()
                 .ok_or("missing admitted plan")?;
+            if outputs.len() > 32
+                || (request.version == CONTRACT_VERSION && !outputs.is_empty())
+                || (request.version == COMPOSITION_VERSION && candidate.is_some())
+            {
+                return Err("invalid prepared outputs".into());
+            }
+            let mut output_ids = std::collections::BTreeSet::new();
+            for output in outputs {
+                validate_resource_output(output)?;
+                if !output_in_scope(output, &request.target)
+                    || !output_ids.insert((&output.producer, &output.output_id))
+                    || !plan.resources.iter().any(|resource| {
+                        resource.provider == output.resource.provider
+                            && resource.resource_id == output.resource.resource_id
+                            && resource.execution_domain == output.resource.execution_domain
+                            && resource
+                                .incarnation
+                                .as_ref()
+                                .is_none_or(|id| id == &output.resource.incarnation)
+                            && resource
+                                .expected_revision
+                                .is_none_or(|revision| revision == output.resource.revision)
+                    })
+                {
+                    return Err("output outside admitted plan".into());
+                }
+            }
             if obligations
                 .iter()
                 .any(|obligation| !plan.obligations.contains(obligation))
@@ -906,6 +1054,53 @@ fn validate_method(method: &MethodRef) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn v1_omits_composition_fields_and_v2_binds_selected_input() {
+        let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":2});
+        let origin =
+            json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1});
+        let schema = json!({"id":"example.schema/1","major":1,"minor":0,"digest":"a".repeat(64)});
+        let resource = json!({"provider":"example.owner","resource_id":"resource","incarnation":"instance","revision":4,"execution_domain":"seat","mutation_domain":"domain","mutation_domains":["domain"]});
+        let output = json!({"output_id":"selected","capability":"example.target","schema":schema,"producer":"example.owner","producer_service":"example.owner/2","origin":origin,"resource":resource,"data":{}});
+        let mut request: ProviderRequest = serde_json::from_value(json!({"version":1,"provider_sequence":1,"operation":"resource_plan","transition_id":"transition","operation_id":"operation","target":target,"phase":"stream.prepare","settings_revision":"settings","settings":{},"intent":"initial","reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector/1"]},"remaining_ms":5000,"plan_revision":null,"admission_id":null,"approved_plan":null})).unwrap();
+        assert!(validate_provider_request(&request).is_ok());
+        assert!(
+            serde_json::to_value(&request)
+                .unwrap()
+                .get("dependency_inputs")
+                .is_none()
+        );
+        request
+            .dependency_inputs
+            .push(serde_json::from_value(output.clone()).unwrap());
+        assert!(validate_provider_request(&request).is_err());
+        request.version = 2;
+        assert!(validate_provider_request(&request).is_ok());
+        let proposal = json!({"proposal_id":"change","output_id":"selected","owner_provider":"example.owner","owner_service":"example.owner/2","target":target,"resource":resource,"method":{"service":"example.owner/2","method":"resource_control","interface_major":2,"interface_minor":0,"schema_revision":1},"argument_schema":schema,"arguments":{},"access":"exclusive","mutation_domains":["domain"]});
+        let plan: ResourcePlan = serde_json::from_value(json!({"plan_id":"plan","revision":1,"resources":[],"mutation_domains":[{"domain":"domain","expected_revision":1,"borrowers":{},"access":"exclusive"}],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[],"control_proposals":[proposal]})).unwrap();
+        assert!(
+            validate_provider_response(&request, &ProviderResponse::Planned { plan: plan.clone() })
+                .is_ok()
+        );
+        let mut foreign = request.clone();
+        foreign.dependency_inputs[0].resource.incarnation = "other".into();
+        assert!(
+            validate_provider_response(&foreign, &ProviderResponse::Planned { plan: plan.clone() })
+                .is_err()
+        );
+        request.operation = ProviderOperation::LifecycleCallback;
+        request.admission_id = Some("admitted".into());
+        request.plan_revision = Some(1);
+        request.approved_plan = Some(plan);
+        assert!(validate_provider_request(&request).is_err());
+        request.control_results.push(ConfirmedControl {
+            proposal_id: "change".into(),
+            output: serde_json::from_value(output).unwrap(),
+            candidate: None,
+        });
+        assert!(validate_provider_request(&request).is_ok());
+    }
 
     #[test]
     fn reserved_action_status_round_trips() {
