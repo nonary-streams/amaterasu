@@ -429,6 +429,8 @@ fn valid_cancellation(
             before.stage,
             Stage::AwaitingConsume { .. }
                 | Stage::AwaitingTransition { .. }
+                | Stage::Replanning { .. }
+                | Stage::AwaitingRebind { .. }
                 | Stage::ReadyToExecute { .. }
                 | Stage::Running { .. }
                 | Stage::ProviderPending { .. }
@@ -549,6 +551,9 @@ fn valid_transition(before: &Dispatch, after: &Dispatch) -> bool {
         ),
         (Stage::AwaitingTransition { .. }, Stage::ReadyToExecute { digest, .. }) => computed
             .confirm_transition(&before.request.operation_id, &before.request.target, digest),
+        (Stage::AwaitingTransition { digest, .. }, Stage::Replanning { transition_id, .. }) => computed.accept_reply(json!({"status":"replan_required","operation_id":before.request.operation_id,"target":before.request.target,"plan_digest":digest,"transition_id":transition_id})),
+        (Stage::Replanning { .. }, Stage::AwaitingRebind { plan, .. }) => computed.accept_reply(json!({"status":"planned","operation_id":before.request.operation_id,"action_id":before.request.action_id,"target":before.request.target,"plan":plan})),
+        (Stage::AwaitingRebind { transition_id, digest, .. }, Stage::ReadyToExecute { permit, .. }) => computed.accept_reply(json!({"status":"succeeded","operation_id":before.request.operation_id,"transition_id":transition_id,"target":before.request.target,"plan_digest":digest,"permit_id":permit})),
         (Stage::ReadyToExecute { .. }, Stage::Running { .. }) => {
             computed.begin_effect().and_then(|_| {
                 if after.proof.is_some() {
@@ -594,6 +599,8 @@ fn valid_transition(before: &Dispatch, after: &Dispatch) -> bool {
             | Stage::AwaitingPermit { .. }
             | Stage::AwaitingConsume { .. }
             | Stage::AwaitingTransition { .. }
+            | Stage::Replanning { .. }
+            | Stage::AwaitingRebind { .. }
             | Stage::ReadyToExecute { .. }
             | Stage::Running { .. }
             | Stage::ProviderPending { .. }
@@ -614,6 +621,8 @@ fn failure_for(job: &Job, unknown_save: bool) -> Failure {
             job.replacement.stage,
             Stage::AwaitingConsume { .. }
                 | Stage::AwaitingTransition { .. }
+                | Stage::Replanning { .. }
+                | Stage::AwaitingRebind { .. }
                 | Stage::ReadyToExecute { .. }
                 | Stage::Running { .. }
                 | Stage::ProviderPending { .. }
@@ -624,6 +633,8 @@ fn failure_for(job: &Job, unknown_save: bool) -> Failure {
             job.expected.stage,
             Stage::AwaitingConsume { .. }
                 | Stage::AwaitingTransition { .. }
+                | Stage::Replanning { .. }
+                | Stage::AwaitingRebind { .. }
                 | Stage::ReadyToExecute { .. }
                 | Stage::Running { .. }
                 | Stage::ProviderPending { .. }
@@ -777,6 +788,94 @@ mod tests {
             }
         }
         panic!("worker failed to finish")
+    }
+    #[test]
+    fn replan_rebind_transitions_are_durable_and_exact() {
+        let (ready, _, mut epoch) = fixture();
+        let Stage::ReadyToExecute {
+            plan,
+            digest,
+            permit,
+        } = &ready.stage
+        else {
+            panic!()
+        };
+        let mut awaiting = ready.clone();
+        awaiting.stage = Stage::AwaitingTransition {
+            plan: plan.clone(),
+            digest: digest.clone(),
+            permit: permit.clone(),
+        };
+        epoch["receipts"]["1"]["dispatch"] = serde_json::to_value(&awaiting).unwrap();
+        let target = awaiting.request.target.clone();
+        let id = awaiting.request.operation_id.clone();
+        let mut replanning = awaiting.clone();
+        replanning.accept_reply(json!({"status":"replan_required","operation_id":id,"target":target,"plan_digest":digest,"transition_id":"transition-2"})).unwrap();
+        assert!(valid_transition(&awaiting, &replanning));
+        let mut forged = replanning.clone();
+        if let Stage::Replanning { old_permit, .. } = &mut forged.stage {
+            *old_permit = "foreign".into();
+        }
+        assert!(!valid_transition(&awaiting, &forged));
+        let mut rebound = replanning.clone();
+        let mut changed_plan = plan.clone();
+        changed_plan["revision"] = json!(2);
+        rebound.accept_reply(json!({"status":"planned","operation_id":id,"action_id":awaiting.request.action_id,"target":target,"plan":changed_plan})).unwrap();
+        assert!(valid_transition(&replanning, &rebound));
+        let mut forged = rebound.clone();
+        if let Stage::AwaitingRebind { digest, .. } = &mut forged.stage {
+            *digest = "0".repeat(64);
+        }
+        assert!(!valid_transition(&replanning, &forged));
+        let Stage::AwaitingRebind {
+            digest: new_digest, ..
+        } = &rebound.stage
+        else {
+            panic!()
+        };
+        let mut reauthorized = rebound.clone();
+        reauthorized.accept_reply(json!({"status":"succeeded","operation_id":id,"transition_id":"transition-2","target":target,"plan_digest":new_digest,"permit_id":"new-permit"})).unwrap();
+        assert!(valid_transition(&rebound, &reauthorized));
+        let mut forged = reauthorized.clone();
+        if let Stage::ReadyToExecute { permit, .. } = &mut forged.stage {
+            *permit = "permit".into();
+        }
+        assert!(!valid_transition(&rebound, &forged));
+        for stage in [&replanning, &rebound] {
+            let mut fenced = stage.clone();
+            fenced.fence_after_restart();
+            assert!(valid_transition(stage, &fenced));
+            assert!(valid_cancellation(
+                stage,
+                stage,
+                &json!({"status":"queued"}),
+                &json!({"status":"queued","cancellation_requested":true})
+            ));
+        }
+        let mut host = host(epoch);
+        let mut worker = Worker::new().unwrap();
+        for (before, after) in [
+            (awaiting, replanning.clone()),
+            (replanning, rebound.clone()),
+            (rebound, reauthorized),
+        ] {
+            worker
+                .persist(
+                    before.request.epoch.clone(),
+                    before,
+                    after,
+                    json!({"status":"queued"}),
+                    json!({"status":"queued"}),
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .unwrap();
+            assert_eq!(drive(&mut worker, &mut host).result, Ok(()));
+        }
+        assert_eq!(host.commits, 3);
+        assert_eq!(
+            host.epoch["receipts"]["1"]["dispatch"]["stage"]["phase"],
+            "ready_to_execute"
+        );
     }
     #[test]
     fn concurrent_workers_cannot_consume_an_armed_calls_reservation() {
