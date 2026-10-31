@@ -1,5 +1,6 @@
 //! Broker adapter for the lifecycle authority. Request payloads do not establish identity.
-use amaterasu_extension_api::{ConsumerRequirements, MethodRef};
+use crate::prepare_authority::ControlPolicy;
+use amaterasu_extension_api::{ConsumerRequirements, MethodRef, ResourceAccess, SchemaRef};
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -42,6 +43,8 @@ pub struct LifecycleSettings {
     pub journal_path: String,
     pub operation_grants: BTreeMap<String, BTreeSet<String>>,
     pub participants: Vec<ParticipantSettings>,
+    /// Installed owner-mediated control grants; absent means no control is allowed.
+    pub control_policies: Vec<ControlPolicy>,
     pub consumers: ConsumerSettings,
     pub consumer_requirements: ConsumerRequirements,
 }
@@ -58,6 +61,7 @@ impl Default for LifecycleSettings {
             journal_path: String::new(),
             operation_grants: BTreeMap::new(),
             participants: Vec::new(),
+            control_policies: Vec::new(),
             consumers: ConsumerSettings::default(),
             consumer_requirements: ConsumerRequirements {
                 execution_domain: String::new(),
@@ -111,7 +115,61 @@ fn valid_identifier(name: &str) -> bool {
         })
 }
 
+fn valid_opaque_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+}
+
+fn valid_schema_reference(schema: &SchemaRef) -> bool {
+    valid_opaque_id(&schema.id)
+        && schema.major != 0
+        && schema.digest.len() == 64
+        && schema
+            .digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 impl LifecycleSettings {
+    /// Validate installed policy shape and graph binding. Resolving the actual
+    /// schema bytes and installed method approvals remains a separate authority check.
+    fn validate_control_policies(&self) -> ModuleResult<()> {
+        if self.control_policies.len() > 128 {
+            return Err("too many lifecycle control policies".into());
+        }
+        for (index, policy) in self.control_policies.iter().enumerate() {
+            let dependent = self
+                .participants
+                .iter()
+                .find(|p| p.provider == policy.dependent_provider);
+            let owner = self
+                .participants
+                .iter()
+                .find(|p| p.provider == policy.owner_provider);
+            if dependent.is_none_or(|p| !p.depends_on.contains(&policy.owner_provider))
+                || owner.is_none()
+                || self.control_policies[..index].contains(policy)
+                || !valid_identifier(&policy.owner_service)
+                || policy.owner_service != policy.owner_method.service
+                || !valid_identifier(&policy.owner_method.method)
+                || policy.owner_method.interface_major == 0
+                || policy.owner_method.schema_revision == 0
+                || !valid_opaque_id(&policy.output_capability)
+                || !valid_schema_reference(&policy.argument_schema)
+                || !valid_schema_reference(&policy.output_schema)
+                || matches!(policy.max_access, ResourceAccess::Read)
+                || policy.mutation_domains.is_empty()
+                || policy.mutation_domains.len() > 32
+                || policy
+                    .mutation_domains
+                    .iter()
+                    .any(|domain| !valid_opaque_id(domain))
+            {
+                return Err("invalid lifecycle control policy".into());
+            }
+        }
+        Ok(())
+    }
+
     /// Resolve required dependencies before admission. Among ready participants,
     /// the earliest configured provider wins, preserving deterministic tie order.
     pub(crate) fn resolved_participants(&self) -> ModuleResult<Vec<String>> {
@@ -284,7 +342,7 @@ impl LifecycleSettings {
             {
                 if !valid_identifier(&method.service)
                     || !valid_identifier(&method.method)
-                    || method.interface_major == 0
+                    || method.interface_major != 1
                     || method.schema_revision == 0
                 {
                     return Err("invalid lifecycle participant method".into());
@@ -292,6 +350,7 @@ impl LifecycleSettings {
             }
         }
         self.resolved_participants()?;
+        self.validate_control_policies()?;
         Ok(())
     }
 }
@@ -701,6 +760,8 @@ mod tests {
         assert!(parse(duplicate).is_err());
         let mut invalid_major = policy.clone();
         invalid_major["participants"][0]["plan_method"]["interface_major"] = json!(0);
+        assert!(parse(invalid_major.clone()).is_err());
+        invalid_major["participants"][0]["plan_method"]["interface_major"] = json!(2);
         assert!(parse(invalid_major).is_err());
         let mut invalid_settings = policy.clone();
         invalid_settings["participants"][0]["settings"] = json!([]);
@@ -730,5 +791,35 @@ mod tests {
         settings.participants[2].depends_on = vec!["a".into()];
         settings.participants[3].provider = "b".into();
         assert!(settings.resolved_participants().is_err());
+    }
+    #[test]
+    fn installed_control_policy_requires_exact_graph_and_valid_pins() {
+        let method = json!({"service":"owner/1","method":"apply","interface_major":1,"interface_minor":0,"schema_revision":1});
+        let participant = |provider: &str, depends_on: Value| json!({"provider":provider,"depends_on":depends_on,"plan_method":method,"callback_method":method,"status_method":method,"capabilities":[],"cleanup_methods":[],"settings_revision":"initial","settings":{}});
+        let schema = json!({"id":"schema/1","major":1,"minor":0,"digest":"a".repeat(64)});
+        let policy = json!({"dependent_provider":"dependent","owner_provider":"owner","owner_service":"owner/1","owner_method":method,"argument_schema":schema,"output_capability":"display/output","output_schema":schema,"max_access":"exclusive","mutation_domains":["seat:0"]});
+        let mut settings: LifecycleSettings = serde_json::from_value(json!({"journal_path":"/test", "consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector/1"]},"participants":[participant("dependent",json!(["owner"])),participant("owner",json!([]))],"control_policies":[policy]})).unwrap();
+        assert!(settings.validate().is_ok());
+        settings
+            .control_policies
+            .push(settings.control_policies[0].clone());
+        assert!(settings.validate().is_err());
+        settings.control_policies.pop();
+        settings.participants[0].depends_on.clear();
+        assert!(settings.validate().is_err());
+        settings.participants[0].depends_on.push("owner".into());
+        settings.control_policies[0].argument_schema.digest = "A".repeat(64);
+        assert!(settings.validate().is_err());
+        settings.control_policies[0].argument_schema.digest = "a".repeat(64);
+        settings.control_policies[0].owner_method.service = "other/1".into();
+        assert!(settings.validate().is_err());
+        settings.control_policies[0].owner_method.service = "owner/1".into();
+        settings.control_policies[0].max_access = ResourceAccess::Read;
+        assert!(settings.validate().is_err());
+        settings.control_policies[0].max_access = ResourceAccess::Exclusive;
+        settings.control_policies[0].mutation_domains.clear();
+        assert!(settings.validate().is_err());
+        settings.control_policies.clear();
+        assert!(settings.validate().is_ok());
     }
 }
