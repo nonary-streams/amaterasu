@@ -497,6 +497,41 @@ impl InputAuthority {
             })
     }
 
+    /// Read-only checkpoint gate. The exact transferred action reservation
+    /// remains durable and running; every other input in the session fences.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn checkpoint_allows_transferred_action(
+        &self,
+        host_epoch: &str,
+        session_id: &str,
+        stream_id: &str,
+        generation: u64,
+        reservation_id: &str,
+        action_service: &str,
+        action: &crate::action_authority::ActionBinding,
+    ) -> bool {
+        let Ok(reservation) = self.resolve_running_reservation(reservation_id) else {
+            return false;
+        };
+        reservation.transferred_to.as_deref() == Some(action_service)
+            && reservation.operation_id == action.operation_id
+            && reservation.action_id == action.action_id
+            && reservation.target.as_ref() == Some(&action.target)
+            && reservation.binding.host_epoch == host_epoch
+            && reservation.binding.session_id == session_id
+            && reservation.binding.stream_id == stream_id
+            && reservation.binding.generation == generation
+            && !self
+                .bindings
+                .values()
+                .any(|binding| binding.session_id == session_id)
+            && !self.reservations.values().any(|entry| {
+                entry.binding.session_id == session_id
+                    && entry.reservation_id != reservation_id
+                    && matches!(entry.outcome, Outcome::Running | Outcome::RecoveryRequired)
+            })
+    }
+
     pub fn has_unresolved_session(&self, _host_epoch: &str, session_id: &str) -> bool {
         self.bindings
             .values()
@@ -675,6 +710,110 @@ mod tests {
                 &session
             ),
             Ok(ReservationResult::Admitted(_))
+        ));
+    }
+
+    #[test]
+    fn checkpoint_exempts_only_the_exact_transferred_running_input() {
+        let mut authority = InputAuthority::default();
+        let active = binding();
+        let token = authority.issue_input_binding(&active).unwrap();
+        let target = ActionTarget::Stream {
+            host_epoch: active.host_epoch.clone(),
+            session_id: active.session_id.clone(),
+            stream_id: active.stream_id.clone(),
+            expected_generation: active.generation,
+        };
+        let action = crate::action_authority::ActionBinding {
+            operation_id: "op".into(),
+            action_id: "display".into(),
+            target: target.clone(),
+            plan_digest: "a".repeat(64),
+            source: crate::action_authority::Principal {
+                caller: "transport".into(),
+                initiator: "client".into(),
+            },
+        };
+        let ReservationResult::Admitted(reservation) = authority
+            .reserve_input_action_for_target(
+                "input", "client", "op", &token, "display", &active, &target,
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        authority
+            .transfer_reservation(&reservation.reservation_id, "actions", "op", "display")
+            .unwrap();
+        authority
+            .fence_except(&active, &reservation.reservation_id, "actions")
+            .unwrap();
+        let allowed = |authority: &InputAuthority,
+                       id: &str,
+                       service: &str,
+                       binding: &crate::action_authority::ActionBinding| {
+            authority.checkpoint_allows_transferred_action(
+                "host", "session", "stream", 1, id, service, binding,
+            )
+        };
+        assert!(allowed(
+            &authority,
+            &reservation.reservation_id,
+            "actions",
+            &action
+        ));
+        assert!(!allowed(
+            &authority,
+            &reservation.reservation_id,
+            "foreign",
+            &action
+        ));
+        let mut wrong = action.clone();
+        wrong.operation_id = "other".into();
+        assert!(!allowed(
+            &authority,
+            &reservation.reservation_id,
+            "actions",
+            &wrong
+        ));
+        wrong = action.clone();
+        wrong.target = ActionTarget::Session {
+            host_epoch: "host".into(),
+            session_id: "session".into(),
+            expected_generation: 1,
+        };
+        assert!(!allowed(
+            &authority,
+            &reservation.reservation_id,
+            "actions",
+            &wrong
+        ));
+        assert!(!allowed(&authority, "other", "actions", &action));
+        let mut concurrent = authority.clone();
+        let second_token = concurrent.issue_input_binding(&active).unwrap();
+        concurrent
+            .reserve_input_action_for_target(
+                "input",
+                "client",
+                "second",
+                &second_token,
+                "display",
+                &active,
+                &target,
+            )
+            .unwrap();
+        assert!(!allowed(
+            &concurrent,
+            &reservation.reservation_id,
+            "actions",
+            &action
+        ));
+        authority.recover_after_restart();
+        assert!(!allowed(
+            &authority,
+            &reservation.reservation_id,
+            "actions",
+            &action
         ));
     }
 

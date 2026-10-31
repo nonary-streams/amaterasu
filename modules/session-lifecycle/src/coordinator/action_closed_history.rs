@@ -247,10 +247,19 @@ fn compact_one_released_action(
     if next.action_dispositions.remove(&key).is_none() {
         return Err("action_marker_changed".into());
     }
-    match closed_stream::retire_closed_stream(
+    let input = transfer
+        .input_reservation_id
+        .as_deref()
+        .map(|reservation_id| closed_stream::ActionInputExemption {
+            reservation_id,
+            service: &transfer.service,
+            binding: &marker.binding,
+        });
+    match closed_stream::retire_closed_stream_for_action(
         &mut next,
         &marker.cleanup_work.target,
         &marker.cleanup_work.transition_id,
+        input.as_ref(),
     )? {
         closed_stream::RetirementOutcome::Retired => {}
         closed_stream::RetirementOutcome::NotReady => return Err("action_stream_not_ready".into()),

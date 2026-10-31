@@ -348,6 +348,14 @@ pub(super) enum RetirementOutcome {
     NotReady,
 }
 
+/// Derived exclusively from a verified terminal action marker. It excludes no
+/// input other than this still-durable transferred reservation.
+pub(super) struct ActionInputExemption<'a> {
+    pub reservation_id: &'a str,
+    pub service: &'a str,
+    pub binding: &'a crate::action_authority::ActionBinding,
+}
+
 /// Work on a private clone so failure never partially retires the caller's
 /// journal. The caller must atomically persist the replacement before effects.
 pub(super) fn retire_closed_stream(
@@ -355,7 +363,16 @@ pub(super) fn retire_closed_stream(
     target: &LifecycleTarget,
     transition_id: &str,
 ) -> ModuleResult<RetirementOutcome> {
-    let Some(certificate) = ClosedStream::from_verified(next, target, transition_id) else {
+    retire_closed_stream_for_action(next, target, transition_id, None)
+}
+
+pub(super) fn retire_closed_stream_for_action(
+    next: &mut Journal,
+    target: &LifecycleTarget,
+    transition_id: &str,
+    input: Option<&ActionInputExemption<'_>>,
+) -> ModuleResult<RetirementOutcome> {
+    let Some(certificate) = ClosedStream::from_verified(next, target, transition_id, input) else {
         return Ok(RetirementOutcome::NotReady);
     };
     let anchor = composition::StageAnchor {
@@ -371,7 +388,7 @@ pub(super) fn retire_closed_stream(
     // historical output even when its own target differs.
     if !next.recovery_sources.is_empty()
         || next.actions.has_unresolved_session(epoch, session_id)
-        || next.inputs.has_unresolved_session(epoch, session_id)
+        || !inputs_quiescent(next, target, input)
         || next.receipts.values().any(|receipt| {
             receipt.work.as_ref().is_some_and(|work| {
                 operations::target_parts(&work.target).is_ok_and(|(_, id, _, _)| id == session_id)
@@ -1207,6 +1224,37 @@ fn scope_digest(target: &LifecycleTarget) -> Option<String> {
 /// verified graph, cross-book inbound references and replay-fence budget must
 /// also be checked on the same journal clone before committing any removal.
 fn no_pending_stream_work(journal: &Journal, target: &LifecycleTarget) -> bool {
+    no_pending_stream_work_for_action(journal, target, None)
+}
+
+fn inputs_quiescent(
+    journal: &Journal,
+    target: &LifecycleTarget,
+    input: Option<&ActionInputExemption<'_>>,
+) -> bool {
+    let Ok((epoch, session_id, Some(stream_id), generation)) = operations::target_parts(target)
+    else {
+        return false;
+    };
+    match input {
+        Some(input) => journal.inputs.checkpoint_allows_transferred_action(
+            epoch,
+            session_id,
+            stream_id,
+            generation,
+            input.reservation_id,
+            input.service,
+            input.binding,
+        ),
+        None => !journal.inputs.has_unresolved_session(epoch, session_id),
+    }
+}
+
+fn no_pending_stream_work_for_action(
+    journal: &Journal,
+    target: &LifecycleTarget,
+    input: Option<&ActionInputExemption<'_>>,
+) -> bool {
     let Ok((epoch, session_id, Some(stream_id), generation)) = operations::target_parts(target)
     else {
         return false;
@@ -1221,9 +1269,7 @@ fn no_pending_stream_work(journal: &Journal, target: &LifecycleTarget) -> bool {
         && stream.generation == generation
         && stream.phase == StreamPhase::Retired
         && stream.required.is_subset(&stream.retirements)
-        && !journal
-            .inputs
-            .has_unresolved_stream(epoch, session_id, stream_id)
+        && inputs_quiescent(journal, target, input)
         && !journal
             .actions
             .has_unresolved_stream(epoch, session_id, stream_id)
@@ -1320,12 +1366,13 @@ impl ClosedStream {
         })
     }
     /// Build only from the exact release after all graph evidence is verified.
-    pub(super) fn from_verified(
+    fn from_verified(
         journal: &Journal,
         target: &LifecycleTarget,
         transition_id: &str,
+        input: Option<&ActionInputExemption<'_>>,
     ) -> Option<Self> {
-        if !no_pending_stream_work(journal, target) {
+        if !no_pending_stream_work_for_action(journal, target, input) {
             return None;
         }
         let proof =
