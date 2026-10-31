@@ -2202,10 +2202,16 @@ impl Coordinator {
                         && next.authority.settled.contains_key(admission)
                         && next.references_admission(admission)
                 }) && session.obligations.iter().all(|obligation| {
-                    work.states.values().any(|state| matches!(&state.response,
+                    work.states.values().any(|state| state.plan.as_ref().is_some_and(|plan|
+                        plan.obligations.contains(obligation)) && matches!(&state.response,
                         Some(ProviderResponse::Cleanup { outcomes, .. }) if outcomes.iter().any(|outcome|
                             outcome.obligation_id == obligation.obligation_id
                                 && outcome.state == amaterasu_extension_api::CleanupState::Released)))
+                        || super::session_release::proven_stream_obligation_released(
+                            &next,
+                            &work.target,
+                            obligation,
+                        )
                 })
             });
         let session = next.sessions.get_mut(id).ok_or("unknown_session")?;
