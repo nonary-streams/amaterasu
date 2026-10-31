@@ -161,3 +161,41 @@ fn sampled_capacity_is_bounded_and_expiry_frees_slots_without_consuming_rejected
     );
     assert_eq!(adapter.pending_sample_count(), 1);
 }
+
+#[test]
+fn source_observation_is_strictly_a_negotiated_label_not_a_route_grant() {
+    use super::source_label::observe;
+    use amaterasu_extension_api::LifecycleTarget;
+    use serde_json::json;
+    let target = LifecycleTarget::Stream {
+        host_epoch: "epoch".into(),
+        session_id: "session".into(),
+        stream_id: "stream".into(),
+        generation: 3,
+    };
+    let response = json!({"status":"succeeded", "active":true, "target":target,
+        "source":{"version":1,"id":"0123456789abcdef0123456789abcdef","generation":3}});
+    assert!(observe(&response, &target).unwrap().is_some());
+    let mut null = response.clone();
+    null["source"] = serde_json::Value::Null;
+    assert!(observe(&null, &target).unwrap().is_none());
+    let mut missing = response.clone();
+    missing.as_object_mut().unwrap().remove("source");
+    assert!(observe(&missing, &target).is_err());
+    for source in [
+        json!({"version":2,"id":"0123456789abcdef0123456789abcdef","generation":3}),
+        json!({"version":1,"id":"0123456789ABCDEF0123456789abcdef","generation":3}),
+        json!({"version":1,"id":"0123456789abcdef0123456789abcdef","generation":4}),
+        json!({"version":1,"id":"0123456789abcdef0123456789abcdef","generation":3,"grant":true}),
+    ] {
+        let mut bad = response.clone();
+        bad["source"] = source;
+        assert!(observe(&bad, &target).is_err());
+    }
+    let mut inactive = response.clone();
+    inactive["active"] = json!(false);
+    assert!(observe(&inactive, &target).is_err());
+    let mut forged_target = response.clone();
+    forged_target["target"]["stream_id"] = json!("other");
+    assert!(observe(&forged_target, &target).is_err());
+}

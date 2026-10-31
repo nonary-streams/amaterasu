@@ -91,3 +91,28 @@ The existing `authenticated_controller_extension_packets_reach_the_native_input_
 stream-session test covers arrival, touch, motion and battery through the
 production pipeline's explicit pre-translator path; the standalone translator's
 rejection of those events is not a production-path rejection.
+
+## Lifecycle source-label checkpoint
+
+The optional checkpoint at lifecycle commit `0fb7f221b918565fdad7764daa4fd453d90d12dc`
+returns `source: {version: 1, id, generation}` only when the selected input
+consumer requests `source_version: 1` in `validate_input_binding`. A null source
+means no attested active source. Omitting the version preserves the existing
+response shape; `paired_client` remains null. `source_label::observe` is a pure
+parser for that negotiated response against an expected stream target. It does
+not send a broker request, authorize anything, or install a route.
+
+Do not connect this parser to production effects yet. A lifecycle label and
+revalidation alone do not close the asynchronous protocol revocation race. The
+protocol-owned effect admission and acknowledged revoke/drain barrier must be
+implemented and tested first. The app/lifecycle worker owns that authority.
+
+Once its exact operation is available, the input owner must bind the exact host
+epoch, session ID, stream ID and stream generation, lifecycle source ID and
+source generation, selected input principal, provider boot epoch, and separately
+managed device identity/generation to an admitted route. The current `Route`
+contains only host epoch, session, source ID, device ID and one generation; it
+must be versioned or extended to distinguish these incarnations before use.
+Do not substitute remote-supplied identifiers or treat a source label as a bearer
+token. Pause, revocation, expiration, cleanup and restart must fence new effects
+before draining already-admitted work. Unknown barrier outcomes remain fenced.

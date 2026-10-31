@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
+pub mod source_label;
 pub mod speaker_pcm;
 pub mod steam_attributes;
 
