@@ -4956,3 +4956,29 @@ fn touch_as_mouse_still_requires_the_existing_mouse_device_policy() {
     );
     assert!(controller.backend.trace.borrow().is_empty());
 }
+
+#[test]
+fn lifecycle_revoke_only_cancels_exact_lease_and_retains_failed_cleanup() {
+    let mut controller = Controller::new(
+        FakeBackend {
+            fail_stop: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let now = Instant::now();
+    let token = acquire(&mut controller, now);
+    assert!(
+        !controller
+            .cancel_bound_lease("owner", "different-lease")
+            .unwrap()
+    );
+    assert!(controller.bound_lease_active("owner", &token));
+    assert!(controller.cancel_bound_lease("owner", &token).is_err());
+    assert!(controller.cleanup_required());
+    assert!(!controller.bound_lease_active("owner", &token));
+    controller.backend.fail_stop = false;
+    controller.expire(now + Duration::from_millis(101));
+    assert!(!controller.cleanup_required());
+    assert!(!controller.bound_lease_active("owner", &token));
+}

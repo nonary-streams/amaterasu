@@ -2,7 +2,8 @@
 //! Browser or input payload fields are never accepted as target authority here.
 use amaterasu_extension_api::{
     ActionDescriptor, BindingSource, BindingTarget, ExecutionClass, ExtensionDescriptor,
-    Keybinding, OptionPresentation, TargetKind, validate_descriptor, validate_keybinding,
+    Keybinding, LifecycleTarget, OptionPresentation, TargetKind, validate_descriptor,
+    validate_keybinding,
 };
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde::Deserialize;
@@ -17,6 +18,8 @@ const MAX_BINDINGS: usize = 128;
 /// Construct only from lifecycle-authenticated facts, never an input request.
 pub(crate) struct CanonicalContext {
     pub session_id: String,
+    pub target: LifecycleTarget,
+    pub input_binding: String,
     pub application: Option<String>,
     pub paired_client: Option<String>,
     pub context: String,
@@ -77,7 +80,10 @@ impl DiscoveryJob {
             !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
         };
         if !valid(&context.session_id)
+            || !valid(&context.input_binding)
             || !valid(&context.context)
+            || context.paired_client.is_some()
+            || !matches!(&context.target, LifecycleTarget::Stream { session_id, .. } if session_id == &context.session_id)
             || context.application.as_deref().is_some_and(|id| !valid(id))
             || context
                 .paired_client
@@ -145,7 +151,8 @@ impl DiscoveryJob {
                 };
                 json!({"operation":"settings_get","provider":descriptor.provider,
                     "scope":{"kind":"session","id":self.context.session_id},
-                    "application":self.context.application,"paired_client":self.context.paired_client,"session":self.context.session_id})
+                    "application":self.context.application,"paired_client":null,"session":self.context.session_id,
+                    "target":self.context.target,"input_binding":self.context.input_binding})
             }
             Stage::Done => return Err("shortcut discovery already consumed".into()),
         };
@@ -324,6 +331,13 @@ pub(crate) mod tests {
             10,
             CanonicalContext {
                 session_id: "session".into(),
+                target: LifecycleTarget::Stream {
+                    host_epoch: "host".into(),
+                    session_id: "session".into(),
+                    stream_id: "stream".into(),
+                    generation: 1,
+                },
+                input_binding: "token".into(),
                 application: None,
                 paired_client: None,
                 context: "active".into(),
@@ -352,6 +366,12 @@ pub(crate) mod tests {
                 }
                 Command::TakeResult { .. } => {
                     assert_eq!(pending["scope"], json!({"kind":"session","id":"session"}));
+                    assert_eq!(
+                        pending["target"],
+                        json!({"kind":"stream","host_epoch":"host","session_id":"session","stream_id":"stream","generation":1})
+                    );
+                    assert_eq!(pending["input_binding"], "token");
+                    assert!(pending["paired_client"].is_null());
                     Ok(Response::Result {
                         payload: json!({"ok":true,"effective":{"shortcut":{"value":binding(),"source":null}}}),
                     })
@@ -367,6 +387,32 @@ pub(crate) mod tests {
         assert_eq!(found[0].binding.action_id, "provider/action");
         assert_eq!(found[0].action.id, "provider/action");
     }
+    #[test]
+    fn discovery_rejects_unverified_paired_client_and_wrong_session_target() {
+        let context = |target, paired_client| CanonicalContext {
+            session_id: "session".into(),
+            target,
+            input_binding: "token".into(),
+            application: None,
+            paired_client,
+            context: "active".into(),
+        };
+        let target = LifecycleTarget::Stream {
+            host_epoch: "host".into(),
+            session_id: "session".into(),
+            stream_id: "stream".into(),
+            generation: 1,
+        };
+        assert!(DiscoveryJob::new(10, context(target, Some("client".into())), 1000).is_err());
+        let wrong = LifecycleTarget::Stream {
+            host_epoch: "host".into(),
+            session_id: "other".into(),
+            stream_id: "stream".into(),
+            generation: 1,
+        };
+        assert!(DiscoveryJob::new(10, context(wrong, None), 1000).is_err());
+    }
+
     #[test]
     fn rejects_changed_pages_missing_action_and_host_target() {
         let mut job = new_job();

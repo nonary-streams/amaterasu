@@ -8,16 +8,16 @@ mod gamepad;
 mod gamepad_profile;
 mod model;
 pub mod shortcut;
-#[allow(dead_code)]
 mod shortcut_bridge;
-#[allow(dead_code)]
+mod shortcut_discovery;
+mod shortcut_dispatch;
+mod shortcut_job;
 mod shortcut_journal;
-#[allow(dead_code)]
 mod shortcut_reservation;
-#[allow(dead_code)]
 mod shortcut_store;
 pub use model::{Key as ShortcutKey, KeyState as ShortcutKeyState};
 mod product_settings;
+mod session_binding;
 
 use amaterasu_input_policy::KeyBindings;
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
@@ -69,6 +69,10 @@ struct InputModule {
     controller: Controller<NativeBackend>,
     product_settings: ProductSettings,
     queued: VecDeque<QueuedRequest>,
+    shortcut_job: Option<(String, shortcut_job::ShortcutJob)>,
+    bindings: session_binding::Bindings,
+    acquire_job: Option<session_binding::AcquireJob>,
+    pending_revoke: Option<(QueuedRequest, session_binding::RevokeRequest)>,
 }
 
 struct QueuedRequest {
@@ -77,6 +81,16 @@ struct QueuedRequest {
     service: String,
     payload: Value,
     deadline: Instant,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeliveryProofRequest {
+    action: String,
+    epoch: String,
+    sequence: u64,
+    operation_id: String,
+    reservation_id: String,
 }
 
 #[derive(Deserialize)]
@@ -169,6 +183,10 @@ impl ManagedModule for InputModule {
             controller: Controller::new(backend, settings.allow_injection),
             product_settings: ProductSettings::new(),
             queued: VecDeque::new(),
+            shortcut_job: None,
+            bindings: session_binding::Bindings::default(),
+            acquire_job: None,
+            pending_revoke: None,
         })
     }
     fn tick(&mut self) -> ModuleResult<()> {
@@ -176,6 +194,9 @@ impl ManagedModule for InputModule {
         let runtime = &self.runtime;
         self.product_settings
             .advance(&mut |command| runtime.send(command), &mut self.controller)?;
+        self.advance_acquire()?;
+        self.advance_shortcut()?;
+        self.advance_revoke()?;
         self.drain_queued()?;
         for _ in 0..8 {
             let (id, caller, service, payload, remaining_ms) =
@@ -193,6 +214,9 @@ impl ManagedModule for InputModule {
                 };
             self.accept_request(id, caller, service, payload, remaining_ms)?;
         }
+        self.advance_acquire()?;
+        self.advance_shortcut()?;
+        self.advance_revoke()?;
         self.drain_queued()?;
         Ok(())
     }
@@ -214,11 +238,106 @@ impl InputModule {
             payload,
             deadline: Instant::now() + Duration::from_millis(remaining_ms),
         };
-        let defer = should_defer_settings_request(
-            &self.product_settings,
-            &request.service,
-            &request.payload,
-        );
+        // Fence immediately, even when a previously admitted batch is draining.
+        if request.service == SERVICE
+            && request.payload.get("action").and_then(Value::as_str) == Some("revoke_binding")
+        {
+            let revoke: Result<session_binding::RevokeRequest, _> =
+                serde_json::from_value(request.payload.clone());
+            let Ok(revoke) = revoke else {
+                return self.complete(
+                    request.id,
+                    InputError::new("invalid_request", "invalid binding revocation").payload(),
+                    &request.caller,
+                    false,
+                );
+            };
+            if revoke.action != "revoke_binding" {
+                return self.complete(
+                    request.id,
+                    InputError::new("invalid_request", "invalid binding action").payload(),
+                    &request.caller,
+                    false,
+                );
+            }
+            let transferred = if let Some(transfer) = &revoke.transfer {
+                if request.caller != "amaterasu.session-lifecycle" {
+                    return self.complete(
+                        request.id,
+                        InputError::new(
+                            "permission_denied",
+                            "transfer requires lifecycle coordinator",
+                        )
+                        .payload(),
+                        &request.caller,
+                        false,
+                    );
+                }
+                let valid = self.shortcut_job.as_ref().is_some_and(|(_, job)| {
+                    job.can_transfer(
+                        &revoke.token,
+                        &revoke.target,
+                        &transfer.operation_id,
+                        &transfer.reservation_id,
+                    )
+                });
+                if !valid {
+                    return self.complete(
+                        request.id,
+                        InputError::new(
+                            "invalid_transfer",
+                            "no matching delivered action reservation",
+                        )
+                        .payload(),
+                        &request.caller,
+                        false,
+                    );
+                }
+                true
+            } else {
+                false
+            };
+            if let Err(code) = self.bindings.revoke(
+                &request.caller,
+                &revoke.operation_id,
+                &revoke.token,
+                revoke.target.clone(),
+            ) {
+                return self.complete(
+                    request.id,
+                    InputError::new(code, "binding revocation rejected").payload(),
+                    &request.caller,
+                    false,
+                );
+            }
+            if transferred {
+                self.shortcut_job
+                    .as_mut()
+                    .expect("validated transfer")
+                    .1
+                    .activate_transfer();
+                return self.dispatch(request);
+            }
+            if self.queued.len() >= MAX_QUEUED_REQUESTS {
+                return self.complete(
+                    request.id,
+                    InputError::new("resource_exhausted", "input queue full").payload(),
+                    &request.caller,
+                    false,
+                );
+            }
+            self.queued.push_front(request);
+            return self.drain_queued();
+        }
+        let defer = ((self.shortcut_job.is_some()
+            || self.acquire_job.is_some()
+            || self.pending_revoke.is_some())
+            && !is_read_only_input(&request.payload))
+            || should_defer_settings_request(
+                &self.product_settings,
+                &request.service,
+                &request.payload,
+            );
         if defer {
             if self.queued.len() >= MAX_QUEUED_REQUESTS {
                 return self.complete(
@@ -236,7 +355,12 @@ impl InputModule {
     }
 
     fn drain_queued(&mut self) -> ModuleResult<()> {
-        while self.product_settings.ready() && !self.product_settings.busy() {
+        while self.product_settings.ready()
+            && !self.product_settings.busy()
+            && self.shortcut_job.is_none()
+            && self.acquire_job.is_none()
+            && self.pending_revoke.is_none()
+        {
             let Some(request) = self.queued.pop_front() else {
                 break;
             };
@@ -262,6 +386,144 @@ impl InputModule {
                 &request.caller,
                 false,
             );
+        }
+        if request.payload.get("action").and_then(Value::as_str) == Some("confirm_delivery") {
+            let proof: Result<DeliveryProofRequest, _> =
+                serde_json::from_value(request.payload.clone());
+            let response = if request.caller != "amaterasu.extension-actions" {
+                InputError::new(
+                    "permission_denied",
+                    "delivery confirmation requires action service",
+                )
+                .payload()
+            } else if let Ok(proof) = proof {
+                if proof.action != "confirm_delivery" {
+                    InputError::new("invalid_request", "invalid delivery confirmation").payload()
+                } else {
+                    self.shortcut_job
+                        .as_ref()
+                        .and_then(|(_, job)| {
+                            job.confirm_delivery(
+                                &proof.epoch,
+                                proof.sequence,
+                                &proof.operation_id,
+                                &proof.reservation_id,
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            InputError::new("not_found", "confirmed delivery is unavailable")
+                                .payload()
+                        })
+                }
+            } else {
+                InputError::new("invalid_request", "invalid delivery confirmation").payload()
+            };
+            return self.complete(request.id, response, &request.caller, false);
+        }
+        if request.payload.get("action").and_then(Value::as_str) == Some("binding_status") {
+            let mut object = request.payload.clone();
+            if let Some(fields) = object.as_object_mut() {
+                fields.insert("action".into(), "revoke_binding".into());
+            }
+            let parsed: Result<session_binding::RevokeRequest, _> = serde_json::from_value(object);
+            let reply = match parsed {
+                Ok(status) => {
+                    match self
+                        .bindings
+                        .status(&request.caller, &status.token, &status.target)
+                    {
+                        Ok((owner, lease, geometry))
+                            if self.controller.bound_lease_active(owner, lease) =>
+                        {
+                            serde_json::json!({"ok":true,"status":"bound","token":status.token,"target":status.target,"lease":lease,"geometry_revision":geometry})
+                        }
+                        _ => InputError::new("binding_unavailable", "no active bound lease")
+                            .payload(),
+                    }
+                }
+                Err(_) => {
+                    InputError::new("invalid_request", "invalid binding status request").payload()
+                }
+            };
+            return self.complete(request.id, reply, &request.caller, false);
+        }
+        if request.payload.get("action").and_then(Value::as_str) == Some("revoke_binding") {
+            let revoke: session_binding::RevokeRequest =
+                serde_json::from_value(request.payload.clone()).map_err(|e| e.to_string())?;
+            let (owner, lease) = self
+                .bindings
+                .revoke(
+                    &request.caller,
+                    &revoke.operation_id,
+                    &revoke.token,
+                    revoke.target.clone(),
+                )
+                .map_err(str::to_owned)?;
+            if let Some(lease) = lease {
+                let _ = self.controller.cancel_bound_lease(&owner, &lease);
+            }
+            self.pending_revoke = Some((request, revoke));
+            return self.advance_revoke();
+        }
+        if request.payload.get("action").and_then(Value::as_str) == Some("acquire")
+            && request.payload.get("lifecycle_binding_token").is_some()
+        {
+            let mut payload = request.payload.clone();
+            let token = payload
+                .as_object_mut()
+                .and_then(|object| object.remove("lifecycle_binding_token"))
+                .and_then(|v| v.as_str().map(str::to_owned));
+            let Some(token) = token else {
+                return self.complete(
+                    request.id,
+                    InputError::new("invalid_request", "invalid binding token").payload(),
+                    &request.caller,
+                    false,
+                );
+            };
+            if let Err(code) = self.bindings.begin_acquire(&token, &request.caller) {
+                return self.complete(
+                    request.id,
+                    InputError::new(code, "binding unavailable").payload(),
+                    &request.caller,
+                    false,
+                );
+            }
+            match session_binding::AcquireJob::new(
+                request.id,
+                request.caller.clone(),
+                token.clone(),
+                payload,
+                request.deadline,
+            ) {
+                Ok(job) => self.acquire_job = Some(job),
+                Err(error) => {
+                    self.bindings.abandon_acquire(&token);
+                    return self.complete(
+                        request.id,
+                        InputError::new("binding_unavailable", error).payload(),
+                        &request.caller,
+                        false,
+                    );
+                }
+            }
+            return Ok(());
+        }
+        if request.payload.get("action").and_then(Value::as_str) == Some("batch") {
+            let lease = request
+                .payload
+                .get("lease")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let token = request.payload.get("input_binding").and_then(Value::as_str);
+            if let Err(code) = self.bindings.authorize_batch(&request.caller, lease, token) {
+                return self.complete(
+                    request.id,
+                    InputError::new(code, "input binding is unavailable").payload(),
+                    &request.caller,
+                    false,
+                );
+            }
         }
         if let Some(action) = request.payload.get("action").and_then(Value::as_str)
             && matches!(action, "settings_get" | "settings_update")
@@ -351,6 +613,50 @@ impl InputModule {
                 ),
             };
         }
+        if request.payload.get("action").and_then(Value::as_str) == Some("batch")
+            && (request.payload.get("operation_id").is_some()
+                || request.payload.get("input_binding").is_some())
+        {
+            let lease = request
+                .payload
+                .get("lease")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let token = request
+                .payload
+                .get("input_binding")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let target = match self.bindings.batch_target(&request.caller, lease, token) {
+                Ok(target) => target,
+                Err(code) => {
+                    return self.complete(
+                        request.id,
+                        InputError::new(code, "input binding unavailable").payload(),
+                        &request.caller,
+                        false,
+                    );
+                }
+            };
+            return match shortcut_job::ShortcutJob::new(
+                request.id,
+                request.caller.clone(),
+                request.payload,
+                target,
+                request.deadline,
+            ) {
+                Ok(job) => {
+                    self.shortcut_job = Some((request.caller, job));
+                    Ok(())
+                }
+                Err(message) => self.complete(
+                    request.id,
+                    InputError::new("invalid_request", message).payload(),
+                    &request.caller,
+                    false,
+                ),
+            };
+        }
         let operation: Result<Operation, _> = serde_json::from_value(request.payload);
         match operation {
             Ok(operation) => {
@@ -394,6 +700,173 @@ impl InputModule {
         }
     }
 
+    fn advance_acquire(&mut self) -> ModuleResult<()> {
+        let Some(mut job) = self.acquire_job.take() else {
+            return Ok(());
+        };
+        if self.bindings.is_revoked(&job.token) {
+            let runtime = &self.runtime;
+            job.cancel(&mut |command| runtime.send(command));
+            return self.complete(
+                job.parent,
+                InputError::new("binding_retired", "binding was revoked").payload(),
+                &job.owner,
+                false,
+            );
+        }
+        let runtime = &self.runtime;
+        match job.advance(&mut |command| runtime.send(command)) {
+            Ok(None) => {
+                self.acquire_job = Some(job);
+                Ok(())
+            }
+            Err(error) => {
+                self.bindings.abandon_acquire(&job.token);
+                self.complete(
+                    job.parent,
+                    InputError::new("binding_unavailable", error).payload(),
+                    &job.owner,
+                    false,
+                )
+            }
+            Ok(Some(authority)) => {
+                if let Err(error) = self.check_request(job.parent) {
+                    self.bindings.abandon_acquire(&job.token);
+                    return self.complete(job.parent, error.payload(), &job.owner, false);
+                }
+                let operation: Operation = match serde_json::from_value(job.payload.clone()) {
+                    Ok(operation @ Operation::Acquire { .. }) => operation,
+                    _ => {
+                        self.bindings.abandon_acquire(&job.token);
+                        return self.complete(
+                            job.parent,
+                            InputError::new("invalid_request", "invalid bound acquisition")
+                                .payload(),
+                            &job.owner,
+                            false,
+                        );
+                    }
+                };
+                let runtime = &self.runtime;
+                let mut guard = || match runtime.send(Command::CheckRequest {
+                    request: job.parent,
+                }) {
+                    Ok(Response::Ok) => Ok(()),
+                    _ => Err(InputError::new("cancelled", "acquisition cancelled")),
+                };
+                let mut reply =
+                    self.controller
+                        .handle(&job.owner, operation, Instant::now(), &mut guard);
+                if reply.get("ok").and_then(Value::as_bool) == Some(true) {
+                    let lease = reply
+                        .get("lease")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    if self
+                        .bindings
+                        .bind(
+                            &job.token,
+                            &job.owner,
+                            &lease,
+                            authority.target.clone(),
+                            authority.geometry_revision,
+                        )
+                        .is_err()
+                    {
+                        self.controller.cancel_owner(&job.owner);
+                        return self.complete(
+                            job.parent,
+                            InputError::new("binding_unavailable", "could not bind acquired lease")
+                                .payload(),
+                            &job.owner,
+                            false,
+                        );
+                    }
+                    reply["input_binding"] = job.token.clone().into();
+                    reply["target"] =
+                        serde_json::to_value(authority.target).map_err(|e| e.to_string())?;
+                    reply["geometry_revision"] = authority.geometry_revision.into();
+                    reply["batch_epoch"] = authority.batch_epoch.into();
+                    reply["input_acknowledged"] = true.into();
+                    self.complete(job.parent, reply, &job.owner, true)
+                } else {
+                    self.bindings.abandon_acquire(&job.token);
+                    self.complete(job.parent, reply, &job.owner, false)
+                }
+            }
+        }
+    }
+
+    fn advance_revoke(&mut self) -> ModuleResult<()> {
+        if self.controller.cleanup_required() {
+            return Ok(());
+        }
+        let Some((request, revoke)) = self.pending_revoke.take() else {
+            return Ok(());
+        };
+        self.complete(request.id, serde_json::json!({"ok":true,"status":"retired","token":revoke.token,"target":revoke.target}), &request.caller, false)
+    }
+
+    fn advance_shortcut(&mut self) -> ModuleResult<()> {
+        let Some((caller, mut job)) = self.shortcut_job.take() else {
+            return Ok(());
+        };
+        let request = job.request_id();
+        let (lease, binding) = job.binding_identity();
+        let lease = lease.to_owned();
+        let binding = binding.to_owned();
+        if self
+            .bindings
+            .authorize_batch(&caller, &lease, Some(&binding))
+            .is_err()
+            && !job.is_transferred()
+        {
+            let armed = job.armed();
+            if armed {
+                self.controller.cancel_owner(&caller);
+            }
+            let mut payload =
+                InputError::new("binding_retired", "input binding was revoked").payload();
+            payload["recovery_required"] = armed.into();
+            return self.complete(request, payload, &caller, false);
+        }
+        let runtime = &self.runtime;
+        let bindings = &self.bindings;
+        let mut send = |command| runtime.send(command);
+        let mut guard = || match runtime.send(Command::CheckRequest { request }) {
+            Ok(Response::Ok) => bindings
+                .authorize_batch(&caller, &lease, Some(&binding))
+                .map_err(|code| InputError::new(code, "input binding revoked")),
+            Ok(Response::Error { message, .. }) => Err(InputError::new("cancelled", message)),
+            _ => Err(InputError::new(
+                "runtime_error",
+                "shortcut request guard failed",
+            )),
+        };
+        match job.advance(&mut self.controller, &mut send, &mut guard) {
+            Ok(None) => {
+                self.shortcut_job = Some((caller, job));
+                Ok(())
+            }
+            Ok(Some(payload)) => self.complete(request, payload, &caller, false),
+            Err(message) => {
+                let armed = job.armed();
+                if armed {
+                    self.controller.cancel_owner(&caller);
+                }
+                let code = if message == "shortcut receipt expired" {
+                    "receipt_expired"
+                } else {
+                    "shortcut_unavailable"
+                };
+                let mut payload = InputError::new(code, message).payload();
+                payload["recovery_required"] = armed.into();
+                self.complete(request, payload, &caller, false)
+            }
+        }
+    }
+
     fn check_request(&self, request: u64) -> Result<(), InputError> {
         match self.runtime.send(Command::CheckRequest { request }) {
             Ok(Response::Ok) => Ok(()),
@@ -434,7 +907,7 @@ impl InputModule {
 fn is_read_only_input(payload: &Value) -> bool {
     matches!(
         payload.get("action").and_then(Value::as_str),
-        Some("status" | "lookup" | "settings_get")
+        Some("status" | "lookup" | "settings_get" | "confirm_delivery")
     )
 }
 

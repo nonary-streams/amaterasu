@@ -26,6 +26,8 @@ pub(crate) struct ReservationJob {
     invoke: ActionInvoke,
     timeout_ms: u64,
     phase: Phase,
+    reservation_attempted: bool,
+    instance: String,
 }
 
 impl ReservationJob {
@@ -43,18 +45,23 @@ impl ReservationJob {
         {
             return Err("invalid shortcut reservation request".into());
         }
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random).map_err(|_| "reservation identity unavailable")?;
+        let instance = random.iter().map(|byte| format!("{byte:02x}")).collect();
         Ok(Self {
+            instance,
             parent,
             input_binding,
             invoke,
             timeout_ms,
             phase: Phase::LifecycleSubmit,
+            reservation_attempted: false,
         })
     }
 
-    /// A held reservation must be reconciled even when action admission fails.
-    pub fn held_reservation(&self) -> Option<&str> {
-        self.invoke.input_reservation_id.as_deref()
+    /// An ambiguous reservation attempt must remain fenced until reconciled.
+    pub fn may_have_reservation(&self) -> bool {
+        self.reservation_attempted
     }
 
     /// Each step submits or polls one broker call. Any unknown or rejected
@@ -65,9 +72,10 @@ impl ReservationJob {
     ) -> Result<Option<ApprovedReservation>, String> {
         match self.phase {
             Phase::LifecycleSubmit => {
+                self.reservation_attempted = true;
                 let payload = json!({"operation":"reserve_input_action", "operation_id":self.invoke.operation_id,
                     "token":self.input_binding, "action_id":self.invoke.action_id});
-                let operation_id = format!("input-lifecycle-reserve:{}", self.invoke.operation_id);
+                let operation_id = format!("input-lifecycle-reserve-{}", self.instance);
                 match send(Command::Request {
                     service: LIFECYCLE.into(),
                     payload,
@@ -85,6 +93,9 @@ impl ReservationJob {
             Phase::LifecycleWait(request) => match send(Command::TakeResult { request }) {
                 Ok(Response::Pending) => Ok(None),
                 Ok(Response::Result { payload }) => {
+                    if !matches!(send(Command::ReleaseResult { request }), Ok(Response::Ok)) {
+                        return Err("shortcut lifecycle result release failed".into());
+                    }
                     let reservation = payload["reservation_id"]
                         .as_str()
                         .filter(|id| !id.is_empty());
@@ -108,7 +119,7 @@ impl ReservationJob {
                 let mut payload =
                     serde_json::to_value(&self.invoke).map_err(|_| "invalid shortcut action")?;
                 payload["operation"] = json!("reserve_input");
-                let operation_id = format!("input-action-reserve:{}", self.invoke.operation_id);
+                let operation_id = format!("input-action-reserve-{}", self.instance);
                 match send(Command::Request {
                     service: ACTIONS.into(),
                     payload,
@@ -125,10 +136,15 @@ impl ReservationJob {
             }
             Phase::ActionWait(request) => match send(Command::TakeResult { request }) {
                 Ok(Response::Pending) => Ok(None),
-                Ok(Response::Result { payload })
-                    if payload["status"] == "reserved"
-                        && payload["operation_id"] == self.invoke.operation_id =>
-                {
+                Ok(Response::Result { payload }) => {
+                    if !matches!(send(Command::ReleaseResult { request }), Ok(Response::Ok)) {
+                        return Err("shortcut action result release failed".into());
+                    }
+                    if payload["status"] != "reserved"
+                        || payload["operation_id"] != self.invoke.operation_id
+                    {
+                        return Err("shortcut action admission rejected".into());
+                    }
                     self.phase = Phase::Finished;
                     Ok(Some(ApprovedReservation {
                         invoke: self.invoke.clone(),
@@ -180,8 +196,15 @@ mod tests {
                     service,
                     payload,
                     parent,
+                    operation_id,
                     ..
                 } => {
+                    assert!(
+                        operation_id.len() <= 128
+                            && operation_id.bytes().all(|b| b.is_ascii_lowercase()
+                                || b.is_ascii_digit()
+                                || b"._-/".contains(&b))
+                    );
                     if service == LIFECYCLE {
                         assert_eq!(parent, Some(17));
                     } else {
@@ -192,6 +215,7 @@ mod tests {
                         id: sent.len() as u64,
                     })
                 }
+                Command::ReleaseResult { .. } => Ok(Response::Ok),
                 Command::TakeResult { request: 1 } => Ok(Response::Result {
                     payload: json!({
                     "status":"succeeded", "operation_id":"action-epoch:1", "action_id":"example/remove",
@@ -227,7 +251,10 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        let result = job.advance(&mut |_| {
+        let result = job.advance(&mut |command| {
+            if matches!(command, Command::ReleaseResult { .. }) {
+                return Ok(Response::Ok);
+            }
             Ok(Response::Result {
                 payload: json!({
             "status":"succeeded", "operation_id":"action-epoch:1", "action_id":"example/remove",

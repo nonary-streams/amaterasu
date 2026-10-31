@@ -785,6 +785,25 @@ impl<B: Backend> Controller<B> {
             let _ = self.finish_lease(Instant::now(), "cancelled");
         }
     }
+    pub(crate) fn bound_lease_active(&self, owner: &str, token: &str) -> bool {
+        !self.cleanup_required()
+            && self.lease.as_ref().is_some_and(|lease| {
+                lease.owner == owner && lease.token == token && Instant::now() < lease.expires
+            })
+    }
+    /// Retire only the exact lease selected by lifecycle, never a newer lease
+    /// owned by the same broker principal.
+    pub(crate) fn cancel_bound_lease(&mut self, owner: &str, token: &str) -> InputResult<bool> {
+        if self
+            .lease
+            .as_ref()
+            .is_none_or(|lease| lease.owner != owner || lease.token != token)
+        {
+            return Ok(false);
+        }
+        self.finish_lease(Instant::now(), "cancelled")?;
+        Ok(true)
+    }
     fn acquire(
         &mut self,
         caller: &str,

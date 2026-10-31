@@ -153,7 +153,15 @@ impl ShortcutStore {
             }
             Pending::Wait { request, candidate } => match send(Command::TakeResult { request }) {
                 Ok(Response::Pending) => self.pending = Some(Pending::Wait { request, candidate }),
-                Ok(Response::Result { payload }) if payload["ok"] == true => {
+                Ok(Response::Result { payload }) => {
+                    if !matches!(send(Command::ReleaseResult { request }), Ok(Response::Ok)) {
+                        self.fenced = true;
+                        return;
+                    }
+                    if payload["ok"] != true {
+                        self.fenced = true;
+                        return;
+                    }
                     let Some(revision) = payload["revision"].as_u64() else {
                         self.fenced = true;
                         return;
@@ -226,6 +234,7 @@ mod tests {
                     self.requests.insert(self.next, payload);
                     Ok(Response::Accepted { id: self.next })
                 }
+                Command::ReleaseResult { .. } => Ok(Response::Ok),
                 Command::TakeResult { request } => {
                     let payload = self.requests.remove(&request).unwrap();
                     match payload["action"].as_str().unwrap() {

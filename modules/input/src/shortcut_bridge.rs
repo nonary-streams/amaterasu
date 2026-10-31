@@ -152,7 +152,18 @@ impl StagedBatch {
             ));
         }
         *matcher = self.matcher;
-        Ok(controller.deliver_prepared_batch(self.prepared, now, guard))
+        let mut result = controller.deliver_prepared_batch(self.prepared, now, guard);
+        if result["ok"] == true {
+            let consumed = self
+                .dispositions
+                .iter()
+                .filter(|disposition| **disposition == Disposition::Consume)
+                .count();
+            let suppressed = result["suppressed"].as_u64().unwrap_or(0);
+            result["accepted"] = json!(self.dispositions.len());
+            result["suppressed"] = json!(suppressed + consumed as u64);
+        }
+        Ok(result)
     }
 }
 
@@ -211,6 +222,7 @@ mod tests {
                     self.calls.insert(self.next, payload);
                     Ok(Response::Accepted { id: self.next })
                 }
+                Command::ReleaseResult { .. } => Ok(Response::Ok),
                 Command::TakeResult { request } => {
                     let request = self.calls.remove(&request).unwrap();
                     match request["action"].as_str().unwrap() {
@@ -316,6 +328,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result["ok"], true);
+        assert_eq!(result["accepted"], 2);
+        assert_eq!(result["suppressed"], 1);
         assert_eq!(&*trace.borrow(), &[key(1, KeyState::Down)]);
         store.finish(1, Phase::Delivered, Some(result)).unwrap();
         state.pump(&mut store);
