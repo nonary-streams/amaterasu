@@ -376,6 +376,14 @@ impl Coordinator {
                 }
                 continue;
             }
+            if matches!(
+                work.phase,
+                LifecyclePhase::StreamRelease | LifecyclePhase::SessionRelease
+            ) && work.provider_graph.is_none()
+            {
+                self.fail_work(&key, "provider_dependency_graph_missing")?;
+                continue;
+            }
             if work.index >= work.providers.len() {
                 if work.recovery_authorized_epoch.is_some()
                     && matches!(
@@ -392,6 +400,14 @@ impl Coordinator {
                 continue;
             }
             let provider = &work.providers[work.index];
+            if matches!(
+                work.phase,
+                LifecyclePhase::StreamRelease | LifecyclePhase::SessionRelease
+            ) && work.cleanup_blocked(provider)
+            {
+                self.cleanup_failure(&key, "dependent_cleanup_unresolved")?;
+                continue;
+            }
             if work.recovery_authorized_epoch.is_some()
                 && matches!(
                     work.phase,
@@ -668,6 +684,13 @@ impl Coordinator {
         if journal.receipts.values().any(|receipt| {
             receipt.work.as_ref().is_some_and(|other| {
                 other.transition_id != work.transition_id
+                    // A failed preparation may be retained for explicit recovery,
+                    // while its unresolved effects are already fenced by this
+                    // cleanup work. Independent branches can then proceed.
+                    && !(receipt.response["status"] == "recovery_required"
+                        && other.states.iter().any(|(_, state)| !matches!(state.phase, PreparePhase::Prepared | PreparePhase::Rejected))
+                        && other.states.iter().filter(|(_, state)| !matches!(state.phase, PreparePhase::Prepared | PreparePhase::Rejected))
+                            .all(|(provider, _)| work.cleanup_blockers.contains(provider)))
                     && matches!(
                         other.phase,
                         LifecyclePhase::SessionPrepare | LifecyclePhase::StreamPrepare
@@ -962,6 +985,9 @@ impl Coordinator {
             .and_then(|r| r.work.as_mut())
             .ok_or("unknown_transition")?;
         work.failure.get_or_insert_with(|| reason.into());
+        if let Some(provider) = work.providers.get(work.index) {
+            work.cleanup_blockers.insert(provider.clone());
+        }
         work.index += 1;
         save(&self.shared, next)
     }
@@ -1019,9 +1045,36 @@ impl Coordinator {
                 session.phase = SessionPhase::Ending;
                 session.application_retired = session.application.is_none();
             }
-            let receipt = next.receipts.get_mut(key).unwrap();
-            receipt.response["reason"] = json!(reason);
+            next.receipts.get_mut(key).unwrap().response["reason"] = json!(reason);
             if another_release {
+                // Transfer uncertain providers to the existing cleanup fence before
+                // it can run another callback. Its graph may predate this work;
+                // if graphs differ, discard proof of independence altogether.
+                let blockers: BTreeSet<_> = work
+                    .states
+                    .iter()
+                    .filter_map(|(provider, state)| {
+                        (!matches!(state.phase, PreparePhase::Prepared | PreparePhase::Rejected))
+                            .then_some(provider.clone())
+                    })
+                    .collect();
+                for (other_key, other) in &mut next.receipts {
+                    if other_key == key || other.response["status"] != "pending" {
+                        continue;
+                    }
+                    if let Some(release) = other.work.as_mut()
+                        && release.phase == phase
+                        && release.target == work.target
+                    {
+                        if serde_json::to_value(&release.provider_graph).ok()
+                            != serde_json::to_value(&work.provider_graph).ok()
+                        {
+                            release.provider_graph = None;
+                        }
+                        release.cleanup_blockers.extend(blockers.iter().cloned());
+                    }
+                }
+                let receipt = next.receipts.get_mut(key).unwrap();
                 // An admitted end operation already owns cleanup. Do not issue
                 // a second set of restoration callbacks for the same target.
                 receipt.response["status"] = json!(if uncertain {
@@ -1030,6 +1083,7 @@ impl Coordinator {
                     "failed"
                 });
             } else {
+                let receipt = next.receipts.get_mut(key).unwrap();
                 receipt.work = Some(Work {
                     phase,
                     target: work.target.clone(),
@@ -1038,6 +1092,18 @@ impl Coordinator {
                     video: work.video.clone(),
                     transition_id: identifier()?,
                     providers,
+                    provider_graph: work.provider_graph.clone(),
+                    cleanup_blockers: work
+                        .states
+                        .iter()
+                        .filter_map(|(provider, state)| {
+                            (!matches!(
+                                state.phase,
+                                PreparePhase::Prepared | PreparePhase::Rejected
+                            ))
+                            .then_some(provider.clone())
+                        })
+                        .collect(),
                     index: 0,
                     states: BTreeMap::new(),
                     candidate: None,
@@ -1083,6 +1149,7 @@ mod admission_target_tests {
 
     fn session(id: &str) -> SessionRecord {
         SessionRecord {
+            provider_graph: None,
             host_epoch: "epoch".into(),
             id: id.into(),
             generation: 1,
@@ -1201,5 +1268,144 @@ mod admission_target_tests {
             LifecyclePhase::StreamPrepare
         );
         assert!(restored.sessions["second"].admission_ids.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod dependency_cleanup_tests {
+    use super::*;
+
+    fn work() -> Work {
+        Work {
+            phase: LifecyclePhase::SessionRelease,
+            target: LifecycleTarget::Session {
+                host_epoch: "epoch".into(),
+                session_id: "session".into(),
+                generation: 1,
+            },
+            intent: None,
+            reason: Some(ReleaseReason::End),
+            video: None,
+            transition_id: "transition".into(),
+            providers: vec![
+                "independent".into(),
+                "leaf".into(),
+                "middle".into(),
+                "root".into(),
+            ],
+            provider_graph: Some(ProviderGraph {
+                order: vec![
+                    "root".into(),
+                    "middle".into(),
+                    "leaf".into(),
+                    "independent".into(),
+                ],
+                dependencies: [
+                    ("root".into(), vec![]),
+                    ("middle".into(), vec!["root".into()]),
+                    ("leaf".into(), vec!["middle".into()]),
+                    ("independent".into(), vec![]),
+                ]
+                .into(),
+            }),
+            cleanup_blockers: ["leaf".into()].into(),
+            index: 0,
+            states: Default::default(),
+            candidate: None,
+            waiting_retirement: false,
+            failure: None,
+            failed_preparation: None,
+            action_transfer: None,
+            recovery_authorized_epoch: None,
+        }
+    }
+
+    #[test]
+    fn unresolved_dependent_fences_all_prerequisites_after_restart() {
+        let original = work();
+        let recovered: Work =
+            serde_json::from_slice(&serde_json::to_vec(&original).unwrap()).unwrap();
+        assert!(recovered.cleanup_blocked("leaf"));
+        assert!(recovered.cleanup_blocked("middle"));
+        assert!(recovered.cleanup_blocked("root"));
+        assert!(!recovered.cleanup_blocked("independent"));
+    }
+
+    #[test]
+    fn scheduler_persists_unknown_dependent_fence_before_skipping_prerequisite() {
+        let path = std::env::temp_dir().join(format!(
+            "amaterasu-dependency-cleanup-{}",
+            identifier().unwrap()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let journal_path = path.join("journal.json");
+        let mut coordinator = Coordinator::open(&journal_path).unwrap();
+        coordinator.configured = true;
+        let receipt = coordinator.handle(
+            "caller",
+            "initiator",
+            json!({
+                "operation": "prepare", "operation_id": "operation"
+            }),
+        );
+        let key = receipt_key("caller", "initiator", "operation");
+        let mut next = coordinator.shared.borrow().value.clone();
+        let target: LifecycleTarget = serde_json::from_value(receipt["target"].clone()).unwrap();
+        let session_id = super::super::operations::target_parts(&target)
+            .unwrap()
+            .1
+            .to_owned();
+        let mut release = work();
+        release.target = target;
+        release.providers = vec!["root".into()];
+        next.sessions.get_mut(&session_id).unwrap().phase = SessionPhase::Ending;
+        next.receipts.get_mut(&key).unwrap().work = Some(release);
+        save(&coordinator.shared, next).unwrap();
+        coordinator
+            .advance_work(&mut |_| panic!("blocked prerequisite must not be called"))
+            .unwrap();
+        let saved = coordinator.shared.borrow().value.receipts[&key]
+            .work
+            .clone()
+            .unwrap();
+        assert_eq!(saved.index, 1);
+        assert!(saved.cleanup_blockers.contains("root"));
+        assert!(saved.cleanup_blockers.contains("leaf"));
+        drop(coordinator);
+        let recovered = Coordinator::open(&journal_path).unwrap();
+        let saved = recovered.shared.borrow().value.receipts[&key]
+            .work
+            .clone()
+            .unwrap();
+        assert!(saved.cleanup_blocked("root"));
+        drop(recovered);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn missing_or_invalid_graph_never_establishes_independence() {
+        let mut pending = work();
+        pending.provider_graph = None;
+        assert!(pending.cleanup_blocked("independent"));
+        pending.provider_graph = work().provider_graph;
+        pending
+            .provider_graph
+            .as_mut()
+            .unwrap()
+            .dependencies
+            .get_mut("root")
+            .unwrap()
+            .push("leaf".into());
+        assert!(pending.cleanup_blocked("independent"));
+        let mut legacy = serde_json::to_value(work()).unwrap();
+        legacy.as_object_mut().unwrap().remove("provider_graph");
+        legacy.as_object_mut().unwrap().remove("cleanup_blockers");
+        let legacy: Work = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.cleanup_blocked("root"));
     }
 }

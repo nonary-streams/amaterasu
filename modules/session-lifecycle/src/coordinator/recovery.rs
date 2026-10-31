@@ -180,6 +180,8 @@ mod tests {
             video: None,
             transition_id: "transition".into(),
             providers: vec!["display".into()],
+            provider_graph: None,
+            cleanup_blockers: BTreeSet::new(),
             index: 0,
             states: [("display".into(), state)].into(),
             candidate: None,
@@ -190,6 +192,7 @@ mod tests {
             recovery_authorized_epoch: None,
         };
         let session = SessionRecord {
+            provider_graph: None,
             host_epoch: "old".into(),
             id: "session".into(),
             generation: 1,
@@ -211,6 +214,7 @@ mod tests {
             streams: [(
                 "stream".into(),
                 StreamRecord {
+                    provider_graph: None,
                     generation: 1,
                     phase: StreamPhase::RecoveryRequired,
                     candidate: None,

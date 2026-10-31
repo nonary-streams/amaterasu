@@ -909,6 +909,7 @@ mod tests {
     }
     fn selection() -> ProviderSelection {
         let participant = ParticipantSettings {
+            depends_on: vec![],
             provider: "display".into(),
             plan_method: method("plan"),
             callback_method: method("callback"),

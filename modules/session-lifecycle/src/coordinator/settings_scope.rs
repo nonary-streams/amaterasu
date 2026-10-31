@@ -167,6 +167,7 @@ mod tests {
         coordinator.shared.borrow_mut().value.sessions.insert(
             "session".into(),
             SessionRecord {
+                provider_graph: None,
                 host_epoch: epoch.clone(),
                 id: "session".into(),
                 generation: 3,
@@ -253,6 +254,7 @@ mod tests {
                 .insert(
                     "stream".into(),
                     StreamRecord {
+                        provider_graph: None,
                         generation: 4,
                         phase: StreamPhase::Active,
                         candidate: Some(candidate),

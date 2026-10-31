@@ -20,6 +20,7 @@ fn selection(provider: &str) -> ProviderSelection {
 
 fn session(epoch: &str, id: &str) -> SessionRecord {
     SessionRecord {
+        provider_graph: None,
         host_epoch: epoch.into(),
         id: id.into(),
         generation: 1,

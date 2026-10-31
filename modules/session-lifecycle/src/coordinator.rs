@@ -48,6 +48,13 @@ struct Receipt {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ProviderGraph {
+    order: Vec<String>,
+    dependencies: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Work {
     phase: LifecyclePhase,
     target: LifecycleTarget,
@@ -56,6 +63,10 @@ struct Work {
     video: Option<VideoMode>,
     transition_id: String,
     providers: Vec<String>,
+    #[serde(default)]
+    provider_graph: Option<ProviderGraph>,
+    #[serde(default)]
+    cleanup_blockers: BTreeSet<String>,
     index: usize,
     states: BTreeMap<String, PrepareState>,
     candidate: Option<CaptureBinding>,
@@ -68,6 +79,62 @@ struct Work {
     action_transfer: Option<ActionTransfer>,
     #[serde(default)]
     recovery_authorized_epoch: Option<String>,
+}
+
+impl Work {
+    fn use_release_graph(&mut self, graph: Option<ProviderGraph>) {
+        if let Some(graph) = &graph {
+            self.providers = graph.order.iter().rev().cloned().collect();
+        }
+        self.provider_graph = graph;
+    }
+
+    // Missing or malformed persisted graphs never prove independence.
+    fn cleanup_blocked(&self, provider: &str) -> bool {
+        let Some(graph) = &self.provider_graph else {
+            return true;
+        };
+        let positions: BTreeMap<_, _> = graph
+            .order
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (id.as_str(), index))
+            .collect();
+        if positions.len() != graph.order.len()
+            || graph.dependencies.len() != positions.len()
+            || graph.dependencies.iter().any(|(id, dependencies)| {
+                let Some(position) = positions.get(id.as_str()) else {
+                    return true;
+                };
+                let unique: BTreeSet<_> = dependencies.iter().collect();
+                unique.len() != dependencies.len()
+                    || dependencies.iter().any(|dependency| {
+                        positions
+                            .get(dependency.as_str())
+                            .is_none_or(|parent| parent >= position)
+                    })
+            })
+            || !positions.contains_key(provider)
+            || self
+                .cleanup_blockers
+                .iter()
+                .any(|id| !positions.contains_key(id.as_str()))
+        {
+            return true;
+        }
+        let mut frontier: Vec<_> = self.cleanup_blockers.iter().map(String::as_str).collect();
+        let mut visited = BTreeSet::new();
+        while let Some(id) = frontier.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            if id == provider {
+                return true;
+            }
+            frontier.extend(graph.dependencies[id].iter().map(String::as_str));
+        }
+        false
+    }
 }
 
 /// Exact reservation ownership transferred to a durable teardown work item.
@@ -115,6 +182,8 @@ enum StreamPhase {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StreamRecord {
+    #[serde(default)]
+    provider_graph: Option<ProviderGraph>,
     generation: u64,
     phase: StreamPhase,
     candidate: Option<CaptureBinding>,
@@ -132,6 +201,8 @@ struct StreamRecord {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SessionRecord {
+    #[serde(default)]
+    provider_graph: Option<ProviderGraph>,
     host_epoch: String,
     id: String,
     generation: u64,

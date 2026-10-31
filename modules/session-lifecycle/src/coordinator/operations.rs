@@ -69,12 +69,18 @@ impl Coordinator {
         target: LifecycleTarget,
         payload: &Value,
     ) -> ModuleResult<Work> {
-        let mut providers: Vec<_> = self
+        let order = self.settings.resolved_participants()?;
+        let dependencies = self
             .settings
             .participants
             .iter()
-            .map(|p| p.provider.clone())
+            .map(|participant| (participant.provider.clone(), participant.depends_on.clone()))
             .collect();
+        let graph = ProviderGraph {
+            order,
+            dependencies,
+        };
+        let mut providers = graph.order.clone();
         if matches!(
             phase,
             LifecyclePhase::StreamRelease | LifecyclePhase::SessionRelease
@@ -104,6 +110,8 @@ impl Coordinator {
                 .map_err(|_| "invalid_video")?,
             transition_id: identifier()?,
             providers,
+            provider_graph: Some(graph),
+            cleanup_blockers: BTreeSet::new(),
             index: 0,
             states: BTreeMap::new(),
             candidate: None,
@@ -153,6 +161,7 @@ impl Coordinator {
             next.sessions.insert(
                 id.clone(),
                 SessionRecord {
+                    provider_graph: current.provider_graph.clone(),
                     host_epoch: next.host_epoch.clone(),
                     id,
                     generation: 1,
@@ -248,6 +257,7 @@ impl Coordinator {
                     next.sessions.get_mut(&session_id).unwrap().streams.insert(
                         stream_id,
                         StreamRecord {
+                            provider_graph: current.provider_graph.clone(),
                             generation: 1,
                             phase: StreamPhase::Preparing,
                             candidate: None,
@@ -334,6 +344,7 @@ impl Coordinator {
                         stream.phase = StreamPhase::Quiescing;
                         let mut current =
                             self.new_work(LifecyclePhase::StreamRelease, target.clone(), &payload)?;
+                        current.use_release_graph(stream.provider_graph.clone());
                         current.reason = Some(ReleaseReason::Pause);
                         current.waiting_retirement = true;
                         self.fence_stream(&mut next, &target)?;
@@ -404,7 +415,7 @@ impl Coordinator {
                         let stream_target = LifecycleTarget::Stream {
                             host_epoch: next.host_epoch.clone(),
                             session_id: session_id.clone(),
-                            stream_id,
+                            stream_id: stream_id.clone(),
                             generation,
                         };
                         self.fence_stream(&mut next, &stream_target)?;
@@ -419,6 +430,10 @@ impl Coordinator {
                                 stream_target.clone(),
                                 &json!({}),
                             )?;
+                            let graph = next.sessions[&session_id].streams[&stream_id]
+                                .provider_graph
+                                .clone();
+                            release.use_release_graph(graph);
                             release.reason = Some(ReleaseReason::End);
                             release.waiting_retirement = true;
                             let operation_id = identifier()?;
@@ -428,6 +443,7 @@ impl Coordinator {
                     }
                     let mut current =
                         self.new_work(LifecyclePhase::SessionRelease, target.clone(), &payload)?;
+                    current.use_release_graph(next.sessions[&session_id].provider_graph.clone());
                     current.reason = Some(ReleaseReason::End);
                     current.waiting_retirement = true;
                     response = json!({"status":"pending","target":target,"fenced":true,"transition_id":current.transition_id});

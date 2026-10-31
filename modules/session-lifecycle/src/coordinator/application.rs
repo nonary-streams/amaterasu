@@ -284,6 +284,7 @@ mod tests {
         next.sessions.insert(
             "session".into(),
             SessionRecord {
+                provider_graph: None,
                 host_epoch: epoch.clone(),
                 id: "session".into(),
                 generation: 1,

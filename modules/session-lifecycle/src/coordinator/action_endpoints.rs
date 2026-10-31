@@ -477,6 +477,8 @@ impl Coordinator {
                     video: None,
                     transition_id,
                     providers: vec![],
+                    provider_graph: None,
+                    cleanup_blockers: BTreeSet::new(),
                     index: 0,
                     states: Default::default(),
                     candidate: None,
@@ -993,6 +995,7 @@ mod tests {
         state.sessions.insert(
             "session".into(),
             SessionRecord {
+                provider_graph: None,
                 host_epoch: epoch.clone(),
                 id: "session".into(),
                 generation: 3,
@@ -1080,6 +1083,7 @@ mod tests {
             schema_revision: 1,
         };
         let participant = ParticipantSettings {
+            depends_on: vec![],
             provider: "display".into(),
             plan_method: method("plan"),
             callback_method: method("callback"),
@@ -1107,6 +1111,7 @@ mod tests {
         streams.insert(
             "stream".into(),
             super::super::StreamRecord {
+                provider_graph: None,
                 generation: 4,
                 phase: StreamPhase::Active,
                 candidate: None,
@@ -1128,6 +1133,7 @@ mod tests {
         state.sessions.insert(
             "session".into(),
             SessionRecord {
+                provider_graph: None,
                 host_epoch: epoch.clone(),
                 id: "session".into(),
                 generation: 3,
@@ -1274,6 +1280,7 @@ mod tests {
         state.sessions.get_mut("session").unwrap().streams.insert(
             "resumed".into(),
             super::super::StreamRecord {
+                provider_graph: None,
                 generation: 1,
                 phase: StreamPhase::Active,
                 candidate: None,
@@ -1320,6 +1327,7 @@ mod tests {
             schema_revision: 1,
         };
         coordinator.settings.participants.push(ParticipantSettings {
+            depends_on: vec![],
             provider: "display".into(),
             plan_method: method("plan"),
             callback_method: method("callback"),
@@ -1337,6 +1345,7 @@ mod tests {
         streams.insert(
             "stream".into(),
             super::super::StreamRecord {
+                provider_graph: None,
                 generation: 4,
                 phase: StreamPhase::Active,
                 candidate: Some(candidate),
@@ -1369,6 +1378,7 @@ mod tests {
         state.sessions.insert(
             "session".into(),
             SessionRecord {
+                provider_graph: None,
                 host_epoch: epoch.clone(),
                 id: "session".into(),
                 generation: 3,
