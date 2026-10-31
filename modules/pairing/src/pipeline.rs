@@ -948,7 +948,16 @@ impl Pipeline {
             } if service == EFFECT_SERVICE
                 && matches!(
                     payload["action"].as_str(),
-                    Some("complete" | "lookup" | "acknowledge" | "status" | "drain" | "recover")
+                    Some(
+                        "complete"
+                            | "complete_stream_lease"
+                            | "lookup_stream_lease"
+                            | "lookup"
+                            | "acknowledge"
+                            | "status"
+                            | "drain"
+                            | "recover"
+                    )
                 ) =>
             {
                 self.handle_effect_request(id, &caller, &initiator, payload, now, send)
@@ -1000,7 +1009,9 @@ impl Pipeline {
         let request: EffectRequest =
             serde_json::from_value(payload).map_err(|_| "invalid_request")?;
         let permitted = match request {
-            EffectRequest::Bind { .. } => caller == policy.protocol_owner,
+            EffectRequest::Bind { .. } | EffectRequest::BindStream { .. } => {
+                caller == policy.protocol_owner
+            }
             EffectRequest::Status {} => {
                 caller == policy.protocol_owner || caller == policy.effect_owner
             }
@@ -1008,6 +1019,20 @@ impl Pipeline {
         };
         if !permitted {
             return Err("forbidden");
+        }
+        match request {
+            EffectRequest::Bind {
+                epoch,
+                certificate_pem,
+                source,
+            } => return self.bind_effect_source(epoch, certificate_pem, source, None, now),
+            EffectRequest::BindStream {
+                epoch,
+                certificate_pem,
+                source,
+                scope,
+            } => return self.bind_effect_source(epoch, certificate_pem, source, Some(scope), now),
+            _ => {}
         }
         let gate = self.effect_gate.as_mut().ok_or("authority_unavailable")?;
         match request {
@@ -1017,34 +1042,53 @@ impl Pipeline {
                 self.effect_bindings.clear();
                 Ok(json!({"ok":true,"epoch":gate.epoch()}))
             }
-            EffectRequest::Bind {
+            EffectRequest::Bind { .. } | EffectRequest::BindStream { .. } => {
+                unreachable!("handled above")
+            }
+            EffectRequest::AdmitStreamLease {
                 epoch,
-                certificate_pem,
                 source,
+                operation_id,
+                sequence,
+                scope,
             } => {
-                // The protocol-to-lifecycle source join has not been wired yet.
-                // Keep the production endpoint closed until its integration and
-                // final-effect tests prove that the assertion is authentic.
                 gate.require_epoch(&epoch)?;
-                if !source_join_available() {
-                    return Err("source_attestation_unavailable");
-                }
-                let certificate = crate::crypto::parse_certificate(&certificate_pem, Some(now))
-                    .map_err(|_| "source_denied")?;
-                let der = certificate
-                    .certificate
-                    .to_der()
-                    .map_err(|_| "source_denied")?;
-                let snapshot = self.identity.get(now).map_err(|_| "source_denied")?;
-                snapshot
-                    .check_permission(&der, now, amaterasu_identity::PERMISSION_LAUNCH)
-                    .map_err(|_| "source_denied")?;
-                if !self.identity.current(&snapshot, now) {
+                let (snapshot, certificate) =
+                    self.effect_bindings.get(&source).ok_or("source_denied")?;
+                if !self.identity.current(snapshot, now)
+                    || snapshot
+                        .check_permission(certificate, now, amaterasu_identity::PERMISSION_LAUNCH)
+                        .is_err()
+                {
                     return Err("source_denied");
                 }
-                gate.bind(source.clone())?;
-                self.effect_bindings.insert(source, (snapshot, der));
-                Ok(json!({"ok":true,"epoch":gate.epoch()}))
+                let ticket = gate
+                    .admit_stream_lease(&source, &operation_id, sequence, scope)?
+                    .to_owned();
+                Ok(
+                    json!({"ok":true,"epoch":gate.epoch(),"operation_id":operation_id,"ticket":ticket,"kind":"stream_lease"}),
+                )
+            }
+            EffectRequest::LookupStreamLease {
+                epoch,
+                source,
+                operation_id,
+                scope,
+            } => {
+                gate.require_epoch(&epoch)?;
+                let (ticket, fenced) = gate.lookup_stream_lease(&source, &operation_id, &scope)?;
+                Ok(
+                    json!({"ok":true,"epoch":gate.epoch(),"operation_id":operation_id,"ticket":ticket,"kind":"stream_lease","fenced":fenced,"source":source,"scope":scope}),
+                )
+            }
+            EffectRequest::CompleteStreamLease {
+                epoch,
+                operation_id,
+                ticket,
+                retirement,
+            } => {
+                gate.complete_stream_lease(&epoch, &operation_id, &ticket, &retirement)?;
+                Ok(json!({"ok":true,"epoch":gate.epoch(),"operation_id":operation_id}))
             }
             EffectRequest::Admit {
                 epoch,
@@ -1104,6 +1148,48 @@ impl Pipeline {
                 Ok(json!({"ok":true,"epoch":gate.epoch(),"operation_id":operation_id}))
             }
         }
+    }
+
+    fn bind_effect_source(
+        &mut self,
+        epoch: String,
+        certificate_pem: String,
+        source: EffectSource,
+        stream_scope: Option<crate::effect_gate::StreamScope>,
+        now: u64,
+    ) -> Result<Value, &'static str> {
+        let gate = self.effect_gate.as_mut().ok_or("authority_unavailable")?;
+        gate.require_epoch(&epoch)?;
+        // Keep the production endpoint closed until the protocol authenticates
+        // the lifecycle join and the end-to-end retirement barrier is proven.
+        if !source_join_available() {
+            return Err("source_attestation_unavailable");
+        }
+        let certificate = crate::crypto::parse_certificate(&certificate_pem, Some(now))
+            .map_err(|_| "source_denied")?;
+        let der = certificate
+            .certificate
+            .to_der()
+            .map_err(|_| "source_denied")?;
+        let snapshot = self.identity.get(now).map_err(|_| "source_denied")?;
+        snapshot
+            .check_permission(&der, now, amaterasu_identity::PERMISSION_LAUNCH)
+            .map_err(|_| "source_denied")?;
+        if !self.identity.current(&snapshot, now) {
+            return Err("source_denied");
+        }
+        if self
+            .effect_bindings
+            .get(&source)
+            .is_some_and(|(previous, bound_certificate)| {
+                bound_certificate != &der || !Arc::ptr_eq(previous, &snapshot)
+            })
+        {
+            return Err("source_owner_conflict");
+        }
+        gate.bind_scoped(source.clone(), stream_scope)?;
+        self.effect_bindings.insert(source, (snapshot, der));
+        Ok(json!({"ok":true,"epoch":gate.epoch()}))
     }
 
     fn submit(

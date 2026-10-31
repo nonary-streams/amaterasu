@@ -4046,3 +4046,134 @@ fn real_broker_cancelled_effect_requests_cannot_admit_or_acknowledge_drain() {
         .unwrap();
     assert!(pipeline.effect_gate.as_ref().unwrap().drain_required());
 }
+
+#[test]
+fn trust_mutation_waits_for_stream_lease_retirement_and_owner_drain() {
+    let (mut pipeline, mut harness, certificate_id) = paired_native_client();
+    pipeline.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        protocol_owner: "nvhttp".into(),
+        effect_owner: "input".into(),
+    });
+    let gate = pipeline.effect_gate.as_mut().unwrap();
+    gate.recover("owner").unwrap();
+    let source = crate::effect_gate::Source {
+        version: 1,
+        id: "ab".repeat(16),
+        generation: 1,
+        host_epoch: "host".into(),
+        session_id: "session".into(),
+        stream_id: "stream".into(),
+        stream_generation: 1,
+        device: "device".into(),
+        device_generation: 1,
+        effect_owner_epoch: "owner".into(),
+    };
+    let scope = crate::effect_gate::StreamScope {
+        capabilities: ["speaker.pcm/1".into()].into(),
+        transport_service: "amaterasu.control-transport/1".into(),
+        transport_stream: 7,
+        transport_epoch: "transport".into(),
+    };
+    gate.bind_scoped(source.clone(), Some(scope.clone()))
+        .unwrap();
+    let ticket = gate
+        .admit_stream_lease(&source, "lease", 1, scope.clone())
+        .unwrap()
+        .to_owned();
+    let epoch = gate.epoch().to_owned();
+    let writes = harness.writes;
+    harness.enqueue("console", json!({"action":"unpair","certificate_id":certificate_id,"expected_revision":harness.revision}));
+    pipeline
+        .tick_at(now(), |command| harness.send(command))
+        .unwrap();
+    assert_eq!(harness.writes, writes);
+    assert!(
+        pipeline
+            .effect_gate
+            .as_ref()
+            .unwrap()
+            .lookup_stream_lease(&source, "lease", &scope)
+            .unwrap()
+            .1
+    );
+    let mut retirement = crate::effect_gate::StreamRetirement {
+        ok: true,
+        service: scope.transport_service.clone(),
+        stream: scope.transport_stream + 1,
+        provider_epoch: scope.transport_epoch.clone(),
+        operation_id: "retire".into(),
+        scope: "whole_control_stream".into(),
+        state: "retired".into(),
+    };
+    assert_eq!(pipeline.apply_effect_request("input", "input", json!({"action":"complete_stream_lease","epoch":epoch,"operation_id":"lease","ticket":ticket,"retirement":retirement}), now()), Err("retirement_mismatch"));
+    assert_eq!(harness.writes, writes);
+    retirement.stream = scope.transport_stream;
+    pipeline.apply_effect_request("input", "input", json!({"action":"complete_stream_lease","epoch":epoch,"operation_id":"lease","ticket":ticket,"retirement":retirement}), now()).unwrap();
+    pipeline
+        .tick_at(now(), |command| harness.send(command))
+        .unwrap();
+    assert_eq!(harness.writes, writes);
+    let generation = pipeline.effect_gate.as_ref().unwrap().fence_generation();
+    pipeline
+        .apply_effect_request(
+            "input",
+            "input",
+            json!({"action":"drain","epoch":epoch,"fence_generation":generation}),
+            now(),
+        )
+        .unwrap();
+    for _ in 0..5 {
+        pipeline
+            .tick_at(now(), |command| harness.send(command))
+            .unwrap();
+        if harness.output.is_some() {
+            break;
+        }
+    }
+    assert_eq!(harness.output.unwrap()["ok"], true);
+    assert_eq!(harness.writes, writes + 1);
+}
+
+#[test]
+fn stream_binding_cannot_rebind_source_to_another_certificate_or_capability_scope() {
+    let (mut pipeline, mut harness, _) = paired_native_client();
+    assert_eq!(harness.request(&mut pipeline, "console", json!({"action":"import_client","client_id":"other-client","name":"Other", "certificate_pem":HOST_CERT}), now())["ok"], true);
+    pipeline.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        protocol_owner: "nvhttp".into(),
+        effect_owner: "input".into(),
+    });
+    let startup_epoch = pipeline.effect_gate.as_ref().unwrap().epoch().to_owned();
+    let result = pipeline
+        .apply_effect_request(
+            "input",
+            "input",
+            json!({"action":"recover","epoch":startup_epoch,"owner_epoch":"owner"}),
+            now(),
+        )
+        .unwrap();
+    let epoch = result["epoch"].as_str().unwrap();
+    let source = json!({"version":1,"id":"ab".repeat(16),"generation":1,"host_epoch":"host",
+        "session_id":"session","stream_id":"stream","stream_generation":1,"device":"device",
+        "device_generation":1,"effect_owner_epoch":"owner"});
+    let scope = json!({"capabilities":["speaker.pcm/1"],"transport_service":"amaterasu.control-transport/1",
+        "transport_stream":7,"transport_epoch":"transport"});
+    let request = json!({"action":"bind_stream","epoch":epoch,"certificate_pem":CLIENT_CERT,"source":source,"scope":scope});
+    assert_eq!(
+        pipeline
+            .apply_effect_request("nvhttp", "nvhttp", request.clone(), now())
+            .unwrap()["ok"],
+        true
+    );
+    let mut foreign = request.clone();
+    foreign["certificate_pem"] = json!(HOST_CERT);
+    assert_eq!(
+        pipeline.apply_effect_request("nvhttp", "nvhttp", foreign, now()),
+        Err("source_owner_conflict")
+    );
+    let mut altered = request;
+    altered["scope"]["capabilities"] = json!(["foreign/1"]);
+    assert_eq!(
+        pipeline.apply_effect_request("nvhttp", "nvhttp", altered, now()),
+        Err("source_scope_conflict")
+    );
+}
