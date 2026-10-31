@@ -4632,3 +4632,95 @@ fn cleanup_readback_list_paginates_by_bytes_and_preserves_owner() {
 }
 
 mod desktop;
+
+#[test]
+fn retirement_observer_requires_exact_owned_clean_terminal_launch() {
+    let mut harness = Harness::new();
+    let mut pipeline = pipeline();
+    pipeline.set_retirement_observers(["amaterasu.session-lifecycle".to_string()].into());
+    let started = harness.request(&mut pipeline, "alice", launch("retirement-one"));
+    assert_eq!(started["launch"]["state"], "active");
+    let request = json!({"action":"verify_retirement","owner":"alice","launch_id":1,"operation_id":"retirement-one"});
+    assert_eq!(
+        harness.request(&mut pipeline, "mallory", request.clone())["code"],
+        "permission_denied"
+    );
+    assert_eq!(
+        harness.request(
+            &mut pipeline,
+            "amaterasu.session-lifecycle",
+            request.clone()
+        )["code"],
+        "retirement_unconfirmed"
+    );
+    assert_eq!(
+        harness.request(
+            &mut pipeline,
+            "alice",
+            json!({"action":"stop","launch_id":1})
+        )["launch"]["state"],
+        "stopped"
+    );
+    for changed in [
+        json!({"action":"verify_retirement","owner":"bob","launch_id":1,"operation_id":"retirement-one"}),
+        json!({"action":"verify_retirement","owner":"alice","launch_id":2,"operation_id":"retirement-one"}),
+        json!({"action":"verify_retirement","owner":"alice","launch_id":1,"operation_id":"other"}),
+    ] {
+        assert_eq!(
+            harness.request(&mut pipeline, "amaterasu.session-lifecycle", changed)["code"],
+            "retirement_unconfirmed"
+        );
+    }
+    assert_eq!(
+        harness.request(
+            &mut pipeline,
+            "amaterasu.session-lifecycle",
+            request.clone()
+        ),
+        json!({"ok":true,"retired":true,"owner":"alice","launch_id":1,"operation_id":"retirement-one"})
+    );
+    pipeline
+        .records
+        .values
+        .get_mut(&1)
+        .unwrap()
+        .outstanding_request = Some(99);
+    assert_eq!(
+        harness.request(
+            &mut pipeline,
+            "amaterasu.session-lifecycle",
+            request.clone()
+        )["code"],
+        "retirement_unconfirmed"
+    );
+    pipeline
+        .records
+        .values
+        .get_mut(&1)
+        .unwrap()
+        .outstanding_request = None;
+    pipeline.records.values.get_mut(&1).unwrap().cleanup_error = Some("unconfirmed");
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.session-lifecycle", request)["code"],
+        "retirement_unconfirmed"
+    );
+}
+
+#[test]
+fn retirement_observer_configuration_and_requests_are_bounded() {
+    let settings: Settings =
+        serde_json::from_value(json!({"retirement_observers":["amaterasu.session-lifecycle"]}))
+            .unwrap();
+    assert!(settings.validate().is_ok());
+    let invalid: Settings =
+        serde_json::from_value(json!({"retirement_observers":["bad/observer"]})).unwrap();
+    assert!(invalid.validate().is_err());
+    for payload in [
+        json!({"action":"verify_retirement","owner":"alice","launch_id":0,"operation_id":"test"}),
+        json!({"action":"verify_retirement","owner":"alice","launch_id":1,"operation_id":""}),
+        json!({"action":"verify_retirement","owner":"alice","launch_id":1,"operation_id":"test","extra":true}),
+    ] {
+        let operation = serde_json::from_value::<Operation>(payload);
+        assert!(operation.is_err() || operation.unwrap().validate().is_err());
+    }
+}

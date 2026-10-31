@@ -13,7 +13,7 @@ use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     time::{Duration, Instant},
 };
 
@@ -346,6 +346,7 @@ pub struct Pipeline {
     monitor_after: u64,
     ingress_since_monitor: u8,
     environment: BTreeMap<String, String>,
+    retirement_observers: BTreeSet<String>,
 }
 impl Pipeline {
     pub fn new(environment: BTreeMap<String, String>) -> Result<Self, &'static str> {
@@ -356,7 +357,35 @@ impl Pipeline {
             monitor_after: 0,
             ingress_since_monitor: 0,
             environment,
+            retirement_observers: BTreeSet::new(),
         })
+    }
+    pub fn set_retirement_observers(&mut self, observers: BTreeSet<String>) {
+        self.retirement_observers = observers;
+    }
+
+    fn verify_retirement(
+        &self,
+        caller: &str,
+        owner: &str,
+        launch_id: u64,
+        operation_id: &str,
+    ) -> Value {
+        if !self.retirement_observers.contains(caller) {
+            return error("permission_denied");
+        }
+        let Ok(record) = self.records.owned(owner, launch_id) else {
+            return error("retirement_unconfirmed");
+        };
+        if record.operation_id != operation_id
+            || !record.state.terminal()
+            || record.cleanup_error.is_some()
+            || record.outstanding_request.is_some()
+        {
+            return error("retirement_unconfirmed");
+        }
+        serde_json::json!({"ok":true,"retired":true,"owner":owner,
+            "launch_id":launch_id,"operation_id":operation_id})
     }
     pub fn tick(&mut self, mut send: impl FnMut(Command) -> Transport) -> ModuleResult<()> {
         if let Some(mut job) = self.job.take() {
@@ -491,6 +520,11 @@ impl Pipeline {
                 Ok(operation)
             });
         let response = match operation {
+            Ok(Operation::VerifyRetirement {
+                owner,
+                launch_id,
+                operation_id,
+            }) => self.verify_retirement(&caller, &owner, launch_id, &operation_id),
             Ok(Operation::Status { launch_id }) => self
                 .records
                 .owned(&caller, launch_id)
@@ -543,6 +577,17 @@ impl Pipeline {
                 Ok(operation)
             });
         match operation {
+            Ok(Operation::VerifyRetirement {
+                owner,
+                launch_id,
+                operation_id,
+            }) => {
+                complete(
+                    send,
+                    id,
+                    self.verify_retirement(&caller, &owner, launch_id, &operation_id),
+                )?;
+            }
             Ok(Operation::Status { launch_id }) => {
                 let response = self
                     .records
@@ -613,6 +658,15 @@ impl Pipeline {
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
         match operation {
+            Operation::VerifyRetirement {
+                owner,
+                launch_id,
+                operation_id,
+            } => complete(
+                send,
+                request,
+                self.verify_retirement(caller, &owner, launch_id, &operation_id),
+            ),
             Operation::PreflightExport {
                 operation_id,
                 app_id,

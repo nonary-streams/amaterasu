@@ -168,6 +168,13 @@ Startup settings are optional and default to an empty environment:
 {"environment":{"SystemRoot":"C:\\Windows"}}
 ```
 
+An optional `retirement_observers` array grants named broker callers read-only
+retirement verification. `verify_retirement` requires the original owner, launch
+ID, and application operation ID. It returns a bounded identity-matched success
+only for a clean terminal launch with no unsettled broker request. An unknown
+record, including after a service restart, is unconfirmed and cannot prove that a
+launch was never admitted. The array defaults to empty.
+
 The application environment is cleared, then populated with this trusted startup
 map. Host variables are not inherited implicitly. Supply OS/application-required
 variables explicitly; Windows Python and some native applications may require

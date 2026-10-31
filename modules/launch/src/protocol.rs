@@ -98,6 +98,11 @@ pub enum Operation {
     Lookup {
         operation_id: String,
     },
+    VerifyRetirement {
+        owner: String,
+        launch_id: u64,
+        operation_id: String,
+    },
     Stop {
         launch_id: u64,
     },
@@ -143,6 +148,16 @@ impl Operation {
                 validate_legacy_preparation(legacy_global_preparation)?;
             }
             Self::Lookup { operation_id } if !valid_operation_id(operation_id) => {
+                return Err("invalid_request");
+            }
+            Self::VerifyRetirement {
+                owner,
+                launch_id,
+                operation_id,
+            } if !valid_catalog_principal(owner)
+                || *launch_id == 0
+                || !valid_operation_id(operation_id) =>
+            {
                 return Err("invalid_request");
             }
             Self::VerifyFrameLimiterSnapshot {
@@ -1999,9 +2014,18 @@ pub fn error(code: &str) -> Value {
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub environment: BTreeMap<String, String>,
+    pub retirement_observers: BTreeSet<String>,
 }
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self.retirement_observers.len() > 32
+            || self
+                .retirement_observers
+                .iter()
+                .any(|observer| !valid_catalog_principal(observer))
+        {
+            return Err("invalid_launch_settings");
+        }
         let mut keys = BTreeSet::new();
         if self.environment.len() > 32 {
             return Err("invalid_launch_settings");
