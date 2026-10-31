@@ -2800,6 +2800,7 @@ mod admission_target_tests {
             ended_session_history: Default::default(),
             composition: Default::default(),
             closed_streams: Default::default(),
+            closed_actions: Default::default(),
             control_settlements: Default::default(),
             finalize_results: Default::default(),
             stream_releases: Default::default(),

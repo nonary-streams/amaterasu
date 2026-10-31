@@ -516,6 +516,20 @@ impl Coordinator {
                 let Some(token) = payload["permit"].as_str() else {
                     return rejection("invalid_permit");
                 };
+                if operation == "complete_action"
+                    && payload["outcome"] == "succeeded"
+                    && let Some(binding) = journal.closed_actions.matching_retry(
+                        caller,
+                        token,
+                        &payload["dispatch_proof"],
+                    )
+                {
+                    return if binding_matches(payload, binding) {
+                        json!({"status":"succeeded","operation_id":binding.operation_id,"target":binding.target,"plan_digest":binding.plan_digest})
+                    } else {
+                        rejection("action_binding_mismatch")
+                    };
+                }
                 let Ok(binding) = journal.actions.binding_for_permit(caller, token) else {
                     return rejection("invalid_permit");
                 };

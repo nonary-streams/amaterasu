@@ -4,8 +4,73 @@
 //! action. Their insertion and source retirement remain disabled until one
 //! atomic transaction can fence and retire every inbound reference.
 use super::*;
-use crate::action_authority::ActionBinding;
+use crate::action_authority::{ActionBinding, ActionTarget};
 use sha2::{Digest, Sha256};
+
+const MAX_CLOSED_ACTIONS: usize = 1024;
+
+/// Compact private-journal completion receipts. Insertion is only permitted by
+/// an atomic retirement transaction after all source references are fenced.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ClosedActionBook {
+    records: Vec<ClosedActionCertificate>,
+}
+
+impl ClosedActionBook {
+    pub(super) fn validate(&self) -> bool {
+        self.records.len() <= MAX_CLOSED_ACTIONS
+            && self.records.iter().enumerate().all(|(i, record)| {
+                record.valid_shape()
+                    && !self.records[..i].iter().any(|old| {
+                        old.caller == record.caller && old.binding == record.binding
+                            || old.permit_commitment == record.permit_commitment
+                    })
+            })
+    }
+
+    /// Read-only lookup; this never recovers permission to execute an effect.
+    pub(super) fn matching_retry(
+        &self,
+        caller: &str,
+        permit: &str,
+        proof: &Value,
+    ) -> Option<&ActionBinding> {
+        if !self.validate() {
+            return None;
+        }
+        let mut matches = self
+            .records
+            .iter()
+            .filter(|record| record.matches_retry(caller, &record.binding, permit, proof));
+        let record = matches.next()?;
+        matches.next().is_none().then_some(&record.binding)
+    }
+
+    /// Called only on a private journal clone after the complete preflight.
+    fn insert_verified(
+        &mut self,
+        journal: &Journal,
+        session: &str,
+        owner: &str,
+        generation: u64,
+    ) -> ModuleResult<()> {
+        if !self.validate() || self.records.len() >= MAX_CLOSED_ACTIONS {
+            return Err("closed_action_capacity".into());
+        }
+        let record = ClosedActionCertificate::from_verified(journal, session, owner, generation)?;
+        if !record.valid_shape()
+            || self.records.iter().any(|old| {
+                old.caller == record.caller && old.binding == record.binding
+                    || old.permit_commitment == record.permit_commitment
+            })
+        {
+            return Err("closed_action_conflict".into());
+        }
+        self.records.push(record);
+        Ok(())
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,6 +96,59 @@ fn commitment(value: &impl Serialize) -> Option<String> {
 }
 
 impl ClosedActionCertificate {
+    fn valid_shape(&self) -> bool {
+        let LifecycleTarget::Session {
+            host_epoch,
+            session_id,
+            generation,
+        } = &self.session_target
+        else {
+            return false;
+        };
+        let scope = match &self.binding.target {
+            ActionTarget::Session {
+                host_epoch: epoch,
+                session_id: id,
+                expected_generation,
+            } => epoch == host_epoch && id == session_id && expected_generation == generation,
+            ActionTarget::Stream {
+                host_epoch: epoch,
+                session_id: id,
+                stream_id,
+                expected_generation,
+            } => {
+                epoch == host_epoch
+                    && id == session_id
+                    && valid_id(stream_id)
+                    && *expected_generation > 0
+            }
+            ActionTarget::Host { .. } => false,
+        };
+        let digest = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        self.version == 1
+            && valid_id(host_epoch)
+            && valid_id(session_id)
+            && *generation > 0
+            && scope
+            && valid_id(&self.owner)
+            && valid_id(&self.caller)
+            && valid_id(&self.replacement_admission)
+            && valid_id(&self.binding.operation_id)
+            && valid_id(&self.binding.action_id)
+            && valid_id(&self.binding.source.caller)
+            && valid_id(&self.binding.source.initiator)
+            && digest(&self.binding.plan_digest)
+            && digest(&self.replacement_commitment)
+            && digest(&self.permit_commitment)
+            && digest(&self.dispatch_commitment)
+            && self.resource_generation > 0
+            && self.replacement_generation > self.resource_generation
+    }
     /// Construct only while the full source marker and replacement root are
     /// present and independently authenticated. This does not modify either.
     pub(super) fn from_verified(
@@ -95,12 +213,7 @@ impl ClosedActionCertificate {
         permit: &str,
         proof: &Value,
     ) -> bool {
-        self.version == 1
-            && valid_id(&self.owner)
-            && valid_id(&self.caller)
-            && self.resource_generation > 0
-            && self.replacement_generation > self.resource_generation
-            && valid_id(&self.replacement_admission)
+        self.valid_shape()
             && caller == self.caller
             && binding == &self.binding
             && commitment(&permit).as_ref() == Some(&self.permit_commitment)
@@ -176,6 +289,45 @@ mod tests {
         let mut invalid = restored.clone();
         invalid.replacement_generation = invalid.resource_generation;
         assert!(!invalid.matches_retry("actions", &cert.binding, "permit", &proof));
+    }
+
+    #[test]
+    fn closed_book_only_reattaches_exact_historical_tuple() {
+        let certificate = certificate();
+        let book = ClosedActionBook {
+            records: vec![certificate.clone()],
+        };
+        let restored: ClosedActionBook =
+            serde_json::from_slice(&serde_json::to_vec(&book).unwrap()).unwrap();
+        assert!(restored.validate());
+        assert_eq!(
+            restored.matching_retry("actions", "permit", &json!({"receipt":"done"})),
+            Some(&certificate.binding)
+        );
+        assert!(
+            restored
+                .matching_retry("foreign", "permit", &json!({"receipt":"done"}))
+                .is_none()
+        );
+        assert!(
+            restored
+                .matching_retry("actions", "other", &json!({"receipt":"done"}))
+                .is_none()
+        );
+        assert!(
+            restored
+                .matching_retry("actions", "permit", &json!({"receipt":"other"}))
+                .is_none()
+        );
+        let duplicate = ClosedActionBook {
+            records: vec![certificate.clone(), certificate],
+        };
+        assert!(!duplicate.validate());
+        assert!(
+            duplicate
+                .matching_retry("actions", "permit", &json!({"receipt":"done"}))
+                .is_none()
+        );
     }
 
     #[test]

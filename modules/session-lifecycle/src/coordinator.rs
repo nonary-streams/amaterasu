@@ -463,6 +463,8 @@ struct Journal {
     #[serde(default)]
     closed_streams: closed_stream::ClosedStreamBook,
     #[serde(default)]
+    closed_actions: action_closed_history::ClosedActionBook,
+    #[serde(default)]
     control_settlements: control_settlement::ControlSettlementBook,
     #[serde(default)]
     finalize_results: finalize_result::FinalizeResultBook,
@@ -646,6 +648,7 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                         && !journal.authority.settled.contains_key(id))
             })
         || !journal.closed_streams.validate(journal)
+        || !journal.closed_actions.validate()
         || !journal.validate_composition()
         || !composition::validate_finalize_selections(journal)
         || journal.composition.records().any(|record| {
@@ -1082,6 +1085,7 @@ impl Coordinator {
             ended_session_history: Default::default(),
             composition: Default::default(),
             closed_streams: Default::default(),
+            closed_actions: Default::default(),
             control_settlements: Default::default(),
             finalize_results: Default::default(),
             stream_releases: Default::default(),
