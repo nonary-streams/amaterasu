@@ -9,6 +9,10 @@ mod control_backend;
 #[allow(dead_code)] // Control dispatch remains gated until coordinator sequencing is wired.
 mod control_dispatch;
 mod control_endpoints;
+#[allow(dead_code)]
+mod finalize_dispatch;
+#[allow(dead_code)] // Finalization selection remains gated until composition sequencing is wired.
+mod finalize_selection;
 mod operations;
 mod provider_observations;
 mod providers;
@@ -17,6 +21,8 @@ mod retention;
 mod security;
 mod settings_scope;
 mod settings_snapshot;
+#[allow(dead_code)] // Settlement dispatch is gated until composition sequencing is wired.
+mod settlement_dispatch;
 
 use crate::adapter::LifecycleSettings;
 use crate::prepare_authority::{AuthorityState, ProviderSelection};

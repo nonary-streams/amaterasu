@@ -28,6 +28,8 @@ pub enum PreparePhase {
     Callback,
     PlanStatus,
     CallbackStatus,
+    /// Fresh owner finalization plan is durably admitted; no effect was sent.
+    FinalizePlanAdmitted,
     Prepared,
     CleanupSettled,
     Rejected,
@@ -103,10 +105,39 @@ impl PrepareDriver {
     /// Caller must durably reserve the operation and matching provider sequence
     /// before constructing this driver. No plan or effect is implied by creation.
     pub fn new(state: PrepareState, settings: &LifecycleSettings) -> ModuleResult<Self> {
-        // Version 2 requires durable control and finalization sequencing. The
-        // shared wire validator recognizes it, but this driver must not dispatch
-        // it until those coordinator-owned gates are implemented.
-        if state.request.version != 1 {
+        Self::new_inner(state, settings, false)
+    }
+
+    /// Only the coordinator may call this after validating the pinned owner,
+    /// current output and all durable owner-settled control results. This driver
+    /// admits the fresh finalize plan and stops before any owner effect.
+    #[allow(dead_code)] // The coordinator must wire the complete v2 gates first.
+    pub(crate) fn new_finalize_plan(
+        state: PrepareState,
+        settings: &LifecycleSettings,
+    ) -> ModuleResult<Self> {
+        Self::new_inner(state, settings, true)
+    }
+
+    fn new_inner(
+        state: PrepareState,
+        settings: &LifecycleSettings,
+        finalize_plan: bool,
+    ) -> ModuleResult<Self> {
+        // Regular v2 prepare/control remains fenced until all stages are wired.
+        if (!finalize_plan && state.request.version != 1)
+            || (finalize_plan
+                && (state.request.version != api::COMPOSITION_VERSION
+                    || state.request.operation != ProviderOperation::ResourceFinalizePlan
+                    || !matches!(
+                        state.phase,
+                        PreparePhase::Plan
+                            | PreparePhase::PlanStatus
+                            | PreparePhase::FinalizePlanAdmitted
+                            | PreparePhase::Rejected
+                            | PreparePhase::RecoveryRequired
+                    )))
+        {
             return Err("provider composition is not supported".into());
         }
         if participant(settings, &state.provider)? != &state.participant
@@ -118,7 +149,8 @@ impl PrepareDriver {
         }
         api::validate_provider_request(&state.request)?;
         if (matches!(state.phase, PreparePhase::Plan | PreparePhase::PlanStatus)
-            && state.request.operation != ProviderOperation::ResourcePlan)
+            && state.request.operation != ProviderOperation::ResourcePlan
+            && state.request.operation != ProviderOperation::ResourceFinalizePlan)
             || state.request.provider_sequence == 0
             || state.request.provider_sequence > state.last_sequence
             || state.status_polls > MAX_STATUS_POLLS
@@ -158,6 +190,7 @@ impl PrepareDriver {
         if matches!(
             self.state.phase,
             PreparePhase::Prepared
+                | PreparePhase::FinalizePlanAdmitted
                 | PreparePhase::CleanupSettled
                 | PreparePhase::Rejected
                 | PreparePhase::RecoveryRequired
@@ -353,7 +386,11 @@ impl PrepareDriver {
                 }
                 next.plan = Some(plan.clone());
                 next.admission_id = Some(admission);
-                next.phase = PreparePhase::Callback;
+                next.phase = if next.request.operation == ProviderOperation::ResourceFinalizePlan {
+                    PreparePhase::FinalizePlanAdmitted
+                } else {
+                    PreparePhase::Callback
+                };
             }
             ProviderResponse::Pending { receipt_id } => {
                 next.pending_receipt = Some(receipt_id.clone());
@@ -633,6 +670,53 @@ mod tests {
         assert_eq!(authority.polls, 2);
         assert_eq!(authority.sequence, 3);
         assert_eq!(driver.state.last_sequence, 3);
+    }
+
+    #[test]
+    fn finalize_plan_admits_fresh_rights_without_dispatching_callback() {
+        let (settings, mut state) = fixture();
+        state.request.version = api::COMPOSITION_VERSION;
+        state.request.operation = ProviderOperation::ResourceFinalizePlan;
+        state.request.target = serde_json::from_value(
+            json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1}),
+        )
+        .unwrap();
+        state.request.dependency_inputs = vec![serde_json::from_value(json!({"output_id":"output","capability":"display","schema":{"id":"display/1","major":1,"minor":0,"digest":"a".repeat(64)},"producer":"provider","producer_service":"provider/2","origin":state.request.target,"resource":{"provider":"provider","resource_id":"output","incarnation":"native","revision":2,"execution_domain":"desktop","mutation_domain":null,"mutation_domains":[]},"domain_observations":[],"data":{}})).unwrap()];
+        let mut driver = PrepareDriver::new_finalize_plan(state, &settings).unwrap();
+        let mut authority = Authority {
+            sequence: 1,
+            rights: false,
+            polls: 0,
+        };
+        let mut journal = Journal::default();
+        let plan = json!({"plan_id":"final","revision":1,"resources":[{"provider":"provider","resource_id":"output","incarnation":"native","expected_revision":2,"execution_domain":"desktop","mutation_domains":[],"access":"read"}],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]});
+        let mut calls = Vec::new();
+        for _ in 0..12 {
+            driver.advance(&settings, &mut authority, &mut journal, &mut |command| match command {
+                Command::QueryApiApproval { service, method, interface_major, min_minor } => Ok(Response::Result { payload: json!({"provider":"provider","method":{"service":service,"method":method,"interface_major":interface_major,"interface_minor":min_minor}}) }),
+                Command::CallApi { method, payload, .. } => {
+                    calls.push(method.clone());
+                    assert_eq!(method, "plan");
+                    assert_eq!(payload["operation"], "resource_finalize_plan");
+                    Ok(Response::Accepted { id: 1 })
+                }
+                Command::TakeResult { request: 1 } => Ok(Response::Result { payload: json!({"status":"planned","plan":plan}) }),
+                Command::ReleaseResult { request: 1 } => Ok(Response::Ok),
+                other => panic!("unexpected finalization-plan command: {other:?}"),
+            }).unwrap();
+            if driver.state().phase == PreparePhase::FinalizePlanAdmitted {
+                break;
+            }
+        }
+        assert_eq!(calls, ["plan"]);
+        assert_eq!(driver.state().phase, PreparePhase::FinalizePlanAdmitted);
+        assert_eq!(driver.state().admission_id.as_deref(), Some("admission"));
+        assert!(authority.rights);
+        driver
+            .advance(&settings, &mut authority, &mut journal, &mut |_| {
+                panic!("finalize planning must not dispatch a callback")
+            })
+            .unwrap();
     }
 
     #[test]
