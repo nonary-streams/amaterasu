@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base64 = "0.22"
 amaterasu-abi.workspace = true
 amaterasu-contracts.workspace = true
 amaterasu-extension-api = { path = "../extension-api" }

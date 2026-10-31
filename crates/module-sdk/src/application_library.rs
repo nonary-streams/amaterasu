@@ -213,9 +213,9 @@ mod tests {
     }
 }
 
-/// Domain types for independently implemented library providers. These types
-/// specify proposed provider payloads; registration and routing of this provider
-/// protocol are not implemented by the current library facade.
+/// Domain types for independently implemented library providers. Registration,
+/// selection, routing, and lifecycle ownership require host-side configuration
+/// and support; these types alone do not activate a provider.
 pub mod provider {
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeSet;
@@ -460,3 +460,7 @@ mod provider_tests {
         );
     }
 }
+
+/// Adapter for a broker-registered provider service. Host-side routing and
+/// lifecycle ownership remain separate responsibilities.
+pub mod provider_adapter;

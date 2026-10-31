@@ -34,8 +34,10 @@ IDs. Do not infer successful launch, termination, or cleanup from a timeout.
 
 Artwork references are provider-owned and opaque. Existing Steam and Lutris
 artwork reads use provider-specific revision-pinned chunk protocols; the SDK
-also defines proposed provider discovery, artwork and lifecycle domain types.
-These proposals are not registered, routed, or enforced by the current facade.
+also defines provider discovery, artwork and lifecycle domain types and a
+broker-facing provider adapter. Host-side selection and routing require
+explicit configuration; lifecycle operations are not routed by the launch
+coordinator.
 The artwork validator pins chunks to a reference, revision, MIME, length, and
 offset; the consumer must retain these values across the stream. Do not treat a
 reference as a local path or assume a generic provider can serve it.
