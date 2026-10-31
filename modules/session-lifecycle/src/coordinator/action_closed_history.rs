@@ -41,6 +41,9 @@ impl ClosedActionCertificate {
     ) -> ModuleResult<Self> {
         let marker = action_disposition::verified_marker_at(journal, session_id, owner, generation)
             .ok_or("action_closure_marker_unproven")?;
+        if marker.resource_generation != generation {
+            return Err("action_closure_generation_mismatch".into());
+        }
         let session = journal.sessions.get(session_id).ok_or("unknown_session")?;
         let current = *session
             .resource_generations
@@ -161,6 +164,15 @@ mod tests {
         let mut binding = cert.binding.clone();
         binding.operation_id = "other".into();
         assert!(!restored.matches_retry("actions", &binding, "permit", &proof));
+        let mut wrong_generation = cert.binding.clone();
+        if let ActionTarget::Session {
+            expected_generation,
+            ..
+        } = &mut wrong_generation.target
+        {
+            *expected_generation += 1;
+        }
+        assert!(!restored.matches_retry("actions", &wrong_generation, "permit", &proof));
         let mut invalid = restored.clone();
         invalid.replacement_generation = invalid.resource_generation;
         assert!(!invalid.matches_retry("actions", &cert.binding, "permit", &proof));
