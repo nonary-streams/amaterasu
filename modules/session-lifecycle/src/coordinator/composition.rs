@@ -96,8 +96,16 @@ impl CompositionSelectionSnapshot {
                 &finalize.owner_provider,
                 &finalize.method,
             )
-            || !approval_is_valid(&self.control_status_approval, &policy.owner_provider)
-            || !approval_is_valid(&self.finalize_status_approval, &policy.owner_provider)
+            || !approval_matches(
+                &self.control_status_approval,
+                &policy.owner_provider,
+                &policy.status_method,
+            )
+            || !approval_matches(
+                &self.finalize_status_approval,
+                &finalize.owner_provider,
+                &finalize.status_method,
+            )
             || self.schema_documents.len() > 32
             || self
                 .schema_documents
@@ -775,6 +783,16 @@ mod tests {
             }],
         };
         assert!(snapshot.validate_structure());
+        let mut wrong_status = snapshot.clone();
+        wrong_status.control_status_approval.method.method = "other".into();
+        wrong_status.control_status_approval.broker_approval["method"]["method"] = json!("other");
+        assert!(!wrong_status.validate_structure());
+        let mut wrong_finalize_status = snapshot.clone();
+        wrong_finalize_status
+            .finalize_status_approval
+            .method
+            .schema_revision += 1;
+        assert!(!wrong_finalize_status.validate_structure());
         let mut book = CompositionBook::default();
         let selected = OutputSelection {
             producer: stored.output.producer.clone(),
