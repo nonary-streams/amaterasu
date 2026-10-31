@@ -36,7 +36,8 @@ impl ClosedStreamBook {
             && self.expired_scopes.iter().all(|item| valid_digest(item))
             && self.records.iter().enumerate().all(|(index, record)| {
                 record.valid(journal)
-                    && !self.scope_fenced(&record.target)
+                    && scope_digest(&record.target)
+                        .is_some_and(|digest| !self.expired_scopes.contains(&digest))
                     && !self.records[..index]
                         .iter()
                         .any(|old| old.target == record.target)
@@ -55,16 +56,17 @@ impl ClosedStreamBook {
         Ok(())
     }
 
-    fn scope_fenced(&self, target: &LifecycleTarget) -> bool {
-        scope_digest(target).is_some_and(|digest| self.expired_scopes.contains(&digest))
+    pub(super) fn scope_fenced(&self, target: &LifecycleTarget) -> bool {
+        self.contains_target(target)
+            || scope_digest(target).is_some_and(|digest| self.expired_scopes.contains(&digest))
     }
 
-    fn released_output_for_target<'a>(
+    pub(super) fn released_output_for_target<'a>(
         &'a self,
         journal: &Journal,
         target: &LifecycleTarget,
     ) -> Option<(&'a str, &'a amaterasu_extension_api::ResourceOutput)> {
-        if !self.validate(journal) || self.scope_fenced(target) {
+        if !self.validate(journal) {
             return None;
         }
         let record = self.records.iter().find(|item| &item.target == target)?;
@@ -119,7 +121,7 @@ impl ClosedStreamBook {
         journal: &Journal,
         target: &LifecycleTarget,
     ) -> Option<&'a ClosedStream> {
-        if !self.validate(journal) || self.scope_fenced(target) {
+        if !self.validate(journal) {
             return None;
         }
         let mut matches = self
