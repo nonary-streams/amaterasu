@@ -100,7 +100,11 @@ def check_provider(descriptor: dict, component: dict, approvals: list, provider:
                 or action.get("execute") != action_ref("action_execute")
                 or action.get("status") != action_ref("action_status")):
             raise ValueError("unsupported owner action contract")
-    expected_methods = methods | ACTION_METHODS if provider == OWNER and actions else methods
+    allowed_method_sets = [methods]
+    if provider == OWNER:
+        allowed_method_sets.append(methods | ACTION_METHODS)
+    if actions:
+        allowed_method_sets = [methods | ACTION_METHODS]
     names = []
     for approval in approvals:
         if not isinstance(approval, dict) or approval.get("provider") != provider:
@@ -110,7 +114,7 @@ def check_provider(descriptor: dict, component: dict, approvals: list, provider:
             raise ValueError("approval does not select v2")
         check_method_schema(method)
         names.append(method.get("method"))
-    if len(names) != len(expected_methods) or set(names) != expected_methods:
+    if len(names) != len(set(names)) or set(names) not in allowed_method_sets:
         raise ValueError("provider method approvals are incomplete, duplicated or unexpected")
 
 

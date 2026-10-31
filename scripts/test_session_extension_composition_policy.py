@@ -63,6 +63,51 @@ class CompositionPolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported owner action"):
             policy.provider_entries(self.selected, True)
 
+    def test_registered_but_unadvertised_actions_remain_unauthorized(self):
+        for name in sorted(check.ACTION_METHODS):
+            approval = copy.deepcopy(self.owner["approvals"][0])
+            approval["method"]["method"] = name
+            self.owner["approvals"].append(approval)
+        result = policy.provider_entries(self.selected)
+        self.assertEqual(result["input_actions"], [])
+        self.assertEqual(result["action_grants"], [])
+        with self.assertRaisesRegex(ValueError, "does not advertise"):
+            policy.provider_entries(self.selected, True)
+
+    def test_action_profile_requires_owner_grants_and_full_call_chain(self):
+        self.owner["descriptor"]["actions"] = [{"id": check.OWNER + "/remove-owned", "execution": "session_mutation",
+            "allowed_targets": ["session", "stream"], "arguments": {},
+            "plan": policy.method_ref(check.OWNER, "action_plan"),
+            "execute": policy.method_ref(check.OWNER, "action_execute"),
+            "status": policy.method_ref(check.OWNER, "action_status")}]
+        for name in sorted(check.ACTION_METHODS):
+            approval = copy.deepcopy(self.owner["approvals"][0])
+            approval["method"]["method"] = name
+            self.owner["approvals"].append(approval)
+        entries = policy.provider_entries(self.selected, True)
+        identities = [legacy.NVHTTP, legacy.RTSP, legacy.STREAM, legacy.INPUT,
+                      legacy.MANAGEMENT, legacy.CONSOLE]
+        base = {"policy": {"principals": {identity: {"call": []} for identity in identities},
+                           "settings": {legacy.NVHTTP: {"streaming": {"capture": {}}}},
+                           "api_methods": []}}
+        lifecycle = {"operation_grants": {check.OWNER: ["verify_action_effect", "check_action_effect"]}}
+        with self.assertRaisesRegex(ValueError, "owner action operation grants"):
+            policy.build_bootstrap(base, self.selected, entries, lifecycle, True)
+        lifecycle["operation_grants"][check.OWNER] = sorted(policy.ACTION_OWNER_OPERATIONS)
+        bootstrap, calls = policy.build_bootstrap(base, self.selected, entries, lifecycle, True)
+        for identity in (legacy.INPUT, legacy.ACTIONS, legacy.STREAM):
+            if identity != legacy.ACTIONS:
+                self.assertIn(legacy.ACTIONS_SERVICE, calls[identity])
+            self.assertIn(legacy.LIFECYCLE_SERVICE, calls[identity])
+            self.assertIn(check.OWNER + "/2", calls[identity])
+            self.assertIn("amaterasu.virtual-display/1", calls[identity])
+        self.assertIn(legacy.LIFECYCLE_SERVICE, calls[legacy.LIFECYCLE])
+        self.assertEqual(bootstrap["policy"]["settings"][legacy.LIFECYCLE]["input_actions"],
+                         [check.OWNER + "/remove-owned"])
+        disabled_entries = policy.provider_entries(self.selected)
+        with self.assertRaisesRegex(ValueError, "action authorization"):
+            policy.build_bootstrap(base, self.selected, disabled_entries, lifecycle, True)
+
     def test_missing_duplicate_and_mismatched_provider_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "both selected"):
             policy.provider_entries([self.owner])

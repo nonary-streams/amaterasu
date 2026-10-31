@@ -11,6 +11,9 @@ import copy
 import check_session_extension_composition as check
 import prepare_session_extension_profile as legacy
 
+ACTION_OWNER_OPERATIONS = {"describe_action_target", "inspect_action_effect",
+                           "verify_action_effect", "check_action_effect"}
+
 
 def method_ref(provider: str, name: str) -> dict:
     return {"service": provider + "/2", "method": name, "interface_major": 2,
@@ -168,6 +171,12 @@ def build_bootstrap(base: dict, selected: list[dict], entries: dict, lifecycle_s
     lifecycle = copy.deepcopy(lifecycle_settings)
     if any(name in lifecycle for name in ("participants", "input_actions")):
         raise ValueError("lifecycle settings must not override selected participants or actions")
+    expected_actions = [check.OWNER + "/remove-owned"] if enable_action else []
+    if entries["input_actions"] != expected_actions or bool(entries["action_grants"]) != enable_action:
+        raise ValueError("action authorization does not match the profile selection")
+    owner_operations = lifecycle.get("operation_grants", {}).get(check.OWNER, [])
+    if enable_action and not ACTION_OWNER_OPERATIONS <= set(owner_operations):
+        raise ValueError("owner action operation grants are incomplete")
     lifecycle["participants"] = copy.deepcopy(entries["participants"])
     lifecycle["input_actions"] = copy.deepcopy(entries["input_actions"])
     settings[legacy.LIFECYCLE] = lifecycle

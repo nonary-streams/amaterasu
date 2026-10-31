@@ -106,7 +106,9 @@ class CompositionPreflightTest(unittest.TestCase):
             self.approvals.append(item)
         self.check()
         self.descriptor["actions"] = []
-        with self.assertRaisesRegex(ValueError, "unexpected"):
+        self.check()  # Registered action methods alone do not publish an action.
+        self.approvals.pop()
+        with self.assertRaisesRegex(ValueError, "incomplete"):
             self.check()
 
 
