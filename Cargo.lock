@@ -508,7 +508,10 @@ dependencies = [
 name = "amaterasu-lutris"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-contracts",
  "amaterasu-module-sdk",
+ "amaterasu-runtime",
+ "libloading",
  "rusqlite",
  "serde",
  "serde_json",

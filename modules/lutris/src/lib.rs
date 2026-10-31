@@ -762,6 +762,8 @@ fn scan_is_due(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    mod artwork_broker_tests;
     use super::*;
     use crate::discovery::{Game, Snapshot};
     use crate::settings::Exclusion;
