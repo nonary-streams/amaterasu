@@ -579,6 +579,48 @@ mod tests {
     fn certified_replaced_root_retires_atomically() {
         let (mut journal, _, mut root) = resource_generation::tests::fixture();
         journal.receipts.clear();
+        let input = crate::input_authority::ActiveBinding {
+            host_epoch: "epoch".into(),
+            session_id: "session".into(),
+            stream_id: "stream".into(),
+            generation: 2,
+            geometry_revision: 1,
+            input_consumer: "input".into(),
+            allowed_actions: BTreeSet::from(["display".into()]),
+        };
+        let token = journal.inputs.issue_input_binding(&input).unwrap();
+        let target = ActionTarget::Stream {
+            host_epoch: "epoch".into(),
+            session_id: "session".into(),
+            stream_id: "stream".into(),
+            expected_generation: 2,
+        };
+        let crate::input_authority::ReservationResult::Admitted(reservation) = journal
+            .inputs
+            .reserve_input_action_for_target(
+                "input",
+                "client",
+                "input-operation",
+                &token,
+                "display",
+                &input,
+                &target,
+            )
+            .unwrap()
+        else {
+            panic!("new input must be admitted")
+        };
+        let receipt = journal
+            .inputs
+            .finish_input_action(
+                "input",
+                "client",
+                "input-operation",
+                &reservation.reservation_id,
+                crate::input_authority::Outcome::Completed,
+            )
+            .unwrap();
+        journal.inputs.fence(&input);
         journal.sessions.get_mut("session").unwrap().provider_graph = Some(ProviderGraph {
             order: vec!["owner".into()],
             dependencies: BTreeMap::from([("owner".into(), vec![])]),
@@ -726,6 +768,18 @@ mod tests {
                 .closed_actions
                 .historical_root("root", "prepare", "owner", 7)
                 .is_some()
+        );
+        assert_eq!(
+            recovered
+                .inputs
+                .lookup_input_action("input", "client", "input-operation"),
+            Ok(receipt)
+        );
+        assert_eq!(
+            recovered
+                .inputs
+                .resolve_running_reservation(&reservation.reservation_id),
+            Err(crate::input_authority::Error::NotFound)
         );
     }
 
