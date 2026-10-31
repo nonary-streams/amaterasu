@@ -29,6 +29,17 @@ pub(super) struct VerifiedRelease<'a> {
 }
 
 impl ComposedReleaseBook {
+    fn unique_proof(&self, target: &LifecycleTarget) -> Option<&Proof> {
+        let mut matches = self
+            .proofs
+            .iter()
+            .filter(|proof| &proof.work.target == target);
+        let proof = matches.next()?;
+        matches.next().is_none().then_some(proof)
+    }
+    pub fn contains_target(&self, target: &LifecycleTarget) -> bool {
+        self.proofs.iter().any(|proof| &proof.work.target == target)
+    }
     pub fn references_admission(&self, id: &str) -> bool {
         self.proofs.iter().any(|proof| {
             proof
@@ -48,9 +59,8 @@ impl ComposedReleaseBook {
             })
     }
     pub fn has_valid_release(&self, journal: &Journal, target: &LifecycleTarget) -> bool {
-        self.proofs
-            .iter()
-            .any(|proof| &proof.work.target == target && verify(journal, proof).is_ok())
+        self.unique_proof(target)
+            .is_some_and(|proof| verify(journal, proof).is_ok())
     }
     /// Return only the exact transition's fully verified retained callbacks.
     #[allow(dead_code)] // Used by the action transfer integration.
@@ -60,9 +70,10 @@ impl ComposedReleaseBook {
         target: &LifecycleTarget,
         transition_id: &str,
     ) -> Option<&'a Work> {
-        let proof = self.proofs.iter().find(|proof| {
-            &proof.work.target == target && proof.work.transition_id == transition_id
-        })?;
+        let proof = self.unique_proof(target)?;
+        if proof.work.transition_id != transition_id {
+            return None;
+        }
         verify(journal, proof).ok().map(|()| &proof.work)
     }
     #[allow(dead_code)] // Consumed by closure/checkpoint integration.
@@ -72,9 +83,10 @@ impl ComposedReleaseBook {
         target: &LifecycleTarget,
         transition_id: &str,
     ) -> Option<VerifiedRelease<'a>> {
-        let proof = self.proofs.iter().find(|proof| {
-            &proof.work.target == target && proof.work.transition_id == transition_id
-        })?;
+        let proof = self.unique_proof(target)?;
+        if proof.work.transition_id != transition_id {
+            return None;
+        }
         verify(journal, proof).ok()?;
         let finalized = journal.finalize_results.records().find(|record| {
             record.request.permit_id == proof.finalize_permit_id && record.request.target == *target
@@ -89,10 +101,7 @@ impl ComposedReleaseBook {
         &self,
         target: &LifecycleTarget,
     ) -> Option<(&str, &amaterasu_extension_api::ResourceOutput)> {
-        let proof = self
-            .proofs
-            .iter()
-            .find(|proof| &proof.work.target == target)?;
+        let proof = self.unique_proof(target)?;
         let owner = &proof.released_output.producer;
         let admission = proof.work.states.get(owner)?.admission_id.as_deref()?;
         Some((admission, &proof.released_output))

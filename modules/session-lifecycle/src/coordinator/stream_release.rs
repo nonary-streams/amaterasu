@@ -77,10 +77,11 @@ impl StreamReleaseBook {
         })
     }
     pub fn has_valid_released(&self, journal: &Journal, target: &LifecycleTarget) -> bool {
-        self.proofs
-            .iter()
-            .find(|proof| &proof.target == target)
-            .is_some_and(|proof| validate_proof(journal, proof))
+        let mut matches = self.proofs.iter().filter(|proof| &proof.target == target);
+        let Some(proof) = matches.next() else {
+            return false;
+        };
+        matches.next().is_none() && validate_proof(journal, proof)
     }
     pub fn has_released(&self, target: &LifecycleTarget) -> bool {
         self.proofs.iter().any(|proof| &proof.target == target)

@@ -467,16 +467,16 @@ impl Journal {
         &self,
         target: &LifecycleTarget,
     ) -> Option<(&str, &amaterasu_extension_api::ResourceOutput)> {
-        let standalone = self
-            .stream_releases
-            .released_output_for_target(target)
-            .filter(|_| self.stream_releases.has_valid_released(self, target));
-        let composed = self
-            .composed_releases
-            .released_output_for_target(target)
-            .filter(|_| self.composed_releases.has_valid_release(self, target));
-        match (standalone, composed) {
-            (Some(value), None) | (None, Some(value)) => Some(value),
+        match (
+            self.stream_releases.has_released(target),
+            self.composed_releases.contains_target(target),
+        ) {
+            (true, false) if self.stream_releases.has_valid_released(self, target) => {
+                self.stream_releases.released_output_for_target(target)
+            }
+            (false, true) if self.composed_releases.has_valid_release(self, target) => {
+                self.composed_releases.released_output_for_target(target)
+            }
             _ => None,
         }
     }
