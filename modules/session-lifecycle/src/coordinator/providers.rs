@@ -1293,7 +1293,10 @@ impl Coordinator {
                     if roots.next().is_some() {
                         return Err("session_root_ambiguous".into());
                     }
-                    vec![root.output.clone()]
+                    vec![super::session_release::session_release_input(
+                        &shared.value,
+                        root,
+                    )?]
                 } else if standalone_v2 && work.phase == LifecyclePhase::StreamRelease {
                     let shared = self.shared.borrow();
                     let mut results = shared.value.finalize_results.records().filter(|record| {
