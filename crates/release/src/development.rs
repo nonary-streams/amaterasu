@@ -283,7 +283,7 @@ pub fn build_package(
     sequence: u64,
     profile: PackageProfile,
 ) -> PackageResult<()> {
-    build_package_with_external(root, artifacts, output, sequence, profile, None)
+    build_package_with_external(root, artifacts, output, sequence, profile, None, None)
 }
 
 /// Include an explicitly selected independently built component in a complete signed set.
@@ -294,6 +294,7 @@ pub fn build_package_with_external(
     sequence: u64,
     profile: PackageProfile,
     external: Option<(&Path, &Path)>,
+    call_grants: Option<&Path>,
 ) -> PackageResult<()> {
     let bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json"))?;
     if !bootstrap.development {
@@ -302,6 +303,17 @@ pub fn build_package_with_external(
     let external = external
         .map(|(template, artifact)| read_external_component(template, artifact, &bootstrap))
         .transpose()?;
+    let call_grants = match call_grants {
+        Some(path) => {
+            let external = external
+                .as_ref()
+                .ok_or("call grants require an external component")?;
+            let grants: BTreeMap<String, BTreeSet<String>> = read_json(path)?;
+            validate_external_call_grants(&grants, profile, external, &bootstrap)?;
+            grants
+        }
+        None => BTreeMap::new(),
+    };
     let secret: String = read_json(&root.join("development-key.json"))?;
     let signing_key = SigningKey::from_bytes(&decode_hex::<32>(&secret)?);
     let authority = if matches!(profile, PackageProfile::LinuxSession)
@@ -326,6 +338,7 @@ pub fn build_package_with_external(
         x264_runtime_available,
         authority.as_ref(),
         external.as_ref(),
+        &call_grants,
     )?;
     if external.is_some() {
         verify_package(
@@ -2480,6 +2493,7 @@ fn build_signed_package_with_runtime_probe(
         runtime_available,
         None,
         None,
+        &BTreeMap::new(),
     )
 }
 
@@ -2494,6 +2508,7 @@ fn build_signed_package_with_runtime_probe_and_authority(
     runtime_available: impl FnOnce(u32) -> bool,
     authority: Option<&crate::capture_authority_package::PackageSpec>,
     external: Option<&ExternalComponent>,
+    call_grants: &BTreeMap<String, BTreeSet<String>>,
 ) -> PackageResult<()> {
     if authority.is_some() && !matches!(profile, PackageProfile::LinuxSession) {
         return Err("capture authority is only supported by the Linux session package".into());
@@ -2536,6 +2551,12 @@ fn build_signed_package_with_runtime_probe_and_authority(
         fs::write(output.join(&external.manifest.file), &external.bytes)
             .map_err(|error| error.to_string())?;
         components.push(external.manifest.clone());
+    }
+
+    for component in &mut components {
+        if let Some(calls) = call_grants.get(&component.id) {
+            component.requested.call.extend(calls.iter().cloned());
+        }
     }
 
     let privileged_requests = authority
@@ -2815,6 +2836,39 @@ fn read_external_component(
     Ok(ExternalComponent { manifest, bytes })
 }
 
+fn validate_external_call_grants(
+    calls: &BTreeMap<String, BTreeSet<String>>,
+    profile: PackageProfile,
+    external: &ExternalComponent,
+    bootstrap: &BootstrapConfig,
+) -> PackageResult<()> {
+    for (component, services) in calls {
+        if !profile
+            .components()
+            .iter()
+            .any(|entry| entry.id == component && entry.id != RUNTIME_ID)
+        {
+            return Err(format!(
+                "call grant target is not a selected component: {component}"
+            ));
+        }
+        let installed =
+            bootstrap.policy.principals.get(component).ok_or_else(|| {
+                format!("call grant target has no installed approval: {component}")
+            })?;
+        for service in services {
+            if !external.manifest.requested.provide.contains(service)
+                || !installed.call.contains(service)
+            {
+                return Err(format!(
+                    "external call is not provided and separately approved: {component} -> {service}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn copy_component(
     artifacts: &Path,
     output: &Path,
@@ -2933,6 +2987,45 @@ mod external_component_tests {
             .policy
             .principals
             .insert(manifest.id.clone(), manifest.requested.clone());
+        let calls_path = base.join("calls.json");
+        let forbidden = BTreeMap::from([("not.selected", ["example.display/1"])]);
+        fs::write(&calls_path, serde_json::to_vec(&forbidden).unwrap()).unwrap();
+        write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
+        assert!(
+            build_package_with_external(
+                &root,
+                &artifacts,
+                &output,
+                1,
+                PackageProfile::Example,
+                Some((&template, &artifact)),
+                Some(&calls_path),
+            )
+            .is_err()
+        );
+        let calls = BTreeMap::from([("amaterasu.example-echo", ["example.display/1"])]);
+        fs::write(&calls_path, serde_json::to_vec(&calls).unwrap()).unwrap();
+        write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
+        assert!(
+            build_package_with_external(
+                &root,
+                &artifacts,
+                &output,
+                1,
+                PackageProfile::Example,
+                Some((&template, &artifact)),
+                Some(&calls_path),
+            )
+            .is_err()
+        );
+        assert!(!output.exists());
+        bootstrap
+            .policy
+            .principals
+            .get_mut("amaterasu.example-echo")
+            .unwrap()
+            .call
+            .insert("example.display/1".into());
         write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
         build_package_with_external(
             &root,
@@ -2941,6 +3034,7 @@ mod external_component_tests {
             1,
             PackageProfile::Example,
             Some((&template, &artifact)),
+            Some(&calls_path),
         )
         .unwrap();
         let policy = VerificationPolicy {
@@ -2950,6 +3044,22 @@ mod external_component_tests {
         };
         let verified = verify_package(&output, &bootstrap, policy).unwrap();
         assert!(verified.signed);
+        assert!(
+            verified
+                .manifest
+                .components
+                .iter()
+                .find(|entry| entry.id == "amaterasu.example-echo")
+                .unwrap()
+                .requested
+                .call
+                .contains("example.display/1")
+        );
+        assert!(
+            verified.runtime_config.principals["amaterasu.example-echo"]
+                .call
+                .contains("example.display/1")
+        );
         assert!(
             verified
                 .manifest
