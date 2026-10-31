@@ -24,7 +24,11 @@ pub struct Capabilities {
     pub create: bool,
     pub reconfigure: bool,
     pub borrow: bool,
+    /// Whether recovery is supported during this provider process. This alone
+    /// does not promise recovery after a restart.
     pub recovery: bool,
+    /// Current provider-scoped revision for an initial fenced mutation, when available.
+    pub topology: Option<TopologyRevision>,
     pub layouts: Vec<Layout>,
 }
 
@@ -105,7 +109,8 @@ pub enum ModeObservation {
 
 /// Mutations must compare the expected topology before native effects. A
 /// provider must bind every reference and borrow to the authenticated caller.
-/// Recover observes the outcome for an earlier operation; it is not an undo.
+/// Recover observes a retained outcome; it is not an undo. An unknown or lost
+/// record must not be reported as proof that an effect did not occur.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
@@ -144,6 +149,12 @@ pub enum Request {
         acceptance: ModeAcceptance,
     },
     Recover {
+        owner: OwnerReference,
+        operation_id: String,
+    },
+    /// Forget an outcome after the caller has reconciled it. This does not
+    /// cancel or undo an effect. Never reuse the released operation ID.
+    ReleaseOperation {
         owner: OwnerReference,
         operation_id: String,
     },
@@ -215,6 +226,10 @@ impl Request {
             Self::Recover {
                 owner: o,
                 operation_id,
+            }
+            | Self::ReleaseOperation {
+                owner: o,
+                operation_id,
             } => owner(o) && token(operation_id),
         }
     }
@@ -224,6 +239,8 @@ impl Request {
 #[serde(rename_all = "snake_case")]
 pub enum EffectState {
     Pending,
+    /// The provider reports the effect ready. Mode and HDR still require an
+    /// observed outcome and the caller's acceptance check.
     Applied,
     Removed,
     Absent,
@@ -250,6 +267,8 @@ pub enum Reply {
         current: TopologyRevision,
     },
     NotOwned,
+    /// The provider forgot its retry record; this is not display removal.
+    OperationReleased,
     Conflict,
     InvalidRequest,
     ResourceExhausted,

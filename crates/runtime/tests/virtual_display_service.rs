@@ -108,6 +108,7 @@ impl Provider for FakeProvider {
                     reconfigure: false,
                     borrow: false,
                     recovery: true,
+                    topology: Some(topology(self.revision)),
                     layouts: vec![Layout::Extended],
                 },
             },

@@ -1390,3 +1390,247 @@ fn lost_completion_cleans_new_monitor_but_preserves_idempotent_retry() {
     assert_eq!(manager.monitors.values().next().unwrap().state, "ready");
     assert_eq!(calls.borrow().feeds.len(), 1);
 }
+
+#[test]
+fn typed_adapter_routes_real_manager_through_broker_without_legacy_regression() {
+    use amaterasu_contracts::{ApiMethodApproval, Command, Grants, RuntimeConfig};
+    use amaterasu_module_sdk::{
+        RuntimeClient,
+        abi::{AbiHeader, BorrowedBytes, HostApi, ReplySink, STATUS_OK},
+        requests::RequestOptions,
+        service::{CallOptions, ServiceMethod},
+        virtual_display_service::{
+            self as display, DisplayService, EffectState, Layout, Mode, ModeAcceptance,
+            ModeObservation, OwnerReference, Reply, Request, TopologyRevision,
+        },
+    };
+    use amaterasu_runtime::Broker;
+    use std::{
+        ffi::c_void,
+        sync::{Arc, Mutex},
+    };
+
+    struct Endpoint {
+        broker: Arc<Mutex<Broker>>,
+        principal: &'static str,
+    }
+    unsafe extern "C" fn invoke(
+        context: *mut c_void,
+        input: BorrowedBytes,
+        reply: ReplySink,
+    ) -> i32 {
+        // SAFETY: endpoint and request remain valid for this synchronous invocation.
+        let endpoint = unsafe { &*context.cast::<Endpoint>() };
+        let command: Command = serde_json::from_slice(unsafe { input.read().unwrap() }).unwrap();
+        let result = endpoint
+            .broker
+            .lock()
+            .unwrap()
+            .dispatch(endpoint.principal, command);
+        let bytes = serde_json::to_vec(&result).unwrap();
+        // SAFETY: the reply sink copies bytes before returning.
+        unsafe { reply.send(&bytes) };
+        STATUS_OK
+    }
+    fn client(endpoint: &Endpoint) -> RuntimeClient {
+        let host = HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: (endpoint as *const Endpoint).cast_mut().cast(),
+            invoke,
+        };
+        // SAFETY: the endpoint outlives all calls using its RuntimeClient.
+        unsafe { RuntimeClient::from_endpoint(host) }
+    }
+    fn options(id: &str) -> CallOptions<'_> {
+        CallOptions {
+            timeout_ms: 5000,
+            operation_id: id,
+            parent: None,
+        }
+    }
+    let method = DisplayService::method();
+    let mut config = RuntimeConfig::default();
+    config.principals.insert(
+        "provider".into(),
+        Grants {
+            provide: [method.service.clone(), crate::SERVICE.into()].into(),
+            ..Default::default()
+        },
+    );
+    for caller in ["alice", "bob"] {
+        config.principals.insert(
+            caller.into(),
+            Grants {
+                call: [method.service.clone(), crate::SERVICE.into()].into(),
+                ..Default::default()
+            },
+        );
+    }
+    config.api_methods.push(ApiMethodApproval {
+        provider: "provider".into(),
+        callers: ["alice".into(), "bob".into()].into(),
+        method,
+    });
+    let broker = Arc::new(Mutex::new(Broker::new(config).unwrap()));
+    let p = Endpoint {
+        broker: broker.clone(),
+        principal: "provider",
+    };
+    let a = Endpoint {
+        broker: broker.clone(),
+        principal: "alice",
+    };
+    let b = Endpoint {
+        broker,
+        principal: "bob",
+    };
+    let provider = client(&p);
+    let alice = client(&a);
+    let bob = client(&b);
+    provider
+        .require_success(Command::Register {
+            service: crate::SERVICE.into(),
+        })
+        .unwrap();
+    display::register(&provider).unwrap();
+    let (mut manager, calls) = setup(true);
+    let mut adapter = crate::service_adapter::Adapter::default();
+    // The unchanged v1 path can create and retain an owned reference.
+    let legacy = alice
+        .request_serialized(
+            RequestOptions {
+                service: crate::SERVICE,
+                timeout_ms: 5000,
+                operation_id: "legacy",
+                parent: None,
+            },
+            &create_with_reference("stream"),
+        )
+        .unwrap();
+    let incoming = provider.poll_serialized().unwrap().unwrap();
+    let operation = incoming.decode::<Operation>().unwrap();
+    let (reply, _) = manager.admit(&incoming.caller, operation);
+    provider.complete_serialized(incoming.id, &reply).unwrap();
+    assert!(alice.take_serialized::<Value>(legacy).unwrap().unwrap()["ok"] == true);
+    assert_eq!(calls.borrow().creates.len(), 1);
+    let owner = OwnerReference {
+        identity: ID.into(),
+        reference_id: "stream".into(),
+    };
+    let mut exchange = |consumer: &RuntimeClient, id: &str, request| {
+        let call = display::call(consumer, options(id), request).unwrap();
+        let incoming = provider.poll_serialized().unwrap().unwrap();
+        crate::handle_display_api(&provider, &mut manager, &mut adapter, incoming).unwrap();
+        let reply = call.poll().unwrap().unwrap().reply;
+        assert!(call.release().is_ok());
+        reply
+    };
+    assert!(
+        matches!(exchange(&alice, "caps", Request::Capabilities), Reply::Capabilities { capabilities } if !capabilities.create && capabilities.topology.is_none())
+    );
+    assert!(matches!(
+        exchange(
+            &alice,
+            "inspect",
+            Request::Inspect {
+                owner: owner.clone()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Pending,
+            observation: ModeObservation::NotObserved,
+            ..
+        }
+    ));
+    assert_eq!(
+        exchange(
+            &bob,
+            "foreign",
+            Request::Inspect {
+                owner: owner.clone()
+            }
+        ),
+        Reply::NotOwned
+    );
+    assert_eq!(
+        exchange(
+            &alice,
+            "fenced",
+            Request::Create {
+                owner,
+                operation_id: "v2".into(),
+                expected: TopologyRevision {
+                    domain_id: "invented".into(),
+                    revision: 0
+                },
+                mode: Mode {
+                    width: 1920,
+                    height: 1080,
+                    refresh_millihz: 60000,
+                    hdr: false
+                },
+                acceptance: ModeAcceptance {
+                    max_refresh_delta_ppm: 0,
+                    require_hdr_match: true
+                },
+                name: "Test".into(),
+                layout: Layout::Exclusive,
+                scale: None
+            }
+        ),
+        Reply::Unavailable
+    );
+    assert_eq!(calls.borrow().creates.len(), 1);
+
+    // An old startup composition has no /2 grant or approval. Module startup
+    // must still register and answer the legacy service.
+    use amaterasu_module_sdk::ManagedModule;
+    let mut legacy_config = RuntimeConfig::default();
+    legacy_config.principals.insert(
+        "provider".into(),
+        Grants {
+            provide: [crate::SERVICE.into()].into(),
+            ..Default::default()
+        },
+    );
+    legacy_config.principals.insert(
+        "alice".into(),
+        Grants {
+            call: [crate::SERVICE.into()].into(),
+            ..Default::default()
+        },
+    );
+    let legacy_broker = Arc::new(Mutex::new(Broker::new(legacy_config).unwrap()));
+    let legacy_p = Endpoint {
+        broker: legacy_broker.clone(),
+        principal: "provider",
+    };
+    let legacy_a = Endpoint {
+        broker: legacy_broker,
+        principal: "alice",
+    };
+    let old_client = client(&legacy_a);
+    let mut module = crate::VirtualDisplayModule::start(client(&legacy_p)).unwrap();
+    let request = old_client
+        .request_serialized(
+            RequestOptions {
+                service: crate::SERVICE,
+                timeout_ms: 5000,
+                operation_id: "old-startup",
+                parent: None,
+            },
+            &Operation::Status {
+                identity: None,
+                reference_id: None,
+            },
+        )
+        .unwrap();
+    module.tick().unwrap();
+    assert!(
+        old_client
+            .take_serialized::<Value>(request)
+            .unwrap()
+            .unwrap()["ok"]
+            == true
+    );
+}

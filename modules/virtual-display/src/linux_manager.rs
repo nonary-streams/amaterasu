@@ -1462,3 +1462,6 @@ impl Drop for Manager {
         }
     }
 }
+
+#[cfg(test)]
+mod service_adapter_tests;
