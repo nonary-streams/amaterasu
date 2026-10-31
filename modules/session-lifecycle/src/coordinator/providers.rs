@@ -10,7 +10,7 @@ impl AuthorityJournal for AuthorityWriter {
         if next.admission_transitions.keys().any(|id| {
             !state.admissions.contains_key(id)
                 && !state.settled.contains_key(id)
-                && next.composition.references_admission(id)
+                && next.references_admission(id)
         }) {
             return Err("composition_admission_still_referenced".into());
         }
@@ -923,13 +923,7 @@ impl Coordinator {
                                 outcome.state == amaterasu_extension_api::CleanupState::Released
                             })
                         {
-                            if self
-                                .shared
-                                .borrow()
-                                .value
-                                .composition
-                                .references_admission(&id)
-                            {
+                            if self.shared.borrow().value.references_admission(&id) {
                                 composition_cleanup_blocked = true;
                             } else {
                                 authority.retire_settled(provider, &id, &matched)?;
@@ -1241,6 +1235,10 @@ impl Coordinator {
                         next.authority.admissions.contains_key(admission)
                             || next.authority.settled.contains_key(admission)
                             || next.composition.references_admission(admission)
+                            || next
+                                .control_settlements
+                                .records()
+                                .any(|record| &record.settlement.request.admission_id == admission)
                     })
                 {
                     return Err("session_cleanup_obligations_unresolved".into());
@@ -1509,6 +1507,7 @@ mod admission_target_tests {
             input_boot_epochs: Default::default(),
             retention: Default::default(),
             composition: Default::default(),
+            control_settlements: Default::default(),
             admission_transitions: Default::default(),
         };
         let target = LifecycleTarget::Stream {
@@ -1828,7 +1827,10 @@ mod output_finish_tests {
         let plan = json!({"plan_id":"plan","revision":1,"resources":[{"provider":"screen","resource_id":"output","incarnation":"native","expected_revision":1,"execution_domain":"seat","mutation_domains":[],"access":"read"}],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]});
         let output = json!({"output_id":"screen-output","capability":"screen/output","schema":schema,"producer":"screen","producer_service":"screen/2","origin":target,"resource":{"provider":"screen","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":null,"mutation_domains":[]},"data":{"ok":if mode == 2 { json!("bad") } else { json!(true) }}});
         let request = json!({"provider_sequence":1,"operation":"lifecycle_callback","version":2,"transition_id":"transition","operation_id":"callback","target":target,"phase":"session.prepare","settings_revision":"revision","settings":{},"intent":null,"reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector/1"]},"remaining_ms":1000,"plan_revision":1,"admission_id":"admission","approved_plan":plan});
-        let state: PrepareState = serde_json::from_value(json!({"provider":"screen","participant":participant,"request":request,"phase":"prepared","plan":plan,"admission_id":"admission","pending_receipt":null,"status_polls":0,"last_sequence":1,"dispatch":null,"response":{"status":"prepared","candidate":null,"obligations":[],"outputs":[output]}})).unwrap();
+        let mut state: PrepareState = serde_json::from_value(json!({"provider":"screen","participant":participant,"request":request,"phase":"prepared","plan":plan,"admission_id":"admission","pending_receipt":null,"status_polls":0,"last_sequence":1,"dispatch":null,"terminal_dispatch":{"call":{"service":"screen/2","method":"callback","interface_major":2,"interface_minor":1,"approval":{"provider":"screen","method":method},"arguments":request,"timeout_ms":1000,"operation_id":"callback"},"state":{"state":"completed","payload":{"status":"prepared","candidate":null,"obligations":[],"outputs":[output]}}},"response":{"status":"prepared","candidate":null,"obligations":[],"outputs":[output]}})).unwrap();
+        if mode == 3 {
+            state.terminal_dispatch = None;
+        }
         let mut settings = LifecycleSettings::default();
         settings
             .schema_documents
@@ -1897,7 +1899,7 @@ mod output_finish_tests {
                 0
             );
             std::fs::rename(&moved, &dir).unwrap();
-        } else if mode == 2 {
+        } else if mode == 2 || mode == 3 {
             let before = std::fs::read(dir.join("journal.json")).unwrap();
             assert!(writer.persist(&resulting_authority).is_err());
             assert_eq!(std::fs::read(dir.join("journal.json")).unwrap(), before);
@@ -1933,5 +1935,9 @@ mod output_finish_tests {
     #[test]
     fn invalid_schema_publishes_neither_output_nor_progress() {
         exercise_output_finish(2);
+    }
+    #[test]
+    fn missing_completed_callback_cannot_publish_output() {
+        exercise_output_finish(3);
     }
 }

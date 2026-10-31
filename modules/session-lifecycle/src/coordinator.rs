@@ -10,6 +10,8 @@ mod control_backend;
 mod control_dispatch;
 mod control_endpoints;
 #[allow(dead_code)]
+mod control_settlement;
+#[allow(dead_code)]
 mod finalize_dispatch;
 #[allow(dead_code)] // Finalization selection remains gated until composition sequencing is wired.
 mod finalize_selection;
@@ -276,9 +278,21 @@ struct Journal {
     retention: retention::Retention,
     #[serde(default)]
     composition: composition::CompositionBook,
+    #[serde(default)]
+    control_settlements: control_settlement::ControlSettlementBook,
     /// Immutable producing transition of each retained admission.
     #[serde(default)]
     admission_transitions: BTreeMap<String, String>,
+}
+
+impl Journal {
+    fn references_admission(&self, id: &str) -> bool {
+        self.composition.references_admission(id)
+            || self
+                .control_settlements
+                .records()
+                .any(|record| record.settlement.request.admission_id == id)
+    }
 }
 
 struct SharedJournal {
@@ -349,6 +363,7 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                 || session.admission_targets.get(&record.admission_id) != Some(target)
                 || admission.provider != record.output.producer
                 || admission.plan != record.plan
+                || !composition::validate_callback_provenance(record, admission)
                 || journal.admission_transitions.get(&record.admission_id)
                     != Some(&record.transition_id)
                 || !matches!(
@@ -420,6 +435,7 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                     || record.admission_id != selection.input.admission_id
                     || record.transition_id != selection.input.transition_id
                     || record.plan != selection.input.plan
+                    || record.callback_proof != selection.input.callback_proof
             }) {
                 return true;
             }
@@ -436,6 +452,59 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                         .as_ref()
                         == Some(&selection.target))
             })
+        })
+        || !journal.control_settlements.validate_structure()
+        || journal.control_settlements.records().any(|item| {
+            let request = &item.settlement.request;
+            let Some(permit) = journal.authority.control_permits.get(&request.permit_id) else {
+                return true;
+            };
+            let Some(admission) = journal
+                .authority
+                .admissions
+                .get(&request.admission_id)
+                .or_else(|| journal.authority.settled.get(&request.admission_id))
+            else {
+                return true;
+            };
+            let Some(selection) = journal.composition.selection(
+                &request.target,
+                &request.transition_id,
+                &permit.context.policy.dependent_provider,
+                &request.proposal.owner_provider,
+                &request.proposal.output_id,
+            ) else {
+                return true;
+            };
+            let catalog = amaterasu_extension_api::schemas::SchemaCatalog::compile(
+                selection
+                    .schema_documents
+                    .iter()
+                    .map(|doc| (doc.reference.clone(), doc.document.as_str())),
+            );
+            !permit.consumed
+                || permit.request != *request
+                || permit.context.target != request.target
+                || permit.context.transition_id != request.transition_id
+                || permit.context.policy != selection.control_policy
+                || permit.context.output != selection.input.output
+                || admission.provider != selection.control_policy.dependent_provider
+                || !admission.plan.control_proposals.contains(&request.proposal)
+                || permit.settled != item.owner_ack.is_some()
+                || item.owner_dispatch.as_ref().is_some_and(|dispatch| {
+                    dispatch.call.approval != selection.settlement_approval.broker_approval
+                        || !composition::approval_matches_call(
+                            &selection.settlement_approval,
+                            &dispatch.call,
+                        )
+                })
+                || item.confirmed.output.schema != selection.input.output.schema
+                || item.confirmed.output.origin != selection.input.output.origin
+                || !catalog.is_ok_and(|catalog| {
+                    catalog
+                        .validate(&item.confirmed.output.schema, &item.confirmed.output.data)
+                        .is_ok()
+                })
         })
         || journal.composition.refinements().any(|item| {
             let Some(permit) = journal
@@ -543,6 +612,7 @@ impl Coordinator {
             input_boot_epochs: BTreeMap::new(),
             retention: Default::default(),
             composition: Default::default(),
+            control_settlements: Default::default(),
             admission_transitions: Default::default(),
         });
         validate_journal(&journal)?;

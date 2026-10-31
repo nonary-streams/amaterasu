@@ -37,6 +37,19 @@ pub struct StoredOutput {
     pub transition_id: String,
     pub plan: ResourcePlan,
     pub state: OutputState,
+    /// Exact broker-completed producer callback; missing legacy proof never
+    /// authorizes materialization, cleanup or recovery.
+    #[serde(default)]
+    pub callback_proof: Option<ProducerCallbackProof>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProducerCallbackProof {
+    pub participant: crate::adapter::ParticipantSettings,
+    pub request: amaterasu_extension_api::ProviderRequest,
+    pub terminal: crate::provider_dispatch::DispatchRecord,
+    pub pending_receipt: Option<String>,
 }
 
 /// Authenticated control confirmation retained alongside its original
@@ -719,6 +732,24 @@ pub(super) fn collect_verified_outputs(
     {
         return Err("provider_approval_mismatch".into());
     }
+    let proof = ProducerCallbackProof {
+        participant: state.participant.clone(),
+        request: state.request.clone(),
+        terminal: state
+            .terminal_dispatch
+            .clone()
+            .ok_or("provider_terminal_proof_missing")?,
+        pending_receipt: state.pending_receipt.clone(),
+    };
+    if !valid_callback_proof(&proof, response)
+        || !selected.approvals.iter().any(|entry| {
+            entry.broker_approval == proof.terminal.call.approval
+                && approval_matches_call(entry, &proof.terminal.call)
+                && approval_is_valid(entry, provider)
+        })
+    {
+        return Err("provider_terminal_proof_invalid".into());
+    }
     let admission_id = state.admission_id.as_deref().ok_or("admission_missing")?;
     let admission = journal
         .authority
@@ -786,6 +817,7 @@ pub(super) fn collect_verified_outputs(
             transition_id: work.transition_id.clone(),
             plan: plan.clone(),
             state: OutputState::Retained,
+            callback_proof: Some(proof.clone()),
         };
         next.record(record, &output_selection, &work.target, &|value| {
             amaterasu_extension_api::validate_resource_output(value).is_ok()
@@ -796,6 +828,95 @@ pub(super) fn collect_verified_outputs(
     journal.composition = next;
     Ok(())
 }
+pub(super) fn approval_matches_call(
+    approval: &MethodApproval,
+    call: &crate::provider_dispatch::ProviderCall,
+) -> bool {
+    approval.method.service == call.service
+        && approval.method.method == call.method
+        && approval.method.interface_major == call.interface_major
+        && approval.method.interface_minor == call.interface_minor
+}
+
+fn valid_callback_proof(
+    proof: &ProducerCallbackProof,
+    response: &amaterasu_extension_api::ProviderResponse,
+) -> bool {
+    use crate::provider_dispatch::DispatchState;
+    let call = &proof.terminal.call;
+    let DispatchState::Completed { payload } = &proof.terminal.state else {
+        return false;
+    };
+    if serde_json::to_value(response).ok().as_ref() != Some(payload)
+        || amaterasu_extension_api::validate_provider_response(&proof.request, response).is_err()
+        || call
+            .approval
+            .get("provider")
+            .and_then(serde_json::Value::as_str)
+            != Some(proof.participant.provider.as_str())
+    {
+        return false;
+    }
+    let callback = &proof.participant.callback_method;
+    let status = &proof.participant.status_method;
+    let matches_method = |method: &crate::adapter::MethodSettings| {
+        call.service == method.service
+            && call.method == method.method
+            && call.interface_major == method.interface_major
+            && call.interface_minor == method.interface_minor
+    };
+    if matches_method(callback) {
+        return call.operation_id == proof.request.operation_id
+            && serde_json::to_value(&proof.request).ok().as_ref() == Some(&call.arguments);
+    }
+    if !matches_method(status) {
+        return false;
+    }
+    let Ok(request) = serde_json::from_value::<amaterasu_extension_api::ProviderStatusRequest>(
+        call.arguments.clone(),
+    ) else {
+        return false;
+    };
+    request.operation_id == proof.request.operation_id
+        && request.transition_id == proof.request.transition_id
+        && Some(&request.receipt_id) == proof.pending_receipt.as_ref()
+        && request.provider_sequence > proof.request.provider_sequence
+}
+
+pub(super) fn validate_callback_provenance(record: &StoredOutput, admission: &Admission) -> bool {
+    let Some(proof) = &record.callback_proof else {
+        return false;
+    };
+    let Ok(response) = serde_json::from_value::<amaterasu_extension_api::ProviderResponse>(
+        match &proof.terminal.state {
+            crate::provider_dispatch::DispatchState::Completed { payload } => payload.clone(),
+            _ => return false,
+        },
+    ) else {
+        return false;
+    };
+    amaterasu_extension_api::validate_provider_request(&proof.request).is_ok()
+        && proof.request.version == amaterasu_extension_api::COMPOSITION_VERSION
+        && proof.request.operation == amaterasu_extension_api::ProviderOperation::LifecycleCallback
+        && matches!(
+            proof.request.phase,
+            amaterasu_extension_api::LifecyclePhase::SessionPrepare
+                | amaterasu_extension_api::LifecyclePhase::StreamPrepare
+        )
+        && proof.participant == admission.selection.participant
+        && proof.request.target == record.output.origin
+        && proof.request.admission_id.as_deref() == Some(record.admission_id.as_str())
+        && proof.request.transition_id == record.transition_id
+        && proof.request.approved_plan.as_ref() == Some(&record.plan)
+        && admission.selection.approvals.iter().any(|approval| {
+            approval.broker_approval == proof.terminal.call.approval
+                && approval_matches_call(approval, &proof.terminal.call)
+                && approval_is_valid(approval, &admission.provider)
+        })
+        && matches!(&response, amaterasu_extension_api::ProviderResponse::Prepared { outputs, .. } if outputs.contains(&record.output))
+        && valid_callback_proof(proof, &response)
+}
+
 fn valid_text(value: &str) -> bool {
     !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
 }
@@ -946,6 +1067,7 @@ mod tests {
             transition_id: "transition".into(),
             plan,
             state: OutputState::Retained,
+            callback_proof: None,
         }
     }
     fn selection() -> OutputSelection {

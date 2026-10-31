@@ -205,7 +205,7 @@ mod tests {
         FinalizeSelectionSnapshot {
             target: serde_json::from_value(json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1})).unwrap(),
             parent_generation:Some(3),transition_id:"finalize-transition".into(),
-            input:StoredOutput {output:serde_json::from_value(output).unwrap(),admission_id:"admission".into(),transition_id:"prepare-transition".into(),plan:serde_json::from_value(plan).unwrap(),state:OutputState::Retained},
+            input:StoredOutput {output:serde_json::from_value(output).unwrap(),admission_id:"admission".into(),transition_id:"prepare-transition".into(),plan:serde_json::from_value(plan).unwrap(),state:OutputState::Retained,callback_proof:None},
             policy:serde_json::from_value(policy).unwrap(),finalize_approval:approval(&effect),finalize_status_approval:approval(&status),
             schema_documents:vec![SchemaDocument {reference:serde_json::from_value(schema).unwrap(),document:document.into()}],
         }

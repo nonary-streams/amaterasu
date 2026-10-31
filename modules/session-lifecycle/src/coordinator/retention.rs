@@ -78,6 +78,10 @@ fn has_composition_output(journal: &Journal, session_id: &str, stream_id: Option
         .composition
         .records()
         .any(|record| matches_target(&record.output.origin, session_id, stream_id))
+        || journal
+            .control_settlements
+            .records()
+            .any(|record| matches_target(&record.settlement.request.target, session_id, stream_id))
 }
 fn unresolved_receipt(receipt: &Receipt, session_id: &str, stream_id: Option<&str>) -> bool {
     let matches = receipt
