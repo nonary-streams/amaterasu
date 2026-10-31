@@ -71,7 +71,7 @@ namespace Amaterasu {
           const save = el("button", "button primary", "Save extension settings");
           save.type = "submit";
           save.disabled = !context.api.allows("configuration.write");
-          form.append(status, save);
+          form.append(el("p", "muted", "Stream settings apply to new or resumed streams. Running streams retain their existing snapshot; session settings apply to new sessions."), status, save);
           form.addEventListener("submit", (event) => {
             event.preventDefault();
             void runAction(save, status, async () => {
@@ -81,7 +81,7 @@ namespace Amaterasu {
                 else values[id] = entry.editor.value();
               }
               await context.api.post("session-extensions/settings_update", { provider: descriptor.provider, scope: { kind: "host" }, expected_revision: document.revision, values });
-              context.notify("Extension settings saved. Active sessions may use an earlier snapshot.");
+              context.notify("Extension settings saved. Stream settings apply to new or resumed streams; running streams retain their snapshot.");
               await load();
             });
           });
