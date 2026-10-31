@@ -959,7 +959,7 @@ impl Coordinator {
             let (_, session_id, _, _) = super::operations::target_parts(&stage.target)?;
             let stage_session = journal.sessions.get(session_id).ok_or("unknown_session")?;
             if !journal.composition.validate_structure()
-                || stage.before != selection.input.output
+                || !stage_input_is_authenticated(journal, &selection.input.output, stage)
                 || stage.transition_id != record.selection_transition_id
                 || stage.parent_generation != stage_session.generation
                 || !stage_session.admission_ids.contains(&stage.admission_id)
