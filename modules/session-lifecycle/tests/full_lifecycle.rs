@@ -86,7 +86,7 @@ impl Harness {
                     "operation_grants": {
                         "transport": ["prepare", "lookup", "snapshot", "prepare_stream", "start_stream", "pause_stream", "resume_stream", "end_session", "bind_application", "application_retired", "issue_input_binding"],
                         "capture": ["ack_binding", "retire_stream", "lookup"],
-                        "amaterasu.input": ["ack_binding", "lookup"]
+                        "amaterasu.input": ["ack_binding", "lookup", "validate_input_binding"]
                     }
                 }
             }
@@ -366,6 +366,15 @@ impl Harness {
         assert_eq!(ack["status"], "succeeded", "{ack}");
         let binding = self.call("transport", json!({"operation":"issue_input_binding","operation_id":format!("{operation}.input-token"),"target":target}));
         assert_eq!(binding["status"], "succeeded", "{binding}");
+        let token = binding["token"].clone();
+        let validate = |boot: &str| json!({"operation":"validate_input_binding","token":token,"input_boot_epoch":boot});
+        let valid = self.call("amaterasu.input", validate("fake-input-boot"));
+        assert_eq!(valid["status"], "succeeded", "{valid}");
+        let repeated = self.call("amaterasu.input", validate("fake-input-boot"));
+        assert_eq!(repeated["status"], "succeeded", "{repeated}");
+        let restarted = self.call("amaterasu.input", validate("different-input-boot"));
+        assert_eq!(restarted["status"], "rejected", "{restarted}");
+        assert_eq!(restarted["reason"], "input_provider_restarted");
         let input_id = format!("{operation}.input");
         let ack = self.call("amaterasu.input", json!({"operation":"ack_binding","operation_id":input_id,"target":target,"consumer":"input","plan_revision":1,"candidate":candidate}));
         assert_eq!(ack["status"], "pending", "{ack}");
