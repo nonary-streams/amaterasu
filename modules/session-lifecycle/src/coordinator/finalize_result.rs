@@ -17,6 +17,10 @@ pub(super) struct FinalizeResultRecord {
     pub selection: FinalizeSelectionSnapshot,
     pub plan_request: ProviderRequest,
     pub plan: ResourcePlan,
+    #[serde(default)]
+    pub plan_approval: Option<crate::prepare_authority::MethodApproval>,
+    #[serde(default)]
+    pub plan_terminal: Option<DispatchRecord>,
     pub request: ResourceFinalizeRequest,
     pub applied: ResourceControlResponse,
     pub terminal: DispatchRecord,
@@ -34,6 +38,26 @@ impl FinalizeResultRecord {
         else {
             return false;
         };
+        let Some(plan_approval) = &self.plan_approval else {
+            return false;
+        };
+        let Some(plan_terminal) = &self.plan_terminal else {
+            return false;
+        };
+        let DispatchState::Completed {
+            payload: plan_payload,
+        } = &plan_terminal.state
+        else {
+            return false;
+        };
+        let plan_matches = approval_matches_call(plan_approval, &plan_terminal.call)
+            && plan_terminal.call.approval == plan_approval.broker_approval
+            && plan_terminal.call.approval["provider"].as_str()
+                == Some(selection.policy.owner_provider.as_str())
+            && plan_terminal.call.operation_id == self.plan_request.operation_id
+            && serde_json::to_value(&self.plan_request).ok().as_ref()
+                == Some(&plan_terminal.call.arguments)
+            && matches!(serde_json::from_value::<ProviderResponse>(plan_payload.clone()), Ok(ProviderResponse::Planned { plan }) if plan == self.plan);
         let Some(constraint) = &self.plan.candidate_constraint else {
             return false;
         };
@@ -59,6 +83,7 @@ impl FinalizeResultRecord {
                 .map(|doc| (doc.reference.clone(), doc.document.as_str())),
         );
         selection.validate_structure()
+            && plan_matches
             && self.plan_request.operation == ProviderOperation::ResourceFinalizePlan
             && self.plan_request.target == selection.target
             && self.plan_request.transition_id == selection.transition_id
@@ -230,10 +255,27 @@ pub(super) fn record_finalize_result(
     let super::finalize_dispatch::FinalizePhase::Confirmed { result } = &dispatch.phase else {
         return Err("finalize_not_confirmed".into());
     };
+    let plan_terminal = progress
+        .owner_plan
+        .terminal_dispatch
+        .clone()
+        .ok_or("finalize_plan_proof_missing")?;
+    let plan_approval = installed
+        .approvals
+        .iter()
+        .find(|approval| {
+            approval.method == installed.participant.plan_method
+                && approval.broker_approval == plan_terminal.call.approval
+                && approval_matches_call(approval, &plan_terminal.call)
+        })
+        .cloned()
+        .ok_or("finalize_plan_approval_missing")?;
     let record = FinalizeResultRecord {
         selection: selected.clone(),
         plan_request: progress.owner_plan.request.clone(),
         plan,
+        plan_approval: Some(plan_approval),
+        plan_terminal: Some(plan_terminal),
         request: dispatch.request.clone(),
         applied: (**result).clone(),
         terminal: dispatch
@@ -273,10 +315,15 @@ mod tests {
         let candidate = json!({"capture_provider":"capture","selector_schema":"selector/1","selector":{},"resource":output.resource,"mode":mode,"plan_revision":2,"geometry_revision":4,"generation":1});
         let applied = json!({"status":"applied","output":output,"candidate":candidate});
         let terminal = json!({"call":{"service":"owner/2","method":"finalize","interface_major":2,"interface_minor":0,"approval":selection.finalize_approval.broker_approval,"arguments":request,"timeout_ms":1000,"operation_id":"finalize-operation"},"state":{"state":"completed","payload":applied}});
+        let plan_approval = selection.finalize_approval.clone();
+        let plan_request: ProviderRequest = serde_json::from_value(plan_request).unwrap();
+        let plan_terminal = serde_json::from_value(json!({"call":{"service":"owner/2","method":"finalize","interface_major":2,"interface_minor":0,"approval":plan_approval.broker_approval,"arguments":plan_request,"timeout_ms":1000,"operation_id":"plan-operation"},"state":{"state":"completed","payload":{"status":"planned","plan":plan}}})).unwrap();
         FinalizeResultRecord {
             selection,
-            plan_request: serde_json::from_value(plan_request).unwrap(),
+            plan_request,
             plan: serde_json::from_value(plan).unwrap(),
+            plan_approval: Some(plan_approval),
+            plan_terminal: Some(plan_terminal),
             request: serde_json::from_value(request).unwrap(),
             applied: serde_json::from_value(applied).unwrap(),
             terminal: serde_json::from_value(terminal).unwrap(),
@@ -317,6 +364,9 @@ mod tests {
             .as_mut()
             .unwrap()
             .geometry_revision = Some(5);
+        assert!(!changed.validate_structure());
+        let mut changed = record.clone();
+        changed.plan_terminal.as_mut().unwrap().call.operation_id = "foreign-plan".into();
         assert!(!changed.validate_structure());
         let mut changed = record;
         changed.terminal.call.approval["provider"] = json!("other");

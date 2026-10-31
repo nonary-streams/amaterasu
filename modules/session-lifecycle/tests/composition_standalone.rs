@@ -393,6 +393,7 @@ fn real_broker_persists_v2_session_output() {
         stored["callback_proof"]["terminal"]["state"]["state"],
         "completed"
     );
+    let prior_calls = harness.provider_calls.len();
     // SAFETY: the live instance is destroyed once before creating a replacement.
     unsafe { (harness.api.destroy)(harness.instance) };
     harness.instance = std::ptr::null_mut();
@@ -408,6 +409,11 @@ fn real_broker_persists_v2_session_output() {
         recovered_journal["composition"]["outputs"][0]["callback_proof"]["terminal"]["state"]["state"],
         "completed"
     );
+    assert_eq!(
+        recovered_journal["composition"]["outputs"][0]["state"],
+        "recovery_required"
+    );
+    assert_eq!(harness.provider_calls.len(), prior_calls);
 }
 
 #[test]

@@ -550,6 +550,10 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                 || selection != &item.selection
                 || admission.provider != item.selection.policy.owner_provider
                 || admission.plan != item.plan
+                || item.plan_approval.as_ref().is_none_or(|approval| {
+                    !admission.selection.approvals.contains(approval)
+                        || approval.method != admission.selection.participant.plan_method
+                })
                 || journal.admission_transitions.get(&request.admission_id)
                     != Some(&request.transition_id)
         })
@@ -569,7 +573,7 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
             };
             let Some(selection) = journal.composition.selection(
                 &request.target,
-                &request.transition_id,
+                &item.selection_transition_id,
                 &permit.context.policy.dependent_provider,
                 &request.proposal.owner_provider,
                 &request.proposal.output_id,
@@ -582,7 +586,8 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                     .iter()
                     .map(|doc| (doc.reference.clone(), doc.document.as_str())),
             );
-            !permit.consumed
+            !item.valid_under_permit(permit)
+                || !permit.consumed
                 || permit.request != *request
                 || permit.context.target != request.target
                 || permit.context.transition_id != request.transition_id
@@ -591,6 +596,22 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                 || admission.provider != selection.control_policy.dependent_provider
                 || !admission.plan.control_proposals.contains(&request.proposal)
                 || permit.settled != item.owner_ack.is_some()
+                || ![
+                    &selection.control_approval,
+                    &selection.control_status_approval,
+                ]
+                .iter()
+                .any(|approval| {
+                    approval.broker_approval == item.effect_dispatch.call.approval
+                        && composition::approval_matches_call(approval, &item.effect_dispatch.call)
+                })
+                || item.effect_pending_proof.as_ref().is_some_and(|proof| {
+                    proof.call.approval != selection.control_approval.broker_approval
+                        || !composition::approval_matches_call(
+                            &selection.control_approval,
+                            &proof.call,
+                        )
+                })
                 || item.owner_dispatch.as_ref().is_some_and(|dispatch| {
                     dispatch.call.approval != selection.settlement_approval.broker_approval
                         || !composition::approval_matches_call(
