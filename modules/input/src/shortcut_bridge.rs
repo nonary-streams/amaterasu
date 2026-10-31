@@ -80,6 +80,11 @@ impl StagedBatch {
         &self.intents
     }
 
+    /// Pin the lifecycle-derived target before durable intent admission.
+    pub fn set_authorized_target(&mut self, target: Value) {
+        self.authorized_target = target;
+    }
+
     /// A fully forwarded batch has no shortcut ownership or action effects and
     /// can use the lease's ordered, revocation-guarded native path directly.
     pub fn deliver_forwarded<B: Backend>(

@@ -13,7 +13,9 @@ use crate::{
     shortcut_reservation::ReservationJob,
     shortcut_store::ShortcutStore,
 };
-use amaterasu_extension_api::{ActionInvoke, ActionTarget, BindingSource, LifecycleTarget};
+use amaterasu_extension_api::{
+    ActionInvoke, ActionTarget, BindingSource, BindingTarget, LifecycleTarget,
+};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -40,6 +42,32 @@ struct Authority {
     application: Option<String>,
     paired_client: Option<String>,
     allowed_actions: Vec<String>,
+}
+
+impl Authority {
+    fn target_for_binding(&self, target: &BindingTarget) -> Result<ActionTarget, String> {
+        match (target, &self.target, &self.action_target) {
+            (BindingTarget::CurrentSession, _, Some(target @ ActionTarget::Session { .. })) => {
+                Ok(target.clone())
+            }
+            (
+                BindingTarget::CurrentStream,
+                LifecycleTarget::Stream {
+                    host_epoch,
+                    session_id,
+                    stream_id,
+                    generation,
+                },
+                _,
+            ) => Ok(ActionTarget::Stream {
+                host_epoch: host_epoch.clone(),
+                session_id: session_id.clone(),
+                stream_id: stream_id.clone(),
+                expected_generation: *generation,
+            }),
+            _ => Err("shortcut action target unavailable".into()),
+        }
+    }
 }
 
 enum Step {
@@ -79,6 +107,7 @@ pub(crate) struct ShortcutJob {
     store: Option<ShortcutStore>,
     action_epoch: Option<String>,
     reservations: Vec<DispatchIntent>,
+    invocation_target: Option<ActionTarget>,
     reservation: Option<ReservationJob>,
     delivery: Option<Value>,
     dispatch: Option<DispatchJob>,
@@ -148,6 +177,7 @@ impl ShortcutJob {
             store: None,
             action_epoch: None,
             reservations: Vec::new(),
+            invocation_target: None,
             reservation: None,
             delivery: None,
             dispatch: None,
@@ -524,9 +554,6 @@ impl ShortcutJob {
                                 .map(|key| (key, Disposition::Forward)),
                         );
                         self.matcher.recover_held(&held).map_err(str::to_owned)?;
-                        let authority = self.authority.as_ref().unwrap();
-                        let target = serde_json::to_value(&authority.action_target)
-                            .map_err(|_| "invalid target")?;
                         self.staged = Some(
                             StagedBatch::prepare(
                                 controller,
@@ -534,7 +561,7 @@ impl ShortcutJob {
                                 &self.caller,
                                 &self.request.lease,
                                 self.request.events.clone(),
-                                target,
+                                Value::Null,
                                 Instant::now(),
                             )
                             .map_err(|_| "invalid staged input")?,
@@ -545,6 +572,16 @@ impl ShortcutJob {
                         if self.staged.as_ref().unwrap().intents().is_empty() {
                             Step::Arm
                         } else {
+                            let intent = &self.staged.as_ref().unwrap().intents()[0];
+                            let target = self
+                                .authority
+                                .as_ref()
+                                .unwrap()
+                                .target_for_binding(&intent.target)?;
+                            self.staged.as_mut().unwrap().set_authorized_target(
+                                serde_json::to_value(&target).map_err(|_| "invalid target")?,
+                            );
+                            self.invocation_target = Some(target);
                             Step::OpenEpoch
                         }
                     }
@@ -603,10 +640,7 @@ impl ShortcutJob {
                         operation_id: format!("{epoch}:1"),
                         action_id: intent.action_id.clone(),
                         target: self
-                            .authority
-                            .as_ref()
-                            .unwrap()
-                            .action_target
+                            .invocation_target
                             .clone()
                             .ok_or("action target unavailable")?,
                         arguments: intent.arguments.clone(),
@@ -786,6 +820,7 @@ mod tests {
         value: Option<Value>,
         requests: BTreeMap<u64, (String, Value)>,
         actionful: bool,
+        stream_target: bool,
         commits: usize,
         registry_requests: usize,
     }
@@ -818,7 +853,7 @@ mod tests {
                                     json!({"status":"succeeded","batch_epoch":"input-epoch","target":{"kind":"stream","host_epoch":"host","session_id":"session","stream_id":"stream","generation":1},"action_target":if self.actionful {json!({"kind":"session","host_epoch":"host","session_id":"session","expected_generation":1})} else {Value::Null},"active":true,"context":if self.actionful {"active"} else {"game"},"application":null,"paired_client":null,"allowed_actions":if self.actionful {json!(["provider/action"])} else {json!([])}})
                                 }
                                 "reserve_input_action" => {
-                                    json!({"status":"succeeded","operation_id":"action:1","action_id":"provider/action","reservation_id":"permit","target":{"kind":"session","host_epoch":"host","session_id":"session","expected_generation":1}})
+                                    json!({"status":"reserved","operation_id":"action:1","action_id":"provider/action","reservation_id":"permit","target":payload["target"]})
                                 }
                                 "finish_input_action" => json!({"status":"succeeded"}),
                                 _ => panic!("unexpected lifecycle operation"),
@@ -827,9 +862,17 @@ mod tests {
                         "amaterasu.extension-registry/1" => {
                             self.registry_requests += 1;
                             if payload["operation"] == "list" {
-                                json!({"ok":true,"revision":1,"items":if self.actionful {vec![crate::shortcut_discovery::tests::descriptor()]} else {vec![]},"next":null})
+                                let mut descriptor = crate::shortcut_discovery::tests::descriptor();
+                                if self.stream_target {
+                                    descriptor["actions"][0]["allowed_targets"] = json!(["stream"]);
+                                }
+                                json!({"ok":true,"revision":1,"items":if self.actionful {vec![descriptor]} else {vec![]},"next":null})
                             } else {
-                                json!({"ok":true,"revision":1,"effective":{"shortcut":{"value":crate::shortcut_discovery::tests::binding(),"source":null}}})
+                                let mut binding = crate::shortcut_discovery::tests::binding();
+                                if self.stream_target {
+                                    binding["target"] = json!("current_stream");
+                                }
+                                json!({"ok":true,"revision":1,"effective":{"shortcut":{"value":binding,"source":null}}})
                             }
                         }
                         "amaterasu.extension-actions/1" => {
@@ -837,6 +880,18 @@ mod tests {
                                 "open_epoch" => json!({"status":"ok","epoch":"action"}),
                                 "reserve_input" => {
                                     assert_eq!(payload["expected_settings_revision"], "1");
+                                    assert_eq!(
+                                        payload["target"]["kind"],
+                                        if self.stream_target {
+                                            "stream"
+                                        } else {
+                                            "session"
+                                        }
+                                    );
+                                    if self.stream_target {
+                                        assert_eq!(payload["target"]["stream_id"], "stream");
+                                        assert_eq!(payload["target"]["expected_generation"], 1);
+                                    }
                                     json!({"status":"reserved","operation_id":"action:1"})
                                 }
                                 "close_epoch" | "retire_epoch" => json!({"status":"ok"}),
@@ -964,6 +1019,15 @@ mod tests {
     }
     #[test]
     fn actionful_batch_reserves_before_consuming_and_dispatches_after_delivery_receipt() {
+        run_actionful_batch(false);
+    }
+
+    #[test]
+    fn stream_shortcut_uses_authenticated_stream_target() {
+        run_actionful_batch(true);
+    }
+
+    fn run_actionful_batch(stream_target: bool) {
         let trace = Rc::new(RefCell::new(Vec::new()));
         let mut controller = Controller::new(BackendFake(trace.clone()), true);
         let now = Instant::now();
@@ -996,6 +1060,7 @@ mod tests {
         .unwrap();
         let mut host = Host {
             actionful: true,
+            stream_target,
             ..Host::default()
         };
         let mut result = None;

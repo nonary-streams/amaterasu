@@ -267,6 +267,9 @@ impl DiscoveryJob {
                         .collect();
                     amaterasu_configuration_schema::validate_values(&fields, &values)
                         .map_err(|_| "shortcut value violates declared schema")?;
+                    if value.value.is_null() {
+                        continue;
+                    }
                     let binding: Keybinding = serde_json::from_value(value.value.clone())
                         .map_err(|_| "invalid shortcut binding")?;
                     if !binding.enabled
@@ -275,15 +278,19 @@ impl DiscoveryJob {
                     {
                         continue;
                     }
-                    if binding.target != BindingTarget::CurrentSession {
-                        return Err("remote shortcut cannot select host target".into());
-                    }
+                    let target_kind = match binding.target {
+                        BindingTarget::CurrentSession => TargetKind::Session,
+                        BindingTarget::CurrentStream => TargetKind::Stream,
+                        BindingTarget::Host => {
+                            return Err("remote shortcut cannot select host target".into());
+                        }
+                    };
                     let action = descriptor
                         .actions
                         .iter()
                         .find(|action| action.id == binding.action_id)
                         .ok_or("shortcut action unavailable")?;
-                    if !action.allowed_targets.contains(&TargetKind::Session)
+                    if !action.allowed_targets.contains(&target_kind)
                         || !matches!(
                             action.execution,
                             ExecutionClass::ReadOnly | ExecutionClass::SessionMutation
@@ -433,6 +440,58 @@ pub(crate) mod tests {
             generation: 1,
         };
         assert!(DiscoveryJob::new(10, context(wrong, None), 1000).is_err());
+    }
+
+    #[test]
+    fn unset_nullable_binding_is_skipped_only_after_schema_validation() {
+        let mut nullable = descriptor();
+        let inner = nullable["options"][0]["definition"].clone();
+        nullable["options"][0]["definition"] =
+            json!({"type":"nullable","default":null,"inner":inner});
+        let mut job = new_job();
+        job.accept(json!({"ok":true,"revision":1,"items":[nullable],"next":null}))
+            .unwrap();
+        job.accept(json!({"ok":true,"revision":2,"effective":{"shortcut":{"value":null}}}))
+            .unwrap();
+        assert!(job.bindings.is_empty());
+        let mut job = new_job();
+        job.accept(json!({"ok":true,"revision":1,"items":[descriptor()],"next":null}))
+            .unwrap();
+        assert!(
+            job.accept(json!({"ok":true,"revision":2,"effective":{"shortcut":{"value":null}}}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn stream_binding_requires_stream_authorization_without_widening_session_or_host() {
+        let mut stream = binding();
+        stream["target"] = json!("current_stream");
+        let mut stream_descriptor = descriptor();
+        stream_descriptor["actions"][0]["allowed_targets"] = json!(["stream"]);
+        let mut job = new_job();
+        job.accept(json!({"ok":true,"revision":1,"items":[stream_descriptor.clone()],"next":null}))
+            .unwrap();
+        job.accept(json!({"ok":true,"revision":5,"effective":{"shortcut":{"value":stream}}}))
+            .unwrap();
+        assert_eq!(job.bindings[0].binding.target, BindingTarget::CurrentStream);
+        assert_eq!(job.bindings[0].settings_revision, 5);
+        let mut job = new_job();
+        job.accept(json!({"ok":true,"revision":1,"items":[stream_descriptor],"next":null}))
+            .unwrap();
+        assert!(
+            job.accept(
+                json!({"ok":true,"revision":5,"effective":{"shortcut":{"value":binding()}}})
+            )
+            .is_err()
+        );
+        let mut job = new_job();
+        job.accept(json!({"ok":true,"revision":1,"items":[descriptor()],"next":null}))
+            .unwrap();
+        assert!(
+            job.accept(json!({"ok":true,"revision":5,"effective":{"shortcut":{"value":stream}}}))
+                .is_err()
+        );
     }
 
     #[test]

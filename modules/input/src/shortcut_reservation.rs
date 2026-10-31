@@ -74,7 +74,7 @@ impl ReservationJob {
             Phase::LifecycleSubmit => {
                 self.reservation_attempted = true;
                 let payload = json!({"operation":"reserve_input_action", "operation_id":self.invoke.operation_id,
-                    "token":self.input_binding, "action_id":self.invoke.action_id});
+                    "token":self.input_binding, "action_id":self.invoke.action_id, "target":self.invoke.target});
                 let operation_id = format!("input-lifecycle-reserve-{}", self.instance);
                 match send(Command::Request {
                     service: LIFECYCLE.into(),
@@ -101,7 +101,7 @@ impl ReservationJob {
                         .filter(|id| !id.is_empty());
                     let expected_target = serde_json::to_value(&self.invoke.target)
                         .map_err(|_| "invalid action target")?;
-                    if payload["status"] != "succeeded"
+                    if payload["status"] != "reserved"
                         || payload["operation_id"] != self.invoke.operation_id
                         || payload["action_id"] != self.invoke.action_id
                         || payload["target"] != expected_target
@@ -218,7 +218,7 @@ mod tests {
                 Command::ReleaseResult { .. } => Ok(Response::Ok),
                 Command::TakeResult { request: 1 } => Ok(Response::Result {
                     payload: json!({
-                    "status":"succeeded", "operation_id":"action-epoch:1", "action_id":"example/remove",
+                    "status":"reserved", "operation_id":"action-epoch:1", "action_id":"example/remove",
                     "target":invoke().target, "reservation_id":"reservation" }),
                 }),
                 Command::TakeResult { request: 2 } => Ok(Response::Result {
@@ -257,7 +257,7 @@ mod tests {
             }
             Ok(Response::Result {
                 payload: json!({
-            "status":"succeeded", "operation_id":"action-epoch:1", "action_id":"example/remove",
+            "status":"reserved", "operation_id":"action-epoch:1", "action_id":"example/remove",
             "target":{"kind":"host","host_epoch":"host"}, "reservation_id":"reservation" }),
             })
         });
