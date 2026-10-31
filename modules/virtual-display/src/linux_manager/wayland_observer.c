@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include <errno.h>
 #include <poll.h>
@@ -5,6 +6,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <time.h>
 #include <wayland-client.h>
 
@@ -114,15 +116,16 @@ static void removed(void *d, struct wl_registry *r, uint32_t id) {
   struct observer *s = d;
   for (size_t i = 0; i < LIMIT; i++)
     if (s->entries[i].output && s->entries[i].global == id) {
-      s->entries[i].alive = false;
-      s->entries[i].generation = ++s->generation;
+      ++s->generation;
+      wl_output_release(s->entries[i].output);
+      memset(&s->entries[i], 0, sizeof(s->entries[i]));
     }
 }
 static const struct wl_registry_listener registry_listener = {global, removed};
 static void synced(void *d, struct wl_callback *cb, uint32_t serial) {
   (void)serial;
+  (void)cb;
   *(bool *)d = true;
-  wl_callback_destroy(cb);
 }
 static const struct wl_callback_listener sync_listener = {synced};
 static int sync_display(struct observer *s) {
@@ -165,6 +168,7 @@ static int sync_display(struct observer *s) {
       return -1;
     }
   }
+  wl_callback_destroy(cb);
   return s->failed ? -1 : 0;
 }
 void *am_display_observer_open(void) {
@@ -222,4 +226,16 @@ int am_display_observer_read(void *p, const char *wanted,
                               (uint32_t)found->height, (uint32_t)found->refresh,
                               found->generation};
   return 0;
+}
+
+int am_display_observer_peer_pid(void *p) {
+  struct observer *s = p;
+  struct ucred cred;
+  socklen_t len = sizeof(cred);
+  if (!s ||
+      getsockopt(wl_display_get_fd(s->display), SOL_SOCKET, SO_PEERCRED, &cred,
+                 &len) != 0 ||
+      len != sizeof(cred) || cred.pid <= 0)
+    return -1;
+  return cred.pid;
 }

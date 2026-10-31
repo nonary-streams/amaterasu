@@ -513,9 +513,27 @@ fn linux_shared_references_persist_and_release_only_the_last_connector_owner() {
                 height: 1080,
                 refresh: 60000,
                 generation: 1,
+                compositor_id: [1; 32],
             },
+            valid: true,
         },
     );
+    assert_eq!(
+        manager.remove("session", FIRST, Some("stream-a"))["code"],
+        "display_borrowed"
+    );
+    // Failed revalidation does not drop the reference fence, and cannot
+    // become valid again if an equivalent output later appears.
+    assert_eq!(
+        manager.validate_borrow("session", FIRST, "stream-a", "borrow-token")["code"],
+        "borrow_invalid"
+    );
+    assert_eq!(
+        manager.remove("session", FIRST, Some("stream-a"))["code"],
+        "display_borrowed"
+    );
+    assert!(!manager.borrows["borrow-token"].valid);
+    manager.invalidate_observer();
     assert_eq!(
         manager.remove("session", FIRST, Some("stream-a"))["code"],
         "display_borrowed"

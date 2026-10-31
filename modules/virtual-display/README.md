@@ -273,11 +273,14 @@ requires an existing ready caller-owned reference and independently observes the
 current `wl_output` global, name and current mode through a persistent Wayland
 connection. It also checks broker connection state. The response includes
 `observed_output` with version 1, protocol `wayland-wl-output`, registry global,
-output name, width, height and refresh in millihertz. The consumer must compare
+output name, width, height, refresh in millihertz and `compositor_id`, a digest
+of the Wayland peer process identity and boot ID. Both connections must be in
+the same PID namespace and reach the same compositor rather than separate
+proxies. The consumer must compare
 this tuple with its own live observation and validate before and after opening
 capture and throughout its lifetime. Changed mode, removal, observer failure,
-provider restart, or an unavailable observation invalidates validation. A
-borrow blocks releasing its reference, and caller ownership is checked on every
+provider restart, or an unavailable observation invalidates validation. An invalid borrow continues to block releasing its reference until the consumer
+explicitly releases it after retiring capture. A borrow blocks releasing its reference, and caller ownership is checked on every
 operation. Lost borrow completion releases the newly created borrow.
 
 This is a cooperative fence against this provider's own removal and reuse, not

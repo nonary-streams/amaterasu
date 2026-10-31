@@ -70,6 +70,7 @@ struct Borrow {
     key: (String, String),
     reference_id: String,
     observation: observer::Observation,
+    valid: bool,
 }
 enum Work {
     Create {
@@ -493,8 +494,7 @@ impl Manager {
             .as_mut()
             .and_then(|observer| observer.read(&output))
         else {
-            self.observer = None;
-            self.borrows.clear();
+            self.invalidate_observer();
             return (failure("binding_unavailable"), None);
         };
         if observation.width != monitor.specification.width
@@ -514,6 +514,7 @@ impl Manager {
                 key: key.clone(),
                 reference_id: reference_id.into(),
                 observation,
+                valid: true,
             },
         );
         let result = json!({"ok":true,"borrow_id":borrow_id,"observed_output":Self::observation(&output, observation)});
@@ -526,8 +527,19 @@ impl Manager {
             }),
         )
     }
+    fn invalidate_observer(&mut self) {
+        self.observer = None;
+        for borrow in self.borrows.values_mut() {
+            borrow.valid = false;
+        }
+    }
     fn observation(output: &str, observation: observer::Observation) -> Value {
-        json!({"version":1,"protocol":"wayland-wl-output","registry_global":observation.global,"output_name":output,"width":observation.width,"height":observation.height,"refresh_millihz":observation.refresh})
+        let compositor_id: String = observation
+            .compositor_id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        json!({"version":1,"protocol":"wayland-wl-output","compositor_id":compositor_id,"registry_global":observation.global,"output_name":output,"width":observation.width,"height":observation.height,"refresh_millihz":observation.refresh})
     }
     fn validate_borrow(
         &mut self,
@@ -540,22 +552,24 @@ impl Manager {
         let Some(borrow) = self.borrows.get(borrow_id) else {
             return failure("borrow_invalid");
         };
-        if borrow.key != key || borrow.reference_id != reference_id {
+        if borrow.key != key || borrow.reference_id != reference_id || !borrow.valid {
             return failure("borrow_invalid");
         }
         let expected = borrow.observation;
-        let Some(monitor) = self.monitors.get(&key) else {
-            return failure("borrow_invalid");
-        };
-        if monitor.state != "ready"
-            || !monitor
-                .references
-                .as_ref()
-                .is_some_and(|refs| refs.contains(reference_id))
-        {
-            return failure("borrow_invalid");
-        }
-        let Some(output) = monitor.output.clone() else {
+        let output = self.monitors.get(&key).and_then(|monitor| {
+            (monitor.state == "ready"
+                && monitor
+                    .references
+                    .as_ref()
+                    .is_some_and(|refs| refs.contains(reference_id)))
+            .then(|| monitor.output.clone())
+            .flatten()
+        });
+        let Some(output) = output else {
+            self.borrows
+                .get_mut(borrow_id)
+                .expect("borrow exists")
+                .valid = false;
             return failure("borrow_invalid");
         };
         let connected = matches!(
@@ -567,7 +581,10 @@ impl Manager {
             .as_mut()
             .and_then(|observer| observer.read(&output));
         if !connected || observed != Some(expected) {
-            self.borrows.remove(borrow_id);
+            self.borrows
+                .get_mut(borrow_id)
+                .expect("borrow exists")
+                .valid = false;
             return failure("borrow_invalid");
         }
         json!({"ok":true,"borrow_id":borrow_id,"observed_output":Self::observation(&output, expected)})
