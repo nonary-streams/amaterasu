@@ -8,6 +8,7 @@ mod action_disposition;
 mod action_endpoints;
 #[allow(dead_code)] // Action replan remains fenced until all proof writers are wired.
 mod action_release_proof;
+mod action_root_retirement;
 mod action_target;
 mod application;
 mod checkpoint_queries;
@@ -563,6 +564,7 @@ fn valid_id(value: &str) -> bool {
 fn save(shared: &Shared, mut next: Journal) -> ModuleResult<()> {
     action_closed_history::compact_released_actions(&mut next);
     retention::compact(&mut next);
+    action_root_retirement::compact_replaced_roots(&mut next);
     let mut shared = shared.borrow_mut();
     shared
         .store

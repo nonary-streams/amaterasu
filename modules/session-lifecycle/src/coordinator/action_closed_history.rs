@@ -64,11 +64,33 @@ impl ClosedActionBook {
                 && root.output == record.retired_root
                 && root.state == composition::OutputState::Released
         });
-        let root = roots.next()?;
-        if roots.next().is_some()
-            || resource_generation::historical_generation(journal, root).ok() != Some(generation)
-        {
-            return None;
+        if let Some(root) = roots.next() {
+            if roots.next().is_some()
+                || resource_generation::historical_generation(journal, root).ok()
+                    != Some(generation)
+            {
+                return None;
+            }
+        } else {
+            // The compact certificate is historical proof only. Reprepare still
+            // requires the separately authenticated current replacement root.
+            let current = *session.resource_generations.get(owner)?;
+            if current <= generation {
+                return None;
+            }
+            let mut replacements = journal.composition.records().filter(|root| {
+                root.output.origin == record.session_target
+                    && root.output.producer == owner
+                    && resource_generation::current_root_generation(journal, root).ok()
+                        == Some(current)
+            });
+            let replacement = replacements.next()?;
+            if replacements.next().is_some()
+                || replacement.output.resource.incarnation
+                    == record.retired_root.resource.incarnation
+            {
+                return None;
+            }
         }
         Some(action_disposition::ResolvedDisposition {
             session_target: record.session_target.clone(),
@@ -98,6 +120,42 @@ impl ClosedActionBook {
         });
         let record = records.next()?;
         records.next().is_none().then_some(&record.retired_root)
+    }
+
+    /// Read-only root lookup for historical checkpoints after source retirement.
+    pub(super) fn historical_root_for_admission(
+        &self,
+        admission: &str,
+        owner: &str,
+        generation: u64,
+    ) -> Option<&amaterasu_extension_api::ResourceOutput> {
+        if !self.validate() {
+            return None;
+        }
+        let mut records = self.records.iter().filter(|record| {
+            record.retired_admission == admission
+                && record.owner == owner
+                && record.resource_generation == generation
+        });
+        let record = records.next()?;
+        records.next().is_none().then_some(&record.retired_root)
+    }
+
+    pub(super) fn retired_roots(&self) -> Vec<(String, String, String, u64)> {
+        if !self.validate() {
+            return Vec::new();
+        }
+        self.records
+            .iter()
+            .map(|record| {
+                (
+                    record.retired_admission.clone(),
+                    record.retired_transition.clone(),
+                    record.owner.clone(),
+                    record.resource_generation,
+                )
+            })
+            .collect()
     }
 
     /// Exact admission IDs covered by fully verified action cleanup.
@@ -515,6 +573,30 @@ mod tests {
             permit_commitment: commitment(&"permit").unwrap(),
             dispatch_commitment: commitment(&json!({"receipt":"done"})).unwrap(),
         }
+    }
+
+    #[test]
+    fn certified_historical_root_is_scoped_and_read_only() {
+        let cert = certificate();
+        let mut journal: Journal = serde_json::from_value(json!({
+            "version":3,"host_epoch":"epoch","receipts":{},
+            "sessions":{"session":{"host_epoch":"epoch","id":"session","generation":1,
+                "phase":"ready","owner":{"caller":"caller","initiator":"client"},
+                "delegates":[],"application_ref":null,"settings_revision":"revision",
+                "application_retired":false,"streams":{}}}
+        }))
+        .unwrap();
+        journal.closed_actions.records.push(cert.clone());
+        let target: LifecycleTarget = serde_json::from_value(json!({"kind":"stream", "host_epoch":"epoch", "session_id":"session", "stream_id":"stream", "generation":2})).unwrap();
+        let digest = closed_stream::commitment(&cert.retired_root).unwrap();
+        let resolve = |owner: &str, generation, hash: &str| {
+            closed_stream::historical_root(&journal, &target, 1, "retired", hash, owner, generation)
+        };
+        assert_eq!(resolve("owner", 1, &digest), Some(&cert.retired_root));
+        assert!(resolve("foreign", 1, &digest).is_none());
+        assert!(resolve("owner", 2, &digest).is_none());
+        assert!(resolve("owner", 1, &"0".repeat(64)).is_none());
+        assert!(journal.composition.records().next().is_none());
     }
 
     #[test]

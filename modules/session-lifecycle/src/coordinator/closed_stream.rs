@@ -254,7 +254,9 @@ pub(super) fn test_archived_root(
         settlement_commitments: vec![],
         closed_obligations: vec![],
     };
-    archive.root(journal).is_some_and(|actual| actual == root)
+    archive
+        .root(journal)
+        .is_some_and(|actual| actual == &root.output)
 }
 
 #[cfg(test)]
@@ -341,55 +343,25 @@ impl ArchivedStream {
     fn historical_proof<'a>(&self, journal: &'a Journal) -> Option<HistoricalProof<'a>> {
         let root = self.root(journal)?;
         Some(HistoricalProof {
-            session_target: root.output.origin.clone(),
+            session_target: root.origin.clone(),
             resource_generation: self.resource_generation,
-            root_output: &root.output,
+            root_output: root,
         })
     }
 
-    fn root<'a>(&self, journal: &'a Journal) -> Option<&'a composition::StoredOutput> {
-        let (epoch, session_id, Some(stream_id), generation) =
-            operations::target_parts(&self.target).ok()?
-        else {
-            return None;
-        };
-        if generation == 0 || !valid_id(epoch) || !valid_id(session_id) || !valid_id(stream_id) {
-            return None;
-        }
-        if !journal.sessions.contains_key(session_id) {
-            let parent = LifecycleTarget::Session {
-                host_epoch: epoch.into(),
-                session_id: session_id.into(),
-                generation: self.parent_generation,
-            };
-            let root = journal.ended_session_history.historical_root(
-                journal,
-                &parent,
-                &self.root_admission,
-                &self.owner,
-                self.resource_generation,
-            )?;
-            return (commitment(&root.output).as_deref() == Some(self.root_output.as_str()))
-                .then_some(root);
-        }
-        let session = journal.sessions.get(session_id)?;
-        if session.host_epoch != epoch || session.generation != self.parent_generation {
-            return None;
-        }
-        let mut roots = journal.composition.records().filter(|root| {
-            root.admission_id == self.root_admission && root.output.producer == self.owner
-                && commitment(&root.output).as_deref() == Some(self.root_output.as_str())
-                && matches!(&root.output.origin, LifecycleTarget::Session { host_epoch, session_id: id, generation }
-                    if host_epoch == epoch && id == session_id && *generation == self.parent_generation)
-        });
-        let root = roots.next()?;
-        if roots.next().is_some()
-            || resource_generation::historical_generation(journal, root)
-                != Ok(self.resource_generation)
-        {
-            return None;
-        }
-        Some(root)
+    fn root<'a>(
+        &self,
+        journal: &'a Journal,
+    ) -> Option<&'a amaterasu_extension_api::ResourceOutput> {
+        historical_root(
+            journal,
+            &self.target,
+            self.parent_generation,
+            &self.root_admission,
+            &self.root_output,
+            &self.owner,
+            self.resource_generation,
+        )
     }
 
     fn valid(&self, journal: &Journal) -> bool {
@@ -419,6 +391,68 @@ impl ArchivedStream {
                     && valid_schemas(&tuple.schemas)
             })
     }
+}
+
+/// Resolve retained or certified retired roots for read-only historical checks.
+pub(super) fn historical_root<'a>(
+    journal: &'a Journal,
+    target: &LifecycleTarget,
+    parent_generation: u64,
+    admission: &str,
+    output_commitment: &str,
+    owner: &str,
+    generation: u64,
+) -> Option<&'a amaterasu_extension_api::ResourceOutput> {
+    let (epoch, session_id, Some(stream_id), stream_generation) =
+        operations::target_parts(target).ok()?
+    else {
+        return None;
+    };
+    let session = journal.sessions.get(session_id);
+    if stream_generation == 0
+        || !valid_id(epoch)
+        || !valid_id(session_id)
+        || !valid_id(stream_id)
+        || session.is_some_and(|session| {
+            session.host_epoch != epoch || session.generation != parent_generation
+        })
+    {
+        return None;
+    }
+    let mut roots = journal
+        .composition
+        .records()
+        .filter(|root| root.admission_id == admission);
+    let root = if session.is_none() {
+        let parent = LifecycleTarget::Session {
+            host_epoch: epoch.into(),
+            session_id: session_id.into(),
+            generation: parent_generation,
+        };
+        &journal
+            .ended_session_history
+            .historical_root(journal, &parent, admission, owner, generation)?
+            .output
+    } else if let Some(root) = roots.next() {
+        if roots.next().is_some()
+            || root.output.producer != owner
+            || resource_generation::historical_generation(journal, root).ok() != Some(generation)
+        {
+            return None;
+        }
+        &root.output
+    } else {
+        journal
+            .closed_actions
+            .historical_root_for_admission(admission, owner, generation)?
+    };
+    if commitment(root).as_deref() != Some(output_commitment)
+        || !matches!(&root.origin, LifecycleTarget::Session { host_epoch, session_id: id, generation }
+            if host_epoch == epoch && id == session_id && *generation == parent_generation)
+    {
+        return None;
+    }
+    Some(root)
 }
 
 pub(super) struct HistoricalProof<'a> {
@@ -1315,7 +1349,7 @@ struct SettlementTuple {
     schemas: Vec<String>,
 }
 
-fn commitment(value: &impl Serialize) -> Option<String> {
+pub(super) fn commitment(value: &impl Serialize) -> Option<String> {
     let mut value = serde_json::to_value(value).ok()?;
     canonicalize(&mut value);
     let bytes = serde_json::to_vec(&value).ok()?;
@@ -1471,13 +1505,22 @@ fn closed_source_generation(journal: &Journal, source: &composition::StoredOutpu
 
 impl ClosedStream {
     fn historical_proof<'a>(&self, journal: &'a Journal) -> Option<HistoricalProof<'a>> {
-        let root = self.root(journal)?;
+        let root = historical_root(
+            journal,
+            &self.target,
+            self.parent_generation,
+            &self.root_admission,
+            &self.root_output,
+            &self.owner,
+            self.resource_generation,
+        )?;
         Some(HistoricalProof {
-            session_target: root.output.origin.clone(),
+            session_target: root.origin.clone(),
             resource_generation: self.resource_generation,
-            root_output: &root.output,
+            root_output: root,
         })
     }
+
     /// Build only from the exact release after all graph evidence is verified.
     fn from_verified(
         journal: &Journal,
@@ -1660,44 +1703,6 @@ impl ClosedStream {
             })
     }
 
-    fn root<'a>(&self, journal: &'a Journal) -> Option<&'a composition::StoredOutput> {
-        let (epoch, session_id, Some(_), _) = operations::target_parts(&self.target).ok()? else {
-            return None;
-        };
-        let root = if journal.sessions.contains_key(session_id) {
-            let mut roots = journal.composition.records().filter(|item| {
-                item.admission_id == self.root_admission
-                    && commitment(&item.output).as_deref() == Some(self.root_output.as_str())
-            });
-            let root = roots.next()?;
-            if roots.next().is_some()
-                || resource_generation::historical_generation(journal, root)
-                    != Ok(self.resource_generation)
-            {
-                return None;
-            }
-            root
-        } else {
-            let parent = LifecycleTarget::Session {
-                host_epoch: epoch.into(),
-                session_id: session_id.into(),
-                generation: self.parent_generation,
-            };
-            let root = journal.ended_session_history.historical_root(
-                journal,
-                &parent,
-                &self.root_admission,
-                &self.owner,
-                self.resource_generation,
-            )?;
-            if commitment(&root.output).as_deref() != Some(self.root_output.as_str()) {
-                return None;
-            }
-            root
-        };
-        Some(root)
-    }
-
     fn valid(&self, journal: &Journal) -> bool {
         let Ok((epoch, session_id, Some(stream_id), generation)) =
             operations::target_parts(&self.target)
@@ -1705,10 +1710,17 @@ impl ClosedStream {
             return false;
         };
         let session = journal.sessions.get(session_id);
-        let Some(root) = self.root(journal) else {
+        let Some(root_output) = historical_root(
+            journal,
+            &self.target,
+            self.parent_generation,
+            &self.root_admission,
+            &self.root_output,
+            &self.owner,
+            self.resource_generation,
+        ) else {
             return false;
         };
-        let root_output = &root.output;
         generation > 0
             && valid_id(epoch)
             && valid_id(session_id)

@@ -211,6 +211,34 @@ fn valid_record(journal: &Journal, record: &Evidence) -> bool {
         && composition::callback_approvals_valid(proof, &admission.selection.approvals, provider)
 }
 
+/// Remove only the exact validated producer callback after certificate transfer.
+pub(super) fn retire_action_prepare(
+    journal: &mut Journal,
+    root: &composition::StoredOutput,
+) -> ModuleResult<()> {
+    let mut matches = journal
+        .session_prepare_evidence
+        .records
+        .iter()
+        .filter(|record| {
+            record.admission_id == root.admission_id
+                && record.transition_id == root.transition_id
+                && record.target == root.output.origin
+        });
+    let record = matches.next().ok_or("action_prepare_evidence_missing")?;
+    if matches.next().is_some()
+        || !valid_record(journal, record)
+        || root.callback_proof.as_ref() != Some(&record.proof)
+    {
+        return Err("action_prepare_evidence_invalid".into());
+    }
+    journal
+        .session_prepare_evidence
+        .records
+        .retain(|record| record.admission_id != root.admission_id);
+    Ok(())
+}
+
 /// Record on the clone that atomically receives settled authority and progress.
 pub(super) fn record(
     journal: &mut Journal,

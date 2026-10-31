@@ -414,6 +414,40 @@ impl CompositionBook {
         Ok(())
     }
 
+    /// Retire one exactly certified old root, while preserving other generations.
+    pub(super) fn retire_action_root_exact(
+        &mut self,
+        root: &StoredOutput,
+    ) -> Result<(), &'static str> {
+        if root.state != OutputState::Released
+            || self.outputs.iter().filter(|item| *item == root).count() != 1
+            || self
+                .selections
+                .iter()
+                .any(|item| item.input.admission_id == root.admission_id)
+            || self
+                .finalize_selections
+                .iter()
+                .any(|item| item.input.admission_id == root.admission_id)
+            || self.staged_outputs.iter().any(|item| {
+                same_key(&item.after, &root.output)
+                    && item.after.resource.incarnation == root.output.resource.incarnation
+            })
+            || self
+                .refinements
+                .iter()
+                .any(|item| item.request.admission_id == root.admission_id)
+        {
+            return Err("action_root_still_referenced");
+        }
+        self.outputs.retain(|item| item != root);
+        self.stage_anchors.retain(|item| {
+            !(same_key(&item.staged, &root.output)
+                && item.staged.resource.incarnation == root.output.resource.incarnation)
+        });
+        Ok(())
+    }
+
     /// The enclosing transaction must prove the exact stream closed and replace
     /// every removed history reference with a validated checkpoint first. The
     /// staged output remains pinned for successor validation.
