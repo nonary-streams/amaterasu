@@ -1894,6 +1894,37 @@ mod tests {
             .admission_transitions
             .insert("session-admission".into(), "transition".into());
         paused.composition = serde_json::from_value(json!({"outputs":[{"output":{"output_id":"owned","capability":"screen","schema":{"id":"screen","major":1,"minor":0,"digest":"a".repeat(64)},"producer":"display","producer_service":"display/2","origin":{"kind":"session","host_epoch":epoch,"session_id":"session","generation":3},"resource":{"provider":"display","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"actual-seat","mutation_domain":"domain"},"domain_observations":[{"domain":"domain","revision":6,"borrowers":{"session":3},"complete":true}],"data":{}},"admission_id":"session-admission","transition_id":"transition","plan":plan,"state":"retained"}]})).unwrap();
+        // Retain the actual approved producer callback, including its resource
+        // generation, rather than deriving generation from the action request.
+        let session = paused.sessions.get_mut("session").unwrap();
+        session.resource_generations.insert("display".into(), 7);
+        let admission = paused
+            .authority
+            .settled
+            .get_mut("session-admission")
+            .unwrap();
+        let participant = &mut admission.selection.participant;
+        participant.contract_version = 2;
+        participant.callback_method.service = "display/2".into();
+        participant.callback_method.interface_major = 2;
+        let callback_method = participant.callback_method.clone();
+        let participant = participant.clone();
+        let broker_approval = json!({"provider":"display","method":{"service":"display/2","method":"callback","interface_major":2,"interface_minor":0}});
+        admission
+            .selection
+            .approvals
+            .push(crate::prepare_authority::MethodApproval {
+                method: callback_method,
+                broker_approval: broker_approval.clone(),
+            });
+        let mut book = serde_json::to_value(&paused.composition).unwrap();
+        let output = book["outputs"][0]["output"].clone();
+        let request = json!({"version":2,"provider_sequence":1,"operation":"lifecycle_callback","transition_id":"transition","operation_id":"owner-callback","target":output["origin"],"resource_generation":7,"phase":"session.prepare","settings_revision":"installed","settings":{},"intent":null,"reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"actual-seat","capture_providers":["capture"],"selector_schemas":["selector/1"]},"remaining_ms":1000,"plan_revision":1,"admission_id":"session-admission","approved_plan":plan});
+        let response =
+            json!({"status":"prepared","candidate":null,"obligations":[],"outputs":[output]});
+        let call = json!({"service":"display/2","method":"callback","interface_major":2,"interface_minor":0,"approval":broker_approval,"arguments":request,"timeout_ms":1000,"operation_id":"owner-callback"});
+        book["outputs"][0]["callback_proof"] = json!({"participant":participant,"request":request,"terminal":{"call":call,"state":{"state":"completed","payload":response}},"pending_receipt":null,"pending_dispatch":null});
+        paused.composition = serde_json::from_value(book).unwrap();
         save(&coordinator.shared, paused.clone()).unwrap();
         let v2 = json!({"operation":"describe_action_target","version":2,"target":{"kind":"session","host_epoch":epoch,"session_id":"session","expected_generation":3}});
         let described = coordinator.describe_action_target("display", &v2);
@@ -1902,8 +1933,30 @@ mod tests {
             serde_json::from_value(described.clone()).unwrap();
         amaterasu_extension_api::validate_action_target_description(&typed).unwrap();
         assert_eq!(described["owner_output"]["output_id"], "owned");
+        assert_eq!(described["resource_generation"], 7);
         assert_eq!(described["settings_revision"], "session-rev");
         assert_eq!(described["streams"], json!([]));
+        let mut stale_cursor = paused.clone();
+        stale_cursor
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .resource_generations
+            .insert("display".into(), 8);
+        save(&coordinator.shared, stale_cursor).unwrap();
+        assert_eq!(
+            coordinator.describe_action_target("display", &v2)["status"],
+            "rejected"
+        );
+        let mut unproven = paused.clone();
+        let mut book = serde_json::to_value(&unproven.composition).unwrap();
+        book["outputs"][0]["callback_proof"] = Value::Null;
+        unproven.composition = serde_json::from_value(book).unwrap();
+        save(&coordinator.shared, unproven).unwrap();
+        assert_eq!(
+            coordinator.describe_action_target("display", &v2)["status"],
+            "rejected"
+        );
         let mut unavailable = paused.clone();
         let mut book = serde_json::to_value(&unavailable.composition).unwrap();
         book["outputs"][0]["state"] = json!("recovery_required");

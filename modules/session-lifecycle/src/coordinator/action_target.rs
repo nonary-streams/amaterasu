@@ -230,6 +230,11 @@ impl Coordinator {
         {
             return rejection("owner_output_provenance_invalid");
         }
+        let Ok(resource_generation) =
+            super::resource_generation::current_root_generation(journal, record)
+        else {
+            return rejection("owner_output_generation_unavailable");
+        };
         let Some(snapshot) = session.provider_settings.get(caller) else {
             return rejection("settings_snapshot_missing");
         };
@@ -336,7 +341,7 @@ impl Coordinator {
         let streams: Vec<_> = session.streams.iter().filter(|(_, stream)| stream.binding_owner == caller).map(|(stream_id, stream)| {
             json!({"target":{"kind":"stream","host_epoch":session.host_epoch,"session_id":session.id,"stream_id":stream_id,"expected_generation":stream.generation},"lifecycle_target":{"kind":"stream","host_epoch":session.host_epoch,"session_id":session.id,"stream_id":stream_id,"generation":stream.generation},"phase":stream.phase,"candidate":stream.candidate,"consumers_retired":stream.phase==StreamPhase::Retired || (stream.phase==StreamPhase::Quiescing && stream.retirements==stream.required)})
         }).collect();
-        let result = json!({"version":2,"status":"succeeded","provider":caller,"target":target,"session_target":origin,"execution_domain":resource.execution_domain,"settings_revision":snapshot.revision,"settings":snapshot.settings,"streams":streams,"obligations":metadata["obligations"],"mutation_domains":mutation_domains,"admitted_plans":metadata["admitted_plans"],"resource_targets":metadata["resource_targets"],"stale_mutation_domains":metadata["stale_mutation_domains"],"owner_output":record.output});
+        let result = json!({"version":2,"status":"succeeded","provider":caller,"target":target,"session_target":origin,"execution_domain":resource.execution_domain,"settings_revision":snapshot.revision,"settings":snapshot.settings,"streams":streams,"obligations":metadata["obligations"],"mutation_domains":mutation_domains,"admitted_plans":metadata["admitted_plans"],"resource_targets":metadata["resource_targets"],"stale_mutation_domains":metadata["stale_mutation_domains"],"owner_output":record.output,"resource_generation":resource_generation});
         if serde_json::to_vec(&result).map_or(true, |bytes| bytes.len() > 16 * 1024) {
             return rejection("provider_metadata_too_large");
         }
