@@ -331,6 +331,55 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_retry_survives_restart_and_never_grants_effects() {
+        let path =
+            std::env::temp_dir().join(format!("closed-action-retry-{}", identifier().unwrap()));
+        std::fs::create_dir(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let coordinator = Coordinator::open(&path.join("journal")).unwrap();
+        let mut cert = certificate();
+        cert.caller = coordinator.settings.action_service.clone();
+        let mut journal = coordinator.shared.borrow().value.clone();
+        journal.closed_actions.records.push(cert.clone());
+        save(&coordinator.shared, journal).unwrap();
+        drop(coordinator);
+        let mut coordinator = Coordinator::open(&path.join("journal")).unwrap();
+        let payload = json!({"operation":"complete_action", "operation_id":cert.binding.operation_id,
+            "action_id":cert.binding.action_id, "target":cert.binding.target, "plan_digest":cert.binding.plan_digest,
+            "permit":"permit", "outcome":"succeeded", "dispatch_proof":{"receipt":"done"}});
+        let response = coordinator.action_operation(&cert.caller, "ignored", &payload);
+        assert_eq!(response["status"], "succeeded", "{response}");
+        let mut changed = payload.clone();
+        changed["operation_id"] = json!("other");
+        assert_eq!(
+            coordinator.action_operation(&cert.caller, "ignored", &changed)["status"],
+            "rejected"
+        );
+        changed = payload.clone();
+        changed["dispatch_proof"]["receipt"] = json!("other");
+        assert_eq!(
+            coordinator.action_operation(&cert.caller, "ignored", &changed)["status"],
+            "rejected"
+        );
+        changed = payload.clone();
+        changed["operation"] = json!("consume_action_permit");
+        assert_eq!(
+            coordinator.action_operation(&cert.caller, "ignored", &changed)["status"],
+            "rejected"
+        );
+        assert_eq!(
+            coordinator.action_operation("foreign", "ignored", &payload)["status"],
+            "rejected"
+        );
+        drop(coordinator);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn absent_marker_cannot_create_certificate() {
         let journal: Journal = serde_json::from_value(
             json!({"version":3,"host_epoch":"epoch","receipts":{},"sessions":{}}),
