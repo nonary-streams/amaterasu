@@ -24,6 +24,8 @@ pub(super) type Send<'a> = dyn FnMut(amaterasu_module_sdk::Command) -> ModuleRes
 pub(super) struct Entry {
     pub record_id: u64,
     pub owner: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_recovery: Option<LifecycleRecovery>,
     pub attempted_resources: BTreeSet<String>,
     pub input_attempted: bool,
     #[serde(default)]
@@ -36,6 +38,15 @@ pub(super) struct Entry {
     pub limiter_attempted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limiter_executable_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(super) struct LifecycleRecovery {
+    version: u32,
+    session_target: amaterasu_extension_api::LifecycleTarget,
+    stream_target: Option<amaterasu_extension_api::LifecycleTarget>,
+    plan_revision: Option<u64>,
 }
 
 /// Only the provider's bounded cleanup identity and specification survive restart.
@@ -103,6 +114,22 @@ impl Entry {
         Self {
             record_id: record.id,
             owner: record.owner.clone(),
+            lifecycle_recovery: record.config.lifecycle_session_target.clone().map(
+                |session_target| LifecycleRecovery {
+                    version: 1,
+                    session_target,
+                    stream_target: record
+                        .start
+                        .as_ref()
+                        .and_then(|start| start.lifecycle_target.clone()),
+                    plan_revision: record.start.as_ref().and_then(|start| {
+                        start
+                            .lifecycle_candidate
+                            .as_ref()
+                            .map(|candidate| candidate.plan_revision)
+                    }),
+                },
+            ),
             attempted_resources: record
                 .attempted
                 .iter()
@@ -165,6 +192,11 @@ impl Entry {
     pub fn recovery_record(&self) -> Result<Record, &'static str> {
         if !self.validate() {
             return Err("invalid_lifecycle_journal_entry");
+        }
+        // Old process handles and epochs cannot authorize lifecycle cleanup.
+        // Preserve this entry and block admission until the authority can reconcile it.
+        if self.lifecycle_recovery.is_some() {
+            return Err("lifecycle_reconciliation_required");
         }
         let config: PrepareConfig = serde_json::from_value(json!({
             "peer_ip":"127.0.0.1",
@@ -396,6 +428,24 @@ mod tests {
     use super::*;
     use crate::model::PrepareConfig;
     use serde_json::json;
+
+    #[test]
+    fn lifecycle_marker_survives_restart_and_blocks_legacy_recovery() {
+        let mut record = record();
+        record.config.lifecycle_session_target = Some(serde_json::from_value(json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1})).unwrap());
+        let entry = Entry::from_record(&record);
+        let encoded = serde_json::to_value(&entry).unwrap();
+        assert_eq!(encoded["lifecycle_recovery"]["version"], 1);
+        assert_eq!(
+            encoded["lifecycle_recovery"]["session_target"]["session_id"],
+            "session"
+        );
+        let restored: Entry = serde_json::from_value(encoded).unwrap();
+        assert!(matches!(
+            restored.recovery_record(),
+            Err("lifecycle_reconciliation_required")
+        ));
+    }
 
     fn record() -> Record {
         let config: PrepareConfig = serde_json::from_value(json!({

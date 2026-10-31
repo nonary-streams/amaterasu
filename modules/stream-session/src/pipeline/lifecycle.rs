@@ -35,6 +35,15 @@ impl Pipeline {
                 self.reply(record, job, send);
                 return false;
             }
+            if matches!(
+                job.step,
+                Step::ObserveActiveBinding
+                    | Step::ValidateActiveBinding
+                    | Step::NotifyCaptureInvalidated
+            ) {
+                record.plane = None;
+                record.input_events.clear();
+            }
             job.fail(record, "operation_deadline", now);
         }
         if let Some(mut pending) = job.pending.take() {
@@ -98,9 +107,38 @@ impl Pipeline {
                     return false;
                 }
                 rpc::Progress::Result(payload) => {
+                    if matches!(
+                        job.step,
+                        Step::ValidateLifecycleCandidate
+                            | Step::ObserveLifecycleCapture
+                            | Step::AckLifecycleCapture
+                            | Step::StartLifecycle
+                            | Step::PauseLifecycle
+                            | Step::RetireLifecycle
+                            | Step::ObserveActiveBinding
+                            | Step::ValidateActiveBinding
+                            | Step::NotifyCaptureInvalidated
+                            | Step::IssueLifecycleInputBinding
+                            | Step::AckLifecycleInput
+                    ) && !pending.release_result(send)
+                    {
+                        job.pending = Some(pending);
+                        return true;
+                    }
                     return self.consume(record, job, payload, now, send, factory);
                 }
                 rpc::Progress::Failed => {
+                    if matches!(
+                        job.step,
+                        Step::ObserveActiveBinding | Step::ValidateActiveBinding
+                    ) {
+                        record.plane = None;
+                        record.input_events.clear();
+                        record.lifecycle_invalid_reason = Some("capture_validation_unavailable");
+                        job.lifecycle_lookup = false;
+                        job.step = Step::NotifyCaptureInvalidated;
+                        return true;
+                    }
                     if matches!(job.step, Step::FeedbackPeek | Step::FeedbackAck) {
                         if job.step == Step::FeedbackPeek {
                             record.feedback_ack_through = None;
@@ -124,6 +162,19 @@ impl Pipeline {
                         return true;
                     }
                     if job.cleanup {
+                        if job.step == Step::ConfirmControlDisconnect {
+                            record.control_disconnect_checked = true;
+                            return true;
+                        }
+                        if matches!(job.step, Step::PauseLifecycle | Step::RetireLifecycle) {
+                            if job.step == Step::PauseLifecycle {
+                                job.lifecycle_pause_tried = true;
+                            } else {
+                                job.lifecycle_retire_tried = true;
+                            }
+                            record.cleanup_error = Some("lifecycle_cleanup_unavailable");
+                            return true;
+                        }
                         return if matches!(
                             job.step,
                             Step::Find(_)
@@ -265,6 +316,15 @@ impl Pipeline {
         if let Step::Open(resource) = job.step {
             record.attempted.insert(resource);
         }
+        if job.step == Step::AcquireOutput
+            && record
+                .start
+                .as_ref()
+                .is_some_and(|start| start.lifecycle_target.is_some())
+            && !record.lifecycle_candidate_validated
+        {
+            job.step = Step::ValidateLifecycleCandidate;
+        }
         if job.step == Step::ApplyLimiter {
             record.limiter_attempted = true;
         }
@@ -386,6 +446,151 @@ impl Pipeline {
         }
         if job.cleanup {
             return self.consume_cleanup(record, job, payload, now, send);
+        }
+        if job.step == Step::NotifyCaptureInvalidated {
+            job.fail(
+                record,
+                record
+                    .lifecycle_invalid_reason
+                    .unwrap_or("capture_binding_invalid"),
+                now,
+            );
+            return true;
+        }
+        if job.step == Step::ObserveActiveBinding {
+            if payload["ok"] != true
+                || payload["stream"] != record.resources[&Resource::Video]
+                || record.lifecycle_observation.as_ref() != Some(&payload["observed_capture"])
+            {
+                record.lifecycle_invalid_reason = Some("capture_binding_invalid");
+                record.plane = None;
+                record.input_events.clear();
+                job.step = Step::NotifyCaptureInvalidated;
+            } else {
+                job.step = Step::ValidateActiveBinding;
+            }
+            return true;
+        }
+        if job.step == Step::ValidateActiveBinding {
+            if payload["status"] == "pending" {
+                job.lifecycle_lookup = true;
+                return true;
+            }
+            let start = record.start.as_ref().expect("active lifecycle start");
+            if payload["status"] != "succeeded"
+                || payload["target"] != json!(start.lifecycle_target)
+                || payload["plan_revision"]
+                    != json!(start.lifecycle_candidate.as_ref().unwrap().plan_revision)
+                || payload["binding"] != json!(start.lifecycle_candidate)
+                || payload["observation"] != json!(record.lifecycle_observation)
+            {
+                record.lifecycle_invalid_reason = Some("capture_binding_invalid");
+                record.plane = None;
+                record.input_events.clear();
+                job.lifecycle_lookup = false;
+                job.step = Step::NotifyCaptureInvalidated;
+            } else {
+                record.lifecycle_delivery_permit = true;
+                record.lifecycle_control_permit = true;
+                job.lifecycle_lookup = false;
+                return false;
+            }
+            return true;
+        }
+        if matches!(
+            job.step,
+            Step::ValidateLifecycleCandidate
+                | Step::AckLifecycleCapture
+                | Step::StartLifecycle
+                | Step::IssueLifecycleInputBinding
+                | Step::AckLifecycleInput
+        ) {
+            let start = record.start.as_ref().expect("lifecycle start");
+            if payload["status"] == "pending" {
+                job.lifecycle_lookup = true;
+                return true;
+            }
+            if payload["status"] != "succeeded"
+                || payload["target"] != json!(start.lifecycle_target)
+                || payload["plan_revision"]
+                    != json!(start.lifecycle_candidate.as_ref().unwrap().plan_revision)
+            {
+                job.fail(record, "lifecycle_authority_rejected", now);
+                return true;
+            }
+            if job.step == Step::StartLifecycle && payload["all_consumers_acknowledged"] != true {
+                job.fail(record, "lifecycle_consumers_unconfirmed", now);
+                return true;
+            }
+            job.lifecycle_lookup = false;
+            match job.step {
+                Step::ValidateLifecycleCandidate => {
+                    record.lifecycle_candidate_validated = true;
+                    job.step = Step::AcquireOutput;
+                }
+                Step::AckLifecycleCapture => {
+                    job.step = if record.config.stream_audio {
+                        Step::Open(Resource::AudioCapture)
+                    } else {
+                        Step::Activate
+                    };
+                }
+                Step::IssueLifecycleInputBinding => {
+                    let Some(token) = payload["token"].as_str().filter(|token| {
+                        !token.is_empty()
+                            && token.len() <= 512
+                            && !token.chars().any(char::is_control)
+                    }) else {
+                        job.fail(record, "input_binding_unavailable", now);
+                        return true;
+                    };
+                    let Some(revision) = payload["geometry_revision"]
+                        .as_u64()
+                        .filter(|revision| *revision > 0)
+                    else {
+                        job.fail(record, "input_binding_unavailable", now);
+                        return true;
+                    };
+                    if revision
+                        != start
+                            .lifecycle_candidate
+                            .as_ref()
+                            .unwrap()
+                            .geometry_revision
+                    {
+                        job.fail(record, "input_binding_unavailable", now);
+                        return true;
+                    }
+                    record.lifecycle_input_token = Some(token.to_owned());
+                    record.lifecycle_input_geometry_revision = Some(revision);
+                    job.step = Step::AcquireInput;
+                }
+                Step::AckLifecycleInput => {
+                    job.step = Step::StartLifecycle;
+                }
+                Step::StartLifecycle => {
+                    record.state = State::Active;
+                    record.history.activated(now);
+                    record.host_metrics.activated(record.id);
+                    record.session_effects.activated(record.id);
+                    self.activate_tray_session(record.id);
+                    return self.deliver_success(record, job, now, send);
+                }
+                _ => unreachable!(),
+            }
+            return true;
+        }
+        if job.step == Step::ObserveLifecycleCapture {
+            if payload["ok"] != true
+                || payload["stream"] != record.resources[&Resource::Video]
+                || !payload["observed_capture"].is_object()
+            {
+                job.fail(record, "capture_observation_unavailable", now);
+            } else {
+                record.lifecycle_observation = Some(payload["observed_capture"].clone());
+                job.step = Step::AckLifecycleCapture;
+            }
+            return true;
         }
         if job.step == Step::ApplyLimiter {
             super::limiter::accept_apply(record, &payload);
@@ -589,7 +794,9 @@ impl Pipeline {
                 self.journal.failed = true;
                 return self.journal_write_failed(record, job, now, send);
             }
-            if job.step == Step::InputBatch && payload["error"]["code"] == "controller_unavailable"
+            if job.step == Step::InputBatch
+                && record.lifecycle_input_token.is_none()
+                && payload["error"]["code"] == "controller_unavailable"
             {
                 record.session_effects.vigem_missing(record.id);
                 match accept_controller_batch_failure(record, &payload) {
@@ -710,8 +917,26 @@ impl Pipeline {
                 if session["state"] != "active" {
                     return Err("invalid_session_response");
                 }
-                if self.settings.enable_input {
-                    job.step = Step::AcquireInput;
+                if record
+                    .lifecycle_input_required
+                    .unwrap_or(self.settings.enable_input)
+                {
+                    job.step = if record
+                        .start
+                        .as_ref()
+                        .is_some_and(|start| start.lifecycle_target.is_some())
+                    {
+                        Step::IssueLifecycleInputBinding
+                    } else {
+                        Step::AcquireInput
+                    };
+                    Ok(true)
+                } else if record
+                    .start
+                    .as_ref()
+                    .is_some_and(|start| start.lifecycle_target.is_some())
+                {
+                    job.step = Step::StartLifecycle;
                     Ok(true)
                 } else {
                     record.state = State::Active;
@@ -724,6 +949,28 @@ impl Pipeline {
             }
             Step::AcquireInput => {
                 accept_input_lease(record, &payload, now)?;
+                if let Some(token) = record.lifecycle_input_token.as_ref() {
+                    let start = record.start.as_ref().ok_or("input_binding_unavailable")?;
+                    let epoch = payload["batch_epoch"]
+                        .as_str()
+                        .filter(|epoch| {
+                            !epoch.is_empty()
+                                && epoch.len() <= 128
+                                && epoch.bytes().all(|b| {
+                                    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')
+                                })
+                        })
+                        .ok_or("input_binding_unavailable")?;
+                    if payload["input_binding"] != *token
+                        || payload["target"] != json!(start.lifecycle_target)
+                        || payload["geometry_revision"]
+                            != json!(record.lifecycle_input_geometry_revision)
+                        || payload["input_acknowledged"] != true
+                    {
+                        return Err("input_binding_unavailable");
+                    }
+                    record.lifecycle_input_epoch = Some(epoch.to_owned());
+                }
                 if super::virtual_display::requested(record)
                     && record.input_absolute_pointer
                     && record
@@ -739,6 +986,14 @@ impl Pipeline {
                         "x":(u32::from(bounds.left)+u32::from(bounds.right))/2,
                         "y":(u32::from(bounds.top)+u32::from(bounds.bottom))/2}));
                 }
+                if record
+                    .start
+                    .as_ref()
+                    .is_some_and(|start| start.lifecycle_target.is_some())
+                {
+                    job.step = Step::AckLifecycleInput;
+                    return Ok(true);
+                }
                 record.state = State::Active;
                 record.history.activated(now);
                 record.host_metrics.activated(record.id);
@@ -751,7 +1006,19 @@ impl Pipeline {
                 Ok(false)
             }
             Step::InputBatch => {
+                if let Some(epoch) = &record.lifecycle_input_epoch
+                    && payload["operation_id"]
+                        != format!("{epoch}:{}", record.lifecycle_input_sequence)
+                {
+                    return Err("input_batch_failed");
+                }
                 accept_input_batch(record, &payload)?;
+                if record.lifecycle_input_epoch.is_some() {
+                    record.lifecycle_input_sequence = record
+                        .lifecycle_input_sequence
+                        .checked_add(1)
+                        .ok_or("lifecycle_sequence_exhausted")?;
+                }
                 Ok(false)
             }
             Step::FeedbackPeek => {
@@ -942,7 +1209,13 @@ impl Pipeline {
                     return Err("video_not_running");
                 }
                 configure_absolute_input(record, payload)?;
-                job.step = if record.config.stream_audio {
+                job.step = if record
+                    .start
+                    .as_ref()
+                    .is_some_and(|start| start.lifecycle_target.is_some())
+                {
+                    Step::ObserveLifecycleCapture
+                } else if record.config.stream_audio {
                     Step::Open(Resource::AudioCapture)
                 } else {
                     Step::Activate

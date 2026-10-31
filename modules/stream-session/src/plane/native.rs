@@ -380,7 +380,11 @@ impl<T> Delivery<T> {
             (STATUS_OK, Some(result)) => result.map(Some),
             (MEDIA_BUSY | MEDIA_PENDING, None) => Ok(None),
             (_, Some(Err(error))) => Err(error),
-            (MEDIA_CLOSED, _) => Err("native_stream_closed"),
+            (MEDIA_CLOSED, _) => Err(if matches!(lane, DeliveryLane::Control) {
+                "native_control_closed"
+            } else {
+                "native_stream_closed"
+            }),
             _ => {
                 // Only fixed lane names, numeric ABI status, and callback presence
                 // are logged. No borrowed media, control message, or peer data escapes.

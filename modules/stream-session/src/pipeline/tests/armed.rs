@@ -1,9 +1,270 @@
 use super::*;
 
+#[test]
+fn logical_identities_are_only_accepted_from_rtsp_and_are_echoed() {
+    let mut host = Harness::new();
+    let mut request = prepare();
+    request["lifecycle_session_target"] =
+        json!({"kind":"session", "host_epoch":"epoch", "session_id":"session:1", "generation":1});
+    assert_eq!(
+        host.response(1, request.clone())["code"],
+        "permission_denied"
+    );
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    let response = host.response_from(2, "amaterasu.rtsp", request);
+    assert_eq!(
+        response["lifecycle_session_target"]["session_id"],
+        "session:1"
+    );
+    assert_eq!(response["lifecycle_input_required"], false);
+}
+
 fn arm(id: u64) -> Value {
     let mut value = start(id);
     value["action"] = json!("start_when_authenticated");
     value
+}
+
+fn arm_lifecycle(host: &mut Harness) -> (u64, Value) {
+    let session_target =
+        json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1});
+    let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1});
+    let mut request = prepare();
+    request["lifecycle_session_target"] = session_target;
+    let id = host.response_from(1, "amaterasu.rtsp", request)["session"]
+        .as_u64()
+        .unwrap();
+    let mut start = arm(id);
+    start["configuration"]["capture_provider"] = json!("pipewire");
+    start["configuration"]["lifecycle_target"] = target.clone();
+    start["configuration"]["lifecycle_candidate"] = json!({"capture_provider":"amaterasu.capture-pipewire/1","selector_schema":"amaterasu.kwin-wl-output/1","selector":{"output":"kwin:Virtual-12"},"resource":{"provider":"provider","resource_id":"r","incarnation":"i","revision":1,"execution_domain":"seat","mutation_domain":null},"mode":{"width":1280,"height":720,"refresh_millihz":60000,"hdr":false},"plan_revision":1,"geometry_revision":1,"generation":1});
+    assert_eq!(
+        host.response_from(2, "amaterasu.rtsp", start)["state"],
+        "armed"
+    );
+    (id, target)
+}
+
+#[test]
+fn lifecycle_capture_waits_for_authority_and_retires_after_close() {
+    let mut host = Harness::new();
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    host.broker.lifecycle_success = true;
+    host.broker.lifecycle_pending_once = true;
+    let (id, target) = arm_lifecycle(&mut host);
+    host.idle();
+    assert_eq!(host.pipeline.records[&id].state, State::Active);
+    let calls = &host.broker.calls;
+    let index = |service: &str, key: &str, action: &str| {
+        calls
+            .iter()
+            .position(|call| call.service == service && call.payload[key] == action)
+            .unwrap()
+    };
+    assert!(
+        index("amaterasu.session-lifecycle/1", "operation", "lookup")
+            < index("amaterasu.video/1", "action", "open")
+    );
+    assert!(
+        index("amaterasu.video/1", "action", "observe_capture")
+            < index("amaterasu.session-lifecycle/1", "operation", "ack_binding")
+    );
+    let ticks_before_stop = host.plane.borrow().ticks;
+    let stopped = host.response_from(3, "amaterasu.rtsp", json!({"action":"stop","session":id}));
+    // The harness pumps once before admitting the queued stop request.
+    assert!(host.plane.borrow().ticks <= ticks_before_stop + 1);
+    assert_eq!(stopped["lifecycle_retired"], true);
+    assert_eq!(stopped["lifecycle_target"], target);
+    let calls = &host.broker.calls;
+    let position = |service: &str, key: &str, action: &str| {
+        calls
+            .iter()
+            .position(|call| call.service == service && call.payload[key] == action)
+            .unwrap()
+    };
+    assert!(
+        position("amaterasu.session-lifecycle/1", "operation", "pause_stream")
+            < position("amaterasu.video/1", "action", "close")
+    );
+    assert!(
+        position("amaterasu.video/1", "action", "close")
+            < position(
+                "amaterasu.session-lifecycle/1",
+                "operation",
+                "retire_stream"
+            )
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|call| call.service == "amaterasu.video/1" && call.payload["action"] == "drain")
+    );
+}
+
+#[test]
+fn lifecycle_rejection_blocks_capture_and_unconfirmed_retirement() {
+    let mut host = Harness::new();
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    host.broker.lifecycle_success = true;
+    host.broker.lifecycle_reject_operation = Some("validate_candidate".into());
+    let (id, _) = arm_lifecycle(&mut host);
+    host.idle();
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == "amaterasu.video/1" && call.payload["action"] == "open")
+    );
+    assert_ne!(host.pipeline.records[&id].state, State::Active);
+
+    let mut host = Harness::new();
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    host.broker.lifecycle_success = true;
+    host.broker.lifecycle_omit_consumer_confirmation = true;
+    let (id, _) = arm_lifecycle(&mut host);
+    host.idle();
+    assert_ne!(host.pipeline.records[&id].state, State::Active);
+    assert_eq!(
+        host.pipeline.records[&id].error,
+        Some("lifecycle_consumers_unconfirmed")
+    );
+}
+
+#[test]
+fn lifecycle_fence_rejection_cannot_report_retired() {
+    let mut host = Harness::new();
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    host.broker.lifecycle_success = true;
+    let (id, _) = arm_lifecycle(&mut host);
+    host.idle();
+    host.broker.lifecycle_reject_operation = Some("pause_stream".into());
+    let stopped = host.response_from(3, "amaterasu.rtsp", json!({"action":"stop","session":id}));
+    assert_eq!(stopped["state"], "cleanup_failed");
+    assert_eq!(stopped["lifecycle_retired"], false);
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.payload["operation"] == "retire_stream")
+    );
+}
+
+#[test]
+fn changed_active_observation_stops_delivery_and_reports_invalidation() {
+    let mut host = Harness::new();
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    host.broker.lifecycle_success = true;
+    let (id, _) = arm_lifecycle(&mut host);
+    host.idle();
+    assert_eq!(host.pipeline.records[&id].state, State::Active);
+    host.broker.lifecycle_observation_override = Some(
+        json!({"protocol":"wayland-wl-output","registry_global":5,"output_name":"Virtual-12"}),
+    );
+    host.idle();
+    assert_ne!(host.pipeline.records[&id].state, State::Active);
+    assert!(
+        host.broker
+            .calls
+            .iter()
+            .any(|call| call.payload["operation"] == "capture_invalidated")
+    );
+}
+
+#[test]
+fn unavailable_active_validation_stops_delivery() {
+    let mut host = Harness::new();
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    host.broker.lifecycle_success = true;
+    let (id, _) = arm_lifecycle(&mut host);
+    host.idle();
+    assert_eq!(host.pipeline.records[&id].state, State::Active);
+    host.broker.lifecycle_reject_operation = Some("binding_validate".into());
+    host.idle();
+    assert_ne!(host.pipeline.records[&id].state, State::Active);
+}
+
+#[test]
+fn lifecycle_stream_rejects_input_when_authority_denies_binding() {
+    let mut host = Harness::new();
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    host.pipeline.settings.enable_input = true;
+    host.broker.lifecycle_success = true;
+    host.broker.lifecycle_reject_operation = Some("issue_input_binding".into());
+    let (id, _) = arm_lifecycle(&mut host);
+    host.idle();
+    assert_ne!(host.pipeline.records[&id].state, State::Active);
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == "amaterasu.input/1" && call.payload["action"] == "acquire")
+    );
+}
+
+#[test]
+fn staged_bound_input_uses_token_and_monotonic_batch_ids() {
+    let mut host = Harness::new();
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    host.pipeline.settings.enable_input = true;
+    host.broker.lifecycle_success = true;
+    let (id, _) = arm_lifecycle(&mut host);
+    host.idle();
+    assert_eq!(host.pipeline.records[&id].state, State::Active);
+    host.pipeline
+        .records
+        .get_mut(&id)
+        .unwrap()
+        .input_events
+        .push_back(json!({"kind":"key","key":30,"down":true}));
+    host.idle();
+    host.pipeline
+        .records
+        .get_mut(&id)
+        .unwrap()
+        .input_events
+        .push_back(json!({"kind":"key","key":30,"down":false}));
+    host.idle();
+    let batches: Vec<_> = host
+        .broker
+        .calls
+        .iter()
+        .filter(|call| call.service == "amaterasu.input/1" && call.payload["action"] == "batch")
+        .map(|call| call.payload.clone())
+        .collect();
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[0]["operation_id"], "epoch-1:1");
+    assert_eq!(batches[1]["operation_id"], "epoch-1:2");
+    assert_eq!(batches[0]["input_binding"], "binding-token");
 }
 
 #[test]

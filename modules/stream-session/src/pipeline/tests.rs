@@ -10,6 +10,71 @@ use super::*;
 use harness::*;
 
 #[test]
+fn authenticated_control_disconnect_is_confirmed_on_exact_owned_stream() {
+    for (reason, expected, wrong_stream, plane_error) in [
+        (
+            "peer_disconnected",
+            Some("peer_disconnected"),
+            false,
+            "native_control_closed",
+        ),
+        (
+            "authenticated_peer_idle",
+            Some("authenticated_peer_idle"),
+            false,
+            "native_delivery_failed_control",
+        ),
+        (
+            "peer_timeout",
+            Some("peer_timeout"),
+            false,
+            "native_control_closed",
+        ),
+        (
+            "authentication_timeout",
+            None,
+            false,
+            "native_control_closed",
+        ),
+        ("peer_disconnected", None, true, "native_control_closed"),
+        (
+            "peer_disconnected",
+            None,
+            false,
+            "native_delivery_failed_video",
+        ),
+    ] {
+        let mut host = Harness::new();
+        let id = host.response(1, prepare())["session"].as_u64().unwrap();
+        assert_eq!(host.response(2, start(id))["state"], "active");
+        host.broker.control_failure = Some(reason.into());
+        host.broker.control_status_wrong_stream = wrong_stream;
+        host.plane.borrow_mut().failure = Some(plane_error);
+        host.idle();
+        let record = &host.pipeline.records[&id];
+        assert_eq!(
+            record.authenticated_disconnect_reason, expected,
+            "{reason} {plane_error}"
+        );
+    }
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    host.pipeline
+        .records
+        .get_mut(&id)
+        .unwrap()
+        .control_authenticated = false;
+    host.broker.control_failure = Some("peer_disconnected".into());
+    host.plane.borrow_mut().failure = Some("native_control_closed");
+    host.idle();
+    assert_eq!(
+        host.pipeline.records[&id].authenticated_disconnect_reason,
+        None
+    );
+}
+
+#[test]
 fn session_status_list_is_scoped_to_the_exact_authenticated_caller() {
     let mut host = Harness::new();
     host.pipeline.settings.allowed_principals =

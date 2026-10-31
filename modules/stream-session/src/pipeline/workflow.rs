@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 pub(super) enum Step {
     Open(Resource),
     Authenticate,
+    ConfirmControlDisconnect,
     MediaReady,
     ConfigureMediaVideoFormat,
     ApplyLimiter,
@@ -27,6 +28,17 @@ pub(super) enum Step {
     FindOwnedVirtualDisplay,
     RemoveOwnedVirtualDisplay,
     AcquireOutput,
+    ValidateLifecycleCandidate,
+    ObserveLifecycleCapture,
+    AckLifecycleCapture,
+    StartLifecycle,
+    PauseLifecycle,
+    RetireLifecycle,
+    ObserveActiveBinding,
+    ValidateActiveBinding,
+    NotifyCaptureInvalidated,
+    IssueLifecycleInputBinding,
+    AckLifecycleInput,
     AcquireAudio,
     Activate,
     AcquireInput,
@@ -72,6 +84,9 @@ pub(super) struct Job {
     pub journal_payload: Option<Value>,
     pub journal_operation_id: Option<String>,
     pub rumble_tried: bool,
+    pub lifecycle_pause_tried: bool,
+    pub lifecycle_retire_tried: bool,
+    pub lifecycle_lookup: bool,
 }
 
 impl Job {
@@ -96,6 +111,9 @@ impl Job {
             journal_payload: None,
             journal_operation_id: None,
             rumble_tried: false,
+            lifecycle_pause_tried: false,
+            lifecycle_retire_tried: false,
+            lifecycle_lookup: false,
         }
     }
 
@@ -112,7 +130,12 @@ impl Job {
         if let Some(plane) = record.plane.as_mut() {
             plane.stop();
         }
-        if record.rumble_pending.is_empty() {
+        if record.rumble_pending.is_empty()
+            || record
+                .start
+                .as_ref()
+                .is_some_and(|start| start.lifecycle_target.is_some())
+        {
             record.plane = None;
         }
         record.audio_recovery_needed = false;
@@ -121,10 +144,29 @@ impl Job {
             self.settling_allocation = true;
         }
         self.cleanup = true;
+        self.lifecycle_lookup = false;
         self.deadline = now.saturating_add(15000);
     }
 
     pub fn next_cleanup(&mut self, record: &Record) -> Option<Step> {
+        if record.control_authenticated
+            && !record.control_disconnect_checked
+            && matches!(
+                record.error,
+                Some("native_control_closed" | "native_delivery_failed_control")
+            )
+            && record.resources.contains_key(&Resource::Control)
+        {
+            return Some(Step::ConfirmControlDisconnect);
+        }
+        if record
+            .start
+            .as_ref()
+            .is_some_and(|start| start.lifecycle_target.is_some())
+            && !self.lifecycle_pause_tried
+        {
+            return Some(Step::PauseLifecycle);
+        }
         if !self.rumble_tried
             && (!record.rumble_active_until.is_empty() || !record.rumble_pending.is_empty())
         {
@@ -210,6 +252,25 @@ impl Job {
             }
             self.virtual_display_tried = true;
         }
+        if record
+            .start
+            .as_ref()
+            .is_some_and(|start| start.lifecycle_target.is_some())
+            && record.lifecycle_fenced
+            && !self.lifecycle_retire_tried
+        {
+            if record
+                .attempted
+                .iter()
+                .any(|resource| *resource != Resource::Session)
+            {
+                return None;
+            }
+            if record.lifecycle_retirement_receipt.is_none() {
+                return Some(Step::Find(Resource::Video));
+            }
+            return Some(Step::RetireLifecycle);
+        }
         if record.resources.contains_key(&Resource::Session) {
             if record
                 .attempted
@@ -229,6 +290,88 @@ impl Job {
     pub fn command(&self, record: &Record) -> (String, Value) {
         let session = || record.resources[&Resource::Session];
         match self.step {
+            Step::ObserveLifecycleCapture | Step::ObserveActiveBinding => (
+                Resource::Video.service(),
+                json!({"action":"observe_capture", "stream":record.resources[&Resource::Video]}),
+            ),
+            Step::ValidateLifecycleCandidate
+            | Step::AckLifecycleCapture
+            | Step::StartLifecycle
+            | Step::PauseLifecycle
+            | Step::RetireLifecycle
+            | Step::ValidateActiveBinding
+            | Step::NotifyCaptureInvalidated
+            | Step::IssueLifecycleInputBinding
+            | Step::AckLifecycleInput => {
+                let start = record.start.as_ref().expect("lifecycle requires start");
+                let target = start.lifecycle_target.as_ref().expect("lifecycle target");
+                let candidate = start
+                    .lifecycle_candidate
+                    .as_ref()
+                    .expect("lifecycle candidate");
+                let operation = match self.step {
+                    Step::ValidateLifecycleCandidate => "validate_candidate",
+                    Step::AckLifecycleCapture => "ack_binding",
+                    Step::StartLifecycle => "start_stream",
+                    Step::PauseLifecycle => "pause_stream",
+                    Step::RetireLifecycle => "retire_stream",
+                    Step::ValidateActiveBinding => "binding_validate",
+                    Step::NotifyCaptureInvalidated => "capture_invalidated",
+                    Step::IssueLifecycleInputBinding => "issue_input_binding",
+                    Step::AckLifecycleInput => "ack_binding",
+                    _ => unreachable!(),
+                };
+                let operation_id = if matches!(
+                    self.step,
+                    Step::ValidateActiveBinding | Step::NotifyCaptureInvalidated
+                ) {
+                    format!(
+                        "ss-{:016x}-{operation}-{}",
+                        record.id, record.lifecycle_validation_sequence
+                    )
+                } else if self.step == Step::AckLifecycleInput {
+                    format!("ss-{:016x}-{operation}-input", record.id)
+                } else {
+                    format!("ss-{:016x}-{operation}", record.id)
+                };
+                let payload = if self.lifecycle_lookup {
+                    json!({"operation":"lookup","operation_id":operation_id})
+                } else {
+                    let mut payload = json!({"operation":operation,"operation_id":operation_id,"target":target,"plan_revision":candidate.plan_revision});
+                    match self.step {
+                        Step::ValidateLifecycleCandidate => payload["candidate"] = json!(candidate),
+                        Step::AckLifecycleCapture => {
+                            payload["candidate"] = json!(candidate);
+                            payload["consumer"] = json!("capture");
+                            payload["observed_capture"] = json!(record.lifecycle_observation);
+                        }
+                        Step::RetireLifecycle => {
+                            payload["retirement_receipt"] =
+                                json!(record.lifecycle_retirement_receipt)
+                        }
+                        Step::ValidateActiveBinding => {
+                            payload["binding"] = json!(candidate);
+                            payload["observation"] = json!(record.lifecycle_observation);
+                        }
+                        Step::NotifyCaptureInvalidated => {
+                            payload["reason"] = json!(record.lifecycle_invalid_reason);
+                        }
+                        Step::IssueLifecycleInputBinding => {
+                            payload["consumer"] = json!("amaterasu.input/1");
+                        }
+                        Step::AckLifecycleInput => {
+                            payload["candidate"] = json!(candidate);
+                            payload["consumer"] = json!("input");
+                            payload["token"] = json!(record.lifecycle_input_token);
+                            payload["geometry_revision"] =
+                                json!(record.lifecycle_input_geometry_revision);
+                        }
+                        _ => {}
+                    }
+                    payload
+                };
+                ("amaterasu.session-lifecycle/1".into(), payload)
+            }
             Step::PersistJournal => (
                 "amaterasu.state/1".into(),
                 self.journal_payload
@@ -237,6 +380,10 @@ impl Job {
             ),
             Step::Open(resource) => (resource.service(), record.open(resource)),
             Step::Authenticate => (
+                Resource::Control.service(),
+                json!({"action":"status","stream":record.resources[&Resource::Control]}),
+            ),
+            Step::ConfirmControlDisconnect => (
                 Resource::Control.service(),
                 json!({"action":"status","stream":record.resources[&Resource::Control]}),
             ),
@@ -327,6 +474,9 @@ impl Job {
                     "keybindings":start.keybindings,
                     "key_repeat_delay":start.key_repeat_delay,
                     "key_repeat_frequency":start.key_repeat_frequency});
+                if let Some(token) = &record.lifecycle_input_token {
+                    payload["lifecycle_binding_token"] = json!(token);
+                }
                 if let Some(back_as_touchpad_click) = start.ds4_back_as_touchpad_click {
                     payload["ds4_back_as_touchpad_click"] = json!(back_as_touchpad_click);
                 }
@@ -353,10 +503,17 @@ impl Job {
                 "amaterasu.input/1".into(),
                 json!({"action":"renew","lease":record.input_lease,"ttl_ms":record.input_ttl_ms}),
             ),
-            Step::InputBatch => (
-                "amaterasu.input/1".into(),
-                json!({"action":"batch","lease":record.input_lease,"events":record.input_events.iter().take(record.input_inflight).collect::<Vec<_>>() }),
-            ),
+            Step::InputBatch => {
+                let mut payload = json!({"action":"batch","lease":record.input_lease,"events":record.input_events.iter().take(record.input_inflight).collect::<Vec<_>>() });
+                if let (Some(token), Some(epoch)) =
+                    (&record.lifecycle_input_token, &record.lifecycle_input_epoch)
+                {
+                    payload["input_binding"] = json!(token);
+                    payload["operation_id"] =
+                        json!(format!("{epoch}:{}", record.lifecycle_input_sequence));
+                }
+                ("amaterasu.input/1".into(), payload)
+            }
             Step::FeedbackPeek => (
                 "amaterasu.input/1".into(),
                 json!({"action":"feedback_peek","lease":record.input_lease,"limit":16}),

@@ -144,6 +144,10 @@ impl Pipeline {
             rpc::complete(send, request, error(code));
             return;
         }
+        if config.lifecycle_session_target.is_some() && owner != "amaterasu.rtsp" {
+            rpc::complete(send, request, error("permission_denied"));
+            return;
+        }
         if let Some(record) = self.records.values().find(|record| {
             record.owner == owner && record.config.operation_id == config.operation_id
         }) {
@@ -188,10 +192,13 @@ impl Pipeline {
                 return;
             }
         };
-        self.records.insert(
-            id,
-            Record::new(id, owner, config, self.settings.input_lease_ttl_ms),
-        );
+        let lifecycle_input_required = config
+            .lifecycle_session_target
+            .as_ref()
+            .map(|_| self.settings.enable_input);
+        let mut record = Record::new(id, owner, config, self.settings.input_lease_ttl_ms);
+        record.lifecycle_input_required = lifecycle_input_required;
+        self.records.insert(id, record);
         self.job = Some(Job::new(
             id,
             Some(request),
@@ -228,6 +235,49 @@ impl Pipeline {
             rpc::complete(send, request, error("session_not_found"));
             return;
         };
+        match (
+            &record.config.lifecycle_session_target,
+            &configuration.lifecycle_target,
+            &configuration.lifecycle_candidate,
+        ) {
+            (None, None, None) => {}
+            (
+                Some(amaterasu_extension_api::LifecycleTarget::Session {
+                    host_epoch,
+                    session_id,
+                    ..
+                }),
+                Some(amaterasu_extension_api::LifecycleTarget::Stream {
+                    host_epoch: stream_epoch,
+                    session_id: stream_session,
+                    stream_id,
+                    generation,
+                }),
+                Some(candidate),
+            ) if owner == "amaterasu.rtsp"
+                && host_epoch == stream_epoch
+                && session_id == stream_session
+                && valid_name(stream_id)
+                && *generation > 0
+                && candidate.generation == *generation
+                && amaterasu_extension_api::validate_capture_binding(candidate).is_ok()
+                && candidate.capture_provider == "amaterasu.capture-pipewire/1"
+                && candidate.selector_schema == "amaterasu.kwin-wl-output/1"
+                && candidate
+                    .selector
+                    .as_object()
+                    .is_some_and(|object| object.len() == 1)
+                && candidate.selector["output"].as_str().is_some_and(|output| {
+                    output.starts_with("kwin:Virtual-") && valid_name(output)
+                })
+                && !candidate.mode.hdr
+                && configuration.source_id.is_none()
+                && configuration.capture_provider == crate::model::CaptureProvider::PipeWire => {}
+            _ => {
+                rpc::complete(send, request, error("invalid_lifecycle_identity"));
+                return;
+            }
+        }
         if let Err(code) = configuration.configuration.normalize_codec() {
             rpc::complete(send, request, error(code));
             return;
@@ -352,7 +402,12 @@ impl Pipeline {
         record.state = State::Stopping;
         record.cleanup_error = None;
         input::queue_rumble_zeros(record, now);
-        if retrying_cleanup {
+        if retrying_cleanup
+            || record
+                .start
+                .as_ref()
+                .is_some_and(|start| start.lifecycle_target.is_some())
+        {
             if !record.rumble_pending.is_empty() {
                 record.rumble_stop_unconfirmed = true;
                 record.rumble_pending.clear();

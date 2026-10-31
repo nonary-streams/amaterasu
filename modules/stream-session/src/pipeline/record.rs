@@ -75,6 +75,20 @@ pub(super) struct Record {
     pub owner: String,
     pub config: PrepareConfig,
     pub start: Option<StartConfig>,
+    pub lifecycle_observation: Option<Value>,
+    pub lifecycle_retirement_receipt: Option<Value>,
+    pub lifecycle_candidate_validated: bool,
+    pub lifecycle_fenced: bool,
+    pub lifecycle_retired: bool,
+    pub lifecycle_delivery_permit: bool,
+    pub lifecycle_control_permit: bool,
+    pub lifecycle_validation_sequence: u64,
+    pub lifecycle_invalid_reason: Option<&'static str>,
+    pub lifecycle_input_token: Option<String>,
+    pub lifecycle_input_epoch: Option<String>,
+    pub lifecycle_input_geometry_revision: Option<u64>,
+    pub lifecycle_input_sequence: u64,
+    pub lifecycle_input_required: Option<bool>,
     pub state: State,
     pub outcome: State,
     pub resources: BTreeMap<Resource, u64>,
@@ -87,6 +101,8 @@ pub(super) struct Record {
     pub armed_accepted: bool,
     pub next_auth_poll: u64,
     pub control_authenticated: bool,
+    pub control_disconnect_checked: bool,
+    pub authenticated_disconnect_reason: Option<&'static str>,
     pub media_ready: bool,
     pub peer_discovery: bool,
     pub video_peer_port: Option<u16>,
@@ -163,6 +179,20 @@ impl Record {
             owner,
             config,
             start: None,
+            lifecycle_observation: None,
+            lifecycle_retirement_receipt: None,
+            lifecycle_candidate_validated: false,
+            lifecycle_fenced: false,
+            lifecycle_retired: false,
+            lifecycle_delivery_permit: false,
+            lifecycle_control_permit: false,
+            lifecycle_validation_sequence: 0,
+            lifecycle_invalid_reason: None,
+            lifecycle_input_token: None,
+            lifecycle_input_epoch: None,
+            lifecycle_input_geometry_revision: None,
+            lifecycle_input_sequence: 1,
+            lifecycle_input_required: None,
             state: State::Preparing,
             outcome: State::Failed,
             resources: BTreeMap::new(),
@@ -175,6 +205,8 @@ impl Record {
             armed_accepted: false,
             next_auth_poll: 0,
             control_authenticated: false,
+            control_disconnect_checked: false,
+            authenticated_disconnect_reason: None,
             media_ready: false,
             peer_discovery: false,
             video_peer_port: None,
@@ -326,6 +358,11 @@ impl Record {
         json!({
             "ok": true,
             "session": self.id,
+            "lifecycle_session_target": self.config.lifecycle_session_target,
+            "lifecycle_input_required": self.lifecycle_input_required,
+            "lifecycle_target": self.start.as_ref().and_then(|start| start.lifecycle_target.as_ref()),
+            "lifecycle_retired": self.lifecycle_retired,
+            "authenticated_disconnect_reason": self.authenticated_disconnect_reason,
             "history_activity_id": self.config.history_activity_id,
             "rtsp_operation_id": self.config.rtsp_operation_id,
             "state": self.state,
@@ -444,8 +481,11 @@ impl Record {
                 } else {
                     payload["capture_provider"] = json!(start.capture_provider);
                     payload["output"] = json!(
-                        self.virtual_display_output
-                            .as_deref()
+                        start
+                            .lifecycle_candidate
+                            .as_ref()
+                            .and_then(|binding| binding.selector["output"].as_str())
+                            .or(self.virtual_display_output.as_deref())
                             .unwrap_or(&start.output)
                     );
                     payload["constant_rate"] = json!(start.constant_rate);

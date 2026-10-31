@@ -341,6 +341,9 @@ impl DisplayRequest {
 #[serde(deny_unknown_fields)]
 pub struct PrepareConfig {
     pub peer_ip: IpAddr,
+    /// Coordinator-issued logical session selected by the transport adapter.
+    #[serde(default)]
+    pub lifecycle_session_target: Option<amaterasu_extension_api::LifecycleTarget>,
     /// Prelaunch History reservation, bound to the signed RTSP operation.
     #[serde(default)]
     pub history_activity_id: Option<String>,
@@ -396,6 +399,21 @@ pub struct PrepareConfig {
 }
 impl PrepareConfig {
     pub fn validate(&self, allow_remote: bool) -> Result<(), &'static str> {
+        if let Some(target) = &self.lifecycle_session_target {
+            match target {
+                amaterasu_extension_api::LifecycleTarget::Session {
+                    host_epoch,
+                    session_id,
+                    generation,
+                } if valid_lifecycle_id(host_epoch)
+                    && valid_lifecycle_id(session_id)
+                    && *generation > 0 => {}
+                _ => return Err("invalid_lifecycle_identity"),
+            }
+            if self.display_request.is_some() || self.virtual_display_intent.is_some() {
+                return Err("lifecycle_display_policy_conflict");
+            }
+        }
         match (&self.history_activity_id, &self.rtsp_operation_id) {
             (None, None) => {}
             (Some(activity), Some(operation)) if valid_name(activity) && activity == operation => {}
@@ -859,6 +877,10 @@ fn is_default_qp(value: &i32) -> bool {
 #[derive(Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartConfigData {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_target: Option<amaterasu_extension_api::LifecycleTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_candidate: Option<amaterasu_extension_api::CaptureBinding>,
     #[serde(default)]
     pub capture_provider: CaptureProvider,
     #[serde(default)]
@@ -1271,6 +1293,13 @@ fn default_ping_timeout_ms() -> u32 {
 pub fn valid_name(value: &str) -> bool {
     valid_label(value, 128)
 }
+fn valid_lifecycle_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+}
 fn valid_label(value: &str, limit: usize) -> bool {
     !value.is_empty() && value.len() <= limit && !value.chars().any(char::is_control)
 }
@@ -1291,6 +1320,27 @@ mod tests {
 
     fn prepare() -> PrepareConfig {
         serde_json::from_value(prepare_json()).unwrap()
+    }
+
+    #[test]
+    fn lifecycle_session_target_is_a_bounded_session_identity() {
+        let mut request = prepare_json();
+        request["lifecycle_session_target"] = json!({"kind":"session", "host_epoch":"epoch", "session_id":"session:1", "generation":1});
+        assert!(
+            serde_json::from_value::<PrepareConfig>(request.clone())
+                .unwrap()
+                .validate(false)
+                .is_ok()
+        );
+        for invalid in ["", "a b", "☃", &"x".repeat(129)] {
+            request["lifecycle_session_target"]["session_id"] = json!(invalid);
+            assert_eq!(
+                serde_json::from_value::<PrepareConfig>(request.clone())
+                    .unwrap()
+                    .validate(false),
+                Err("invalid_lifecycle_identity")
+            );
+        }
     }
 
     fn start_json() -> Value {

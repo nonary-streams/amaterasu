@@ -33,6 +33,13 @@ pub enum Fault {
 
 #[derive(Default)]
 pub struct Broker {
+    pub lifecycle_success: bool,
+    pub lifecycle_reject_operation: Option<String>,
+    pub lifecycle_omit_consumer_confirmation: bool,
+    pub lifecycle_observation_override: Option<Value>,
+    pub lifecycle_input_target: Option<Value>,
+    pub lifecycle_pending_once: bool,
+    pub lifecycle_receipts: BTreeMap<String, Value>,
     incoming: VecDeque<Response>,
     requests: BTreeMap<u64, Request>,
     operations: BTreeMap<String, u64>,
@@ -53,6 +60,8 @@ pub struct Broker {
     pub fail_audio_recover: bool,
     pub malformed_audio_recover: bool,
     pub authenticated: bool,
+    pub control_failure: Option<String>,
+    pub control_status_wrong_stream: bool,
     pub video_close_polls: u8,
     pub video_remaining: u8,
     pub format_rate: u32,
@@ -391,8 +400,39 @@ impl Broker {
     }
 
     fn execute(&mut self, call: &Call) -> Value {
+        if call.service == "amaterasu.session-lifecycle/1" {
+            if !self.lifecycle_success {
+                return json!({"status":"rejected"});
+            }
+            let operation = call.payload["operation"].as_str().unwrap();
+            let id = call.payload["operation_id"].as_str().unwrap();
+            if self.lifecycle_reject_operation.as_deref() == Some(operation) {
+                return json!({"status":"rejected"});
+            }
+            if operation == "lookup" {
+                return self
+                    .lifecycle_receipts
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| json!({"status":"rejected"}));
+            }
+            if operation == "issue_input_binding" {
+                self.lifecycle_input_target = Some(call.payload["target"].clone());
+            }
+            let result = json!({"status":"succeeded", "target":call.payload["target"], "plan_revision":call.payload["plan_revision"], "fenced":true, "all_consumers_acknowledged":!self.lifecycle_omit_consumer_confirmation, "binding":call.payload["binding"], "observation":call.payload["observation"],"token":"binding-token","geometry_revision":1});
+            self.lifecycle_receipts.insert(id.into(), result.clone());
+            if self.lifecycle_pending_once && operation == "validate_candidate" {
+                self.lifecycle_pending_once = false;
+                return json!({"status":"pending"});
+            }
+            return result;
+        }
         let action = call.payload["action"].as_str().unwrap();
         let service = call.service.as_str();
+        if service == "amaterasu.video/1" && action == "observe_capture" {
+            let observation=self.lifecycle_observation_override.clone().unwrap_or_else(|| json!({"protocol":"wayland-wl-output","registry_global":4,"output_name":"Virtual-12"}));
+            return json!({"ok":true,"stream":call.payload["stream"],"observed_capture":observation});
+        }
         if service == "amaterasu.host-metrics/1" {
             return match action {
                 "stream_activity_begin" => {
@@ -673,7 +713,7 @@ impl Broker {
             return self.metadata(service, &self.allocations[&key]);
         }
         if action == "status" && service == "amaterasu.control-transport/1" {
-            return json!({"ok":true,"streams":[{"stream":id,"authenticated":self.authenticated,"state":if self.authenticated {"active"} else {"awaiting_authentication"}}]});
+            return json!({"ok":true,"streams":[{"stream":if self.control_status_wrong_stream {id+1} else {id},"authenticated":self.authenticated && self.control_failure.is_none(),"state":if self.control_failure.is_some() {"failed"} else if self.authenticated {"active"} else {"awaiting_authentication"},"failure":self.control_failure}]});
         }
         if action == "status" && service == "amaterasu.media-transport/1" {
             let mut metadata = self.metadata(service, &self.allocations[&key]);
@@ -972,11 +1012,19 @@ impl Broker {
                 self.input_lease = Some("0123456789abcdef0123456789abcdef".into());
                 self.input_ttl_ms = ttl_ms;
                 self.input_terminal = false;
-                self.input_active(
+                let mut reply = self.input_active(
                     operation,
                     self.input_lease.as_deref().expect("input lease"),
                     ttl_ms,
-                )
+                );
+                if let Some(token) = payload["lifecycle_binding_token"].as_str() {
+                    reply["input_binding"] = json!(token);
+                    reply["target"] = json!(self.lifecycle_input_target);
+                    reply["geometry_revision"] = json!(1);
+                    reply["batch_epoch"] = json!("epoch-1");
+                    reply["input_acknowledged"] = json!(true);
+                }
+                reply
             }
             "lookup" => {
                 let operation = payload["operation_id"].as_str().unwrap();
@@ -1035,7 +1083,11 @@ impl Broker {
                     self.input_terminal = true;
                     return json!({"ok":false,"error":{"code":"backend_failed"},"accepted":0,"partial_event_possible":true});
                 }
-                json!({"ok":true,"lease":self.input_lease,"accepted":events.len()})
+                let mut reply = json!({"ok":true,"lease":self.input_lease,"accepted":events.len()});
+                if !payload["operation_id"].is_null() {
+                    reply["operation_id"] = payload["operation_id"].clone();
+                }
+                reply
             }
             "feedback_peek" => {
                 assert_eq!(payload["lease"], json!(self.input_lease));

@@ -12,6 +12,70 @@ impl Pipeline {
         send: &mut Send<'_>,
     ) -> bool {
         match job.step {
+            Step::ConfirmControlDisconnect => {
+                record.control_disconnect_checked = true;
+                if payload["ok"] == true
+                    && let Some(id) = record.resources.get(&Resource::Control)
+                    && let Some(status) = component_status(&payload, *id)
+                    && status["state"] == "failed"
+                {
+                    record.authenticated_disconnect_reason = match status["failure"].as_str() {
+                        Some("peer_disconnected") => Some("peer_disconnected"),
+                        Some("authenticated_peer_idle") => Some("authenticated_peer_idle"),
+                        Some("peer_timeout") => Some("peer_timeout"),
+                        _ => None,
+                    };
+                }
+            }
+            Step::PauseLifecycle => {
+                job.lifecycle_pause_tried = true;
+                let target = record
+                    .start
+                    .as_ref()
+                    .and_then(|start| start.lifecycle_target.as_ref());
+                let plan_revision = record
+                    .start
+                    .as_ref()
+                    .and_then(|start| start.lifecycle_candidate.as_ref())
+                    .map(|candidate| candidate.plan_revision);
+                if payload["target"] == json!(target)
+                    && payload["plan_revision"] == json!(plan_revision)
+                    && payload["fenced"] == true
+                    && matches!(payload["status"].as_str(), Some("pending" | "succeeded"))
+                {
+                    record.lifecycle_fenced = true;
+                } else {
+                    record.cleanup_error = Some("lifecycle_fence_unconfirmed");
+                }
+            }
+            Step::RetireLifecycle => {
+                let target = record
+                    .start
+                    .as_ref()
+                    .and_then(|start| start.lifecycle_target.as_ref());
+                let plan_revision = record
+                    .start
+                    .as_ref()
+                    .and_then(|start| start.lifecycle_candidate.as_ref())
+                    .map(|candidate| candidate.plan_revision);
+                if payload["status"] == "pending"
+                    && payload["target"] == json!(target)
+                    && payload["plan_revision"] == json!(plan_revision)
+                {
+                    job.lifecycle_lookup = true;
+                } else {
+                    job.lifecycle_retire_tried = true;
+                    job.lifecycle_lookup = false;
+                    if payload["status"] == "succeeded"
+                        && payload["target"] == json!(target)
+                        && payload["plan_revision"] == json!(plan_revision)
+                    {
+                        record.lifecycle_retired = true;
+                    } else {
+                        record.cleanup_error = Some("lifecycle_retirement_unconfirmed");
+                    }
+                }
+            }
             Step::FindOwnedVirtualDisplay | Step::RemoveOwnedVirtualDisplay => {
                 if payload["error"]["code"] == "startup_reconciliation_pending" {
                     return true;
@@ -153,8 +217,15 @@ impl Pipeline {
             Step::Find(resource) => {
                 if let Some(id) = allocation_id(record, resource, &payload) {
                     record.resources.insert(resource, id);
+                    record.attempted.insert(resource);
+                    job.tried.remove(&resource);
                 } else if missing(&payload) {
                     record.attempted.remove(&resource);
+                    if resource == Resource::Video && record.lifecycle_fenced {
+                        record.lifecycle_retirement_receipt = Some(
+                            json!({"service":Resource::Video.service(),"operation_id":record.operation(resource),"response":{"code":payload["code"]}}),
+                        );
+                    }
                 } else {
                     return self.cleanup_rejected(record, job, send);
                 }
@@ -177,6 +248,11 @@ impl Pipeline {
                     record.attempted.remove(&resource);
                     job.tried.insert(resource);
                     job.confirming = None;
+                    if resource == Resource::Video && record.lifecycle_fenced {
+                        record.lifecycle_retirement_receipt = Some(
+                            json!({"service":Resource::Video.service(),"operation_id":record.operation(resource),"response":{"code":payload["code"]}}),
+                        );
+                    }
                 } else if allocation_id(record, resource, &payload).is_none()
                     || payload["state"] == "cleanup_failed"
                 {
@@ -312,7 +388,12 @@ impl Pipeline {
             && !record.virtual_display_attempted
             && !record.display_attempted
             && record.display_lease.is_none()
-            && !record.virtual_display_reference_owned;
+            && !record.virtual_display_reference_owned
+            && (record
+                .start
+                .as_ref()
+                .is_none_or(|start| start.lifecycle_target.is_none())
+                || record.lifecycle_retired);
         if clean && self.journal.document.entries.contains_key(&record.id) {
             let document = self.journal.without_record(record.id);
             job.journal_resume = Some(Step::WaitDrain);

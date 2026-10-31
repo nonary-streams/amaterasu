@@ -506,11 +506,28 @@ impl Pipeline {
     }
 
     fn schedule_control(&mut self, now: u64) -> bool {
+        let has_control_work = |record: &Record| {
+            record.force_idr
+                || (record.input_lease.is_some()
+                    && (now >= record.input_renew_at
+                        || (record.feedback_ack_through.is_some()
+                            && now >= record.feedback_poll_at)
+                        || !record.input_events.is_empty()
+                        || now >= record.feedback_poll_at
+                        || (record.input_controller_supported
+                            && record.client_haptics_requested
+                            && now >= record.rumble_poll_at)))
+        };
         let eligible = |record: &&Record| {
             (matches!(record.state, State::Active | State::Stopping)
                 && record.audio_recovery_needed)
                 || (record.state == State::Active
-                    && (record.force_idr
+                    && (record
+                        .start
+                        .as_ref()
+                        .is_some_and(|start| start.lifecycle_target.is_some())
+                        && !record.lifecycle_delivery_permit
+                        || record.force_idr
                         || (record.input_lease.is_some()
                             && (now >= record.input_renew_at
                                 || (record.feedback_ack_through.is_some()
@@ -542,6 +559,15 @@ impl Pipeline {
                 },
                 record.prepared_until,
             )
+        } else if record.state == State::Active
+            && record
+                .start
+                .as_ref()
+                .is_some_and(|start| start.lifecycle_target.is_some())
+            && !record.lifecycle_delivery_permit
+            && !(record.lifecycle_control_permit && has_control_work(record))
+        {
+            (Step::ObserveActiveBinding, now.saturating_add(5000))
         } else if record.audio_recovery_needed {
             (Step::RecoverAudio, now.saturating_add(5000))
         } else if record.input_lease.is_some()
@@ -573,7 +599,25 @@ impl Pipeline {
         } else {
             (Step::ForceIdr, now + 5000)
         };
-        self.job = Some(Job::new(record.id, None, step, deadline));
+        let id = record.id;
+        if step == Step::ObserveActiveBinding {
+            let record = self.records.get_mut(&id).expect("selected record");
+            let Some(next) = record.lifecycle_validation_sequence.checked_add(1) else {
+                record.state = State::Stopping;
+                record.outcome = State::Failed;
+                record.error = Some("lifecycle_sequence_exhausted");
+                return true;
+            };
+            record.lifecycle_validation_sequence = next;
+        } else if let Some(record) = self.records.get_mut(&id)
+            && record
+                .start
+                .as_ref()
+                .is_some_and(|start| start.lifecycle_target.is_some())
+        {
+            record.lifecycle_control_permit = false;
+        }
+        self.job = Some(Job::new(id, None, step, deadline));
         true
     }
 
@@ -627,6 +671,16 @@ impl Pipeline {
                 record.outcome = State::Failed;
                 record.error = Some("prepare_expired");
             }
+            if record.state == State::Stopping
+                && record
+                    .start
+                    .as_ref()
+                    .is_some_and(|start| start.lifecycle_target.is_some())
+            {
+                record.plane = None;
+                record.input_events.clear();
+                continue;
+            }
             if record.state == State::Active
                 && record.input_lease.is_some()
                 && now >= record.input_expires_at
@@ -648,6 +702,17 @@ impl Pipeline {
                 record.state = State::Stopping;
                 record.rumble_pending.clear();
                 record.rumble_active_until.clear();
+            }
+            if record.state == State::Active
+                && record
+                    .start
+                    .as_ref()
+                    .is_some_and(|start| start.lifecycle_target.is_some())
+            {
+                if !record.lifecycle_delivery_permit {
+                    continue;
+                }
+                record.lifecycle_delivery_permit = false;
             }
             let Some(plane) = record.plane.as_mut() else {
                 continue;

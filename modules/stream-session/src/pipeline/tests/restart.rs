@@ -4,6 +4,7 @@ use std::collections::BTreeSet;
 
 fn journal_with_owned_session(record_id: u64) -> Value {
     let entry = Entry {
+        lifecycle_recovery: None,
         record_id,
         owner: "owner".into(),
         attempted_resources: BTreeSet::from(["session".to_owned()]),

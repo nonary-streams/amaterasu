@@ -1,6 +1,18 @@
 use super::*;
 use amaterasu_module_sdk::{Command, Response};
 
+#[test]
+fn closed_control_lane_is_distinct_from_other_native_closures() {
+    assert!(matches!(
+        Delivery::<()>::default().finish(MEDIA_CLOSED, DeliveryLane::Control),
+        Err("native_control_closed")
+    ));
+    assert!(matches!(
+        Delivery::<()>::default().finish(MEDIA_CLOSED, DeliveryLane::Video),
+        Err("native_stream_closed")
+    ));
+}
+
 #[derive(Default)]
 struct Provider {
     duplicate: bool,
