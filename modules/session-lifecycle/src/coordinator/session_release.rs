@@ -2265,6 +2265,34 @@ pub(in crate::coordinator) mod tests {
         assert!(retention::session_expired(&retired, &work.target));
         assert!(retired.composition.records().next().is_none());
         assert!(validate_journal(&retired).is_ok());
+        let roots: Vec<_> = retired
+            .ended_session_history
+            .verified_roots(&retired, "owner")
+            .collect();
+        assert_eq!(roots.len(), 1);
+        assert!(roots[0] == &cert.root);
+        assert_eq!(
+            retired
+                .ended_session_history
+                .verified_roots(&retired, "foreign")
+                .count(),
+            0
+        );
+        let mut tampered = serde_json::to_value(&retired).unwrap();
+        let certificates = tampered["ended_session_history"]["certificates"]
+            .as_object_mut()
+            .unwrap();
+        let entry = certificates.values_mut().next().unwrap();
+        entry["owner_release"]["callback"]["terminal"]["call"]["approval"]["provider"] =
+            json!("foreign");
+        let tampered: Journal = serde_json::from_value(tampered).unwrap();
+        assert_eq!(
+            tampered
+                .ended_session_history
+                .verified_roots(&tampered, "owner")
+                .count(),
+            0
+        );
         let mut rejected = journal.clone();
         rejected.sessions.get_mut("session").unwrap().phase = SessionPhase::RecoveryRequired;
         let before = serde_json::to_value(&rejected).unwrap();
