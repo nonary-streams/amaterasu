@@ -652,6 +652,21 @@ pub(super) struct EndedSessionBook {
 }
 
 impl EndedSessionBook {
+    /// Historical roots are evidence of closed scopes, never authority for effects.
+    pub(super) fn verified_roots<'a>(
+        &'a self,
+        journal: &Journal,
+        producer: &str,
+    ) -> impl Iterator<Item = &'a composition::StoredOutput> + 'a {
+        let roots: Vec<_> = self
+            .certificates
+            .values()
+            .filter(|cert| cert.producer == producer && Self::valid_entry(journal, cert))
+            .map(|cert| &cert.root)
+            .collect();
+        roots.into_iter()
+    }
+
     pub(super) fn end_response(
         &self,
         journal: &Journal,

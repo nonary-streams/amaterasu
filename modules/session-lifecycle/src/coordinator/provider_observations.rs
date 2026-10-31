@@ -338,6 +338,125 @@ fn reprepare_domains(
     scoped_root_domains(journal, root, provider)
 }
 
+// A closed session supplies only the identity of a previously owned domain.
+// Refresh remains tied to the new session's exact in-flight owner plan and a
+// fresh native readback; no admission or resource is inherited from the root.
+pub(super) fn new_session_domains(
+    journal: &Journal,
+    session: &SessionRecord,
+    provider: &str,
+) -> ModuleResult<BTreeMap<String, ResourceAccess>> {
+    if session.phase != SessionPhase::Preparing || !session.admission_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let mut works = journal.receipts.values().filter_map(|receipt| {
+        let work = receipt.work.as_ref()?;
+        (receipt.response["status"] == "pending"
+            && work.phase == LifecyclePhase::SessionPrepare
+            && work.reprepare.is_none()
+            && work.target
+                == (LifecycleTarget::Session {
+                    host_epoch: session.host_epoch.clone(),
+                    session_id: session.id.clone(),
+                    generation: session.generation,
+                })
+            && work
+                .providers
+                .get(work.index)
+                .is_some_and(|p| p == provider))
+        .then_some(work)
+    });
+    let Some(work) = works.next() else {
+        return Ok(BTreeMap::new());
+    };
+    if works.next().is_some() {
+        return Err("new_session_observation_ambiguous".into());
+    }
+    let Some(state) = work.states.get(provider) else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(dispatch) = state.dispatch.as_ref() else {
+        return Ok(BTreeMap::new());
+    };
+    let method = &state.participant.plan_method;
+    if state.provider != provider
+        || state.participant.provider != provider
+        || state.participant.contract_version != amaterasu_extension_api::COMPOSITION_VERSION
+        || state.request.version != amaterasu_extension_api::COMPOSITION_VERSION
+        || state.request.operation != amaterasu_extension_api::ProviderOperation::ResourcePlan
+        || state.request.phase != LifecyclePhase::SessionPrepare
+        || state.request.target != work.target
+        || state.request.transition_id != work.transition_id
+        || state.request.resource_generation != session.resource_generations.get(provider).copied()
+        || state.phase != crate::prepare_driver::PreparePhase::Plan
+        || !matches!(
+            dispatch.state,
+            crate::provider_dispatch::DispatchState::OutcomeUnknown
+        )
+        || dispatch.call.service != method.service
+        || dispatch.call.method != method.method
+        || dispatch.call.interface_major != method.interface_major
+        || dispatch.call.interface_minor != method.interface_minor
+        || dispatch.call.operation_id != state.request.operation_id
+        || dispatch.call.approval["provider"].as_str() != Some(provider)
+        || serde_json::to_value(&state.request).ok().as_ref() != Some(&dispatch.call.arguments)
+        || crate::provider_dispatch::ProviderDispatcher::new(dispatch.clone()).is_err()
+    {
+        return Ok(BTreeMap::new());
+    }
+    let mut domains = BTreeMap::new();
+    let retained_roots = journal.composition.records().filter(|root| {
+        root.output.producer == provider
+            && root.state == super::composition::OutputState::Released
+            && super::operations::target_parts(&root.output.origin)
+                .ok()
+                .is_some_and(|(_, id, stream, _)| {
+                    stream.is_none()
+                        && journal.sessions.get(id).is_some_and(|old| {
+                            old.phase == SessionPhase::Ended
+                                && journal.session_releases.has_valid_released(
+                                    journal,
+                                    &root.output.origin,
+                                    provider,
+                                )
+                        })
+                })
+    });
+    for root in journal
+        .ended_session_history
+        .verified_roots(journal, provider)
+        .chain(retained_roots)
+    {
+        let (epoch, old_session, _, _) = super::operations::target_parts(&root.output.origin)?;
+        if epoch != session.host_epoch || old_session == session.id {
+            continue;
+        }
+        for (domain, access) in scoped_root_domains(journal, root, provider)? {
+            if journal.authority.domain_locks.contains_key(&domain)
+                || journal.authority.admissions.values().any(|admission| {
+                    admission
+                        .plan
+                        .mutation_domains
+                        .iter()
+                        .any(|d| d.domain == domain)
+                })
+                || journal.sessions.values().any(|other| {
+                    other.id != session.id
+                        && other.phase != SessionPhase::Ended
+                        && other
+                            .obligations
+                            .iter()
+                            .any(|o| o.mutation_domain.as_deref() == Some(domain.as_str()))
+                })
+            {
+                continue;
+            }
+            domains.insert(domain, access);
+        }
+    }
+    Ok(domains)
+}
+
 fn scoped_root_domains(
     journal: &Journal,
     root: &super::composition::StoredOutput,
@@ -637,7 +756,9 @@ fn metadata_with_scope(
         }
     }
     if scoped_domains.is_none() {
-        for (domain, access) in reprepare_domains(journal, session, provider)? {
+        let mut observation_domains = reprepare_domains(journal, session, provider)?;
+        observation_domains.extend(new_session_domains(journal, session, provider)?);
+        for (domain, access) in observation_domains {
             let observed = journal
                 .authority
                 .snapshot
@@ -865,6 +986,7 @@ impl Coordinator {
         // persisted replacement plan before the released-root exception applies.
         if nested.is_some() {
             allowed_domains.extend(reprepare_domains(&next, session, caller)?.into_keys());
+            allowed_domains.extend(new_session_domains(&next, session, caller)?.into_keys());
         }
         if allowed_domains.is_empty() && allowed_resources.is_empty() {
             return Err("provider_session_not_owned".into());
@@ -879,6 +1001,14 @@ impl Coordinator {
                 .unwrap_or_else(|| json!([])),
         )
         .map_err(|_| "invalid_resources")?;
+        let new_domains = new_session_domains(&next, session, caller)?;
+        if domains
+            .iter()
+            .any(|domain| new_domains.contains_key(&domain.domain) && !domain.borrowers.is_empty())
+            || (!new_domains.is_empty() && !resources.is_empty())
+        {
+            return Err("new_session_observation_not_empty".into());
+        }
         if domains.len() > MAX_ITEMS
             || resources.len() > MAX_ITEMS
             || (domains.is_empty() && resources.is_empty())

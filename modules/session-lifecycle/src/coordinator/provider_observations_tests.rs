@@ -945,3 +945,20 @@ fn forged_reprepare_cannot_expose_closed_root_domain() {
             .is_empty()
     );
 }
+
+#[test]
+fn new_session_does_not_discover_domains_without_an_in_flight_owner_plan() {
+    let fixture = Fixture::new();
+    let mut journal = fixture.coordinator.shared.borrow().value.clone();
+    let session = journal.sessions.get_mut("session-a").unwrap();
+    session.phase = SessionPhase::Preparing;
+    session.admission_ids.clear();
+    assert!(
+        new_session_domains(&journal, &journal.sessions["session-a"], "provider-a")
+            .unwrap()
+            .is_empty()
+    );
+    // A known owner/domain is not sufficient evidence of a finished prior scope.
+    assert_eq!(journal.authority.domain_owners["shared"], "provider-a");
+    assert!(journal.authority.snapshot.domains.contains_key("shared"));
+}

@@ -260,6 +260,37 @@ impl Coordinator {
             {
                 continue;
             }
+            if request.phase == LifecyclePhase::SessionPrepare
+                && request.operation == amaterasu_extension_api::ProviderOperation::ResourcePlan
+                && journal
+                    .sessions
+                    .get(
+                        super::operations::target_parts(&request.target)
+                            .ok()
+                            .map(|parts| parts.1)
+                            .unwrap_or(""),
+                    )
+                    .is_some_and(|session| {
+                        super::provider_observations::new_session_domains(journal, session, caller)
+                            .is_ok_and(|domains| !domains.is_empty())
+                    })
+                && work.states.get(caller).is_none_or(|state| {
+                    state.dispatch.as_ref().is_none_or(|dispatch| {
+                        self.selections.get(caller).is_none_or(|selection| {
+                            !selection.approvals.iter().any(|approval| {
+                                approval.method == participant.plan_method
+                                    && approval.broker_approval == dispatch.call.approval
+                                    && super::composition::approval_matches_call(
+                                        approval,
+                                        &dispatch.call,
+                                    )
+                            })
+                        })
+                    })
+                })
+            {
+                continue;
+            }
             let Ok((target_epoch, session_id, stream_id, generation)) =
                 super::operations::target_parts(&request.target)
             else {
