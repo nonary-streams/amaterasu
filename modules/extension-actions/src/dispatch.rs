@@ -189,13 +189,14 @@ impl Dispatch {
         use amaterasu_module_sdk::Command;
         use serde_json::json;
         let operation_id = &self.request.operation_id;
+        let broker_id = operation_id.replace(':', ".");
         let action_id = &self.request.action_id;
         let target = &self.request.target;
         let request = |payload: Value, suffix: &str| Command::Request {
             service: amaterasu_extension_api::SESSION_LIFECYCLE_SERVICE.into(),
             payload,
             timeout_ms: 5_000,
-            operation_id: format!("{operation_id}:{suffix}"),
+            operation_id: format!("{broker_id}.{suffix}"),
             parent: None,
         };
         let api = |method: &amaterasu_extension_api::MethodRef, payload: Value, suffix: &str| {
@@ -206,7 +207,7 @@ impl Dispatch {
                 interface_minor: method.interface_minor,
                 payload,
                 timeout_ms: 5_000,
-                operation_id: format!("{operation_id}:{suffix}"),
+                operation_id: format!("{broker_id}.{suffix}"),
                 parent: None,
             }
         };
@@ -219,8 +220,8 @@ impl Dispatch {
                     "plan",
                 ))
             }
-            Stage::AwaitingPermit { digest, .. } => Some(request(
-                json!({"operation":"authorize_action","operation_id":operation_id,"action_id":action_id,"target":target,"plan_digest":digest,"source":{"caller":self.caller,"initiator":self.initiator}}),
+            Stage::AwaitingPermit { plan, digest } => Some(request(
+                json!({"operation":"authorize_action","operation_id":operation_id,"action_id":action_id,"target":target,"plan":plan,"plan_digest":digest,"source":{"caller":self.caller,"initiator":self.initiator}}),
                 "authorize",
             )),
             Stage::AwaitingConsume { digest, permit, .. } => Some(request(

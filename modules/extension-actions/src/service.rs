@@ -1,10 +1,13 @@
-//! Serialized state-backed action receipt admission. Native dispatch remains closed.
+//! Serialized state-backed action admission and lifecycle-fenced dispatch.
+use crate::dispatch::{Dispatch, Outcome, Stage as DispatchStage};
+use crate::worker::Worker;
 use amaterasu_extension_api::{ActionInvoke, EXTENSION_ACTIONS_SERVICE};
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, VecDeque};
+use std::time::{Duration, Instant};
 
 const STATE: &str = "amaterasu.state/1";
 const COLLECTION: &str = "extension-actions-v1";
@@ -99,6 +102,17 @@ enum Stage {
     Write {
         parent: u64,
         result: Value,
+        start: Option<Box<Dispatch>>,
+    },
+    DispatchReply {
+        key: (String, u64),
+    },
+    CancelReply {
+        key: (String, u64),
+    },
+    RecoveryHead,
+    RecoveryPage {
+        revision: u64,
     },
     Descriptor {
         incoming: Incoming,
@@ -119,6 +133,29 @@ struct PlanContext {
     provider: String,
     registry_revision: u64,
 }
+enum Recovery {
+    NeedHead,
+    NeedPage {
+        revision: u64,
+        after: Option<String>,
+    },
+    Waiting,
+    WaitingPersist {
+        epoch: String,
+        sequence: u64,
+    },
+    Done,
+    Blocked,
+}
+struct ActiveWork {
+    dispatch: Dispatch,
+    receipt: Value,
+    replacement: Option<(Dispatch, Value)>,
+    recovery_unconfirmed: bool,
+    polls: u64,
+    cancel_parent: Option<u64>,
+    cancel_sent: bool,
+}
 struct Pending {
     request: u64,
     stage: Stage,
@@ -128,6 +165,12 @@ pub struct ActionsModule {
     runtime: RuntimeClient,
     pending: VecDeque<Pending>,
     policy: Policy,
+    worker: Worker,
+    active: BTreeMap<(String, u64), ActiveWork>,
+    recovery: Recovery,
+    recovery_operation: u64,
+    recovery_epoch: String,
+    recovery_retries: u8,
 }
 impl ManagedModule for ActionsModule {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
@@ -138,6 +181,12 @@ impl ManagedModule for ActionsModule {
         if !policy.validate() {
             return Err("invalid action policy".into());
         }
+        let mut recovery_bytes = [0_u8; 16];
+        getrandom::fill(&mut recovery_bytes).map_err(|error| error.to_string())?;
+        let recovery_epoch = recovery_bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         runtime.require_success(Command::Register {
             service: EXTENSION_ACTIONS_SERVICE.into(),
         })?;
@@ -145,11 +194,25 @@ impl ManagedModule for ActionsModule {
             runtime,
             pending: VecDeque::new(),
             policy,
+            worker: Worker::new()?,
+            active: BTreeMap::new(),
+            recovery: Recovery::NeedHead,
+            recovery_operation: 0,
+            recovery_epoch,
+            recovery_retries: 0,
         })
     }
     fn tick(&mut self) -> ModuleResult<()> {
+        let completed = self.worker.tick(|command| self.runtime.send(command))?;
+        for completion in completed {
+            self.worker_completed(completion)?;
+        }
+        self.advance_recovery()?;
         if let Some(pending) = self.pending.pop_front() {
             self.advance(pending)?;
+        }
+        if !matches!(self.recovery, Recovery::Done | Recovery::Blocked) {
+            return Ok(());
         }
         // Keep status and cancellation responsive while other requests wait on
         // broker calls. The broker retains backpressure when this bound is full.
@@ -189,6 +252,9 @@ impl ActionsModule {
             .get("operation")
             .and_then(Value::as_str)
             .unwrap_or("");
+        if operation == "invoke" && !matches!(self.recovery, Recovery::Done) {
+            return self.complete(incoming.id, failure("startup_recovery"));
+        }
         if !matches!(
             operation,
             "open_epoch"
@@ -231,6 +297,12 @@ impl ActionsModule {
             Stage::Write { parent, .. } => *parent,
             Stage::Descriptor { incoming, .. } => incoming.id,
             Stage::Plan(context) => context.incoming.id,
+            Stage::DispatchReply { .. }
+            | Stage::CancelReply { .. }
+            | Stage::RecoveryHead
+            | Stage::RecoveryPage { .. } => {
+                return Err("invalid submission stage".into());
+            }
         };
         let descriptor = matches!(stage, Stage::Descriptor { .. });
         let phase = match &stage {
@@ -238,6 +310,12 @@ impl ActionsModule {
             Stage::Write { .. } => "write",
             Stage::Descriptor { .. } => "descriptor",
             Stage::Plan(_) => "plan",
+            Stage::DispatchReply { .. }
+            | Stage::CancelReply { .. }
+            | Stage::RecoveryHead
+            | Stage::RecoveryPage { .. } => {
+                return Err("invalid submission stage".into());
+            }
         };
         match self.runtime.send(Command::Request {
             service: if descriptor {
@@ -283,13 +361,25 @@ impl ActionsModule {
                     } => self
                         .after_descriptor(incoming, revision, metadata, *epoch, *invoke, payload),
                     Stage::Plan(context) => self.after_plan(*context, payload),
-                    Stage::Write { parent, result } => {
+                    Stage::Write {
+                        parent,
+                        result,
+                        start,
+                    } => {
                         if payload.get("ok") == Some(&Value::Bool(true)) {
-                            self.complete(parent, result)
+                            self.complete(parent, result.clone())?;
+                            if let Some(dispatch) = start {
+                                self.start_dispatch(*dispatch, result)?;
+                            }
+                            Ok(())
                         } else {
                             self.complete(parent, failure("state_commit_failed"))
                         }
                     }
+                    Stage::DispatchReply { key } => self.dispatch_reply(key, payload),
+                    Stage::CancelReply { key } => self.drive(key),
+                    Stage::RecoveryHead => self.recovery_head(payload),
+                    Stage::RecoveryPage { revision } => self.recovery_page(revision, payload),
                 }
             }
             _ => {
@@ -298,6 +388,18 @@ impl ActionsModule {
                     Stage::Write { parent, .. } => parent,
                     Stage::Descriptor { incoming, .. } => incoming.id,
                     Stage::Plan(context) => context.incoming.id,
+                    Stage::DispatchReply { key } => {
+                        self.dispatch_unknown(key)?;
+                        return Ok(());
+                    }
+                    Stage::CancelReply { key } => {
+                        self.drive(key)?;
+                        return Ok(());
+                    }
+                    Stage::RecoveryHead | Stage::RecoveryPage { .. } => {
+                        self.recovery = Recovery::Blocked;
+                        return Ok(());
+                    }
                 };
                 self.complete(parent, failure("state_unavailable"))
             }
@@ -362,6 +464,7 @@ impl ActionsModule {
                 Stage::Write {
                     parent: incoming.id,
                     result: json!({"status":"ok","epoch":epoch}),
+                    start: None,
                 },
             );
         }
@@ -377,7 +480,10 @@ impl ActionsModule {
         if operation == "retire_epoch" {
             if !epoch.closed
                 || epoch.receipts.values().any(|entry| {
-                    entry.receipt.get("status").and_then(Value::as_str) != Some("rejected")
+                    !matches!(
+                        entry.receipt.get("status").and_then(Value::as_str),
+                        Some("rejected" | "succeeded" | "failed" | "cancelled")
+                    )
                 })
             {
                 return self.complete(incoming.id, failure("epoch_not_retirable"));
@@ -392,6 +498,7 @@ impl ActionsModule {
                 Stage::Write {
                     parent: incoming.id,
                     result: json!({"status":"ok"}),
+                    start: None,
                 },
             );
         }
@@ -414,11 +521,45 @@ impl ActionsModule {
         if sequence == 0 || sequence > 64 {
             return self.complete(incoming.id, failure("sequence_window"));
         }
+        if operation == "cancel" {
+            let Some(record) = epoch.receipts.get(&sequence) else {
+                return self.complete(incoming.id, failure("unknown_receipt"));
+            };
+            if !matches!(
+                record.receipt.get("status").and_then(Value::as_str),
+                Some("queued" | "running")
+            ) {
+                return self.complete(
+                    incoming.id,
+                    self.observed_receipt(epoch_id, sequence, record),
+                );
+            }
+            let key = (epoch_id.to_owned(), sequence);
+            let Some(active) = self.active.get_mut(&key) else {
+                return self.complete(incoming.id, failure("cancellation_unavailable"));
+            };
+            if active.cancel_parent.is_some() {
+                return self.complete(incoming.id, failure("cancellation_pending"));
+            }
+            active.cancel_parent = Some(incoming.id);
+            return self.persist_cancellation(key);
+        }
         if operation != "invoke" {
             let result = epoch
                 .receipts
                 .get(&sequence)
-                .map(|record| record.receipt.clone())
+                .map(|record| {
+                    if operation == "cancel"
+                        && matches!(
+                            record.receipt.get("status").and_then(Value::as_str),
+                            Some("queued" | "running")
+                        )
+                    {
+                        failure("cancellation_unavailable")
+                    } else {
+                        self.observed_receipt(epoch_id, sequence, record)
+                    }
+                })
                 .unwrap_or_else(|| failure("unknown_receipt"));
             return self.complete(incoming.id, result);
         }
@@ -454,7 +595,7 @@ impl ActionsModule {
             return self.complete(
                 incoming.id,
                 if record.request == invoke {
-                    record.receipt.clone()
+                    self.observed_receipt(epoch_id, sequence, record)
                 } else {
                     failure("operation_conflict")
                 },
@@ -598,7 +739,17 @@ impl ActionsModule {
         {
             return self.complete(incoming.id, failure("invalid_plan"));
         }
-        let receipt = json!({"status":"rejected","receipt_id":invoke.operation_id,"operation_id":invoke.operation_id,"result":null,"reason":"lifecycle_permit_unavailable"});
+        if self.active.len() >= 128
+            || self
+                .active
+                .values()
+                .filter(|work| same_session(&work.dispatch.request.target, &invoke.target))
+                .count()
+                >= 16
+        {
+            return self.complete(incoming.id, failure("capacity"));
+        }
+        let receipt = json!({"status":"queued","receipt_id":invoke.operation_id,"operation_id":invoke.operation_id,"result":null,"reason":null});
         let epoch_id = invoke.epoch.clone();
         epoch.receipts.insert(
             invoke.sequence,
@@ -608,10 +759,17 @@ impl ActionsModule {
                 selected_provider: provider,
                 registry_revision,
                 descriptor: action,
-                dispatch: Some(dispatch),
+                dispatch: Some(dispatch.clone()),
             },
         );
-        self.write(incoming.id, revision, metadata, &epoch_id, &epoch, receipt)
+        self.write_start(
+            incoming.id,
+            (revision, metadata),
+            &epoch_id,
+            &epoch,
+            receipt,
+            Some(dispatch),
+        )
     }
     fn write(
         &mut self,
@@ -622,6 +780,18 @@ impl ActionsModule {
         record: &Epoch,
         result: Value,
     ) -> ModuleResult<()> {
+        self.write_start(parent, (revision, metadata), epoch, record, result, None)
+    }
+    fn write_start(
+        &mut self,
+        parent: u64,
+        state: (u64, Value),
+        epoch: &str,
+        record: &Epoch,
+        result: Value,
+        start: Option<Dispatch>,
+    ) -> ModuleResult<()> {
+        let (revision, metadata) = state;
         let value = serde_json::to_value(record).map_err(|error| error.to_string())?;
         if serde_json::to_vec(&value)
             .map_err(|error| error.to_string())?
@@ -631,7 +801,415 @@ impl ActionsModule {
             return self.complete(parent, failure("capacity"));
         }
         let payload = json!({"action":"collection_commit","collection":COLLECTION,"expected_revision":revision,"metadata":metadata,"edits":[{"key":format!("epoch/{epoch}"),"value":value}]});
-        self.submit(payload, Stage::Write { parent, result })
+        self.submit(
+            payload,
+            Stage::Write {
+                parent,
+                result,
+                start: start.map(Box::new),
+            },
+        )
+    }
+    fn advance_recovery(&mut self) -> ModuleResult<()> {
+        let phase = std::mem::replace(&mut self.recovery, Recovery::Waiting);
+        let (payload, stage) = match phase {
+            Recovery::NeedHead => (
+                json!({"action":"collection_get","collection":COLLECTION}),
+                Stage::RecoveryHead,
+            ),
+            Recovery::NeedPage { revision, after } => (
+                json!({"action":"collection_page","collection":COLLECTION,"revision":revision,"after":after,"limit":16}),
+                Stage::RecoveryPage { revision },
+            ),
+            other => {
+                self.recovery = other;
+                return Ok(());
+            }
+        };
+        self.recovery_operation = self.recovery_operation.saturating_add(1);
+        match self.runtime.send(Command::Request {
+            service: STATE.into(),
+            payload,
+            timeout_ms: 5_000,
+            operation_id: format!(
+                "actions-recovery-{}-{}",
+                self.recovery_epoch, self.recovery_operation
+            ),
+            parent: None,
+        }) {
+            Ok(Response::Accepted { id }) => self.pending.push_back(Pending { request: id, stage }),
+            _ => self.recovery = Recovery::Blocked,
+        }
+        Ok(())
+    }
+    fn recovery_head(&mut self, payload: Value) -> ModuleResult<()> {
+        self.recovery = match payload.get("revision").and_then(Value::as_u64) {
+            Some(revision) if payload.get("ok") == Some(&Value::Bool(true)) => Recovery::NeedPage {
+                revision,
+                after: None,
+            },
+            _ => Recovery::Blocked,
+        };
+        Ok(())
+    }
+    fn recovery_page(&mut self, revision: u64, payload: Value) -> ModuleResult<()> {
+        if payload.pointer("/error/code").and_then(Value::as_str) == Some("revision_conflict")
+            && self.recovery_retries < 8
+        {
+            self.recovery_retries += 1;
+            self.recovery = Recovery::NeedHead;
+            return Ok(());
+        }
+        if payload.get("ok") != Some(&Value::Bool(true))
+            || payload.get("revision").and_then(Value::as_u64) != Some(revision)
+        {
+            self.recovery = Recovery::Blocked;
+            return Ok(());
+        }
+        let Some(entries) = payload.get("entries").and_then(Value::as_array) else {
+            self.recovery = Recovery::Blocked;
+            return Ok(());
+        };
+        for item in entries {
+            let Some(epoch_id) = item
+                .get("key")
+                .and_then(Value::as_str)
+                .and_then(|key| key.strip_prefix("epoch/"))
+            else {
+                continue;
+            };
+            if !valid_epoch(epoch_id) {
+                self.recovery = Recovery::Blocked;
+                return Ok(());
+            }
+            let Ok(epoch) =
+                serde_json::from_value::<Epoch>(item.get("value").cloned().unwrap_or(Value::Null))
+            else {
+                self.recovery = Recovery::Blocked;
+                return Ok(());
+            };
+            for (sequence, record) in epoch.receipts {
+                let Some(dispatch) = record.dispatch else {
+                    continue;
+                };
+                if !matches!(
+                    record.receipt.get("status").and_then(Value::as_str),
+                    Some("queued" | "running")
+                ) {
+                    continue;
+                }
+                let mut replacement = dispatch.clone();
+                replacement.fence_after_restart();
+                if replacement == dispatch {
+                    replacement.stage = DispatchStage::RecoveryRequired;
+                }
+                let receipt =
+                    action_receipt(&replacement, "recovery_required", Some("worker_restart"));
+                self.recovery = match self.worker.persist(
+                    epoch_id.to_owned(),
+                    dispatch,
+                    replacement,
+                    record.receipt,
+                    receipt,
+                    Instant::now() + Duration::from_secs(30),
+                ) {
+                    Ok(()) => Recovery::WaitingPersist {
+                        epoch: epoch_id.to_owned(),
+                        sequence,
+                    },
+                    Err(_) => Recovery::Blocked,
+                };
+                return Ok(());
+            }
+        }
+        self.recovery = match payload.get("next") {
+            Some(Value::String(after)) => Recovery::NeedPage {
+                revision,
+                after: Some(after.clone()),
+            },
+            Some(Value::Null) | None => Recovery::Done,
+            _ => Recovery::Blocked,
+        };
+        Ok(())
+    }
+    fn observed_receipt(&self, epoch: &str, sequence: u64, record: &Record) -> Value {
+        if matches!(
+            record.receipt.get("status").and_then(Value::as_str),
+            Some("queued" | "running")
+        ) {
+            let active = self.active.get(&(epoch.to_owned(), sequence));
+            if active.is_none_or(|work| work.recovery_unconfirmed) {
+                let mut receipt = record.receipt.clone();
+                receipt["status"] = json!("recovery_required");
+                receipt["reason"] = json!("worker_state_unconfirmed");
+                return receipt;
+            }
+        }
+        record.receipt.clone()
+    }
+    fn start_dispatch(&mut self, dispatch: Dispatch, receipt: Value) -> ModuleResult<()> {
+        let key = (dispatch.request.epoch.clone(), dispatch.request.sequence);
+        if self.active.contains_key(&key) {
+            return Ok(());
+        }
+        self.active.insert(
+            key.clone(),
+            ActiveWork {
+                dispatch,
+                receipt,
+                replacement: None,
+                recovery_unconfirmed: false,
+                polls: 0,
+                cancel_parent: None,
+                cancel_sent: false,
+            },
+        );
+        self.drive(key)
+    }
+    fn drive(&mut self, key: (String, u64)) -> ModuleResult<()> {
+        let Some(active) = self.active.get_mut(&key) else {
+            return Ok(());
+        };
+        if active.replacement.is_some() || active.recovery_unconfirmed {
+            return Ok(());
+        }
+        if active.receipt.get("cancellation_requested") == Some(&Value::Bool(true))
+            && !active.cancel_sent
+        {
+            let permit = match &active.dispatch.stage {
+                DispatchStage::Running { permit, .. }
+                | DispatchStage::ProviderPending { permit, .. } => Some(permit.clone()),
+                _ => None,
+            };
+            active.cancel_sent = true;
+            if let Some(permit) = permit {
+                let operation_id = &active.dispatch.request.operation_id;
+                let command = Command::Request {
+                    service: amaterasu_extension_api::SESSION_LIFECYCLE_SERVICE.into(),
+                    payload: json!({"operation":"cancel_action","operation_id":operation_id,"permit":permit,"target":active.dispatch.request.target}),
+                    timeout_ms: 5_000,
+                    operation_id: format!("{}.cancel", operation_id.replace(':', ".")),
+                    parent: None,
+                };
+                if let Ok(Response::Accepted { id }) = self.runtime.send(command) {
+                    self.pending.push_back(Pending {
+                        request: id,
+                        stage: Stage::CancelReply { key },
+                    });
+                    return Ok(());
+                }
+            }
+        }
+        if matches!(active.dispatch.stage, DispatchStage::ReadyToExecute { .. }) {
+            let expected = active.dispatch.clone();
+            let mut replacement = expected.clone();
+            if replacement.begin_effect().is_err() {
+                active.recovery_unconfirmed = true;
+                return Ok(());
+            }
+            let receipt = action_receipt(&replacement, "running", None);
+            match self.worker.persist(
+                key.0.clone(),
+                expected,
+                replacement.clone(),
+                active.receipt.clone(),
+                receipt.clone(),
+                Instant::now() + Duration::from_secs(30),
+            ) {
+                Ok(()) => active.replacement = Some((replacement, receipt)),
+                Err(_) => active.recovery_unconfirmed = true,
+            }
+            return Ok(());
+        }
+        let mut command = match active.dispatch.broker_call() {
+            Ok(Some(command)) => command,
+            Ok(None) => {
+                self.active.remove(&key);
+                return Ok(());
+            }
+            Err(_) => return self.dispatch_unknown(key),
+        };
+        if matches!(active.dispatch.stage, DispatchStage::ProviderPending { .. }) {
+            active.polls = active.polls.saturating_add(1);
+            if let Command::CallApi { operation_id, .. } = &mut command {
+                operation_id.push_str(&format!("-{}", active.polls));
+            }
+        }
+        match self.runtime.send(command) {
+            Ok(Response::Accepted { id }) => {
+                self.pending.push_back(Pending {
+                    request: id,
+                    stage: Stage::DispatchReply { key },
+                });
+                Ok(())
+            }
+            _ => self.dispatch_unknown(key),
+        }
+    }
+    fn dispatch_reply(&mut self, key: (String, u64), payload: Value) -> ModuleResult<()> {
+        let Some(active) = self.active.get_mut(&key) else {
+            return Ok(());
+        };
+        let expected = active.dispatch.clone();
+        let mut replacement = expected.clone();
+        if replacement.accept_reply(payload).is_err() {
+            return self.dispatch_unknown(key);
+        }
+        let status = match &replacement.stage {
+            DispatchStage::Running { .. }
+            | DispatchStage::ProviderPending { .. }
+            | DispatchStage::Completing { .. } => "running",
+            DispatchStage::Finished {
+                outcome: Outcome::Succeeded,
+                ..
+            } => "succeeded",
+            DispatchStage::Finished {
+                outcome: Outcome::Failed,
+                ..
+            } => "failed",
+            DispatchStage::RecoveryRequired
+            | DispatchStage::Finished {
+                outcome: Outcome::RecoveryRequired,
+                ..
+            } => "recovery_required",
+            _ => "queued",
+        };
+        let mut receipt = action_receipt(&replacement, status, None);
+        if active.receipt.get("cancellation_requested") == Some(&Value::Bool(true)) {
+            receipt["cancellation_requested"] = json!(true);
+        }
+        match self.worker.persist(
+            key.0.clone(),
+            expected,
+            replacement.clone(),
+            active.receipt.clone(),
+            receipt.clone(),
+            Instant::now() + Duration::from_secs(30),
+        ) {
+            Ok(()) => active.replacement = Some((replacement, receipt)),
+            Err(_) => active.recovery_unconfirmed = true,
+        }
+        Ok(())
+    }
+    fn dispatch_unknown(&mut self, key: (String, u64)) -> ModuleResult<()> {
+        let Some(active) = self.active.get_mut(&key) else {
+            return Ok(());
+        };
+        let expected = active.dispatch.clone();
+        let mut replacement = expected.clone();
+        replacement.fence_after_restart();
+        if replacement == expected {
+            active.recovery_unconfirmed = true;
+            return Ok(());
+        }
+        let mut receipt =
+            action_receipt(&replacement, "recovery_required", Some("outcome_unknown"));
+        if active.receipt.get("cancellation_requested") == Some(&Value::Bool(true)) {
+            receipt["cancellation_requested"] = json!(true);
+        }
+        match self.worker.persist(
+            key.0.clone(),
+            expected,
+            replacement.clone(),
+            active.receipt.clone(),
+            receipt.clone(),
+            Instant::now() + Duration::from_secs(30),
+        ) {
+            Ok(()) => active.replacement = Some((replacement, receipt)),
+            Err(_) => active.recovery_unconfirmed = true,
+        }
+        Ok(())
+    }
+    fn persist_cancellation(&mut self, key: (String, u64)) -> ModuleResult<()> {
+        let inflight = self.pending.iter().any(|pending| matches!(&pending.stage, Stage::DispatchReply { key: pending_key } if pending_key == &key));
+        let Some(active) = self.active.get_mut(&key) else {
+            return Ok(());
+        };
+        if active.replacement.is_some() || inflight {
+            return Ok(());
+        }
+        let Some(parent) = active.cancel_parent else {
+            return Ok(());
+        };
+        if active.recovery_unconfirmed {
+            active.cancel_parent = None;
+            return self.complete(parent, failure("recovery_required"));
+        }
+        if active.receipt.get("cancellation_requested") == Some(&Value::Bool(true)) {
+            let receipt = active.receipt.clone();
+            active.cancel_parent = None;
+            return self.complete(parent, receipt);
+        }
+        if !matches!(
+            active.dispatch.stage,
+            DispatchStage::Running { .. }
+                | DispatchStage::ProviderPending { .. }
+                | DispatchStage::Completing { .. }
+        ) {
+            active.cancel_parent = None;
+            return self.complete(parent, failure("cancellation_unavailable"));
+        }
+        let expected = active.dispatch.clone();
+        let mut receipt = active.receipt.clone();
+        receipt["cancellation_requested"] = json!(true);
+        match self.worker.persist(
+            key.0.clone(),
+            expected.clone(),
+            expected.clone(),
+            active.receipt.clone(),
+            receipt.clone(),
+            Instant::now() + Duration::from_secs(30),
+        ) {
+            Ok(()) => active.replacement = Some((expected, receipt)),
+            Err(_) => {
+                active.cancel_parent = None;
+                return self.complete(parent, failure("cancellation_unavailable"));
+            }
+        }
+        Ok(())
+    }
+    fn worker_completed(&mut self, completion: crate::worker::Completion) -> ModuleResult<()> {
+        let key = (completion.epoch_id, completion.sequence);
+        if matches!(&self.recovery, Recovery::WaitingPersist { epoch, sequence } if epoch == &key.0 && *sequence == key.1)
+        {
+            self.recovery = if completion.result.is_ok() {
+                Recovery::NeedHead
+            } else {
+                Recovery::Blocked
+            };
+            return Ok(());
+        }
+        let Some(active) = self.active.get_mut(&key) else {
+            return Ok(());
+        };
+        if completion.result.is_err() {
+            active.recovery_unconfirmed = true;
+            if let Some(parent) = active.cancel_parent.take() {
+                return self.complete(parent, failure("recovery_required"));
+            }
+            return Ok(());
+        }
+        let Some((dispatch, receipt)) = active.replacement.take() else {
+            active.recovery_unconfirmed = true;
+            return Ok(());
+        };
+        active.dispatch = dispatch;
+        active.receipt = receipt;
+        if let Some(parent) = active.cancel_parent {
+            if active.receipt.get("cancellation_requested") == Some(&Value::Bool(true))
+                || matches!(
+                    active.dispatch.stage,
+                    DispatchStage::Finished { .. } | DispatchStage::RecoveryRequired
+                )
+            {
+                let receipt = active.receipt.clone();
+                active.cancel_parent = None;
+                self.complete(parent, receipt)?;
+            } else {
+                return self.persist_cancellation(key);
+            }
+        }
+        self.drive(key)
     }
     fn complete(&self, request: u64, payload: Value) -> ModuleResult<()> {
         match self.runtime.send(Command::Complete { request, payload })? {
@@ -642,6 +1220,47 @@ impl ActionsModule {
             other => Err(format!("action completion failed: {other:?}")),
         }
     }
+}
+fn same_session(
+    left: &amaterasu_extension_api::ActionTarget,
+    right: &amaterasu_extension_api::ActionTarget,
+) -> bool {
+    use amaterasu_extension_api::ActionTarget;
+    match (left, right) {
+        (
+            ActionTarget::Session {
+                host_epoch: a,
+                session_id: x,
+                ..
+            }
+            | ActionTarget::Stream {
+                host_epoch: a,
+                session_id: x,
+                ..
+            },
+            ActionTarget::Session {
+                host_epoch: b,
+                session_id: y,
+                ..
+            }
+            | ActionTarget::Stream {
+                host_epoch: b,
+                session_id: y,
+                ..
+            },
+        ) => a == b && x == y,
+        (ActionTarget::Host { host_epoch: a }, ActionTarget::Host { host_epoch: b }) => a == b,
+        _ => false,
+    }
+}
+fn action_receipt(dispatch: &Dispatch, status: &str, reason: Option<&str>) -> Value {
+    let result = match &dispatch.stage {
+        DispatchStage::Finished {
+            provider_receipt, ..
+        } => Some(provider_receipt.clone()),
+        _ => None,
+    };
+    json!({"status":status,"receipt_id":dispatch.request.operation_id,"operation_id":dispatch.request.operation_id,"result":result,"reason":reason})
 }
 fn open_key(caller: &str, initiator: &str, operation_id: &str) -> String {
     let mut digest = Sha256::new();
@@ -679,6 +1298,11 @@ mod tests {
         revision: u64,
         next: u64,
         metadata: Value,
+        allow_permit: bool,
+        revoke_consume: bool,
+        effects: usize,
+        provider_pending: bool,
+        cancellation_requests: usize,
     }
     impl Host {
         fn dispatch(&mut self, command: Command) -> Response {
@@ -702,7 +1326,28 @@ mod tests {
                     let value = if service == amaterasu_extension_api::EXTENSION_REGISTRY_SERVICE {
                         assert!(parent.is_some());
                         let method = json!({"service":"example.provider/1","method":"action_execute","interface_major":1,"interface_minor":0,"schema_revision":1});
-                        json!({"ok":true,"provider":"example.provider","revision":1,"action":{"id":"example/action","label":"Example","description":"Example","execution":"session_mutation","arguments":{},"allowed_targets":["session"],"required_capabilities":[],"plan":method,"execute":method,"status":null}})
+                        let plan = json!({"service":"example.provider/1","method":"action_plan","interface_major":1,"interface_minor":0,"schema_revision":1});
+                        let status = json!({"service":"example.provider/1","method":"action_status","interface_major":1,"interface_minor":0,"schema_revision":1});
+                        json!({"ok":true,"provider":"example.provider","revision":1,"action":{"id":"example/action","label":"Example","description":"Example","execution":"session_mutation","arguments":{},"allowed_targets":["session"],"required_capabilities":[],"plan":plan,"execute":method,"status":status}})
+                    } else if service == amaterasu_extension_api::SESSION_LIFECYCLE_SERVICE {
+                        match payload["operation"].as_str() {
+                            Some("authorize_action") if self.allow_permit => {
+                                json!({"status":"succeeded","operation_id":payload["operation_id"],"target":payload["target"],"permit":"permit"})
+                            }
+                            Some("consume_action_permit")
+                                if self.allow_permit && !self.revoke_consume =>
+                            {
+                                json!({"status":"succeeded","operation_id":payload["operation_id"],"target":payload["target"],"plan_digest":payload["plan_digest"]})
+                            }
+                            Some("cancel_action") if self.allow_permit => {
+                                self.cancellation_requests += 1;
+                                json!({"status":"pending"})
+                            }
+                            Some("complete_action") if self.allow_permit => {
+                                json!({"status":"succeeded","operation_id":payload["operation_id"]})
+                            }
+                            _ => json!({"status":"rejected"}),
+                        }
                     } else {
                         match payload["action"].as_str() {
                             Some("collection_get") => {
@@ -711,6 +1356,18 @@ mod tests {
                                     .and_then(|key| self.state.get(key))
                                     .cloned();
                                 json!({"ok":true,"revision":self.revision,"count":self.state.len(),"metadata":self.metadata,"value":value})
+                            }
+                            Some("collection_page") => {
+                                let after = payload["after"].as_str();
+                                let entries: Vec<_> = self
+                                    .state
+                                    .iter()
+                                    .filter(|(key, _)| {
+                                        after.is_none_or(|cursor| key.as_str() > cursor)
+                                    })
+                                    .map(|(key, value)| json!({"key":key,"value":value}))
+                                    .collect();
+                                json!({"ok":true,"revision":self.revision,"entries":entries,"next":null})
                             }
                             Some("collection_commit")
                                 if payload["expected_revision"] == self.revision =>
@@ -734,11 +1391,36 @@ mod tests {
                     Response::Accepted { id: self.next }
                 }
                 Command::CallApi {
-                    payload, parent, ..
+                    method,
+                    payload,
+                    parent,
+                    ..
                 } => {
-                    assert!(parent.is_some());
                     self.next += 1;
-                    self.results.insert(self.next, json!({"status":"planned","operation_id":payload["operation_id"],"action_id":payload["action_id"],"target":payload["target"],"plan":{"mutation_domains":[]}}));
+                    let result = if method == "action_plan" {
+                        assert!(parent.is_some());
+                        json!({"status":"planned","operation_id":payload["operation_id"],"action_id":payload["action_id"],"target":payload["target"],"plan":{"mutation_domains":[]}})
+                    } else if method == "action_status" {
+                        json!({"status":"pending","receipt":{"id":"pending"}})
+                    } else {
+                        assert!(parent.is_none());
+                        let epoch = payload["operation_id"]
+                            .as_str()
+                            .unwrap()
+                            .split(':')
+                            .next()
+                            .unwrap();
+                        let record = &self.state[&format!("epoch/{epoch}")]["receipts"]["1"];
+                        assert_eq!(record["dispatch"]["stage"]["phase"], "running");
+                        assert_eq!(record["receipt"]["status"], "running");
+                        self.effects += 1;
+                        if self.provider_pending {
+                            json!({"status":"pending","receipt":{"id":"pending"}})
+                        } else {
+                            json!({"status":"succeeded","receipt":{"effect":"confirmed"}})
+                        }
+                    };
+                    self.results.insert(self.next, result);
                     Response::Accepted { id: self.next }
                 }
                 Command::TakeResult { request } => Response::Result {
@@ -766,7 +1448,7 @@ mod tests {
             // SAFETY: the host outlives the module and is used only through this endpoint.
             let client = unsafe { RuntimeClient::from_endpoint(endpoint) };
             let mut module = ActionsModule::start(client).unwrap();
-            for _ in 0..20 {
+            for _ in 0..200 {
                 module.tick().unwrap();
             }
         }
@@ -802,8 +1484,7 @@ mod tests {
         let invoke = json!({"operation":"invoke","epoch":epoch,"sequence":1,"operation_id":format!("{epoch}:1"),"action_id":"example/action","target":{"kind":"session","host_epoch":"h","session_id":"s","expected_generation":1},"arguments":{},"expected_settings_revision":null});
         host.request(2, "alice", invoke.clone());
         host.run();
-        assert_eq!(host.replies[1]["status"], "rejected");
-        assert_eq!(host.replies[1]["reason"], "lifecycle_permit_unavailable");
+        assert_eq!(host.replies[1]["status"], "queued");
         host.request(3, "alice", invoke.clone());
         host.request(
             4,
@@ -814,10 +1495,10 @@ mod tests {
         changed["arguments"] = json!({"changed":true});
         host.request(5, "alice", changed);
         host.run();
-        assert_eq!(host.replies[2], host.replies[1]);
+        assert_eq!(host.replies[2]["status"], "recovery_required");
         assert_eq!(host.replies[3]["code"], "unknown_epoch");
         assert_eq!(host.replies[4]["code"], "operation_conflict");
-        assert_eq!(host.revision, 2);
+        assert_eq!(host.effects, 0);
     }
     #[test]
     fn epoch_open_is_idempotent_across_restart_and_scoped_by_initiator() {
@@ -859,5 +1540,123 @@ mod tests {
         assert_eq!(host.replies[3]["code"], "receipt_expired");
         assert_ne!(host.replies[4]["epoch"], epoch);
         assert_eq!(host.metadata["active"], 1);
+    }
+    #[test]
+    fn dispatch_requires_consumed_permit_and_durable_running_record() {
+        for revoked in [false, true] {
+            let mut host = Host {
+                allow_permit: true,
+                revoke_consume: revoked,
+                ..Host::default()
+            };
+            host.request(
+                1,
+                "alice",
+                json!({"operation":"open_epoch","operation_id":"open"}),
+            );
+            host.run();
+            let epoch = host.replies[0]["epoch"].as_str().unwrap().to_owned();
+            host.request(2, "alice", json!({"operation":"invoke","epoch":epoch,"sequence":1,"operation_id":format!("{epoch}:1"),"action_id":"example/action","target":{"kind":"session","host_epoch":"h","session_id":"s","expected_generation":1},"arguments":{},"expected_settings_revision":null}));
+            host.run();
+            host.request(
+                3,
+                "alice",
+                json!({"operation":"status","epoch":epoch,"sequence":1}),
+            );
+            host.run();
+            assert_eq!(host.effects, usize::from(!revoked));
+            assert_eq!(
+                host.replies[2]["status"],
+                if revoked {
+                    "recovery_required"
+                } else {
+                    "succeeded"
+                }
+            );
+        }
+    }
+    #[test]
+    fn startup_persists_recovery_for_interrupted_effect_before_admission() {
+        let mut host = Host {
+            allow_permit: true,
+            ..Host::default()
+        };
+        host.request(
+            1,
+            "alice",
+            json!({"operation":"open_epoch","operation_id":"open"}),
+        );
+        host.run();
+        let epoch = host.replies[0]["epoch"].as_str().unwrap().to_owned();
+        host.request(2, "alice", json!({"operation":"invoke","epoch":epoch,"sequence":1,"operation_id":format!("{epoch}:1"),"action_id":"example/action","target":{"kind":"session","host_epoch":"h","session_id":"s","expected_generation":1},"arguments":{},"expected_settings_revision":null}));
+        host.run();
+        let record = &mut host.state.get_mut(&format!("epoch/{epoch}")).unwrap()["receipts"]["1"];
+        record["dispatch"]["stage"] =
+            json!({"phase":"running","plan":{},"digest":"digest","permit":"permit"});
+        record["receipt"]["status"] = json!("running");
+        host.effects = 0;
+        host.request(
+            3,
+            "alice",
+            json!({"operation":"status","epoch":epoch,"sequence":1}),
+        );
+        host.run();
+        assert_eq!(host.replies[2]["status"], "recovery_required");
+        assert_eq!(
+            host.state[&format!("epoch/{epoch}")]["receipts"]["1"]["receipt"]["status"],
+            "recovery_required"
+        );
+        assert_eq!(host.effects, 0);
+    }
+    #[test]
+    fn cancellation_is_persisted_then_requested_without_claiming_retirement() {
+        let mut host = Host {
+            allow_permit: true,
+            provider_pending: true,
+            ..Host::default()
+        };
+        host.request(
+            1,
+            "alice",
+            json!({"operation":"open_epoch","operation_id":"open"}),
+        );
+        host.run();
+        let epoch = host.replies[0]["epoch"].as_str().unwrap().to_owned();
+        host.request(2, "alice", json!({"operation":"invoke","epoch":epoch,"sequence":1,"operation_id":format!("{epoch}:1"),"action_id":"example/action","target":{"kind":"session","host_epoch":"h","session_id":"s","expected_generation":1},"arguments":{},"expected_settings_revision":null}));
+        let host_ptr: *mut Host = &mut host;
+        let endpoint = HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: host_ptr.cast(),
+            invoke,
+        };
+        // SAFETY: the host remains alive and test accesses are serialized between ticks.
+        let client = unsafe { RuntimeClient::from_endpoint(endpoint) };
+        let mut module = ActionsModule::start(client).unwrap();
+        for _ in 0..300 {
+            module.tick().unwrap();
+            if host.effects > 0 {
+                break;
+            }
+        }
+        host.request(
+            3,
+            "alice",
+            json!({"operation":"cancel","epoch":epoch,"sequence":1}),
+        );
+        for _ in 0..500 {
+            module.tick().unwrap();
+            if host.replies.len() >= 3 && host.cancellation_requests > 0 {
+                break;
+            }
+        }
+        drop(module);
+        assert_eq!(host.effects, 1);
+        assert_eq!(host.replies[2]["cancellation_requested"], true);
+        assert_eq!(host.replies[2]["status"], "running");
+        assert!(host.cancellation_requests > 0);
+        assert_eq!(
+            host.state[&format!("epoch/{epoch}")]["receipts"]["1"]["receipt"]["cancellation_requested"],
+            true
+        );
     }
 }

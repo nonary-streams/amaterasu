@@ -8,3 +8,5 @@ pub mod validation;
 
 mod service;
 amaterasu_module_sdk::export_module!(service::ActionsModule);
+
+pub(crate) mod worker;
