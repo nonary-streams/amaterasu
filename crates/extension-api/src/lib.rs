@@ -95,6 +95,9 @@ pub struct ActionInvoke {
     pub target: ActionTarget,
     pub arguments: Value,
     pub expected_settings_revision: Option<String>,
+    /// Opaque selector for a lifecycle-owned reservation, never authority by itself.
+    #[serde(default)]
+    pub input_reservation_id: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -247,6 +250,16 @@ pub struct CleanupOutcome {
     pub reason: Option<String>,
 }
 
+/// Coordinator-selected consumer constraints established before provider planning.
+/// These fields constrain a plan; they never authorize the requester.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsumerRequirements {
+    pub execution_domain: String,
+    pub capture_providers: Vec<String>,
+    pub selector_schemas: Vec<String>,
+}
+
 /// Calls use the coordinator's broker identity after durable admission. The
 /// admission ID identifies a recorded plan; the ID alone is not authority.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -263,6 +276,7 @@ pub struct ProviderRequest {
     pub intent: Option<StreamIntent>,
     pub reason: Option<ReleaseReason>,
     pub requested_video: Option<VideoMode>,
+    pub consumer_requirements: ConsumerRequirements,
     pub remaining_ms: u64,
     pub plan_revision: Option<u64>,
     pub admission_id: Option<String>,
@@ -464,6 +478,21 @@ pub fn validate_provider_request(request: &ProviderRequest) -> Result<(), String
         || !valid_opaque_id(&request.transition_id)
         || !valid_opaque_id(&request.operation_id)
         || !valid_opaque_id(&request.settings_revision)
+        || !valid_opaque_id(&request.consumer_requirements.execution_domain)
+        || request.consumer_requirements.capture_providers.is_empty()
+        || request.consumer_requirements.capture_providers.len() > 32
+        || request
+            .consumer_requirements
+            .capture_providers
+            .iter()
+            .any(|id| !valid_identifier(id))
+        || request.consumer_requirements.selector_schemas.is_empty()
+        || request.consumer_requirements.selector_schemas.len() > 32
+        || request
+            .consumer_requirements
+            .selector_schemas
+            .iter()
+            .any(|id| !valid_identifier(id))
         || request.remaining_ms == 0
         || serde_json::to_vec(request)
             .map_err(|error| error.to_string())?
@@ -489,6 +518,7 @@ pub fn validate_provider_request(request: &ProviderRequest) -> Result<(), String
                 return Err("missing or mismatched admission".into());
             }
             validate_resource_plan(plan)?;
+            validate_consumer_requirements(plan, &request.consumer_requirements)?;
         }
     }
     Ok(())
@@ -607,6 +637,24 @@ pub fn validate_resource_plan(plan: &ResourcePlan) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_consumer_requirements(
+    plan: &ResourcePlan,
+    requirements: &ConsumerRequirements,
+) -> Result<(), String> {
+    if let Some(binding) = &plan.candidate_constraint
+        && (binding.execution_domain != requirements.execution_domain
+            || !requirements
+                .capture_providers
+                .contains(&binding.capture_provider)
+            || !requirements
+                .selector_schemas
+                .contains(&binding.selector_schema))
+    {
+        return Err("binding violates selected consumer requirements".into());
+    }
+    Ok(())
+}
+
 /// Check response shape and ensure a prepared binding respects its admitted plan.
 /// This does not attest that a capture consumer actually opened that resource.
 pub fn validate_provider_response(
@@ -624,7 +672,8 @@ pub fn validate_provider_response(
         ProviderResponse::Planned { plan }
             if request.operation == ProviderOperation::ResourcePlan =>
         {
-            validate_resource_plan(plan)
+            validate_resource_plan(plan)?;
+            validate_consumer_requirements(plan, &request.consumer_requirements)
         }
         ProviderResponse::Prepared {
             candidate,
@@ -918,6 +967,11 @@ mod tests {
             intent: None,
             reason: None,
             requested_video: None,
+            consumer_requirements: ConsumerRequirements {
+                execution_domain: "desktop".into(),
+                capture_providers: vec!["capture".into()],
+                selector_schemas: vec!["selector/1".into()],
+            },
             remaining_ms: 100,
             plan_revision: Some(1),
             admission_id: None,
@@ -934,6 +988,27 @@ mod tests {
             }],
         };
         assert!(validate_provider_response(&request, &response).is_err());
+        let plan = request.approved_plan.as_mut().unwrap();
+        plan.resources.push(PlannedResource {
+            provider: "display".into(),
+            resource_id: "output".into(),
+            incarnation: None,
+            expected_revision: None,
+            execution_domain: "other-domain".into(),
+            mutation_domains: vec![],
+            access: ResourceAccess::Exclusive,
+        });
+        plan.candidate_constraint = Some(BindingConstraint {
+            capture_provider: "capture".into(),
+            selector_schema: "selector/1".into(),
+            resource_provider: "display".into(),
+            resource_id: "output".into(),
+            incarnation: None,
+            execution_domain: "other-domain".into(),
+            mode: None,
+            plan_revision: 1,
+        });
+        assert!(validate_provider_request(&request).is_err());
     }
 
     #[test]
