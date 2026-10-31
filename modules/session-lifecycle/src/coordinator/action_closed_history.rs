@@ -576,6 +576,160 @@ mod tests {
     }
 
     #[test]
+    fn certified_replaced_root_retires_atomically() {
+        let (mut journal, _, mut root) = resource_generation::tests::fixture();
+        journal.receipts.clear();
+        journal.sessions.get_mut("session").unwrap().provider_graph = Some(ProviderGraph {
+            order: vec!["owner".into()],
+            dependencies: BTreeMap::from([("owner".into(), vec![])]),
+        });
+        journal
+            .composition
+            .set_state(
+                "owner",
+                "output",
+                &root.output.origin,
+                composition::OutputState::Released,
+            )
+            .unwrap();
+        root.state = composition::OutputState::Released;
+        let mut cert = certificate();
+        cert.resource_generation = 7;
+        cert.retired_admission = root.admission_id.clone();
+        cert.retired_transition = root.transition_id.clone();
+        cert.closed_admissions = BTreeSet::from([root.admission_id.clone()]);
+        cert.retired_root = root.output.clone();
+        cert.replacement_generation = 0;
+        cert.replacement_admission.clear();
+        cert.replacement_commitment.clear();
+        journal.closed_actions.records.push(cert);
+        let proof = root.callback_proof.as_ref().unwrap();
+        let response = match &proof.terminal.state {
+            crate::provider_dispatch::DispatchState::Completed { payload } => payload.clone(),
+            _ => panic!("fixture callback must be complete"),
+        };
+        let mut value = serde_json::to_value(&journal).unwrap();
+        value["session_prepare_evidence"] = json!({"records":[{"target":root.output.origin,
+            "transition_id":root.transition_id,"admission_id":root.admission_id,
+            "proof":proof,"response":response}]});
+        journal = serde_json::from_value(value).unwrap();
+        let mut replacement = root.clone();
+        replacement.state = composition::OutputState::Retained;
+        replacement.admission_id = "new-root".into();
+        replacement.transition_id = "new-prepare".into();
+        replacement.output.output_id = "new-output".into();
+        replacement.output.resource.incarnation = "new-native".into();
+        let callback = replacement.callback_proof.as_mut().unwrap();
+        callback.request.resource_generation = Some(8);
+        callback.request.admission_id = Some("new-root".into());
+        callback.request.transition_id = "new-prepare".into();
+        callback.request.operation_id = "new-call".into();
+        callback.terminal.call.operation_id = "new-call".into();
+        callback.terminal.call.arguments = serde_json::to_value(&callback.request).unwrap();
+        callback.terminal.state = crate::provider_dispatch::DispatchState::Completed {
+            payload: json!({"status":"prepared","candidate":null,"obligations":[],"outputs":[replacement.output]}),
+        };
+        let selection = composition::OutputSelection {
+            producer: "owner".into(),
+            service: "owner/2".into(),
+            capability: "screen".into(),
+            schema: replacement.output.schema.clone(),
+        };
+        journal
+            .composition
+            .record(
+                replacement.clone(),
+                &selection,
+                &replacement.output.origin,
+                &|_| true,
+            )
+            .unwrap();
+        let admission = journal.authority.settled.get("root").unwrap().clone();
+        journal
+            .authority
+            .settled
+            .insert("new-root".into(), admission);
+        let session = journal.sessions.get_mut("session").unwrap();
+        session.resource_generations.insert("owner".into(), 8);
+        session.admission_ids.insert("new-root".into());
+        session
+            .admission_targets
+            .insert("new-root".into(), replacement.output.origin.clone());
+        session
+            .admission_phases
+            .insert("new-root".into(), LifecyclePhase::SessionPrepare);
+        journal
+            .admission_transitions
+            .insert("new-root".into(), "new-prepare".into());
+        assert_eq!(
+            resource_generation::current_root_generation(&journal, &replacement),
+            Ok(8)
+        );
+        for mutation in 0..3 {
+            let mut denied = journal.clone();
+            match mutation {
+                0 => {
+                    denied
+                        .sessions
+                        .get_mut("session")
+                        .unwrap()
+                        .resource_generations
+                        .insert("owner".into(), 7);
+                }
+                1 => {
+                    denied
+                        .authority
+                        .domain_locks
+                        .insert("seat".into(), "root".into());
+                }
+                _ => {
+                    denied.closed_actions.records[0]
+                        .retired_root
+                        .resource
+                        .incarnation = "forged".into();
+                }
+            }
+            let before = serde_json::to_value(&denied).unwrap();
+            assert!(
+                action_root_retirement::retire_one(&mut denied, "root", "prepare", "owner", 7)
+                    .is_err()
+            );
+            assert_eq!(serde_json::to_value(&denied).unwrap(), before);
+        }
+        let before = serde_json::to_value(&journal).unwrap();
+        assert!(
+            action_root_retirement::retire_one(&mut journal, "root", "wrong", "owner", 7).is_err()
+        );
+        assert_eq!(serde_json::to_value(&journal).unwrap(), before);
+        action_root_retirement::retire_one(&mut journal, "root", "prepare", "owner", 7).unwrap();
+        assert!(!journal.authority.settled.contains_key("root"));
+        assert!(
+            journal
+                .composition
+                .records()
+                .all(|item| item.admission_id != "root")
+        );
+        assert_eq!(
+            journal
+                .closed_actions
+                .historical_root("root", "prepare", "owner", 7),
+            Some(&root.output)
+        );
+        assert_eq!(
+            resource_generation::current_root_generation(&journal, &replacement),
+            Ok(8)
+        );
+        let recovered: Journal =
+            serde_json::from_value(serde_json::to_value(&journal).unwrap()).unwrap();
+        assert!(
+            recovered
+                .closed_actions
+                .historical_root("root", "prepare", "owner", 7)
+                .is_some()
+        );
+    }
+
+    #[test]
     fn certified_historical_root_is_scoped_and_read_only() {
         let cert = certificate();
         let mut journal: Journal = serde_json::from_value(json!({

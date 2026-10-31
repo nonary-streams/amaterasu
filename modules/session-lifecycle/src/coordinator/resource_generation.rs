@@ -200,13 +200,13 @@ pub(super) fn active_generation(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::prepare_authority::{Admission, MethodApproval, ProviderSelection};
     use crate::provider_dispatch::{DispatchRecord, DispatchState, ProviderCall};
     use serde_json::json;
 
-    fn fixture() -> (Journal, Work, StoredOutput) {
+    pub(in crate::coordinator) fn fixture() -> (Journal, Work, StoredOutput) {
         let target =
             json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1});
         let stream = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":2});

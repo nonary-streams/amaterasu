@@ -17,7 +17,7 @@ fn contains_id(value: &Value, id: &str) -> bool {
     }
 }
 
-fn retire_one(
+pub(super) fn retire_one(
     journal: &mut Journal,
     admission: &str,
     transition: &str,
