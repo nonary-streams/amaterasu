@@ -757,8 +757,8 @@ mod tests {
             )
             .unwrap()
         };
-        let policy: ControlPolicy = serde_json::from_value(json!({"dependent_provider":"settings","owner_provider":"screen","owner_service":"screen/1","owner_method":method,"argument_schema":schema,"output_capability":"screen","output_schema":schema,"max_access":"exclusive","mutation_domains":[]})).unwrap();
-        let finalize: FinalizePolicy = serde_json::from_value(json!({"owner_provider":"screen","owner_service":"screen/1","method":method,"output_capability":"screen","output_schema":schema,"capture_provider":"capture","selector_schema":"selector/1","required_access":"exclusive","mutation_domains":[]})).unwrap();
+        let policy: ControlPolicy = serde_json::from_value(json!({"dependent_provider":"settings","owner_provider":"screen","owner_service":"screen/1","owner_method":method,"status_method":status,"argument_schema":schema,"output_capability":"screen","output_schema":schema,"max_access":"exclusive","mutation_domains":[]})).unwrap();
+        let finalize: FinalizePolicy = serde_json::from_value(json!({"owner_provider":"screen","owner_service":"screen/1","method":method,"status_method":status,"output_capability":"screen","output_schema":schema,"capture_provider":"capture","selector_schema":"selector/1","required_access":"exclusive","mutation_domains":[]})).unwrap();
         let snapshot = CompositionSelectionSnapshot {
             target: target(),
             transition_id: "consumer-transition".into(),
