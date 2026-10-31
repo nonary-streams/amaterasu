@@ -127,20 +127,24 @@ unknown or failed cleanup is not proof of retirement.
 
 `scripts/export_session_extension_split.py` prepares a non-mutating,
 reviewable mapping from an exported v1 registry document and its descriptor to
-the two candidate descriptors. It moves `retention`, `retention_seconds`,
-`keepalive_while_paused`, and `enforce_while_paused` to virtual-screen, retains
-the other settings with display-settings, and requires an explicit virtual-screen
-`enabled` choice for each source scope and the host scope. It preserves the
-source bytes and digest, pins descriptor digests, and validates the proposed
-settings against the supplied schemas. Its ordered settings-update plans require
-an empty destination and compare-and-set revisions starting at zero.
+the two selected descriptors. With the current virtual-screen descriptor, it
+omits legacy `retention`, `retention_seconds`, `keepalive_while_paused`, and
+`enforce_while_paused` only when their values match the owner's fixed defaults.
+It rejects a nondefault value in any source layer, even if another layer would
+override it. It retains the other display settings and requires an explicit
+virtual-screen `enabled` choice for each source scope and the host scope.
+The owner's nullable `remove_owned_shortcut` defaults to `null`; the export
+does not import a shortcut. The output preserves the exact source bytes and
+digest, pins descriptor digests, and validates proposed settings against the
+supplied schemas. Its ordered settings-update plans require an empty destination
+and compare-and-set revisions starting at zero.
 
 The tool does not contact the registry or apply its plans. It cannot migrate an
 existing state root: display-settings retains its provider ID, so an existing v1
 document needs an explicit migration and ordinary v2 updates reject it. The plans
 require scope authorization, approved descriptors, provider validation, and cleanup
 by the old owner before effects. The current preparer configures no registry
-migration plans. The export has been tested with synthetic split descriptors;
-the final descriptors, live import, and fail-closed upgrade checks still require
-validation before this is an executable upgrade procedure. Preserve unrelated
-global settings and validate both resulting documents before enabling effects.
+migration plans. The publication descriptors have been checked against
+the canonical schema; this does not establish an actual registry import or
+adoption of existing resources. Preserve unrelated global settings and validate
+both resulting documents before enabling effects.
