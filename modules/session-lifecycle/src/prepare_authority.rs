@@ -6,7 +6,10 @@
 //! revalidate native state under the callback before performing an effect.
 use std::collections::{BTreeMap, BTreeSet};
 
-use amaterasu_extension_api::{CleanupOutcome, CleanupState, MethodRef, ResourcePlan};
+use amaterasu_extension_api::{
+    CleanupOutcome, CleanupState, LifecycleTarget, MethodRef, ResourceAccess,
+    ResourceControlRequest, ResourceOutput, ResourcePlan, SchemaRef,
+};
 use amaterasu_module_sdk::ModuleResult;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -50,6 +53,50 @@ pub struct Admission {
     pub rights: Vec<(String, Access)>,
 }
 
+/// Installed policy, independently selected from the dependent's proposal.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlPolicy {
+    pub dependent_provider: String,
+    pub owner_provider: String,
+    pub owner_service: String,
+    pub owner_method: MethodRef,
+    pub argument_schema: SchemaRef,
+    pub output_capability: String,
+    pub output_schema: SchemaRef,
+    pub max_access: ResourceAccess,
+    pub mutation_domains: BTreeSet<String>,
+}
+
+/// Constructed by the coordinator from the frozen installed graph and its
+/// journaled, authenticated producer output. Never deserialize from a request.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlContext {
+    pub policy: ControlPolicy,
+    pub output: ResourceOutput,
+    pub target: LifecycleTarget,
+    pub transition_id: String,
+    /// Coordinator-read generation of the session containing a stream target.
+    pub parent_generation: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlPermit {
+    pub context: ControlContext,
+    pub request: ResourceControlRequest,
+    pub consumed: bool,
+    #[serde(default)]
+    pub settled: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlPermitUse {
+    Execute,
+    ReattachOnly,
+}
+
 /// The entire state must share one durable serialized authority/journal with
 /// the prepare driver, or writes must use serialized atomic compare-and-set.
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -72,6 +119,8 @@ pub struct AuthorityState {
     pub refresh_required: BTreeSet<String>,
     /// Retains the full plan and cleanup obligations after lock release.
     pub settled: BTreeMap<String, Admission>,
+    #[serde(default)]
+    pub control_permits: BTreeMap<String, ControlPermit>,
 }
 
 pub trait AuthorityJournal {
@@ -87,6 +136,158 @@ pub struct CoordinatorPrepareAuthority<J> {
 
 fn valid_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+}
+
+fn access_level(access: &ResourceAccess) -> u8 {
+    match access {
+        ResourceAccess::Read => 0,
+        ResourceAccess::Shared => 1,
+        ResourceAccess::Exclusive => 2,
+    }
+}
+
+fn valid_schema(schema: &SchemaRef) -> bool {
+    valid_id(&schema.id)
+        && schema.major != 0
+        && schema.digest.len() == 64
+        && schema
+            .digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn output_in_scope(context: &ControlContext) -> bool {
+    match (&context.output.origin, &context.target) {
+        (
+            LifecycleTarget::Session {
+                host_epoch: a,
+                session_id: b,
+                generation: g,
+            },
+            LifecycleTarget::Stream {
+                host_epoch: c,
+                session_id: d,
+                ..
+            },
+        ) => a == c && b == d && context.parent_generation == Some(*g),
+        (origin, target) => origin == target,
+    }
+}
+
+fn validate_control_binding(
+    admission: &Admission,
+    context: &ControlContext,
+    request: &ResourceControlRequest,
+    snapshot: &PlanningSnapshot,
+) -> ModuleResult<()> {
+    let policy = &context.policy;
+    let output = &context.output;
+    let proposal = &request.proposal;
+    let resource = &proposal.resource;
+    let domains: BTreeSet<_> = proposal.mutation_domains.iter().cloned().collect();
+    if !valid_id(&policy.dependent_provider)
+        || !valid_id(&policy.owner_provider)
+        || !valid_id(&policy.owner_service)
+        || !valid_id(&policy.output_capability)
+        || !valid_schema(&policy.argument_schema)
+        || !valid_schema(&policy.output_schema)
+        || !valid_id(&policy.owner_method.method)
+        || policy.owner_method.interface_major == 0
+        || policy.owner_method.schema_revision == 0
+        || !valid_id(&request.transition_id)
+        || !valid_id(&request.operation_id)
+        || !valid_id(&proposal.proposal_id)
+        || !valid_id(&proposal.output_id)
+        || request.provider_sequence == 0
+        || request.version != amaterasu_extension_api::COMPOSITION_VERSION
+        || request.remaining_ms == 0
+        || request.target != context.target
+        || proposal.target != context.target
+        || request.transition_id != context.transition_id
+        || admission.provider != policy.dependent_provider
+        || !admission
+            .selection
+            .participant
+            .depends_on
+            .contains(&policy.owner_provider)
+        || proposal.owner_provider != policy.owner_provider
+        || proposal.owner_service != policy.owner_service
+        || proposal.method != policy.owner_method
+        || proposal.method.service != policy.owner_service
+        || proposal.argument_schema != policy.argument_schema
+        || !proposal.arguments.is_object()
+        || output.output_id != proposal.output_id
+        || !output_in_scope(context)
+        || output.producer != policy.owner_provider
+        || output.producer_service != policy.owner_service
+        || output.capability != policy.output_capability
+        || output.schema != policy.output_schema
+        || output.resource != *resource
+        || resource.provider != policy.owner_provider
+        || domains.len() != proposal.mutation_domains.len()
+        || domains.is_empty()
+        || domains != resource.mutation_domains.iter().cloned().collect()
+        || !domains.is_subset(&policy.mutation_domains)
+        || access_level(&proposal.access) > access_level(&policy.max_access)
+        || admission
+            .plan
+            .control_proposals
+            .iter()
+            .filter(|entry| entry.proposal_id == proposal.proposal_id)
+            .count()
+            != 1
+        || !admission.plan.control_proposals.contains(proposal)
+    {
+        return Err("control proposal differs from frozen policy or output".into());
+    }
+    let planned = admission
+        .plan
+        .resources
+        .iter()
+        .find(|planned| {
+            planned.provider == resource.provider && planned.resource_id == resource.resource_id
+        })
+        .ok_or("control resource was not admitted")?;
+    if planned.incarnation.as_deref() != Some(&resource.incarnation)
+        || planned.expected_revision != Some(resource.revision)
+        || planned.execution_domain != resource.execution_domain
+        || planned
+            .mutation_domains
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            != domains
+        || access_level(&planned.access) < access_level(&proposal.access)
+        || domains.iter().any(|domain| {
+            admission
+                .rights
+                .iter()
+                .find(|(name, _)| name == domain)
+                .is_none_or(|(_, right)| {
+                    let level = match right {
+                        Access::Read => 0,
+                        Access::Shared => 1,
+                        Access::Exclusive => 2,
+                    };
+                    level < access_level(&proposal.access)
+                })
+        })
+        || snapshot
+            .resources
+            .get(&resource.provider)
+            .and_then(|items| items.get(&resource.resource_id))
+            != Some(&ResourceRef {
+                provider: resource.provider.clone(),
+                resource_id: resource.resource_id.clone(),
+                incarnation: resource.incarnation.clone(),
+                revision: resource.revision,
+                execution_domain: resource.execution_domain.clone(),
+                mutation_domains: domains,
+            })
+    {
+        return Err("control resource or rights are stale".into());
+    }
+    Ok(())
 }
 
 fn validate_selection(selection: &ProviderSelection) -> ModuleResult<()> {
@@ -256,6 +457,7 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
             || state.sequences.len() > MAX_PROVIDERS
             || state.admissions.len() + state.settled.len() > MAX_ADMISSIONS
             || state.issued_operation_ids.len() > 4096
+            || state.control_permits.len() > MAX_ADMISSIONS
             || state.issued_operation_ids.iter().any(|id| !valid_id(id))
         {
             return Err("authority capacity exceeded".into());
@@ -300,6 +502,30 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
             }
             validate_selection(&admission.selection)?;
             amaterasu_extension_api::validate_resource_plan(&admission.plan)?;
+        }
+        let mut control_operations = BTreeSet::new();
+        let mut control_sequences = BTreeSet::new();
+        for (id, permit) in &state.control_permits {
+            let admission = state
+                .admissions
+                .get(&permit.request.admission_id)
+                .ok_or("orphaned control permit")?;
+            if !valid_id(id)
+                || permit.request.permit_id != *id
+                || (permit.settled && !permit.consumed)
+                || !control_operations.insert(&permit.request.operation_id)
+                || !control_sequences.insert((
+                    &permit.context.policy.owner_provider,
+                    permit.request.provider_sequence,
+                ))
+                || state
+                    .sequences
+                    .get(&permit.context.policy.owner_provider)
+                    .is_none_or(|current| *current < permit.request.provider_sequence)
+            {
+                return Err("invalid recovered control permit".into());
+            }
+            validate_control_binding(admission, &permit.context, &permit.request, &state.snapshot)?;
         }
         if state.refresh_required.iter().any(|domain| {
             !state.domain_owners.contains_key(domain) || state.domain_locks.contains_key(domain)
@@ -354,6 +580,14 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
     ) -> ModuleResult<()> {
         if self.poisoned || !self.selections.contains_key(provider) {
             return Err("provider is not approved".into());
+        }
+        if self
+            .state
+            .control_permits
+            .values()
+            .any(|permit| permit.request.admission_id == admission_id && !permit.settled)
+        {
+            return Err("control outcome remains unsettled".into());
         }
         if let Some(settled) = self.state.settled.get(admission_id) {
             if settled.provider != provider {
@@ -413,6 +647,8 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
             next.refresh_required.insert(domain.clone());
         }
         next.admissions.remove(admission_id);
+        next.control_permits
+            .retain(|_, permit| permit.request.admission_id != admission_id);
         if !admission.plan.obligations.is_empty() {
             next.settled.insert(admission_id.to_owned(), admission);
         }
@@ -633,6 +869,142 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
                 .insert(observation.resource_id.clone(), observation.clone());
         }
         prune_idle_orphan_resources(&mut next);
+        self.persist(next)
+    }
+
+    /// Issue only from a locked coordinator journal lookup of the canonical
+    /// dependency output and frozen installed policy. `validate_arguments`
+    /// must resolve the digest-pinned schema and validate the actual arguments.
+    pub fn issue_control_permit(
+        &mut self,
+        participant: &ParticipantSettings,
+        context: &ControlContext,
+        request: &mut ResourceControlRequest,
+        validate_arguments: impl Fn(&SchemaRef, &Value) -> ModuleResult<()>,
+    ) -> ModuleResult<()> {
+        if !request.permit_id.is_empty() || self.poisoned {
+            return Err("invalid permit issuance".into());
+        }
+        if let Some((id, existing)) = self
+            .state
+            .control_permits
+            .iter()
+            .find(|(_, permit)| permit.request.operation_id == request.operation_id)
+        {
+            let mut proposed = request.clone();
+            proposed.permit_id = id.clone();
+            if existing.context != *context || existing.request != proposed {
+                return Err("control operation conflicts with existing intent".into());
+            }
+            request.permit_id = id.clone();
+            return Ok(());
+        }
+        let admission = self
+            .state
+            .admissions
+            .get(&request.admission_id)
+            .ok_or("unknown admission")?
+            .clone();
+        self.validate_rights(participant, &admission.plan, &request.admission_id)?;
+        validate_control_binding(&admission, context, request, &self.state.snapshot)?;
+        validate_arguments(&context.policy.argument_schema, &request.proposal.arguments)?;
+        if self.state.sequences.get(&context.policy.owner_provider)
+            != Some(&request.provider_sequence)
+            || self.state.control_permits.len() >= MAX_ADMISSIONS
+            || self.state.control_permits.values().any(|permit| {
+                permit.request.operation_id == request.operation_id
+                    || (permit.context.policy.owner_provider == context.policy.owner_provider
+                        && permit.request.provider_sequence == request.provider_sequence)
+            })
+        {
+            return Err("control operation is not fresh".into());
+        }
+        let permit_id =
+            amaterasu_storage::random_identifier().map_err(|_| "entropy unavailable")?;
+        if self.state.control_permits.contains_key(&permit_id) {
+            return Err("permit ID collision".into());
+        }
+        let mut frozen = request.clone();
+        frozen.permit_id = permit_id.clone();
+        let mut next = self.state.clone();
+        next.control_permits.insert(
+            permit_id.clone(),
+            ControlPermit {
+                context: context.clone(),
+                request: frozen,
+                consumed: false,
+                settled: false,
+            },
+        );
+        self.persist(next)?;
+        request.permit_id = permit_id;
+        Ok(())
+    }
+
+    /// Authenticated owner consumes exactly once. Replays may only reattach to
+    /// status; they never authorize another native effect.
+    pub fn consume_control_permit(
+        &mut self,
+        owner_caller: &str,
+        participant: &ParticipantSettings,
+        context: &ControlContext,
+        request: &ResourceControlRequest,
+        validate_arguments: impl Fn(&SchemaRef, &Value) -> ModuleResult<()>,
+    ) -> ModuleResult<ControlPermitUse> {
+        if self.poisoned {
+            return Err("authority journal requires recovery".into());
+        }
+        let permit = self
+            .state
+            .control_permits
+            .get(&request.permit_id)
+            .ok_or("unknown control permit")?;
+        if owner_caller != context.policy.owner_provider
+            || permit.context != *context
+            || permit.request != *request
+        {
+            return Err("control permit binding mismatch".into());
+        }
+        if permit.consumed {
+            return Ok(ControlPermitUse::ReattachOnly);
+        }
+        let admission = self
+            .state
+            .admissions
+            .get(&request.admission_id)
+            .ok_or("unknown admission")?
+            .clone();
+        self.validate_rights(participant, &admission.plan, &request.admission_id)?;
+        validate_control_binding(&admission, context, request, &self.state.snapshot)?;
+        validate_arguments(&context.policy.argument_schema, &request.proposal.arguments)?;
+        let mut next = self.state.clone();
+        next.control_permits
+            .get_mut(&request.permit_id)
+            .ok_or("unknown control permit")?
+            .consumed = true;
+        self.persist(next)?;
+        Ok(ControlPermitUse::Execute)
+    }
+
+    /// The coordinator calls this after authenticating and validating a
+    /// terminal owner result; unknown outcomes remain fenced indefinitely.
+    pub fn settle_control_permit(&mut self, request: &ResourceControlRequest) -> ModuleResult<()> {
+        let permit = self
+            .state
+            .control_permits
+            .get(&request.permit_id)
+            .ok_or("unknown control permit")?;
+        if permit.request != *request || !permit.consumed {
+            return Err("control permit not consumed".into());
+        }
+        if permit.settled {
+            return Ok(());
+        }
+        let mut next = self.state.clone();
+        next.control_permits
+            .get_mut(&request.permit_id)
+            .ok_or("unknown control permit")?
+            .settled = true;
         self.persist(next)
     }
 
@@ -911,6 +1283,7 @@ mod tests {
         let participant = ParticipantSettings {
             depends_on: vec![],
             provider: "display".into(),
+            depends_on: vec![],
             plan_method: method("plan"),
             callback_method: method("callback"),
             status_method: method("status"),
@@ -943,6 +1316,142 @@ mod tests {
     }
     fn plan() -> ResourcePlan {
         serde_json::from_value(json!({"plan_id":"plan","revision":1,"resources":[{"provider":"display","resource_id":"output","incarnation":"native","expected_revision":2,"execution_domain":"seat","mutation_domains":["topology"],"access":"exclusive"}],"mutation_domains":[{"domain":"topology","expected_revision":4,"borrowers":{"stream":1},"access":"exclusive"}],"required_capabilities":["display/change"],"constraints":{},"obligations":[{"obligation_id":"restore","provider":"display","resource_id":"output","mutation_domain":"topology","depends_on":[],"cleanup_method":{"service":"display/1","method":"cleanup","interface_major":1,"interface_minor":0,"schema_revision":2},"payload":{}}],"affected_consumers":[],"consumer_change":"restart_pipeline","candidate_constraint":null,"allowed_degradation":[]})).unwrap()
+    }
+
+    #[test]
+    fn control_permit_fences_forgery_replay_and_uncertain_effect() {
+        let mut selected = selection();
+        selected.participant.depends_on.push("owner".into());
+        let mut plan = plan();
+        plan.resources[0].provider = "owner".into();
+        plan.obligations[0].provider = "owner".into();
+        let target =
+            json!({"kind":"session", "host_epoch":"host", "session_id":"session", "generation":1});
+        let schema = json!({"id":"schema", "major":1, "minor":0, "digest":"a".repeat(64)});
+        let resource = json!({"provider":"owner", "resource_id":"output", "incarnation":"native", "revision":2, "execution_domain":"seat", "mutation_domain":"topology", "mutation_domains":["topology"]});
+        let method = json!({"service":"display/1", "method":"control", "interface_major":1, "interface_minor":0, "schema_revision":2});
+        let proposal = json!({"proposal_id":"proposal", "output_id":"output-id", "owner_provider":"owner", "owner_service":"display/1", "target":target, "resource":resource, "method":method, "argument_schema":schema, "arguments":{"width":1920}, "access":"exclusive", "mutation_domains":["topology"]});
+        plan.control_proposals
+            .push(serde_json::from_value(proposal.clone()).unwrap());
+        let context: ControlContext = serde_json::from_value(json!({
+            "policy":{"dependent_provider":"display", "owner_provider":"owner", "owner_service":"display/1", "owner_method":method, "argument_schema":schema, "output_capability":"display", "output_schema":schema, "max_access":"exclusive", "mutation_domains":["topology"]},
+            "output":{"output_id":"output-id", "capability":"display", "schema":schema, "producer":"owner", "producer_service":"display/1", "origin":target, "resource":resource, "data":{}},
+            "target":target, "transition_id":"transition", "parent_generation":null
+        })).unwrap();
+        let mut state = AuthorityState::default();
+        state.sequences.insert("owner".into(), 1);
+        state
+            .domain_owners
+            .insert("topology".into(), "owner".into());
+        state.snapshot.domains.insert(
+            "topology".into(),
+            DomainState {
+                revision: 4,
+                borrowers: [("stream".into(), 1)].into(),
+            },
+        );
+        state.snapshot.resources.insert(
+            "owner".into(),
+            [(
+                "output".into(),
+                ResourceRef {
+                    provider: "owner".into(),
+                    resource_id: "output".into(),
+                    incarnation: "native".into(),
+                    revision: 2,
+                    execution_domain: "seat".into(),
+                    mutation_domains: ["topology".into()].into(),
+                },
+            )]
+            .into(),
+        );
+        let mut authority =
+            CoordinatorPrepareAuthority::new(state, vec![selected.clone()], Journal::default())
+                .unwrap();
+        let id = authority.admit_plan(&selected.participant, &plan).unwrap();
+        let mut request: ResourceControlRequest = serde_json::from_value(json!({"version":2,"transition_id":"transition","operation_id":"operation","provider_sequence":1,"target":target,"proposal":proposal,"admission_id":id,"permit_id":"","remaining_ms":1000})).unwrap();
+        let validate = |_: &SchemaRef, _: &Value| Ok(());
+        authority
+            .issue_control_permit(&selected.participant, &context, &mut request, validate)
+            .unwrap();
+        let mut retry = request.clone();
+        retry.permit_id.clear();
+        authority
+            .issue_control_permit(&selected.participant, &context, &mut retry, validate)
+            .unwrap();
+        assert_eq!(retry.permit_id, request.permit_id);
+        let mut wrong_origin = context.clone();
+        wrong_origin.output.origin = serde_json::from_value(
+            json!({"kind":"session","host_epoch":"host","session_id":"other","generation":1}),
+        )
+        .unwrap();
+        assert!(!output_in_scope(&wrong_origin));
+        let mut child = context.clone();
+        child.target = serde_json::from_value(json!({"kind":"stream","host_epoch":"host","session_id":"session","stream_id":"s","generation":3})).unwrap();
+        child.parent_generation = Some(1);
+        assert!(output_in_scope(&child));
+        child.parent_generation = Some(2);
+        assert!(!output_in_scope(&child));
+        child.output.origin = serde_json::from_value(json!({"kind":"stream","host_epoch":"host","session_id":"session","stream_id":"s","generation":2})).unwrap();
+        assert!(!output_in_scope(&child));
+        let mut forged = request.clone();
+        forged.proposal.arguments["width"] = json!(1);
+        assert!(
+            authority
+                .consume_control_permit("owner", &selected.participant, &context, &forged, validate)
+                .is_err()
+        );
+        assert!(
+            authority
+                .consume_control_permit(
+                    "foreign",
+                    &selected.participant,
+                    &context,
+                    &request,
+                    validate
+                )
+                .is_err()
+        );
+        let mut stale = context.clone();
+        stale.output.resource.revision += 1;
+        assert!(
+            authority
+                .consume_control_permit("owner", &selected.participant, &stale, &request, validate)
+                .is_err()
+        );
+        assert_eq!(
+            authority
+                .consume_control_permit(
+                    "owner",
+                    &selected.participant,
+                    &context,
+                    &request,
+                    validate
+                )
+                .unwrap(),
+            ControlPermitUse::Execute
+        );
+        assert_eq!(
+            authority
+                .consume_control_permit(
+                    "owner",
+                    &selected.participant,
+                    &context,
+                    &request,
+                    validate
+                )
+                .unwrap(),
+            ControlPermitUse::ReattachOnly
+        );
+        assert!(
+            authority
+                .finish_admission("display", &request.admission_id)
+                .is_err()
+        );
+        authority.settle_control_permit(&request).unwrap();
+        authority
+            .finish_admission("display", &request.admission_id)
+            .unwrap();
     }
 
     #[test]
