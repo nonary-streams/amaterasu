@@ -98,6 +98,7 @@ pub struct RawPreparationCommand {
 pub enum ArtworkReference {
     Steam { app_id: u32, revision: String },
     Lutris { game_id: i64, revision: String },
+    Playnite { game_id: String, revision: String },
 }
 
 impl ArtworkReference {
@@ -112,6 +113,17 @@ impl ArtworkReference {
                     || parsed_revision.is_none_or(|number| number.to_string() != *revision)
                 {
                     return Err("invalid Steam artwork reference");
+                }
+            }
+            Self::Playnite { game_id, revision } => {
+                if !valid_guid(game_id)
+                    || game_id.bytes().any(|byte| byte.is_ascii_uppercase())
+                    || revision.len() != 64
+                    || !revision
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err("invalid Playnite artwork reference");
                 }
             }
             Self::Lutris { game_id, revision } => {

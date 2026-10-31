@@ -114,6 +114,7 @@ struct ProviderScan {
     scanned: usize,
     fingerprints: BTreeMap<String, String>,
     entry_names: BTreeMap<String, String>,
+    artwork_entries: BTreeMap<String, Entry>,
     entry_ids: BTreeSet<String>,
     markers: BTreeMap<String, Marker>,
     provider_state: Option<SnapshotState>,
@@ -138,6 +139,7 @@ struct ProviderSession {
     entry_ids: BTreeSet<String>,
     fingerprints: BTreeMap<String, String>,
     entry_names: BTreeMap<String, String>,
+    artwork_entries: BTreeMap<String, Entry>,
     markers: BTreeMap<String, Marker>,
     seen_source_ids: BTreeSet<String>,
     state: SnapshotState,
@@ -298,6 +300,20 @@ impl Pipeline {
                 })?;
                 Ok((format!("principal/{owner}"), None, operation))
             }
+            operation @ Operation::ResolveExportedArtwork { .. } => {
+                let consumer = if caller == LIBRARY_PRINCIPAL {
+                    initiator
+                } else {
+                    caller
+                };
+                let owner = self.export_principals.get(consumer).ok_or_else(|| {
+                    error(
+                        "permission_denied",
+                        "caller is not an authorized catalog consumer",
+                    )
+                })?;
+                Ok((format!("principal/{owner}"), None, operation))
+            }
             operation @ Operation::ExportSteamIds { .. } => {
                 let owner = self.steam_id_export_principals.get(caller).ok_or_else(|| {
                     error(
@@ -452,6 +468,7 @@ impl Pipeline {
             Operation::Get { id }
             | Operation::ResolveLaunch { id }
             | Operation::ResolveExported { id }
+            | Operation::ResolveExportedArtwork { id }
             | Operation::ResolveExportedLaunch { id }
             | Operation::Update { id, .. }
             | Operation::Delete { id, .. } => Some(id),
@@ -573,6 +590,7 @@ impl Pipeline {
             entry_ids: scan.entry_ids,
             fingerprints: scan.fingerprints,
             entry_names: scan.entry_names,
+            artwork_entries: scan.artwork_entries,
             markers: scan.markers,
             seen_source_ids,
             state,
@@ -1759,6 +1777,7 @@ impl Pipeline {
                 source_id,
                 mut entry,
                 source_flags,
+                preserve_artwork,
             } = provider_entry;
             let invalid_launch_owner = matches!(
                 &entry.launch,
@@ -1770,6 +1789,10 @@ impl Pipeline {
                 &entry.launch,
                 Launch::PlayniteFullscreen { .. } | Launch::Desktop { .. }
             );
+            let valid_playnite_identity = session.caller == PLAYNITE_IMPORTER
+                && crate::model::valid_guid(&source_id)
+                && !source_id.bytes().any(|byte| byte.is_ascii_uppercase())
+                && matches!(&entry.launch, Launch::Playnite { game_id, .. } if game_id == &source_id);
             let invalid_artwork_owner = match &entry.artwork {
                 Some(ArtworkReference::Steam { app_id, .. }) => {
                     session.caller != STEAM_IMPORTER || source_id != format!("steam:{app_id}")
@@ -1777,8 +1800,12 @@ impl Pipeline {
                 Some(ArtworkReference::Lutris { game_id, .. }) => {
                     session.caller != LUTRIS_IMPORTER || source_id != game_id.to_string()
                 }
+                Some(ArtworkReference::Playnite { game_id, .. }) => {
+                    !valid_playnite_identity || game_id != &source_id
+                }
                 None => false,
-            };
+            } || (preserve_artwork
+                && (!valid_playnite_identity || entry.artwork.is_some()));
             let has_steam_metadata = entry.steam_id.is_some() || entry.steam_install_dir.is_some();
             let valid_steam_metadata_identity = entry.steam_id.as_ref().is_some_and(|app_id| {
                 session.caller == STEAM_IMPORTER && source_id == format!("steam:{app_id}")
@@ -1872,6 +1899,15 @@ impl Pipeline {
                 session.entry_ids.insert(entry_id.clone());
                 (entry_id, false, ConfigOverrides::default())
             };
+            if preserve_artwork
+                && !detached
+                && let Some(previous) = session.artwork_entries.get(&entry_id)
+                && matches!((&previous.launch, &previous.artwork),
+                    (Launch::Playnite { game_id: launch_id, .. }, Some(ArtworkReference::Playnite { game_id, .. }))
+                        if launch_id == &source_id && game_id == &source_id)
+            {
+                entry.artwork = previous.artwork.clone();
+            }
             if session.caller == PLAYNITE_IMPORTER {
                 entry.config_overrides = config_overrides.clone();
             }
@@ -2369,6 +2405,7 @@ impl Pipeline {
                     scanned: 0,
                     fingerprints: BTreeMap::new(),
                     entry_names: BTreeMap::new(),
+                    artwork_entries: BTreeMap::new(),
                     entry_ids: BTreeSet::new(),
                     markers: BTreeMap::new(),
                     provider_state: None,
@@ -2447,7 +2484,10 @@ impl Pipeline {
                         {
                             return complete(send, context.request_id, malformed());
                         }
-                        scan.entry_names.insert(key.into(), entry.name);
+                        scan.entry_names.insert(key.into(), entry.name.clone());
+                        if matches!(entry.launch, Launch::Playnite { .. }) {
+                            scan.artwork_entries.insert(key.into(), entry);
+                        }
                         scan.entry_ids.insert(key.into());
                     } else {
                         return complete(send, context.request_id, malformed());
@@ -2516,6 +2556,7 @@ impl Pipeline {
                 if let Operation::Get { id }
                 | Operation::ResolveLaunch { id }
                 | Operation::ResolveExported { id }
+                | Operation::ResolveExportedArtwork { id }
                 | Operation::ResolveExportedLaunch { id }
                 | Operation::Update { id, .. }
                 | Operation::Delete { id, .. } = &operation
@@ -2577,6 +2618,7 @@ impl Pipeline {
                 Operation::ExportList { .. }
                     | Operation::ExportSteamIds { .. }
                     | Operation::ResolveExported { .. }
+                    | Operation::ResolveExportedArtwork { .. }
                     | Operation::ResolveExportedLaunch { .. }
             ) {
                 return complete_read(send, context, operation, Document::default());
@@ -2596,6 +2638,7 @@ impl Pipeline {
             Operation::ExportList { .. }
                 | Operation::ExportSteamIds { .. }
                 | Operation::ResolveExported { .. }
+                | Operation::ResolveExportedArtwork { .. }
                 | Operation::ResolveExportedLaunch { .. }
         ) {
             return complete_read(send, context, operation, document);

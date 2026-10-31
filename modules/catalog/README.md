@@ -403,6 +403,14 @@ selected catalog. A tombstone only matches a marker owned by the authenticated
 importer. Unknown IDs are ignored. Ordinary catalog management actions cannot
 write tombstones.
 
+Playnite artwork is an opaque typed reference with a lowercase canonical GUID
+and lowercase SHA-256 revision. For artwork-bearing items, the source ID, launch
+game ID and artwork game ID must match and the caller must be the authenticated
+Playnite importer. When artwork cannot be inspected, that importer can set
+`preserve_artwork:true` on the snapshot item to retain matching artwork on an
+attached entry. A known absence omits both the reference and that flag, clearing
+the previous artwork. Detached entries remain user-owned.
+
 The last committed batch can be retried after an ambiguous timeout. The replay
 must have the same sequence, expected revision and SHA-256 payload fingerprint;
 it returns the committed revision without applying the batch again. Earlier or

@@ -25,6 +25,10 @@ pub enum Operation {
     ResolveExported {
         id: String,
     },
+    /// Resolve only the opaque artwork reference for an exported entry.
+    ResolveExportedArtwork {
+        id: String,
+    },
     Update {
         id: String,
         entry: Entry,
@@ -134,6 +138,12 @@ pub struct ProviderEntry {
     pub entry: Entry,
     #[serde(default)]
     pub source_flags: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub preserve_artwork: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Deserialize, Serialize)]
@@ -157,6 +167,10 @@ pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change,
             return Ok(Change::Read(
                 json!({"ok":true,"revision":document.revision,"id":id,"name":entry.name}),
             ));
+        }
+        Operation::ResolveExportedArtwork { id } => {
+            let entry = find_entry(&document, &id)?;
+            return Ok(Change::Read(json!({"ok":true,"artwork":entry.artwork})));
         }
         Operation::Get { id }
         | Operation::ResolveLaunch { id }
@@ -495,6 +509,7 @@ pub fn matches_query(entry: &Entry, query: &str) -> bool {
         || entry.artwork.as_ref().is_some_and(|artwork| match artwork {
             crate::model::ArtworkReference::Steam { .. } => contains("steam"),
             crate::model::ArtworkReference::Lutris { .. } => contains("lutris"),
+            crate::model::ArtworkReference::Playnite { .. } => contains("playnite"),
         })
     {
         return true;

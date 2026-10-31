@@ -2289,6 +2289,68 @@ fn library_resolve_returns_only_public_fields() {
 }
 
 #[test]
+fn exported_artwork_is_scoped_to_the_configured_consumer_and_opaque() {
+    let mut backend = Backend::default();
+    run_steam_artwork_snapshot(
+        &mut backend,
+        &mut steam_artwork_importer(),
+        "steam-scan",
+        1,
+        Some("7"),
+    );
+    let mut pipeline = Pipeline::new_with_steam_id_export_principals(
+        BTreeSet::new(),
+        BTreeMap::from([("nvhttp".into(), "amaterasu.management".into())]),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let request = json!({"action":"resolve_exported_artwork","id":"app-0000000000000001"});
+    let denied = backend.run_for(
+        &mut pipeline,
+        request.clone(),
+        "stranger",
+        "nvhttp",
+        "unused",
+    );
+    assert_eq!(denied["error"]["code"], "permission_denied");
+    let result = backend.run_for(
+        &mut pipeline,
+        request,
+        "nvhttp",
+        "nvhttp",
+        "amaterasu.management",
+    );
+    assert_eq!(
+        result,
+        json!({"ok":true,"artwork":{"provider":"steam","app_id":42,"revision":"7"}})
+    );
+    let delegated = backend.run_for(
+        &mut pipeline,
+        json!({"action":"resolve_exported_artwork","id":"app-0000000000000001"}),
+        "amaterasu.library",
+        "nvhttp",
+        "amaterasu.management",
+    );
+    assert_eq!(delegated, result);
+    let denied = backend.run_for(
+        &mut pipeline,
+        json!({"action":"resolve_exported_artwork","id":"app-0000000000000001"}),
+        "amaterasu.library",
+        "stranger",
+        "unused",
+    );
+    assert_eq!(denied["error"]["code"], "permission_denied");
+    let spoofed = backend.run_for(
+        &mut pipeline,
+        json!({"action":"resolve_exported_artwork","id":"app-0000000000000001","owner":"other"}),
+        "nvhttp",
+        "nvhttp",
+        "unused",
+    );
+    assert_eq!(spoofed["error"]["code"], "invalid_request");
+}
+
+#[test]
 fn export_authority_uses_fixed_owner_and_rejects_payload_spoofing() {
     let mut pipeline = Pipeline::new_with_steam_id_export_principals(
         BTreeSet::new(),
@@ -5880,3 +5942,133 @@ fn keybindings_catalog_updates_preserve_lists_durability_and_revision_authority(
     }
 }
 mod desktop_seed;
+
+#[test]
+fn playnite_artwork_unknown_preserves_only_owned_matching_artwork() {
+    const ID: &str = "a1b2c3d4-1234-5678-9abc-0123456789ab";
+    let mut backend = Backend::default();
+    let mut pipeline = playnite_importer();
+    let revision = "a".repeat(64);
+    for (number, mode) in [(1, "known"), (2, "unknown"), (3, "missing")] {
+        let sync = format!("artwork-{number}");
+        let begin = backend.run_for(
+            &mut pipeline,
+            snapshot_begin(&sync, number),
+            "amaterasu.playnite",
+            "amaterasu.management",
+            "amaterasu.management",
+        );
+        assert_eq!(begin["ok"], true, "{begin}");
+        let mut game = playnite_entry("Game");
+        if mode == "known" {
+            game["artwork"] = json!({"provider":"playnite","game_id":ID,"revision":revision});
+        }
+        let mut request = snapshot_batch(
+            &sync,
+            begin["generation"].as_u64().unwrap(),
+            number,
+            0,
+            begin["revision"].as_u64().unwrap(),
+            vec![(ID, game)],
+        );
+        if mode == "unknown" {
+            request["entries"][0]["preserve_artwork"] = json!(true);
+        }
+        let batch = backend.run_for(
+            &mut pipeline,
+            request,
+            "amaterasu.playnite",
+            "amaterasu.management",
+            "amaterasu.management",
+        );
+        assert_eq!(batch["ok"], true, "{batch}");
+        let row = &backend.entries["app-0000000000000001"];
+        if mode == "missing" {
+            assert!(row.get("artwork").is_none());
+        } else {
+            assert_eq!(row["artwork"]["revision"], revision);
+        }
+        let finish = backend.run_for(
+            &mut pipeline,
+            snapshot_finish(
+                &sync,
+                begin["generation"].as_u64().unwrap(),
+                number,
+                batch["revision"].as_u64().unwrap(),
+                1,
+                true,
+            ),
+            "amaterasu.playnite",
+            "amaterasu.management",
+            "amaterasu.management",
+        );
+        assert_eq!(finish["ok"], true, "{finish}");
+    }
+}
+
+#[test]
+fn playnite_artwork_rejects_forged_identity_and_preservation() {
+    const ID: &str = "a1b2c3d4-1234-5678-9abc-0123456789ab";
+    for (source, preserve, artwork_id) in [
+        ("b1b2c3d4-1234-5678-9abc-0123456789ab", false, ID),
+        ("A1B2C3D4-1234-5678-9ABC-0123456789AB", true, ID),
+        (ID, false, "b1b2c3d4-1234-5678-9abc-0123456789ab"),
+        (ID, true, ID),
+    ] {
+        let mut backend = Backend::default();
+        let mut pipeline = playnite_importer();
+        let begin = backend.run_for(
+            &mut pipeline,
+            snapshot_begin("forged", 1),
+            "amaterasu.playnite",
+            "amaterasu.management",
+            "amaterasu.management",
+        );
+        let mut game = playnite_entry("Forged");
+        game["artwork"] =
+            json!({"provider":"playnite","game_id":artwork_id,"revision":"a".repeat(64)});
+        let mut request = snapshot_batch(
+            "forged",
+            begin["generation"].as_u64().unwrap(),
+            1,
+            0,
+            begin["revision"].as_u64().unwrap(),
+            vec![(source, game)],
+        );
+        if preserve {
+            request["entries"][0]["preserve_artwork"] = json!(true);
+        }
+        let rejected = backend.run_for(
+            &mut pipeline,
+            request,
+            "amaterasu.playnite",
+            "amaterasu.management",
+            "amaterasu.management",
+        );
+        assert_eq!(
+            rejected["error"]["code"], "provider_artwork_required",
+            "{rejected}"
+        );
+    }
+}
+
+#[test]
+fn playnite_artwork_reference_requires_lowercase_guid_and_sha256() {
+    let valid = "a1b2c3d4-1234-5678-9abc-0123456789ab";
+    for (game_id, digest, expected) in [
+        (valid, "a".repeat(64), true),
+        (
+            "A1B2C3D4-1234-5678-9ABC-0123456789AB",
+            "a".repeat(64),
+            false,
+        ),
+        (valid, "A".repeat(64), false),
+        (valid, "a".repeat(63), false),
+        (valid, "g".repeat(64), false),
+    ] {
+        let mut game = playnite_entry("Game");
+        game["artwork"] = json!({"provider":"playnite","game_id":game_id,"revision":digest});
+        let entry: Entry = serde_json::from_value(game).unwrap();
+        assert_eq!(entry.validate().is_ok(), expected);
+    }
+}
