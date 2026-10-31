@@ -41,6 +41,48 @@ struct Controller<B: Broker, C: Compositor, I: ConnectorInventory> {
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
+    fn reconfigure(
+        &mut self,
+        key: &(String, String),
+        transition: super::Transition,
+        scale: ScaleSetting,
+        layout: VirtualDisplayLayout,
+    ) -> Result<Record, String> {
+        let mut record = self
+            .journal
+            .records
+            .iter()
+            .find(|record| &record.key() == key)
+            .cloned()
+            .ok_or("missing owned display record")?;
+        if record
+            .transition
+            .as_ref()
+            .is_some_and(|previous| !previous.completed)
+            || record.specification != transition.old
+            || !self.broker.connected(&record.output)?
+        {
+            return Err("reconfigure precondition changed".into());
+        }
+        // The complete old/new intent remains available for cleanup even if the
+        // compositor command partially executes or the process disappears.
+        record.transition = Some(transition.clone());
+        self.journal.update(record.clone())?;
+        let placement = self.placement(&record.output, layout);
+        self.compositor
+            .configure(&record.output, &transition.desired, None, &placement, scale)?;
+        if !self.broker.connected(&record.output)? {
+            return Err("owned connector disappeared during reconfiguration".into());
+        }
+        record.specification = transition.desired;
+        record
+            .transition
+            .as_mut()
+            .expect("persisted transition")
+            .completed = true;
+        self.journal.update(record.clone())?;
+        Ok(record)
+    }
     /// Exclusive placement leaves the outputs of other journaled Amaterasu
     /// streams enabled; only displays Amaterasu does not own are turned off.
     fn placement(&self, owned: &str, layout: VirtualDisplayLayout) -> Placement {
@@ -129,6 +171,7 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
             output: selected.ok_or("no free virtual display connector")?,
             layout: None,
             references,
+            transition: None,
         };
         record.layout = self.compositor.snapshot(&record.output)?;
         let placement = self.placement(&record.output, layout);
@@ -199,6 +242,15 @@ pub(super) fn run<B: Broker, C: Compositor, I: ConnectorInventory>(
             break;
         }
         let event = match work {
+            Work::Reconfigure {
+                key,
+                transition,
+                scale,
+                layout,
+            } => {
+                let result = controller.reconfigure(&key, transition, scale, layout);
+                Event::Reconfigured { key, result }
+            }
             Work::Create {
                 owner,
                 specification,

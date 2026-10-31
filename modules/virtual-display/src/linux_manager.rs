@@ -30,6 +30,18 @@ pub(super) struct Record {
     layout: Option<layout::Layout>,
     #[serde(default)]
     references: Option<BTreeSet<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transition: Option<Transition>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Transition {
+    operation_id: String,
+    reference_id: String,
+    borrow_id: String,
+    old: Specification,
+    desired: Specification,
+    completed: bool,
 }
 impl Record {
     fn key(&self) -> (String, String) {
@@ -46,6 +58,26 @@ impl Record {
             && self.owner.len() <= 128
             && !self.owner.chars().any(char::is_control)
             && self.specification.validate().is_ok()
+            && self.transition.as_ref().is_none_or(|transition| {
+                !transition.operation_id.is_empty()
+                    && transition.operation_id.len() <= 128
+                    && transition
+                        .operation_id
+                        .bytes()
+                        .all(|b| b.is_ascii_graphic())
+                    && valid_reference_id(&transition.reference_id)
+                    && transition.borrow_id.len() == 64
+                    && transition.borrow_id.bytes().all(|b| b.is_ascii_hexdigit())
+                    && transition.old.validate().is_ok()
+                    && transition.desired.validate().is_ok()
+                    && transition.old.identity == self.specification.identity
+                    && transition.desired.identity == self.specification.identity
+                    && if transition.completed {
+                        self.specification == transition.desired
+                    } else {
+                        self.specification == transition.old
+                    }
+            })
             && connectors::connector_id(&self.output).is_some()
     }
 }
@@ -77,7 +109,20 @@ struct Borrow {
     observation: observer::Observation,
     valid: bool,
 }
+struct Reconfiguration {
+    transition: Transition,
+    state: &'static str,
+    result: Option<Value>,
+    domain_id: String,
+    revision: u64,
+}
 enum Work {
+    Reconfigure {
+        key: (String, String),
+        transition: Transition,
+        scale: ScaleSetting,
+        layout: VirtualDisplayLayout,
+    },
     Create {
         owner: String,
         specification: Specification,
@@ -95,6 +140,10 @@ enum Work {
     },
 }
 enum Event {
+    Reconfigured {
+        key: (String, String),
+        result: Result<Record, String>,
+    },
     Recovered {
         records: Vec<Record>,
         error: Option<String>,
@@ -120,6 +169,7 @@ pub struct Manager {
     cleanup_pending: std::collections::BTreeSet<(String, String)>,
     observer: Option<observer::Observer>,
     borrows: BTreeMap<String, Borrow>,
+    reconfigurations: BTreeMap<(String, String), Reconfiguration>,
     domain_id: String,
     topology_revision: u64,
     pending_mutations: usize,
@@ -147,6 +197,7 @@ impl Manager {
             cleanup_pending: Default::default(),
             observer: None,
             borrows: BTreeMap::new(),
+            reconfigurations: BTreeMap::new(),
             domain_id,
             topology_revision: 0,
             pending_mutations: 0,
@@ -186,6 +237,26 @@ impl Manager {
             .and_then(|receiver| receiver.try_recv().ok())
         {
             match event {
+                Event::Reconfigured { key, result } => {
+                    self.pending_mutations = self.pending_mutations.saturating_sub(1);
+                    if let Some(change) = self.reconfigurations.get_mut(&key) {
+                        match result {
+                            Ok(record) => {
+                                if let Some(monitor) = self.monitors.get_mut(&key) {
+                                    monitor.specification = record.specification;
+                                    monitor.state = "ready";
+                                }
+                                change.state = "observing";
+                            }
+                            Err(_) => {
+                                change.state = "recovery_required";
+                                if let Some(monitor) = self.monitors.get_mut(&key) {
+                                    monitor.state = "cleanup_failed";
+                                }
+                            }
+                        }
+                    }
+                }
                 Event::Recovered { records, error } => {
                     self.ready = error.is_none();
                     self.recovery_error = error;
@@ -228,6 +299,7 @@ impl Manager {
                     match result {
                         Ok(()) => {
                             self.monitors.remove(&key);
+                            self.reconfigurations.remove(&key);
                             if self.monitors.is_empty() && self.recovery_error.is_some() {
                                 self.ready = true;
                                 self.recovery_error = None;
@@ -247,6 +319,31 @@ impl Manager {
     pub fn admit(&mut self, caller: &str, operation: Operation) -> (Value, Option<Admission>) {
         self.tick();
         match operation {
+            Operation::Reconfigure {
+                operation_id,
+                identity,
+                reference_id,
+                borrow_id,
+                width,
+                height,
+                refresh_millihz,
+                expected_topology_domain_id,
+                expected_topology_revision,
+            } => (
+                self.reconfigure(
+                    caller,
+                    operation_id,
+                    identity,
+                    reference_id,
+                    borrow_id,
+                    width,
+                    height,
+                    refresh_millihz,
+                    expected_topology_domain_id,
+                    expected_topology_revision,
+                ),
+                None,
+            ),
             Operation::Borrow {
                 identity,
                 reference_id,
@@ -291,6 +388,13 @@ impl Manager {
                 expected_topology_revision,
                 expected_topology_domain_id,
             } => {
+                if self
+                    .reconfigurations
+                    .values()
+                    .any(|change| change.state != "succeeded")
+                {
+                    return (failure("reconfigure_pending"), None);
+                }
                 match (&expected_topology_domain_id, expected_topology_revision) {
                     (None, None) => {}
                     (Some(domain), Some(revision))
@@ -463,6 +567,13 @@ impl Manager {
         true
     }
     fn remove(&mut self, caller: &str, identity: &str, reference_id: Option<&str>) -> Value {
+        if self
+            .reconfigurations
+            .values()
+            .any(|change| change.state == "pending")
+        {
+            return failure("reconfigure_pending");
+        }
         if !valid_identity(identity)
             || reference_id.is_some_and(|reference| !valid_reference_id(reference))
         {
@@ -522,12 +633,211 @@ impl Manager {
         }
         json!({"ok":true,"removed":false,"monitor":self.monitors[&key].response(reference_id),"reference_owned":false})
     }
+    #[allow(clippy::too_many_arguments)]
+    fn reconfigure(
+        &mut self,
+        caller: &str,
+        operation_id: String,
+        identity: String,
+        reference_id: String,
+        borrow_id: String,
+        width: u32,
+        height: u32,
+        refresh_millihz: u32,
+        domain_id: String,
+        revision: u64,
+    ) -> Value {
+        let key = (caller.to_owned(), identity.clone());
+        if let Some(change) = self.reconfigurations.get(&key)
+            && !(change.state == "succeeded" && change.transition.operation_id != operation_id)
+        {
+            let t = &change.transition;
+            if t.operation_id != operation_id
+                || t.reference_id != reference_id
+                || t.borrow_id != borrow_id
+                || t.desired.width != width
+                || t.desired.height != height
+                || t.desired.refresh_millihz != refresh_millihz
+                || change.domain_id != domain_id
+                || change.revision != revision
+            {
+                return failure("reconfigure_conflict");
+            }
+            if let Some(result) = &change.result {
+                let result = result.clone();
+                let Some(new_borrow) = result["borrow_id"].as_str() else {
+                    return failure("recovery_required");
+                };
+                let validation = self.validate_borrow(caller, &identity, &reference_id, new_borrow);
+                if validation["ok"] != true
+                    || validation["mutation_domain"] != result["mutation_domain"]
+                {
+                    return failure("recovery_required");
+                }
+                return result;
+            }
+            match change.state {
+                "pending" => {
+                    return json!({"ok":true,"state":"pending","operation_id":operation_id});
+                }
+                "recovery_required" => return failure("recovery_required"),
+                "observing" => return self.finish_reconfigure(&key),
+                _ => return failure("recovery_required"),
+            }
+        }
+        if operation_id.is_empty()
+            || operation_id.len() > 128
+            || !operation_id.bytes().all(|b| b.is_ascii_graphic())
+            || domain_id != self.domain_id
+            || revision != self.topology_revision
+            || self.pending_mutations != 0
+            || !self.ready
+            || self.borrows.len() != 1
+            || self.topology_revision == u64::MAX
+        {
+            return failure("reconfigure_precondition_failed");
+        }
+        if self.validate_borrow(caller, &identity, &reference_id, &borrow_id)["ok"] != true {
+            return failure("borrow_invalid");
+        }
+        let Some(monitor) = self.monitors.get(&key) else {
+            return failure("not_found");
+        };
+        if monitor.state != "ready"
+            || !monitor
+                .references
+                .as_ref()
+                .is_some_and(|refs| refs.len() == 1 && refs.contains(&reference_id))
+        {
+            return failure("reference_conflict");
+        }
+        let mut desired = monitor.specification.clone();
+        desired.width = width;
+        desired.height = height;
+        desired.refresh_millihz = refresh_millihz;
+        if desired.validate().is_err() {
+            return failure("invalid_request");
+        }
+        let transition = Transition {
+            operation_id: operation_id.clone(),
+            reference_id,
+            borrow_id: borrow_id.clone(),
+            old: monitor.specification.clone(),
+            desired,
+            completed: false,
+        };
+        let work = Work::Reconfigure {
+            key: key.clone(),
+            transition: transition.clone(),
+            scale: monitor.scale,
+            layout: monitor.layout,
+        };
+        if !self.enqueue(work) {
+            return failure("busy");
+        }
+        self.borrows
+            .get_mut(&borrow_id)
+            .expect("verified borrow")
+            .valid = false;
+        self.monitors.get_mut(&key).expect("verified monitor").state = "reconfiguring";
+        self.topology_revision += 1;
+        self.pending_mutations += 1;
+        self.reconfigurations.insert(
+            key,
+            Reconfiguration {
+                transition,
+                state: "pending",
+                result: None,
+                domain_id,
+                revision,
+            },
+        );
+        json!({"ok":true,"state":"pending","operation_id":operation_id})
+    }
+    fn finish_reconfigure(&mut self, key: &(String, String)) -> Value {
+        let Some(change) = self.reconfigurations.get(key) else {
+            return failure("recovery_required");
+        };
+        let old_borrow = change.transition.borrow_id.clone();
+        let reference_id = change.transition.reference_id.clone();
+        let operation_id = change.transition.operation_id.clone();
+        let Some(old_observation) = self
+            .borrows
+            .get(&old_borrow)
+            .map(|borrow| borrow.observation)
+        else {
+            return failure("recovery_required");
+        };
+        let Some(monitor) = self.monitors.get(key) else {
+            return failure("recovery_required");
+        };
+        let Some(output) = monitor.output.clone() else {
+            return failure("recovery_required");
+        };
+        let desired = monitor.specification.clone();
+        if !matches!(
+            crate::linux_control::LinuxControlClient::default().query_connector(&output),
+            Ok(true)
+        ) {
+            return failure("recovery_required");
+        }
+        let Some(observation) = self
+            .observer
+            .as_mut()
+            .and_then(|observer| observer.read(&output))
+        else {
+            return failure("recovery_required");
+        };
+        if observation.compositor_id != old_observation.compositor_id
+            || observation.width != desired.width
+            || observation.height != desired.height
+            || observation.refresh != desired.refresh_millihz
+        {
+            return failure("recovery_required");
+        }
+        if self.topology_revision == u64::MAX {
+            return failure("recovery_required");
+        }
+        let mut random = [0u8; 32];
+        if getrandom::fill(&mut random).is_err() {
+            return failure("recovery_required");
+        }
+        let new_borrow: String = random.iter().map(|b| format!("{b:02x}")).collect();
+        self.borrows.remove(&old_borrow);
+        self.borrows.insert(
+            new_borrow.clone(),
+            Borrow {
+                key: key.clone(),
+                reference_id,
+                observation,
+                valid: true,
+            },
+        );
+        self.topology_revision += 1;
+        self.reconfigurations
+            .get_mut(key)
+            .expect("existing transition")
+            .state = "succeeded";
+        let result = json!({"ok":true,"state":"succeeded","operation_id":operation_id,"borrow_id":new_borrow,"observed_output":Self::observation(&output, observation),"mutation_domain":self.domain()});
+        self.reconfigurations
+            .get_mut(key)
+            .expect("existing transition")
+            .result = Some(result.clone());
+        result
+    }
     fn borrow(
         &mut self,
         caller: &str,
         identity: &str,
         reference_id: &str,
     ) -> (Value, Option<Admission>) {
+        if self
+            .reconfigurations
+            .values()
+            .any(|change| change.state != "succeeded")
+        {
+            return (failure("reconfigure_pending"), None);
+        }
         let key = (caller.to_owned(), identity.to_owned());
         if self.pending_mutations != 0 || !self.ready {
             return (failure("topology_mutating"), None);
@@ -669,6 +979,15 @@ impl Manager {
         reference_id: &str,
         borrow_id: &str,
     ) -> Value {
+        if self
+            .reconfigurations
+            .get(&(caller.to_owned(), identity.to_owned()))
+            .is_some_and(|change| {
+                change.transition.borrow_id == borrow_id && change.state == "pending"
+            })
+        {
+            return failure("reconfigure_pending");
+        }
         if self.borrows.get(borrow_id).is_some_and(|borrow| {
             borrow.key == (caller.to_owned(), identity.to_owned())
                 && borrow.reference_id == reference_id
@@ -688,7 +1007,12 @@ impl Manager {
         }
     }
     fn domain(&self) -> Value {
-        json!({"id":self.domain_id,"revision":self.topology_revision,"borrowers":self.borrows.len(),"pending_mutations":self.pending_mutations,"scope":"provider_session"})
+        let unresolved = self
+            .reconfigurations
+            .values()
+            .any(|change| change.state != "succeeded");
+        let pending = self.pending_mutations.max(usize::from(unresolved));
+        json!({"id":self.domain_id,"revision":self.topology_revision,"borrowers":self.borrows.len(),"pending_mutations":pending,"scope":"provider_session"})
     }
     fn status(
         &self,
@@ -724,7 +1048,7 @@ impl Manager {
                 })
             });
         json!({"reference_owned":reference_id.map(|_|reference_owned),"ok":true,"enabled":self.settings.enabled,"native_supported":true,"driver":"libvirtualdisplay",
-            "ownership_authority":"unix_uid_broker","mutation_domain":self.domain(),"settings":{"virtual_display_layout":self.settings.virtual_display_layout,"dd_virtual_display_scale":Self::scale_value(self.settings.dd_virtual_display_scale),"dd_activate_virtual_display":self.settings.dd_activate_virtual_display,"dd_use_sunshine_virtual_display_driver":self.settings.dd_use_sunshine_virtual_display_driver},"recovery_ready":self.ready,"recovery_error":self.recovery_error,"monitors":monitors,
+            "ownership_authority":"unix_uid_broker","mutation_domain":self.domain(),"settings":{"virtual_display_layout":self.settings.virtual_display_layout,"dd_virtual_display_scale":Self::scale_value(self.settings.dd_virtual_display_scale),"dd_activate_virtual_display":self.settings.dd_activate_virtual_display,"dd_use_sunshine_virtual_display_driver":self.settings.dd_use_sunshine_virtual_display_driver},"recovery_ready":self.ready && self.reconfigurations.values().all(|change| change.state == "succeeded"),"recovery_error":self.recovery_error,"monitors":monitors,
             "activation_requested":self.settings.dd_activate_virtual_display,
             "configured_permanent_monitor_count":self.settings.dd_virtual_display_permanent_count,"permanent_monitor_runtime_supported":false})
     }

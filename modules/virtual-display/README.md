@@ -61,6 +61,18 @@ broker effect. The broker accepts any `Virtual-<id>` public name (a positive
 32-bit id) and resolves it through the driver's `drm_name` mapping. Journal
 records accept the same names. The shared broker rechecks Unix UID
 ownership on every mutation. The private user journal at
+Linux `reconfigure` accepts an operation ID, exact caller-owned identity,
+reference and borrow, new width, height and refresh, and the expected topology
+domain ID and revision. It admits only one owned reference and one provider
+borrow. It journals both modes before changing KScreen, then independently
+observes the new mode before returning a replacement borrow. Poll the same
+operation body with a fresh transport request ID. Once pending has been
+reported, a transport error or provider restart is an unknown outcome requiring
+reconciliation; startup recovery may remove the journaled connector. The caller
+must hold its cooperative mutation reservation and retire capture consumers
+before admission, and persist the replacement borrow before publishing capture.
+External desktop applications are outside that cooperative fence.
+
 `$XDG_STATE_HOME/amaterasu/virtual-display-linux` (default
 `~/.local/state/amaterasu/virtual-display-linux`) is locked against other
 Amaterasu hosts and synced before connect. Startup removes interrupted owned

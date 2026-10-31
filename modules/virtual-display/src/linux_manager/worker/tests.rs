@@ -144,6 +144,174 @@ fn specification(identity: &str) -> Specification {
 const FIRST: &str = "11111111-1111-4111-8111-111111111111";
 const SECOND: &str = "22222222-2222-4222-8222-222222222222";
 #[test]
+fn reconfigure_persists_old_and_new_modes_and_retains_uncertain_intent() {
+    let (root, mut controller) = fixture();
+    let old = specification(FIRST);
+    let record = controller
+        .create_with_references(
+            "owner".into(),
+            old.clone(),
+            ScaleSetting::Retain,
+            Some(std::collections::BTreeSet::from(["ref-1".into()])),
+            VirtualDisplayLayout::Extended,
+        )
+        .unwrap();
+    let mut desired = old.clone();
+    desired.width = 1280;
+    let transition = super::super::Transition {
+        operation_id: "resize-1".into(),
+        reference_id: "ref-1".into(),
+        borrow_id: "a".repeat(64),
+        old: old.clone(),
+        desired: desired.clone(),
+        completed: false,
+    };
+    controller.compositor.fail = true;
+    assert!(
+        controller
+            .reconfigure(
+                &record.key(),
+                transition.clone(),
+                ScaleSetting::Retain,
+                VirtualDisplayLayout::Extended
+            )
+            .is_err()
+    );
+    let document: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("connectors.json")).unwrap()).unwrap();
+    assert_eq!(document["records"][0]["specification"]["width"], 1920);
+    assert_eq!(document["records"][0]["transition"]["old"]["width"], 1920);
+    assert_eq!(
+        document["records"][0]["transition"]["desired"]["width"],
+        1280
+    );
+    assert_eq!(document["records"][0]["transition"]["completed"], false);
+    controller.compositor.fail = false;
+    assert!(
+        controller
+            .reconfigure(
+                &record.key(),
+                transition,
+                ScaleSetting::Retain,
+                VirtualDisplayLayout::Extended
+            )
+            .is_err()
+    );
+    let mut pending = controller.journal.records[0].clone();
+    pending.references = Some(Default::default());
+    controller.journal.update(pending).unwrap();
+    drop(controller);
+    let reopened = Journal::open(&root).unwrap();
+    assert!(reopened.records[0].references.as_ref().unwrap().is_empty());
+    drop(reopened);
+    fs::remove_dir_all(root).unwrap();
+}
+#[test]
+fn reconfigure_records_confirmed_mode_before_success() {
+    let (root, mut controller) = fixture();
+    let old = specification(FIRST);
+    let record = controller
+        .create_with_references(
+            "owner".into(),
+            old.clone(),
+            ScaleSetting::Retain,
+            Some(std::collections::BTreeSet::from(["ref-1".into()])),
+            VirtualDisplayLayout::Extended,
+        )
+        .unwrap();
+    let mut desired = old.clone();
+    desired.width = 1280;
+    let transition = super::super::Transition {
+        operation_id: "resize-1".into(),
+        reference_id: "ref-1".into(),
+        borrow_id: "a".repeat(64),
+        old,
+        desired,
+        completed: false,
+    };
+    let mut result = controller
+        .reconfigure(
+            &record.key(),
+            transition,
+            ScaleSetting::Retain,
+            VirtualDisplayLayout::Extended,
+        )
+        .unwrap();
+    assert_eq!(result.specification.width, 1280);
+    let document: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("connectors.json")).unwrap()).unwrap();
+    assert_eq!(document["records"][0]["specification"]["width"], 1280);
+    assert_eq!(document["records"][0]["transition"]["completed"], true);
+    // Releasing the final reference is persisted before native removal. The
+    // completed receipt remains valid even if the process stops in that gap.
+    result.references = Some(Default::default());
+    controller.journal.update(result.clone()).unwrap();
+    assert!(result.valid());
+    controller.remove(&result.key()).unwrap();
+    assert!(controller.journal.records.is_empty());
+    drop(controller);
+    let reopened = Journal::open(&root).unwrap();
+    assert!(reopened.records.is_empty());
+    drop(reopened);
+    fs::remove_dir_all(root).unwrap();
+}
+#[test]
+fn pending_reconfiguration_keeps_old_borrow_fenced_until_worker_settles() {
+    use super::super::{Borrow, Manager, Reconfiguration, Transition, observer::Observation};
+    let mut manager =
+        Manager::start(serde_json::from_value(serde_json::json!({"enabled":false})).unwrap())
+            .unwrap();
+    let key = ("owner".to_string(), FIRST.to_string());
+    let old = specification(FIRST);
+    let borrow_id = "a".repeat(64);
+    manager.borrows.insert(
+        borrow_id.clone(),
+        Borrow {
+            key: key.clone(),
+            reference_id: "ref-1".into(),
+            valid: false,
+            observation: Observation {
+                global: 1,
+                width: 1920,
+                height: 1080,
+                refresh: 60000,
+                generation: 1,
+                compositor_id: [1; 32],
+            },
+        },
+    );
+    manager.reconfigurations.insert(
+        key.clone(),
+        Reconfiguration {
+            transition: Transition {
+                operation_id: "resize-1".into(),
+                reference_id: "ref-1".into(),
+                borrow_id: borrow_id.clone(),
+                old: old.clone(),
+                desired: old,
+                completed: false,
+            },
+            state: "pending",
+            result: None,
+            domain_id: "domain".into(),
+            revision: 1,
+        },
+    );
+    assert_eq!(
+        manager.release_borrow("owner", FIRST, "ref-1", &borrow_id)["code"],
+        "reconfigure_pending"
+    );
+    assert_eq!(manager.borrows.len(), 1);
+    assert_eq!(manager.domain()["pending_mutations"], 1);
+    manager.reconfigurations.get_mut(&key).unwrap().state = "recovery_required";
+    assert_eq!(manager.domain()["pending_mutations"], 1);
+    assert_eq!(
+        manager.release_borrow("owner", FIRST, "ref-1", &borrow_id)["released"],
+        true
+    );
+    assert!(manager.borrows.is_empty());
+}
+#[test]
 fn clients_get_distinct_free_connectors_and_cleanup_preserves_vibeshines_display() {
     let (root, mut controller) = fixture();
     let first = controller
@@ -464,6 +632,7 @@ fn linux_shared_references_persist_and_release_only_the_last_connector_owner() {
         cleanup_pending: Default::default(),
         observer: None,
         borrows: Default::default(),
+        reconfigurations: Default::default(),
         domain_id: "test-domain".into(),
         topology_revision: 0,
         pending_mutations: 0,
