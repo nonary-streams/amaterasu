@@ -136,6 +136,72 @@ pub enum ExecutionClass {
     HostMutation,
 }
 
+/// An explicit editor hint; consumers never infer keybindings from object shape.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OptionPresentation {
+    Keybinding,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "platform", rename_all = "snake_case", deny_unknown_fields)]
+pub enum KeyIdentity {
+    LinuxEvdev { code: u16 },
+    WindowsScan { code: u16, extended: bool },
+    MoonlightVk { code: u8, normalized: bool },
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingSource {
+    SessionInput,
+    HostLocal,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingPropagation {
+    ConsumeTrigger,
+    Forward,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingTarget {
+    CurrentSession,
+    Host,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Keybinding {
+    pub id: String,
+    pub enabled: bool,
+    pub source: BindingSource,
+    /// Opaque provider-scoped context, never an authority claim.
+    pub context: String,
+    pub trigger: KeyIdentity,
+    pub modifiers: Vec<KeyIdentity>,
+    pub propagation: BindingPropagation,
+    pub action_id: String,
+    pub arguments: amaterasu_configuration_schema::Values,
+    pub target: BindingTarget,
+}
+
+/// Validate shape and action arguments; authorization and chord conflicts are separate.
+pub fn validate_keybinding(binding: &Keybinding, action: &ActionDescriptor) -> Result<(), String> {
+    if !valid_opaque_id(&binding.id)
+        || !valid_opaque_id(&binding.context)
+        || binding.action_id != action.id
+        || binding.modifiers.len() > 8
+        || binding.modifiers.contains(&binding.trigger)
+        || binding
+            .modifiers
+            .iter()
+            .enumerate()
+            .any(|(index, key)| binding.modifiers[..index].contains(key))
+    {
+        return Err("invalid keybinding".into());
+    }
+    amaterasu_configuration_schema::validate_values(&action.arguments, &binding.arguments)
+}
+
 /// A registered method is selected only when its installed approval matches.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -162,6 +228,8 @@ pub struct OptionDescriptor {
     pub label: String,
     pub help: String,
     pub definition: amaterasu_configuration_schema::Definition,
+    #[serde(default)]
+    pub presentation: Option<OptionPresentation>,
     pub allowed_scopes: Vec<SettingScope>,
     pub apply_policy: ApplyPolicy,
     pub required_capabilities: Vec<String>,
@@ -191,6 +259,36 @@ pub struct ExtensionDescriptor {
     pub actions: Vec<ActionDescriptor>,
     pub capabilities: Vec<String>,
     pub settings_validate: MethodRef,
+}
+
+/// Validate an exact candidate before any consumer opens it. Authorization,
+/// provider availability, and actual capture acknowledgement are separate checks.
+pub fn validate_capture_binding(binding: &CaptureBinding) -> Result<(), String> {
+    let resource = &binding.resource;
+    if !valid_identifier(&binding.capture_provider)
+        || !valid_identifier(&binding.selector_schema)
+        || !valid_identifier(&resource.provider)
+        || !valid_opaque_id(&resource.resource_id)
+        || !valid_opaque_id(&resource.incarnation)
+        || !valid_opaque_id(&resource.execution_domain)
+        || resource
+            .mutation_domain
+            .as_ref()
+            .is_some_and(|domain| !valid_opaque_id(domain))
+        || !binding.selector.is_object()
+        || resource.revision == 0
+        || binding.plan_revision == 0
+        || binding.mode.width == 0
+        || binding.mode.height == 0
+        || binding.mode.refresh_millihz == 0
+        || serde_json::to_vec(binding)
+            .map_err(|error| error.to_string())?
+            .len()
+            > 12 * 1024
+    {
+        return Err("invalid capture binding".into());
+    }
+    Ok(())
 }
 
 /// Validate a descriptor's structural bounds before installation or discovery.
@@ -261,6 +359,10 @@ pub fn validate_descriptor(descriptor: &ExtensionDescriptor) -> Result<(), Strin
     Ok(())
 }
 
+fn valid_opaque_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+}
+
 fn valid_identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -321,6 +423,48 @@ mod tests {
     }
 
     #[test]
+    fn keybindings_reject_duplicate_modifiers_and_invalid_arguments() {
+        let method = MethodRef {
+            service: "example.provider/1".into(),
+            method: "execute".into(),
+            interface_major: 1,
+            interface_minor: 0,
+            schema_revision: 1,
+        };
+        let action = ActionDescriptor {
+            id: "example.provider/do".into(),
+            label: "Do".into(),
+            description: String::new(),
+            execution: ExecutionClass::ReadOnly,
+            arguments: Default::default(),
+            allowed_targets: vec![TargetKind::Session],
+            required_capabilities: vec![],
+            plan: None,
+            execute: method,
+            status: None,
+        };
+        let modifier = KeyIdentity::LinuxEvdev { code: 29 };
+        let mut binding = Keybinding {
+            id: "binding".into(),
+            enabled: true,
+            source: BindingSource::SessionInput,
+            context: "active".into(),
+            trigger: KeyIdentity::LinuxEvdev { code: 30 },
+            modifiers: vec![modifier.clone()],
+            propagation: BindingPropagation::Forward,
+            action_id: action.id.clone(),
+            arguments: Default::default(),
+            target: BindingTarget::CurrentSession,
+        };
+        assert!(validate_keybinding(&binding, &action).is_ok());
+        binding.modifiers.push(modifier);
+        assert!(validate_keybinding(&binding, &action).is_err());
+        binding.modifiers.clear();
+        binding.arguments.insert("unexpected".into(), json!(true));
+        assert!(validate_keybinding(&binding, &action).is_err());
+    }
+
+    #[test]
     fn targets_identify_kind_and_reject_unknown_authority() {
         let target: LifecycleTarget = serde_json::from_value(json!({"kind":"validation", "host_epoch":"epoch", "validation_id":"probe", "generation":1})).unwrap();
         assert!(matches!(target, LifecycleTarget::Validation { .. }));
@@ -343,6 +487,10 @@ mod tests {
         let value = json!({"capture_provider":"capture", "selector_schema":"selector/1", "selector":{}, "resource":{"provider":"display", "resource_id":"resource", "incarnation":"instance", "revision":1, "execution_domain":"desktop", "mutation_domain":null}, "mode":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false}, "plan_revision":3});
         let binding: CaptureBinding = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(binding.fallback, CaptureFallback::Forbidden);
+        assert!(validate_capture_binding(&binding).is_ok());
+        let mut invalid_binding = binding.clone();
+        invalid_binding.resource.incarnation.clear();
+        assert!(validate_capture_binding(&invalid_binding).is_err());
         let mut unsupported = value;
         unsupported["fallback"] = json!("approved");
         assert!(serde_json::from_value::<CaptureBinding>(unsupported).is_err());
