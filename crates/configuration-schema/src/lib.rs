@@ -1,3 +1,5 @@
+//! Shared configuration definitions and validation used by configuration providers.
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -259,6 +261,22 @@ pub fn validate_values(fields: &Fields, values: &Values) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn preserves_the_schema_wire_format() {
+        let wire = json!({
+            "enabled": {"type":"boolean","default":true},
+            "count": {"type":"integer","default":2,"minimum":1,"maximum":null},
+            "scale": {"type":"decimal","default":1.25,"minimum":null,"maximum":2.0},
+            "title": {"type":"string","default":"hello","min_length":null,"max_length":10},
+            "quality": {"type":"enum","default":"fast","options":["fast","quality"]},
+            "tags": {"type":"list","default":["one"],"item":{"type":"string","default":"","min_length":null,"max_length":null},"min_items":null,"max_items":4},
+            "display": {"type":"object","default":{"enabled":true},"fields":{"enabled":{"type":"boolean","default":true}}}
+        });
+        let fields: Fields = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&fields).unwrap(), wire);
+        assert!(defaults(&fields).is_ok());
+    }
 
     #[test]
     fn validates_types_bounds_defaults_and_unknown_fields() {

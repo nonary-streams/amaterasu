@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/abi",
+    "crates/configuration-schema",
+    "crates/extension-api",
     "crates/media",
     "crates/windows-capture-geometry",
     "crates/identity",
@@ -73,6 +75,8 @@ rust-version = "1.89"
 version = "0.1.0"
 
 [workspace.dependencies]
+amaterasu-configuration-schema = { path = "crates/configuration-schema" }
+amaterasu-extension-api = { path = "crates/extension-api" }
 amaterasu-abi = { path = "crates/abi" }
 amaterasu-media = { path = "crates/media" }
 amaterasu-windows-capture-geometry = { path = "crates/windows-capture-geometry" }

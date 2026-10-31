@@ -3,10 +3,12 @@ pub mod capture;
 pub mod encode;
 pub mod exports;
 pub mod media;
+pub mod requests;
 mod native;
 pub use native::NativeBinding;
 
 pub use amaterasu_abi as abi;
+pub use amaterasu_extension_api as extension_api;
 pub use amaterasu_contracts::encoder::{
     DynamicRange, EncoderBackend, EncoderIdentity, EncoderSelection, NvencSettings,
     NvencSettingsOverrides, NvencSplitEncode, NvencTwoPass, SOFTWARE_ENCODER_ID,

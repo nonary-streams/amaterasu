@@ -234,7 +234,16 @@ dependencies = [
 name = "amaterasu-configuration"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-configuration-schema",
  "amaterasu-module-sdk",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "amaterasu-configuration-schema"
+version = "0.1.0"
+dependencies = [
  "serde",
  "serde_json",
 ]
@@ -310,6 +319,14 @@ dependencies = [
  "amaterasu-abi",
  "amaterasu-media",
  "amaterasu-module-sdk",
+ "serde_json",
+]
+
+[[package]]
+name = "amaterasu-extension-api"
+version = "0.1.0"
+dependencies = [
+ "serde",
  "serde_json",
 ]
 
@@ -512,7 +529,9 @@ version = "0.1.0"
 dependencies = [
  "amaterasu-abi",
  "amaterasu-contracts",
+ "amaterasu-extension-api",
  "amaterasu-media",
+ "serde",
  "serde_json",
 ]
 

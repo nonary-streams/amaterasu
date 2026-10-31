@@ -2,7 +2,6 @@
 mod migration;
 mod pipeline;
 mod protocol;
-mod schema;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, RuntimeClient};
 use pipeline::Pipeline;
