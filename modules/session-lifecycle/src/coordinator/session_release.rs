@@ -525,11 +525,39 @@ pub(super) fn session_release_input(
     {
         return Err("session_root_provenance_invalid".into());
     }
+    if !journal.validate_composition() {
+        return Err("composition_history_invalid".into());
+    }
+    let has_live_stage = journal.composition.staged_outputs().any(|stage| {
+        stage.after.producer == root.output.producer
+            && stage.after.output_id == root.output.output_id
+            && stage.after.origin == root.output.origin
+    });
+    if !has_live_stage && let Some(anchor) = journal.composition.stage_anchor(&root.output) {
+        let (admission, output) = journal
+            .verified_released_output(&anchor.target)
+            .ok_or("prior_stream_release_readback_missing")?;
+        return validated_anchor_input(root, anchor, admission, output);
+    }
     select_release_input(root, journal.composition.staged_outputs().rev(), |target| {
         journal
             .verified_released_output(target)
             .map(|(_, output)| output.clone())
     })
+}
+
+fn validated_anchor_input(
+    root: &composition::StoredOutput,
+    anchor: &composition::StageAnchor,
+    admission: &str,
+    output: &amaterasu_extension_api::ResourceOutput,
+) -> ModuleResult<amaterasu_extension_api::ResourceOutput> {
+    if admission != anchor.release_admission || output != &anchor.released {
+        return Err("prior_stream_release_anchor_mismatch".into());
+    }
+    amaterasu_extension_api::validate_output_refinement(&root.output, output)
+        .map_err(|_| "session_release_readback_mismatch")?;
+    Ok(output.clone())
 }
 
 fn select_release_input<'a>(
@@ -1984,6 +2012,61 @@ mod tests {
             "session_release_readback_mismatch"
         );
         assert_eq!(session_release_input(&journal, &root).unwrap(), root.output);
+    }
+
+    #[test]
+    fn checkpoint_anchor_requires_authentication_and_exact_release_identity() {
+        let (journal, _, _) = complete_fixture();
+        let root = journal.composition.records().next().unwrap().clone();
+        let mut released = root.output.clone();
+        released.resource.revision += 2;
+        let anchor = composition::StageAnchor {
+            target: LifecycleTarget::Stream {
+                host_epoch: "epoch".into(),
+                session_id: "session".into(),
+                stream_id: "closed".into(),
+                generation: 1,
+            },
+            release_admission: "cleanup".into(),
+            staged: root.output.clone(),
+            released: released.clone(),
+        };
+        assert_eq!(
+            validated_anchor_input(&root, &anchor, "cleanup", &released).unwrap(),
+            released
+        );
+        assert_eq!(
+            validated_anchor_input(&root, &anchor, "other", &released).unwrap_err(),
+            "prior_stream_release_anchor_mismatch"
+        );
+        let mut mismatched = released.clone();
+        mismatched.resource.revision += 1;
+        assert_eq!(
+            validated_anchor_input(&root, &anchor, "cleanup", &mismatched).unwrap_err(),
+            "prior_stream_release_anchor_mismatch"
+        );
+        let mut foreign = anchor.clone();
+        foreign.released.resource.incarnation = "foreign".into();
+        assert_eq!(
+            validated_anchor_input(&root, &foreign, "cleanup", &foreign.released).unwrap_err(),
+            "session_release_readback_mismatch"
+        );
+        // A forged structurally valid anchor with no authenticated checkpoint is
+        // never accepted by the actual journal-backed SessionRelease resolver.
+        let mut encoded = serde_json::to_value(&journal).unwrap();
+        encoded["composition"]["stage_anchors"] = json!([anchor]);
+        let forged: Journal = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(
+            session_release_input(&forged, &root).unwrap_err(),
+            "composition_history_invalid"
+        );
+        let first = encoded["composition"]["stage_anchors"][0].clone();
+        encoded["composition"]["stage_anchors"] = json!([first, first]);
+        let ambiguous: Journal = serde_json::from_value(encoded).unwrap();
+        assert_eq!(
+            session_release_input(&ambiguous, &root).unwrap_err(),
+            "composition_history_invalid"
+        );
     }
 
     #[test]
