@@ -7,6 +7,7 @@ use crate::model::{Event, Key, KeyState};
 use amaterasu_extension_api::{
     BindingPropagation, BindingSource, BindingTarget, KeyIdentity, Keybinding,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const MAX_BINDINGS: usize = 128;
@@ -32,7 +33,8 @@ pub struct Intent {
     pub arguments: Value,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Disposition {
     Forward,
     Consume,
@@ -213,6 +215,14 @@ impl Matcher {
             .map(|(key, disposition)| HeldKey { key, disposition })
             .collect();
         Ok(())
+    }
+
+    /// Return the exact ownership state to persist with a staged receipt.
+    pub fn held_snapshot(&self) -> Vec<(Key, Disposition)> {
+        self.held
+            .iter()
+            .map(|entry| (entry.key.clone(), entry.disposition))
+            .collect()
     }
 
     /// Retire held ownership on lease reset; no synthetic shortcut is fired.

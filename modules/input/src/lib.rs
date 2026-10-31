@@ -8,6 +8,14 @@ mod gamepad;
 mod gamepad_profile;
 mod model;
 pub mod shortcut;
+#[allow(dead_code)]
+mod shortcut_bridge;
+#[allow(dead_code)]
+mod shortcut_journal;
+#[allow(dead_code)]
+mod shortcut_reservation;
+#[allow(dead_code)]
+mod shortcut_store;
 pub use model::{Key as ShortcutKey, KeyState as ShortcutKeyState};
 mod product_settings;
 
