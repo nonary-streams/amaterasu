@@ -15,6 +15,8 @@ pub enum PackageProfile {
     Platform,
     /// Opt-in test package with a third-party registered API provider.
     ExtensionExample,
+    /// Isolated registry/provider integration fixture.
+    RegistryFixture,
     MediaProbe,
     StreamProbe,
     /// Test-only controlled NV12 capture with the real video and encoder modules.
@@ -70,6 +72,17 @@ const EXTENSION_EXAMPLE: ComponentDefinition = ComponentDefinition {
     native_provides: &[],
     native_uses: &[],
     dependencies: &[RUNTIME_ID],
+};
+
+const EXTENSION_REGISTRY_FIXTURE: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.extension-registry",
+    library: "amaterasu_extension_registry",
+    provides: &["amaterasu.extension-registry/1"],
+    calls: &["amaterasu.state/1"],
+    publishes: &[],
+    native_provides: &[],
+    native_uses: &[],
+    dependencies: &[RUNTIME_ID, "amaterasu.state"],
 };
 
 const STATE: ComponentDefinition = ComponentDefinition {
@@ -1390,6 +1403,7 @@ impl PackageProfile {
     pub fn components(self) -> &'static [ComponentDefinition] {
         match self {
             Self::Example => &[RUNTIME, EXAMPLE],
+            Self::RegistryFixture => &[RUNTIME, STATE, EXTENSION_REGISTRY_FIXTURE],
             Self::MediaProbe => &[
                 RUNTIME,
                 CAPTURE_PIPEWIRE,
