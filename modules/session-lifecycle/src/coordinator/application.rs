@@ -24,6 +24,7 @@ pub(super) enum ApplicationRetirementProof {
         no_launch: bool,
         service: String,
         request_operation_id: String,
+        broker_request: u64,
         request_payload: Value,
         response: Value,
     },
@@ -55,6 +56,7 @@ pub(super) fn valid_retirement_proof(session: &SessionRecord, target: &Lifecycle
             no_launch,
             service,
             request_operation_id,
+            broker_request: _,
             request_payload,
             response,
         }) => {
@@ -300,17 +302,19 @@ impl Coordinator {
             return Err("session_target_required".into());
         }
         let session = next.sessions.get_mut(session_id).ok_or("unknown_session")?;
-        let valid = result.as_ref().is_some_and(|r| {
-            r["ok"] == true
-                && r["retired"] == true
-                && r["owner"] == job.binding.owner
-                && if job.no_launch {
-                    r["launch_id"].is_null() && r["never_admitted"] == true
-                } else {
-                    r["launch_id"] == job.binding.launch_id
-                }
-                && r["operation_id"] == job.binding.operation_id
-        }) && session.host_epoch == next.host_epoch
+        let valid = job.request.is_some()
+            && result.as_ref().is_some_and(|r| {
+                r["ok"] == true
+                    && r["retired"] == true
+                    && r["owner"] == job.binding.owner
+                    && if job.no_launch {
+                        r["launch_id"].is_null() && r["never_admitted"] == true
+                    } else {
+                        r["launch_id"] == job.binding.launch_id
+                    }
+                    && r["operation_id"] == job.binding.operation_id
+            })
+            && session.host_epoch == next.host_epoch
             && session.generation == generation
             && session.phase == SessionPhase::Ending
             && if job.no_launch {
@@ -329,6 +333,7 @@ impl Coordinator {
                 no_launch: job.no_launch,
                 service: "amaterasu.launch/1".into(),
                 request_operation_id: format!("retirement-{}", job.query_id),
+                broker_request: job.request.expect("validated broker request"),
                 request_payload: retirement_payload(&job.binding, job.no_launch),
                 response: result.clone().expect("validated response"),
             });
