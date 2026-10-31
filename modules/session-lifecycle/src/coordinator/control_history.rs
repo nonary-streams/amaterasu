@@ -34,7 +34,19 @@ pub(super) fn authenticated_input(
     if historical.next().is_some() {
         return None;
     }
+    let closed_release = journal.composed_releases.verified_work_for(
+        journal,
+        &request.target,
+        &request.transition_id,
+    );
+    if let (Some(live), Some(closed)) = (live, closed_release)
+        && serde_json::to_value(live).ok() != serde_json::to_value(closed).ok()
+    {
+        return None;
+    }
     let work = if let Some(work) = live {
+        Some(work)
+    } else if let Some(work) = closed_release {
         Some(work)
     } else if let Some(record) = historical_record {
         let permit = journal
