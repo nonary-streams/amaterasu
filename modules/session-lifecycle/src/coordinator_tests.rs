@@ -438,6 +438,7 @@ fn frozen_action_lineage_survives_restart_and_rejects_tampering() {
         capabilities: Default::default(),
         cleanup_methods: vec![],
         authorized_borrowers: Default::default(),
+        approved_control_bindings: Default::default(),
     };
     coordinator.settings.participants.push(participant);
     coordinator
