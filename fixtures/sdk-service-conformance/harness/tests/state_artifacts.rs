@@ -1,7 +1,8 @@
+mod support;
 use amaterasu_abi::{
     BorrowedBytes, HostApi, ModuleApi, ModuleEntry, RuntimeApi, RuntimeEntry, STATUS_OK,
 };
-use amaterasu_contracts::{Command, Grants, Response, RuntimeConfig};
+use amaterasu_contracts::{Command, Response, RuntimeConfig};
 use amaterasu_module_sdk::{RuntimeClient, state::STATE_SERVICE};
 use libloading::Library;
 use serde_json::{Value, json};
@@ -110,13 +111,6 @@ fn artifact(name: &str) -> PathBuf {
 fn digest(path: &Path) -> Vec<u8> {
     Sha256::digest(std::fs::read(path).unwrap()).to_vec()
 }
-fn grants(call: &[&str], provide: &[&str]) -> Grants {
-    Grants {
-        call: call.iter().map(|s| (*s).into()).collect(),
-        provide: provide.iter().map(|s| (*s).into()).collect(),
-        ..Default::default()
-    }
-}
 fn request(client: &RuntimeClient, service: &str, operation: &str, payload: Value) -> u64 {
     match client
         .send(Command::Request {
@@ -171,30 +165,28 @@ fn run(provider_path: &Path, consumer_path: &Path, runtime_path: &Path, allow_de
         NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir(&dir).unwrap();
-    let mut config = RuntimeConfig::default();
+    // Package verification resolves trusted metadata, grants, and the selection
+    // before the host injects its process-local State root.
+    let package =
+        support::Package::new(runtime_path, provider_path, consumer_path, allow_delegation);
+    let verified = package.verify().unwrap();
+    assert!(verified.service_diagnostics.is_empty());
+    let mut config = verified.runtime_config;
     config.host_context.schema = 1;
     config.host_context.state_root = Some(dir.to_str().unwrap().into());
-    config
-        .principals
-        .insert("amaterasu.state".into(), grants(&[], &[STATE_SERVICE]));
-    config.principals.insert(
-        "fixture.consumer".into(),
-        grants(&[STATE_SERVICE], &[CONSUMER_SERVICE]),
+    let packaged_consumer = package.artifact_path(support::CONSUMER);
+    assert_eq!(digest(consumer_path), digest(&packaged_consumer));
+    let runtime = Runtime::new(&package.artifact_path("amaterasu.runtime"), &config);
+    // This endpoint has a provide grant but is not the selected provider.
+    let alternate = runtime.client("fixture.other");
+    assert!(
+        matches!(alternate.send(Command::Register { service: STATE_SERVICE.into() }).unwrap(), Response::Error { code, .. } if code == "permission_denied")
     );
-    let driver_calls = if allow_delegation {
-        vec![CONSUMER_SERVICE, STATE_SERVICE]
-    } else {
-        vec![CONSUMER_SERVICE]
-    };
-    config
-        .principals
-        .insert("fixture.driver".into(), grants(&driver_calls, &[]));
-    config
-        .principals
-        .insert("fixture.other".into(), grants(&[STATE_SERVICE], &[]));
-    let runtime = Runtime::new(runtime_path, &config);
-    let provider = Module::start(provider_path, runtime.endpoint("amaterasu.state"));
-    let consumer = Module::start(consumer_path, runtime.endpoint("fixture.consumer"));
+    let provider = Module::start(
+        &package.artifact_path(support::PROVIDER),
+        runtime.endpoint("amaterasu.state"),
+    );
+    let consumer = Module::start(&packaged_consumer, runtime.endpoint("fixture.consumer"));
     let driver = runtime.client("fixture.driver");
     let other = runtime.client("fixture.other");
     let set = json!({"action":"set","key":"one","value":null,"expected_revision":0});
@@ -347,5 +339,87 @@ fn same_consumer_artifact_uses_real_state_and_independent_replacement() {
     println!(
         "unchanged consumer SHA-256: {:x}",
         Sha256::digest(std::fs::read(consumer).unwrap())
+    );
+}
+
+#[test]
+#[ignore = "requires independently built runtime, State and consumer artifacts"]
+fn signed_package_selection_rejects_incompatible_contracts_and_invalid_policy() {
+    use amaterasu_contracts::SelectedService;
+    let runtime_path = artifact("AMATERASU_CONFORMANCE_RUNTIME");
+    let provider = artifact("AMATERASU_CONFORMANCE_STATE");
+    let consumer = artifact("AMATERASU_CONFORMANCE_CONSUMER");
+    let mut package = support::Package::new(&runtime_path, &provider, &consumer, true);
+    assert!(package.verify().is_ok());
+    let manifest = package.manifest.clone();
+    let bootstrap = package.bootstrap.clone();
+    let reject = |package: &support::Package, expected: &str| {
+        let error = match package.verify() {
+            Ok(_) => panic!("package unexpectedly accepted"),
+            Err(error) => error,
+        };
+        assert!(error.contains(expected), "expected {expected}, got {error}");
+    };
+
+    package.manifest.components[2].service_requires[0]
+        .capabilities
+        .insert("missing".into());
+    reject(&package, "incompatible service");
+    package.manifest = manifest.clone();
+    package.manifest.components[2].service_requires[0].contract = "example.other/1".into();
+    reject(&package, "incompatible service");
+    package.manifest = manifest.clone();
+    package.manifest.components[2].service_requires[0].major = 2;
+    reject(&package, "incompatible service");
+    package.manifest = manifest.clone();
+    package.manifest.components[2].service_requires[0].minor = 1;
+    reject(&package, "incompatible service");
+    package.manifest = manifest.clone();
+    package
+        .bootstrap
+        .policy
+        .principals
+        .get_mut(support::CONSUMER)
+        .unwrap()
+        .call
+        .clear();
+    reject(&package, "lacks grant");
+    package.bootstrap = bootstrap.clone();
+    package
+        .bootstrap
+        .policy
+        .principals
+        .get_mut(support::PROVIDER)
+        .unwrap()
+        .provide
+        .clear();
+    reject(&package, "ungranted selected provider");
+    package.bootstrap = bootstrap.clone();
+    package.manifest.components[2].service_requires[0].optional = true;
+    package.bootstrap.policy.service_selections.broker.insert(
+        support::STATE.into(),
+        Some(SelectedService {
+            provider: "fixture.missing".into(),
+            contract: support::CONTRACT.into(),
+        }),
+    );
+    reject(&package, "selected provider");
+    package.bootstrap = bootstrap;
+    package.bootstrap.policy.service_selections.broker.clear();
+    let verified = package.verify().unwrap();
+    assert_eq!(verified.service_diagnostics.len(), 1);
+    assert_eq!(verified.service_diagnostics[0].consumer, support::CONSUMER);
+    assert_eq!(
+        verified
+            .runtime_config
+            .service_selections
+            .broker
+            .get(support::STATE),
+        Some(&None)
+    );
+    let runtime = Runtime::new(&runtime_path, &verified.runtime_config);
+    let provider_client = runtime.client(support::PROVIDER);
+    assert!(
+        matches!(provider_client.send(Command::Register { service: support::STATE.into() }).unwrap(), Response::Error { code, .. } if code == "permission_denied")
     );
 }

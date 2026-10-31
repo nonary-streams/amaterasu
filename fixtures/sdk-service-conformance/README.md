@@ -4,8 +4,9 @@ This test loads one unchanged consumer module and runs the same key/value behavi
 against the production State module and a separately built in-memory replacement.
 Both use the real runtime ABI. The replacement deliberately implements only the
 exercised key/value subset, is memory-only and bounded, and is not a production
-State implementation. The test does not validate provider startup selection,
-capability policy, persistent replacement storage, or all State operations.
+State implementation. The test verifies signed package metadata and loads its verified artifacts with
+resolved startup selections. It does not validate persistent replacement storage
+or all State operations.
 
 On Linux, from the repository root (use platform library names elsewhere):
 
@@ -24,3 +25,10 @@ composition, verifies caller-scoped state, revision conflicts and denied delegat
 calls, broker capacity recovery, cancellation before provider execution, and consumer shutdown with queued work. Cancellation is not a
 rollback guarantee for work that has already executed. Artifacts are trusted test
 modules; runtime grants are not a native-code sandbox.
+
+The startup tests use the real signed-package verifier to reject missing
+capabilities, mismatched raw contract or version, denied consumer and provider
+grants, and explicit invalid selections. Optional absence emits a diagnostic and
+disables registration. Raw contract identity and capabilities are signed claims,
+not runtime proof of implementation; this test does not claim native ABI
+negotiation or complete behavioral conformance.
