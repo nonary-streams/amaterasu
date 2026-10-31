@@ -76,6 +76,266 @@ Assert-True ($manifest -match '(?m)^Version:\s*\d+\.\d+\.\d+\s*$') 'packaging ve
 
 $extension = Import-Module -Name $ModulePath -PassThru -Force
 try {
+    $coverPath = Join-Path ([System.IO.Path]::GetTempPath()) ([Guid]::NewGuid().ToString('N') + '.png')
+    try {
+        $coverBytes = [byte[]](0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,1,2,3,4)
+        [System.IO.File]::WriteAllBytes($coverPath, $coverBytes)
+        $image = & $extension { param($p) $budget = 100L; Read-ArtworkFile $p 2000 ([ref]$budget) } $coverPath
+        Assert-True ($null -ne $image) 'valid cover was not read'
+        Assert-Equal $image.MimeType 'image/png' 'cover MIME'
+        Assert-Equal $image.Revision.Length 64 'cover revision length'
+        $noBudget = & $extension { param($p) $budget = 11L; Read-ArtworkFile $p 2000 ([ref]$budget) } $coverPath
+        Assert-True ($null -eq $noBudget) 'cover exceeded scan budget'
+        $artPayload = @{ Lines=@('{"type":"games","payload":[{"id":"60000000-0000-0000-0000-000000000001"}]}'); Games=1; CapturedAt=[DateTime]::UtcNow; Generation=0L; Artwork=@{ '60000000-0000-0000-0000-000000000001'=@{ State='path'; Path=$coverPath } } }
+        $artCache = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+        $artSignals = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+        & $extension { param($payload,$cache,$signals) Scan-ArtworkPayload $payload $cache $signals } $artPayload $artCache $artSignals
+        $enriched = & $extension { param($payload,$cache) Add-ArtworkToSnapshot $payload $cache } $artPayload $artCache
+        $record = $enriched.Lines[0] | ConvertFrom-Json
+        Assert-Equal $record.payload[0].artworkState 'revision' 'cover state'
+        Assert-Equal $record.payload[0].artworkRevision $image.Revision 'cover snapshot revision'
+        Assert-True (-not $enriched.Lines[0].Contains($coverPath)) 'cover path leaked into snapshot'
+        $rotationPayload = @{ Lines=@('{"type":"games","payload":[{"id":"a"},{"id":"b"}]}'); Games=2; CapturedAt=[DateTime]::UtcNow; Generation=0L; Artwork=@{ a=@{ State='path'; Path=$coverPath }; b=@{ State='path'; Path=$coverPath } } }
+        $rotationCache = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+        & $extension { param($payload,$cache,$signals) Scan-ArtworkPayload $payload $cache $signals 12 2000 } $rotationPayload $rotationCache $artSignals
+        $firstRotation = & $extension { param($payload,$cache) Add-ArtworkToSnapshot $payload $cache } $rotationPayload $rotationCache
+        & $extension { param($payload,$cache,$signals) Scan-ArtworkPayload $payload $cache $signals 12 2000 } $rotationPayload $rotationCache $artSignals
+        $secondRotation = & $extension { param($payload,$cache) Add-ArtworkToSnapshot $payload $cache } $rotationPayload $rotationCache
+        $firstGames = ($firstRotation.Lines[0] | ConvertFrom-Json).payload
+        $secondGames = ($secondRotation.Lines[0] | ConvertFrom-Json).payload
+        Assert-Equal $firstGames[0].artworkState 'revision' 'first scan did not visit first game'
+        Assert-Equal $firstGames[1].artworkState 'unknown' 'unscanned game was not unknown'
+        Assert-Equal $secondGames[0].artworkState 'revision' 'rotation discarded a cached image'
+        Assert-Equal $secondGames[1].artworkState 'revision' 'rotation starved later game'
+        $artCache['payload'] = $artPayload
+        $artConnection = New-MockConnection ('a' * 32) $artCache
+        $artConnection.Role = 'sunshine'
+        $artConnection.Stream = [System.IO.MemoryStream]::new()
+        $request = [pscustomobject]@{ type='command'; command='artwork_read'; requestId=('b' * 32); transferId=('d' * 32); id='60000000-0000-0000-0000-000000000001'; revision=$image.Revision; offset=0 }
+        # Hold the dedicated scanner where an opener could stall. The control
+        # handler must still serve already cached bytes without waiting for it.
+        $gate = [System.Threading.ManualResetEventSlim]::new($false)
+        $artStop = [System.Threading.CancellationTokenSource]::new()
+        $scanQueue = [System.Collections.Concurrent.BlockingCollection[object]]::new(1)
+        $artCache['artworkQueue'] = $scanQueue
+        $artCache['artworkInstance'] = 'test-instance'
+        $scanSpace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+        $scanSpace.Open()
+        $scanWorker = [PowerShell]::Create(); $scanWorker.Runspace = $scanSpace
+        [void]$scanWorker.AddScript('param($path,$cache,$signals,$stop,$gate) Import-Module -Name $path -Force; Start-ArtworkWorker $cache $signals $stop "test-instance" $gate').AddArgument($ModulePath).AddArgument($artCache).AddArgument($artSignals).AddArgument($artStop).AddArgument($gate)
+        $scanHandle = $scanWorker.BeginInvoke()
+        try {
+            Assert-True ($scanQueue.TryAdd($artPayload)) 'scanner queue rejected work'
+            $scanDeadline = [DateTime]::UtcNow.AddSeconds(3)
+            while ($scanQueue.Count -gt 0 -and [DateTime]::UtcNow -lt $scanDeadline) { Start-Sleep -Milliseconds 10 }
+            Assert-Equal $scanQueue.Count 0 'scanner did not take stalled job'
+            $watch = [System.Diagnostics.Stopwatch]::StartNew()
+            & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $artConnection $request
+            $watch.Stop()
+            Assert-True ($watch.ElapsedMilliseconds -lt 1000) 'stalled artwork opener blocked control'
+        } finally {
+            $artStop.Cancel(); $gate.Set()
+            [void]$scanHandle.AsyncWaitHandle.WaitOne(3000)
+            if ($scanHandle.IsCompleted) { $scanWorker.Dispose(); $scanSpace.Dispose() }
+            $gate.Dispose(); $artStop.Dispose(); $scanQueue.Dispose()
+        }
+        $reply = ($artConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-True ([bool]$reply.success) 'pinned artwork read failed'
+        Assert-Equal $reply.data ([Convert]::ToBase64String($coverBytes)) 'artwork chunk bytes'
+        $artConnection.ArtworkPins.Clear()
+        $largeBytes = [byte[]]::new(16777216)
+        $largeBytes[16777215] = 42
+        $artCache['artworkResult'] = @{ Generation=0L; Instance='test-instance'; Images=@{ '60000000-0000-0000-0000-000000000001'=@{ Revision=$image.Revision; MimeType='image/png'; Data=$largeBytes } }; Ready='large' }
+        $request.offset = 0
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $artConnection $request
+        $largeFirst = ($artConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-True ([bool]$largeFirst.success) 'large cached artwork pin failed'
+        $request.offset = 16769024
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $artConnection $request
+        $largeReply = ($artConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-True ([bool]$largeReply.success) 'large cached artwork final chunk failed'
+        Assert-Equal $largeReply.total_bytes 16777216 'large artwork size changed'
+        $largeChunk = [Convert]::FromBase64String($largeReply.data)
+        Assert-Equal $largeChunk.Length 8192 'large artwork chunk was not bounded'
+        Assert-Equal $largeChunk[8191] 42 'large artwork chunk did not use cached bytes'
+        $request.offset = 0
+        Assert-Equal $reply.total_bytes $coverBytes.Length 'artwork total size'
+        $request.revision = '0' * 64
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $artConnection $request
+        $failedReply = ($artConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-True (-not [bool]$failedReply.success) 'changed revision was accepted'
+        $artConnection.ArtworkPins.Clear()
+        $largeBytes = [byte[]]::new(8193)
+        [Array]::Copy($coverBytes, $largeBytes, $coverBytes.Length)
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $largeRevision = [BitConverter]::ToString($sha.ComputeHash($largeBytes)).Replace('-', '').ToLowerInvariant() }
+        finally { $sha.Dispose() }
+        $largeImage = @{ Data=$largeBytes; Revision=$largeRevision; MimeType='image/png' }
+        $artCache['artworkResult'] = @{ Generation=0L; Instance=''; Images=@{ '60000000-0000-0000-0000-000000000001'=$largeImage }; Order=@('60000000-0000-0000-0000-000000000001'); Ready='large' }
+        $request.revision = $largeRevision; $request.offset = 0
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $artConnection $request
+        $firstChunk = ($artConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-True ([bool]$firstChunk.success) 'first chunk did not pin artwork'
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $artConnection $request
+        $secondReader = ($artConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-True ([bool]$secondReader.success) 'second reader could not share the pin'
+        $otherTransfer = [pscustomobject]@{ type='command'; command='artwork_read'; requestId=('e' * 32); transferId=('f' * 32); id=$request.id; revision=$largeRevision; offset=0 }
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $artConnection $otherTransfer
+        $otherReply = ($artConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-True ([bool]$otherReply.success) 'independent transfer could not pin same image'
+        Assert-Equal $artConnection.ArtworkPins.Count 2 'distinct transfers did not receive distinct pins'
+        $release = [pscustomobject]@{ type='command'; command='artwork_release'; requestId=('e' * 32); transferId=$otherTransfer.transferId }
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $artConnection $release
+        $releaseReply = ($artConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-True ([bool]$releaseReply.success) 'explicit release failed'
+        Assert-Equal $artConnection.ArtworkPins.Count 1 'explicit release removed another transfer'
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $artConnection $release
+        $repeatRelease = ($artConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-True ([bool]$repeatRelease.success) 'repeated release was not idempotent'
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $artConnection $otherTransfer
+        $releasedReplay = ($artConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-True (-not [bool]$releasedReplay.success) 'released transfer recreated its pin'
+        $beforeRead = [pscustomobject]@{ type='command'; command='artwork_release'; requestId=('e' * 32); transferId=('a' * 32) }
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $artConnection $beforeRead
+        $beforeReply = ($artConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-True ([bool]$beforeReply.success) 'release before read was not accepted'
+        $lateRead = [pscustomobject]@{ type='command'; command='artwork_read'; requestId=('e' * 32); transferId=$beforeRead.transferId; id=$request.id; revision=$largeRevision; offset=0 }
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $artConnection $lateRead
+        $lateReply = ($artConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-True (-not [bool]$lateReply.success) 'late read recreated a released transfer'
+        $conflicting = [pscustomobject]@{ type='command'; command='artwork_read'; requestId=('e' * 32); transferId=$request.transferId; id=$request.id; revision=('0' * 64); offset=0 }
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $artConnection $conflicting
+        $conflictReply = ($artConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-True (-not [bool]$conflictReply.success) 'transfer token accepted a different revision'
+        Assert-Equal $conflictReply.transferId $request.transferId 'failed response lost transfer correlation'
+        for ($attempt = 0; $attempt -lt 20; $attempt++) {
+            & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $artConnection $request
+            $retry = ($artConnection.Queue.Take())[0] | ConvertFrom-Json
+            Assert-True ([bool]$retry.success) 'repeated first chunk exhausted the pin'
+        }
+        $evictPayload = @{ Generation=0L; Artwork=@{ other=@{ State='path'; Path=$coverPath } } }
+        & $extension { param($payload,$cache,$signals) Scan-ArtworkPayload $payload $cache $signals 12 2000 '' 12 1 } $evictPayload $artCache $artSignals
+        Assert-True (-not $artCache['artworkResult'].Images.ContainsKey($request.id)) 'scan did not evict original image'
+        $request.offset = 8192
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $artConnection $request
+        $lastChunk = ($artConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-True ([bool]$lastChunk.success) 'eviction interrupted pinned artwork'
+        Assert-Equal $lastChunk.data ([Convert]::ToBase64String($largeBytes, 8192, 1)) 'pinned final chunk differs'
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $artConnection $request
+        $secondLastChunk = ($artConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-True ([bool]$secondLastChunk.success) 'first reader released another reader pin'
+        Assert-Equal $artConnection.ArtworkPins.Count 1 'completed artwork pin did not survive retries'
+        $pin = @($artConnection.ArtworkPins.Values)[0]
+        & $extension { param($connection,$now) Remove-ExpiredArtworkPins $connection $now } $artConnection $pin.Expires.AddTicks(-1)
+        Assert-Equal $artConnection.ArtworkPins.Count 1 'pin expired before its idle deadline'
+        & $extension { param($connection,$now) Remove-ExpiredArtworkPins $connection $now } $artConnection $pin.Expires.AddSeconds(1)
+        Assert-Equal $artConnection.ArtworkPins.Count 0 'idle pin was not expired by periodic pruning'
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $artConnection $request
+        $expiredReply = ($artConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-True (-not [bool]$expiredReply.success) 'expired evicted pin remained readable'
+        # No automatic snapshot or scan is needed to recover an evicted image.
+        $demandCache = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
+        $demandCache['payload'] = $artPayload
+        $demandCache['artworkInstance'] = 'demand-instance'
+        $demandQueue = [System.Collections.Concurrent.BlockingCollection[object]]::new(1)
+        $demandCache['artworkPriorityQueue'] = $demandQueue
+        $demandConnection = New-MockConnection ('a' * 32) $demandCache
+        $demandConnection.Role = 'sunshine'; $demandConnection.Stream = [System.IO.MemoryStream]::new()
+        $demandRequest = [pscustomobject]@{ type='command'; command='artwork_read'; requestId=('1' * 32); transferId=('2' * 32); id='60000000-0000-0000-0000-000000000001'; revision=$image.Revision; offset=0 }
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $demandConnection $demandRequest
+        $demandPending = ($demandConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-Equal $demandPending.error 'artwork_pending' 'cache miss did not schedule artwork scan'
+        $scanJob = $null
+        Assert-True ($demandQueue.TryTake([ref]$scanJob)) 'priority scan job missing'
+        & $extension { param($job,$cache,$signals) Invoke-ArtworkScanJob $job $cache $signals 'demand-instance' } $scanJob $demandCache $demandConnection.Signals
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $demandConnection $demandRequest
+        $demandReply = ($demandConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-True ([bool]$demandReply.success) 'prioritized rescan did not restore evicted artwork'
+        $demandConnection.ArtworkPins.Clear()
+        # A persisted unknown revision cannot trust a matching cache entry.
+        # Change the file after caching and force a fresh hash for this token.
+        $demandRequest | Add-Member -NotePropertyName refresh -NotePropertyValue $true
+        $demandRequest.transferId = '6' * 32
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $demandConnection $demandRequest
+        Assert-Equal (($demandConnection.Queue.Take())[0] | ConvertFrom-Json).error 'artwork_pending' 'refresh did not verify cached bytes'
+        $verifiedJob = $null
+        Assert-True ($demandQueue.TryTake([ref]$verifiedJob)) 'verification job missing'
+        & $extension { param($job,$cache,$signals) Invoke-ArtworkScanJob $job $cache $signals 'demand-instance' } $verifiedJob $demandCache $demandConnection.Signals
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $demandConnection $demandRequest
+        $verifiedReply = ($demandConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-True ([bool]$verifiedReply.success) 'fresh matching hash was rejected'
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $demandConnection $demandRequest
+        $pinnedReply = ($demandConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-True ([bool]$pinnedReply.success) 'pinned retry incorrectly restarted verification'
+        Assert-Equal $demandQueue.Count 0 'pinned retry enqueued another scan'
+        $demandConnection.ArtworkPins.Clear()
+        $demandRequest.transferId = '5' * 32
+        $changedBytes = [byte[]]$coverBytes.Clone(); $changedBytes[11] = 99
+        [System.IO.File]::WriteAllBytes($coverPath, $changedBytes)
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $demandConnection $demandRequest
+        $refreshPending = ($demandConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-Equal $refreshPending.error 'artwork_pending' 'refresh served stale cached bytes'
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $demandConnection $demandRequest
+        $refreshRetry = ($demandConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-Equal $refreshRetry.error 'artwork_pending' 'refresh retry bypassed the pending scan'
+        $refreshJob = $null
+        Assert-True ($demandQueue.TryTake([ref]$refreshJob)) 'refresh scan job missing'
+        & $extension { param($job,$cache,$signals) Invoke-ArtworkScanJob $job $cache $signals 'demand-instance' } $refreshJob $demandCache $demandConnection.Signals
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $demandConnection $demandRequest
+        $changedReply = ($demandConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-Equal $changedReply.error 'artwork_unavailable' 'changed artwork passed forced revision verification'
+        [System.IO.File]::WriteAllBytes($coverPath, $coverBytes)
+        $demandConnection.ArtworkDemands.Clear()
+        $demandCache['artworkResult'] = @{ Generation=0L; Instance='demand-instance'; Images=@{ '60000000-0000-0000-0000-000000000001'=$image }; Order=@('60000000-0000-0000-0000-000000000001'); Ready='stale' }
+        $missingPath = Join-Path ([System.IO.Path]::GetTempPath()) ([Guid]::NewGuid().ToString('N'))
+        $failedPayload = @{ Generation=0L; Artwork=@{ '60000000-0000-0000-0000-000000000001'=@{ State='path'; Path=$missingPath } } }
+        $demandCache['payload'] = $failedPayload
+        $demandRequest.transferId = '3' * 32
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $demandConnection $demandRequest
+        Assert-Equal (($demandConnection.Queue.Take())[0] | ConvertFrom-Json).error 'artwork_pending' 'missing cover was not queued'
+        $scanJob = $null
+        Assert-True ($demandQueue.TryTake([ref]$scanJob)) 'failed scan job missing'
+        & $extension { param($job,$cache,$signals) Invoke-ArtworkScanJob $job $cache $signals 'demand-instance' } $scanJob $demandCache $demandConnection.Signals
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $demandConnection $demandRequest
+        Assert-Equal (($demandConnection.Queue.Take())[0] | ConvertFrom-Json).error 'artwork_unavailable' 'failed scan did not terminate retry'
+        $demandCache['payload'] = $artPayload
+        $demandRequest.refresh = $false
+        $demandCache['artworkResult'] = @{ Generation=0L; Instance='demand-instance'; Images=@{}; Order=@(); Ready='none' }
+        $demandRequest.transferId = '4' * 32
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $demandConnection $demandRequest
+        Assert-Equal (($demandConnection.Queue.Take())[0] | ConvertFrom-Json).error 'artwork_pending' 'release race scan was not queued'
+        $scanJob = $null
+        Assert-True ($demandQueue.TryTake([ref]$scanJob)) 'release race job missing'
+        $demandRelease = [pscustomobject]@{ type='command'; command='artwork_release'; requestId=('1' * 32); transferId=$demandRequest.transferId }
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $demandConnection $demandRelease
+        $releasedDemand = ($demandConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-True ([bool]$releasedDemand.success) 'release during scan failed'
+        & $extension { param($job,$cache,$signals) Invoke-ArtworkScanJob $job $cache $signals 'demand-instance' } $scanJob $demandCache $demandConnection.Signals
+        & $extension { param($connection,$message) Invoke-ExtensionCommand $connection $message } $demandConnection $demandRequest
+        $lateDemand = ($demandConnection.Queue.Take())[0] | ConvertFrom-Json
+        Assert-True (-not [bool]$lateDemand.success) 'completed scan revived released transfer'
+        $demandQueue.Dispose(); $demandConnection.Queue.Dispose(); $demandConnection.Stream.Dispose()
+        $overflow = New-MockConnection ('a' * 32) $artCache
+        $overflow.Role = 'sunshine'; $overflow.Stream = [System.IO.MemoryStream]::new()
+        $overflow.ArtworkTombstones = @{}
+        $fakeNow = [DateTime]'2040-01-01T00:00:00Z'
+        for ($i = 0; $i -lt 4096; $i++) { $overflow.ArtworkTombstones[('{0:x32}' -f $i)] = $fakeNow.AddSeconds(60) }
+        $overflowRelease = [pscustomobject]@{ transferId=('f' * 32) }
+        & $extension { param($connection,$message,$now) Release-ArtworkTransfer $connection $message ('e' * 32) $now } $overflow $overflowRelease $fakeNow
+        $overflowReply = ($overflow.Queue.Take())[0] | ConvertFrom-Json
+        Assert-True (-not [bool]$overflowReply.success) 'full tombstone table acknowledged an unfenced release'
+        Assert-True ($null -ne $overflow.ArtworkReleaseOverflowUntil) 'full table did not fail closed'
+        & $extension { param($connection,$now) Remove-ExpiredArtworkPins $connection $now } $overflow $fakeNow.AddSeconds(60)
+        Assert-Equal $overflow.ArtworkTombstones.Count 0 'expired tombstones were retained'
+        Assert-True (-not $overflow.ArtworkReleaseOverflowUntil) 'overflow fence did not expire'
+        $overflow.Queue.Dispose(); $overflow.Stream.Dispose()
+        $artConnection.Queue.Dispose()
+        $artConnection.Stream.Dispose()
+        [System.IO.File]::WriteAllBytes($coverPath, [byte[]](1,2,3,4,5,6,7,8,9,10,11,12))
+        $invalid = & $extension { param($p) $budget = 100L; Read-ArtworkFile $p 2000 ([ref]$budget) } $coverPath
+        Assert-True ($null -eq $invalid) 'invalid image signature accepted'
+    } finally { Remove-Item -LiteralPath $coverPath -ErrorAction SilentlyContinue }
+
     $eventSignals = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
     $timer = [System.Timers.Timer]::new(20)
     $timer.AutoReset = $false

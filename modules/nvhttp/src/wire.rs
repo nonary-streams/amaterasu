@@ -1,5 +1,6 @@
 //! Moonlight Gen7 HTTP/XML adapter. This layer never performs TLS or PIN approval.
 mod applications;
+mod artwork;
 mod capabilities;
 mod cleanup;
 mod pairing;
@@ -15,7 +16,7 @@ use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
 use query::Query;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
@@ -95,6 +96,7 @@ pub struct Router {
     launches: LaunchController,
     transcripts: BTreeMap<String, pairing::Transcript>,
     jobs: BTreeMap<u64, Job>,
+    artwork_reservations: BTreeSet<u64>,
     cancellations: BTreeMap<u64, Instant>,
     next_job: u64,
     next_call: u64,
@@ -106,6 +108,7 @@ struct Job {
     call: Call,
     deadline: Instant,
     applications: Option<applications::Applications>,
+    artwork: Option<artwork::Artwork>,
 }
 
 enum Call {
@@ -137,6 +140,15 @@ enum Purpose {
     /// Removes the certificate presented on this paired TLS connection.
     Unpair,
     Cleanup,
+    Artwork {
+        id: String,
+        transfer_id: String,
+        certificate: Vec<u8>,
+    },
+    ArtworkRelease {
+        id: String,
+        transfer_id: String,
+    },
     Applications {
         desktop_enabled: bool,
         certificate: Vec<u8>,
@@ -156,6 +168,7 @@ impl Router {
             launches,
             transcripts: BTreeMap::new(),
             jobs: BTreeMap::new(),
+            artwork_reservations: BTreeSet::new(),
             cancellations: BTreeMap::new(),
             next_job: 0,
             next_call: 0,
@@ -342,6 +355,7 @@ impl Router {
             }
             "/pair" => self.pair(connection, query, &peer, now),
             "/applist" => self.applications(connection, &peer, now),
+            "/appasset" => self.appasset(connection, &peer, &query, now),
             "/launch" => {
                 if !trusted {
                     Some(xml::error(401, "authenticated paired TLS is required"))
@@ -495,6 +509,12 @@ impl Router {
                     } => Some(applications::Applications::new(desktop_enabled)),
                     _ => None,
                 },
+                artwork: match &purpose {
+                    Purpose::Artwork {
+                        id, transfer_id, ..
+                    } => Some(artwork::Artwork::new(id.clone(), transfer_id.clone())),
+                    _ => None,
+                },
                 purpose,
                 call: Call::Ready {
                     payload,
@@ -543,7 +563,8 @@ impl Router {
                 continue;
             };
             let permission = match &job.purpose {
-                Purpose::Applications { certificate, .. } => {
+                Purpose::Applications { certificate, .. }
+                | Purpose::Artwork { certificate, .. } => {
                     Some((certificate.as_slice(), Permission::List))
                 }
                 Purpose::LaunchIdentity { peer, .. } => {
@@ -553,18 +574,26 @@ impl Router {
             };
             if permission.is_some_and(|(certificate, permission)| !allowed(certificate, permission))
             {
-                self.expire_job(job, now, send, &mut replies);
+                if let Some(job) = self.expire_job(job, now, send, &mut replies) {
+                    self.jobs.insert(key, job);
+                }
                 continue;
             }
             if now >= job.deadline {
-                self.expire_job(job, now, send, &mut replies);
+                if let Some(job) = self.expire_job(job, now, send, &mut replies) {
+                    self.jobs.insert(key, job);
+                }
                 continue;
             }
             let Some(result) = self.advance_call(&mut job, now, send) else {
                 self.jobs.insert(key, job);
                 continue;
             };
-            let continued = if matches!(job.purpose, Purpose::Applications { .. }) {
+            let continued = if matches!(job.purpose, Purpose::ArtworkRelease { .. }) {
+                self.resolve_artwork_release(job, result, now)
+            } else if matches!(job.purpose, Purpose::Artwork { .. }) {
+                self.resolve_artwork(job, result, now, &mut replies)
+            } else if matches!(job.purpose, Purpose::Applications { .. }) {
                 self.resolve_applications(job, result, now, &mut replies)
             } else {
                 self.resolve(job, result, now, &mut replies)
@@ -605,7 +634,12 @@ impl Router {
                     .as_millis()
                     .max(1) as u64;
                 match send(Command::Request {
-                    service: job.purpose.service().into(),
+                    service: if let Some(artwork) = &job.artwork {
+                        artwork.service()
+                    } else {
+                        job.purpose.service()
+                    }
+                    .into(),
                     payload: payload.clone(),
                     timeout_ms,
                     operation_id: format!("nvhttp-wire-{sequence}"),
@@ -643,6 +677,7 @@ impl Router {
         now: Instant,
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
     ) {
+        self.artwork_reservations.remove(&connection);
         self.launches.connection_closed(connection, now);
         let keys: Vec<_> = self
             .jobs
@@ -660,12 +695,15 @@ impl Router {
             {
                 self.jobs.insert(key, job);
             } else {
-                self.expire_job(job, now, send, &mut Vec::new());
+                if let Some(job) = self.expire_job(job, now, send, &mut Vec::new()) {
+                    self.jobs.insert(key, job);
+                }
             }
         }
     }
 
     pub fn reply_delivered(&mut self, connection: u64) {
+        self.artwork_reservations.remove(&connection);
         self.launches.reply_delivered(connection, Instant::now());
     }
 
@@ -684,7 +722,7 @@ impl Router {
         now: Instant,
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
         replies: &mut Vec<(u64, Reply)>,
-    ) {
+    ) -> Option<Job> {
         if let Call::Waiting { request } = job.call {
             self.retire_request(request, now, send);
         }
@@ -693,6 +731,19 @@ impl Router {
         }
         if let Some(connection) = job.connection {
             replies.push((connection, xml::error(504, "request expired")));
+        }
+        if matches!(job.purpose, Purpose::Artwork { .. }) {
+            if let Some(connection) = job.connection {
+                self.artwork_reservations.remove(&connection);
+            }
+            Some(artwork::release_job(job, now))
+        } else {
+            if matches!(job.purpose, Purpose::ArtworkRelease { .. }) {
+                eprintln!(
+                    "amaterasu nvhttp artwork transfer release remains unconfirmed after retry deadline"
+                );
+            }
+            None
         }
     }
 
@@ -715,6 +766,8 @@ impl Purpose {
     fn service(&self) -> &'static str {
         if matches!(self, Self::Applications { .. }) {
             applications::LIBRARY_SERVICE
+        } else if matches!(self, Self::ArtworkRelease { .. }) {
+            "amaterasu.library/1"
         } else {
             PAIRING_SERVICE
         }

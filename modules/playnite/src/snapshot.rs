@@ -46,6 +46,26 @@ pub struct Game {
     pub installed: Option<bool>,
     #[serde(default, rename = "isInstalled")]
     pub is_installed: Option<bool>,
+    #[serde(default, rename = "artworkState")]
+    pub artwork_state: ArtworkState,
+    #[serde(default, rename = "artworkRevision")]
+    pub artwork_revision: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtworkState {
+    #[default]
+    Unknown,
+    Missing,
+    Revision,
+}
+
+pub fn valid_artwork_revision(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 impl Game {
@@ -262,6 +282,12 @@ impl SnapshotAssembler {
                 || game.name.len() > 1_024
                 || game.name.chars().any(char::is_control)
                 || game.is_installed().is_none()
+                || match game.artwork_state {
+                    ArtworkState::Revision => !valid_artwork_revision(&game.artwork_revision),
+                    ArtworkState::Unknown | ArtworkState::Missing => {
+                        !game.artwork_revision.is_empty()
+                    }
+                }
                 || game.categories.len() > MAX_CATEGORIES
                 || game
                     .categories
@@ -673,6 +699,8 @@ mod tests {
             last_played: last_played.into(),
             installed: Some(true),
             is_installed: None,
+            artwork_state: ArtworkState::Unknown,
+            artwork_revision: String::new(),
         }
     }
 

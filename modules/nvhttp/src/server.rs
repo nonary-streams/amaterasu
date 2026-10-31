@@ -18,7 +18,7 @@ use std::{
 const MAX_CONNECTIONS: usize = 32;
 const MAX_PER_PEER: usize = 8;
 const MAX_REQUEST: usize = 32 * 1024;
-const MAX_REPLY: usize = 1024 * 1024;
+const MAX_REPLY: usize = 16 * 1024 * 1024;
 const IO_BUDGET: usize = 16 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const ROUTE_TIMEOUT: Duration = Duration::from_secs(130);

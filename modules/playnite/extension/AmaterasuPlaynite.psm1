@@ -9,6 +9,7 @@ $script:Signals = [System.Collections.Concurrent.ConcurrentDictionary[string,obj
 $script:SnapshotCache = [System.Collections.Concurrent.ConcurrentDictionary[string,object]]::new()
 $script:Stop = [System.Threading.CancellationTokenSource]::new()
 $script:Background = $null
+$script:ArtworkBackground = $null
 $script:Subscriptions = @()
 $script:PlayniteApi = $null
 
@@ -158,6 +159,277 @@ function Get-GameExecutable($Game) {
     return [System.IO.Path]::GetFullPath($path)
 }
 
+# Artwork bytes and paths never enter the snapshot or leave the extension.
+# Async reads bound the time spent waiting for a slow local file.
+function Read-ArtworkFile([string]$Path, [int]$TimeoutMs, [ref]$Budget) {
+    if ($TimeoutMs -le 0 -or $Budget.Value -lt 12 -or -not [System.IO.Path]::IsPathRooted($Path) -or $Path.StartsWith('\\')) { return $null }
+    $stream = $null
+    try {
+        $stream = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read, 8192, $true)
+        $length = $stream.Length
+        if ($length -lt 12 -or $length -gt 16777216 -or $length -gt $Budget.Value) { return $null }
+        $Budget.Value -= $length
+        $data = [byte[]]::new([int]$length)
+        $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMs)
+        $offset = 0
+        while ($offset -lt $data.Length) {
+            $remaining = [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds
+            if ($remaining -le 0) { return $null }
+            $read = $stream.ReadAsync($data, $offset, $data.Length - $offset)
+            if (-not $read.Wait($remaining) -or $read.Result -le 0) { return $null }
+            $offset += $read.Result
+        }
+        if ($stream.Length -ne $length) { return $null }
+        $mime = ''
+        if ($data[0] -eq 0x89 -and $data[1] -eq 0x50 -and $data[2] -eq 0x4e -and $data[3] -eq 0x47 -and $data[4] -eq 0x0d -and $data[5] -eq 0x0a -and $data[6] -eq 0x1a -and $data[7] -eq 0x0a) { $mime = 'image/png' }
+        elseif ($data[0] -eq 0xff -and $data[1] -eq 0xd8 -and $data[2] -eq 0xff) { $mime = 'image/jpeg' }
+        elseif ([System.Text.Encoding]::ASCII.GetString($data, 0, 4) -eq 'RIFF' -and [System.Text.Encoding]::ASCII.GetString($data, 8, 4) -eq 'WEBP') { $mime = 'image/webp' }
+        if (-not $mime) { return $null }
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $revision = [BitConverter]::ToString($sha.ComputeHash($data)).Replace('-', '').ToLowerInvariant() }
+        finally { $sha.Dispose() }
+        return @{ Data=$data; Revision=$revision; MimeType=$mime }
+    } catch { return $null } finally { if ($stream) { $stream.Dispose() } }
+}
+
+function Scan-ArtworkPayload($Payload, $Cache, $Signals, [long]$ScanBudget = 67108864L, [int]$ScanTimeoutMs = 2000, [string]$Instance = '', [long]$CacheBudget = 67108864L, [int]$CacheCount = 1024, [string]$PreferredId = '') {
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($ScanTimeoutMs)
+    $budget = $ScanBudget
+    $ids = @(if ($PreferredId) { $PreferredId } else { $Payload.Artwork.Keys | Sort-Object })
+    $images = @{}
+    $cursor = 0
+    if (-not $PreferredId -and $ids.Count -and $Cache.ContainsKey('artworkCursor')) { $cursor = [int]$Cache['artworkCursor'] % $ids.Count }
+    $visited = 0
+    while ($visited -lt $ids.Count -and $images.Count -lt 1024 -and $budget -ge 12 -and [DateTime]::UtcNow -lt $deadline) {
+        if ($Payload.Generation -ne (Get-SnapshotGeneration $Signals)) { return }
+        $id = [string]$ids[$cursor]
+        $entry = $Payload.Artwork[$id]
+        $cursor = ($cursor + 1) % $ids.Count
+        $visited++
+        if ($entry.State -ne 'path') { continue }
+        $remaining = [int]($deadline - [DateTime]::UtcNow).TotalMilliseconds
+        $beforeRead = $budget
+        $image = Read-ArtworkFile $entry.Path $remaining ([ref]$budget)
+        if ($image) { $images[$id] = $image }
+        if (-not $image -and $budget -eq $beforeRead -and $budget -lt 16777216) { break }
+    }
+    if ($Payload.Generation -ne (Get-SnapshotGeneration $Signals) -or ($Instance -and $Cache['artworkInstance'] -cne $Instance)) { return }
+    if (-not $PreferredId) { $Cache['artworkCursor'] = $cursor }
+    # Carry forward current-generation entries and evict the oldest scanned
+    # entries when the count or byte limit is reached. Published buffers are
+    # immutable; connection pins may outlive their presence in this map.
+    $merged = @{}
+    $order = [System.Collections.Generic.List[string]]::new()
+    $size = 0L
+    $previous = $null
+    if ($Cache.TryGetValue('artworkResult', [ref]$previous) -and $previous.Generation -eq $Payload.Generation -and $previous.Instance -ceq $Instance) {
+        foreach ($key in $previous.Order) {
+            $merged[$key] = $previous.Images[$key]
+            $order.Add([string]$key)
+            $size += $previous.Images[$key].Data.Length
+        }
+    }
+    foreach ($key in $ids) {
+        if (-not $images.ContainsKey($key)) { continue }
+        $image = $images[$key]
+        if ($image.Data.Length -gt $CacheBudget -or $CacheCount -lt 1) { continue }
+        if ($merged.ContainsKey($key)) {
+            $size -= $merged[$key].Data.Length
+            [void]$merged.Remove($key)
+            [void]$order.Remove([string]$key)
+        }
+        while ($order.Count -ge $CacheCount -or $size + $image.Data.Length -gt $CacheBudget) {
+            $evicted = $order[0]
+            $size -= $merged[$evicted].Data.Length
+            [void]$merged.Remove($evicted)
+            $order.RemoveAt(0)
+        }
+        $merged[$key] = $image
+        $order.Add([string]$key)
+        $size += $image.Data.Length
+    }
+    # A single replacement exposes a consistent map to connection workers.
+    $Cache['artworkResult'] = @{ Generation=$Payload.Generation; Instance=$Instance; Images=$merged; Order=$order.ToArray(); Ready=[Guid]::NewGuid().ToString('N') }
+    if ($PreferredId) { return $images[$PreferredId] }
+}
+
+function Invoke-ArtworkScanJob($Job, $Cache, $Signals, [string]$Instance) {
+    if ($Job.PreferredId) {
+        $image = $null
+        try { $image = Scan-ArtworkPayload $Job.Payload $Cache $Signals 67108864 2000 $Instance 67108864 1024 $Job.PreferredId } catch {}
+        # Publish completion as one object, including a null image on failure.
+        $Job.State.Outcome = @{ Image=$image }
+    } else {
+        try { Scan-ArtworkPayload $Job $Cache $Signals 67108864 2000 $Instance } catch {}
+    }
+}
+
+function Start-ArtworkWorker($Cache, $Signals, $Stop, [string]$Instance, $TestGate = $null) {
+    $queue = $Cache['artworkQueue']
+    $priority = $Cache['artworkPriorityQueue']
+    while (-not $Stop.IsCancellationRequested) {
+        $job = $null
+        $found = $priority -and $priority.TryTake([ref]$job)
+        if (-not $found) { $found = $queue.TryTake([ref]$job, 100) }
+        if ($found) {
+            if ($TestGate) { $TestGate.Wait() }
+            Invoke-ArtworkScanJob $job $Cache $Signals $Instance
+        }
+    }
+}
+
+function Add-ArtworkToSnapshot($Payload, $Cache = $null) {
+    $result = $null
+    if ($null -ne $Cache) { [void]$Cache.TryGetValue('artworkResult', [ref]$result) }
+    if ($result -and ($result.Generation -ne $Payload.Generation -or ($result.Instance -and $result.Instance -cne $Cache['artworkInstance']))) { $result = $null }
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $bytes = 0
+    foreach ($line in $Payload.Lines) {
+        $record = ConvertFrom-Json -InputObject $line
+        if ($record.type -eq 'games') {
+            foreach ($game in $record.payload) {
+                $id = [string]$game.id
+                $entry = $Payload.Artwork[$id]
+                $state = 'unknown'; $revision = ''
+                if ($entry -and $entry.State -eq 'missing') { $state = 'missing' }
+                elseif ($result -and $result.Images.ContainsKey($id)) { $state = 'revision'; $revision = $result.Images[$id].Revision }
+                $game | Add-Member -NotePropertyName artworkState -NotePropertyValue $state
+                $game | Add-Member -NotePropertyName artworkRevision -NotePropertyValue $revision
+            }
+        }
+        Add-CapturedLine $lines $record ([ref]$bytes)
+    }
+    return @{ Lines=$lines.ToArray(); Games=$Payload.Games; CapturedAt=$Payload.CapturedAt; Generation=$Payload.Generation; Artwork=$Payload.Artwork }
+}
+
+function Remove-ExpiredArtworkPins($Connection, [DateTime]$Now = [DateTime]::UtcNow) {
+    if ($Connection.ArtworkNextPrune -and $Now -lt $Connection.ArtworkNextPrune) { return }
+    $Connection.ArtworkNextPrune = $Now.AddSeconds(1)
+    $pins = $Connection.ArtworkPins
+    if ($pins) {
+        $generation = Get-SnapshotGeneration $Connection.Signals
+        foreach ($key in @($pins.Keys)) {
+            if ($pins[$key].Generation -ne $generation -or
+                $pins[$key].Instance -cne $Connection.Cache['artworkInstance'] -or $pins[$key].Expires -le $Now) {
+                [void]$pins.Remove($key)
+            }
+        }
+    }
+    $demands = $Connection.ArtworkDemands
+    if ($demands) {
+        $generation = Get-SnapshotGeneration $Connection.Signals
+        foreach ($key in @($demands.Keys)) {
+            if ($demands[$key].Generation -ne $generation -or
+                $demands[$key].Instance -cne $Connection.Cache['artworkInstance'] -or $demands[$key].Expires -le $Now) { [void]$demands.Remove($key) }
+        }
+    }
+    $tombstones = $Connection.ArtworkTombstones
+    if ($tombstones) {
+        foreach ($key in @($tombstones.Keys)) { if ($tombstones[$key] -le $Now) { [void]$tombstones.Remove($key) } }
+    }
+    if ($Connection.ArtworkReleaseOverflowUntil -and $Connection.ArtworkReleaseOverflowUntil -le $Now) { $Connection.ArtworkReleaseOverflowUntil = $null }
+}
+
+function Send-ArtworkChunk($Connection, $Message, [string]$RequestId, [DateTime]$Now = [DateTime]::UtcNow) {
+    $transferId = [string]$Message.transferId
+    if ($RequestId -notmatch '^[0-9a-f]{32}$' -or $transferId -cnotmatch '^[0-9a-f]{32}$') { return }
+    $result = @{ type='artworkResult'; requestId=$RequestId; nonce=[string]$Connection.Nonce; transferId=$transferId; success=$false }
+    try {
+        $id = [Guid]::Parse([string]$Message.id).ToString('D')
+        $revision = [string]$Message.revision
+        $offset = 0L
+        if ($transferId -cnotmatch '^[0-9a-f]{32}$' -or $revision -cnotmatch '^[0-9a-f]{64}$' -or -not [long]::TryParse([string]$Message.offset, [ref]$offset) -or $offset -lt 0 -or $offset -ge 16777216) { throw 'invalid artwork request' }
+        $payload = $null
+        if (-not $Connection.Cache.TryGetValue('payload', [ref]$payload) -or $payload.Generation -ne (Get-SnapshotGeneration $Connection.Signals)) { throw 'stale artwork snapshot' }
+        if (-not $Connection.ArtworkPins) { $Connection.ArtworkPins = @{} }
+        $pins = $Connection.ArtworkPins
+        Remove-ExpiredArtworkPins $Connection $Now
+        if ($Connection.ArtworkReleaseOverflowUntil -or ($Connection.ArtworkTombstones -and $Connection.ArtworkTombstones.ContainsKey($transferId))) { throw 'artwork transfer released' }
+        $pinKey = $transferId
+        $pin = $pins[$pinKey]
+        if ($pin -and ($pin.Generation -ne $payload.Generation -or $pin.Instance -cne $Connection.Cache['artworkInstance'] -or $pin.Expires -le $Now)) {
+            [void]$pins.Remove($pinKey)
+            $pin = $null
+        }
+        if ($pin -and ($pin.Id -cne $id -or $pin.Revision -cne $revision)) { throw 'artwork transfer identity changed' }
+        if (-not $pin) {
+            if ($offset -ne 0 -or $pins.Count -ge 2) { throw 'artwork pin unavailable' }
+            if (-not $Connection.ArtworkDemands) { $Connection.ArtworkDemands = @{} }
+            $demands = $Connection.ArtworkDemands
+            $demand = $demands[$transferId]
+            if ($demand -and $demand.Expires -le $Now) { [void]$demands.Remove($transferId); $demand = $null }
+            if (-not $demand -and $pins.Count + $demands.Count -ge 2) { throw 'artwork transfer capacity reached' }
+            if ($demand -and ($demand.Id -cne $id -or $demand.Revision -cne $revision -or
+                $demand.Generation -ne $payload.Generation -or $demand.Instance -cne $Connection.Cache['artworkInstance'])) { throw 'artwork transfer identity changed' }
+            $resultCache = $null
+            $image = $null
+            # A restored unknown reference must be checked against current file
+            # bytes. Once a scan is pending, every retry uses that outcome even
+            # if a stale matching image remains in the cache.
+            $refresh = $Message.refresh -is [bool] -and $Message.refresh
+            if (-not $refresh -and -not $demand -and $Connection.Cache.TryGetValue('artworkResult', [ref]$resultCache) -and
+                $resultCache.Generation -eq $payload.Generation -and
+                (-not $resultCache.Instance -or $resultCache.Instance -ceq $Connection.Cache['artworkInstance']) -and $resultCache.Images.ContainsKey($id)) {
+                $image = $resultCache.Images[$id]
+                if ($image.Revision -cne $revision) { $image = $null }
+            }
+            if (-not $image) {
+                if ($demand) {
+                    $demand.Expires = $Now.AddSeconds(10)
+                    if (-not $demand.State.Outcome) { $result.error = 'artwork_pending'; throw 'artwork scan pending' }
+                    $image = $demand.State.Outcome.Image
+                    if (-not $image -or $image.Revision -cne $revision) { $result.error = 'artwork_unavailable'; throw 'artwork scan failed' }
+                } else {
+                    if ($pins.Count + $demands.Count -ge 2) { throw 'artwork scan capacity reached' }
+                    $entry = $payload.Artwork[$id]
+                    $queue = $null
+                    if (-not $entry -or $entry.State -ne 'path' -or -not $Connection.Cache.TryGetValue('artworkPriorityQueue', [ref]$queue)) { $result.error = 'artwork_unavailable'; throw 'artwork scan unavailable' }
+                    $state = @{ Outcome=$null }
+                    $job = @{ Payload=$payload; PreferredId=$id; State=$state }
+                    if ($queue.TryAdd($job)) {
+                        $demands[$transferId] = @{ Id=$id; Revision=$revision; Generation=$payload.Generation; Instance=$Connection.Cache['artworkInstance']; Expires=$Now.AddSeconds(10); State=$state }
+                    }
+                    $result.error = 'artwork_pending'
+                    throw 'artwork scan pending'
+                }
+            }
+            if ($demand) { [void]$demands.Remove($transferId) }
+            $pin = @{ Id=$id; Revision=$revision; Generation=$payload.Generation; Instance=$Connection.Cache['artworkInstance']; Image=$image; Expires=$Now.AddSeconds(10) }
+            $pins[$pinKey] = $pin
+        }
+        $image = $pin.Image
+        if ($offset -ge $image.Data.Length -or $payload.Generation -ne (Get-SnapshotGeneration $Connection.Signals)) { throw 'artwork changed or unavailable' }
+        $pin.Expires = $Now.AddSeconds(10)
+        $count = [Math]::Min(8192, $image.Data.Length - [int]$offset)
+        $result.id = $id; $result.revision = $revision; $result.offset = $offset; $result.transferId = $transferId
+        $result.total_bytes = $image.Data.Length; $result.mime_type = $image.MimeType
+        $result.data = [Convert]::ToBase64String($image.Data, [int]$offset, $count); $result.success = $true
+
+    } catch {}
+    if (-not (Add-Frame $Connection @((Convert-FrameLine $result)))) { $Connection.Stream.Dispose() }
+}
+
+function Release-ArtworkTransfer($Connection, $Message, [string]$RequestId, [DateTime]$Now = [DateTime]::UtcNow) {
+    $transferId = [string]$Message.transferId
+    if ($RequestId -notmatch '^[0-9a-f]{32}$' -or $transferId -cnotmatch '^[0-9a-f]{32}$') { return }
+    Remove-ExpiredArtworkPins $Connection $Now
+    if (-not $Connection.ArtworkTombstones) { $Connection.ArtworkTombstones = @{} }
+    $tombstones = $Connection.ArtworkTombstones
+    $success = $true
+    if (-not $tombstones.ContainsKey($transferId) -and $tombstones.Count -ge 4096) {
+        # A full fence table blocks every read until a slot expires. Never evict
+        # a live fence or acknowledge a release without one.
+        $Connection.ArtworkReleaseOverflowUntil = $Now.AddSeconds(60)
+        $success = $false
+    } else {
+        $tombstones[$transferId] = $Now.AddSeconds(60)
+    }
+    if ($Connection.ArtworkPins) { [void]$Connection.ArtworkPins.Remove($transferId) }
+    if ($Connection.ArtworkDemands) { [void]$Connection.ArtworkDemands.Remove($transferId) }
+    $result = @{ type='artworkReleaseResult'; requestId=$RequestId; nonce=[string]$Connection.Nonce; transferId=$transferId; success=$success }
+    if (-not (Add-Frame $Connection @((Convert-FrameLine $result)))) { $Connection.Stream.Dispose() }
+}
+
 function Capture-SnapshotPayload($Api, $Signals = $null) {
     $PlayniteApi = $Api
     if (-not $PlayniteApi.MainView.UIDispatcher.CheckAccess()) { throw 'snapshot capture requires the Playnite UI thread' }
@@ -179,6 +451,7 @@ function Capture-SnapshotPayload($Api, $Signals = $null) {
         if ($categories.Count -gt 4096) { throw 'too many categories' }
     }
     Add-CapturedLine $lines @{ type='categories'; payload=@($categories) } ([ref]$bytes)
+    $artwork = @{}
     $count = 0
     $batch = [System.Collections.Generic.List[object]]::new()
     foreach ($game in $PlayniteApi.Database.Games) {
@@ -186,6 +459,12 @@ function Capture-SnapshotPayload($Api, $Signals = $null) {
         $names = @()
         foreach ($id in @($game.CategoryIds)) { if ($categoryNames.ContainsKey([string]$id)) { $names += $categoryNames[[string]$id] } }
         $lastPlayed = if ($game.LastActivity) { ([DateTime]$game.LastActivity).ToString('o') } else { '' }
+        $cover = @{ State='unknown'; Path='' }
+        try {
+            if (-not $game.CoverImage) { $cover.State = 'missing' }
+            else { $cover.Path = [string]$PlayniteApi.Database.GetFullFilePath([string]$game.CoverImage); if ($cover.Path) { $cover.State = 'path' } }
+        } catch {}
+        $artwork[[string]$game.Id] = $cover
         $batch.Add(@{ id=[string]$game.Id; name=[string]$game.Name; exe=(Get-GameExecutable $game); args=''; workingDir=''; installDir=[string]$game.InstallDirectory; categories=@($names); pluginId=[string]$game.PluginId; pluginName=''; lastPlayed=$lastPlayed; installed=[bool]$game.IsInstalled })
         if ($batch.Count -eq 100) {
             Add-CapturedLine $lines @{ type='games'; payload=$batch.ToArray() } ([ref]$bytes)
@@ -195,7 +474,7 @@ function Capture-SnapshotPayload($Api, $Signals = $null) {
     if ($batch.Count) { Add-CapturedLine $lines @{ type='games'; payload=$batch.ToArray() } ([ref]$bytes) }
     if ($lines.Count -gt 510) { throw 'snapshot exceeds frame count' }
     if ($generation -ne (Get-SnapshotGeneration $Signals)) { throw 'Playnite library changed during snapshot capture' }
-    return @{ Lines=$lines.ToArray(); Games=$count; CapturedAt=[DateTime]::UtcNow; Generation=$generation }
+    return @{ Lines=$lines.ToArray(); Games=$count; CapturedAt=[DateTime]::UtcNow; Generation=$generation; Artwork=$artwork }
 }
 
 function New-SnapshotFrame($Connection, [string]$RequestId = '', $Payload = $null) {
@@ -261,7 +540,7 @@ function Write-QueuedFrame($Connection, $Frame, $Writer) {
     return $true
 }
 
-function Queue-Snapshot($Connection, [string]$RequestId = '') {
+function Queue-Snapshot($Connection, [string]$RequestId = '', [bool]$ScheduleArtwork = $true) {
     try {
         $dirtyAt = [DateTime]::MinValue
         [void]$Connection.Signals.TryGetValue('dirty', [ref]$dirtyAt)
@@ -276,6 +555,9 @@ function Queue-Snapshot($Connection, [string]$RequestId = '') {
         }
         $payload = $null
         if (-not $Connection.Cache.TryGetValue('payload', [ref]$payload)) { throw 'no complete UI-thread snapshot exists' }
+        $queue = $null
+        if ($ScheduleArtwork -and $Connection.Cache.TryGetValue('artworkQueue', [ref]$queue)) { [void]$queue.TryAdd($payload) }
+        $payload = Add-ArtworkToSnapshot $payload $Connection.Cache
         $frame = [string[]]@(New-SnapshotFrame $Connection $RequestId $payload)
         if (-not (Add-SnapshotFrame $Connection $frame $payload.CapturedAt $payload.Generation $RequestId)) { throw 'snapshot outbox full' }
     } catch { $Connection.Stream.Dispose() }
@@ -369,6 +651,8 @@ function Invoke-ExtensionCommand($Connection, $Message) {
         }
     }
     switch ([string]$Message.command) {
+        'artwork_release' { Release-ArtworkTransfer $Connection $Message $requestId; break }
+        'artwork_read' { Send-ArtworkChunk $Connection $Message $requestId; break }
         'snapshot' { if ($requestId -match '^[0-9a-f]{32}$') { Queue-Snapshot $Connection $requestId }; break }
         'launch' {
             $success = $false
@@ -467,8 +751,10 @@ function Serve-DataConnection($Stream, $Api, $Dispatcher, $Connections, $Stop, $
         if (-not $Connections.TryAdd($key, $connection)) { throw 'connection registration failed' }
         if ($connection.Role -eq 'sunshine') { Queue-Snapshot $connection }
         if ($connection.Role -eq 'launcher') { Replay-RunningGame $connection }
+        $lastArtworkReady = ''
         $read = $reader.ReadLineAsync()
         while (-not $Stop.IsCancellationRequested -and $Stream.IsConnected) {
+            Remove-ExpiredArtworkPins $connection
             if (Write-FullscreenShutdown $connection $writer) { break }
             if ($read.IsCompleted) {
                 $line = $read.GetAwaiter().GetResult()
@@ -482,6 +768,11 @@ function Serve-DataConnection($Stream, $Api, $Dispatcher, $Connections, $Stop, $
             if ($connection.Role -eq 'sunshine' -and $dirtyAt -gt $connection.LastDirty -and [DateTime]::UtcNow -ge $dirtyAt.AddSeconds(3)) {
                 $connection.LastDirty = $dirtyAt
                 Queue-Snapshot $connection
+            }
+            $artworkResult = $null
+            if ($connection.Role -eq 'sunshine' -and $Cache.TryGetValue('artworkResult', [ref]$artworkResult) -and $artworkResult.Ready -ne $lastArtworkReady) {
+                $lastArtworkReady = $artworkResult.Ready
+                Queue-Snapshot $connection '' $false
             }
             if (Write-FullscreenShutdown $connection $writer) { break }
             $frame = $null
@@ -562,6 +853,25 @@ function OnApplicationStarted() {
     if ($script:Background) { return }
     try { $script:SnapshotCache['payload'] = Capture-SnapshotPayload $PlayniteApi $script:Signals } catch { $discard = $null; [void]$script:SnapshotCache.TryRemove('payload', [ref]$discard) }
     $script:Stop = [System.Threading.CancellationTokenSource]::new()
+    # Never create a second scanner while a previous local open is stuck.
+    if ($script:ArtworkBackground -and $script:ArtworkBackground.Handle.IsCompleted) {
+        $script:ArtworkBackground.Worker.Dispose(); $script:ArtworkBackground.Runspace.Dispose()
+        $script:ArtworkBackground = $null
+    }
+    $script:SnapshotCache['artworkInstance'] = [Guid]::NewGuid().ToString('N')
+    $discard = $null
+    [void]$script:SnapshotCache.TryRemove('artworkQueue', [ref]$discard)
+    [void]$script:SnapshotCache.TryRemove('artworkPriorityQueue', [ref]$discard)
+    [void]$script:SnapshotCache.TryRemove('artworkResult', [ref]$discard)
+    if (-not $script:ArtworkBackground) {
+        $script:SnapshotCache['artworkQueue'] = [System.Collections.Concurrent.BlockingCollection[object]]::new(1)
+        $script:SnapshotCache['artworkPriorityQueue'] = [System.Collections.Concurrent.BlockingCollection[object]]::new(1)
+        $artRunspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+        $artRunspace.Open()
+        $artWorker = [PowerShell]::Create(); $artWorker.Runspace = $artRunspace
+        [void]$artWorker.AddScript('param($modulePath,$cache,$signals,$stop,$instance) Import-Module -Name $modulePath -Force; Start-ArtworkWorker $cache $signals $stop $instance').AddArgument($script:ModulePath).AddArgument($script:SnapshotCache).AddArgument($script:Signals).AddArgument($script:Stop).AddArgument($script:SnapshotCache['artworkInstance'])
+        $script:ArtworkBackground = @{ Runspace=$artRunspace; Worker=$artWorker; Handle=$artWorker.BeginInvoke() }
+    }
     $runspace = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
     $runspace.Open()
     $worker = [PowerShell]::Create(); $worker.Runspace = $runspace
@@ -591,10 +901,18 @@ function OnApplicationStopped() {
     $dispatcher = if ($api) { $api.MainView.UIDispatcher } else { $null }
     $pending = @(Request-FullscreenShutdown $script:Connections $api $dispatcher)
     Await-FullscreenShutdown $pending 500
+    $script:SnapshotCache['artworkInstance'] = [Guid]::NewGuid().ToString('N')
     $script:Stop.Cancel()
     foreach ($connection in $script:Connections.Values) { $connection.Stream.Dispose() }
     $script:PlayniteApi = $null
     foreach ($subscription in $script:Subscriptions) { Unregister-Event -SubscriptionId $subscription.SubscriptionId -ErrorAction SilentlyContinue }
+    if ($script:ArtworkBackground) {
+        [void]$script:ArtworkBackground.Handle.AsyncWaitHandle.WaitOne(200)
+        if ($script:ArtworkBackground.Handle.IsCompleted) {
+            $script:ArtworkBackground.Worker.Dispose(); $script:ArtworkBackground.Runspace.Dispose()
+            $script:ArtworkBackground = $null
+        }
+    }
     if ($script:Background) {
         $script:Background.Worker.Dispose()
         $script:Background.Runspace.Dispose()
@@ -602,4 +920,4 @@ function OnApplicationStopped() {
     }
 }
 
-Export-ModuleMember -Function OnApplicationStarted,OnApplicationStopped,OnGameStarted,OnGameStopped,OnLibraryUpdated,Start-PipeServer,Serve-DataConnection
+Export-ModuleMember -Function OnApplicationStarted,OnApplicationStopped,OnGameStarted,OnGameStopped,OnLibraryUpdated,Start-PipeServer,Serve-DataConnection,Start-ArtworkWorker

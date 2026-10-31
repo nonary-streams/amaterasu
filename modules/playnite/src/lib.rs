@@ -17,13 +17,14 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use settings::ProductSettings;
 use snapshot::Snapshot;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SERVICE: &str = "amaterasu.playnite/1";
 const MANAGEMENT_CALLER: &str = "amaterasu.management";
+const LIBRARY_CALLER: &str = "amaterasu.library";
 const LAUNCH_CALLER: &str = "amaterasu.launch";
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 
@@ -32,6 +33,15 @@ const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 enum Action {
     Status {},
     Refresh {},
+    ArtworkRead {
+        game_id: String,
+        revision: String,
+        offset: usize,
+        transfer_id: String,
+    },
+    ArtworkRelease {
+        transfer_id: String,
+    },
     SettingsGet {},
     SettingsUpdate {
         enabled: bool,
@@ -256,11 +266,32 @@ struct PlayniteModule {
     fullscreen_entry_sync: fullscreen_entry::FullscreenEntrySync,
     next_discovery: Instant,
     pending_launches: VecDeque<PendingLaunch>,
+    artwork_revisions: BTreeMap<String, String>,
+    artwork_snapshot_current: bool,
+    pending_artwork: Vec<PendingArtwork>,
+    pending_artwork_releases: Vec<PendingArtworkRelease>,
     last_epoch_ready: bool,
     #[cfg(test)]
     discovery_override: Option<discovery::Discovery>,
     #[cfg(test)]
     discovery_call_count: std::cell::Cell<usize>,
+}
+
+struct PendingArtworkRelease {
+    request: u64,
+    transfer_id: String,
+    receiver: Receiver<Result<(), String>>,
+}
+
+struct PendingArtwork {
+    request: u64,
+    game_id: String,
+    revision: String,
+    transfer_id: String,
+    catalog_reference: bool,
+    processes: Vec<discovery::ProcessImage>,
+    settings_epoch: u64,
+    receiver: Receiver<Result<connector::ArtworkChunk, String>>,
 }
 
 struct PendingLaunch {
@@ -323,6 +354,10 @@ impl ManagedModule for PlayniteModule {
             fullscreen_entry_sync: fullscreen_entry::FullscreenEntrySync::default(),
             next_discovery: Instant::now(),
             pending_launches: VecDeque::new(),
+            artwork_revisions: BTreeMap::new(),
+            artwork_snapshot_current: false,
+            pending_artwork: Vec::new(),
+            pending_artwork_releases: Vec::new(),
             last_epoch_ready: false,
             #[cfg(test)]
             discovery_override: None,
@@ -341,6 +376,7 @@ impl ManagedModule for PlayniteModule {
         self.fullscreen_launches
             .advance(Instant::now(), &self.last_discovery.processes);
         self.poll_snapshot();
+        self.poll_artwork()?;
         self.start_automatic_snapshot();
         self.catalog
             .advance(&self.runtime, self.settings_epoch)
@@ -426,6 +462,8 @@ impl PlayniteModule {
             Instant::now(),
         );
         if !same_catalog_policy {
+            self.artwork_revisions.clear();
+            self.artwork_snapshot_current = false;
             self.catalog.revoke_epoch();
             self.configuration.require_epoch_for_deferred_response();
         }
@@ -467,6 +505,8 @@ impl PlayniteModule {
                 && self.configuration.settings().auto_sync,
             Instant::now(),
         ) {
+            self.artwork_revisions.clear();
+            self.artwork_snapshot_current = false;
             self.catalog.cancel_after_process_change();
             self.catalog.revoke_epoch();
             self.pending_unsolicited_snapshot = None;
@@ -495,6 +535,8 @@ impl PlayniteModule {
                 && self.configuration.settings().auto_sync,
             Instant::now(),
         ) {
+            self.artwork_revisions.clear();
+            self.artwork_snapshot_current = false;
             self.catalog.cancel_after_process_change();
             self.catalog.revoke_epoch();
             self.pending_unsolicited_snapshot = None;
@@ -533,6 +575,8 @@ impl PlayniteModule {
                     now,
                 ) {
                     Ok(()) => {
+                        update_artwork_revisions(&mut self.artwork_revisions, &snapshot);
+                        self.artwork_snapshot_current = true;
                         self.catalog_processes = Some(self.snapshot_worker.processes.clone());
                         self.last_error = None;
                     }
@@ -580,6 +624,8 @@ impl PlayniteModule {
             now,
         ) {
             Ok(()) => {
+                update_artwork_revisions(&mut self.artwork_revisions, &event.snapshot);
+                self.artwork_snapshot_current = true;
                 self.last_snapshot_games = event.snapshot.games.len();
                 self.catalog_processes = Some(event.processes);
                 self.next_auto_sync = Some(Instant::now() + AUTO_SYNC_INTERVAL);
@@ -629,6 +675,29 @@ impl PlayniteModule {
         };
         if action.is_settings() && !settings_caller_is_authorized(caller) {
             return self.complete(id, json!({"ok":false,"code":"forbidden"}));
+        }
+        let artwork_read = matches!(
+            action,
+            Action::ArtworkRead { .. } | Action::ArtworkRelease { .. }
+        );
+        if !artwork_caller_allowed(caller, artwork_read) {
+            return self.complete(id, json!({"ok":false,"code":"forbidden"}));
+        }
+        if let Action::ArtworkRead {
+            game_id,
+            revision,
+            offset,
+            transfer_id,
+        } = &action
+        {
+            return self.request_artwork(
+                id,
+                game_id.clone(),
+                revision.clone(),
+                *offset,
+                transfer_id.clone(),
+                caller == LIBRARY_CALLER,
+            );
         }
         if action.is_launch() && !launch_caller_is_authorized(caller) {
             return self.complete(id, json!({"ok":false,"code":"forbidden"}));
@@ -714,6 +783,34 @@ impl PlayniteModule {
         }
         match action {
             Action::Status {} => self.complete(id, self.status()),
+            Action::ArtworkRead {
+                game_id,
+                revision,
+                offset,
+                transfer_id,
+            } => self.request_artwork(id, game_id, revision, offset, transfer_id, false),
+            Action::ArtworkRelease { transfer_id } => {
+                if !connector::valid_artwork_transfer_id(&transfer_id) {
+                    return self.complete(id, json!({"ok":false,"code":"invalid_cursor"}));
+                }
+                if self.pending_artwork_releases.len() >= 8 {
+                    return self.complete(id, json!({"ok":false,"code":"artwork_busy"}));
+                }
+                match connector::release_artwork_transfer(
+                    &self.last_discovery.processes,
+                    &transfer_id,
+                ) {
+                    Ok(receiver) => {
+                        self.pending_artwork_releases.push(PendingArtworkRelease {
+                            request: id,
+                            transfer_id,
+                            receiver,
+                        });
+                        Ok(())
+                    }
+                    Err(_) => self.complete(id, json!({"ok":false,"code":"artwork_unavailable"})),
+                }
+            }
             Action::LaunchStart {
                 operation_id,
                 game_id,
@@ -918,6 +1015,115 @@ impl PlayniteModule {
         }
     }
 
+    fn request_artwork(
+        &mut self,
+        request: u64,
+        game_id: String,
+        revision: String,
+        offset: usize,
+        transfer_id: String,
+        catalog_reference: bool,
+    ) -> ModuleResult<()> {
+        let game_id = game_id.to_ascii_lowercase();
+        if !self.configuration.ready() || !self.configuration.settings().enabled {
+            return self.complete(request, json!({"ok":false,"code":"artwork_unavailable"}));
+        }
+        if !snapshot::valid_playnite_id(&game_id)
+            || !snapshot::valid_artwork_revision(&revision)
+            || !connector::valid_artwork_transfer_id(&transfer_id)
+            || offset >= 16 * 1024 * 1024
+            || !offset.is_multiple_of(8192)
+        {
+            return self.complete(request, json!({"ok":false,"code":"invalid_cursor"}));
+        }
+        if !artwork_revision_may_be_read(
+            &self.artwork_revisions,
+            self.artwork_snapshot_current,
+            catalog_reference,
+            &game_id,
+            &revision,
+        ) {
+            return self.complete(request, json!({"ok":false,"code":"artwork_changed"}));
+        }
+        if self.pending_artwork.len() >= 8 {
+            return self.complete(request, json!({"ok":false,"code":"artwork_busy"}));
+        }
+        match connector::request_artwork_chunk(
+            &self.last_discovery.processes,
+            &game_id,
+            &revision,
+            offset,
+            &transfer_id,
+            !self.artwork_snapshot_current
+                || self
+                    .artwork_revisions
+                    .get(&game_id)
+                    .is_some_and(String::is_empty),
+        ) {
+            Ok(receiver) => self.pending_artwork.push(PendingArtwork {
+                request,
+                game_id,
+                revision,
+                transfer_id,
+                catalog_reference,
+                processes: self.last_discovery.processes.clone(),
+                settings_epoch: self.settings_epoch,
+                receiver,
+            }),
+            Err(_) => {
+                return self.complete(request, json!({"ok":false,"code":"artwork_unavailable"}));
+            }
+        }
+        Ok(())
+    }
+
+    fn poll_artwork(&mut self) -> ModuleResult<()> {
+        let mut pending = std::mem::take(&mut self.pending_artwork);
+        for item in pending.drain(..) {
+            let result = item.receiver.try_recv();
+            if matches!(result, Err(mpsc::TryRecvError::Empty)) {
+                self.pending_artwork.push(item);
+                continue;
+            }
+            let current = self.configuration.ready()
+                && self.configuration.settings().enabled
+                && item.settings_epoch == self.settings_epoch
+                && item.processes == self.last_discovery.processes
+                && artwork_revision_may_be_read(
+                    &self.artwork_revisions,
+                    self.artwork_snapshot_current,
+                    item.catalog_reference,
+                    &item.game_id,
+                    &item.revision,
+                );
+            let payload = match result {
+                Ok(Ok(chunk)) if current => {
+                    let next = (chunk.offset + 8192).min(chunk.total_bytes);
+                    json!({"ok":true,"game_id":item.game_id,"revision":item.revision,"transfer_id":item.transfer_id,"offset":chunk.offset,
+                        "next_offset":(next < chunk.total_bytes).then_some(next),"total_bytes":chunk.total_bytes,
+                        "mime_type":chunk.mime_type,"data":chunk.data_base64})
+                }
+                _ => json!({"ok":false,"code":"artwork_changed"}),
+            };
+            self.complete(item.request, payload)?;
+        }
+        let releases = std::mem::take(&mut self.pending_artwork_releases);
+        for release in releases {
+            match release.receiver.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => self.pending_artwork_releases.push(release),
+                Ok(Ok(())) => self.complete(
+                    release.request,
+                    json!({"ok":true,"transfer_id":release.transfer_id}),
+                )?,
+                _ => self.complete(
+                    release.request,
+                    json!({"ok":false,"code":"artwork_unavailable"}),
+                )?,
+            }
+        }
+        Ok(())
+    }
+
     fn status(&self) -> Value {
         json!({
             "ok":true,
@@ -950,6 +1156,52 @@ impl PlayniteModule {
             response => Err(format!("Playnite request completion failed: {response:?}")),
         }
     }
+}
+
+fn artwork_caller_allowed(caller: &str, artwork_read: bool) -> bool {
+    caller != "amaterasu.nvhttp"
+        && (caller != LIBRARY_CALLER || artwork_read)
+        && (!artwork_read || caller == MANAGEMENT_CALLER || caller == LIBRARY_CALLER)
+}
+
+fn artwork_revision_may_be_read(
+    current: &BTreeMap<String, String>,
+    snapshot_current: bool,
+    catalog_reference: bool,
+    id: &str,
+    revision: &str,
+) -> bool {
+    (!snapshot_current && catalog_reference)
+        || current
+            .get(id)
+            .is_some_and(|known| (known.is_empty() && catalog_reference) || known == revision)
+}
+
+fn update_artwork_revisions(current: &mut BTreeMap<String, String>, snapshot: &Snapshot) {
+    let mut next = BTreeMap::new();
+    for game in &snapshot.games {
+        let id = game.id.to_ascii_lowercase();
+        if !snapshot::valid_playnite_id(&id) {
+            continue;
+        }
+        let revision = match game.artwork_state {
+            // An empty value marks a game in the current complete snapshot
+            // whose artwork scan is unknown. The authenticated connector must
+            // still hash the opened image and match the requested revision.
+            snapshot::ArtworkState::Unknown => Some(String::new()),
+            snapshot::ArtworkState::Missing => None,
+            snapshot::ArtworkState::Revision
+                if snapshot::valid_artwork_revision(&game.artwork_revision) =>
+            {
+                Some(game.artwork_revision.clone())
+            }
+            snapshot::ArtworkState::Revision => None,
+        };
+        if let Some(revision) = revision {
+            next.insert(id, revision);
+        }
+    }
+    *current = next;
 }
 
 fn refresh_discovery_at(

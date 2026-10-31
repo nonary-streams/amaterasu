@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 pub const SERVICE: &str = "amaterasu.library/1";
 const CATALOG: &str = "amaterasu.catalog/1";
 const MAX_PENDING: usize = 64;
+// Keep a minute of release fences without exhausting capacity during library browsing.
+const MAX_TRANSFERS: usize = 4096;
 
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -36,6 +38,11 @@ enum Action {
         id: String,
         revision: Option<String>,
         offset: u64,
+        transfer_id: String,
+    },
+    ArtworkRelease {
+        id: String,
+        transfer_id: String,
     },
 }
 
@@ -67,11 +74,19 @@ impl Action {
                 Ok((json!({"action":"resolve_exported","id":id}), true))
             }
             Self::Resolve { .. } => Err("invalid catalog ID"),
-            Self::ArtworkRead { .. } | Self::Discover { .. } => Err("invalid request"),
+            Self::ArtworkRead { .. } | Self::ArtworkRelease { .. } | Self::Discover { .. } => {
+                Err("invalid request")
+            }
         }
     }
 }
 
+fn valid_transfer_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
 fn valid_id(id: &str) -> bool {
     id.len() == 20
         && id.starts_with("app-")
@@ -159,12 +174,27 @@ enum Stage {
     ArtworkResolve {
         revision: Option<String>,
         offset: u64,
+        transfer_id: String,
     },
     ArtworkProvider {
         artwork: Artwork,
         revision: String,
         offset: u64,
+        transfer_id: String,
     },
+    ArtworkRelease {
+        transfer_id: String,
+    },
+}
+struct Transfer {
+    initiator: String,
+    id: String,
+    artwork: Option<Artwork>,
+    active: bool,
+    release: Option<(u64, Instant)>,
+    closed: bool,
+    proven: bool,
+    touched: Instant,
 }
 struct Pending {
     parent: u64,
@@ -177,11 +207,135 @@ struct Admission {
     command: Command,
     pending: Pending,
 }
+struct Cleanup {
+    command: Option<Command>,
+    child: Option<u64>,
+    result: Option<Value>,
+    attempts: u64,
+    failures: u32,
+    retry_after: Instant,
+}
+impl Cleanup {
+    fn defer_retry(&mut self) {
+        self.failures = self.failures.saturating_add(1);
+        let seconds = (1_u64 << self.failures.saturating_sub(1).min(5)).min(30);
+        self.retry_after = Instant::now() + Duration::from_secs(seconds);
+    }
+}
 struct Library {
     runtime: RuntimeClient,
     admissions: BTreeMap<u64, Admission>,
     pending: BTreeMap<u64, Pending>,
     discovery: discovery::Settings,
+    transfers: BTreeMap<String, Transfer>,
+    cleanup: BTreeMap<String, Cleanup>,
+}
+impl Library {
+    fn retain_cleanup(&mut self, token: String) {
+        if let Some(transfer) = self.transfers.get_mut(&token) {
+            transfer.active = true;
+            transfer.closed = true;
+            transfer.release = None;
+            self.cleanup.entry(token).or_insert(Cleanup {
+                command: None,
+                child: None,
+                result: None,
+                attempts: 0,
+                failures: 0,
+                retry_after: Instant::now(),
+            });
+        }
+    }
+    fn poll_cleanup(&mut self) {
+        for (token, mut cleanup) in std::mem::take(&mut self.cleanup) {
+            if Instant::now() < cleanup.retry_after {
+                self.cleanup.insert(token, cleanup);
+                continue;
+            }
+            if let Some(child) = cleanup.child {
+                if cleanup.result.is_none() {
+                    match self.runtime.send(Command::TakeResult { request: child }) {
+                        Ok(Response::Result { payload }) => cleanup.result = Some(payload),
+                        Ok(Response::Pending) | Err(_) => {
+                            cleanup.retry_after = Instant::now() + Duration::from_millis(100);
+                            self.cleanup.insert(token, cleanup);
+                            continue;
+                        }
+                        _ => cleanup.result = Some(Value::Null),
+                    }
+                }
+                let released = match self.runtime.send(Command::ReleaseResult { request: child }) {
+                    Ok(Response::Ok) => true,
+                    Ok(Response::Error { code, .. }) if code == "not_found" => true,
+                    _ => false,
+                };
+                if !released {
+                    cleanup.retry_after = Instant::now() + Duration::from_millis(100);
+                    self.cleanup.insert(token, cleanup);
+                    continue;
+                }
+                let result = cleanup.result.take().unwrap();
+                if result["ok"] == true && result["transfer_id"].as_str() == Some(&token) {
+                    if let Some(transfer) = self.transfers.get_mut(&token) {
+                        transfer.active = false;
+                        transfer.closed = true;
+                        transfer.proven = true;
+                        transfer.touched = Instant::now();
+                    }
+                    continue;
+                }
+                cleanup.child = None;
+                cleanup.command = None;
+                cleanup.defer_retry();
+            }
+            if cleanup.child.is_none() && Instant::now() >= cleanup.retry_after {
+                if cleanup.command.is_none() {
+                    let Some(next_attempt) = cleanup.attempts.checked_add(1) else {
+                        self.cleanup.insert(token, cleanup);
+                        continue;
+                    };
+                    cleanup.attempts = next_attempt;
+                    cleanup.command = Some(Command::Request {
+                        service: "amaterasu.playnite/1".into(),
+                        payload: json!({"action":"artwork_release","transfer_id":token}),
+                        timeout_ms: 10_000,
+                        operation_id: format!("library.cleanup.{token}.{}", cleanup.attempts),
+                        parent: None,
+                    });
+                }
+                match self.runtime.send(cleanup.command.as_ref().unwrap().clone()) {
+                    Ok(Response::Accepted { id }) => cleanup.child = Some(id),
+                    Err(_) => {
+                        cleanup.defer_retry();
+                    } // Retry identical admission after a lost reply.
+                    _ => {
+                        cleanup.command = None;
+                        cleanup.defer_retry();
+                    }
+                }
+            }
+            // Keep retrying at a bounded rate until a matching acknowledgment proves release.
+            self.cleanup.insert(token, cleanup);
+        }
+    }
+    fn queue_completion(&mut self, parent: u64, payload: Value, deadline: Instant) {
+        self.admissions.insert(
+            parent,
+            Admission {
+                command: Command::Complete {
+                    request: parent,
+                    payload,
+                },
+                pending: Pending {
+                    parent,
+                    stage: Stage::Complete,
+                    result: None,
+                    released: true,
+                    deadline,
+                },
+            },
+        );
+    }
 }
 impl ManagedModule for Library {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
@@ -197,9 +351,71 @@ impl ManagedModule for Library {
             admissions: BTreeMap::new(),
             pending: BTreeMap::new(),
             discovery,
+            transfers: BTreeMap::new(),
+            cleanup: BTreeMap::new(),
         })
     }
     fn tick(&mut self) -> ModuleResult<()> {
+        self.poll_cleanup();
+        self.transfers.retain(|_, transfer| {
+            transfer.active
+                || transfer.release.is_some()
+                || transfer.touched.elapsed() < Duration::from_secs(60)
+        });
+        let ready: Vec<_> = self
+            .transfers
+            .iter()
+            .filter_map(|(token, t)| {
+                (!t.active)
+                    .then_some(t.release)
+                    .flatten()
+                    .map(|(parent, deadline)| (token.clone(), parent, deadline))
+            })
+            .collect();
+        for (token, parent, deadline) in ready {
+            let transfer = self.transfers.get_mut(&token).unwrap();
+            transfer.release = None;
+            transfer.closed = true;
+            transfer.touched = Instant::now();
+            if matches!(transfer.artwork, Some(Artwork::Playnite { .. })) {
+                let timeout = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis()
+                    .min(30_000) as u64;
+                if timeout > 0 {
+                    transfer.active = true;
+                    self.admissions.insert(
+                        parent,
+                        Admission {
+                            command: Command::Request {
+                                service: "amaterasu.playnite/1".into(),
+                                payload: json!({"action":"artwork_release","transfer_id":token}),
+                                timeout_ms: timeout,
+                                operation_id: format!("library.artwork_release.{parent}"),
+                                parent: Some(parent),
+                            },
+                            pending: Pending {
+                                parent,
+                                stage: Stage::ArtworkRelease { transfer_id: token },
+                                result: None,
+                                released: false,
+                                deadline,
+                            },
+                        },
+                    );
+                    continue;
+                }
+                self.retain_cleanup(token);
+                self.queue_completion(
+                    parent,
+                    error("service_unavailable", "artwork release timed out"),
+                    deadline,
+                );
+            } else {
+                transfer.proven = true;
+                self.queue_completion(parent, json!({"ok":true}), deadline);
+            }
+        }
         for (parent, admission) in std::mem::take(&mut self.admissions) {
             let completing = matches!(admission.command, Command::Complete { .. });
             match self.runtime.send(admission.command.clone()) {
@@ -212,6 +428,27 @@ impl ManagedModule for Library {
                 }
                 _ => {
                     let mut pending = admission.pending;
+                    if let Stage::ArtworkResolve {
+                        ref transfer_id, ..
+                    }
+                    | Stage::ArtworkProvider {
+                        ref transfer_id, ..
+                    } = pending.stage
+                        && let Some(t) = self.transfers.get_mut(transfer_id)
+                    {
+                        t.active = false;
+                        t.touched = Instant::now();
+                    }
+                    if let Stage::ArtworkRelease { ref transfer_id } = pending.stage
+                        && let Some(t) = self.transfers.get_mut(transfer_id)
+                    {
+                        t.active = false;
+                        t.closed = false;
+                        t.touched = Instant::now();
+                    }
+                    if let Stage::ArtworkRelease { ref transfer_id } = pending.stage {
+                        self.retain_cleanup(transfer_id.clone());
+                    }
                     let code = match pending.stage {
                         Stage::Discovery { .. } => "provider_unavailable",
                         Stage::Catalog { .. } => "catalog_unavailable",
@@ -282,13 +519,25 @@ impl ManagedModule for Library {
             }
             let payload = pending.result.take().unwrap();
             match pending.stage {
-                Stage::ArtworkResolve { revision, offset } if payload["ok"] == true => {
+                Stage::ArtworkResolve {
+                    revision,
+                    offset,
+                    transfer_id,
+                } if payload["ok"] == true => {
                     let artwork =
                         serde_json::from_value::<Artwork>(payload["artwork"].clone()).ok();
+                    let transfer = self.transfers.get_mut(&transfer_id).unwrap();
                     let provider = artwork
                         .as_ref()
-                        .and_then(|a| a.request(revision.as_deref(), offset));
+                        .filter(|a| {
+                            transfer
+                                .artwork
+                                .as_ref()
+                                .is_none_or(|existing| existing == *a)
+                        })
+                        .and_then(|a| a.request(revision.as_deref(), offset, &transfer_id));
                     if let (Some(artwork), Some((service, request))) = (artwork, provider) {
+                        transfer.artwork = Some(artwork.clone());
                         let revision = artwork.revision().to_owned();
                         let timeout = pending
                             .deadline
@@ -312,6 +561,7 @@ impl ManagedModule for Library {
                                             artwork,
                                             revision,
                                             offset,
+                                            transfer_id,
                                         },
                                         result: None,
                                         released: false,
@@ -322,19 +572,68 @@ impl ManagedModule for Library {
                             continue;
                         }
                     }
+                    if let Some(t) = self.transfers.get_mut(&transfer_id) {
+                        t.active = false;
+                        t.touched = Instant::now();
+                    }
                     pending.result = Some(error(
                         "artwork_unavailable",
                         "artwork unavailable or changed",
                     ));
                 }
-                Stage::ArtworkResolve { .. } => {
+                Stage::ArtworkResolve { transfer_id, .. } => {
+                    if let Some(t) = self.transfers.get_mut(&transfer_id) {
+                        t.active = false;
+                        t.touched = Instant::now();
+                    }
                     pending.result = Some(error("artwork_unavailable", "artwork unavailable"))
                 }
                 Stage::ArtworkProvider {
                     artwork,
                     revision,
                     offset,
-                } => pending.result = Some(artwork_chunk(payload, &artwork, &revision, offset)),
+                    transfer_id,
+                } => {
+                    if let Some(t) = self.transfers.get_mut(&transfer_id) {
+                        t.active = false;
+                        t.touched = Instant::now();
+                    }
+                    pending.result = Some(
+                        if matches!(artwork, Artwork::Playnite { .. })
+                            && payload["transfer_id"].as_str() != Some(&transfer_id)
+                        {
+                            error(
+                                "invalid_artwork_response",
+                                "provider returned invalid transfer",
+                            )
+                        } else {
+                            artwork_chunk(payload, &artwork, &revision, offset)
+                        },
+                    );
+                }
+                Stage::ArtworkRelease { transfer_id } => {
+                    if let Some(t) = self.transfers.get_mut(&transfer_id) {
+                        t.active = false;
+                        t.closed = payload["ok"] == true
+                            && payload["transfer_id"].as_str() == Some(&transfer_id);
+                        t.proven = t.closed;
+                        t.touched = Instant::now();
+                    }
+                    if payload["ok"] != true
+                        || payload["transfer_id"].as_str() != Some(&transfer_id)
+                    {
+                        self.retain_cleanup(transfer_id.clone());
+                    }
+                    pending.result = Some(
+                        if payload["ok"] == true
+                            && payload["transfer_id"].as_str() == Some(&transfer_id)
+                        {
+                            json!({"ok":true})
+                        } else {
+                            error("service_unavailable", "artwork release failed")
+                        },
+                    );
+                }
                 Stage::Catalog { resolve } => pending.result = Some(project(payload, resolve)),
                 Stage::Discovery { limit } => {
                     pending.result = Some(discovery::project(payload, limit))
@@ -383,14 +682,113 @@ impl ManagedModule for Library {
         let action = serde_json::from_value::<Action>(payload);
         let prepared = match action {
             Ok(Action::ArtworkRead {
-                id,
+                id: app_id,
                 revision,
                 offset,
-            }) if valid_id(&id) && valid_artwork_cursor(revision.as_deref(), offset) => Ok((
-                CATALOG.to_owned(),
-                json!({"action":"resolve_exported_artwork","id":id}),
-                Stage::ArtworkResolve { revision, offset },
-            )),
+                transfer_id,
+            }) if valid_id(&app_id)
+                && valid_transfer_id(&transfer_id)
+                && valid_artwork_cursor(revision.as_deref(), offset) =>
+            {
+                if !self.transfers.contains_key(&transfer_id)
+                    && (self.transfers.len() >= MAX_TRANSFERS || offset != 0)
+                {
+                    let _ = self.runtime.send(Command::Complete {
+                        request: id,
+                        payload: error("invalid_transfer", "artwork transfer unavailable"),
+                    });
+                    return Ok(());
+                }
+                let transfer = self
+                    .transfers
+                    .entry(transfer_id.clone())
+                    .or_insert_with(|| Transfer {
+                        initiator: initiator.clone(),
+                        id: app_id.clone(),
+                        artwork: None,
+                        active: false,
+                        release: None,
+                        closed: false,
+                        proven: false,
+                        touched: Instant::now(),
+                    });
+                if transfer.initiator != initiator
+                    || transfer.id != app_id
+                    || transfer.closed
+                    || transfer.release.is_some()
+                    || transfer.active
+                {
+                    Err(("invalid_transfer", "artwork transfer unavailable"))
+                } else if transfer.artwork.is_none() && offset != 0 {
+                    Err((
+                        "invalid_transfer",
+                        "artwork transfer must begin at offset zero",
+                    ))
+                } else {
+                    transfer.active = true;
+                    transfer.touched = Instant::now();
+                    Ok((
+                        CATALOG.to_owned(),
+                        json!({"action":"resolve_exported_artwork","id":app_id}),
+                        Stage::ArtworkResolve {
+                            revision,
+                            offset,
+                            transfer_id,
+                        },
+                    ))
+                }
+            }
+            Ok(Action::ArtworkRelease {
+                id: app_id,
+                transfer_id,
+            }) if valid_id(&app_id) && valid_transfer_id(&transfer_id) => {
+                if !self.transfers.contains_key(&transfer_id)
+                    && self.transfers.len() < MAX_TRANSFERS
+                {
+                    self.transfers.insert(
+                        transfer_id.clone(),
+                        Transfer {
+                            initiator: initiator.clone(),
+                            id: app_id.clone(),
+                            artwork: None,
+                            active: false,
+                            release: None,
+                            closed: true,
+                            proven: false,
+                            touched: Instant::now(),
+                        },
+                    );
+                }
+                if let Some(transfer) = self.transfers.get_mut(&transfer_id) {
+                    if transfer.initiator != initiator
+                        || transfer.id != app_id
+                        || transfer.release.is_some()
+                        || (transfer.closed && transfer.active)
+                    {
+                        Err(("invalid_transfer", "artwork transfer unavailable"))
+                    } else if transfer.closed {
+                        let result = if transfer.proven {
+                            json!({"ok":true})
+                        } else {
+                            error("service_unavailable", "artwork release is unverified")
+                        };
+                        self.queue_completion(
+                            id,
+                            result,
+                            Instant::now() + Duration::from_millis(remaining_ms.min(30_000)),
+                        );
+                        return Ok(());
+                    } else {
+                        transfer.release = Some((
+                            id,
+                            Instant::now() + Duration::from_millis(remaining_ms.min(30_000)),
+                        ));
+                        return Ok(());
+                    }
+                } else {
+                    Err(("busy", "artwork transfer capacity reached"))
+                }
+            }
             Ok(Action::Discover {
                 provider,
                 cursor,
@@ -449,11 +847,22 @@ mod tests {
             serde_json::from_value(json!({"provider":"steam","app_id":42,"revision":"17"}))
                 .unwrap();
         assert_eq!(
-            artwork.request(Some("17"), 0).unwrap().0,
+            artwork
+                .request(Some("17"), 0, "00000000000000000000000000000000")
+                .unwrap()
+                .0,
             "amaterasu.steam/1"
         );
-        assert!(artwork.request(Some("18"), 0).is_none());
-        assert!(artwork.request(None, 0).is_some());
+        assert!(
+            artwork
+                .request(Some("18"), 0, "00000000000000000000000000000000")
+                .is_none()
+        );
+        assert!(
+            artwork
+                .request(None, 0, "00000000000000000000000000000000")
+                .is_some()
+        );
         assert!(valid_artwork_cursor(None, 0));
         assert!(!valid_artwork_cursor(None, 8192));
         assert!(valid_artwork_cursor(Some("17"), 8192));

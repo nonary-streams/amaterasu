@@ -749,3 +749,89 @@ fn discovery_retries_automatic_sync_immediately_only_for_a_new_running_process()
     );
     assert_eq!(next_auto_sync, next_attempt);
 }
+#[test]
+fn artwork_snapshot_preserves_only_unknown_current_games() {
+    let first = "a1b2c3d4-1234-5678-9abc-0123456789ab";
+    let second = "b1b2c3d4-1234-5678-9abc-0123456789ab";
+    let mut revisions = BTreeMap::from([
+        (first.to_string(), "a".repeat(64)),
+        (second.to_string(), "b".repeat(64)),
+    ]);
+    let mut game: snapshot::Game =
+        serde_json::from_value(json!({"id":first,"installed":true})).unwrap();
+    let mut snapshot = Snapshot {
+        games: vec![game.clone()],
+        categories: vec![],
+        plugins: vec![],
+    };
+    update_artwork_revisions(&mut revisions, &snapshot);
+    assert_eq!(revisions.get(first).map(String::as_str), Some(""));
+    assert!(artwork_revision_may_be_read(
+        &revisions,
+        true,
+        true,
+        first,
+        &"a".repeat(64)
+    ));
+    assert!(!revisions.contains_key(second));
+    game.artwork_state = snapshot::ArtworkState::Missing;
+    snapshot.games[0] = game.clone();
+    update_artwork_revisions(&mut revisions, &snapshot);
+    assert!(revisions.is_empty());
+    game.artwork_state = snapshot::ArtworkState::Revision;
+    game.artwork_revision = "c".repeat(64);
+    snapshot.games[0] = game;
+    update_artwork_revisions(&mut revisions, &snapshot);
+    assert_eq!(revisions.get(first), Some(&"c".repeat(64)));
+    assert!(!artwork_revision_may_be_read(
+        &revisions,
+        true,
+        true,
+        first,
+        &"a".repeat(64)
+    ));
+    revisions.clear();
+    game = serde_json::from_value(json!({"id":first,"installed":true})).unwrap();
+    snapshot.games[0] = game;
+    update_artwork_revisions(&mut revisions, &snapshot);
+    assert!(artwork_revision_may_be_read(
+        &revisions,
+        true,
+        true,
+        first,
+        &"a".repeat(64)
+    ));
+    snapshot.games.clear();
+    update_artwork_revisions(&mut revisions, &snapshot);
+    assert!(!artwork_revision_may_be_read(
+        &revisions,
+        true,
+        true,
+        first,
+        &"a".repeat(64)
+    ));
+    assert!(artwork_revision_may_be_read(
+        &revisions,
+        false,
+        true,
+        first,
+        &"a".repeat(64)
+    ));
+    assert!(!artwork_revision_may_be_read(
+        &revisions,
+        false,
+        false,
+        first,
+        &"a".repeat(64)
+    ));
+}
+
+#[test]
+fn artwork_caller_is_limited_to_management_and_library_broker() {
+    assert!(artwork_caller_allowed(MANAGEMENT_CALLER, true));
+    assert!(artwork_caller_allowed(LIBRARY_CALLER, true));
+    assert!(!artwork_caller_allowed(LIBRARY_CALLER, false));
+    assert!(!artwork_caller_allowed("amaterasu.nvhttp", true));
+    assert!(!artwork_caller_allowed("amaterasu.nvhttp", false));
+    assert!(!artwork_caller_allowed("amaterasu.other", true));
+}

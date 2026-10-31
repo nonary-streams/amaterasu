@@ -1294,11 +1294,22 @@ fn provider_entry_with_flags(game: &Game, source_flags: u32) -> Option<Value> {
         .take(16)
         .cloned()
         .collect::<Vec<_>>();
-    Some(json!({
+    let mut result = json!({
         "source_id":game.id.to_ascii_lowercase(),
         "entry":{"name":game.name,"description":"","tags":tags,"launch":launch},
         "source_flags":source_flags
-    }))
+    });
+    match game.artwork_state {
+        crate::snapshot::ArtworkState::Unknown => result["preserve_artwork"] = json!(true),
+        crate::snapshot::ArtworkState::Missing => {}
+        crate::snapshot::ArtworkState::Revision => {
+            if !crate::snapshot::valid_artwork_revision(&game.artwork_revision) {
+                return None;
+            }
+            result["entry"]["artwork"] = json!({"provider":"playnite","game_id":game.id.to_ascii_lowercase(),"revision":game.artwork_revision});
+        }
+    }
+    Some(result)
 }
 
 fn new_sync_id(source_revision: u64) -> String {
@@ -1707,7 +1718,26 @@ mod tests {
             last_played: String::new(),
             installed: Some(true),
             is_installed: None,
+            artwork_state: crate::snapshot::ArtworkState::Unknown,
+            artwork_revision: String::new(),
         }
+    }
+
+    #[test]
+    fn artwork_scan_state_controls_catalog_preservation() {
+        let mut game = game("a1b2c3d4-1234-5678-9abc-0123456789ab", "Game", "");
+        assert_eq!(provider_entry(&game).unwrap()["preserve_artwork"], true);
+        game.artwork_state = crate::snapshot::ArtworkState::Missing;
+        let missing = provider_entry(&game).unwrap();
+        assert!(missing.get("preserve_artwork").is_none());
+        assert!(missing["entry"].get("artwork").is_none());
+        game.artwork_state = crate::snapshot::ArtworkState::Revision;
+        game.artwork_revision = "a".repeat(64);
+        let known = provider_entry(&game).unwrap();
+        assert_eq!(known["entry"]["artwork"]["game_id"], game.id);
+        assert_eq!(known["entry"]["artwork"]["revision"], game.artwork_revision);
+        game.artwork_revision = "INVALID".into();
+        assert!(provider_entry(&game).is_none());
     }
 
     fn inventory_entry(

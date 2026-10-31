@@ -479,6 +479,7 @@ fn desktop_list_survives_missing_or_unavailable_catalog_provider() {
             },
             deadline: now + LIST_TIMEOUT,
             applications: Some(Applications::new(true)),
+            artwork: None,
         };
         let mut replies = Vec::new();
         assert!(

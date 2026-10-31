@@ -353,6 +353,134 @@ pub(crate) struct SnapshotEvent {
     pub(crate) settings_epoch: u64,
 }
 
+/// One encoded artwork chunk. Callers must decode and verify the complete digest.
+#[derive(Debug)]
+pub(crate) struct ArtworkChunk {
+    pub(crate) mime_type: String,
+    pub(crate) total_bytes: usize,
+    pub(crate) offset: usize,
+    pub(crate) data_base64: String,
+}
+
+const ARTWORK_CHUNK_BYTES: usize = 8192;
+const ARTWORK_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+pub(crate) fn request_artwork_chunk(
+    processes: &[ProcessImage],
+    game_id: &str,
+    revision: &str,
+    offset: usize,
+    transfer_id: &str,
+    force_refresh: bool,
+) -> Result<Receiver<Result<ArtworkChunk, String>>, String> {
+    if !valid_artwork_request(game_id, revision, offset) || !valid_artwork_transfer_id(transfer_id)
+    {
+        return Err("Invalid Playnite artwork request".into());
+    }
+    #[cfg(windows)]
+    {
+        let (commands, _) = sunshine_actor_channels().ok_or("Playnite connector unavailable")?;
+        let request_id = fresh_connection_nonce()?;
+        let line = artwork_request_line(
+            &request_id,
+            game_id,
+            revision,
+            offset,
+            transfer_id,
+            force_refresh,
+        )?;
+        let (reply, response) = mpsc::channel();
+        commands
+            .try_send(SunshineCommand::Artwork {
+                processes: processes.to_vec(),
+                line,
+                request_id,
+                game_id: game_id.to_owned(),
+                revision: revision.to_owned(),
+                offset,
+                transfer_id: transfer_id.to_owned(),
+                deadline: Instant::now() + CONNECT_TIMEOUT,
+                reply,
+            })
+            .map_err(|_| "Playnite connector busy")?;
+        Ok(response)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (processes, force_refresh);
+        Err("Playnite connector is only available on Windows".into())
+    }
+}
+
+#[cfg(any(windows, test))]
+fn artwork_request_line(
+    request_id: &str,
+    game_id: &str,
+    revision: &str,
+    offset: usize,
+    transfer_id: &str,
+    force_refresh: bool,
+) -> Result<Vec<u8>, String> {
+    let mut line = serde_json::to_vec(&serde_json::json!({
+        "type": "command", "command": "artwork_read", "requestId": request_id,
+        "id": game_id, "revision": revision, "offset": offset, "transferId": transfer_id,
+        "refresh": force_refresh,
+    }))
+    .map_err(|_| "Playnite artwork request serialization failed")?;
+    line.push(b'\n');
+    Ok(line)
+}
+
+pub(crate) fn valid_artwork_transfer_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Queue release and deliver the authenticated extension acknowledgement asynchronously.
+pub(crate) fn release_artwork_transfer(
+    processes: &[ProcessImage],
+    transfer_id: &str,
+) -> Result<Receiver<Result<(), String>>, String> {
+    if !valid_artwork_transfer_id(transfer_id) {
+        return Err("Invalid artwork transfer ID".into());
+    }
+    #[cfg(windows)]
+    {
+        let (commands, _) = sunshine_actor_channels().ok_or("Playnite connector unavailable")?;
+        let request_id = fresh_connection_nonce()?;
+        let mut line = serde_json::to_vec(&serde_json::json!({"type":"command", "command":"artwork_release", "requestId":request_id, "transferId":transfer_id})).map_err(|_| "Artwork release serialization failed")?;
+        line.push(b'\n');
+        let (reply, response) = mpsc::channel();
+        commands
+            .try_send(SunshineCommand::ReleaseArtwork {
+                processes: processes.to_vec(),
+                line,
+                request_id,
+                transfer_id: transfer_id.to_owned(),
+                reply,
+            })
+            .map_err(|_| "Playnite connector busy")?;
+        Ok(response)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = processes;
+        Err("Playnite connector is only available on Windows".into())
+    }
+}
+
+fn valid_artwork_request(game_id: &str, revision: &str, offset: usize) -> bool {
+    crate::snapshot::valid_playnite_id(game_id)
+        && revision.len() == 64
+        && revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && offset < ARTWORK_MAX_BYTES
+        && offset.is_multiple_of(ARTWORK_CHUNK_BYTES)
+}
+
 #[cfg(windows)]
 enum SunshineCommand {
     Observe {
@@ -371,6 +499,24 @@ enum SunshineCommand {
         command: String,
         request_id: String,
         deadline: Instant,
+        reply: Sender<Result<(), String>>,
+    },
+    Artwork {
+        processes: Vec<ProcessImage>,
+        line: Vec<u8>,
+        request_id: String,
+        game_id: String,
+        revision: String,
+        offset: usize,
+        transfer_id: String,
+        deadline: Instant,
+        reply: Sender<Result<ArtworkChunk, String>>,
+    },
+    ReleaseArtwork {
+        processes: Vec<ProcessImage>,
+        line: Vec<u8>,
+        request_id: String,
+        transfer_id: String,
         reply: Sender<Result<(), String>>,
     },
     Shutdown,
@@ -483,6 +629,9 @@ struct SunshineState {
     received: usize,
     pending_snapshot: Option<PendingSnapshot>,
     pending_command: Option<PendingCommand>,
+    pending_artwork: Option<PendingArtwork>,
+    queued_artwork: Option<SunshineCommand>,
+    pending_release: Option<PendingRelease>,
 }
 
 #[cfg(windows)]
@@ -500,6 +649,31 @@ struct PendingCommand {
     deadline: Instant,
 }
 
+#[cfg(any(windows, test))]
+struct PendingArtwork {
+    request_id: String,
+    game_id: String,
+    revision: String,
+    offset: usize,
+    transfer_id: String,
+    #[cfg(windows)]
+    deadline: Instant,
+    #[cfg(windows)]
+    line: Vec<u8>,
+    #[cfg(windows)]
+    retry_at: Option<Instant>,
+    #[cfg(windows)]
+    reply: Sender<Result<ArtworkChunk, String>>,
+}
+
+#[cfg(windows)]
+struct PendingRelease {
+    request_id: String,
+    transfer_id: String,
+    deadline: Instant,
+    reply: Sender<Result<(), String>>,
+}
+
 #[cfg(windows)]
 impl SunshineState {
     fn new() -> Self {
@@ -515,6 +689,9 @@ impl SunshineState {
             received: 0,
             pending_snapshot: None,
             pending_command: None,
+            pending_artwork: None,
+            queued_artwork: None,
+            pending_release: None,
         }
     }
 
@@ -529,6 +706,15 @@ impl SunshineState {
             let _ = pending.reply.send(Err(reason.into()));
         }
         if let Some(pending) = self.pending_command.take() {
+            let _ = pending.reply.send(Err(reason.into()));
+        }
+        if let Some(pending) = self.pending_artwork.take() {
+            let _ = pending.reply.send(Err(reason.into()));
+        }
+        if let Some(SunshineCommand::Artwork { reply, .. }) = self.queued_artwork.take() {
+            let _ = reply.send(Err(reason.into()));
+        }
+        if let Some(pending) = self.pending_release.take() {
             let _ = pending.reply.send(Err(reason.into()));
         }
     }
@@ -676,6 +862,110 @@ impl SunshineState {
                     });
                 }
             }
+            SunshineCommand::Artwork {
+                processes,
+                line,
+                request_id,
+                game_id,
+                revision,
+                offset,
+                transfer_id,
+                deadline,
+                reply,
+            } => {
+                if self.pending_artwork.is_some()
+                    && self.queued_artwork.is_none()
+                    && Instant::now() < deadline
+                    && self.enabled
+                    && self.processes == processes
+                {
+                    self.queued_artwork = Some(SunshineCommand::Artwork {
+                        processes,
+                        line,
+                        request_id,
+                        game_id,
+                        revision,
+                        offset,
+                        transfer_id,
+                        deadline,
+                        reply,
+                    });
+                    return;
+                }
+                if Instant::now() >= deadline
+                    || self.pending_artwork.is_some()
+                    || !self.enabled
+                    || self.processes != processes
+                {
+                    let _ = reply.send(Err("Playnite artwork request unavailable".into()));
+                    return;
+                }
+                let result = self.connect().and_then(|_| {
+                    if Instant::now() >= deadline {
+                        return Err("Playnite artwork request expired".into());
+                    }
+                    self.verify_server()?;
+                    self.pipe.as_ref().unwrap().write_all(&line)
+                });
+                if let Err(error) = result {
+                    self.disconnect("Playnite artwork connection failed");
+                    let _ = reply.send(Err(error));
+                } else {
+                    self.pending_artwork = Some(PendingArtwork {
+                        request_id,
+                        game_id,
+                        revision,
+                        offset,
+                        transfer_id,
+                        deadline: Instant::now() + CONNECT_TIMEOUT,
+                        line,
+                        retry_at: None,
+                        reply,
+                    });
+                }
+            }
+            SunshineCommand::ReleaseArtwork {
+                processes,
+                line,
+                request_id,
+                transfer_id,
+                reply,
+            } => {
+                if matches!(&self.queued_artwork, Some(SunshineCommand::Artwork { transfer_id: queued, .. }) if queued == &transfer_id)
+                    && let Some(SunshineCommand::Artwork { reply, .. }) = self.queued_artwork.take()
+                {
+                    let _ = reply.send(Err("Playnite artwork transfer released".into()));
+                }
+                if self
+                    .pending_artwork
+                    .as_ref()
+                    .is_some_and(|pending| pending.transfer_id == transfer_id)
+                    && let Some(pending) = self.pending_artwork.take()
+                {
+                    let _ = pending
+                        .reply
+                        .send(Err("Playnite artwork transfer released".into()));
+                }
+                if self.pending_release.is_some() || self.processes != processes || !self.enabled {
+                    let _ = reply.send(Err("Playnite artwork release unavailable".into()));
+                    return;
+                }
+                let result = self
+                    .connect()
+                    .and_then(|_| self.verify_server())
+                    .and_then(|_| self.pipe.as_ref().unwrap().write_all(&line));
+                if let Err(error) = result {
+                    self.disconnect("Playnite artwork release failed");
+                    let _ = reply.send(Err(error));
+                } else {
+                    self.pending_release = Some(PendingRelease {
+                        request_id,
+                        transfer_id,
+                        deadline: Instant::now() + CONNECT_TIMEOUT,
+                        reply,
+                    });
+                }
+            }
             SunshineCommand::Shutdown => self.disconnect("Playnite module stopped"),
         }
     }
@@ -721,6 +1011,34 @@ impl SunshineState {
                     } else {
                         Err("Playnite extension rejected command".into())
                     });
+                }
+                if let Some(pending) = self.pending_release.as_ref()
+                    && let Some(result) = parse_artwork_release_result(
+                        &self.line,
+                        &pending.request_id,
+                        &pending.transfer_id,
+                        self.connection_nonce.as_deref(),
+                    )
+                    && let Some(pending) = self.pending_release.take()
+                {
+                    let _ = pending.reply.send(result);
+                }
+                if let Some(pending) = self.pending_artwork.as_ref()
+                    && artwork_result_is_pending(
+                        &self.line,
+                        pending,
+                        self.connection_nonce.as_deref(),
+                    )
+                {
+                    if let Some(pending) = self.pending_artwork.as_mut() {
+                        pending.retry_at = Some(Instant::now() + Duration::from_millis(250));
+                    }
+                } else if let Some(pending) = self.pending_artwork.as_ref()
+                    && let Some(result) =
+                        parse_artwork_result(&self.line, pending, self.connection_nonce.as_deref())
+                    && let Some(pending) = self.pending_artwork.take()
+                {
+                    let _ = pending.reply.send(result);
                 }
                 if let Some((request_id, result)) =
                     self.assembler.receive_line_with_request(&self.line)
@@ -782,6 +1100,20 @@ fn run_sunshine_actor(
         {
             state.disconnect("Playnite extension command acknowledgement timed out");
         }
+        if state
+            .pending_artwork
+            .as_ref()
+            .is_some_and(|pending| Instant::now() >= pending.deadline)
+        {
+            state.disconnect("Playnite artwork request timed out");
+        }
+        if state
+            .pending_release
+            .as_ref()
+            .is_some_and(|pending| Instant::now() >= pending.deadline)
+        {
+            state.disconnect("Playnite artwork release timed out");
+        }
         match commands.recv_timeout(Duration::from_millis(10)) {
             Ok(SunshineCommand::Shutdown) => {
                 state.disconnect("Playnite module stopped");
@@ -800,6 +1132,25 @@ fn run_sunshine_actor(
         }
         if let Err(error) = state.read_available(&events) {
             state.disconnect(&error);
+        }
+        if state
+            .pending_artwork
+            .as_ref()
+            .is_some_and(|pending| pending.retry_at.is_some_and(|due| Instant::now() >= due))
+        {
+            let result = state.verify_server().and_then(|_| {
+                let pending = state.pending_artwork.as_mut().unwrap();
+                pending.retry_at = None;
+                state.pipe.as_ref().unwrap().write_all(&pending.line)
+            });
+            if let Err(error) = result {
+                state.disconnect(&error);
+            }
+        }
+        if state.pending_artwork.is_none()
+            && let Some(command) = state.queued_artwork.take()
+        {
+            state.handle(command);
         }
     }
 }
@@ -1187,6 +1538,107 @@ fn send_command(
     response
         .recv_timeout(CONNECT_TIMEOUT + CONNECT_TIMEOUT)
         .map_err(|_| "Playnite extension command timed out".to_owned())?
+}
+
+#[cfg(any(windows, test))]
+fn parse_artwork_release_result(
+    line: &[u8],
+    request_id: &str,
+    transfer_id: &str,
+    nonce: Option<&str>,
+) -> Option<Result<(), String>> {
+    let message: serde_json::Value = serde_json::from_slice(line).ok()?;
+    if message.get("type")?.as_str()? != "artworkReleaseResult"
+        || message.get("requestId")?.as_str()? != request_id
+        || message.get("transferId")?.as_str()? != transfer_id
+        || nonce.is_none()
+        || message.get("nonce")?.as_str() != nonce
+    {
+        return None;
+    }
+    Some(if message.get("success")?.as_bool()? {
+        Ok(())
+    } else {
+        Err("Playnite extension rejected artwork release".into())
+    })
+}
+
+#[cfg(any(windows, test))]
+fn artwork_result_is_pending(line: &[u8], pending: &PendingArtwork, nonce: Option<&str>) -> bool {
+    let Ok(message) = serde_json::from_slice::<serde_json::Value>(line) else {
+        return false;
+    };
+    nonce.is_some()
+        && message.get("type").and_then(|v| v.as_str()) == Some("artworkResult")
+        && message.get("requestId").and_then(|v| v.as_str()) == Some(pending.request_id.as_str())
+        && message.get("transferId").and_then(|v| v.as_str()) == Some(pending.transfer_id.as_str())
+        && message.get("nonce").and_then(|v| v.as_str()) == nonce
+        && message.get("success").and_then(|v| v.as_bool()) == Some(false)
+        && message.get("error").and_then(|v| v.as_str()) == Some("artwork_pending")
+}
+
+#[cfg(any(windows, test))]
+fn parse_artwork_result(
+    line: &[u8],
+    pending: &PendingArtwork,
+    nonce: Option<&str>,
+) -> Option<Result<ArtworkChunk, String>> {
+    let message: serde_json::Value = serde_json::from_slice(line).ok()?;
+    if message.get("type")?.as_str()? != "artworkResult"
+        || message.get("requestId")?.as_str()? != pending.request_id
+        || message.get("nonce")?.as_str() != nonce
+        || message.get("transferId")?.as_str()? != pending.transfer_id
+        || nonce.is_none()
+    {
+        return None;
+    }
+    if message.get("success").and_then(|v| v.as_bool()) != Some(true) {
+        return Some(Err("Playnite extension rejected artwork request".into()));
+    }
+    let parsed = (|| {
+        if message.get("id")?.as_str()? != pending.game_id
+            || message.get("revision")?.as_str()? != pending.revision
+        {
+            return None;
+        }
+        let offset = usize::try_from(message.get("offset")?.as_u64()?).ok()?;
+        let total_bytes = usize::try_from(message.get("total_bytes")?.as_u64()?).ok()?;
+        let mime_type = message.get("mime_type")?.as_str()?;
+        let data = message.get("data")?.as_str()?;
+        if offset != pending.offset
+            || total_bytes == 0
+            || total_bytes > ARTWORK_MAX_BYTES
+            || offset >= total_bytes
+            || !matches!(mime_type, "image/png" | "image/jpeg" | "image/webp")
+        {
+            return None;
+        }
+        let expected = (total_bytes - offset).min(ARTWORK_CHUNK_BYTES);
+        if !valid_artwork_base64(data, expected) {
+            return None;
+        }
+        Some(ArtworkChunk {
+            mime_type: mime_type.to_owned(),
+            total_bytes,
+            offset,
+            data_base64: data.to_owned(),
+        })
+    })();
+    Some(parsed.ok_or_else(|| "Invalid Playnite artwork response".to_owned()))
+}
+
+#[cfg(any(windows, test))]
+fn valid_artwork_base64(data: &str, bytes: usize) -> bool {
+    let encoded = data.as_bytes();
+    if encoded.len() != bytes.div_ceil(3) * 4 {
+        return false;
+    }
+    let padding = (3 - bytes % 3) % 3;
+    let split = encoded.len() - padding;
+    encoded[..split]
+        .iter()
+        .all(|c| c.is_ascii_alphanumeric() || *c == b'+' || *c == b'/')
+        && encoded[split..].iter().all(|c| *c == b'=')
 }
 
 #[cfg(windows)]
@@ -1721,6 +2173,109 @@ mod tests {
         assert_eq!(
             apply_game_status("gameStopped", &mut started, true),
             Some(State::Stopped)
+        );
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod artwork_tests {
+    use super::{
+        PendingArtwork, artwork_request_line, artwork_result_is_pending,
+        parse_artwork_release_result, parse_artwork_result, valid_artwork_request,
+    };
+
+    #[test]
+    fn artwork_read_wire_carries_refresh_flag() {
+        for refresh in [false, true] {
+            let line = artwork_request_line("request", "game", "revision", 0, "transfer", refresh)
+                .unwrap();
+            let payload: serde_json::Value = serde_json::from_slice(&line).unwrap();
+            assert_eq!(payload["refresh"], refresh);
+            assert_eq!(payload["transferId"], "transfer");
+        }
+    }
+
+    #[test]
+    fn release_ack_requires_nonce_request_and_transfer() {
+        let line = br#"{"type":"artworkReleaseResult","requestId":"req","nonce":"nonce","transferId":"transfer","success":true}"#;
+        assert!(matches!(
+            parse_artwork_release_result(line, "req", "transfer", Some("nonce")),
+            Some(Ok(()))
+        ));
+        assert!(parse_artwork_release_result(line, "req", "other", Some("nonce")).is_none());
+        assert!(parse_artwork_release_result(line, "req", "transfer", Some("old")).is_none());
+        assert!(parse_artwork_release_result(line, "other", "transfer", Some("nonce")).is_none());
+    }
+
+    #[test]
+    fn artwork_responses_require_matching_identity_and_bounded_chunks() {
+        let id = "00000000-0000-0000-0000-000000000001";
+        let revision = "a".repeat(64);
+        let pending = PendingArtwork {
+            request_id: "request".into(),
+            game_id: id.into(),
+            revision: revision.clone(),
+            offset: 0,
+            transfer_id: "a".repeat(32),
+        };
+        let pending_line = br#"{"type":"artworkResult","requestId":"request","transferId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","nonce":"current","success":false,"error":"artwork_pending"}"#;
+        assert!(artwork_result_is_pending(
+            pending_line,
+            &pending,
+            Some("current")
+        ));
+        assert!(!artwork_result_is_pending(
+            pending_line,
+            &pending,
+            Some("old")
+        ));
+        assert!(valid_artwork_request(id, &revision, 0));
+        assert!(!valid_artwork_request(id, &revision, 1));
+        let mut response = serde_json::json!({"type":"artworkResult", "requestId":"request", "nonce":"current", "transferId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "success":true, "id":id, "revision":revision, "offset":0, "total_bytes":3, "mime_type":"image/png", "data":"YWJj"});
+        let line = serde_json::to_vec(&response).unwrap();
+        let chunk = parse_artwork_result(&line, &pending, Some("current"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                chunk.offset,
+                chunk.total_bytes,
+                chunk.mime_type.as_str(),
+                chunk.data_base64.as_str()
+            ),
+            (0, 3, "image/png", "YWJj")
+        );
+        assert!(parse_artwork_result(&line, &pending, Some("old")).is_none());
+        response["transferId"] = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+        assert!(
+            parse_artwork_result(
+                &serde_json::to_vec(&response).unwrap(),
+                &pending,
+                Some("current")
+            )
+            .is_none()
+        );
+        response["transferId"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+        response["total_bytes"] = (16 * 1024 * 1024 + 1).into();
+        assert!(
+            parse_artwork_result(
+                &serde_json::to_vec(&response).unwrap(),
+                &pending,
+                Some("current")
+            )
+            .unwrap()
+            .is_err()
+        );
+        response["total_bytes"] = 3.into();
+        response["data"] = "!!!?".into();
+        assert!(
+            parse_artwork_result(
+                &serde_json::to_vec(&response).unwrap(),
+                &pending,
+                Some("current")
+            )
+            .unwrap()
+            .is_err()
         );
     }
 }

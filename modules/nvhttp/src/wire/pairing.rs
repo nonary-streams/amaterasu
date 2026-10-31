@@ -458,7 +458,10 @@ impl Router {
                 }
                 None
             }
-            Purpose::Cleanup | Purpose::Applications { .. } => None,
+            Purpose::Cleanup
+            | Purpose::Applications { .. }
+            | Purpose::Artwork { .. }
+            | Purpose::ArtworkRelease { .. } => None,
         }
     }
 

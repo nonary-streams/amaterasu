@@ -181,7 +181,7 @@ fn broker_delegates_artwork_to_real_lutris_handler_and_denies_direct_nvhttp() {
         "amaterasu.nvhttp",
         request(
             "amaterasu.library/1",
-            json!({"action":"artwork_read","id":"app-0000000000000001","revision":null,"offset":0}),
+            json!({"action":"artwork_read","id":"app-0000000000000001","revision":null,"offset":0,"transfer_id":"0123456789abcdef0123456789abcdef"}),
             "delegated",
             None,
         ),
@@ -221,16 +221,28 @@ fn broker_delegates_artwork_to_real_lutris_handler_and_denies_direct_nvhttp() {
             assert_eq!(initiator, "amaterasu.nvhttp");
             lutris.handle_request(id, &caller, payload).unwrap();
         }
-        if let Response::Result { payload } = broker
+        let result = broker
             .borrow_mut()
-            .dispatch("amaterasu.nvhttp", Command::TakeResult { request: parent })
-        {
+            .dispatch("amaterasu.nvhttp", Command::TakeResult { request: parent });
+        if let Response::Result { payload } = result {
             assert_eq!(payload["ok"], true, "{payload}");
             assert_eq!(payload["mime_type"], "image/png");
-            // SAFETY: module is destroyed before its library, endpoint and broker.
-            unsafe { (api.destroy)(instance) };
-            std::fs::remove_dir_all(root).unwrap();
-            return;
+            let release = accepted(broker.borrow_mut().dispatch("amaterasu.nvhttp", request("amaterasu.library/1", json!({"action":"artwork_release","id":"app-0000000000000001","transfer_id":"0123456789abcdef0123456789abcdef"}), "release", None)));
+            for _ in 0..8 {
+                // SAFETY: instance remains live through each synchronous tick.
+                assert_eq!(unsafe { (api.tick)(instance) }, STATUS_OK);
+                let released = broker
+                    .borrow_mut()
+                    .dispatch("amaterasu.nvhttp", Command::TakeResult { request: release });
+                if let Response::Result { payload } = released {
+                    assert_eq!(payload, json!({"ok":true}));
+                    // SAFETY: module is destroyed before its library, endpoint and broker.
+                    unsafe { (api.destroy)(instance) };
+                    std::fs::remove_dir_all(root).unwrap();
+                    return;
+                }
+            }
+            panic!("artwork release did not complete");
         }
     }
     panic!("artwork request did not complete");

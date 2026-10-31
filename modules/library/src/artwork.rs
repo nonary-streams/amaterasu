@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 const CHUNK: u64 = 8192;
 const MAX_ARTWORK: u64 = 16 * 1024 * 1024;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(tag = "provider", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Artwork {
     Steam { app_id: u32, revision: String },
@@ -26,6 +26,7 @@ impl Artwork {
         &self,
         expected: Option<&str>,
         offset: u64,
+        transfer_id: &str,
     ) -> Option<(&'static str, Value)> {
         if expected.is_some_and(|value| value != self.revision()) {
             return None;
@@ -51,7 +52,7 @@ impl Artwork {
             {
                 Some((
                     "amaterasu.playnite/1",
-                    json!({"action":"artwork_read","game_id":game_id,"revision":revision,"offset":offset}),
+                    json!({"action":"artwork_read","game_id":game_id,"revision":revision,"offset":offset,"transfer_id":transfer_id}),
                 ))
             }
             _ => None,

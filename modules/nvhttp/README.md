@@ -560,8 +560,9 @@ also falls back (`:556-562`).
 
 Pairing (`nvpairingmanager.cpp:233-366`): `paired`, `plaincert`, `challengeresponse`,
 `pairingsecret`, then HTTPS `pairchallenge`; the query carries `devicename` and
-`updateState`, both accepted. `/appasset` returns 404, which the client tolerates
-(`boxartmanager.cpp:113-115`).
+`updateState`, both accepted. `/appasset` requires paired TLS and list permission.
+It uses the library broker for exported, revision-pinned provider chunks, with a 16 MiB limit. Missing or unavailable
+artwork returns 404, which the client tolerates (`boxartmanager.cpp:113-115`).
 
 Not verified here: the RTSP/UDP legs after `LiStartConnection`, which the RTSP,
 video, audio and input modules own; that `sessionUrl0` names an address a LAN client

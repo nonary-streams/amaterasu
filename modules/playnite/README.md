@@ -6,6 +6,17 @@ persisted by `amaterasu.configuration`; older documents without
 `autosync_remove_uninstalled` load with its host default of `true`, and a
 settings update that omits the optional field preserves its stored value.
 
+Playnite cover artwork is scanned outside the UI thread with a rotating,
+bounded scan. A completed image produces an opaque SHA-256 revision; a missing
+cover clears its reference, while a failed or unfinished scan preserves the
+previous reference. Reads use revision-pinned 8 KiB chunks and accept PNG,
+JPEG, and WebP signatures up to 16 MiB. The isolated scanner uses a bounded
+cache; evicted images are unavailable until rescanned. A slow file open can
+strand the scanner without blocking Playnite commands, and a restarted provider
+must rescan an image before serving it. Artwork transfers use opaque tokens and
+explicit release, with idle expiry and bounded release fences after disconnects.
+Windows Playnite and the extension tests have not been qualified in this build.
+
 `sync_categories` and `exclude_categories` compare category names after ASCII
 lowercase, so matching is case-insensitive for ASCII letters while non-ASCII
 characters remain distinct (for example, the Kelvin sign `K` does not match

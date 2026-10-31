@@ -605,6 +605,7 @@ dependencies = [
  "amaterasu-module-sdk",
  "amaterasu-network-policy",
  "amaterasu-upnp",
+ "base64 0.22.1",
  "getrandom 0.3.4",
  "httparse",
  "pem-rfc7468",
