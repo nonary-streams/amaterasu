@@ -54,6 +54,8 @@ class ProfileActionPolicyTest(unittest.TestCase):
                         self.component, True)
         settings = bootstrap["policy"]["settings"]
         self.assertEqual(settings[profile.LIFECYCLE]["input_actions"], [action_id])
+        self.assertIn(profile.LIFECYCLE_SERVICE,
+                      bootstrap["policy"]["principals"][profile.LIFECYCLE]["call"])
         descriptor_policy = settings[profile.REGISTRY]["descriptors"][0]
         self.assertTrue(any(grant["caller"] == profile.ACTIONS and grant["read"]
                             for grant in descriptor_policy["grants"]))

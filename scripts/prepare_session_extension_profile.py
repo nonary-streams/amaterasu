@@ -95,7 +95,7 @@ def prepare(bootstrap: dict, root: Path, descriptor: dict, descriptor_digest: st
         for identity in parent_chain
     }
     calls.update({
-        LIFECYCLE: ["amaterasu.launch/1", "amaterasu.input/1", REGISTRY_SERVICE, PROVIDER_SERVICE,
+        LIFECYCLE: ["amaterasu.launch/1", "amaterasu.input/1", LIFECYCLE_SERVICE, REGISTRY_SERVICE, PROVIDER_SERVICE,
                     STATE, "amaterasu.display/1", "amaterasu.virtual-display/1"],
         REGISTRY: [LIFECYCLE_SERVICE, STATE, PROVIDER_SERVICE],
         ACTIONS: [LIFECYCLE_SERVICE, REGISTRY_SERVICE, STATE, PROVIDER_SERVICE],
