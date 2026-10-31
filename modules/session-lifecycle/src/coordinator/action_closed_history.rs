@@ -30,6 +30,55 @@ impl ClosedActionBook {
             })
     }
 
+    /// Resolve a certified released root for exact coordinator reprepare.
+    /// The retained root and cursor are independently rechecked on each call.
+    pub(super) fn released_disposition(
+        &self,
+        journal: &Journal,
+        session_id: &str,
+        owner: &str,
+        generation: u64,
+    ) -> Option<action_disposition::ResolvedDisposition> {
+        if !self.validate() {
+            return None;
+        }
+        let mut records = self.records.iter().filter(|record| {
+            record.owner == owner && record.resource_generation == generation
+                && matches!(&record.session_target, LifecycleTarget::Session { session_id: id, .. } if id == session_id)
+        });
+        let record = records.next()?;
+        if records.next().is_some() {
+            return None;
+        }
+        let session = journal.sessions.get(session_id)?;
+        if session
+            .resource_generations
+            .get(owner)
+            .is_none_or(|current| *current < generation)
+        {
+            return None;
+        }
+        let mut roots = journal.composition.records().filter(|root| {
+            root.admission_id == record.retired_admission
+                && root.transition_id == record.retired_transition
+                && root.output == record.retired_root
+                && root.state == composition::OutputState::Released
+        });
+        let root = roots.next()?;
+        if roots.next().is_some()
+            || resource_generation::historical_generation(journal, root).ok() != Some(generation)
+        {
+            return None;
+        }
+        Some(action_disposition::ResolvedDisposition {
+            session_target: record.session_target.clone(),
+            owner: owner.into(),
+            resource_generation: generation,
+            resource: record.retired_root.resource.clone(),
+            root_admission_id: record.retired_admission.clone(),
+        })
+    }
+
     /// Recover the immutable old root only as read-only historical evidence.
     pub(super) fn historical_root(
         &self,
@@ -140,6 +189,77 @@ pub(super) struct ClosedActionCertificate {
     dispatch_commitment: String,
 }
 
+/// Atomically checkpoint each fully completed action and its stream proof on
+/// a private clone. Any missing proof, live reference, or full fence budget
+/// leaves the original marker and every source book unchanged.
+pub(super) fn compact_released_actions(journal: &mut Journal) {
+    let candidates: Vec<_> = journal
+        .action_dispositions
+        .values()
+        .filter_map(|marker| {
+            let LifecycleTarget::Session { session_id, .. } = &marker.session_target else {
+                return None;
+            };
+            Some((
+                session_id.clone(),
+                marker.owner.clone(),
+                marker.resource_generation,
+            ))
+        })
+        .collect();
+    for (session, owner, generation) in candidates {
+        let _ = compact_one_released_action(journal, &session, &owner, generation);
+    }
+}
+
+fn compact_one_released_action(
+    journal: &mut Journal,
+    session_id: &str,
+    owner: &str,
+    generation: u64,
+) -> ModuleResult<()> {
+    let marker = action_disposition::verified_marker_at(journal, session_id, owner, generation)
+        .ok_or("action_marker_unproven")?
+        .clone();
+    let transfer = marker
+        .cleanup_work
+        .action_transfer
+        .as_ref()
+        .ok_or("action_transfer_missing")?;
+    let session = journal.sessions.get(session_id).ok_or("unknown_session")?;
+    if session.phase != SessionPhase::Paused
+        || session.application_retired
+        || session
+            .streams
+            .values()
+            .any(|stream| stream.phase != StreamPhase::Retired)
+    {
+        return Err("action_checkpoint_not_quiescent".into());
+    }
+    let mut next = journal.clone();
+    let mut book = next.closed_actions.clone();
+    book.insert_verified(&next, session_id, owner, generation)?;
+    next.closed_actions = book;
+    next.actions
+        .retire_certified_success(&transfer.service, &marker.permit, &marker.binding)
+        .map_err(|_| "action_retirement_unavailable")?;
+    let key = action_disposition::marker_key(session_id, owner, generation);
+    if next.action_dispositions.remove(&key).is_none() {
+        return Err("action_marker_changed".into());
+    }
+    match closed_stream::retire_closed_stream(
+        &mut next,
+        &marker.cleanup_work.target,
+        &marker.cleanup_work.transition_id,
+    )? {
+        closed_stream::RetirementOutcome::Retired => {}
+        closed_stream::RetirementOutcome::NotReady => return Err("action_stream_not_ready".into()),
+    }
+    validate_journal(&next).map_err(|_| "action_checkpoint_invalid")?;
+    *journal = next;
+    Ok(())
+}
+
 fn commitment(value: &impl Serialize) -> Option<String> {
     Some(format!(
         "{:x}",
@@ -189,7 +309,6 @@ impl ClosedActionCertificate {
             && scope
             && valid_id(&self.owner)
             && valid_id(&self.caller)
-            && valid_id(&self.replacement_admission)
             && valid_id(&self.retired_admission)
             && valid_id(&self.retired_transition)
             && self.closed_admissions.len() <= 128
@@ -203,11 +322,15 @@ impl ClosedActionCertificate {
             && valid_id(&self.binding.source.caller)
             && valid_id(&self.binding.source.initiator)
             && digest(&self.binding.plan_digest)
-            && digest(&self.replacement_commitment)
             && digest(&self.permit_commitment)
             && digest(&self.dispatch_commitment)
             && self.resource_generation > 0
-            && self.replacement_generation > self.resource_generation
+            && ((self.replacement_generation == 0
+                && self.replacement_admission.is_empty()
+                && self.replacement_commitment.is_empty())
+                || (self.replacement_generation > self.resource_generation
+                    && valid_id(&self.replacement_admission)
+                    && digest(&self.replacement_commitment)))
     }
     /// Construct only while the full source marker and replacement root are
     /// present and independently authenticated. This does not modify either.
@@ -240,21 +363,37 @@ impl ClosedActionCertificate {
             .resource_generations
             .get(owner)
             .ok_or("replacement_generation_missing")?;
-        if current <= generation {
-            return Err("replacement_generation_missing".into());
+        if current < generation {
+            return Err("replacement_generation_invalid".into());
         }
         let mut roots = journal.composition.records().filter(|root| {
             root.output.origin == marker.session_target
                 && root.output.producer == owner
                 && root.state == composition::OutputState::Retained
         });
-        let replacement = roots.next().ok_or("replacement_root_missing")?;
-        if roots.next().is_some()
-            || resource_generation::current_root_generation(journal, replacement).ok()
-                != Some(current)
-        {
-            return Err("replacement_root_unproven".into());
+        let replacement = roots.next();
+        if roots.next().is_some() {
+            return Err("replacement_root_ambiguous".into());
         }
+        let (replacement_generation, replacement_admission, replacement_commitment) =
+            if current == generation {
+                if replacement.is_some() {
+                    return Err("replacement_root_unexpected".into());
+                }
+                (0, String::new(), String::new())
+            } else {
+                let replacement = replacement.ok_or("replacement_root_missing")?;
+                if resource_generation::current_root_generation(journal, replacement).ok()
+                    != Some(current)
+                {
+                    return Err("replacement_root_unproven".into());
+                }
+                (
+                    current,
+                    replacement.admission_id.clone(),
+                    commitment(replacement).ok_or("replacement_commitment_invalid")?,
+                )
+            };
         let transfer = marker
             .cleanup_work
             .action_transfer
@@ -299,10 +438,9 @@ impl ClosedActionCertificate {
             retired_transition: old_root.transition_id.clone(),
             closed_admissions,
             retired_root: old_root.output.clone(),
-            replacement_generation: current,
-            replacement_admission: replacement.admission_id.clone(),
-            replacement_commitment: commitment(replacement)
-                .ok_or("replacement_commitment_invalid")?,
+            replacement_generation,
+            replacement_admission,
+            replacement_commitment,
             caller: transfer.service.clone(),
             binding: marker.binding.clone(),
             permit_commitment: commitment(&marker.permit).ok_or("permit_commitment_invalid")?,
@@ -507,6 +645,33 @@ mod tests {
         );
         drop(coordinator);
         std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn pending_replacement_is_distinct_from_a_partially_claimed_replacement() {
+        let mut cert = certificate();
+        cert.replacement_generation = 0;
+        cert.replacement_admission.clear();
+        cert.replacement_commitment.clear();
+        assert!(cert.valid_shape());
+        cert.replacement_admission = "unproven".into();
+        assert!(!cert.valid_shape());
+        cert.replacement_admission.clear();
+        cert.replacement_generation = cert.resource_generation;
+        assert!(!cert.valid_shape());
+    }
+
+    #[test]
+    fn absent_marker_leaves_every_book_unchanged() {
+        let mut journal: Journal = serde_json::from_value(
+            json!({"version":3,"host_epoch":"epoch","receipts":{},"sessions":{}}),
+        )
+        .unwrap();
+        let before = serde_json::to_value(&journal).unwrap();
+        assert!(compact_one_released_action(&mut journal, "session", "owner", 1).is_err());
+        assert_eq!(serde_json::to_value(&journal).unwrap(), before);
+        compact_released_actions(&mut journal);
+        assert_eq!(serde_json::to_value(&journal).unwrap(), before);
     }
 
     #[test]

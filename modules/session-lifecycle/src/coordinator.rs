@@ -206,7 +206,7 @@ impl Work {
         let Some(expected_generation) = continuation.old_generation.checked_add(1) else {
             return false;
         };
-        let Some(marker) = action_disposition::verified_marker_at(
+        let Some(marker) = action_disposition::resolved_at(
             journal,
             session_id,
             &continuation.owner,
@@ -561,6 +561,7 @@ fn valid_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
 }
 fn save(shared: &Shared, mut next: Journal) -> ModuleResult<()> {
+    action_closed_history::compact_released_actions(&mut next);
     retention::compact(&mut next);
     let mut shared = shared.borrow_mut();
     shared

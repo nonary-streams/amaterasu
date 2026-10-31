@@ -109,7 +109,7 @@ fn required_reprepare(
             }
             continue;
         }
-        let marker = action_disposition::verified_marker(journal, &session.id, owner)
+        let marker = action_disposition::resolved_at(journal, &session.id, owner, generation)
             .ok_or("resource_removal_proof_missing")?;
         if marker.resource_generation != generation
             || marker.owner != *owner

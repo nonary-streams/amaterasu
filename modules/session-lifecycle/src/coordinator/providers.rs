@@ -2278,7 +2278,7 @@ impl Coordinator {
         }
         drop(finalize_owners);
         if let Some(continuation) = &work.reprepare {
-            let marker = super::action_disposition::verified_marker_at(
+            let marker = super::action_disposition::resolved_at(
                 &next,
                 id,
                 &continuation.owner,

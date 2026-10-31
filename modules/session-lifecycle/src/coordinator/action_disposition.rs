@@ -23,6 +23,42 @@ pub(super) struct ReleasedActionMarker {
     pub cleanup_work: Work,
 }
 
+pub(super) struct ResolvedDisposition {
+    pub session_target: LifecycleTarget,
+    pub owner: String,
+    pub resource_generation: u64,
+    pub resource: ResourceRef,
+    pub root_admission_id: String,
+}
+
+/// Full marker or compact, independently verified read-only equivalent.
+pub(super) fn resolved_at(
+    journal: &Journal,
+    session_id: &str,
+    owner: &str,
+    generation: u64,
+) -> Option<ResolvedDisposition> {
+    if let Some(marker) = verified_marker_at(journal, session_id, owner, generation) {
+        if journal
+            .closed_actions
+            .released_disposition(journal, session_id, owner, generation)
+            .is_some()
+        {
+            return None;
+        }
+        return Some(ResolvedDisposition {
+            session_target: marker.session_target.clone(),
+            owner: marker.owner.clone(),
+            resource_generation: marker.resource_generation,
+            resource: marker.resource.clone(),
+            root_admission_id: marker.root_admission_id.clone(),
+        });
+    }
+    journal
+        .closed_actions
+        .released_disposition(journal, session_id, owner, generation)
+}
+
 pub(super) fn marker_key(session_id: &str, owner: &str, generation: u64) -> String {
     serde_json::to_string(&(session_id, owner, generation)).expect("marker key serializes")
 }
