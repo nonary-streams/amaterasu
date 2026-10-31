@@ -66,6 +66,9 @@ def check_provider(descriptor: dict, component: dict, approvals: list, provider:
     requested = component.get("requested")
     if not isinstance(requested, dict) or requested.get("provide") != [service]:
         raise ValueError("provider must request exactly its selected v2 service")
+    allowed_grants = {"provide", "call", "native_provide", "native_use", "publish", "subscribe", "hook"}
+    if not set(requested) <= allowed_grants or any(requested.get(name, []) != [] for name in allowed_grants - {"provide", "call"}):
+        raise ValueError("provider requested unexpected non-service grants")
     calls = requested.get("call", [])
     if not isinstance(calls, list) or any(not isinstance(call, str) for call in calls) or len(calls) != len(set(calls)) or set(calls) != PROVIDER_CALLS[provider]:
         raise ValueError("provider requested unexpected service calls")

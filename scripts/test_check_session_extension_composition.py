@@ -45,6 +45,15 @@ class CompositionPreflightTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unexpected service calls"):
             self.check()
 
+    def test_extra_native_or_unknown_grants_fail(self):
+        self.component["requested"]["native_use"] = ["unexpected.native/1"]
+        with self.assertRaisesRegex(ValueError, "non-service grants"):
+            self.check()
+        self.component["requested"]["native_use"] = []
+        self.component["requested"]["unknown"] = []
+        with self.assertRaisesRegex(ValueError, "non-service grants"):
+            self.check()
+
     def test_missing_extra_and_duplicate_approval_fail(self):
         removed = self.approvals.pop()
         with self.assertRaisesRegex(ValueError, "incomplete"):
