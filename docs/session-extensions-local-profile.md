@@ -126,7 +126,9 @@ default. The preparer signs and verifies the package but does not stage, activat
 install, or start it. Run it with `--help` for its arguments. Signed default and
 action-opt-in profiles have passed isolated host startup and discovery with both
 providers disabled and native effects disabled. The opt-in grants target streams;
-startup alone does not establish live display or hardware behavior.
+the startup checks did not invoke actions. The host runtime must implement the
+matching `HostStateContext` ABI used by the providers. Startup alone does not
+establish live display or hardware behavior.
 
 The intended upgrade starts with a fresh isolated profile. Preserve the old
 registry document or an export of it, and retire any old virtual resources
