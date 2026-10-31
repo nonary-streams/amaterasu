@@ -25,6 +25,8 @@ mod capture_events;
 pub use capture_events::*;
 mod frame_resource;
 pub use frame_resource::*;
+mod frame_metadata;
+pub use frame_metadata::*;
 mod encoder_provider;
 pub use encoder_provider::*;
 mod encoder_input_pool;

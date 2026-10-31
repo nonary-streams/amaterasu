@@ -14,6 +14,14 @@ _Static_assert(offsetof(AmaterasuFrameResourceProcessorApi, enumerate_outputs) =
 _Static_assert(sizeof(AmaterasuFrameDescriptor) == 40, "resource descriptor layout");
 _Static_assert(sizeof(AmaterasuCaptureResourceOffer) == 144, "resource offer layout");
 _Static_assert(sizeof(AmaterasuCaptureResourceFrame) == 248, "resource frame layout");
+_Static_assert(sizeof(AmaterasuFrameResourceMetadataFrameV1) == 272, "metadata frame layout");
+_Static_assert(sizeof(AmaterasuFrameMetadataSchemaId) == 24, "metadata schema layout");
+_Static_assert(sizeof(AmaterasuFrameMetadataCapabilityV1) == 32, "metadata capability layout");
+_Static_assert(sizeof(AmaterasuFrameMetadataCapabilitiesApiV1) == 40, "metadata capabilities table layout");
+_Static_assert(offsetof(AmaterasuFrameResourceMetadataFrameV1, frame) == 8, "metadata frame offset");
+_Static_assert(offsetof(AmaterasuCaptureApiV1_10, read_resource_frame_with_metadata) == sizeof(AmaterasuCaptureApiV1_9), "capture metadata tail");
+_Static_assert(offsetof(AmaterasuFrameResourceConsumerApiV1_1, submit_with_metadata) == sizeof(AmaterasuFrameResourceConsumerApi), "consumer metadata tail");
+_Static_assert(offsetof(AmaterasuFrameResourceProcessorApiV1_2, process_with_metadata) == sizeof(AmaterasuFrameResourceProcessorApi), "processor metadata tail");
 _Static_assert(sizeof(AmaterasuFrameColorMetadata) == 24, "frame color metadata layout");
 _Static_assert(sizeof(AmaterasuFrameClockMetadata) == 32, "frame clock metadata layout");
 _Static_assert(sizeof(AmaterasuNativeInterfaceQuery) == 24, "native query layout");

@@ -23,5 +23,8 @@ serde_json.workspace = true
 sha2.workspace = true
 ureq = { version = "=3.4.2", default-features = false, features = ["rustls", "platform-verifier"], optional = true }
 
+[dev-dependencies]
+libloading.workspace = true
+
 [lints]
 workspace = true

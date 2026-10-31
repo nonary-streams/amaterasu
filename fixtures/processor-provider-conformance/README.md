@@ -12,3 +12,14 @@ PROCESSOR_FIXTURE_PQ=/tmp/amaterasu-processor-fixtures/debug/libprocessor_fixtur
 PROCESSOR_FIXTURE_SRGB=/tmp/amaterasu-processor-fixtures/debug/libprocessor_fixture_srgb.so \
 cargo test -p amaterasu-video --offline --locked unchanged_video_plane_loads_two_processor_provider_artifacts -- --ignored
 ```
+
+The same fixture libraries also expose a metadata-capability table and v1.2
+processor tail. This additional check uses one unchanged SDK metadata consumer,
+verifies generation and passthrough, retries a busy sink, and confirms copied
+bytes outlive the callback. It does not exercise a production metadata pump.
+
+```sh
+PROCESSOR_FIXTURE_PQ=/tmp/amaterasu-processor-fixtures/debug/libprocessor_fixture_pq.so \
+PROCESSOR_FIXTURE_SRGB=/tmp/amaterasu-processor-fixtures/debug/libprocessor_fixture_srgb.so \
+cargo test -p amaterasu-module-sdk --offline --locked --test frame_metadata unchanged_metadata_consumer_propagates_two_provider_artifacts -- --ignored
+```

@@ -48,6 +48,7 @@ pub unsafe fn bind_frame_resource_processor(
 
 mod generic;
 mod lease;
+pub mod metadata;
 use amaterasu_abi::{STATUS_INVALID_ARGUMENT, Status};
 use amaterasu_media::{CpuFrame, frame_size};
 pub use generic::{BorrowedResourceFrame, OwnedResourceCpuFrame, RetainedResourceFrame};
