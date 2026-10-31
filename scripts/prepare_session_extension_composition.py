@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Prepare an opt-in two-provider Linux session package in new paths.
 
-The v2 runtime gate currently refuses preparation until coordinator dispatch,
-owner control/finalization and old-owner safety are implemented and qualified.
+The v2 runtime gate currently refuses preparation until coordinator dispatch
+and owner control/finalization are implemented and qualified.
 No activation, installation, service restart, or desktop operation is performed.
 """
 from __future__ import annotations
@@ -48,7 +48,7 @@ def validated_selection(publisher: Path, repo: Path, library: Path, provider: st
 def validated_runtime_configuration() -> dict:
     # The current lifecycle runtime rejects composition v2. Do not let a caller
     # opt out of this gate or provide a self-asserted support flag.
-    raise RuntimeError("split composition runtime and old-owner safety are not yet qualified")
+    raise RuntimeError("split composition runtime is not yet qualified")
 
 
 def pack_profile(publisher: Path, root: Path, artifacts: Path, package: Path, sequence: int,
@@ -56,7 +56,7 @@ def pack_profile(publisher: Path, root: Path, artifacts: Path, package: Path, se
                  enable_action: bool = False) -> None:
     """Construct and verify a development package from already validated inputs.
 
-    Invoked only after a release-controlled runtime and old-owner safety gate.
+    Invoked only after the release-controlled runtime qualification gate.
     The caller must validate lifecycle policy, selected method digests and all
     artifacts before reaching this function. Component snapshots and digest
     checks prevent packaging bytes different from those approved at preflight.
