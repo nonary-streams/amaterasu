@@ -117,6 +117,13 @@ resource identity under fresh owner authorization. It never replays an unknown
 preparation. Missing receipts, uncertain native effects, or unconfirmed retirement
 remain `recovery_required`; that state is not successful restoration.
 
+A failed or rejected preparation callback does not establish that its effects
+were absent or cleaned up. Its admission remains held for recovery. A known
+partial preparation cannot currently settle as a clean failure; that requires
+explicit enrollment of its scoped cleanup obligations. For example, confirming
+a resize after an interrupted stream preparation does not publish a new stream
+or release the preparation's rights.
+
 ## Validation
 
 Run the focused suites with:
