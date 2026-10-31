@@ -241,6 +241,9 @@ pub struct BindingConstraint {
     pub execution_domain: String,
     pub mode: Option<VideoMode>,
     pub plan_revision: u64,
+    /// Frozen geometry observation for candidate validation; absent in v1 plans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry_revision: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -679,6 +682,7 @@ pub fn validate_resource_plan(plan: &ResourcePlan) -> Result<(), String> {
             || !valid_opaque_id(&binding.resource_id)
             || !valid_opaque_id(&binding.execution_domain)
             || binding.plan_revision != plan.revision
+            || binding.geometry_revision == Some(0)
             || binding
                 .incarnation
                 .as_ref()
@@ -861,6 +865,10 @@ pub fn validate_provider_response(
             validate_consumer_requirements(plan, &request.consumer_requirements)?;
             let output = &request.dependency_inputs[0];
             if !plan.control_proposals.is_empty()
+                || plan
+                    .candidate_constraint
+                    .as_ref()
+                    .is_some_and(|constraint| constraint.geometry_revision.is_none())
                 || !plan.resources.iter().any(|resource| {
                     resource.provider == output.resource.provider
                         && resource.resource_id == output.resource.resource_id
@@ -954,6 +962,9 @@ pub fn validate_provider_response(
                     || candidate.resource.resource_id != constraint.resource_id
                     || candidate.resource.execution_domain != constraint.execution_domain
                     || candidate.plan_revision != constraint.plan_revision
+                    || constraint
+                        .geometry_revision
+                        .is_some_and(|revision| candidate.geometry_revision != revision)
                     || constraint
                         .incarnation
                         .as_ref()
@@ -1252,6 +1263,69 @@ mod tests {
         previous.control_results[0].output.resource.revision -= 1;
         previous.control_results[0].output.domain_observations[0].revision -= 1;
         assert!(validate_provider_request(&previous).is_ok());
+
+        let mut capture = plan.clone();
+        capture.candidate_constraint = Some(serde_json::from_value(json!({"capture_provider":"capture","selector_schema":"selector/1","resource_provider":"example.owner","resource_id":"resource","incarnation":"instance","execution_domain":"seat","mode":null,"plan_revision":1})).unwrap());
+        assert!(
+            validate_provider_response(
+                &request,
+                &ProviderResponse::Planned {
+                    plan: capture.clone()
+                }
+            )
+            .is_err()
+        );
+        capture
+            .candidate_constraint
+            .as_mut()
+            .unwrap()
+            .geometry_revision = Some(0);
+        assert!(validate_resource_plan(&capture).is_err());
+        capture
+            .candidate_constraint
+            .as_mut()
+            .unwrap()
+            .geometry_revision = Some(8);
+        assert!(
+            validate_provider_response(
+                &request,
+                &ProviderResponse::Planned {
+                    plan: capture.clone()
+                }
+            )
+            .is_ok()
+        );
+        let mut legacy = request.clone();
+        legacy.version = CONTRACT_VERSION;
+        legacy.operation = ProviderOperation::LifecycleCallback;
+        legacy.dependency_inputs.clear();
+        legacy.control_results.clear();
+        legacy.admission_id = Some("admission".into());
+        legacy.plan_revision = Some(1);
+        legacy.approved_plan = Some(capture);
+        let mut candidate: CaptureBinding = serde_json::from_value(json!({"capture_provider":"capture","selector_schema":"selector/1","selector":{},"resource":resource,"mode":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false},"plan_revision":1,"geometry_revision":9,"generation":2})).unwrap();
+        let prepared = |candidate| ProviderResponse::Prepared {
+            candidate: Some(candidate),
+            obligations: vec![],
+            outputs: vec![],
+        };
+        assert!(validate_provider_response(&legacy, &prepared(candidate.clone())).is_err());
+        candidate.geometry_revision = 8;
+        assert!(validate_provider_response(&legacy, &prepared(candidate)).is_ok());
+        let constraint = legacy
+            .approved_plan
+            .as_mut()
+            .unwrap()
+            .candidate_constraint
+            .as_mut()
+            .unwrap();
+        constraint.geometry_revision = None;
+        assert!(
+            serde_json::to_value(constraint)
+                .unwrap()
+                .get("geometry_revision")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1396,6 +1470,7 @@ mod tests {
             execution_domain: "other-domain".into(),
             mode: None,
             plan_revision: 1,
+            geometry_revision: None,
         });
         assert!(validate_provider_request(&request).is_err());
     }
