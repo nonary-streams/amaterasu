@@ -147,6 +147,91 @@ fn attach_admitted_generations(
 }
 
 impl Coordinator {
+    /// Resolve the newest owner output only from a finalized stage or a verified
+    /// release of that exact stage. The immutable root remains the authority.
+    fn action_owner_output(
+        &self,
+        journal: &Journal,
+        root: &super::composition::StoredOutput,
+        selected_stream: Option<&str>,
+    ) -> ModuleResult<amaterasu_extension_api::ResourceOutput> {
+        let stage = journal.composition.staged_outputs().rfind(|stage| {
+            stage.before.producer == root.output.producer
+                && stage.before.output_id == root.output.output_id
+                && stage.before.origin == root.output.origin
+        });
+        let Some(stage) = stage else {
+            if selected_stream.is_some()
+                || journal
+                    .finalize_results
+                    .records()
+                    .any(|result| result.selection.input == *root)
+            {
+                return Err("owner_stage_missing".into());
+            }
+            return Ok(root.output.clone());
+        };
+        let (_, session_id, Some(stream_id), generation) =
+            super::operations::target_parts(&stage.target)?
+        else {
+            return Err("owner_stage_target_invalid".into());
+        };
+        if selected_stream.is_some_and(|selected| selected != stream_id) {
+            return Err("owner_stage_not_current".into());
+        }
+        let session = journal
+            .sessions
+            .get(session_id)
+            .ok_or("owner_session_missing")?;
+        let stream = session
+            .streams
+            .get(stream_id)
+            .ok_or("owner_stream_missing")?;
+        if stream.generation != generation
+            || stream.binding_owner != root.output.producer
+            || session.streams.iter().any(|(id, other)| {
+                other.binding_owner == root.output.producer
+                    && other.phase == StreamPhase::Active
+                    && id != stream_id
+            })
+        {
+            return Err("owner_stage_stale".into());
+        }
+        let output = if stream.phase == StreamPhase::Retired {
+            journal
+                .verified_released_output(&stage.target)
+                .ok_or("owner_release_unproven")?
+                .1
+                .clone()
+        } else {
+            let mut results = journal
+                .finalize_results
+                .records()
+                .filter(|result| result.request.target == stage.target);
+            let result = results.next().ok_or("owner_finalize_missing")?;
+            if results.next().is_some() || result.selection.input != *root
+                || result.selection.stage.as_ref() != Some(stage)
+                || !result.validate_control_chain(journal)
+                || self.verify_finalize_result(&root.output.producer, json!({
+                    "operation":"verify_finalize_result", "request":result.request, "response":result.applied
+                }))["status"] != "valid"
+            {
+                return Err("owner_finalize_unproven".into());
+            }
+            let amaterasu_extension_api::ResourceControlResponse::Applied { output, .. } =
+                &result.applied
+            else {
+                return Err("owner_finalize_unproven".into());
+            };
+            output.as_ref().clone()
+        };
+        amaterasu_extension_api::validate_output_refinement(&root.output, &output)?;
+        if output.resource.revision < stage.after.resource.revision {
+            return Err("owner_output_stale".into());
+        }
+        Ok(output)
+    }
+
     pub(super) fn describe_action_target(&self, caller: &str, payload: &Value) -> Value {
         match payload.get("version") {
             None | Some(Value::Number(_))
@@ -389,10 +474,13 @@ impl Coordinator {
         else {
             return rejection("owner_output_generation_unavailable");
         };
+        let Ok(owner_output) = self.action_owner_output(journal, record, selected_stream) else {
+            return rejection("owner_output_lineage_unavailable");
+        };
         let Some(snapshot) = session.provider_settings.get(caller) else {
             return rejection("settings_snapshot_missing");
         };
-        let resource = &record.output.resource;
+        let resource = &owner_output.resource;
         if let Some(stream_id) = selected_stream
             && session.streams[stream_id]
                 .candidate
@@ -498,7 +586,7 @@ impl Coordinator {
         let streams: Vec<_> = session.streams.iter().filter(|(_, stream)| stream.binding_owner == caller).map(|(stream_id, stream)| {
             json!({"target":{"kind":"stream","host_epoch":session.host_epoch,"session_id":session.id,"stream_id":stream_id,"expected_generation":stream.generation},"lifecycle_target":{"kind":"stream","host_epoch":session.host_epoch,"session_id":session.id,"stream_id":stream_id,"generation":stream.generation},"phase":stream.phase,"candidate":stream.candidate,"consumers_retired":stream.phase==StreamPhase::Retired || (stream.phase==StreamPhase::Quiescing && stream.retirements==stream.required)})
         }).collect();
-        let result = json!({"version":2,"status":"succeeded","provider":caller,"target":target,"session_target":origin,"execution_domain":resource.execution_domain,"settings_revision":snapshot.revision,"settings":snapshot.settings,"streams":streams,"obligations":metadata["obligations"],"mutation_domains":mutation_domains,"admitted_plans":metadata["admitted_plans"],"resource_targets":metadata["resource_targets"],"stale_mutation_domains":metadata["stale_mutation_domains"],"owner_output":record.output,"resource_generation":resource_generation});
+        let result = json!({"version":2,"status":"succeeded","provider":caller,"target":target,"session_target":origin,"execution_domain":resource.execution_domain,"settings_revision":snapshot.revision,"settings":snapshot.settings,"streams":streams,"obligations":metadata["obligations"],"mutation_domains":mutation_domains,"admitted_plans":metadata["admitted_plans"],"resource_targets":metadata["resource_targets"],"stale_mutation_domains":metadata["stale_mutation_domains"],"owner_output":owner_output,"resource_generation":resource_generation});
         if serde_json::to_vec(&result).map_or(true, |bytes| bytes.len() > 16 * 1024) {
             return rejection("provider_metadata_too_large");
         }
@@ -591,5 +679,32 @@ mod admission_generation_tests {
         assert_eq!(unique_admission_generation(&[Some(1), Some(1)], 1), None);
         assert_eq!(unique_admission_generation(&[Some(1), Some(2)], 1), None);
         assert_eq!(unique_admission_generation(&[Some(0)], 0), None);
+    }
+}
+
+#[cfg(test)]
+mod owner_output_tests {
+    use super::*;
+
+    #[test]
+    fn unproven_stream_never_uses_immutable_root_as_current_output() {
+        let path =
+            std::env::temp_dir().join(format!("action-owner-output-{}", identifier().unwrap()));
+        std::fs::create_dir(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let coordinator = Coordinator::open(&path.join("journal")).unwrap();
+        let selected = super::super::finalize_selection::tests::fixture();
+        let journal = coordinator.shared.borrow().value.clone();
+        assert!(
+            coordinator
+                .action_owner_output(&journal, &selected.input, Some("unknown"))
+                .is_err()
+        );
+        drop(coordinator);
+        std::fs::remove_dir_all(path).unwrap();
     }
 }
