@@ -11,6 +11,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_BINDINGS: usize = 64;
 const MAX_RESERVATIONS: usize = 256;
+// Terminal replies are retained without eviction; admission reserves capacity.
+const MAX_RESERVATION_RECEIPTS: usize = 4096;
+// Leave space in the 1 MiB coordinator journal for its other state. Live
+// records also reserve headroom for a later transfer owner and terminal outcome.
+const MAX_RESERVATION_BYTES: usize = 256 * 1024;
+const TERMINAL_RECORD_HEADROOM: usize = MAX_TEXT + 32;
 const MAX_ACTIONS: usize = 32;
 const MAX_TEXT: usize = 128;
 
@@ -117,8 +123,11 @@ impl std::fmt::Debug for Reservation {
 #[serde(deny_unknown_fields)]
 pub struct InputAuthority {
     bindings: BTreeMap<String, ActiveBinding>,
-    // Durable tombstones prevent operation ID reuse after completion.
+    // Live entries include running, uncertain and unacknowledged terminal work.
     reservations: BTreeMap<String, Reservation>,
+    // Historical receipts are never authority to reserve or dispatch again.
+    #[serde(default)]
+    terminal_receipts: BTreeMap<String, Reservation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -142,32 +151,42 @@ impl InputAuthority {
     pub fn validate(&self) -> bool {
         self.bindings.len() <= MAX_BINDINGS
             && self.reservations.len() <= MAX_RESERVATIONS
+            && self.reservations.len() + self.terminal_receipts.len() <= MAX_RESERVATION_RECEIPTS
+            && self.terminal_receipts.iter().all(|(key, receipt)| {
+                matches!(receipt.outcome, Outcome::Completed | Outcome::Cancelled)
+                    && !self.reservations.contains_key(key)
+            })
             && self
                 .bindings
                 .iter()
                 .all(|(token, binding)| valid_token(token) && binding.valid())
-            && self.reservations.iter().all(|(key, r)| {
-                *key == operation_key(&r.caller, &r.initiator, &r.operation_id)
-                    && valid_token(&r.reservation_id)
-                    && valid_token(&r.token)
-                    && valid_text(&r.operation_id)
-                    && valid_text(&r.caller)
-                    && valid_text(&r.initiator)
-                    && r.binding.valid()
-                    && r.caller == r.binding.input_consumer
-                    && r.binding.allowed_actions.contains(&r.action_id)
-                    && r.target
-                        .as_ref()
-                        .is_none_or(|target| target_matches_binding(target, &r.binding))
-                    && r.transferred_to.as_deref().is_none_or(valid_text)
-            })
+            && self
+                .reservations
+                .iter()
+                .chain(&self.terminal_receipts)
+                .all(|(key, r)| {
+                    *key == operation_key(&r.caller, &r.initiator, &r.operation_id)
+                        && valid_token(&r.reservation_id)
+                        && valid_token(&r.token)
+                        && valid_text(&r.operation_id)
+                        && valid_text(&r.caller)
+                        && valid_text(&r.initiator)
+                        && r.binding.valid()
+                        && r.caller == r.binding.input_consumer
+                        && r.binding.allowed_actions.contains(&r.action_id)
+                        && r.target
+                            .as_ref()
+                            .is_none_or(|target| target_matches_binding(target, &r.binding))
+                        && r.transferred_to.as_deref().is_none_or(valid_text)
+                })
             && self
                 .reservations
                 .values()
+                .chain(self.terminal_receipts.values())
                 .map(|r| &r.reservation_id)
                 .collect::<BTreeSet<_>>()
                 .len()
-                == self.reservations.len()
+                == self.reservations.len() + self.terminal_receipts.len()
     }
 
     /// Only a coordinator-validated active binding and policy-selected consumer
@@ -179,7 +198,14 @@ impl InputAuthority {
         if self.bindings.len() >= MAX_BINDINGS {
             return Err(Error::Capacity);
         }
-        let token = unique_id(|id| self.bindings.contains_key(id))?;
+        let token = unique_id(|id| {
+            self.bindings.contains_key(id)
+                || self
+                    .reservations
+                    .values()
+                    .chain(self.terminal_receipts.values())
+                    .any(|entry| entry.token == id)
+        })?;
         self.bindings.insert(token.clone(), active.clone());
         Ok(token)
     }
@@ -263,6 +289,9 @@ impl InputAuthority {
             return Err(Error::Invalid);
         }
         let key = operation_key(caller, initiator, operation_id);
+        if self.terminal_receipts.contains_key(&key) {
+            return Err(Error::Conflict);
+        }
         if let Some(old) = self.reservations.get(&key) {
             return if old.token == token
                 && old.action_id == action_id
@@ -279,11 +308,17 @@ impl InputAuthority {
         if !binding.allowed_actions.contains(action_id) {
             return Err(Error::Unauthorized);
         }
-        if self.reservations.len() >= MAX_RESERVATIONS {
+        if self.reservations.len() >= MAX_RESERVATIONS
+            || self.reservations.len() + self.terminal_receipts.len() >= MAX_RESERVATION_RECEIPTS
+        {
             return Err(Error::Capacity);
         }
-        let reservation_id =
-            unique_id(|id| self.reservations.values().any(|r| r.reservation_id == id))?;
+        let reservation_id = unique_id(|id| {
+            self.reservations
+                .values()
+                .chain(self.terminal_receipts.values())
+                .any(|r| r.reservation_id == id)
+        })?;
         let reservation = Reservation {
             reservation_id,
             operation_id: operation_id.into(),
@@ -296,6 +331,20 @@ impl InputAuthority {
             outcome: Outcome::Running,
             transferred_to: None,
         };
+        let current_bytes = serde_json::to_vec(&(&self.reservations, &self.terminal_receipts))
+            .map_err(|_| Error::Invalid)?
+            .len();
+        let added_bytes = serde_json::to_vec(&(&key, &reservation))
+            .map_err(|_| Error::Invalid)?
+            .len();
+        let headroom = (self.reservations.len() + 1).saturating_mul(TERMINAL_RECORD_HEADROOM);
+        if current_bytes
+            .saturating_add(added_bytes)
+            .saturating_add(headroom)
+            > MAX_RESERVATION_BYTES
+        {
+            return Err(Error::Capacity);
+        }
         self.reservations.insert(key, reservation.clone());
         Ok(ReservationResult::Admitted(reservation))
     }
@@ -306,8 +355,10 @@ impl InputAuthority {
         initiator: &str,
         operation_id: &str,
     ) -> Result<Reservation, Error> {
+        let key = operation_key(caller, initiator, operation_id);
         self.reservations
-            .get(&operation_key(caller, initiator, operation_id))
+            .get(&key)
+            .or_else(|| self.terminal_receipts.get(&key))
             .cloned()
             .ok_or(Error::NotFound)
     }
@@ -324,24 +375,34 @@ impl InputAuthority {
         if outcome == Outcome::Running {
             return Err(Error::Invalid);
         }
-        let r = self
-            .reservations
-            .get_mut(&operation_key(caller, initiator, operation_id))
-            .ok_or(Error::NotFound)?;
+        let key = operation_key(caller, initiator, operation_id);
+        if let Some(receipt) = self.terminal_receipts.get(&key) {
+            if receipt.reservation_id != reservation_id {
+                return Err(Error::Unauthorized);
+            }
+            return if receipt.outcome == outcome {
+                Ok(receipt.clone())
+            } else {
+                Err(Error::Conflict)
+            };
+        }
+        let r = self.reservations.get_mut(&key).ok_or(Error::NotFound)?;
         if r.reservation_id != reservation_id {
             return Err(Error::Unauthorized);
-        }
-        if r.outcome == outcome {
-            return Ok(r.clone());
         }
         if r.outcome == Outcome::RecoveryRequired {
             return Err(Error::UnknownOutcome);
         }
-        if r.outcome != Outcome::Running {
+        if r.outcome != Outcome::Running && r.outcome != outcome {
             return Err(Error::Conflict);
         }
-        r.outcome = outcome;
-        Ok(r.clone())
+        r.outcome = outcome.clone();
+        let result = r.clone();
+        if matches!(outcome, Outcome::Completed | Outcome::Cancelled) {
+            self.reservations.remove(&key);
+            self.terminal_receipts.insert(key, result.clone());
+        }
+        Ok(result)
     }
 
     /// Lookup of an exact opaque reservation for authenticated coordinator use.
@@ -351,6 +412,7 @@ impl InputAuthority {
         }
         self.reservations
             .values()
+            .chain(self.terminal_receipts.values())
             .find(|reservation| reservation.reservation_id == reservation_id)
             .cloned()
             .ok_or(Error::NotFound)
@@ -611,6 +673,204 @@ mod tests {
             allowed_actions: BTreeSet::from(["display".into()]),
         }
     }
+    #[test]
+    fn finished_input_receipt_is_replayable_but_never_readmitted_or_live() {
+        let mut book = InputAuthority::default();
+        let active = binding();
+        let token = book.issue_input_binding(&active).unwrap();
+        let target = ActionTarget::Stream {
+            host_epoch: "host".into(),
+            session_id: "session".into(),
+            stream_id: "stream".into(),
+            expected_generation: 1,
+        };
+        let ReservationResult::Admitted(reservation) = book
+            .reserve_input_action_for_target(
+                "input", "client", "op", &token, "display", &active, &target,
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            book.finish_input_action("input", "client", "op", "wrong", Outcome::Completed),
+            Err(Error::Unauthorized)
+        );
+        assert!(book.has_any_session_reference("session"));
+        let terminal = book
+            .finish_input_action(
+                "input",
+                "client",
+                "op",
+                &reservation.reservation_id,
+                Outcome::Completed,
+            )
+            .unwrap();
+        book.fence(&active);
+        assert!(!book.has_any_session_reference("session"));
+        let mut restored: InputAuthority =
+            serde_json::from_slice(&serde_json::to_vec(&book).unwrap()).unwrap();
+        assert!(restored.validate());
+        assert_eq!(
+            restored.lookup_input_action("input", "client", "op"),
+            Ok(terminal.clone())
+        );
+        assert_eq!(
+            restored.resolve_reservation(&reservation.reservation_id),
+            Ok(terminal.clone())
+        );
+        assert_eq!(
+            restored.finish_input_action(
+                "input",
+                "client",
+                "op",
+                &reservation.reservation_id,
+                Outcome::Completed
+            ),
+            Ok(terminal)
+        );
+        assert_eq!(
+            restored.finish_input_action(
+                "input",
+                "client",
+                "op",
+                &reservation.reservation_id,
+                Outcome::Cancelled
+            ),
+            Err(Error::Conflict)
+        );
+        assert_eq!(
+            restored.finish_input_action(
+                "foreign",
+                "client",
+                "op",
+                &reservation.reservation_id,
+                Outcome::Completed
+            ),
+            Err(Error::NotFound)
+        );
+        assert_eq!(
+            restored.reserve_input_action_for_target(
+                "input", "client", "op", &token, "display", &active, &target
+            ),
+            Err(Error::Conflict)
+        );
+        assert_eq!(
+            restored.resolve_running_reservation(&reservation.reservation_id),
+            Err(Error::NotFound)
+        );
+        assert!(
+            restored
+                .transfer_reservation(&reservation.reservation_id, "actions", "op", "display")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn acknowledged_receipts_do_not_exhaust_live_reservations() {
+        let mut book = InputAuthority::default();
+        let active = binding();
+        let token = book.issue_input_binding(&active).unwrap();
+        for index in 0..(MAX_RESERVATIONS + 1) {
+            let operation = format!("op-{index}");
+            let ReservationResult::Admitted(reservation) = book
+                .reserve_input_action("input", "client", &operation, &token, "display", &active)
+                .unwrap()
+            else {
+                panic!()
+            };
+            book.finish_input_action(
+                "input",
+                "client",
+                &operation,
+                &reservation.reservation_id,
+                Outcome::Completed,
+            )
+            .unwrap();
+        }
+        assert!(book.reservations.is_empty());
+        assert_eq!(book.terminal_receipts.len(), MAX_RESERVATIONS + 1);
+        assert!(book.validate());
+    }
+
+    #[test]
+    fn receipt_byte_capacity_rejects_before_admission_without_losing_replays() {
+        let mut book = InputAuthority::default();
+        let mut active = binding();
+        active.allowed_actions = (0..32)
+            .map(|index| format!("a{index:02}{}", "x".repeat(120)))
+            .collect();
+        let action = active.allowed_actions.iter().next().unwrap().clone();
+        let token = book.issue_input_binding(&active).unwrap();
+        let mut first = None;
+        let mut failed = false;
+        for index in 0..MAX_RESERVATIONS {
+            let op = format!("op-{index}");
+            match book.reserve_input_action("input", "client", &op, &token, &action, &active) {
+                Ok(ReservationResult::Admitted(reservation)) => {
+                    let receipt = book
+                        .finish_input_action(
+                            "input",
+                            "client",
+                            &op,
+                            &reservation.reservation_id,
+                            Outcome::Completed,
+                        )
+                        .unwrap();
+                    if first.is_none() {
+                        first = Some(receipt);
+                    }
+                }
+                Err(Error::Capacity) => {
+                    failed = true;
+                    break;
+                }
+                other => panic!("unexpected admission: {other:?}"),
+            }
+        }
+        assert!(failed);
+        assert!(book.reservations.is_empty());
+        assert_eq!(
+            book.lookup_input_action("input", "client", "op-0"),
+            Ok(first.unwrap())
+        );
+        assert!(book.validate());
+    }
+
+    #[test]
+    fn uncertain_reservation_never_moves_to_terminal_receipts() {
+        let mut book = InputAuthority::default();
+        let active = binding();
+        let token = book.issue_input_binding(&active).unwrap();
+        let ReservationResult::Admitted(reservation) = book
+            .reserve_input_action("input", "client", "op", &token, "display", &active)
+            .unwrap()
+        else {
+            panic!()
+        };
+        book.finish_input_action(
+            "input",
+            "client",
+            "op",
+            &reservation.reservation_id,
+            Outcome::RecoveryRequired,
+        )
+        .unwrap();
+        book.fence(&active);
+        assert!(book.has_any_session_reference("session"));
+        assert!(book.terminal_receipts.is_empty());
+        assert_eq!(
+            book.finish_input_action(
+                "input",
+                "client",
+                "op",
+                &reservation.reservation_id,
+                Outcome::Completed
+            ),
+            Err(Error::UnknownOutcome)
+        );
+    }
+
     #[test]
     fn terminal_reservation_remains_a_session_reference() {
         let mut authority = InputAuthority::default();
@@ -1015,10 +1275,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(book.fence(&active), 0);
-        assert!(matches!(
+        assert_eq!(
             book.reserve_input_action("input", "client", "op", &token, "display", &active),
-            Ok(ReservationResult::Existing(_))
-        ));
+            Err(Error::Conflict)
+        );
     }
 
     #[test]
