@@ -1873,6 +1873,112 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires completed real action journal in AMATERASU_ACTION_CLOSURE_JOURNAL"]
+    fn closed_stream_rejects_delayed_action_operations_after_restart() {
+        let source = std::env::var("AMATERASU_ACTION_CLOSURE_JOURNAL").unwrap();
+        let mut journal: super::super::Journal =
+            serde_json::from_slice(&std::fs::read(source).unwrap()).unwrap();
+        let marker = journal.action_dispositions.values().next().unwrap().clone();
+        let transfer = marker.cleanup_work.action_transfer.as_ref().unwrap();
+        let encoded = serde_json::to_value(&journal).unwrap();
+        let reservation = encoded["actions"]["reservations"]
+            .as_object()
+            .unwrap()
+            .values()
+            .find(|item| item["permit_token"] == marker.permit)
+            .unwrap();
+        let old_token = reservation["rebind"]["old_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let old_digest = reservation["rebind"]["old_binding"]["plan_digest"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let service = transfer.service.clone();
+        let target = marker.cleanup_work.target.clone();
+        super::super::action_closed_history::compact_released_actions(&mut journal);
+        assert!(
+            journal.closed_streams.scope_fenced(&target),
+            "closure was not durably certifiable"
+        );
+        assert!(journal.action_dispositions.is_empty());
+        let path = std::env::temp_dir().join(format!(
+            "closed-action-matrix-{}",
+            super::super::identifier().unwrap()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut coordinator = Coordinator::open(&path.join("journal")).unwrap();
+        save(&coordinator.shared, journal).unwrap();
+        let binding = &marker.binding;
+        let method = &marker.approval_snapshot.descriptor.execute;
+        let base = json!({"operation_id":binding.operation_id,"action_id":binding.action_id,
+            "target":binding.target,"plan_digest":binding.plan_digest,"permit":marker.permit,
+            "provider":marker.owner,"execute_method":method,"guard_nonce":"stale"});
+        let mut begin = base.clone();
+        begin["operation"] = json!("begin_action_transition");
+        let mut rebind = base.clone();
+        rebind["operation"] = json!("rebind_action_plan");
+        rebind["old_permit"] = json!(old_token);
+        rebind["transition_id"] = json!(marker.cleanup_work.transition_id);
+        rebind["old_plan_digest"] = json!(old_digest);
+        rebind["new_plan_digest"] = json!(binding.plan_digest);
+        rebind["new_plan"] = serde_json::to_value(&marker.plan).unwrap();
+        for reopen in [false, true] {
+            if reopen {
+                drop(coordinator);
+                coordinator = Coordinator::open(&path.join("journal")).unwrap();
+            }
+            assert!(
+                coordinator
+                    .shared
+                    .borrow()
+                    .value
+                    .closed_streams
+                    .scope_fenced(&target)
+            );
+            assert!(
+                canonical_target(&coordinator.shared.borrow().value, &binding.target).is_none()
+            );
+            let fresh = json!({"operation":"authorize_action", "operation_id":"fresh-after-closure",
+                "action_id":binding.action_id, "target":binding.target,
+                "plan_digest":binding.plan_digest, "plan":marker.plan, "source":binding.source});
+            assert_eq!(
+                coordinator.action_operation(&service, "ignored", &fresh)["status"],
+                "rejected"
+            );
+            assert_eq!(
+                coordinator.action_operation(&service, "ignored", &begin)["status"],
+                "rejected"
+            );
+            assert_eq!(
+                coordinator.action_operation(&service, "ignored", &rebind)["status"],
+                "rejected"
+            );
+            for operation in [
+                "inspect_action_effect",
+                "verify_action_effect",
+                "check_action_effect",
+            ] {
+                let mut request = base.clone();
+                request["operation"] = json!(operation);
+                assert_eq!(
+                    coordinator.action_operation(&marker.owner, "ignored", &request)["status"],
+                    "rejected",
+                    "{operation}"
+                );
+            }
+        }
+        drop(coordinator);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
     fn action_graph_requires_proven_independence() {
         let order = vec!["display".into(), "control".into(), "other".into()];
         let mut graph = BTreeMap::from([
