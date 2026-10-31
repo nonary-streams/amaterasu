@@ -307,6 +307,143 @@ fn acquire_operation() -> Operation {
 }
 
 #[test]
+fn prepared_batch_has_no_effect_until_delivered_once() {
+    let now = Instant::now();
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    let lease = acquire(&mut controller, now);
+    let events = vec![key(30, KeyState::Down), key(30, KeyState::Up)];
+    let prepared = controller
+        .prepare_filtered_batch("owner", &lease, events.clone(), now)
+        .unwrap();
+    assert_eq!(prepared.events(), events);
+    assert!(controller.backend.trace.borrow().is_empty());
+    assert!(controller.pressed.is_empty());
+    let response = controller.deliver_prepared_batch(prepared, now, &mut || Ok(()));
+    assert_eq!(response["ok"], true);
+    assert_eq!(*controller.backend.trace.borrow(), events);
+    assert!(controller.pressed.is_empty());
+}
+
+#[test]
+fn prepared_batch_rejects_changed_policy_and_lease_before_injection() {
+    let now = Instant::now();
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    let lease = acquire(&mut controller, now);
+    let prepared = controller
+        .prepare_filtered_batch("owner", &lease, vec![key(30, KeyState::Down)], now)
+        .unwrap();
+    controller.set_always_send_scancodes(false);
+    let response = controller.deliver_prepared_batch(prepared, now, &mut || Ok(()));
+    assert_eq!(response["error"]["code"], "stale_batch");
+    assert!(controller.backend.trace.borrow().is_empty());
+    let prepared = controller
+        .prepare_filtered_batch("owner", &lease, vec![key(30, KeyState::Down)], now)
+        .unwrap();
+    controller.handle("owner", Operation::Release { lease }, now, &mut || Ok(()));
+    let response = controller.deliver_prepared_batch(prepared, now, &mut || Ok(()));
+    assert_eq!(response["ok"], false);
+    assert!(controller.backend.trace.borrow().is_empty());
+}
+
+#[test]
+fn consumed_only_batch_still_requires_live_authority_and_guard() {
+    let now = Instant::now();
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    let lease = acquire(&mut controller, now);
+    assert!(
+        controller
+            .prepare_filtered_batch("other", &lease, vec![], now)
+            .is_err()
+    );
+    let prepared = controller
+        .prepare_filtered_batch("owner", &lease, vec![], now)
+        .unwrap();
+    let response = controller.deliver_prepared_batch(prepared, now, &mut || {
+        Err(InputError::new("cancelled", "cancelled before delivery"))
+    });
+    assert_eq!(response["error"]["code"], "cancelled");
+    assert!(controller.backend.trace.borrow().is_empty());
+    let prepared = controller
+        .prepare_filtered_batch("owner", &lease, vec![], now)
+        .unwrap();
+    let response =
+        controller.deliver_prepared_batch(prepared, now + Duration::from_secs(2), &mut || Ok(()));
+    assert_eq!(response["error"]["code"], "lease_expired");
+    assert!(controller.backend.trace.borrow().is_empty());
+}
+
+#[test]
+fn prepared_batch_rejects_intervening_held_input_changes() {
+    let now = Instant::now();
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    let lease = acquire(&mut controller, now);
+    let prepared = controller
+        .prepare_filtered_batch("owner", &lease, vec![key(30, KeyState::Down)], now)
+        .unwrap();
+    let response = controller.handle(
+        "owner",
+        Operation::Batch {
+            lease,
+            events: vec![key(31, KeyState::Down)],
+        },
+        now,
+        &mut || Ok(()),
+    );
+    assert_eq!(response["ok"], true);
+    let response = controller.deliver_prepared_batch(prepared, now, &mut || Ok(()));
+    assert_eq!(response["error"]["code"], "stale_batch");
+    assert_eq!(
+        *controller.backend.trace.borrow(),
+        vec![key(31, KeyState::Down)]
+    );
+}
+
+#[test]
+fn consumed_only_batch_rechecks_wall_clock_after_guard() {
+    let now = Instant::now();
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    let lease = acquire(&mut controller, now);
+    let prepared = controller
+        .prepare_filtered_batch("owner", &lease, vec![], now)
+        .unwrap();
+    // Keep the sampled admission time valid while making actual delivery stale.
+    // No real wait is needed to exercise the post-guard wall-clock fence.
+    let expired = Instant::now() - Duration::from_millis(1);
+    controller.lease.as_mut().unwrap().expires = expired;
+    let mut guarded = false;
+    let response = controller.deliver_prepared_batch(
+        prepared,
+        expired - Duration::from_millis(1),
+        &mut || {
+            guarded = true;
+            Ok(())
+        },
+    );
+    assert!(guarded);
+    assert_eq!(response["error"]["code"], "lease_expired");
+    assert!(controller.backend.trace.borrow().is_empty());
+}
+
+#[test]
+fn shortcut_filter_obeys_the_active_keyboard_gate() {
+    let now = Instant::now();
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    let _lease = acquire(&mut controller, now);
+    let event = key(30, KeyState::Down);
+    assert!(controller.shortcut_event_enabled(&event));
+    controller
+        .set_device_policy(
+            DevicePolicy {
+                keyboard: false,
+                mouse: true,
+            },
+            now,
+        )
+        .unwrap();
+    assert!(!controller.shortcut_event_enabled(&event));
+}
+
+#[test]
 fn feedback_pull_is_stream_session_only_lease_bound_and_acknowledged_after_peek() {
     let mut controller = Controller::new(FakeBackend::default(), true);
     let now = Instant::now();

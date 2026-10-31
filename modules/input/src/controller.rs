@@ -23,6 +23,22 @@ const DEFAULT_BACK_BUTTON_TIMEOUT_MS: i32 = -1;
 const STREAM_SESSION_CALLER: &str = "amaterasu.stream-session";
 const MAX_FEEDBACK_PEEK: u8 = 16;
 
+/// Validated native delivery, owned by one input queue entry. It deliberately
+/// cannot be cloned or deserialized: the durable queue must never recreate an
+/// armed native delivery after an ambiguous result or process restart.
+pub(crate) struct PreparedBatch {
+    caller: String,
+    token: String,
+    events: Vec<Event>,
+    context: Value,
+}
+
+impl PreparedBatch {
+    pub(crate) fn events(&self) -> &[Event] {
+        &self.events
+    }
+}
+
 fn is_controller_event(event: &Event) -> bool {
     matches!(
         event,
@@ -1110,13 +1126,71 @@ impl<B: Backend> Controller<B> {
         &mut self,
         caller: &str,
         token: &str,
-        mut events: Vec<Event>,
+        events: Vec<Event>,
         now: Instant,
         guard: &mut impl FnMut() -> InputResult<()>,
     ) -> Value {
-        if let Err(error) = self.authorize(caller, token, false) {
-            return self.failure(error);
+        if events.is_empty() {
+            return self.failure(InputError::new(
+                "invalid_request",
+                "input batch must contain 1..64 events",
+            ));
         }
+        match self.prepare_native_events(caller, token, events, now) {
+            Ok(events) => self.deliver_events(token, events, now, guard),
+            Err(error) => self.failure(error),
+        }
+    }
+
+    /// Authenticate before matching shortcuts. This does not reserve a session
+    /// generation; the lifecycle admission service supplies that separate guard.
+    pub(crate) fn authorize_batch_source(
+        &self,
+        caller: &str,
+        token: &str,
+        now: Instant,
+    ) -> InputResult<()> {
+        self.authorize(caller, token, false)?;
+        if self.lease.as_ref().is_none_or(|lease| now >= lease.expires) {
+            return Err(InputError::new(
+                "lease_expired",
+                "input lease expired before batch admission",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Shortcut matching obeys the same per-lease keyboard/device gate as native
+    /// delivery; disabled input must never become an action through filtering.
+    pub(crate) fn shortcut_event_enabled(&self, event: &Event) -> bool {
+        self.event_enabled(event, self.effective_device_policy())
+    }
+
+    /// Validate an already-filtered native batch without injecting or changing
+    /// held state. Empty is valid when every source event was a consumed shortcut.
+    pub(crate) fn prepare_filtered_batch(
+        &self,
+        caller: &str,
+        token: &str,
+        events: Vec<Event>,
+        now: Instant,
+    ) -> InputResult<PreparedBatch> {
+        Ok(PreparedBatch {
+            events: self.prepare_native_events(caller, token, events, now)?,
+            caller: caller.into(),
+            token: token.into(),
+            context: self.batch_context(caller),
+        })
+    }
+
+    fn prepare_native_events(
+        &self,
+        caller: &str,
+        token: &str,
+        mut events: Vec<Event>,
+        now: Instant,
+    ) -> InputResult<Vec<Event>> {
+        self.authorize_batch_source(caller, token, now)?;
         // Generic and left-side modifier VKs name the same physical source in
         // legacy clients. Resolve releases to the original source plan, while
         // retaining distinct sources when explicit keybindings distinguish them.
@@ -1145,9 +1219,61 @@ impl<B: Backend> Controller<B> {
                 }
             }
         }
-        if let Err(error) = self.validate_batch(&events) {
+        if !events.is_empty() {
+            self.validate_batch(&events)?;
+        }
+        Ok(events)
+    }
+
+    /// Deliver once after the caller has durably armed its receipt and intents.
+    /// Revalidate before the first effect; a stale batch never injects anything.
+    pub(crate) fn deliver_prepared_batch(
+        &mut self,
+        prepared: PreparedBatch,
+        now: Instant,
+        guard: &mut impl FnMut() -> InputResult<()>,
+    ) -> Value {
+        if let Err(error) = self.authorize_batch_source(&prepared.caller, &prepared.token, now) {
             return self.failure(error);
         }
+        if prepared.context != self.batch_context(&prepared.caller) {
+            return self.failure(InputError::new(
+                "stale_batch",
+                "input state changed after batch preparation",
+            ));
+        }
+        if !prepared.events().is_empty()
+            && let Err(error) = self.validate_batch(&prepared.events)
+        {
+            return self.failure(error);
+        }
+        // Even a fully consumed shortcut batch must observe cancellation.
+        if prepared.events().is_empty()
+            && let Err(error) = guard()
+        {
+            return self.failure(error);
+        }
+        if prepared.events().is_empty()
+            && self
+                .lease
+                .as_ref()
+                .is_none_or(|lease| Instant::now() >= lease.expires)
+        {
+            return self.failure(InputError::new(
+                "lease_expired",
+                "input lease expired during batch",
+            ));
+        }
+        self.deliver_events(&prepared.token, prepared.events, now, guard)
+    }
+
+    fn deliver_events(
+        &mut self,
+        token: &str,
+        events: Vec<Event>,
+        now: Instant,
+        guard: &mut impl FnMut() -> InputResult<()>,
+    ) -> Value {
         let policy = self.effective_device_policy();
         let mut suppressed = 0;
         for (accepted, event) in events.iter().enumerate() {
@@ -1189,6 +1315,38 @@ impl<B: Backend> Controller<B> {
             }
         }
         json!({"ok":true,"accepted":events.len(),"suppressed":suppressed,"lease":token})
+    }
+
+    fn batch_context(&self, caller: &str) -> Value {
+        let mut policy = self.status(caller, Instant::now());
+        // Passage of time and an authorized lease renewal do not change the
+        // interpretation of events. Expiry is checked separately at delivery.
+        if let Some(lease) = policy.get_mut("lease").and_then(Value::as_object_mut) {
+            lease.remove("expires_in_ms");
+        }
+        let pressed: Vec<_> = self
+            .pressed
+            .iter()
+            .map(|pressed| match pressed {
+                Pressed::Key(key) => json!({"key": key}),
+                Pressed::Button(button) => json!({"button": button}),
+            })
+            .collect();
+        let contacts: Vec<_> = self
+            .pen_touch_contacts
+            .iter()
+            .map(|contact| json!({"event":contact.last_event,"last_move":contact.last_move}))
+            .collect();
+        let controller_contacts: Vec<_> = self
+            .controller_touch_contacts
+            .iter()
+            .map(|contact| &contact.last_event)
+            .collect();
+        json!({
+            "policy": policy, "pressed": pressed, "contacts": contacts,
+            "controller_contacts": controller_contacts,
+            "scroll": [self.vertical_scroll_remainder, self.horizontal_scroll_remainder],
+        })
     }
     fn validate_batch(&self, events: &[Event]) -> InputResult<()> {
         if events.is_empty() || events.len() > MAX_EVENTS {
