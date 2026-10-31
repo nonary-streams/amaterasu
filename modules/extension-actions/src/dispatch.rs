@@ -41,6 +41,18 @@ pub enum Stage {
         digest: String,
         permit: String,
     },
+    Replanning {
+        transition_id: String,
+        old_digest: String,
+        old_permit: String,
+    },
+    AwaitingRebind {
+        transition_id: String,
+        old_digest: String,
+        old_permit: String,
+        plan: Value,
+        digest: String,
+    },
     ReadyToExecute {
         plan: Value,
         digest: String,
@@ -110,6 +122,11 @@ impl Dispatch {
         if self.stage != Stage::Planning {
             return Err("invalid_phase");
         }
+        let digest = self.validated_plan_digest(&plan)?;
+        self.stage = Stage::AwaitingPermit { plan, digest };
+        Ok(())
+    }
+    fn validated_plan_digest(&self, plan: &Value) -> Result<String, &'static str> {
         let bytes = serde_json::to_vec(&plan).map_err(|_| "invalid_plan")?;
         if bytes.len() > 4_000 || !plan.is_object() {
             return Err("invalid_plan");
@@ -124,12 +141,10 @@ impl Dispatch {
         {
             return Err("capability_expansion");
         }
-        let digest = Sha256::digest(&bytes)
+        Ok(Sha256::digest(&bytes)
             .iter()
             .map(|byte| format!("{byte:02x}"))
-            .collect();
-        self.stage = Stage::AwaitingPermit { plan, digest };
-        Ok(())
+            .collect())
     }
     pub fn accept_permit(
         &mut self,
@@ -302,6 +317,24 @@ impl Dispatch {
                 }
                 Some(request(payload, "transition"))
             }
+            Stage::Replanning { .. } => {
+                let method = self.descriptor.plan.as_ref().ok_or("plan_unavailable")?;
+                Some(api(
+                    method,
+                    json!({"version":1,"operation_id":operation_id,"action_id":action_id,"target":target,"arguments":self.request.arguments,"expected_settings_revision":self.request.expected_settings_revision}),
+                    "replan",
+                ))
+            }
+            Stage::AwaitingRebind {
+                transition_id,
+                old_digest,
+                old_permit,
+                plan,
+                digest,
+            } => Some(request(
+                json!({"operation":"rebind_action_plan","operation_id":operation_id,"transition_id":transition_id,"target":target,"old_permit":old_permit,"old_plan_digest":old_digest,"new_plan":plan,"new_plan_digest":digest}),
+                "rebind",
+            )),
             Stage::Running {
                 plan,
                 digest,
@@ -396,8 +429,8 @@ impl Dispatch {
                 let id = self.request.operation_id.clone();
                 self.confirm_consume(&id, &target, &digest, &permit)
             }
-            Stage::AwaitingTransition { digest, .. } => {
-                if !matches!(status, "pending" | "succeeded")
+            Stage::AwaitingTransition { digest, permit, .. } => {
+                if !matches!(status, "pending" | "succeeded" | "replan_required")
                     || reply.get("operation_id").and_then(Value::as_str)
                         != Some(self.request.operation_id.as_str())
                     || reply.get("target")
@@ -409,9 +442,81 @@ impl Dispatch {
                 if status == "pending" {
                     return Ok(());
                 }
+                if status == "replan_required" {
+                    let transition_id = reply
+                        .get("transition_id")
+                        .and_then(Value::as_str)
+                        .filter(|id| {
+                            !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control)
+                        })
+                        .ok_or("invalid_transition")?
+                        .to_owned();
+                    self.stage = Stage::Replanning {
+                        transition_id,
+                        old_digest: digest,
+                        old_permit: permit,
+                    };
+                    return Ok(());
+                }
                 let target = self.request.target.clone();
                 let id = self.request.operation_id.clone();
                 self.confirm_transition(&id, &target, &digest)
+            }
+            Stage::Replanning {
+                transition_id,
+                old_digest,
+                old_permit,
+            } => {
+                if status != "planned"
+                    || reply.get("operation_id").and_then(Value::as_str)
+                        != Some(self.request.operation_id.as_str())
+                    || reply.get("action_id").and_then(Value::as_str)
+                        != Some(self.request.action_id.as_str())
+                    || reply.get("target")
+                        != serde_json::to_value(&self.request.target).ok().as_ref()
+                {
+                    return Err("invalid_reply");
+                }
+                let plan = reply.get("plan").cloned().ok_or("invalid_reply")?;
+                let digest = self.validated_plan_digest(&plan)?;
+                self.stage = Stage::AwaitingRebind {
+                    transition_id,
+                    old_digest,
+                    old_permit,
+                    plan,
+                    digest,
+                };
+                Ok(())
+            }
+            Stage::AwaitingRebind {
+                transition_id,
+                plan,
+                digest,
+                ..
+            } => {
+                if status != "succeeded"
+                    || reply.get("operation_id").and_then(Value::as_str)
+                        != Some(self.request.operation_id.as_str())
+                    || reply.get("transition_id").and_then(Value::as_str)
+                        != Some(transition_id.as_str())
+                    || reply.get("target")
+                        != serde_json::to_value(&self.request.target).ok().as_ref()
+                    || reply.get("plan_digest").and_then(Value::as_str) != Some(digest.as_str())
+                {
+                    return Err("rebind_denied");
+                }
+                let permit = reply
+                    .get("permit_id")
+                    .and_then(Value::as_str)
+                    .filter(|p| !p.is_empty() && p.len() <= 256)
+                    .ok_or("invalid_reply")?
+                    .to_owned();
+                self.stage = Stage::ReadyToExecute {
+                    plan,
+                    digest,
+                    permit,
+                };
+                Ok(())
             }
             Stage::Running { .. } | Stage::ProviderPending { .. } => {
                 let receipt = reply.get("receipt").cloned().ok_or("invalid_reply")?;
@@ -515,6 +620,8 @@ impl Dispatch {
             Stage::AwaitingPermit { .. }
                 | Stage::AwaitingConsume { .. }
                 | Stage::AwaitingTransition { .. }
+                | Stage::Replanning { .. }
+                | Stage::AwaitingRebind { .. }
                 | Stage::ReadyToExecute { .. }
                 | Stage::Running { .. }
                 | Stage::ProviderPending { .. }
@@ -728,6 +835,42 @@ mod tests {
         operation.accept_reply(json!({"status":"pending","operation_id":"e:1","target":target_json,"plan_digest":digest})).unwrap();
         assert!(operation.begin_effect().is_err());
         operation.accept_reply(json!({"status":"succeeded","operation_id":"e:1","target":target_json,"plan_digest":digest})).unwrap();
+        operation.begin_effect().unwrap();
+    }
+    #[test]
+    fn dependent_cleanup_requires_persisted_replan_and_exact_rebind() {
+        let mut operation = fixture();
+        operation.descriptor.execution = ExecutionClass::SessionMutation;
+        operation.accept_plan(sample_plan()).unwrap();
+        let Stage::AwaitingPermit { digest, .. } = &operation.stage else {
+            panic!()
+        };
+        let old_digest = digest.clone();
+        let target = operation.request.target.clone();
+        let target_json = serde_json::to_value(&target).unwrap();
+        operation
+            .accept_permit("e:1", &target, &old_digest, "old-permit".into())
+            .unwrap();
+        operation
+            .confirm_consume("e:1", &target, &old_digest, "old-permit")
+            .unwrap();
+        operation.accept_reply(json!({"status":"replan_required","operation_id":"e:1","target":target_json,"plan_digest":old_digest,"transition_id":"transition"})).unwrap();
+        assert!(operation.begin_effect().is_err());
+        let mut new_plan = sample_plan();
+        new_plan["revision"] = json!(2);
+        operation.accept_reply(json!({"status":"planned","operation_id":"e:1","action_id":"example/action","target":target_json,"plan":new_plan})).unwrap();
+        let Stage::AwaitingRebind { digest, .. } = &operation.stage else {
+            panic!()
+        };
+        let digest = digest.clone();
+        let serialized = serde_json::to_vec(&operation).unwrap();
+        operation = serde_json::from_slice(&serialized).unwrap();
+        assert!(operation.accept_reply(json!({"status":"succeeded","operation_id":"e:1","transition_id":"wrong","target":target_json,"plan_digest":digest,"permit_id":"new-permit"})).is_err());
+        assert!(operation.begin_effect().is_err());
+        operation.accept_reply(json!({"status":"succeeded","operation_id":"e:1","transition_id":"transition","target":target_json,"plan_digest":digest,"permit_id":"new-permit"})).unwrap();
+        assert!(
+            matches!(&operation.stage, Stage::ReadyToExecute { permit, .. } if permit == "new-permit")
+        );
         operation.begin_effect().unwrap();
     }
     #[test]

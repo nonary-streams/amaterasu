@@ -1396,6 +1396,8 @@ impl ActionsModule {
                 active.dispatch.stage,
                 DispatchStage::AwaitingConsume { .. }
                     | DispatchStage::AwaitingTransition { .. }
+                    | DispatchStage::Replanning { .. }
+                    | DispatchStage::AwaitingRebind { .. }
                     | DispatchStage::ReadyToExecute { .. }
                     | DispatchStage::Running { .. }
             )
@@ -1466,6 +1468,8 @@ impl ActionsModule {
             active.dispatch.stage,
             DispatchStage::AwaitingConsume { .. }
                 | DispatchStage::AwaitingTransition { .. }
+                | DispatchStage::Replanning { .. }
+                | DispatchStage::AwaitingRebind { .. }
                 | DispatchStage::ReadyToExecute { .. }
                 | DispatchStage::Running { .. }
         ) && !active.effect_started
@@ -1602,6 +1606,8 @@ impl ActionsModule {
             active.dispatch.stage,
             DispatchStage::AwaitingConsume { .. }
                 | DispatchStage::AwaitingTransition { .. }
+                | DispatchStage::Replanning { .. }
+                | DispatchStage::AwaitingRebind { .. }
                 | DispatchStage::ReadyToExecute { .. }
                 | DispatchStage::Running { .. }
                 | DispatchStage::ProviderPending { .. }
