@@ -27,6 +27,8 @@ mod providers;
 mod recovery;
 mod retention;
 mod security;
+#[allow(dead_code)]
+mod session_release;
 mod settings_scope;
 mod settings_snapshot;
 #[allow(dead_code)] // Settlement dispatch is gated until composition sequencing is wired.
@@ -314,6 +316,8 @@ struct Journal {
     finalize_results: finalize_result::FinalizeResultBook,
     #[serde(default)]
     stream_releases: stream_release::StreamReleaseBook,
+    #[serde(default)]
+    session_releases: session_release::SessionReleaseBook,
     /// Immutable producing transition of each retained admission.
     #[serde(default)]
     admission_transitions: BTreeMap<String, String>,
@@ -321,7 +325,8 @@ struct Journal {
 
 impl Journal {
     fn references_admission(&self, id: &str) -> bool {
-        self.stream_releases.references_admission(id)
+        self.session_releases.references_admission(id)
+            || self.stream_releases.references_admission(id)
             || self
                 .finalize_results
                 .records()
@@ -543,6 +548,7 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                         )
                 })
         })
+        || !journal.session_releases.validate(journal)
         || !journal.stream_releases.validate(journal)
         || !journal.finalize_results.validate_structure()
         || journal.finalize_results.records().any(|item| {
@@ -779,6 +785,7 @@ impl Coordinator {
             control_settlements: Default::default(),
             finalize_results: Default::default(),
             stream_releases: Default::default(),
+            session_releases: Default::default(),
             admission_transitions: Default::default(),
         });
         validate_journal(&journal)?;
