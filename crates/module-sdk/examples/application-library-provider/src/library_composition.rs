@@ -274,6 +274,7 @@ struct Composition {
     launch: LaunchModule,
     library: SelectedLibrary,
     provider: Module,
+    application: Option<ArtifactLibrary>,
     // HostApi context pointers must survive moving endpoints into this vector.
     #[allow(clippy::vec_box)]
     _endpoints: Vec<Box<Endpoint>>,
@@ -293,6 +294,24 @@ impl Composition {
         artifact: Option<&std::path::Path>,
         use_preparation: bool,
         fail_preparation: bool,
+    ) -> Self {
+        Self::configure(
+            generated,
+            artifact,
+            use_preparation,
+            fail_preparation,
+            None,
+            false,
+        )
+    }
+
+    fn configure(
+        generated: bool,
+        artifact: Option<&std::path::Path>,
+        use_preparation: bool,
+        fail_preparation: bool,
+        real_preparation_log: Option<&std::path::Path>,
+        hold_preparation: bool,
     ) -> Self {
         let mut config = RuntimeConfig::default();
         for principal in ["alice", "mallory"] {
@@ -324,9 +343,27 @@ impl Composition {
             .principals
             .insert("application".into(), grants(&[], &[APPLICATION]));
         let policy = if use_preparation {
-            let command = json!({"executable":std::env::current_exe().unwrap()});
-            let settings =
-                json!({"revision":"entry-v7","preparation":[{"run":command,"undo":command}]});
+            let command = |mark: &str| {
+                let mut command = json!({"executable":std::env::current_exe().unwrap()});
+                if let Some(path) = real_preparation_log {
+                    command["args"] = json!([
+                        "--exact",
+                        "library_composition::preparation_subprocess",
+                        "--ignored"
+                    ]);
+                    command["environment"] =
+                        json!({"AMATERASU_TEST_LOG":path,"AMATERASU_TEST_MARK":mark});
+                }
+                command
+            };
+            let mut preparation = vec![json!({"run":command("run"),"undo":command("undo")})];
+            if fail_preparation && real_preparation_log.is_some() {
+                preparation.push(json!({"run":command("fail")}));
+            }
+            if hold_preparation && real_preparation_log.is_some() {
+                preparation.push(json!({"run":command("hold")}));
+            }
+            let settings = json!({"revision":"entry-v7","preparation":preparation});
             json!({"opaque/library/game":settings,"generated:application":settings})
         } else {
             json!({})
@@ -355,15 +392,17 @@ impl Composition {
             ),
             Response::Ok
         ));
-        assert!(matches!(
-            broker.dispatch(
-                "application",
-                Command::Register {
-                    service: APPLICATION.into()
-                }
-            ),
-            Response::Ok
-        ));
+        if real_preparation_log.is_none() {
+            assert!(matches!(
+                broker.dispatch(
+                    "application",
+                    Command::Register {
+                        service: APPLICATION.into()
+                    }
+                ),
+                Response::Ok
+            ));
+        }
         let shared = Rc::new(RefCell::new(Shared {
             broker,
             requests: vec![],
@@ -377,6 +416,7 @@ impl Composition {
         let mut launch_endpoint = endpoint(LAUNCH, shared.clone());
         let mut library_endpoint = endpoint("library", shared.clone());
         let mut provider_endpoint = endpoint("provider", shared.clone());
+        let mut application_endpoint = endpoint("application", shared.clone());
         let launch = LaunchModule::start(client(&mut launch_endpoint)).unwrap();
         let library = if let Some(path) = artifact {
             SelectedLibrary::Artifact(ArtifactLibrary::load(path, &mut library_endpoint))
@@ -398,12 +438,23 @@ impl Composition {
             )
         };
         let provider = Module::start(client(&mut provider_endpoint)).unwrap();
+        let application = real_preparation_log.map(|_| {
+            let path = std::env::var_os("AMATERASU_APPLICATION_ARTIFACT")
+                .expect("independently built application artifact");
+            ArtifactLibrary::load(std::path::Path::new(&path), &mut application_endpoint)
+        });
         Self {
             shared,
             launch,
             library,
             provider,
-            _endpoints: vec![launch_endpoint, library_endpoint, provider_endpoint],
+            application,
+            _endpoints: vec![
+                launch_endpoint,
+                library_endpoint,
+                provider_endpoint,
+                application_endpoint,
+            ],
             request_sequence: 0,
         }
     }
@@ -412,9 +463,18 @@ impl Composition {
         self.launch.tick().unwrap();
         self.library.tick();
         self.provider.tick().unwrap();
+        if let Some(application) = &mut self.application {
+            // SAFETY: the loaded artifact and its instance remain live and are
+            // accessed serially until the composition has been dropped.
+            assert_eq!(
+                unsafe { (application.api.tick)(application.instance) },
+                STATUS_OK
+            );
+        }
         let mut shared = self.shared.borrow_mut();
-        if let Response::Request { id, payload, .. } =
-            shared.broker.dispatch("application", Command::Poll {})
+        if self.application.is_none()
+            && let Response::Request { id, payload, .. } =
+                shared.broker.dispatch("application", Command::Poll {})
         {
             let action = payload["action"].as_str().unwrap();
             let operation = payload["operation_id"].as_str().unwrap().to_owned();
@@ -504,6 +564,9 @@ impl Composition {
         };
         for _ in 0..1000 {
             self.tick();
+            if self.application.is_some() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             let reply = self
                 .shared
                 .borrow_mut()
@@ -657,6 +720,149 @@ fn selected_preparation_is_preserved_across_library_replacements_and_failure() {
             }
         }
     }
+}
+
+#[test]
+#[ignore = "subprocess fixture invoked by real_preparation_is_retired_after_failure_and_stop"]
+fn preparation_subprocess() {
+    use std::io::Write;
+    let path = std::env::var_os("AMATERASU_TEST_LOG").unwrap();
+    let mark = std::env::var("AMATERASU_TEST_MARK").unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    writeln!(file, "{mark}").unwrap();
+    if mark == "hold" {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+    }
+    assert_ne!(mark, "fail", "requested preparation failure");
+}
+
+#[test]
+#[ignore = "requires AMATERASU_APPLICATION_ARTIFACT pointing to the separately built application cdylib"]
+fn real_preparation_is_retired_after_failure_and_stop() {
+    for generated in [false, true] {
+        for fail in [false, true] {
+            let unique = format!(
+                "amaterasu-preparation-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let dir = std::env::temp_dir().join(unique);
+            std::fs::create_dir(&dir).unwrap();
+            let log = dir.join("steps.log");
+            let artifact = std::env::var_os("AMATERASU_LIBRARY_V2_ARTIFACT");
+            let artifact = if generated {
+                None
+            } else {
+                artifact.as_deref().map(std::path::Path::new)
+            };
+            let mut composition =
+                Composition::configure(generated, artifact, true, fail, Some(&log), false);
+            let launch = composition.selection();
+            let result = composition.request("alice", v2::LAUNCH_SERVICE, launch);
+            if fail {
+                assert_eq!(result["launch"]["state"], "failed", "{result}");
+            } else {
+                assert_eq!(result["launch"]["state"], "active", "{result}");
+                let stopped = composition.request(
+                    "alice",
+                    v2::LAUNCH_SERVICE,
+                    json!({"action":"stop","launch_id":result["launch"]["launch_id"]}),
+                );
+                assert_eq!(stopped["launch"]["state"], "stopped", "{stopped}");
+            }
+            assert!(composition.shared.borrow().session.lease.is_none());
+            let output = std::fs::read_to_string(&log).unwrap();
+            let expected = if fail {
+                "run\nfail\nundo\n"
+            } else {
+                "run\nundo\n"
+            };
+            assert_eq!(output, expected);
+            drop(composition);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires AMATERASU_APPLICATION_ARTIFACT pointing to the separately built application cdylib"]
+fn real_preparation_cancellation_undoes_completed_steps_before_lease_release() {
+    let unique = format!(
+        "amaterasu-cancel-preparation-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let dir = std::env::temp_dir().join(unique);
+    std::fs::create_dir(&dir).unwrap();
+    let log = dir.join("steps.log");
+    let mut composition = Composition::configure(false, None, true, false, Some(&log), true);
+    let launch = composition.selection();
+    let Response::Accepted { id } = composition.shared.borrow_mut().broker.dispatch(
+        "alice",
+        Command::Request {
+            service: v2::LAUNCH_SERVICE.into(),
+            payload: launch,
+            timeout_ms: 30_000,
+            operation_id: "cancel-request".into(),
+            parent: None,
+        },
+    ) else {
+        panic!("launch admission failed")
+    };
+    let mut saw_hold = false;
+    for _ in 0..3000 {
+        composition.tick();
+        if std::fs::read_to_string(&log).is_ok_and(|contents| contents.contains("hold\n")) {
+            saw_hold = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(saw_hold, "preparation did not reach the held step");
+    assert!(matches!(
+        composition
+            .shared
+            .borrow_mut()
+            .broker
+            .dispatch("alice", Command::Cancel { request: id }),
+        Response::Ok
+    ));
+    let mut retired = false;
+    for _ in 0..3000 {
+        composition.tick();
+        let state = composition.shared.borrow();
+        let stopped = state.requests.iter().any(|(service, payload, _)| {
+            service == APPLICATION && payload["action"] == "preparation_stop"
+        });
+        if stopped && state.session.lease.is_none() {
+            retired = true;
+            break;
+        }
+        drop(state);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(retired, "preparation was not retired");
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "run\nhold\nundo\n");
+    assert!(
+        !composition
+            .shared
+            .borrow()
+            .requests
+            .iter()
+            .any(|(service, payload, _)| service == SERVICE && payload["action"] == "launch")
+    );
+    drop(composition);
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
