@@ -106,7 +106,6 @@ pub(super) fn validate_dispatch_proof(
         }
         let prior_receipt = result
             .get("receipt")
-            .filter(|v| v.is_object())
             .ok_or("action_dispatch_proof_invalid")?;
         let status_method = approvals
             .descriptor
@@ -180,6 +179,10 @@ mod tests {
             .is_ok()
         };
         assert!(check(&proof));
+        let mut scalar_receipt = proof.clone();
+        scalar_receipt["effect"]["result"]["receipt"] = json!("pending-token");
+        scalar_receipt["status"][0]["call"]["payload"]["provider_receipt"] = json!("pending-token");
+        assert!(check(&scalar_receipt));
         for path in ["provider", "schema", "receipt", "target"] {
             let mut altered = proof.clone();
             match path {

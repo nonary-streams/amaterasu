@@ -645,6 +645,22 @@ impl ActionAuthority {
         Ok(())
     }
 
+    /// Read the approvals frozen for this service and permit. This does not
+    /// grant effect rights; callers must separately verify the active transfer.
+    pub fn approval_snapshot_for_permit(
+        &self,
+        caller: &str,
+        token: &str,
+    ) -> Result<ActionApprovalSnapshot, AuthorityError> {
+        self.validate()?;
+        self.reservations
+            .values()
+            .find(|entry| entry.action_service == caller && entry.permit_token == token)
+            .and_then(|entry| entry.execution.as_ref())
+            .and_then(|execution| execution.approval_snapshot.clone())
+            .ok_or(AuthorityError::NotAuthorized)
+    }
+
     pub fn execution_for_permit(
         &self,
         caller: &str,
