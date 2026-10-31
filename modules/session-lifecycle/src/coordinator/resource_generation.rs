@@ -274,6 +274,32 @@ mod tests {
         journal.receipts.insert("work".into(), receipt);
         (journal, work, root)
     }
+
+    #[test]
+    fn historical_root_survives_epoch_rotation_without_live_authority() {
+        let (mut journal, work, root) = fixture();
+        assert_eq!(historical_generation(&journal, &root).unwrap(), 7);
+        assert_eq!(current_root_generation(&journal, &root).unwrap(), 7);
+        assert_eq!(active_generation(&journal, &work, &root.output).unwrap(), 7);
+
+        journal.host_epoch = "new-epoch".into();
+        assert_eq!(historical_generation(&journal, &root).unwrap(), 7);
+        assert!(current_root_generation(&journal, &root).is_err());
+        assert!(active_generation(&journal, &work, &root.output).is_err());
+
+        journal
+            .composition
+            .set_state(
+                &root.output.producer,
+                &root.output.output_id,
+                &root.output.origin,
+                OutputState::Released,
+            )
+            .unwrap();
+        let released = journal.composition.records().next().unwrap();
+        assert_eq!(historical_generation(&journal, released).unwrap(), 7);
+        assert!(current_root_generation(&journal, released).is_err());
+    }
     #[test]
     fn released_root_blocks_stream_until_authenticated_replacement() {
         let (mut journal, _, root) = fixture();
