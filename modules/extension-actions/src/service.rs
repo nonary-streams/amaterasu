@@ -1,4 +1,4 @@
-//! Serialized state-backed action admission and lifecycle-fenced read-only dispatch.
+//! Serialized state-backed action admission and lifecycle-fenced dispatch.
 use crate::dispatch::{Dispatch, Outcome, Stage as DispatchStage};
 use crate::worker::Worker;
 use amaterasu_extension_api::{ActionInvoke, EXTENSION_ACTIONS_SERVICE};
@@ -41,6 +41,8 @@ pub(crate) struct Record {
 struct Policy {
     #[serde(default)]
     grants: Vec<Grant>,
+    #[serde(default)]
+    input_service: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -74,7 +76,10 @@ impl Policy {
         })
     }
     fn validate(&self) -> bool {
-        self.grants.len() <= 128
+        self.input_service
+            .as_ref()
+            .is_none_or(|principal| !principal.is_empty() && principal.len() <= 256)
+            && self.grants.len() <= 128
             && self.grants.iter().all(|grant| {
                 !grant.principal.is_empty()
                     && grant.principal.len() <= 256
@@ -98,6 +103,7 @@ struct Incoming {
     caller: String,
     initiator: String,
     payload: Value,
+    input_source: Option<crate::dispatch::Source>,
 }
 enum Stage {
     Read(Incoming),
@@ -124,6 +130,23 @@ enum Stage {
         invoke: Box<ActionInvoke>,
     },
     Plan(Box<PlanContext>),
+    InputReservation(Box<ReservationContext>),
+    ConfirmInput(Box<CommitContext>),
+}
+struct ReservationContext {
+    incoming: Incoming,
+    revision: u64,
+    metadata: Value,
+    epoch: Epoch,
+    invoke: ActionInvoke,
+}
+struct CommitContext {
+    incoming: Incoming,
+    revision: u64,
+    metadata: Value,
+    epoch: Epoch,
+    invoke: ActionInvoke,
+    dispatch: Dispatch,
 }
 struct PlanContext {
     incoming: Incoming,
@@ -236,6 +259,7 @@ impl ManagedModule for ActionsModule {
                     caller,
                     initiator,
                     payload,
+                    input_source: None,
                 };
                 self.receive(incoming)
             }
@@ -255,7 +279,9 @@ impl ActionsModule {
             .get("operation")
             .and_then(Value::as_str)
             .unwrap_or("");
-        if operation == "invoke" && !matches!(self.recovery, Recovery::Done) {
+        if matches!(operation, "invoke" | "reserve_input" | "commit_input")
+            && !matches!(self.recovery, Recovery::Done)
+        {
             return self.complete(incoming.id, failure("startup_recovery"));
         }
         if !matches!(
@@ -267,8 +293,16 @@ impl ActionsModule {
                 | "cancel"
                 | "close_epoch"
                 | "retire_epoch"
+                | "reserve_input"
+                | "commit_input"
         ) {
             return self.complete(incoming.id, failure("invalid_request"));
+        }
+        if matches!(operation, "reserve_input" | "commit_input")
+            && (self.policy.input_service.as_deref() != Some(incoming.caller.as_str())
+                || incoming.caller != incoming.initiator)
+        {
+            return self.complete(incoming.id, failure("permission_denied"));
         }
         let key = if operation == "open_epoch" {
             let Some(open_id) = incoming
@@ -300,6 +334,8 @@ impl ActionsModule {
             Stage::Write { parent, .. } => *parent,
             Stage::Descriptor { incoming, .. } => incoming.id,
             Stage::Plan(context) => context.incoming.id,
+            Stage::InputReservation(context) => context.incoming.id,
+            Stage::ConfirmInput(context) => context.incoming.id,
             Stage::DispatchReply { .. }
             | Stage::CancelReply { .. }
             | Stage::RecoveryHead
@@ -308,11 +344,15 @@ impl ActionsModule {
             }
         };
         let descriptor = matches!(stage, Stage::Descriptor { .. });
+        let lifecycle = matches!(stage, Stage::InputReservation(_));
+        let input = matches!(stage, Stage::ConfirmInput(_));
         let phase = match &stage {
             Stage::Read(_) => "read",
             Stage::Write { .. } => "write",
             Stage::Descriptor { .. } => "descriptor",
             Stage::Plan(_) => "plan",
+            Stage::InputReservation(_) => "input-reservation",
+            Stage::ConfirmInput(_) => "input-confirm",
             Stage::DispatchReply { .. }
             | Stage::CancelReply { .. }
             | Stage::RecoveryHead
@@ -323,6 +363,10 @@ impl ActionsModule {
         match self.runtime.send(Command::Request {
             service: if descriptor {
                 amaterasu_extension_api::EXTENSION_REGISTRY_SERVICE.into()
+            } else if lifecycle {
+                amaterasu_extension_api::SESSION_LIFECYCLE_SERVICE.into()
+            } else if input {
+                "amaterasu.input/1".into()
             } else {
                 STATE.into()
             },
@@ -364,6 +408,12 @@ impl ActionsModule {
                     } => self
                         .after_descriptor(incoming, revision, metadata, *epoch, *invoke, payload),
                     Stage::Plan(context) => self.after_plan(*context, payload),
+                    Stage::InputReservation(context) => {
+                        self.after_input_reservation(*context, payload)
+                    }
+                    Stage::ConfirmInput(context) => {
+                        self.after_input_confirmation(*context, payload)
+                    }
                     Stage::Write {
                         parent,
                         result,
@@ -391,6 +441,8 @@ impl ActionsModule {
                     Stage::Write { parent, .. } => parent,
                     Stage::Descriptor { incoming, .. } => incoming.id,
                     Stage::Plan(context) => context.incoming.id,
+                    Stage::InputReservation(context) => context.incoming.id,
+                    Stage::ConfirmInput(context) => context.incoming.id,
                     Stage::DispatchReply { key } => {
                         self.dispatch_unknown(key)?;
                         return Ok(());
@@ -528,6 +580,41 @@ impl ActionsModule {
         if sequence <= epoch.retired {
             return self.complete(incoming.id, failure("receipt_expired"));
         }
+        if operation == "commit_input" {
+            let Some(record) = epoch.receipts.get(&sequence) else {
+                return self.complete(incoming.id, failure("unknown_receipt"));
+            };
+            if incoming.payload.get("operation_id").and_then(Value::as_str)
+                != Some(record.request.operation_id.as_str())
+            {
+                return self.complete(incoming.id, failure("operation_conflict"));
+            }
+            if record.receipt.get("status").and_then(Value::as_str) != Some("reserved") {
+                return self.complete(
+                    incoming.id,
+                    self.observed_receipt(epoch_id, sequence, record),
+                );
+            }
+            let Some(reservation) = record.request.input_reservation_id.clone() else {
+                return self.complete(incoming.id, failure("invalid_reservation"));
+            };
+            let Some(dispatch) = record.dispatch.clone() else {
+                return self.complete(incoming.id, failure("state_corrupt"));
+            };
+            let invoke = record.request.clone();
+            let payload = json!({"action":"confirm_delivery","epoch":epoch_id,"sequence":sequence,"operation_id":invoke.operation_id,"reservation_id":reservation});
+            return self.submit(
+                payload,
+                Stage::ConfirmInput(Box::new(CommitContext {
+                    incoming,
+                    revision,
+                    metadata,
+                    epoch,
+                    invoke,
+                    dispatch,
+                })),
+            );
+        }
         if operation == "cancel" {
             let Some(record) = epoch.receipts.get(&sequence) else {
                 return self.complete(incoming.id, failure("unknown_receipt"));
@@ -551,7 +638,7 @@ impl ActionsModule {
             active.cancel_parent = Some(incoming.id);
             return self.persist_cancellation(key);
         }
-        if operation != "invoke" {
+        if !matches!(operation, "invoke" | "reserve_input") {
             let result = epoch
                 .receipts
                 .get(&sequence)
@@ -578,8 +665,8 @@ impl ActionsModule {
         let Ok(invoke) = serde_json::from_value::<ActionInvoke>(request) else {
             return self.complete(incoming.id, failure("invalid_request"));
         };
-        if invoke.input_reservation_id.is_some() {
-            return self.complete(incoming.id, failure("input_reservation_unavailable"));
+        if (operation == "reserve_input") != invoke.input_reservation_id.is_some() {
+            return self.complete(incoming.id, failure("invalid_reservation"));
         }
         let target_kind = match invoke.target {
             amaterasu_extension_api::ActionTarget::Session { .. } => "session",
@@ -613,6 +700,19 @@ impl ActionsModule {
         }
         if advance_watermark(&mut epoch, sequence).is_err() {
             return self.complete(incoming.id, failure("sequence_window"));
+        }
+        if operation == "reserve_input" {
+            let payload = json!({"operation":"consume_input_reservation","operation_id":invoke.operation_id,"action_id":invoke.action_id,"target":invoke.target,"reservation_id":invoke.input_reservation_id});
+            return self.submit(
+                payload,
+                Stage::InputReservation(Box::new(ReservationContext {
+                    incoming,
+                    revision,
+                    metadata,
+                    epoch,
+                    invoke,
+                })),
+            );
         }
         let payload = json!({"operation":"describe_action","action_id":invoke.action_id});
         self.submit(
@@ -736,31 +836,31 @@ impl ActionsModule {
         {
             return self.complete(incoming.id, failure("invalid_plan"));
         }
-        if action.execution != amaterasu_extension_api::ExecutionClass::ReadOnly {
-            return self.complete(incoming.id, failure("mutation_unavailable"));
-        }
         let Ok(plan) = serde_json::from_value::<amaterasu_extension_api::ResourcePlan>(
             response.get("plan").cloned().unwrap_or(Value::Null),
         ) else {
             return self.complete(incoming.id, failure("invalid_plan"));
         };
         use amaterasu_extension_api::{ConsumerChange, ResourceAccess};
-        if amaterasu_extension_api::validate_resource_plan(&plan).is_err()
-            || plan
+        if amaterasu_extension_api::validate_resource_plan(&plan).is_err() {
+            return self.complete(incoming.id, failure("invalid_plan"));
+        }
+        if action.execution == amaterasu_extension_api::ExecutionClass::ReadOnly
+            && (plan
                 .resources
                 .iter()
                 .any(|resource| resource.access != ResourceAccess::Read)
-            || plan
-                .mutation_domains
-                .iter()
-                .any(|domain| domain.access != ResourceAccess::Read)
-            || plan.consumer_change != ConsumerChange::Live
-            || !plan.affected_consumers.is_empty()
-            || !plan.obligations.is_empty()
-            || !plan.allowed_degradation.is_empty()
-            || plan.candidate_constraint.is_some()
+                || plan
+                    .mutation_domains
+                    .iter()
+                    .any(|domain| domain.access != ResourceAccess::Read)
+                || plan.consumer_change != ConsumerChange::Live
+                || !plan.affected_consumers.is_empty()
+                || !plan.obligations.is_empty()
+                || !plan.allowed_degradation.is_empty()
+                || plan.candidate_constraint.is_some())
         {
-            return self.complete(incoming.id, failure("mutation_unavailable"));
+            return self.complete(incoming.id, failure("invalid_plan"));
         }
         let Ok(mut dispatch) = crate::dispatch::Dispatch::new(
             invoke.clone(),
@@ -772,6 +872,7 @@ impl ActionsModule {
         ) else {
             return self.complete(incoming.id, failure("invalid_plan"));
         };
+        dispatch.source = incoming.input_source.clone();
         if dispatch
             .accept_plan(response.get("plan").cloned().unwrap_or(Value::Null))
             .is_err()
@@ -788,7 +889,8 @@ impl ActionsModule {
         {
             return self.complete(incoming.id, failure("capacity"));
         }
-        let receipt = json!({"status":"queued","receipt_id":invoke.operation_id,"operation_id":invoke.operation_id,"result":null,"reason":null});
+        let reserved = invoke.input_reservation_id.is_some();
+        let receipt = json!({"status":if reserved {"reserved"} else {"queued"},"receipt_id":invoke.operation_id,"operation_id":invoke.operation_id,"result":null,"reason":null});
         let epoch_id = invoke.epoch.clone();
         epoch.receipts.insert(
             invoke.sequence,
@@ -810,6 +912,93 @@ impl ActionsModule {
             incoming.id,
             (revision, metadata),
             &epoch_id,
+            &epoch,
+            receipt,
+            if reserved { None } else { Some(dispatch) },
+        )
+    }
+    fn after_input_reservation(
+        &mut self,
+        context: ReservationContext,
+        response: Value,
+    ) -> ModuleResult<()> {
+        let ReservationContext {
+            mut incoming,
+            revision,
+            metadata,
+            epoch,
+            invoke,
+        } = context;
+        if response.get("status").and_then(Value::as_str) != Some("succeeded")
+            || response.get("operation_id").and_then(Value::as_str)
+                != Some(invoke.operation_id.as_str())
+            || response.get("action_id").and_then(Value::as_str) != Some(invoke.action_id.as_str())
+            || response.get("reservation_id").and_then(Value::as_str)
+                != invoke.input_reservation_id.as_deref()
+            || response.get("target") != serde_json::to_value(&invoke.target).ok().as_ref()
+        {
+            return self.complete(incoming.id, failure("input_reservation_unavailable"));
+        }
+        let Ok(source) = serde_json::from_value::<crate::dispatch::Source>(
+            response.get("source").cloned().unwrap_or(Value::Null),
+        ) else {
+            return self.complete(incoming.id, failure("input_reservation_unavailable"));
+        };
+        if source.caller.is_empty()
+            || source.initiator.is_empty()
+            || source.caller.len() > 256
+            || source.initiator.len() > 256
+        {
+            return self.complete(incoming.id, failure("input_reservation_unavailable"));
+        }
+        incoming.input_source = Some(source);
+        let payload = json!({"operation":"describe_action","action_id":invoke.action_id});
+        self.submit(
+            payload,
+            Stage::Descriptor {
+                incoming,
+                revision,
+                metadata,
+                epoch: Box::new(epoch),
+                invoke: Box::new(invoke),
+            },
+        )
+    }
+    fn after_input_confirmation(
+        &mut self,
+        context: CommitContext,
+        response: Value,
+    ) -> ModuleResult<()> {
+        let CommitContext {
+            incoming,
+            revision,
+            metadata,
+            mut epoch,
+            invoke,
+            dispatch,
+        } = context;
+        if response.get("ok") != Some(&Value::Bool(true))
+            || response.get("status").and_then(Value::as_str) != Some("delivered")
+            || response.get("epoch").and_then(Value::as_str) != Some(invoke.epoch.as_str())
+            || response.get("sequence").and_then(Value::as_u64) != Some(invoke.sequence)
+            || response.get("operation_id").and_then(Value::as_str)
+                != Some(invoke.operation_id.as_str())
+            || response.get("reservation_id").and_then(Value::as_str)
+                != invoke.input_reservation_id.as_deref()
+            || response.get("action_id").and_then(Value::as_str) != Some(invoke.action_id.as_str())
+            || response.get("target") != serde_json::to_value(&invoke.target).ok().as_ref()
+        {
+            return self.complete(incoming.id, failure("input_delivery_unconfirmed"));
+        }
+        let receipt = action_receipt(&dispatch, "queued", None);
+        let Some(record) = epoch.receipts.get_mut(&invoke.sequence) else {
+            return self.complete(incoming.id, failure("state_corrupt"));
+        };
+        record.receipt = receipt.clone();
+        self.write_start(
+            incoming.id,
+            (revision, metadata),
+            &invoke.epoch,
             &epoch,
             receipt,
             Some(dispatch),
@@ -1081,10 +1270,16 @@ impl ActionsModule {
             }
             Err(_) => return self.dispatch_unknown(key),
         };
-        if matches!(active.dispatch.stage, DispatchStage::ProviderPending { .. }) {
+        if matches!(
+            active.dispatch.stage,
+            DispatchStage::ProviderPending { .. } | DispatchStage::AwaitingTransition { .. }
+        ) {
             active.polls = active.polls.saturating_add(1);
-            if let Command::CallApi { operation_id, .. } = &mut command {
-                operation_id.push_str(&format!("-{}", active.polls));
+            match &mut command {
+                Command::CallApi { operation_id, .. } | Command::Request { operation_id, .. } => {
+                    operation_id.push_str(&format!("-{}", active.polls))
+                }
+                _ => {}
             }
         }
         if matches!(active.dispatch.stage, DispatchStage::Running { .. }) {
@@ -1143,6 +1338,9 @@ impl ActionsModule {
         let mut replacement = expected.clone();
         if replacement.accept_reply(payload).is_err() {
             return self.dispatch_unknown(key);
+        }
+        if replacement == expected {
+            return self.drive(key);
         }
         let status = match &replacement.stage {
             DispatchStage::Running { .. }
@@ -1425,13 +1623,17 @@ mod tests {
         cancellation_requests: usize,
         mutation_descriptor: bool,
         required_capability: bool,
+        transition_pending: usize,
+        transition_count: usize,
+        delivery_confirmed: bool,
+        last_source: Value,
     }
     impl Host {
         fn dispatch(&mut self, command: Command) -> Response {
             match command {
                 Command::Register { .. } | Command::ReleaseResult { .. } => Response::Ok,
                 Command::GetSettings {} => Response::Result {
-                    payload: json!({"grants":[{"principal":"management","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["read_only","session_mutation"]},{"principal":"alice","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["read_only","session_mutation"]},{"principal":"bob","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["read_only","session_mutation"]}]}),
+                    payload: json!({"input_service":"input","grants":[{"principal":"input","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["read_only","session_mutation"]},{"principal":"management","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["read_only","session_mutation"]},{"principal":"alice","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["read_only","session_mutation"]},{"principal":"bob","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["read_only","session_mutation"]}]}),
                 },
                 Command::Poll {} => self.incoming.pop_front().unwrap_or(Response::Pending),
                 Command::Complete { payload, .. } => {
@@ -1463,7 +1665,11 @@ mod tests {
                         json!({"ok":true,"provider":"example.provider","revision":1,"action":{"id":"example/action","label":"Example","description":"Example","execution":execution,"arguments":{},"allowed_targets":["session"],"required_capabilities":capabilities,"plan":plan,"execute":method,"status":status}})
                     } else if service == amaterasu_extension_api::SESSION_LIFECYCLE_SERVICE {
                         match payload["operation"].as_str() {
+                            Some("consume_input_reservation") if self.allow_permit => {
+                                json!({"status":"succeeded","operation_id":payload["operation_id"],"action_id":payload["action_id"],"target":payload["target"],"reservation_id":payload["reservation_id"],"source":{"caller":"stream-session","initiator":"paired-client"}})
+                            }
                             Some("authorize_action") if self.allow_permit => {
+                                self.last_source = payload["source"].clone();
                                 json!({"status":"succeeded","operation_id":payload["operation_id"],"target":payload["target"],"permit":"permit"})
                             }
                             Some("consume_action_permit")
@@ -1475,10 +1681,23 @@ mod tests {
                                 self.cancellation_requests += 1;
                                 json!({"status":"pending"})
                             }
+                            Some("begin_action_transition") if self.allow_permit => {
+                                self.transition_count += 1;
+                                json!({"status":if self.transition_count <= self.transition_pending {"pending"} else {"succeeded"},"operation_id":payload["operation_id"],"target":payload["target"],"plan_digest":payload["plan_digest"]})
+                            }
                             Some("complete_action") if self.allow_permit => {
                                 json!({"status":"succeeded","operation_id":payload["operation_id"]})
                             }
                             _ => json!({"status":"rejected"}),
+                        }
+                    } else if service == "amaterasu.input/1" {
+                        if self.delivery_confirmed {
+                            let record = &self.state
+                                [&format!("epoch/{}", payload["epoch"].as_str().unwrap())]["receipts"]
+                                [payload["sequence"].as_u64().unwrap().to_string()];
+                            json!({"ok":true,"status":"delivered","epoch":payload["epoch"],"sequence":payload["sequence"],"operation_id":payload["operation_id"],"reservation_id":payload["reservation_id"],"action_id":record["request"]["action_id"],"target":record["request"]["target"],"batch_epoch":"input-e","batch_sequence":1})
+                        } else {
+                            json!({"ok":false,"status":"unavailable"})
                         }
                     } else {
                         match payload["action"].as_str() {
@@ -1565,6 +1784,16 @@ mod tests {
                 id,
                 caller: "management".into(),
                 initiator: initiator.into(),
+                service: EXTENSION_ACTIONS_SERVICE.into(),
+                payload,
+                remaining_ms: 5_000,
+            });
+        }
+        fn request_input(&mut self, id: u64, payload: Value) {
+            self.incoming.push_back(Response::Request {
+                id,
+                caller: "input".into(),
+                initiator: "input".into(),
                 service: EXTENSION_ACTIONS_SERVICE.into(),
                 payload,
                 remaining_ms: 5_000,
@@ -1791,23 +2020,27 @@ mod tests {
         );
     }
     #[test]
-    fn mutation_descriptor_is_rejected_before_lifecycle_or_execution() {
-        let mut host = Host {
-            allow_permit: true,
-            mutation_descriptor: true,
-            ..Host::default()
-        };
-        host.request(
-            1,
-            "alice",
-            json!({"operation":"open_epoch","operation_id":"open"}),
-        );
-        host.run();
-        let epoch = host.replies[0]["epoch"].as_str().unwrap().to_owned();
-        host.request(2, "alice", json!({"operation":"invoke","epoch":epoch,"sequence":1,"operation_id":format!("{epoch}:1"),"action_id":"example/action","target":{"kind":"session","host_epoch":"h","session_id":"s","expected_generation":1},"arguments":{},"expected_settings_revision":null}));
-        host.run();
-        assert_eq!(host.replies[1]["code"], "mutation_unavailable");
-        assert_eq!(host.effects, 0);
+    fn mutation_waits_until_lifecycle_confirms_retirement() {
+        for pending in [usize::MAX, 2] {
+            let mut host = Host {
+                allow_permit: true,
+                mutation_descriptor: true,
+                transition_pending: pending,
+                ..Host::default()
+            };
+            host.request(
+                1,
+                "alice",
+                json!({"operation":"open_epoch","operation_id":"open"}),
+            );
+            host.run();
+            let epoch = host.replies[0]["epoch"].as_str().unwrap().to_owned();
+            host.request(2, "alice", json!({"operation":"invoke","epoch":epoch,"sequence":1,"operation_id":format!("{epoch}:1"),"action_id":"example/action","target":{"kind":"session","host_epoch":"h","session_id":"s","expected_generation":1},"arguments":{},"expected_settings_revision":null}));
+            host.run();
+            assert_eq!(host.replies[1]["status"], "queued");
+            assert!(host.transition_count > 0);
+            assert_eq!(host.effects, usize::from(pending != usize::MAX));
+        }
     }
     #[test]
     fn unavailable_required_capability_rejects_before_planning() {
@@ -1862,5 +2095,39 @@ mod tests {
         assert_eq!(host.replies[66]["code"], "receipt_expired");
         assert_eq!(host.replies[67]["code"], "receipt_expired");
         assert_eq!(host.effects, 65);
+    }
+    #[test]
+    fn input_reservation_waits_for_independent_delivery_proof() {
+        let mut host = Host {
+            allow_permit: true,
+            mutation_descriptor: true,
+            transition_pending: 1,
+            ..Host::default()
+        };
+        host.request_input(
+            1,
+            json!({"operation":"open_epoch","operation_id":"input-open"}),
+        );
+        host.run();
+        let epoch = host.replies[0]["epoch"].as_str().unwrap().to_owned();
+        let operation_id = format!("{epoch}:1");
+        host.request_input(2, json!({"operation":"reserve_input","epoch":epoch,"sequence":1,"operation_id":operation_id,"action_id":"example/action","target":{"kind":"session","host_epoch":"h","session_id":"s","expected_generation":1},"arguments":{},"expected_settings_revision":null,"input_reservation_id":"reservation"}));
+        host.run();
+        assert_eq!(host.replies[1]["status"], "reserved");
+        assert_eq!(host.effects, 0);
+        host.request_input(3, json!({"operation":"commit_input","epoch":epoch,"sequence":1,"operation_id":operation_id}));
+        host.run();
+        assert_eq!(host.replies[2]["code"], "input_delivery_unconfirmed");
+        assert_eq!(host.effects, 0);
+        host.delivery_confirmed = true;
+        host.request_input(4, json!({"operation":"commit_input","epoch":epoch,"sequence":1,"operation_id":operation_id}));
+        host.run();
+        assert_eq!(host.replies[3]["status"], "queued");
+        assert_eq!(host.effects, 1);
+        assert_eq!(
+            host.last_source,
+            json!({"caller":"stream-session","initiator":"paired-client"})
+        );
+        assert!(host.transition_count >= 2);
     }
 }

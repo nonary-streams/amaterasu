@@ -13,7 +13,15 @@ pub struct Dispatch {
     pub registry_revision: u64,
     pub caller: String,
     pub initiator: String,
+    #[serde(default)]
+    pub source: Option<Source>,
     pub stage: Stage,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Source {
+    pub caller: String,
+    pub initiator: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
@@ -24,6 +32,11 @@ pub enum Stage {
         digest: String,
     },
     AwaitingConsume {
+        plan: Value,
+        digest: String,
+        permit: String,
+    },
+    AwaitingTransition {
         plan: Value,
         digest: String,
         permit: String,
@@ -89,6 +102,7 @@ impl Dispatch {
             registry_revision,
             caller,
             initiator,
+            source: None,
             stage: Stage::Planning,
         })
     }
@@ -168,10 +182,46 @@ impl Dispatch {
         {
             return Err("permit_mismatch");
         }
+        self.stage =
+            if self.descriptor.execution == amaterasu_extension_api::ExecutionClass::ReadOnly {
+                Stage::ReadyToExecute {
+                    plan: plan.clone(),
+                    digest: expected.clone(),
+                    permit: selected.clone(),
+                }
+            } else {
+                Stage::AwaitingTransition {
+                    plan: plan.clone(),
+                    digest: expected.clone(),
+                    permit: selected.clone(),
+                }
+            };
+        Ok(())
+    }
+    pub fn confirm_transition(
+        &mut self,
+        operation_id: &str,
+        target: &amaterasu_extension_api::ActionTarget,
+        digest: &str,
+    ) -> Result<(), &'static str> {
+        let Stage::AwaitingTransition {
+            plan,
+            digest: expected,
+            permit,
+        } = &self.stage
+        else {
+            return Err("invalid_phase");
+        };
+        if operation_id != self.request.operation_id
+            || target != &self.request.target
+            || digest != expected
+        {
+            return Err("transition_mismatch");
+        }
         self.stage = Stage::ReadyToExecute {
             plan: plan.clone(),
             digest: expected.clone(),
-            permit: selected.clone(),
+            permit: permit.clone(),
         };
         Ok(())
     }
@@ -200,6 +250,10 @@ impl Dispatch {
         use serde_json::json;
         let operation_id = &self.request.operation_id;
         let broker_id = operation_id.replace(':', ".");
+        let source = self.source.clone().unwrap_or_else(|| Source {
+            caller: self.caller.clone(),
+            initiator: self.initiator.clone(),
+        });
         let action_id = &self.request.action_id;
         let target = &self.request.target;
         let request = |payload: Value, suffix: &str| Command::Request {
@@ -230,14 +284,24 @@ impl Dispatch {
                     "plan",
                 ))
             }
-            Stage::AwaitingPermit { plan, digest } => Some(request(
-                json!({"operation":"authorize_action","operation_id":operation_id,"action_id":action_id,"target":target,"plan":plan,"plan_digest":digest,"source":{"caller":self.caller,"initiator":self.initiator}}),
-                "authorize",
-            )),
+            Stage::AwaitingPermit { plan, digest } => {
+                let mut payload = json!({"operation":"authorize_action","operation_id":operation_id,"action_id":action_id,"target":target,"plan":plan,"plan_digest":digest,"provider":self.selected_provider,"execute_method":self.descriptor.execute,"source":source});
+                if let Some(reservation) = &self.request.input_reservation_id {
+                    payload["input_reservation_id"] = json!(reservation);
+                }
+                Some(request(payload, "authorize"))
+            }
             Stage::AwaitingConsume { digest, permit, .. } => Some(request(
                 json!({"operation":"consume_action_permit","operation_id":operation_id,"action_id":action_id,"target":target,"plan_digest":digest,"permit":permit}),
                 "consume",
             )),
+            Stage::AwaitingTransition { digest, permit, .. } => {
+                let mut payload = json!({"operation":"begin_action_transition","operation_id":operation_id,"action_id":action_id,"target":target,"plan_digest":digest,"permit":permit});
+                if let Some(reservation) = &self.request.input_reservation_id {
+                    payload["input_reservation_id"] = json!(reservation);
+                }
+                Some(request(payload, "transition"))
+            }
             Stage::Running {
                 plan,
                 digest,
@@ -331,6 +395,23 @@ impl Dispatch {
                 let target = self.request.target.clone();
                 let id = self.request.operation_id.clone();
                 self.confirm_consume(&id, &target, &digest, &permit)
+            }
+            Stage::AwaitingTransition { digest, .. } => {
+                if !matches!(status, "pending" | "succeeded")
+                    || reply.get("operation_id").and_then(Value::as_str)
+                        != Some(self.request.operation_id.as_str())
+                    || reply.get("target")
+                        != serde_json::to_value(&self.request.target).ok().as_ref()
+                    || reply.get("plan_digest").and_then(Value::as_str) != Some(digest.as_str())
+                {
+                    return Err("transition_denied");
+                }
+                if status == "pending" {
+                    return Ok(());
+                }
+                let target = self.request.target.clone();
+                let id = self.request.operation_id.clone();
+                self.confirm_transition(&id, &target, &digest)
             }
             Stage::Running { .. } | Stage::ProviderPending { .. } => {
                 let receipt = reply.get("receipt").cloned().ok_or("invalid_reply")?;
@@ -433,6 +514,7 @@ impl Dispatch {
             self.stage,
             Stage::AwaitingPermit { .. }
                 | Stage::AwaitingConsume { .. }
+                | Stage::AwaitingTransition { .. }
                 | Stage::ReadyToExecute { .. }
                 | Stage::Running { .. }
                 | Stage::ProviderPending { .. }
@@ -479,7 +561,7 @@ mod tests {
             id: "example/action".into(),
             label: "Action".into(),
             description: "Action".into(),
-            execution: ExecutionClass::SessionMutation,
+            execution: ExecutionClass::ReadOnly,
             arguments: Default::default(),
             allowed_targets: vec![TargetKind::Session],
             required_capabilities: vec![],
@@ -617,5 +699,45 @@ mod tests {
         plan["required_capabilities"] = json!(["example/capability"]);
         assert_eq!(operation.accept_plan(plan), Err("capability_expansion"));
         assert_eq!(operation.stage, Stage::Planning);
+    }
+    #[test]
+    fn mutation_waits_for_confirmed_transition_before_effect() {
+        let mut operation = fixture();
+        operation.descriptor.execution = ExecutionClass::SessionMutation;
+        operation.accept_plan(sample_plan()).unwrap();
+        let Stage::AwaitingPermit { digest, .. } = &operation.stage else {
+            panic!()
+        };
+        let digest = digest.clone();
+        let target = operation.request.target.clone();
+        operation
+            .accept_permit("e:1", &target, &digest, "permit".into())
+            .unwrap();
+        operation
+            .confirm_consume("e:1", &target, &digest, "permit")
+            .unwrap();
+        assert!(matches!(operation.stage, Stage::AwaitingTransition { .. }));
+        assert!(operation.begin_effect().is_err());
+        let target_json = serde_json::to_value(&target).unwrap();
+        operation.accept_reply(json!({"status":"pending","operation_id":"e:1","target":target_json,"plan_digest":digest})).unwrap();
+        assert!(operation.begin_effect().is_err());
+        operation.accept_reply(json!({"status":"succeeded","operation_id":"e:1","target":target_json,"plan_digest":digest})).unwrap();
+        operation.begin_effect().unwrap();
+    }
+    #[test]
+    fn plan_digest_matches_cross_component_canonical_vector() {
+        let mut operation = fixture();
+        let mut plan = sample_plan();
+        plan["plan_id"] = json!("p");
+        plan["constraints"] = json!({"z":1,"a":2});
+        plan["consumer_change"] = json!("reconnect_required");
+        operation.accept_plan(plan).unwrap();
+        let Stage::AwaitingPermit { digest, .. } = &operation.stage else {
+            panic!()
+        };
+        assert_eq!(
+            digest,
+            "e45d56a17f9c2d75f55e5c408a1274f304a6437f3c01b5c785c619911f5ce73e"
+        );
     }
 }

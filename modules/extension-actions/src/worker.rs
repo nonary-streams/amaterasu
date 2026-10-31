@@ -388,13 +388,18 @@ fn valid_transition(before: &Dispatch, after: &Dispatch) -> bool {
                 digest,
                 permit.clone(),
             ),
-        (Stage::AwaitingConsume { .. }, Stage::ReadyToExecute { digest, permit, .. }) => computed
-            .confirm_consume(
-                &before.request.operation_id,
-                &before.request.target,
-                digest,
-                permit,
-            ),
+        (
+            Stage::AwaitingConsume { .. },
+            Stage::ReadyToExecute { digest, permit, .. }
+            | Stage::AwaitingTransition { digest, permit, .. },
+        ) => computed.confirm_consume(
+            &before.request.operation_id,
+            &before.request.target,
+            digest,
+            permit,
+        ),
+        (Stage::AwaitingTransition { .. }, Stage::ReadyToExecute { digest, .. }) => computed
+            .confirm_transition(&before.request.operation_id, &before.request.target, digest),
         (Stage::ReadyToExecute { .. }, Stage::Running { .. }) => {
             computed.begin_effect().map(|_| ())
         }
@@ -417,6 +422,7 @@ fn valid_transition(before: &Dispatch, after: &Dispatch) -> bool {
             Stage::Planning
             | Stage::AwaitingPermit { .. }
             | Stage::AwaitingConsume { .. }
+            | Stage::AwaitingTransition { .. }
             | Stage::ReadyToExecute { .. }
             | Stage::Running { .. }
             | Stage::ProviderPending { .. }
@@ -436,6 +442,7 @@ fn failure_for(job: &Job, unknown_save: bool) -> Failure {
         || matches!(
             job.replacement.stage,
             Stage::AwaitingConsume { .. }
+                | Stage::AwaitingTransition { .. }
                 | Stage::ReadyToExecute { .. }
                 | Stage::Running { .. }
                 | Stage::ProviderPending { .. }
@@ -445,6 +452,7 @@ fn failure_for(job: &Job, unknown_save: bool) -> Failure {
         || matches!(
             job.expected.stage,
             Stage::AwaitingConsume { .. }
+                | Stage::AwaitingTransition { .. }
                 | Stage::ReadyToExecute { .. }
                 | Stage::Running { .. }
                 | Stage::ProviderPending { .. }
@@ -529,6 +537,7 @@ mod tests {
         before
             .confirm_consume(&id, &target, &digest, "permit")
             .unwrap();
+        before.confirm_transition(&id, &target, &digest).unwrap();
         let mut after = before.clone();
         after.begin_effect().unwrap();
         let epoch = json!({"caller":"caller","initiator":"initiator","open_index":"index","closed":false,"receipts":{"1":{"request":before.request,"receipt":{"status":"queued"},"selected_provider":"example","registry_revision":1,"descriptor":before.descriptor,"dispatch":before}}});
@@ -722,6 +731,45 @@ mod tests {
         assert!(valid_transition(&changed, &recovery));
         running.request.operation_id = "different".into();
         assert!(!valid_transition(&running, &pending));
+    }
+    #[test]
+    fn transition_requires_exact_consumed_permit_and_fences_uncertainty() {
+        let (ready, _, _) = fixture();
+        let Stage::ReadyToExecute {
+            plan,
+            digest,
+            permit,
+        } = &ready.stage
+        else {
+            panic!("expected ready dispatch")
+        };
+        let mut consumed = ready.clone();
+        consumed.stage = Stage::AwaitingConsume {
+            plan: plan.clone(),
+            digest: digest.clone(),
+            permit: permit.clone(),
+        };
+        let mut awaiting = consumed.clone();
+        awaiting
+            .confirm_consume(
+                &ready.request.operation_id,
+                &ready.request.target,
+                digest,
+                permit,
+            )
+            .unwrap();
+        assert!(matches!(awaiting.stage, Stage::AwaitingTransition { .. }));
+        assert!(valid_transition(&consumed, &awaiting));
+        assert!(!valid_transition(&consumed, &ready));
+        assert!(valid_transition(&awaiting, &ready));
+        let mut forged = ready.clone();
+        if let Stage::ReadyToExecute { permit, .. } = &mut forged.stage {
+            *permit = "other".into();
+        }
+        assert!(!valid_transition(&awaiting, &forged));
+        let mut recovery = awaiting.clone();
+        recovery.stage = Stage::RecoveryRequired;
+        assert!(valid_transition(&awaiting, &recovery));
     }
     #[test]
     fn cooperative_cancellation_only_sets_the_cancellation_flag() {
