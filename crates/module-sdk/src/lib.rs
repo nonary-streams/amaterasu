@@ -16,6 +16,8 @@ pub mod network;
 #[cfg(feature = "network-http")]
 pub mod network_http;
 pub mod protocol;
+pub mod protocol_authority;
+pub mod protocol_state;
 pub mod requests;
 pub mod service;
 pub mod state;

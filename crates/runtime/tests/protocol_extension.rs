@@ -836,3 +836,64 @@ fn uncertain_reservation_never_admits_provider_call() {
         Response::Pending
     ));
 }
+
+#[test]
+fn state_reservation_receipt_matches_production_router_effect_and_is_one_use() {
+    use amaterasu_module_sdk::protocol_state::{
+        self, CleanupReference, DURABLE_CAS_CAPABILITY, DurableStateBinding, ReservationPlan,
+    };
+    let selection = route("example.provider_a", "example.a/1");
+    let mut broker = setup(std::slice::from_ref(&selection));
+    let router = ProtocolRouter::new(vec![selection]).unwrap();
+    let auth = Authority {
+        negotiated: true,
+        permitted: true,
+    };
+    let ctx = context("verified");
+    let request = || DispatchRequest {
+        context: &ctx,
+        message_type: KIND,
+        payload: b"hello",
+        operation_id: "persisted",
+        timeout_ms: 1000,
+        parent: None,
+    };
+    let effect = router.prepare_effect(CLIENT, &request()).unwrap();
+    let binding = DurableStateBinding::new("owner", "state", DURABLE_CAS_CAPABILITY).unwrap();
+    let ReservationPlan::Write(write) = protocol_state::prepare_reservation(
+        &binding,
+        &serde_json::json!({"ok":true,"revision":0,"found":false,"value":null}),
+        effect,
+        CleanupReference::new("a".repeat(64)).unwrap(),
+    )
+    .unwrap() else {
+        panic!()
+    };
+    // The real State provider's persistence/restart semantics are exercised by
+    // modules/state/tests/protocol_journal.rs; here the broker is real.
+    let mut receipt = write
+        .confirmed(serde_json::json!({"ok":true,"revision":1}))
+        .unwrap();
+    assert!(matches!(
+        router
+            .dispatch(
+                &auth,
+                &mut receipt,
+                request(),
+                BrokerEndpoint::new(CLIENT, |cmd| Ok(broker.dispatch(CLIENT, cmd)))
+            )
+            .unwrap(),
+        Response::Accepted { .. }
+    ));
+    assert_eq!(
+        router
+            .dispatch(
+                &auth,
+                &mut receipt,
+                request(),
+                BrokerEndpoint::new(CLIENT, |cmd| Ok(broker.dispatch(CLIENT, cmd)))
+            )
+            .unwrap_err(),
+        "reservation_mismatch"
+    );
+}

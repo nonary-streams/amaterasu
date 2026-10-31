@@ -181,6 +181,45 @@ impl ProtocolRouter {
         Ok(Self { routes })
     }
 
+    /// Construct the exact effect identity before an asynchronous durable State
+    /// reservation. This does not grant admission or call a provider. The caller
+    /// and context must come from trusted endpoint/session composition, and all
+    /// references must be non-secret opaque identifiers safe for persistence.
+    pub fn prepare_effect(
+        &self,
+        caller: &str,
+        request: &DispatchRequest<'_>,
+    ) -> Result<PendingEffect, String> {
+        let route = self
+            .routes
+            .iter()
+            .find(|route| route.message_type == request.message_type)
+            .ok_or("unregistered_route")?;
+        if !amaterasu_contracts::valid_name(caller)
+            || !route.approval.callers.contains(caller)
+            || !route.cleanup_approval.callers.contains(caller)
+            || !valid_context(request.context)
+            || !amaterasu_contracts::valid_name(request.operation_id)
+            || !(1..=30_000).contains(&request.timeout_ms)
+            || request.payload.len() > route.max_payload_bytes
+        {
+            return Err("invalid_request".into());
+        }
+        Ok(PendingEffect {
+            caller: caller.into(),
+            operation_id: request.operation_id.into(),
+            context: request.context.clone(),
+            message_type: request.message_type,
+            capability: route.capability.clone(),
+            provider: route.approval.provider.clone(),
+            method: route.method.clone(),
+            cleanup: route.cleanup.clone(),
+            payload_sha256: format!("{:x}", Sha256::digest(request.payload)),
+            timeout_ms: request.timeout_ms,
+            parent: request.parent,
+        })
+    }
+
     /// Route an authenticated inner control message using the existing broker.
     /// The endpoint must be the trusted caller endpoint installed in the approval.
     /// Even a transport error after reservation leaves the effect in `store`.
@@ -192,36 +231,15 @@ impl ProtocolRouter {
         endpoint: BrokerEndpoint<'_, impl FnMut(Command) -> Result<Response, String>>,
     ) -> Result<Response, String> {
         let BrokerEndpoint { caller, mut send } = endpoint;
-        let DispatchRequest {
-            context,
-            message_type,
-            payload,
-            operation_id,
-            timeout_ms,
-            parent,
-        } = request;
+        let effect = self.prepare_effect(caller, &request)?;
         let route = self
             .routes
             .iter()
-            .find(|route| route.message_type == message_type)
+            .find(|route| route.message_type == request.message_type)
             .ok_or("unregistered_route")?;
-        if !amaterasu_contracts::valid_name(caller)
-            || !route.approval.callers.contains(caller)
-            || !route.cleanup_approval.callers.contains(caller)
-            || !valid_context(context)
-            || !amaterasu_contracts::valid_name(operation_id)
-            || !(1..=30_000).contains(&timeout_ms)
-            || payload.len() > route.max_payload_bytes
-        {
-            return Err("invalid_request".into());
-        }
-        // The guard remains live through reservation and broker admission. Its
-        // implementation, not this helper, enforces atomic revocation fencing.
         let _guard = authority
-            .admit(context, &route.capability)
+            .admit(request.context, &route.capability)
             .map_err(str::to_owned)?;
-        let method = &route.approval.method;
-        // Both action and cleanup must resolve to the exact selected provider.
         for expected in [&route.approval, &route.cleanup_approval] {
             let approved = &expected.method;
             let response = send(Command::QueryApiApproval {
@@ -241,19 +259,15 @@ impl ProtocolRouter {
                 return Err("approval_mismatch".into());
             }
         }
-        let effect = PendingEffect {
-            caller: caller.into(),
-            operation_id: operation_id.into(),
-            context: context.clone(),
+        let DispatchRequest {
+            context,
             message_type,
-            capability: route.capability.clone(),
-            provider: route.approval.provider.clone(),
-            method: route.method.clone(),
-            cleanup: route.cleanup.clone(),
-            payload_sha256: format!("{:x}", Sha256::digest(payload)),
+            payload,
+            operation_id,
             timeout_ms,
             parent,
-        };
+        } = request;
+        let method = &route.approval.method;
         match store.reserve(&effect).map_err(str::to_owned)? {
             Reservation::New => {}
             Reservation::Existing | Reservation::Uncertain => {
