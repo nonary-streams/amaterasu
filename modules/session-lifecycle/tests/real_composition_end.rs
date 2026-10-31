@@ -10,9 +10,8 @@
 //! must match that configuration and be trusted native code.
 //!
 //! Run with `cargo test -p amaterasu-session-lifecycle --test
-//! real_composition_end -- --ignored`. A coordinator that still gates dependent
-//! profiles rejects this fixture at startup; an isolated qualification build
-//! may be used to investigate it without changing the production gate.
+//! real_composition_end -- --ignored`. The selected coordinator must support
+//! the configured dependent profile.
 //! The fixture replaces the configured lifecycle journal path with a private
 //! temporary path; native display and state services are deterministic fakes.
 #![cfg(target_os = "linux")]

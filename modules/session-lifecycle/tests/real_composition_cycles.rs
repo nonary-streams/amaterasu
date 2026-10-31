@@ -7,11 +7,9 @@
 //! A private host-state root and journal are created for each run. Native display
 //! and capture observations are simulated; the broker and state module are real.
 //!
-//! The production coordinator currently gates dependent profiles. This ignored
-//! test may run against an isolated qualification build; the gate remains in
-//! place until the full flow and bounded retirement are qualified. It reports
-//! logical namespace/collection counts and checks full-record growth after
-//! warmup. Run `cargo test -p amaterasu-session-lifecycle --test
+//! The selected coordinator must support the configured dependent profile. The
+//! test reports logical namespace/collection counts and checks full-record
+//! growth after warmup. Run `cargo test -p amaterasu-session-lifecycle --test
 //! real_composition_cycles -- --ignored --nocapture` with matching artifacts.
 #![cfg(target_os = "linux")]
 use amaterasu_module_sdk::{Command, Response, abi};
