@@ -974,6 +974,31 @@ impl Coordinator {
                     continue;
                 }
             }
+            if composed_v2
+                && work.phase == LifecyclePhase::StreamPrepare
+                && !work.states.contains_key(provider)
+                && work
+                    .provider_graph
+                    .as_ref()
+                    .and_then(|graph| graph.dependencies.get(provider))
+                    .is_some_and(|dependencies| !dependencies.is_empty())
+            {
+                match self.advance_owner_observations(&key, &work, provider, send) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(reason) => {
+                        let mut next = self.shared.borrow().value.clone();
+                        let receipt = next
+                            .receipts
+                            .get_mut(&key)
+                            .ok_or("transition_no_longer_active")?;
+                        receipt.response["status"] = json!("recovery_required");
+                        receipt.response["reason"] = json!(reason);
+                        save(&self.shared, next)?;
+                        continue;
+                    }
+                }
+            }
             let runtime_key = format!("{key}/{}", work.index);
             let mut authority = match self.authority_for_work(&work) {
                 Ok(a) => a,
@@ -1898,6 +1923,7 @@ impl Coordinator {
                 let receipt = next.receipts.get_mut(key).unwrap();
                 receipt.work = Some(Work {
                     composition_progress: None,
+                    owner_observations: Default::default(),
                     phase,
                     target: work.target.clone(),
                     intent: None,
@@ -2159,6 +2185,7 @@ mod dependency_cleanup_tests {
     fn work() -> Work {
         Work {
             composition_progress: None,
+            owner_observations: Default::default(),
             phase: LifecyclePhase::SessionRelease,
             target: LifecycleTarget::Session {
                 host_epoch: "epoch".into(),

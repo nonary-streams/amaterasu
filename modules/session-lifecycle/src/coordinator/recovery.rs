@@ -176,6 +176,7 @@ mod tests {
         };
         let work = Work {
             composition_progress: None,
+            owner_observations: Default::default(),
             phase: LifecyclePhase::StreamPrepare,
             target: old_target.clone(),
             intent: Some(StreamIntent::Initial),

@@ -89,6 +89,7 @@ impl Coordinator {
         }
         Ok(Work {
             composition_progress: None,
+            owner_observations: Default::default(),
             phase,
             target,
             intent: payload

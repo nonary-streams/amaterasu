@@ -27,6 +27,7 @@ mod finalize_result;
 mod finalize_result_verify;
 #[allow(dead_code)] // Finalization selection remains gated until composition sequencing is wired.
 mod finalize_selection;
+mod observation_scheduler;
 mod operations;
 #[allow(dead_code)]
 mod plan_observation;
@@ -96,6 +97,8 @@ struct Work {
     /// Inert until composition sequencing and owner verification are installed.
     #[serde(default)]
     composition_progress: Option<composition_progress::CompositionProgress>,
+    #[serde(default)]
+    owner_observations: BTreeMap<String, plan_observation::PlanObservationState>,
     phase: LifecyclePhase,
     target: LifecycleTarget,
     intent: Option<StreamIntent>,
@@ -404,7 +407,8 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
         || journal.sessions.len() > MAX_SESSIONS
         || journal.receipts.values().any(|receipt| {
             receipt.work.as_ref().is_some_and(|work| {
-                work.action_transfer.as_ref().is_some_and(|transfer| {
+                !observation_scheduler::validate_work_observations(journal, work)
+                    || work.action_transfer.as_ref().is_some_and(|transfer| {
                     transfer.snapshot.as_ref().is_some_and(|snapshot| {
                         !action_endpoints::action_snapshot_matches(
                             journal, receipt, work, transfer, snapshot,
@@ -830,6 +834,7 @@ pub struct Coordinator {
     approval_cursor: usize,
     drivers: BTreeMap<String, PrepareDriver>,
     finalize_drivers: BTreeMap<String, finalize_dispatch::FinalizeDispatch>,
+    observation_drivers: BTreeMap<String, plan_observation::PlanObservationDriver>,
     control_drivers: BTreeMap<String, control_dispatch::ControlDispatch>,
     settlement_drivers: BTreeMap<String, settlement_dispatch::SettlementDispatch>,
     validations: BTreeMap<String, security::ValidationJob>,
@@ -905,6 +910,7 @@ impl Coordinator {
             approval_cursor: 0,
             drivers: BTreeMap::new(),
             finalize_drivers: BTreeMap::new(),
+            observation_drivers: BTreeMap::new(),
             control_drivers: BTreeMap::new(),
             settlement_drivers: BTreeMap::new(),
             validations: BTreeMap::new(),
