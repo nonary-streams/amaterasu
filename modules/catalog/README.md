@@ -454,21 +454,42 @@ complete snapshot.
 
 Set `"staged":true` in `provider_snapshot_begin` to durably collect batches
 without publishing their entries or removal intents. Retry begin with the same
-`sync_id`, source revision, and mode to resume after restart. Batch replies keep
-the catalog revision unchanged. A complete finish rescans the collection and
-publishes all entry changes, provenance changes, and selected cleanup in one
-compare-and-set commit. Manual edits made before that scan remain protected;
-concurrent writes during publication cause a revision conflict. The caller must
-retry with the current catalog revision. An incomplete finish cannot publish.
-Playnite provider epochs still fence revoked generations.
+`sync_id`, source revision, epoch, and mode to resume after restart. Confirm the
+begin response explicitly contains `"staged":true` before sending batches;
+Steam, Lutris, and Playnite require this acknowledgment. Each accepted batch is
+stored as a hidden durable row and leaves the public catalog revision unchanged.
+A batch contains at most eight total entry and removal intents and at most
+12,000 encoded bytes; source IDs cannot repeat within the generation.
 
-The staged state row, including its key and serialized value, is limited to
-10,000 bytes. Publication must fit both 128 collection edits and a 16,384-byte
-serialized command. A `resource_exhausted` response leaves the published catalog
-unchanged; previously accepted staged batches remain available. These limits make
-this mode suitable only for bounded snapshots and cleanup sets. Starting a fresh
-snapshot requires a new `sync_id`. Omit `staged` for the existing incremental
-batch and cleanup behavior.
+A complete finish rescans the collection, plans entry and provenance changes
+and selected cleanup, and sends bounded chunks to a durable State draft. State
+publishes its manifest in one compare-and-set operation, so readers see the
+previous catalog or the completed publication. Manual edits found during the
+scan remain protected; a concurrent collection write fences publication with a
+revision conflict. Retry with the current catalog revision. An incomplete finish
+cannot publish, and Playnite provider epochs still fence revoked generations.
+
+Publication is bounded: State permits at most 1,024 chunks, 100,000 edits, and
+16 MiB of encoded chunk data per draft. Each chunk has at most 128 edits and a
+12,000-byte encoded edits array; individual entries and transport frames have
+their own limits. These edits include provenance changes and hidden staged-row
+removals, so not every catalog at its maximum entry count fits one publication.
+At most 12,500 staged batch rows per provider can be held, including abandoned
+older generations. Begin and batch operations incrementally reclaim older rows
+without deleting the current generation or public entries. State also limits
+each caller to 16 active drafts and reclaims valid drafts idle for at least 24
+hours when a new draft begins. See [durable collection drafts](../state/README.md#durable-collection-drafts)
+for the full limits and cleanup rules.
+
+The catalog binds resumable drafts to the exact planned contents and collection
+revision. If a request times out or its acknowledgment is lost, retry the same
+finish; completed chunks can be resumed, and a completed publication can be
+recognized on retry. A changed collection revision requires a fresh plan and
+revision-conflict retry. A `resource_exhausted` response leaves public entries
+unchanged; accepted staged batches remain available, but an oversized plan
+cannot finish without reducing its size or changing the snapshot. Starting a
+fresh snapshot requires a new `sync_id`. Omit `staged` for the legacy incremental
+batch and cleanup behavior, which does not provide whole-snapshot atomicity.
 
 Playnite uses explicit `installed:false` records as tombstones only when both
 `auto_sync` and `autosync_remove_uninstalled` are enabled. A manual refresh with
