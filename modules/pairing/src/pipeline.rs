@@ -169,7 +169,15 @@ impl Pipeline {
         }
     }
 
-    pub fn invalidate_identity(&self) {
+    pub fn authority_available(&self) -> bool {
+        self.effect_authority.is_none() || self.effect_gate.is_some()
+    }
+
+    pub fn invalidate_identity(&mut self) {
+        if let Some(gate) = &mut self.effect_gate {
+            gate.fence();
+        }
+        self.effect_bindings.clear();
         self.identity.invalidate();
     }
 
@@ -229,7 +237,7 @@ impl Pipeline {
         if self.identity_generation.is_some() {
             let result = self.advance_identity_generation(now, &mut send);
             if result.is_err() {
-                self.identity.invalidate();
+                self.invalidate_identity();
                 self.recovery_needed = true;
             }
             return result;
@@ -247,13 +255,16 @@ impl Pipeline {
                     HostConfigurationState::Failed { .. }
                 ) =>
             {
-                self.reject_unconfigured(&mut send)
+                self.reject_unconfigured(now, &mut send)
+            }
+            Ok(false) if self.effect_authority.is_some() => {
+                self.poll_effect_completion(now, &mut send)
             }
             Ok(false) => Ok(()),
             Err(failure) => Err(failure),
         };
         if result.is_err() {
-            self.identity.invalidate();
+            self.invalidate_identity();
             self.recovery_needed = true;
         }
         result
@@ -347,7 +358,7 @@ impl Pipeline {
                     .as_ref()
                     .is_some_and(|previous| previous.provider_revision != revision)
                 {
-                    self.identity.invalidate();
+                    self.invalidate_identity();
                     self.recovery_needed = true;
                 }
                 if payload["ok"] != true || payload["ready"] != true {
@@ -390,7 +401,7 @@ impl Pipeline {
         if !std::path::Path::new(&paths.certificate_path).exists()
             && !std::path::Path::new(&paths.private_key_path).exists()
         {
-            self.identity.invalidate();
+            self.invalidate_identity();
             self.recovery_needed = true;
             let loader: Generator<ConfiguredIdentity> = Box::new(move || {
                 ConfiguredIdentity::load(
@@ -436,7 +447,7 @@ impl Pipeline {
                         previous
                     }
                     Some(_) => {
-                        self.identity.invalidate();
+                        self.invalidate_identity();
                         self.recovery_needed = true;
                         Arc::new(identity)
                     }
@@ -693,7 +704,7 @@ impl Pipeline {
         };
         self.host_configuration_retry_seconds =
             (self.host_configuration_retry_seconds * 2).min(HOST_CONFIGURATION_MAX_RETRY_SECONDS);
-        self.identity.invalidate();
+        self.invalidate_identity();
         self.recovery_needed = true;
     }
 
@@ -721,6 +732,7 @@ impl Pipeline {
 
     fn reject_unconfigured(
         &mut self,
+        now: u64,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
         if let Some(deferred) = &self.deferred_import {
@@ -735,6 +747,16 @@ impl Pipeline {
         }
         match send(Command::Poll {})? {
             Response::Pending => Ok(()),
+            Response::Request {
+                id,
+                caller,
+                initiator,
+                service,
+                payload,
+                ..
+            } if service == EFFECT_SERVICE => {
+                self.handle_effect_request(id, &caller, &initiator, payload, now, send)
+            }
             response if self.authorized_import_for_retry(&response) => {
                 let Response::Request { remaining_ms, .. } = &response else {
                     unreachable!()
@@ -789,11 +811,10 @@ impl Pipeline {
             ) {
                 return complete(&mut send, request.id, error("request_ended"));
             }
-            if self
-                .effect_gate
-                .as_ref()
-                .is_some_and(|gate| !gate.drained())
-            {
+            if let Some(gate) = &mut self.effect_gate {
+                gate.fence();
+            }
+            if self.effect_gate.as_ref().is_none_or(|gate| !gate.drained()) {
                 self.deferred_effect_mutation = Some((request, operation));
                 return self.poll_effect_completion(now, &mut send);
             }
@@ -803,6 +824,13 @@ impl Pipeline {
                 json!({"action":"get","key":STATE_KEY}),
                 &mut send,
             );
+        }
+        if self
+            .effect_gate
+            .as_ref()
+            .is_some_and(|gate| gate.drain_required())
+        {
+            return self.poll_effect_completion(now, &mut send);
         }
         // One request at a time: state CAS operations cannot race internally and
         // identity writes and pairing commits are serialized without stale caches.
@@ -835,6 +863,9 @@ impl Pipeline {
                 remaining_ms,
                 ..
             } => {
+                if !matches!(send(Command::CheckRequest { request: id })?, Response::Ok) {
+                    return complete(&mut send, id, error("request_ended"));
+                }
                 if let Some((_, stale, _)) = &mut self.recovery_request {
                     *stale = true;
                 }
@@ -877,16 +908,13 @@ impl Pipeline {
                     deadline: Instant::now() + Duration::from_millis(remaining_ms.min(30_000)),
                 };
                 if operation.may_write() && !is_client_configuration_update(&operation) {
-                    if let Some(gate) = &mut self.effect_gate {
-                        gate.fence();
+                    if self.effect_authority.is_some() && self.effect_gate.is_none() {
+                        return complete(&mut send, id, error("authority_unavailable"));
                     }
-                    self.effect_bindings.clear();
-                    self.identity.invalidate();
+                    self.invalidate_identity();
                     self.recovery_needed = true;
-                    if self
-                        .effect_gate
-                        .as_ref()
-                        .is_some_and(|gate| !gate.drained())
+                    if self.effect_authority.is_some()
+                        && self.effect_gate.as_ref().is_none_or(|gate| !gate.drained())
                     {
                         self.deferred_effect_mutation = Some((request, operation));
                         return Ok(());
@@ -920,7 +948,7 @@ impl Pipeline {
             } if service == EFFECT_SERVICE
                 && matches!(
                     payload["action"].as_str(),
-                    Some("complete" | "lookup" | "acknowledge" | "status" | "drain")
+                    Some("complete" | "lookup" | "acknowledge" | "status" | "drain" | "recover")
                 ) =>
             {
                 self.handle_effect_request(id, &caller, &initiator, payload, now, send)
@@ -939,6 +967,9 @@ impl Pipeline {
         now: u64,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
+        if !matches!(send(Command::CheckRequest { request: id })?, Response::Ok) {
+            return complete(send, id, error("request_ended"));
+        }
         let response = self.apply_effect_request(caller, initiator, payload, now);
         complete(
             send,
@@ -1037,7 +1068,7 @@ impl Pipeline {
                 )
             }
             EffectRequest::Status {} => Ok(
-                json!({"ok":true,"epoch":gate.epoch(),"owner_epoch":gate.owner_epoch(),"fence_generation":gate.fence_generation(),"drain_required":gate.drain_required(),"in_flight":gate.in_flight()}),
+                json!({"ok":true,"epoch":gate.epoch(),"owner_epoch":gate.owner_epoch(),"startup_recovery_required":gate.startup_recovery_required(),"fence_generation":gate.fence_generation(),"drain_required":gate.drain_required(),"in_flight":gate.in_flight()}),
             ),
             EffectRequest::Drain {
                 epoch,
@@ -1109,7 +1140,7 @@ impl Pipeline {
                 Ok(())
             }
             _ => {
-                self.identity.invalidate();
+                self.invalidate_identity();
                 self.recovery_needed = true;
                 complete(send, request.id, error("state_unavailable"))
             }
@@ -1139,7 +1170,7 @@ impl Pipeline {
                         expected_ack_revision,
                     } => {
                         if payload["revision"].as_u64() != Some(expected_ack_revision) {
-                            self.identity.invalidate();
+                            self.invalidate_identity();
                             self.recovery_needed = true;
                             return complete(send, pending.request.id, error("state_unavailable"));
                         }
@@ -1150,7 +1181,7 @@ impl Pipeline {
                     Stage::Loading(operation) => {
                         if Instant::now() >= pending.request.deadline {
                             if is_client_configuration_update(&operation) {
-                                self.identity.invalidate();
+                                self.invalidate_identity();
                                 self.recovery_needed = true;
                             }
                             return complete(send, pending.request.id, error("deadline_exceeded"));
@@ -1162,7 +1193,7 @@ impl Pipeline {
                             Response::Ok
                         ) {
                             if is_client_configuration_update(&operation) {
-                                self.identity.invalidate();
+                                self.invalidate_identity();
                                 self.recovery_needed = true;
                             }
                             return complete(send, pending.request.id, error("request_ended"));
@@ -1172,7 +1203,7 @@ impl Pipeline {
                             match read_document(&payload, now, configured_identity.is_none()) {
                                 Ok(document) => document,
                                 Err(code) => {
-                                    self.identity.invalidate();
+                                    self.invalidate_identity();
                                     self.recovery_needed = true;
                                     return complete(send, pending.request.id, error(code));
                                 }
@@ -1194,7 +1225,7 @@ impl Pipeline {
                     && payload["error"]["code"] == "revision_conflict"
                     && payload["error"]["current_revision"].as_u64().is_some() =>
             {
-                self.identity.invalidate();
+                self.invalidate_identity();
                 self.recovery_needed = true;
                 complete(
                     send,
@@ -1208,7 +1239,7 @@ impl Pipeline {
             }
             // Never echo transport/state messages: they can contain input values.
             _ => {
-                self.identity.invalidate();
+                self.invalidate_identity();
                 self.recovery_needed = true;
                 complete(send, pending.request.id, error("state_unavailable"))
             }
@@ -1358,7 +1389,7 @@ impl Pipeline {
         let loaded = match self.prepare_snapshot(&document, now) {
             Ok(snapshot) => snapshot,
             Err(code) => {
-                self.identity.invalidate();
+                self.invalidate_identity();
                 self.recovery_needed = true;
                 return complete(send, request.id, error(code));
             }
@@ -1456,7 +1487,7 @@ impl Pipeline {
                     response["revision"] = revision.into();
                 }
                 if let Some(document) = initialized_document {
-                    self.identity.invalidate();
+                    self.invalidate_identity();
                     self.recovery_needed = true;
                     let Some(expected_ack_revision) = revision.checked_add(1) else {
                         return complete(send, request.id, error("state_unavailable"));
@@ -1497,11 +1528,11 @@ impl Pipeline {
                     document.identity = Some(identity);
                 }
                 if !configuration_only {
-                    self.identity.invalidate();
+                    self.invalidate_identity();
                     self.recovery_needed = true;
                 }
                 let Some(expected_ack_revision) = revision.checked_add(1) else {
-                    self.identity.invalidate();
+                    self.invalidate_identity();
                     self.recovery_needed = true;
                     return complete(send, request.id, error("state_unavailable"));
                 };
@@ -1516,7 +1547,7 @@ impl Pipeline {
                 let snapshot = match self.prepare_snapshot(&document, snapshot_now) {
                     Ok(snapshot) => snapshot,
                     Err(code) => {
-                        self.identity.invalidate();
+                        self.invalidate_identity();
                         self.recovery_needed = true;
                         return complete(send, request.id, error(code));
                     }
@@ -1641,6 +1672,13 @@ impl Pipeline {
         pairing_revision: u64,
         snapshot: Option<Arc<Snapshot>>,
     ) -> Result<(), &'static str> {
+        if self
+            .effect_gate
+            .as_ref()
+            .is_some_and(|gate| gate.drain_required())
+        {
+            return Err("effect_retirement_pending");
+        }
         let configuration_revision = match &self.host_configuration {
             HostConfigurationState::Ready {
                 identity: configured_identity,
