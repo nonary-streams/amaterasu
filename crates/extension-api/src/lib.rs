@@ -938,9 +938,14 @@ pub fn validate_provider_response(
                                 .incarnation
                                 .as_ref()
                                 .is_none_or(|id| id == &output.resource.incarnation)
-                            && resource
-                                .expected_revision
-                                .is_none_or(|revision| revision == output.resource.revision)
+                            && resource.expected_revision.is_none_or(|revision| {
+                                match resource.access {
+                                    ResourceAccess::Read => output.resource.revision == revision,
+                                    ResourceAccess::Shared | ResourceAccess::Exclusive => {
+                                        output.resource.revision >= revision
+                                    }
+                                }
+                            })
                     })
                 {
                     return Err("output outside admitted plan".into());
@@ -1249,7 +1254,26 @@ mod tests {
             outputs: vec![output],
         };
         assert!(validate_provider_response(&request, &response(output.clone())).is_ok());
+        for access in [
+            ResourceAccess::Read,
+            ResourceAccess::Shared,
+            ResourceAccess::Exclusive,
+        ] {
+            let mut scoped = request.clone();
+            scoped.approved_plan.as_mut().unwrap().resources[0].access = access.clone();
+            for (revision, expected) in [(3, false), (4, true), (5, access != ResourceAccess::Read)]
+            {
+                let mut revised = output.clone();
+                revised.resource.revision = revision;
+                assert_eq!(
+                    validate_provider_response(&scoped, &response(revised)).is_ok(),
+                    expected,
+                    "{access:?} at revision {revision}"
+                );
+            }
+        }
         let mut foreign = output.clone();
+        foreign.resource.revision += 1;
         foreign.resource.mutation_domains.push("foreign".into());
         foreign.domain_observations.push(DomainObservation {
             domain: "foreign".into(),
