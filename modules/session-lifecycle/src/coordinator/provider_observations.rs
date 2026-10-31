@@ -157,7 +157,10 @@ fn closed_stream_admissions(
 
 /// Only authenticated terminal action evidence closes historical admissions.
 /// Domain names and a released output flag alone do not prove cleanup.
-fn closed_admissions(journal: &Journal, session: &SessionRecord) -> ModuleResult<BTreeSet<String>> {
+pub(super) fn closed_admissions(
+    journal: &Journal,
+    session: &SessionRecord,
+) -> ModuleResult<BTreeSet<String>> {
     let target = LifecycleTarget::Session {
         host_epoch: session.host_epoch.clone(),
         session_id: session.id.clone(),
@@ -170,6 +173,34 @@ fn closed_admissions(journal: &Journal, session: &SessionRecord) -> ModuleResult
             .closed_admissions(&target)
             .ok_or("closed_action_invalid")?,
     );
+    if session.phase == SessionPhase::Ended
+        && let Ok(proof) = super::session_release::validated_release_closure(journal, &target)
+    {
+        // Only the exact graph-complete terminal proof can remove historical
+        // prepare/release admissions from live shared-domain metadata.
+        let mut exact = vec![
+            (proof.root_admission, LifecyclePhase::SessionPrepare),
+            (
+                proof.owner_release_admission,
+                LifecyclePhase::SessionRelease,
+            ),
+        ];
+        for dependent in proof.dependents {
+            exact.push((dependent.prepare_admission, LifecyclePhase::SessionPrepare));
+            exact.push((dependent.release_admission, LifecyclePhase::SessionRelease));
+        }
+        for (id, phase) in exact {
+            if !session.admission_ids.contains(&id)
+                || session.admission_targets.get(&id) != Some(&target)
+                || session.admission_phases.get(&id) != Some(&phase)
+                || !journal.authority.settled.contains_key(&id)
+                || journal.authority.admissions.contains_key(&id)
+            {
+                return Err("session_release_admission_invalid".into());
+            }
+            closed.insert(id);
+        }
+    }
     for root in journal.composition.records().filter(|root| {
         root.output.origin == target && root.state == super::composition::OutputState::Released
     }) {

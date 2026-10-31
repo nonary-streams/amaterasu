@@ -2345,6 +2345,53 @@ pub(in crate::coordinator) mod tests {
         };
         let mut retained = journal.clone();
         add_new(&mut retained);
+        let closed = super::provider_observations::closed_admissions(
+            &retained,
+            &retained.sessions["session"],
+        )
+        .unwrap();
+        assert!(closed.contains("root"));
+        assert!(closed.contains("release-admission"));
+        let mut visible = retained.clone();
+        visible
+            .authority
+            .settled
+            .insert("new-admission".into(), cert.root_admission.clone());
+        let next = visible.sessions.get_mut("next").unwrap();
+        next.admission_ids.insert("new-admission".into());
+        next.admission_targets
+            .insert("new-admission".into(), new_work.target.clone());
+        next.admission_phases
+            .insert("new-admission".into(), LifecyclePhase::SessionPrepare);
+        visible
+            .admission_transitions
+            .insert("new-admission".into(), "next-transition".into());
+        visible
+            .authority
+            .snapshot
+            .domains
+            .get_mut("shared")
+            .unwrap()
+            .borrowers
+            .insert("next".into(), 1);
+        let metadata =
+            super::provider_observations::metadata(&visible, &visible.sessions["next"], "owner")
+                .unwrap();
+        let admissions = metadata["admitted_plans"].as_array().unwrap();
+        assert_eq!(admissions.len(), 1);
+        assert_eq!(admissions[0]["admission_id"], "new-admission");
+        assert_eq!(metadata["mutation_domains"].as_array().unwrap().len(), 1);
+        assert_eq!(metadata["mutation_domains"][0]["borrowers"]["next"], 1);
+        let mut forged = retained.clone();
+        forged.session_releases.proofs[0]
+            .callback
+            .terminal
+            .call
+            .approval["provider"] = json!("foreign");
+        assert!(
+            super::provider_observations::closed_admissions(&forged, &forged.sessions["session"])
+                .is_err()
+        );
         assert!(
             super::provider_observations::new_session_domains(
                 &retained,
