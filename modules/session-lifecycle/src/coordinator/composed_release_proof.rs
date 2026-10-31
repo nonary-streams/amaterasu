@@ -19,6 +19,15 @@ pub(super) struct ComposedReleaseBook {
     proofs: Vec<Proof>,
 }
 
+/// Immutable evidence; consumers must persist any compact checkpoint atomically
+/// with all replay fences and must not remove facts still referenced elsewhere.
+#[allow(dead_code)] // Consumed by closure/checkpoint integration.
+pub(super) struct VerifiedRelease<'a> {
+    pub work: &'a Work,
+    pub finalized: &'a super::finalize_result::FinalizeResultRecord,
+    pub released_output: &'a amaterasu_extension_api::ResourceOutput,
+}
+
 impl ComposedReleaseBook {
     pub fn references_admission(&self, id: &str) -> bool {
         self.proofs.iter().any(|proof| {
@@ -42,6 +51,39 @@ impl ComposedReleaseBook {
         self.proofs
             .iter()
             .any(|proof| &proof.work.target == target && verify(journal, proof).is_ok())
+    }
+    /// Return only the exact transition's fully verified retained callbacks.
+    #[allow(dead_code)] // Used by the action transfer integration.
+    pub fn verified_work_for<'a>(
+        &'a self,
+        journal: &Journal,
+        target: &LifecycleTarget,
+        transition_id: &str,
+    ) -> Option<&'a Work> {
+        let proof = self.proofs.iter().find(|proof| {
+            &proof.work.target == target && proof.work.transition_id == transition_id
+        })?;
+        verify(journal, proof).ok().map(|()| &proof.work)
+    }
+    #[allow(dead_code)] // Consumed by closure/checkpoint integration.
+    pub fn verified_evidence_for<'a>(
+        &'a self,
+        journal: &'a Journal,
+        target: &LifecycleTarget,
+        transition_id: &str,
+    ) -> Option<VerifiedRelease<'a>> {
+        let proof = self.proofs.iter().find(|proof| {
+            &proof.work.target == target && proof.work.transition_id == transition_id
+        })?;
+        verify(journal, proof).ok()?;
+        let finalized = journal.finalize_results.records().find(|record| {
+            record.request.permit_id == proof.finalize_permit_id && record.request.target == *target
+        })?;
+        Some(VerifiedRelease {
+            work: &proof.work,
+            finalized,
+            released_output: &proof.released_output,
+        })
     }
     pub fn released_output_for_target(
         &self,
@@ -106,11 +148,14 @@ fn verify(journal: &Journal, proof: &Proof) -> ModuleResult<()> {
     {
         return Err("release_graph_context_invalid".into());
     }
-    let mut finalized = journal.finalize_results.records().filter(|item| {
-        item.request.permit_id == proof.finalize_permit_id && item.request.target == work.target
-    });
-    let finalized = finalized.next().ok_or("release_finalize_missing")?;
-    if finalized.selection.policy.owner_provider != **roots.first().unwrap()
+    let mut finalized_results = journal
+        .finalize_results
+        .records()
+        .filter(|item| item.request.target == work.target);
+    let finalized = finalized_results.next().ok_or("release_finalize_missing")?;
+    if finalized_results.next().is_some()
+        || finalized.request.permit_id != proof.finalize_permit_id
+        || finalized.selection.policy.owner_provider != **roots.first().unwrap()
         || !finalized.validate_structure()
         || !finalized.validate_control_chain(journal)
     {
@@ -595,5 +640,17 @@ mod tests {
                 .has_valid_release(&journal, &target)
         );
         assert!(journal.verified_released_output(&target).is_none());
+        assert!(
+            journal
+                .composed_releases
+                .verified_work_for(&journal, &target, "different-transition")
+                .is_none()
+        );
+        assert!(
+            journal
+                .composed_releases
+                .verified_evidence_for(&journal, &target, "different-transition")
+                .is_none()
+        );
     }
 }
