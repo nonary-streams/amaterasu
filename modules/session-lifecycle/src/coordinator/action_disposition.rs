@@ -173,5 +173,10 @@ mod tests {
             .insert(marker_key("session", "owner", 1), marker);
         assert!(verified_marker(&journal, "session", "owner").is_none());
         assert!(validate_journal(&journal).is_err());
+        let session: SessionRecord = serde_json::from_value(json!({"host_epoch":"epoch","id":"session","generation":1,"phase":"paused","owner":{"caller":"transport","initiator":"user"},"delegates":[],"application_ref":null,"settings_revision":"revision","application_retired":false,"streams":{},"resource_generations":{"owner":2}})).unwrap();
+        journal.sessions.insert("session".into(), session);
+        assert!(verified_marker_at(&journal, "session", "owner", 1).is_none());
+        assert!(verified_marker(&journal, "session", "owner").is_none());
+        assert!(validate_journal(&journal).is_err());
     }
 }

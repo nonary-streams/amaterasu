@@ -833,31 +833,35 @@ impl Coordinator {
         let Ok((owner, _, plan)) = journal.actions.execution_for_permit(caller, token) else {
             return rejection("action_execution_unavailable");
         };
-        let Some(generation) = journal
-            .sessions
-            .get(session_id)
-            .and_then(|session| session.resource_generations.get(&owner))
-            .copied()
+        let Some(generation) = plan
+            .resource_disposition
+            .as_ref()
+            .map(|disposition| disposition.resource_generation)
         else {
-            return rejection("action_root_unavailable");
+            return rejection("action_disposition_missing");
         };
         let marker_key = super::action_disposition::marker_key(session_id, &owner, generation);
         if let Some(marker) = journal.action_dispositions.get(&marker_key) {
             let same = marker.binding == *binding
                 && marker.permit == token
                 && marker.dispatch_proof == payload["dispatch_proof"]
-                && journal
-                    .sessions
-                    .get(session_id)
-                    .and_then(|session| session.resource_generations.get(&owner))
-                    == Some(&marker.resource_generation)
-                && super::action_disposition::verified_marker(&journal, session_id, &owner)
-                    .is_some();
+                && super::action_disposition::verified_marker_at(
+                    &journal, session_id, &owner, generation,
+                )
+                .is_some();
             return if same {
                 json!({"status":"succeeded","operation_id":binding.operation_id,"target":binding.target,"plan_digest":binding.plan_digest})
             } else {
                 rejection("action_completion_conflict")
             };
+        }
+        if journal
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.resource_generations.get(&owner))
+            != Some(&generation)
+        {
+            return json!({"status":"recovery_required","reason":"action_completion_history_unavailable"});
         }
         if !effect_rights_current(&journal, caller, token, binding) {
             return rejection("action_effect_not_authorized");
