@@ -215,7 +215,7 @@ pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change,
         }
         Operation::Update {
             id,
-            entry,
+            mut entry,
             expected_revision,
         } => {
             check_revision(&document, expected_revision)?;
@@ -226,6 +226,15 @@ pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change,
                     "provider_entry_managed",
                     "Playnite launch identity can only be changed by its provider",
                 ));
+            }
+            // The caller cannot provide provider artwork. Retain the existing
+            // reference only while the launch target and Steam identity are unchanged;
+            // changing identity must not attach an unrelated provider image.
+            if same_artwork_launch_identity(&existing.launch, &entry.launch)
+                && existing.steam_id == entry.steam_id
+                && existing.steam_install_dir == entry.steam_install_dir
+            {
+                entry.artwork = existing.artwork.clone();
             }
             entry
                 .validate()
@@ -258,6 +267,27 @@ pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change,
     reply["ok"] = true.into();
     reply["revision"] = document.revision.into();
     Ok(Change::Write { document, reply })
+}
+
+fn same_artwork_launch_identity(existing: &Launch, updated: &Launch) -> bool {
+    match (existing, updated) {
+        (Launch::Application { path: a }, Launch::Application { path: b }) => a == b,
+        (
+            Launch::Executable {
+                program: a_program,
+                arguments: a_arguments,
+                working_directory: a_directory,
+                ..
+            },
+            Launch::Executable {
+                program: b_program,
+                arguments: b_arguments,
+                working_directory: b_directory,
+                ..
+            },
+        ) => a_program == b_program && a_arguments == b_arguments && a_directory == b_directory,
+        _ => false,
+    }
 }
 
 fn reject_provider_artwork(entry: &Entry) -> Result<(), Value> {
@@ -441,13 +471,52 @@ pub fn project_entry(id: &str, entry: &Entry, export: bool) -> Value {
 }
 
 pub fn matches_query(entry: &Entry, query: &str) -> bool {
-    query.is_empty()
-        || entry.name.to_lowercase().contains(query)
-        || entry.description.to_lowercase().contains(query)
-        || entry
-            .tags
-            .iter()
-            .any(|tag| tag.to_lowercase().contains(query))
+    if query.is_empty() {
+        return true;
+    }
+    let contains = |value: &str| value.to_lowercase().contains(query);
+    if contains(&entry.name)
+        || contains(&entry.description)
+        || entry.tags.iter().any(|tag| contains(tag))
+        || entry.output.as_deref().is_some_and(contains)
+        || entry.steam_id.as_deref().is_some_and(contains)
+        || entry.steam_install_dir.as_deref().is_some_and(contains)
+        || (entry.steam_id.is_some() && contains("steam"))
+        || entry.artwork.as_ref().is_some_and(|artwork| match artwork {
+            crate::model::ArtworkReference::Steam { .. } => contains("steam"),
+            crate::model::ArtworkReference::Lutris { .. } => contains("lutris"),
+        })
+    {
+        return true;
+    }
+    match &entry.launch {
+        Launch::Application { path } => contains(path),
+        Launch::Executable {
+            program,
+            arguments,
+            working_directory,
+            ..
+        } => {
+            contains(program)
+                || contains(&format!("{} {}", program, arguments.join(" ")))
+                || working_directory.as_deref().is_some_and(contains)
+        }
+        Launch::Playnite {
+            game_id,
+            working_directory,
+            ..
+        } => {
+            contains("playnite")
+                || contains(game_id)
+                || working_directory.as_deref().is_some_and(contains)
+        }
+        Launch::PlayniteFullscreen {
+            working_directory, ..
+        } => contains("playnite") || working_directory.as_deref().is_some_and(contains),
+        Launch::Desktop {
+            working_directory, ..
+        } => contains("desktop") || working_directory.as_deref().is_some_and(contains),
+    }
 }
 
 pub fn error(code: &str, message: impl Into<String>) -> Value {

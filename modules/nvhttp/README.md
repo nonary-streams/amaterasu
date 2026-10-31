@@ -67,6 +67,19 @@ load with backoff. A missing product document uses the bootstrap hostname and
 configured component port at revision 0; its first successful update creates
 revision 1.
 
+## Managed launch stop
+
+The management principal can read an opaque launch reference, revision and
+cleanup state, then request a stop with the exact reference and revision it
+observed. The revision includes the launch state and pending reconnect, so a
+stale confirmation cannot cancel a different launch or an unseen reconnect.
+Accepted requests initiate the existing NVHTTP-owned RTSP, application and
+history cleanup; they do not assert cleanup completed. Read the same reference
+until it is `ended` or `cleanup_failed`. A failed cleanup can be explicitly
+retried using its latest revision. The action cannot stop streams owned outside
+NVHTTP. Management API read and write routes require `session.read` and
+`application.terminate`, respectively; knowing a reference is not authority to stop.
+
 ## Moonlight listener base port
 
 The NVHTTP product settings editor also stores a Moonlight HTTP base port. It

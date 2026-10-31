@@ -1,10 +1,15 @@
 //! Product-owned filtering and bounded session file policy for host records.
-use std::collections::BTreeMap;
+mod host_logs;
+mod support_logs;
+pub use host_logs::HostLogService;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::mem::MaybeUninit;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -284,11 +289,200 @@ fn local_time(unix_ms: u128) -> Option<libc::tm> {
     Some(unsafe { local.assume_init() })
 }
 
+/// Largest response chunk accepted by a log snapshot.
+pub const MAX_LOG_SNAPSHOT_CHUNK_BYTES: usize = 4096;
+const MAX_ACTIVE_LOG_SNAPSHOTS: usize = 8;
+
+struct SnapshotSegment {
+    file: Mutex<File>,
+    length: u64,
+}
+
+struct SnapshotLease(Arc<AtomicUsize>);
+
+impl Drop for SnapshotLease {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn acquire_snapshot_lease(count: &Arc<AtomicUsize>) -> io::Result<SnapshotLease> {
+    let mut active = count.load(Ordering::Acquire);
+    loop {
+        if active >= MAX_ACTIVE_LOG_SNAPSHOTS {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "too many active log snapshots",
+            ));
+        }
+        match count.compare_exchange_weak(active, active + 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Ok(SnapshotLease(Arc::clone(count))),
+            Err(current) => active = current,
+        }
+    }
+}
+
+/// A view of the current product-log session with fixed segment lengths. It owns
+/// already-open file handles, not paths supplied by a caller, and survives the
+/// logger's append and rollover operations. External in-place edits are not an
+/// integrity-protected snapshot; truncation is reported when encountered.
+pub struct LogSnapshot {
+    segments: Vec<SnapshotSegment>,
+    length: u64,
+    stream_id: String,
+    earlier_segments_discarded: u64,
+    _lease: SnapshotLease,
+}
+
+impl LogSnapshot {
+    /// Opaque identity of the writer session that produced this snapshot.
+    pub fn stream_id(&self) -> &str {
+        &self.stream_id
+    }
+
+    pub fn len(&self) -> u64 {
+        self.length
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    /// Count of this session's rollover segments no longer retained when the
+    /// snapshot was taken. Older worker sessions are not included in this view.
+    pub fn earlier_segments_discarded(&self) -> u64 {
+        self.earlier_segments_discarded
+    }
+
+    /// Read a bounded range without moving the logger's shared file position.
+    /// UTF-8 sequences and log lines can cross chunk and rollover boundaries.
+    pub fn read_chunk(&self, offset: u64, limit: usize) -> io::Result<Vec<u8>> {
+        if offset > self.length || limit == 0 || limit > MAX_LOG_SNAPSHOT_CHUNK_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid log snapshot range",
+            ));
+        }
+        let remaining = self.length - offset;
+        let requested = usize::try_from(remaining.min(limit as u64)).unwrap_or(limit);
+        let mut result = Vec::with_capacity(requested);
+        let mut position = offset;
+        for segment in &self.segments {
+            if position >= segment.length {
+                position -= segment.length;
+                continue;
+            }
+            let length =
+                usize::try_from((segment.length - position).min((requested - result.len()) as u64))
+                    .map_err(|_| io::Error::other("log snapshot range is too large"))?;
+            let mut bytes = vec![0; length];
+            let file = segment
+                .file
+                .lock()
+                .map_err(|_| io::Error::other("log snapshot lock failed"))?;
+            read_snapshot_exact(&file, &mut bytes, position + BOM.len() as u64)?;
+            result.extend_from_slice(&bytes);
+            position = 0;
+            if result.len() == requested {
+                break;
+            }
+        }
+        if result.len() != requested {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "log snapshot changed",
+            ));
+        }
+        Ok(result)
+    }
+}
+
+// Windows File::try_clone shares the file cursor, and seek_read moves it.
+// Reopen the already-authorized file object so snapshots cannot reposition
+// the writer. No pathname or caller-selected file is involved.
+#[cfg(windows)]
+fn clone_snapshot_file(file: &File) -> io::Result<File> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_GENERIC_READ, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, ReOpenFile,
+    };
+
+    // SAFETY: `file` owns a live CreateFile handle throughout this call.
+    // A successful ReOpenFile returns a separately owned file handle.
+    let reopened = unsafe {
+        ReOpenFile(
+            file.as_raw_handle(),
+            FILE_GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            0,
+        )
+    };
+    if reopened == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: this new handle is transferred to File, which closes it once.
+    Ok(unsafe { File::from_raw_handle(reopened) })
+}
+
+#[cfg(not(windows))]
+fn clone_snapshot_file(file: &File) -> io::Result<File> {
+    file.try_clone()
+}
+
+#[cfg(unix)]
+fn read_snapshot_exact(file: &File, mut buffer: &mut [u8], mut offset: u64) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    while !buffer.is_empty() {
+        let read = file.read_at(buffer, offset)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "log snapshot changed",
+            ));
+        }
+        offset += read as u64;
+        buffer = &mut buffer[read..];
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn read_snapshot_exact(file: &File, mut buffer: &mut [u8], mut offset: u64) -> io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buffer.is_empty() {
+        let read = file.seek_read(buffer, offset)?;
+        if read == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "log snapshot changed",
+            ));
+        }
+        offset += read as u64;
+        buffer = &mut buffer[read..];
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_snapshot_exact(_file: &File, _buffer: &mut [u8], _offset: u64) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "log snapshots are unsupported on this platform",
+    ))
+}
+
 pub struct SessionWriter {
     root: PathBuf,
+    log_directory: cap_std::fs::Dir,
+    base_name: String,
     label: String,
     active_path: PathBuf,
     file: Option<File>,
+    completed: VecDeque<SnapshotSegment>,
+    active_snapshots: Arc<AtomicUsize>,
+    stream_id: String,
+    earlier_segments_discarded: u64,
     bytes_written: u64,
     rollover_size: u64,
     rollover_count: usize,
@@ -305,6 +499,8 @@ impl SessionWriter {
         rollover_size: u64,
         rollover_count: usize,
     ) -> io::Result<Self> {
+        let stream_id = host_logs::random_id()
+            .ok_or_else(|| io::Error::other("log stream identity unavailable"))?;
         let state_root = validate_state_root(state_root)?;
         let relative_path = !configured_path.is_absolute();
         let configured_path = if relative_path {
@@ -329,6 +525,8 @@ impl SessionWriter {
                 "log root is not a directory",
             ));
         }
+        let log_directory =
+            cap_std::fs::Dir::open_ambient_dir(&canonical_root, cap_std::ambient_authority())?;
 
         purge_old_sessions(&canonical_root, &base_name)?;
         let mut session_file = None;
@@ -356,9 +554,15 @@ impl SessionWriter {
         let active_path = canonical_root.join(format!("{label}{LOG_SUFFIX}"));
         let mut writer = Self {
             root: canonical_root,
+            log_directory,
+            base_name,
             label,
             active_path,
             file: Some(file),
+            completed: VecDeque::new(),
+            active_snapshots: Arc::new(AtomicUsize::new(0)),
+            stream_id,
+            earlier_segments_discarded: 0,
             bytes_written: 0,
             rollover_size: rollover_size.max(1),
             rollover_count,
@@ -369,6 +573,67 @@ impl SessionWriter {
 
     pub fn active_path(&self) -> &Path {
         &self.active_path
+    }
+
+    /// Freeze the bytes retained for this session, excluding per-file UTF-8 BOMs.
+    pub fn snapshot(&mut self) -> io::Result<LogSnapshot> {
+        let lease = acquire_snapshot_lease(&self.active_snapshots)?;
+        self.flush()?;
+        let current = self
+            .file
+            .as_ref()
+            .ok_or_else(|| io::Error::other("session log is unavailable"))?;
+        let mut segments = Vec::with_capacity(self.completed.len() + 1);
+        let mut length = 0_u64;
+        for segment in &self.completed {
+            let file = segment
+                .file
+                .lock()
+                .map_err(|_| io::Error::other("log snapshot lock failed"))?;
+            Self::append_snapshot_segment(&mut segments, &mut length, &file, segment.length)?;
+        }
+        Self::append_snapshot_segment(&mut segments, &mut length, current, self.bytes_written)?;
+        Ok(LogSnapshot {
+            segments,
+            length,
+            stream_id: self.stream_id.clone(),
+            earlier_segments_discarded: self.earlier_segments_discarded,
+            _lease: lease,
+        })
+    }
+
+    fn support_log_source(&mut self) -> io::Result<support_logs::LogSource> {
+        Ok(support_logs::LogSource {
+            directory: self.log_directory.try_clone()?,
+            base_name: self.base_name.clone(),
+            active_label: self.label.clone(),
+            current: self.snapshot()?,
+        })
+    }
+
+    fn append_snapshot_segment(
+        segments: &mut Vec<SnapshotSegment>,
+        length: &mut u64,
+        file: &File,
+        segment_length: u64,
+    ) -> io::Result<()> {
+        let required_length = segment_length
+            .checked_add(BOM.len() as u64)
+            .ok_or_else(|| io::Error::other("log snapshot size overflow"))?;
+        if file.metadata()?.len() < required_length {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "log snapshot changed",
+            ));
+        }
+        *length = length
+            .checked_add(segment_length)
+            .ok_or_else(|| io::Error::other("log snapshot size overflow"))?;
+        segments.push(SnapshotSegment {
+            file: Mutex::new(clone_snapshot_file(file)?),
+            length: segment_length,
+        });
+        Ok(())
     }
 
     pub fn write_record(&mut self, record: &LogRecord) -> io::Result<()> {
@@ -423,12 +688,15 @@ impl SessionWriter {
     }
 
     fn rotate(&mut self) -> io::Result<()> {
-        if let Some(mut file) = self.file.take() {
-            file.flush()?;
-        }
+        let mut previous = self
+            .file
+            .take()
+            .ok_or_else(|| io::Error::other("session log is unavailable"))?;
+        previous.flush()?;
 
         if self.rollover_count == 0 {
             remove_if_present(&self.active_path)?;
+            self.earlier_segments_discarded = self.earlier_segments_discarded.saturating_add(1);
         } else {
             let oldest = rollover_path(&self.root, &self.label, self.rollover_count);
             remove_if_present(&oldest)?;
@@ -446,6 +714,16 @@ impl SessionWriter {
             }
         }
 
+        if self.rollover_count > 0 {
+            self.completed.push_back(SnapshotSegment {
+                file: Mutex::new(previous),
+                length: self.bytes_written,
+            });
+            while self.completed.len() > self.rollover_count {
+                self.completed.pop_front();
+                self.earlier_segments_discarded = self.earlier_segments_discarded.saturating_add(1);
+            }
+        }
         let active_file = open_new_file(&self.active_path)?;
         self.file = Some(active_file);
         self.bytes_written = 0;
@@ -455,7 +733,7 @@ impl SessionWriter {
 
 fn open_new_file(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
+    options.read(true).write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -635,6 +913,7 @@ fn validate_state_root(path: &Path) -> io::Result<PathBuf> {
     Ok(canonical)
 }
 
+#[derive(Clone)]
 pub struct ProductLogger {
     events: SyncSender<LoggerEvent>,
     state_root: PathBuf,
@@ -651,6 +930,8 @@ pub enum LoggerError {
 enum LoggerEvent {
     Record(LogRecord),
     Policy(LoggingPolicy),
+    Snapshot(SyncSender<io::Result<LogSnapshot>>),
+    SupportLogs(SyncSender<io::Result<support_logs::LogSource>>),
 }
 
 impl ProductLogger {
@@ -686,6 +967,26 @@ impl ProductLogger {
         self.events
             .try_send(LoggerEvent::Record(record))
             .map_err(map_send_error)
+    }
+
+    /// Queue a snapshot request without blocking the caller. The receiver
+    /// resolves on the logger thread after earlier accepted events are handled.
+    pub fn request_snapshot(&self) -> Result<Receiver<io::Result<LogSnapshot>>, LoggerError> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        self.events
+            .try_send(LoggerEvent::Snapshot(sender))
+            .map_err(map_send_error)?;
+        Ok(receiver)
+    }
+
+    fn request_support_logs(
+        &self,
+    ) -> Result<Receiver<io::Result<support_logs::LogSource>>, LoggerError> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        self.events
+            .try_send(LoggerEvent::SupportLogs(sender))
+            .map_err(map_send_error)?;
+        Ok(receiver)
     }
 
     pub fn update_policy(
@@ -764,6 +1065,20 @@ fn run_logger(events: Receiver<LoggerEvent>, initial_policy: LoggingPolicy) {
                         policy_retry_at = None;
                         policy_received = true;
                     }
+                }
+                LoggerEvent::Snapshot(reply) => {
+                    let snapshot = writer
+                        .as_mut()
+                        .ok_or_else(|| io::Error::other("product log is unavailable"))
+                        .and_then(SessionWriter::snapshot);
+                    let _ = reply.try_send(snapshot);
+                }
+                LoggerEvent::SupportLogs(reply) => {
+                    let source = writer
+                        .as_mut()
+                        .ok_or_else(|| io::Error::other("product log is unavailable"))
+                        .and_then(SessionWriter::support_log_source);
+                    let _ = reply.try_send(source);
                 }
                 LoggerEvent::Record(record) => {
                     if policy.minimum_level.allows(record.level) {
@@ -930,6 +1245,221 @@ mod tests {
         let configured_file = root.join("nested").join("amaterasu.log");
         let _file_writer = SessionWriter::open(&configured_file, &root).unwrap();
         assert!(root.join("nested").join("logs").is_dir());
+    }
+
+    #[test]
+    fn snapshot_freezes_retained_segments_across_rollovers_and_reads_without_moving_writer() {
+        let directory = TestDirectory::new();
+        let root = directory.0.join("state");
+        fs::create_dir(&root).unwrap();
+        let mut writer =
+            SessionWriter::with_limits(&root.join("product.log"), &root, 5, 2).unwrap();
+        assert!(writer.snapshot().unwrap().is_empty());
+        writer.write_line(b"ABCDEFGHIJK").unwrap();
+        let snapshot = writer.snapshot().unwrap();
+        assert_eq!(snapshot.len(), 11);
+        assert_eq!(snapshot.earlier_segments_discarded(), 0);
+        assert_eq!(snapshot.read_chunk(0, 4).unwrap(), b"ABCD");
+        assert_eq!(snapshot.read_chunk(4, 4).unwrap(), b"EFGH");
+        assert_eq!(snapshot.read_chunk(8, 4).unwrap(), b"IJK");
+        assert!(snapshot.read_chunk(11, 1).unwrap().is_empty());
+        assert_eq!(
+            snapshot.read_chunk(12, 1).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            snapshot.read_chunk(0, 0).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            snapshot
+                .read_chunk(0, MAX_LOG_SNAPSHOT_CHUNK_BYTES + 1)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        // Reading the frozen view does not reposition the logger; subsequent
+        // writes roll and prune independently of the already-open snapshot.
+        writer.write_line(b"LMNOPQRSTUV").unwrap();
+        assert_eq!(snapshot.read_chunk(0, 64).unwrap(), b"ABCDEFGHIJK");
+        let latest = writer.snapshot().unwrap();
+        assert_eq!(latest.stream_id(), snapshot.stream_id());
+        assert_eq!(latest.read_chunk(0, 64).unwrap(), b"KLMNOPQRSTUV");
+        assert_eq!(latest.earlier_segments_discarded(), 2);
+        assert_eq!(snapshot.earlier_segments_discarded(), 0);
+        let mut replacement = SessionWriter::open(&root.join("product.log"), &root).unwrap();
+        assert_ne!(
+            replacement.snapshot().unwrap().stream_id(),
+            snapshot.stream_id()
+        );
+    }
+
+    #[test]
+    fn snapshots_preserve_utf8_bytes_split_across_rollovers_and_report_eviction() {
+        let directory = TestDirectory::new();
+        let root = directory.0.join("state");
+        fs::create_dir(&root).unwrap();
+        let mut writer =
+            SessionWriter::with_limits(&root.join("product.log"), &root, 2, 2).unwrap();
+        writer.write_line("a€b".as_bytes()).unwrap();
+        let snapshot = writer.snapshot().unwrap();
+        let mut bytes = Vec::new();
+        for offset in 0..snapshot.len() {
+            bytes.extend(snapshot.read_chunk(offset, 1).unwrap());
+        }
+        assert_eq!(String::from_utf8(bytes).unwrap(), "a€b");
+        writer.write_line(b"cd").unwrap();
+        assert_eq!(snapshot.read_chunk(0, 16).unwrap(), "a€b".as_bytes());
+        assert_eq!(writer.snapshot().unwrap().earlier_segments_discarded(), 1);
+
+        let mut no_rollovers =
+            SessionWriter::with_limits(&root.join("other.log"), &root, 2, 0).unwrap();
+        no_rollovers.write_line(b"abcd").unwrap();
+        let retained = no_rollovers.snapshot().unwrap();
+        assert_eq!(retained.read_chunk(0, 16).unwrap(), b"cd");
+        assert_eq!(retained.earlier_segments_discarded(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_reads_its_open_file_even_if_the_path_is_replaced() {
+        use std::os::unix::fs::symlink;
+        let directory = TestDirectory::new();
+        let root = directory.0.join("state");
+        fs::create_dir(&root).unwrap();
+        let mut writer = SessionWriter::open(&root.join("product.log"), &root).unwrap();
+        writer.write_line(b"original").unwrap();
+        let snapshot = writer.snapshot().unwrap();
+        let active = writer.active_path().to_path_buf();
+        let outside = directory.0.join("outside");
+        fs::write(&outside, b"unrelated private data").unwrap();
+        fs::rename(&active, active.with_extension("moved")).unwrap();
+        symlink(&outside, &active).unwrap();
+        assert_eq!(snapshot.read_chunk(0, 32).unwrap(), b"original");
+    }
+
+    #[test]
+    fn simultaneous_snapshot_reads_do_not_change_writer_or_each_other() {
+        let directory = TestDirectory::new();
+        let root = directory.0.join("state");
+        fs::create_dir(&root).unwrap();
+        let mut writer = SessionWriter::open(&root.join("product.log"), &root).unwrap();
+        writer
+            .write_line(b"0123456789abcdefghijklmnopqrstuvwxyz")
+            .unwrap();
+        let snapshot = Arc::new(writer.snapshot().unwrap());
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let snapshot = Arc::clone(&snapshot);
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        assert_eq!(snapshot.read_chunk(0, 10).unwrap(), b"0123456789");
+                        assert_eq!(snapshot.read_chunk(10, 10).unwrap(), b"abcdefghij");
+                    }
+                });
+            }
+            writer.write_line(b"-new").unwrap();
+        });
+        assert_eq!(
+            snapshot.read_chunk(0, 64).unwrap(),
+            b"0123456789abcdefghijklmnopqrstuvwxyz"
+        );
+        assert_eq!(
+            writer.snapshot().unwrap().read_chunk(0, 64).unwrap(),
+            b"0123456789abcdefghijklmnopqrstuvwxyz-new"
+        );
+    }
+
+    #[test]
+    fn snapshot_reports_truncation_instead_of_silently_returning_partial_data() {
+        let directory = TestDirectory::new();
+        let root = directory.0.join("state");
+        fs::create_dir(&root).unwrap();
+        let mut writer = SessionWriter::open(&root.join("product.log"), &root).unwrap();
+        writer.write_line(b"message").unwrap();
+        let snapshot = writer.snapshot().unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(writer.active_path())
+            .unwrap()
+            .set_len(3)
+            .unwrap();
+        assert_eq!(
+            snapshot.read_chunk(0, 7).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            writer.snapshot().err().unwrap().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+    }
+
+    #[test]
+    fn snapshot_leases_bound_open_handles_and_release_after_drop_or_error() {
+        let directory = TestDirectory::new();
+        let root = directory.0.join("state");
+        fs::create_dir(&root).unwrap();
+        let mut writer = SessionWriter::open(&root.join("product.log"), &root).unwrap();
+        writer.write_line(b"message").unwrap();
+        let mut snapshots: Vec<_> = (0..MAX_ACTIVE_LOG_SNAPSHOTS)
+            .map(|_| writer.snapshot().unwrap())
+            .collect();
+        assert_eq!(
+            writer.snapshot().err().unwrap().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        snapshots.pop();
+        assert!(writer.snapshot().is_ok());
+        drop(snapshots);
+        fs::OpenOptions::new()
+            .write(true)
+            .open(writer.active_path())
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        assert_eq!(
+            writer.snapshot().err().unwrap().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(writer.active_snapshots.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn product_logger_snapshot_is_queued_after_prior_records() {
+        let directory = TestDirectory::new();
+        let root = directory.0.join("state");
+        fs::create_dir(&root).unwrap();
+        let logger =
+            ProductLogger::start(LoggingPolicy::new(0, 2, "product.log", &root).unwrap()).unwrap();
+        logger.emit(2, "test", "before snapshot").unwrap();
+        let reply = logger.request_snapshot().unwrap();
+        let snapshot = reply.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+        let bytes = snapshot
+            .read_chunk(0, MAX_LOG_SNAPSHOT_CHUNK_BYTES)
+            .unwrap();
+        assert!(
+            String::from_utf8(bytes)
+                .unwrap()
+                .contains("before snapshot")
+        );
+        logger.emit(2, "test", "after snapshot").unwrap();
+        let later = logger
+            .request_snapshot()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(3))
+            .unwrap()
+            .unwrap();
+        assert!(later.len() > snapshot.len());
+        assert!(
+            !String::from_utf8(
+                snapshot
+                    .read_chunk(0, MAX_LOG_SNAPSHOT_CHUNK_BYTES)
+                    .unwrap()
+            )
+            .unwrap()
+            .contains("after snapshot")
+        );
     }
 
     #[test]

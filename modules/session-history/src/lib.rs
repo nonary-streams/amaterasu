@@ -356,6 +356,16 @@ fn execute(
             "ok": true,
             "detail": store.session_detail(&session_id)?,
         })),
+        Operation::TimelineOpen {
+            session_id,
+            sample_limit,
+        } => store.timeline_open(&session_id, sample_limit),
+        Operation::TimelinePage {
+            session_id,
+            kind,
+            cursor,
+            limit,
+        } => store.timeline_page(&session_id, kind, cursor, limit),
         Operation::ActiveSessions { limit, offset } => {
             let page = store.active_sessions_page(limit.unwrap_or(16), offset.unwrap_or(0))?;
             Ok(json!({"ok": true, "sessions": page.sessions, "next_offset": page.next_offset}))
@@ -379,6 +389,10 @@ fn error_response(error: HistoryError) -> Value {
         HistoryError::Invalid(message) => failure("invalid_request", message),
         HistoryError::Database => failure("storage_error", "history storage operation failed"),
         HistoryError::NotFound => failure("not_found", "session history record was not found"),
+        HistoryError::HistoryChanged => failure(
+            "history_changed",
+            "retained session history changed; open a new snapshot",
+        ),
         HistoryError::ActiveSession => {
             failure("active_session", "active history records cannot be deleted")
         }

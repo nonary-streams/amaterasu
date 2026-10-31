@@ -13,6 +13,27 @@ pub const MAX_DETAIL_SAMPLES: usize = 32;
 pub const MAX_DETAIL_EVENTS: usize = 8;
 pub const MAX_STORED_SAMPLES: usize = 7200;
 pub const MAX_STORED_EVENTS: usize = 2000;
+pub const MAX_TIMELINE_PAGE_SAMPLES: usize = 32;
+pub const MAX_TIMELINE_PAGE_EVENTS: usize = 8;
+pub const MAX_TIMELINE_WINDOW_SAMPLES: usize = 2000;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimelineKind {
+    Samples,
+    Events,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimelineCursor {
+    pub session_id: String,
+    pub kind: TimelineKind,
+    pub first_id: String,
+    pub last_id: String,
+    pub after_id: Option<String>,
+    pub total: u64,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -173,6 +194,18 @@ pub enum Operation {
     },
     SessionDetail {
         session_id: String,
+    },
+    TimelineOpen {
+        session_id: String,
+        #[serde(default)]
+        sample_limit: Option<usize>,
+    },
+    TimelinePage {
+        session_id: String,
+        kind: TimelineKind,
+        cursor: TimelineCursor,
+        #[serde(default)]
+        limit: Option<usize>,
     },
     ActiveSessions {
         #[serde(default)]

@@ -119,7 +119,7 @@ impl Engine {
             }
             Operation::Pending {} => Ok(Change::Read(self.pending_metadata())),
             Operation::ListClients {} => Ok(Change::Read(client_metadata(&document))),
-            Operation::Unpair { certificate_id } => self.unpair(document, &certificate_id, now),
+            Operation::Unpair { certificate_id, .. } => self.unpair(document, &certificate_id, now),
             Operation::UpdateClientConfigOverrides {
                 certificate_id,
                 config_overrides,

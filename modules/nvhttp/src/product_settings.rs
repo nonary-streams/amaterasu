@@ -1232,9 +1232,16 @@ impl ProductSettings {
 
     pub fn capture_provider(&self) -> Option<String> {
         self.bootstrap_settings.streaming.as_ref().map(|streaming| {
-            let (provider, _) = self
-                .configured_capture
-                .resolve(streaming.capture.capture_provider.clone());
+            let output = self
+                .configured_output_name
+                .as_deref()
+                .filter(|output| !output.is_empty())
+                .unwrap_or(&streaming.capture.output);
+            let (provider, _, _) = crate::launch::resolve_capture_route(
+                self.configured_capture,
+                streaming.capture.capture_provider.clone(),
+                output,
+            );
             provider.as_str().to_owned()
         })
     }
@@ -5767,6 +5774,27 @@ mod tests {
         let settings = ProductSettings::with_bootstrap_settings("Bootstrap".into(), &bootstrap);
 
         assert_eq!(settings.capture_provider().as_deref(), Some("pipewire"));
+    }
+
+    #[test]
+    fn automatic_virtual_capture_reports_physical_provider_for_saved_output() {
+        let mut bootstrap = bootstrap_with_capture_output("amaterasu-owned-display");
+        bootstrap
+            .streaming
+            .as_mut()
+            .unwrap()
+            .capture
+            .capture_provider = crate::launch::CaptureProvider::External("vkms".into());
+        let mut settings = ProductSettings::with_bootstrap_settings("Bootstrap".into(), &bootstrap);
+        settings.apply_document(
+            parse_document(&json!({
+                "ok":true,"found":true,"version":6,"revision":3,
+                "values":{"hostname":"Host","port":47989,"address_family":null,
+                    "bind_address":null,"output_name":"DP-1","stream_audio":true,"capture":"auto"}
+            }))
+            .unwrap(),
+        );
+        assert_eq!(settings.capture_provider().as_deref(), Some("kms"));
     }
 
     #[test]

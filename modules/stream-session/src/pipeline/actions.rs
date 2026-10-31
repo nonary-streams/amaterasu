@@ -112,6 +112,7 @@ impl Pipeline {
                 self.stop(input, session, send)
             }
             Operation::Status { session } => self.status(input, session, send),
+            Operation::ManagementLiveSessions {} => self.management_live_sessions(input, send),
             Operation::Lookup { operation_id } => self.lookup(input, operation_id, send),
         }
     }
@@ -233,6 +234,13 @@ impl Pipeline {
         }
         if let Err(code) = configuration.validate(record.config.stream_audio) {
             rpc::complete(send, request, error(code));
+            return;
+        }
+        if configuration.source_id.is_some()
+            && (record.config.display_request.is_some()
+                || record.config.virtual_display_intent.is_some())
+        {
+            rpc::complete(send, request, error("source_mode_display_incompatible"));
             return;
         }
         if !configuration.matches_prepared_audio(&record.config) {
@@ -408,6 +416,53 @@ impl Pipeline {
         rpc::complete(send, request, reply);
     }
 
+    fn management_live_sessions(&mut self, input: Incoming, send: &mut Send<'_>) {
+        if input.owner != "amaterasu.management" {
+            rpc::complete(send, input.request, error("permission_denied"));
+            return;
+        }
+        if self.live_status_epoch.is_none() {
+            let mut bytes = [0_u8; 16];
+            if getrandom::fill(&mut bytes).is_err() {
+                rpc::complete(send, input.request, error("live_status_unavailable"));
+                return;
+            }
+            self.live_status_epoch = Some(bytes.iter().map(|byte| format!("{byte:02x}")).collect());
+        }
+        let sessions: Result<Vec<_>, _> = self
+            .records
+            .values()
+            .filter(|record| record.state == State::Active)
+            .map(|record| {
+                let start = record.start.as_ref().ok_or(())?;
+                let (session_id, started_at_unix) = record.history.live_identity();
+                let (frames, bytes, gaps) = record.history.observed_counters();
+                Ok(json!({
+                    "session_id": session_id,
+                    "started_at_unix": started_at_unix.ok_or(())?,
+                    "device_name": start.device_name,
+                    "width": start.configuration.width,
+                    "height": start.configuration.height,
+                    "target_fps": start.configuration.fps,
+                    "target_bitrate_kbps": start.configuration.bitrate / 1000,
+                    "codec": start.configuration.codec,
+                    "frames_sent": frames.to_string(),
+                    "bytes_sent": bytes.to_string(),
+                    "sequence_gaps": gaps.to_string(),
+                }))
+            })
+            .collect();
+        match sessions {
+            Ok(sessions) => rpc::complete(
+                send,
+                input.request,
+                json!({"ok":true,"epoch":self.live_status_epoch,"sampled_at_ms":input.now.to_string(),
+                    "sampled_at_unix_ms":unix_time_millis().to_string(),"sessions":sessions}),
+            ),
+            Err(()) => rpc::complete(send, input.request, error("live_status_unavailable")),
+        };
+    }
+
     fn lookup(&mut self, input: Incoming, operation_id: String, send: &mut Send<'_>) {
         let Incoming { request, owner, .. } = input;
 
@@ -418,5 +473,13 @@ impl Pipeline {
             .map(Record::response)
             .unwrap_or_else(|| error("session_not_found"));
         rpc::complete(send, request, reply);
+    }
+}
+
+fn unix_time_millis() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
+        Err(error) => -i64::try_from(error.duration().as_millis()).unwrap_or(i64::MAX),
     }
 }

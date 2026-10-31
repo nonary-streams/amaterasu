@@ -1047,10 +1047,12 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.media-transport/1",
         "amaterasu.control-transport/1",
         "amaterasu.session-history/1",
+        "amaterasu.stream-session/1",
         "amaterasu.host-metrics/1",
         "amaterasu.updater/1",
         "amaterasu.system-tray/1",
         "amaterasu.host-lifecycle/1",
+        "amaterasu.host-logs/1",
     ],
     publishes: &[],
     native_provides: &[],
@@ -1122,10 +1124,12 @@ const MANAGEMENT_EXTENSION_EXAMPLE: ComponentDefinition = ComponentDefinition {
         "amaterasu.media-transport/1",
         "amaterasu.control-transport/1",
         "amaterasu.session-history/1",
+        "amaterasu.stream-session/1",
         "amaterasu.host-metrics/1",
         "amaterasu.updater/1",
         "amaterasu.system-tray/1",
         "amaterasu.host-lifecycle/1",
+        "amaterasu.host-logs/1",
         "example.extension/1",
     ],
     ..MANAGEMENT
@@ -1334,6 +1338,7 @@ const LINUX_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.video/1",
         "amaterasu.nvhttp/1",
         "amaterasu.rtsp/1",
+        "amaterasu.stream-session/1",
         "amaterasu.host-metrics/1",
         "amaterasu.updater/1",
         "amaterasu.system-tray/1",
@@ -1749,13 +1754,13 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
             "amaterasu.authentication".into(),
             json!({
                 "administrator_principals": ["amaterasu.console", "amaterasu.management"],
-                "authorization_policy_generation": 4,
+                "authorization_policy_generation": 13,
                 "session_token_ttl_seconds": 7200,
                 "remember_me_refresh_token_ttl_seconds": 604800,
                 "allowed_scopes": [
                     "catalog.read", "catalog.write", "configuration.read", "configuration.write",
                     "session.read", "session.write", "application.read", "application.launch",
-                    "application.terminate", "steam.read", "steam.refresh", "lutris.read", "diagnostics.read", "diagnostics.write", "pairing.admin", "display.read", "display.write", "media.read", "capture.read", "capture.write"
+                    "application.terminate", "steam.read", "steam.refresh", "lutris.read", "host-logs.read", "tokens.manage", "diagnostics.read", "diagnostics.write", "pairing.admin", "display.read", "display.write", "media.read", "capture.read", "capture.write"
                 ]
             }),
         ),
@@ -1909,13 +1914,13 @@ pub fn installer_policy(
             "amaterasu.authentication".into(),
             json!({
                 "administrator_principals": ["amaterasu.management"],
-                "authorization_policy_generation": 3,
+                "authorization_policy_generation": 14,
                 "session_token_ttl_seconds": 7200,
                 "remember_me_refresh_token_ttl_seconds": 604800,
                 "allowed_scopes": [
                     "catalog.read", "catalog.write", "configuration.read", "configuration.write",
                     "session.read", "session.write", "application.read", "application.launch",
-                    "application.terminate", "steam.read", "steam.refresh", "lutris.read", "diagnostics.read",
+                    "application.terminate", "steam.read", "steam.refresh", "lutris.read", "host-logs.read", "tokens.manage", "diagnostics.read",
                     "diagnostics.write", "pairing.admin", "display.read", "display.write", "media.read"
                 ],
             }),

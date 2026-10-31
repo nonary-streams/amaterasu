@@ -16,6 +16,7 @@ import secrets
 import socket
 import sys
 import tempfile
+import time
 from urllib.parse import urlsplit
 
 from test_component_updates import CARGO, ComponentHarness, run
@@ -33,6 +34,14 @@ from test_stream_session import start_client, stop_client
 
 FIELDS = ("sw_preset", "sw_tune", "encoder")
 APPLICATION_NAME = "Controlled software policy process"
+
+
+def wait_for_worker(console):
+    deadline = time.monotonic() + 60
+    while not any(line.startswith("Development worker ready: pid=") for line in console.errors):
+        assert console.process.poll() is None, "signed host exited before worker readiness: " + "".join(console.errors)
+        assert time.monotonic() < deadline, "signed host worker readiness timed out: " + "".join(console.errors)
+        time.sleep(0.05)
 
 
 def configure(harness, *, synthetic):
@@ -80,7 +89,9 @@ def configure(harness, *, synthetic):
             }
     else:
         settings["amaterasu.encode"] = {"enabled": True}
-        settings["amaterasu.video"] = {"enabled": True}
+        # The platform fixture grants DXGI, while Linux video defaults to
+        # PipeWire/VKMS; select the provider this package actually grants.
+        settings["amaterasu.video"] = {"enabled": True, "capture_providers": ["dxgi"]}
         settings["amaterasu.capture-dxgi"] = {"enabled": True}
     path.write_text(json.dumps(bootstrap))
 
@@ -219,7 +230,32 @@ def project_stream(console, api, bearer, app_id, launch_id, https, context, fore
             assert metrics["fixture"] is True, metrics
             assert metrics["video"]["last_open_policy"] == expected, metrics
             assert metrics["video"]["opened"] == baseline["video"]["opened"] + 1
-            if mode == "teardown":
+            if mode == "management":
+                snapshot = checked(api, "/v1/nvhttp/launch_status", bearer=bearer)["launch"]
+                assert snapshot["state"] == "ready" and not snapshot["pending_resume"], snapshot
+                assert len(snapshot["reference"]) == len(snapshot["revision"]) == 64, snapshot
+                assert console.request("amaterasu.nvhttp/1", {"action":"management_launch_status"})["code"] == "permission_denied"
+                reader = console.request("amaterasu.authentication/1", {
+                    "action":"issue_token", "scopes":["session.read"], "ttl_seconds":3600,
+                })["bearer"]
+                payload = {"reference":snapshot["reference"], "revision":snapshot["revision"]}
+                assert api.post("/v1/nvhttp/stop_launch", payload, reader)[0] == 403
+                session_writer = console.request("amaterasu.authentication/1", {
+                    "action":"issue_token", "scopes":["session.read", "session.write"], "ttl_seconds":3600,
+                })["bearer"]
+                assert api.post("/v1/nvhttp/stop_launch", payload, session_writer)[0] == 403
+                wrong = {**payload, "revision":"0" * 64}
+                status, rejected, _ = api.post("/v1/nvhttp/stop_launch", wrong, bearer)
+                assert not rejected.get("ok") and rejected.get("code") == "launch_changed", (status, rejected)
+                assert child_running(pid)
+                accepted = checked(api, "/v1/nvhttp/stop_launch", payload, bearer)
+                assert accepted["accepted"] and accepted["reference"] == snapshot["reference"], accepted
+                def cleanup_confirmed():
+                    result = checked(api, "/v1/nvhttp/launch_status", {"reference":snapshot["reference"]}, bearer)
+                    assert result["launch"]["state"] != "cleanup_failed", result
+                    return result["launch"]["state"] == "ended"
+                wait_until(cleanup_confirmed, "management cleanup was not confirmed")
+            elif mode == "teardown":
                 client.transact("TEARDOWN", "/")
             else:
                 successful(get(https, "/cancel", context=context))
@@ -246,6 +282,7 @@ def exercise_public(directory, oracle):
     harness.stage(package)
     console = Console(harness)
     try:
+        wait_for_worker(console)
         imported = console.request("amaterasu.pairing/1", {
             "action": "import_identity",
             "certificate_pem": (FIXTURES / "host-cert.pem").read_text(),
@@ -291,7 +328,7 @@ def exercise_public(directory, oracle):
             update_scopes(api, bearer, app_id, certificate_id,
                           global_options, app_options, client_options)
             project_stream(console, api, bearer, app_id, launch_id, https, context, foreign, certificate_id,
-                           marker, oracle, directory, expected, "teardown" if index % 2 == 0 else "cancel")
+                           marker, oracle, directory, expected, "management" if index == 0 else "teardown" if index % 2 == 0 else "cancel")
         console.eof()
     except Exception:
         print("".join(console.errors))
@@ -306,6 +343,7 @@ def exercise_real_unavailable(directory):
     harness.stage(harness.package(1))
     console = Console(harness)
     try:
+        wait_for_worker(console)
         availability = console.request("amaterasu.encode/1", {"action": "enumerate"})
         assert availability["software_encoder"] == {
             "available": False, "reason": "x264_feature_disabled",

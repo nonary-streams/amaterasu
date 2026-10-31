@@ -1256,6 +1256,7 @@ pub enum Operation {
     Status {
         session: Option<u64>,
     },
+    ManagementLiveSessions {},
     Lookup {
         operation_id: String,
     },

@@ -18,6 +18,17 @@ Synchronous module unload releases native bindings and makes a bounded attempt t
 
 The pipeline retains at most two live or unresolved sessions and 128 lifetime records. Status lists return all live records first and at most 16 rows, with total/truncated metadata; direct ID and operation lookup remain available. Keys remain private in bounded in-memory configuration and child payloads, never in status or logs. Native modules remain trusted code.
 
+The separate `management_live_sessions` read is restricted to the management
+principal. It reports only active sessions, their requested video metadata,
+optional client device name, monotonic and host Unix snapshot times, and exact decimal-string
+host acceptance counters. It excludes transport addresses, keys and control
+capabilities. Counters remain available independently of history recording;
+they do not establish client delivery or playback.
+An opaque per-process epoch lets readers discard counter baselines after a
+module restart; it is not an authorization credential.
+The Unix timestamp is a decimal millisecond string, allowing clients to compare
+live observation intervals with retained samples without relying on browser clocks.
+
 Tests use a stateful fake broker and native plane to exercise before/after-commit transport failure, lost admission and completion, parent cancellation, unconfirmed cancellation retry, late video-close confirmation, lease retention, resolved endpoint validation, auth-before-hardware retry, prepared expiry under ingress, control direction rejection, IDR fairness and unload limits. The separately signed synthetic integration composes the actual Opus, media UDP and ENet/GCM providers. Hardware capture, encoding and playback still require platform qualification.
 
 ## Starting after RTSP PLAY

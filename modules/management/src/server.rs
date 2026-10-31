@@ -523,7 +523,7 @@ impl Connection {
                     self.dispatch_extension(runtime, request, &payload, operation, extensions)?;
                     return Ok(());
                 }
-                if matches!(request.target, RequestTarget::Api(route) if route.service == "amaterasu.capture-pipewire/1")
+                if matches!(request.target, RequestTarget::Api(route) if route.service == "amaterasu.capture-pipewire/1" || route.service == amaterasu_contracts::HOST_LOG_SERVICE)
                 {
                     request.verified_identity = capture_management::identity(
                         payload
@@ -750,6 +750,20 @@ impl Connection {
             )?;
             return Ok(());
         }
+        if route.service == amaterasu_contracts::HOST_LOG_SERVICE {
+            let Some(identity) = request.verified_identity.as_ref() else {
+                self.fail(503, "authentication_unavailable");
+                return Ok(());
+            };
+            let Some(payload) = request.payload.as_object_mut() else {
+                self.fail(400, "invalid_json_body");
+                return Ok(());
+            };
+            payload.insert(
+                "owner".into(),
+                Value::String(identity.auth_context_id.clone()),
+            );
+        }
         if route.service == crate::AUTH_SERVICE
             && matches!(
                 route.action,
@@ -761,6 +775,11 @@ impl Connection {
                     | "change_own_password"
                     | "account_settings_get"
                     | "account_settings_update"
+                    | "account_sessions_list"
+                    | "account_sessions_revoke"
+                    | "account_tokens_list"
+                    | "account_tokens_issue"
+                    | "account_tokens_revoke"
             )
             && let Some(object) = request.payload.as_object_mut()
         {
@@ -1160,8 +1179,12 @@ fn role_permits(payload: &Value, request: &http::Request) -> bool {
     {
         return false;
     }
+    let is_session_only_admin = matches!(request.target, RequestTarget::Api(route)
+        if route.service == crate::AUTH_SERVICE
+            && matches!(route.action, "account_tokens_list" | "account_tokens_issue" | "account_tokens_revoke"
+                | "account_sessions_list" | "account_sessions_revoke"));
     let role = match payload.get("kind").and_then(Value::as_str) {
-        Some("api_token") => return true,
+        Some("api_token") => return !is_session_only_admin,
         Some("administrator_session") => match payload.get("role").and_then(Value::as_str) {
             Some(role) => role,
             None => return false,
@@ -1183,6 +1206,8 @@ fn role_permits(payload: &Value, request: &http::Request) -> bool {
             | ("amaterasu.launch/1", "status" | "list")
             | ("amaterasu.application/1", "status" | "list")
             | ("amaterasu.session/1", "list" | "snapshot")
+            | ("amaterasu.stream-session/1", "management_live_sessions")
+            | ("amaterasu.nvhttp/1", "management_launch_status")
             | ("amaterasu.authentication/1", "change_own_password")
             | (
                 "amaterasu.management/1",
@@ -1194,13 +1219,19 @@ fn role_permits(payload: &Value, request: &http::Request) -> bool {
             | ("amaterasu.display/1", "status" | "enumerate")
             | (
                 "amaterasu.session-history/1",
-                "list_sessions" | "session_detail" | "active_sessions" | "history_status"
+                "list_sessions"
+                    | "session_detail"
+                    | "timeline_open"
+                    | "timeline_page"
+                    | "active_sessions"
+                    | "history_status"
             )
     );
     read || (role == "operator"
         && matches!(
             (route.service, route.action),
             ("amaterasu.launch/1", "launch" | "stop")
+                | ("amaterasu.nvhttp/1", "management_stop_launch")
         ))
 }
 
@@ -1480,17 +1511,61 @@ mod tests {
         };
         for role in ["viewer", "operator"] {
             assert!(allowed(role, "/v1/launch/status"));
+            assert!(allowed(role, "/v1/live-streams/status"));
             assert!(!allowed(role, "/v1/application/launch"));
             assert!(!allowed(role, "/v1/application/terminate"));
             assert!(!allowed(role, "/v1/pairing/list_clients"));
+            assert!(!allowed(role, "/v1/host-logs/open"));
+            assert!(!allowed(role, "/v1/host-logs/export_start"));
+            assert!(!allowed(role, "/v1/tokens/issue"));
+            assert!(!allowed(role, "/v1/account-sessions/list"));
             assert!(!allowed(role, "/v1/auth/settings"));
             assert!(!allowed(role, "/v1/configuration/get"));
         }
         assert!(!allowed("viewer", "/v1/launch/start"));
         assert!(!allowed("viewer", "/v1/launch/stop"));
+        assert!(allowed("viewer", "/v1/nvhttp/launch_status"));
+        assert!(!allowed("viewer", "/v1/nvhttp/stop_launch"));
         assert!(allowed("operator", "/v1/launch/start"));
         assert!(allowed("operator", "/v1/launch/stop"));
+        assert!(allowed("operator", "/v1/nvhttp/launch_status"));
+        assert!(allowed("operator", "/v1/nvhttp/stop_launch"));
         assert!(allowed("administrator", "/v1/pairing/list_clients"));
+        assert!(allowed("administrator", "/v1/host-logs/open"));
+        assert!(allowed("administrator", "/v1/host-logs/export_start"));
+        assert!(allowed("administrator", "/v1/tokens/issue"));
+        assert!(allowed("administrator", "/v1/account-sessions/list"));
+        let request = http::Request {
+            target: RequestTarget::Api(crate::routes::resolve("/v1/tokens/issue").unwrap()),
+            payload: json!({}),
+            bearer: None,
+            verified_identity: None,
+            origin: None,
+            preflight: false,
+            csrf_exception: false,
+            api_request: None,
+        };
+        assert!(!role_permits(
+            &json!({"kind":"api_token", "subject":"token"}),
+            &request
+        ));
+        let browser_sessions = http::Request {
+            target: RequestTarget::Api(
+                crate::routes::resolve("/v1/account-sessions/list").unwrap(),
+            ),
+            payload: json!({}),
+            bearer: None,
+            verified_identity: None,
+            origin: None,
+            preflight: false,
+            csrf_exception: false,
+            api_request: None,
+        };
+        assert!(!role_permits(
+            &json!({"kind":"api_token", "subject":"token"}),
+            &browser_sessions
+        ));
+
         assert!(!allowed("admin", "/v1/pairing/list_clients"));
         assert!(!allowed("", "/v1/launch/status"));
     }

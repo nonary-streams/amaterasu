@@ -1131,11 +1131,16 @@ impl Pipeline {
             self.publish_identity(revision, loaded)?;
             return complete(send, request.id, error("not_initialized"));
         }
-        if let Operation::UpdateClientConfigOverrides {
-            expected_revision, ..
-        } = &operation
-            && *expected_revision != revision
-        {
+        let expected_revision = match &operation {
+            Operation::UpdateClientConfigOverrides {
+                expected_revision, ..
+            } => Some(*expected_revision),
+            Operation::Unpair {
+                expected_revision, ..
+            } => *expected_revision,
+            _ => None,
+        };
+        if expected_revision.is_some_and(|expected| expected != revision) {
             self.publish_identity(revision, loaded)?;
             return complete(
                 send,

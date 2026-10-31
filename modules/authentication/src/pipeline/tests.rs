@@ -3056,3 +3056,413 @@ fn management_login_backstop_recovers_rapidly_and_preserves_other_caller_limits(
         Err("rate_limited")
     );
 }
+
+#[test]
+fn browser_token_management_requires_live_admin_session_and_preserves_owner_boundaries() {
+    let mut state = StateHarness::new();
+    let mut token_settings = settings();
+    token_settings.allowed_scopes.insert("tokens.manage".into());
+    let mut pipeline = Pipeline::new(token_settings);
+    state.setup(&mut pipeline);
+    let login = state.request(
+        &mut pipeline,
+        "amaterasu.management",
+        json!({
+            "action":"login", "username":"admin", "password":"correct horse battery staple"
+        }),
+        100,
+    );
+    let admin = login["bearer"].clone();
+    let console_token = state.request(
+        &mut pipeline,
+        "console",
+        json!({
+            "action":"issue_token", "scopes":["catalog.read"], "ttl_seconds":60
+        }),
+        101,
+    );
+    assert_eq!(console_token["ok"], true);
+    let request = json!({"action":"account_tokens_issue", "bearer":admin,
+        "scopes":["catalog.read"], "ttl_seconds":60});
+    assert_eq!(
+        state.request(&mut pipeline, "untrusted", request.clone(), 101)["code"],
+        "forbidden"
+    );
+    let issued = state.request(&mut pipeline, "amaterasu.management", request, 101);
+    assert_eq!(issued["ok"], true);
+    let secret = issued["bearer"].clone();
+    assert!(
+        !state
+            .stored
+            .as_ref()
+            .unwrap()
+            .to_string()
+            .contains(secret.as_str().unwrap())
+    );
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "amaterasu.management",
+            json!({
+                "action":"account_tokens_issue", "bearer":secret,
+                "scopes":["catalog.read"], "ttl_seconds":60
+            }),
+            101
+        )["code"],
+        "unauthorized"
+    );
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "amaterasu.management",
+            json!({
+                "action":"account_tokens_issue", "bearer":admin,
+                "scopes":["not.allowed"], "ttl_seconds":60
+            }),
+            101
+        )["code"],
+        "unauthorized"
+    );
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "frontend",
+            json!({
+                "action":"verify", "bearer":secret, "required_scopes":["catalog.read"]
+            }),
+            101
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "frontend",
+            json!({
+                "action":"verify", "bearer":secret, "required_scopes":["catalog.write"]
+            }),
+            101
+        )["code"],
+        "unauthorized"
+    );
+    let mut disabled = Pipeline::new(settings());
+    let mut disabled_state = StateHarness::new();
+    disabled_state.stored = state.stored.clone();
+    disabled_state.session_stored = state.session_stored.clone();
+    disabled_state.revision = state.revision;
+    assert_eq!(
+        disabled_state.request(
+            &mut disabled,
+            "amaterasu.management",
+            json!({
+                "action":"account_tokens_list", "bearer":admin
+            }),
+            101
+        )["code"],
+        "forbidden"
+    );
+    assert_eq!(
+        disabled_state.request(
+            &mut disabled,
+            "frontend",
+            json!({
+                "action":"verify", "bearer":secret, "required_scopes":["catalog.read"]
+            }),
+            101
+        )["code"],
+        "unauthorized"
+    );
+    assert_eq!(state.request(&mut pipeline, "amaterasu.management", json!({
+        "action":"create_account", "bearer":admin, "username":"viewer", "password":"viewer secret password", "role":"viewer"
+    }), 101)["ok"], true);
+    let viewer = state.request(
+        &mut pipeline,
+        "amaterasu.management",
+        json!({
+            "action":"login", "username":"viewer", "password":"viewer secret password"
+        }),
+        101,
+    );
+    assert_eq!(viewer["ok"], true);
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "amaterasu.management",
+            json!({
+                "action":"account_tokens_list", "bearer":viewer["bearer"]
+            }),
+            101
+        )["code"],
+        "forbidden"
+    );
+    let list = state.request(
+        &mut pipeline,
+        "amaterasu.management",
+        json!({
+            "action":"account_tokens_list", "bearer":admin
+        }),
+        101,
+    );
+    assert_eq!(list["tokens"].as_array().unwrap().len(), 1);
+    assert_eq!(list["tokens"][0]["token_id"], issued["token_id"]);
+    assert!(!list.to_string().contains(secret.as_str().unwrap()));
+    assert_eq!(state.request(&mut pipeline, "amaterasu.management", json!({
+        "action":"account_tokens_revoke", "bearer":admin, "token_id":console_token["token_id"]
+    }), 101)["code"], "token_not_found");
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "amaterasu.management",
+            json!({
+                "action":"account_tokens_revoke", "bearer":admin, "token_id":issued["token_id"]
+            }),
+            101
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "frontend",
+            json!({
+                "action":"verify", "bearer":secret, "required_scopes":["catalog.read"]
+            }),
+            102
+        )["code"],
+        "unauthorized"
+    );
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "frontend",
+            json!({"action":"logout", "bearer":admin}),
+            102
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "amaterasu.management",
+            json!({
+                "action":"account_tokens_list", "bearer":admin
+            }),
+            103
+        )["code"],
+        "unauthorized"
+    );
+}
+
+#[test]
+fn browser_session_management_binds_admin_and_survives_peer_refresh() {
+    let mut state = StateHarness::new();
+    let mut session_settings = settings();
+    session_settings
+        .allowed_scopes
+        .insert("configuration.write".into());
+    let mut pipeline = Pipeline::new(session_settings.clone());
+    state.setup(&mut pipeline);
+    let login = |state: &mut StateHarness, pipeline: &mut Pipeline| {
+        state.request(
+            pipeline,
+            "amaterasu.management",
+            json!({"action":"login", "username":"admin",
+            "password":"correct horse battery staple", "remember_me":true}),
+            100,
+        )
+    };
+    let current = login(&mut state, &mut pipeline);
+    let peer = login(&mut state, &mut pipeline);
+    let bearer = current["bearer"].clone();
+    let request = json!({"action":"account_sessions_list","bearer":bearer});
+    assert_eq!(
+        state.request(&mut pipeline, "untrusted", request.clone(), 100)["code"],
+        "forbidden"
+    );
+    let list = state.request(&mut pipeline, "amaterasu.management", request, 100);
+    let sessions = list["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 2);
+    let own = sessions
+        .iter()
+        .find(|session| session["current"] == true)
+        .unwrap()["session_id"]
+        .clone();
+    let target = sessions
+        .iter()
+        .find(|session| session["current"] == false)
+        .unwrap()["session_id"]
+        .clone();
+    assert!(
+        !list
+            .to_string()
+            .contains(current["bearer"].as_str().unwrap())
+    );
+    assert!(
+        !list
+            .to_string()
+            .contains(peer["refresh_token"].as_str().unwrap())
+    );
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "amaterasu.management",
+            json!({
+                "action":"account_sessions_revoke", "bearer":bearer, "session_id":own
+            }),
+            100
+        )["code"],
+        "current_session"
+    );
+    let rotated = state.request(
+        &mut pipeline,
+        "frontend",
+        json!({
+            "action":"refresh", "refresh_token":peer["refresh_token"]
+        }),
+        101,
+    );
+    assert_eq!(rotated["ok"], true);
+    let after_rotation = state.request(
+        &mut pipeline,
+        "amaterasu.management",
+        json!({
+            "action":"account_sessions_list", "bearer":bearer
+        }),
+        101,
+    );
+    assert!(
+        after_rotation["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|session| session["session_id"] == target)
+    );
+    let revoked = state.request(
+        &mut pipeline,
+        "amaterasu.management",
+        json!({
+            "action":"account_sessions_revoke", "bearer":bearer, "session_id":target
+        }),
+        101,
+    );
+    assert_eq!(revoked["revoked"], true);
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "frontend",
+            json!({
+                "action":"verify", "bearer":rotated["bearer"], "required_scopes":[]
+            }),
+            102
+        )["code"],
+        "unauthorized"
+    );
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "frontend",
+            json!({
+                "action":"refresh", "refresh_token":rotated["refresh_token"]
+            }),
+            102
+        )["code"],
+        "unauthorized"
+    );
+    let mut restarted = Pipeline::new(session_settings);
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({
+                "action":"refresh", "refresh_token":rotated["refresh_token"]
+            }),
+            102
+        )["code"],
+        "unauthorized"
+    );
+    assert_eq!(
+        state.request(
+            &mut restarted,
+            "frontend",
+            json!({
+                "action":"verify", "bearer":bearer, "required_scopes":["configuration.write"]
+            }),
+            102
+        )["ok"],
+        true
+    );
+
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "amaterasu.management",
+            json!({
+                "action":"account_sessions_revoke", "bearer":bearer, "session_id":target
+            }),
+            102
+        )["revoked"],
+        false
+    );
+    assert_eq!(state.request(&mut pipeline, "amaterasu.management", json!({
+        "action":"create_account", "bearer":bearer, "username":"viewer", "password":"viewer session password", "role":"viewer"
+    }), 102)["ok"], true);
+    let viewer = state.request(
+        &mut pipeline,
+        "amaterasu.management",
+        json!({
+            "action":"login", "username":"viewer", "password":"viewer session password"
+        }),
+        102,
+    );
+    assert_eq!(viewer["ok"], true);
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "amaterasu.management",
+            json!({
+                "action":"account_sessions_list", "bearer":viewer["bearer"]
+            }),
+            102
+        )["code"],
+        "forbidden"
+    );
+    let native = state.request(
+        &mut pipeline,
+        "console",
+        json!({
+            "action":"issue_token", "scopes":["configuration.write"], "ttl_seconds":60
+        }),
+        102,
+    );
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "amaterasu.management",
+            json!({
+                "action":"account_sessions_list", "bearer":native["bearer"]
+            }),
+            102
+        )["code"],
+        "unauthorized"
+    );
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "amaterasu.management",
+            json!({"action":"logout", "bearer":bearer}),
+            102
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "amaterasu.management",
+            json!({
+                "action":"account_sessions_list", "bearer":bearer
+            }),
+            103
+        )["code"],
+        "unauthorized"
+    );
+}

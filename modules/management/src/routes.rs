@@ -40,6 +40,25 @@ pub fn resolve(path: &str) -> Option<Route> {
             },
             Some("configuration.write"),
         ),
+        ("account-sessions", action) => (
+            "amaterasu.authentication/1",
+            match action {
+                "list" => "account_sessions_list",
+                "revoke" => "account_sessions_revoke",
+                _ => return None,
+            },
+            Some("configuration.write"),
+        ),
+        ("tokens", action) => (
+            "amaterasu.authentication/1",
+            match action {
+                "list" => "account_tokens_list",
+                "issue" => "account_tokens_issue",
+                "revoke" => "account_tokens_revoke",
+                _ => return None,
+            },
+            Some("tokens.manage"),
+        ),
         ("auth", "login") => ("amaterasu.authentication/1", "login", None),
         ("auth", "refresh") => ("amaterasu.authentication/1", "refresh", None),
         ("auth", "logout") => ("amaterasu.authentication/1", "logout", None),
@@ -121,6 +140,16 @@ pub fn resolve(path: &str) -> Option<Route> {
             "amaterasu.nvhttp/1",
             "settings_update",
             Some("configuration.write"),
+        ),
+        ("nvhttp", "launch_status") => (
+            "amaterasu.nvhttp/1",
+            "management_launch_status",
+            Some("session.read"),
+        ),
+        ("nvhttp", "stop_launch") => (
+            "amaterasu.nvhttp/1",
+            "management_stop_launch",
+            Some("application.terminate"),
         ),
         ("session", action) => (
             "amaterasu.session/1",
@@ -206,6 +235,11 @@ pub fn resolve(path: &str) -> Option<Route> {
             let (action, scope) = history_action(action)?;
             ("amaterasu.session-history/1", action, Some(scope))
         }
+        ("live-streams", "status") => (
+            "amaterasu.stream-session/1",
+            "management_live_sessions",
+            Some("session.read"),
+        ),
         ("host-metrics", "settings") => (
             "amaterasu.host-metrics/1",
             "settings_get",
@@ -242,6 +276,19 @@ pub fn resolve(path: &str) -> Option<Route> {
             "amaterasu.system-tray/1",
             "settings_update",
             Some("configuration.write"),
+        ),
+        ("host-logs", action) => (
+            amaterasu_contracts::HOST_LOG_SERVICE,
+            match action {
+                "open" => "open",
+                "export_start" => "export_start",
+                "export_status" => "export_status",
+                "export_read" => "export_read",
+                "read" => "read",
+                "close" => "close",
+                _ => return None,
+            },
+            Some("host-logs.read"),
         ),
         ("diagnostics", "query") => ("amaterasu.diagnostics/1", "query", Some("diagnostics.read")),
         ("diagnostics", "status") => (
@@ -329,6 +376,7 @@ pub fn resolve(path: &str) -> Option<Route> {
         requires_empty_body: domain == "media"
             || (domain == "steam" && action == "force_sync")
             || (domain == "host-metrics" && action == "stats_read")
+            || domain == "live-streams"
             || (domain == "package-selection" && action == "package_selection_status"),
     })
 }
@@ -354,6 +402,8 @@ fn history_action(action: &str) -> Option<(&'static str, &'static str)> {
         "settings_update" => Some(("settings_update", "configuration.write")),
         "list_sessions" => Some(("list_sessions", "session.read")),
         "session_detail" => Some(("session_detail", "session.read")),
+        "timeline_open" => Some(("timeline_open", "session.read")),
+        "timeline_page" => Some(("timeline_page", "session.read")),
         "active_sessions" => Some(("active_sessions", "session.read")),
         "history_status" => Some(("history_status", "session.read")),
         "delete_session" => Some(("delete_session", "session.write")),
@@ -502,6 +552,8 @@ mod tests {
             ("settings_update", "configuration.write"),
             ("list_sessions", "session.read"),
             ("session_detail", "session.read"),
+            ("timeline_open", "session.read"),
+            ("timeline_page", "session.read"),
             ("active_sessions", "session.read"),
             ("history_status", "session.read"),
             ("delete_session", "session.write"),
@@ -558,10 +610,38 @@ mod tests {
         let detail = resolve("/v1/history/session_detail").unwrap();
         assert!(payload(detail, br#"{"session_id":"session-1"}"#).is_ok());
         assert!(payload(detail, br#"{"session_id":""}"#).is_err());
+        let open = resolve("/v1/history/timeline_open").unwrap();
+        let page = resolve("/v1/history/timeline_page").unwrap();
+        assert!(payload(open, br#"{"session_id":"session-1"}"#).is_ok());
+        assert!(payload(open, br#"{"session_id":"session-1","sample_limit":2000}"#).is_ok());
+        for invalid in [
+            br#"{"session_id":"session-1","sample_limit":0}"#.as_slice(),
+            br#"{"session_id":"session-1","sample_limit":2001}"#,
+            br#"{"session_id":"session-1","sample_limit":null}"#,
+        ] {
+            assert!(payload(open, invalid).is_err());
+        }
+        assert!(payload(page, br#"{"session_id":"session-1","kind":"samples","cursor":{"session_id":"session-1","kind":"samples","first_id":"1","last_id":"90","after_id":null,"total":70},"limit":32}"#).is_ok());
+        for invalid in [
+            br#"{"session_id":"session-1","kind":"samples","cursor":{"session_id":"other","kind":"samples","first_id":"1","last_id":"90","after_id":null,"total":70}}"#.as_slice(),
+            br#"{"session_id":"session-1","kind":"samples","cursor":{"session_id":"session-1","kind":"events","first_id":"1","last_id":"90","after_id":null,"total":70}}"#,
+            br#"{"session_id":"session-1","kind":"events","cursor":{"session_id":"session-1","kind":"events","first_id":"1","last_id":"90","after_id":null,"total":70},"limit":9}"#,
+            br#"{"session_id":"session-1","kind":"samples","cursor":{"session_id":"session-1","kind":"samples","first_id":"01","last_id":"90","after_id":null,"total":70}}"#,
+            br#"{"session_id":"session-1","kind":"samples","cursor":{"session_id":"session-1","kind":"samples","first_id":"1","last_id":"90","after_id":"90","total":70}}"#,
+            br#"{"session_id":"session-1","kind":"samples","cursor":{"session_id":"session-1","kind":"samples","first_id":"1","last_id":"90","after_id":null,"total":70,"owner":"forged"}}"#,
+            br#"{"session_id":"session-1","kind":"samples","cursor":{"session_id":"session-1","kind":"samples","first_id":"1","last_id":"90","after_id":null,"total":9007199254740992}}"#,
+        ] { assert!(payload(page, invalid).is_err()); }
     }
 
     #[test]
     fn host_metrics_routes_expose_settings_and_empty_body_stats_read() {
+        let streams = resolve("/v1/live-streams/status").unwrap();
+        assert_eq!(streams.service, "amaterasu.stream-session/1");
+        assert_eq!(streams.action, "management_live_sessions");
+        assert_eq!(streams.scope, Some("session.read"));
+        assert!(streams.requires_empty_body);
+        assert!(payload(streams, br#"{}"#).is_ok());
+        assert!(payload(streams, br#"{"owner":"other"}"#).is_err());
         for (path, action, scope) in [
             (
                 "/v1/host-metrics/settings",
@@ -631,6 +711,115 @@ mod tests {
             assert_eq!(route.scope, Some(scope));
         }
         assert!(resolve("/v1/system-tray/events").is_none());
+    }
+
+    #[test]
+    fn browser_session_routes_reject_forged_identity_and_invalid_handles() {
+        let list = resolve("/v1/account-sessions/list").unwrap();
+        let revoke = resolve("/v1/account-sessions/revoke").unwrap();
+        assert_eq!(list.scope, Some("configuration.write"));
+        assert_eq!(revoke.scope, Some("configuration.write"));
+        assert!(payload(list, br#"{}"#).is_ok());
+        assert!(payload(list, br#"{"bearer":"forged"}"#).is_err());
+        assert!(payload(revoke, br#"{"session_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#).is_ok());
+        for body in [br#"{"session_id":"short"}"#.as_slice(),
+            br#"{"session_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","bearer":"forged"}"#] {
+            assert!(payload(revoke, body).is_err());
+        }
+    }
+
+    #[test]
+    fn account_token_routes_are_fixed_scoped_and_reject_caller_authority() {
+        let list = resolve("/v1/tokens/list").unwrap();
+        let issue = resolve("/v1/tokens/issue").unwrap();
+        let revoke = resolve("/v1/tokens/revoke").unwrap();
+        for route in [list, issue, revoke] {
+            assert_eq!(route.service, "amaterasu.authentication/1");
+            assert_eq!(route.scope, Some("tokens.manage"));
+        }
+        assert!(payload(list, br#"{}"#).is_ok());
+        assert!(payload(list, br#"{"bearer":"forged"}"#).is_err());
+        assert!(payload(issue, br#"{"scopes":["catalog.read"],"ttl_seconds":3600}"#).is_ok());
+        assert!(
+            payload(
+                issue,
+                br#"{"scopes":["custom/path:read"],"ttl_seconds":60}"#
+            )
+            .is_ok()
+        );
+        for body in [
+            br#"{"scopes":[],"ttl_seconds":60}"#.as_slice(),
+            br#"{"scopes":["catalog.read"],"ttl_seconds":2592001}"#,
+            br#"{"scopes":["*"],"ttl_seconds":60}"#,
+            br#"{"scopes":["catalog.read","catalog.read"],"ttl_seconds":60}"#,
+            br#"{"scopes":["catalog.read"],"ttl_seconds":60,"owner":"console"}"#,
+            br#"{"scopes":["catalog.read"],"ttl_seconds":60,"bearer":"forged"}"#,
+        ] {
+            assert!(payload(issue, body).is_err());
+        }
+        assert!(payload(revoke, br#"{"token_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#).is_ok());
+        assert!(payload(revoke, br#"{"token_id":"invalid"}"#).is_err());
+    }
+
+    #[test]
+    fn host_logs_require_scope_and_reject_untrusted_owner_and_paths() {
+        let open = resolve("/v1/host-logs/open").unwrap();
+        let read = resolve("/v1/host-logs/read").unwrap();
+        let close = resolve("/v1/host-logs/close").unwrap();
+        let export_start = resolve("/v1/host-logs/export_start").unwrap();
+        let export_status = resolve("/v1/host-logs/export_status").unwrap();
+        let export_read = resolve("/v1/host-logs/export_read").unwrap();
+        for route in [open, read, close, export_start, export_status, export_read] {
+            assert_eq!(route.scope, Some("host-logs.read"));
+            assert_eq!(route.service, amaterasu_contracts::HOST_LOG_SERVICE);
+        }
+        assert!(payload(open, br#"{}"#).is_ok());
+        assert!(payload(open, br#"{"owner":"forged"}"#).is_err());
+        assert!(payload(open, br#"{"path":"/etc/passwd"}"#).is_err());
+        assert!(payload(export_start, br#"{}"#).is_ok());
+        assert!(payload(export_start, br#"{"path":"/etc/passwd"}"#).is_err());
+        assert!(
+            payload(
+                export_status,
+                br#"{"snapshot":"0123456789abcdef0123456789abcdef"}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            payload(
+                export_status,
+                br#"{"snapshot":"0123456789abcdef0123456789abcdef","owner":"forged"}"#
+            )
+            .is_err()
+        );
+        assert!(
+            payload(
+                export_read,
+                br#"{"snapshot":"0123456789abcdef0123456789abcdef","offset":0,"limit":8192}"#
+            )
+            .is_ok()
+        );
+        assert!(
+            payload(
+                export_read,
+                br#"{"snapshot":"0123456789abcdef0123456789abcdef","offset":0,"limit":8193}"#
+            )
+            .is_err()
+        );
+        assert!(
+            payload(
+                read,
+                br#"{"snapshot":"0123456789abcdef0123456789abcdef","offset":0,"limit":4096}"#
+            )
+            .is_ok()
+        );
+        for invalid in [
+            br#"{"snapshot":"0123456789abcdef0123456789abcdef","offset":0,"limit":4097}"#.as_slice(),
+            br#"{"snapshot":"0123456789abcdef0123456789abcdeF","offset":0,"limit":1}"#,
+            br#"{"snapshot":"0123456789abcdef0123456789abcdef","offset":0,"limit":1,"owner":"forged"}"#,
+        ] { assert!(payload(read, invalid).is_err()); }
+        assert!(payload(close, br#"{"snapshot":"0123456789abcdef0123456789abcdef"}"#).is_ok());
+        assert!(resolve("/v1/host-logs/export").is_none());
     }
 
     #[test]
@@ -833,6 +1022,16 @@ mod tests {
             )
             .is_err()
         );
+        let unpair = resolve("/v1/pairing/unpair").unwrap();
+        assert!(payload(unpair, br#"{"certificate_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_revision":7}"#).is_ok());
+        assert!(payload(unpair, br#"{"certificate_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#).is_ok());
+        for body in [
+            br#"{"certificate_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_revision":-1}"#.as_slice(),
+            br#"{"certificate_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_revision":null}"#,
+            br#"{"certificate_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","expected_revision":7,"caller":"forged"}"#,
+        ] {
+            assert!(payload(unpair, body).is_err());
+        }
         let update = resolve("/v1/pairing/update_client_config_overrides").unwrap();
         assert!(payload(
             update,
@@ -1766,5 +1965,25 @@ mod tests {
         assert_eq!(payload(refresh, br#"{}"#).unwrap()["action"], "refresh");
         assert!(payload(status, br#"{"action":"launch_start"}"#).is_err());
         assert!(resolve("/v1/playnite/launch/start").is_none());
+    }
+    #[test]
+    fn managed_launch_routes_bind_scope_and_exact_identifiers() {
+        let status = resolve("/v1/nvhttp/launch_status").unwrap();
+        let stop = resolve("/v1/nvhttp/stop_launch").unwrap();
+        assert_eq!(status.scope, Some("session.read"));
+        assert_eq!(stop.scope, Some("application.terminate"));
+        assert!(payload(status, br#"{}"#).is_ok());
+        let reference = "a".repeat(64);
+        let revision = "b".repeat(64);
+        let body =
+            serde_json::to_vec(&serde_json::json!({"reference":reference,"revision":revision}))
+                .unwrap();
+        assert_eq!(
+            payload(stop, &body).unwrap()["action"],
+            "management_stop_launch"
+        );
+        assert!(payload(stop, br#"{"reference":"bad","revision":"bad"}"#).is_err());
+        assert!(payload(status, br#"{"reference":null}"#).is_err());
+        assert!(payload(status, br#"{"unexpected":1}"#).is_err());
     }
 }

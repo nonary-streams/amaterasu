@@ -535,6 +535,29 @@ impl CaptureMode {
     }
 }
 
+pub(crate) fn resolve_capture_route(
+    mode: CaptureMode,
+    bootstrap_provider: CaptureProvider,
+    output: &str,
+) -> (CaptureProvider, bool, String) {
+    let physical_output = !output.is_empty()
+        && output != OWNED_DISPLAY_OUTPUT
+        && output != PORTAL_SELECTED_SESSION_SOURCE;
+    let virtual_bootstrap = matches!(&bootstrap_provider, CaptureProvider::External(alias) if alias == "virtual_screen" || alias == "vkms");
+    let (provider, constant_rate) =
+        if mode == CaptureMode::Auto && virtual_bootstrap && physical_output {
+            (CaptureProvider::Kms, false)
+        } else {
+            mode.resolve(bootstrap_provider)
+        };
+    let output = if provider == CaptureProvider::PipeWire && output != OWNED_DISPLAY_OUTPUT {
+        PORTAL_SELECTED_SESSION_SOURCE
+    } else {
+        output
+    };
+    (provider, constant_rate, output.to_owned())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CaptureProvider {
     Dxgi,
@@ -690,6 +713,7 @@ pub struct Controller {
     device_name: String,
     records: BTreeMap<u64, Record>,
     pending_resume: Option<PendingResume>,
+    management_replies: Vec<(u64, Reply)>,
     job: Option<Job>,
     nonce: [u8; 16],
     next_id: u64,
@@ -732,6 +756,7 @@ impl Controller {
             device_name: "Amaterasu".into(),
             records: BTreeMap::new(),
             pending_resume: None,
+            management_replies: Vec::new(),
             job: None,
             nonce,
             next_id: 0,
@@ -883,6 +908,102 @@ impl Controller {
         self.records.values().any(|record| !record.state.terminal())
     }
 
+    /// Management sees only opaque launch identities and cleanup state. This is
+    /// separate from RTSP's ticket and stream-session's owner-bound handles.
+    pub fn management_status(&self, reference: Option<&str>) -> Value {
+        let record = match reference {
+            Some(reference) => self
+                .records
+                .values()
+                .find(|record| management_reference(record) == reference),
+            None => self
+                .records
+                .values()
+                .find(|record| !record.state.terminal()),
+        };
+        match record {
+            Some(record) => json!({"ok":true,"launch":{
+                "reference":management_reference(record),
+                "revision":self.management_revision(record),
+                "state":management_state(record.state),
+                "pending_resume":self.pending_resume.as_ref().is_some_and(|pending| pending.record == record.id),
+            }}),
+            None if reference.is_none() => json!({"ok":true,"launch":null}),
+            None => json!({"ok":false,"code":"launch_not_found"}),
+        }
+    }
+
+    fn management_revision(&self, record: &Record) -> String {
+        let pending = self
+            .pending_resume
+            .as_ref()
+            .filter(|pending| pending.record == record.id);
+        let mut digest = Sha256::new();
+        digest.update(b"amaterasu-management-launch-revision-v1\0");
+        digest.update(record.rtsp_operation.as_bytes());
+        digest.update([record.state as u8]);
+        match pending {
+            Some(pending) => {
+                digest.update([1]);
+                digest.update(pending.connection.to_be_bytes());
+            }
+            None => digest.update([0]),
+        }
+        hex(&digest.finalize())
+    }
+
+    /// Accepts cleanup only for the exact launch and resume state the caller
+    /// observed. Completion is read back separately; admission is not cleanup.
+    pub fn management_stop(&mut self, reference: &str, revision: &str, now: Instant) -> Value {
+        let Some(id) = self
+            .records
+            .values()
+            .find(|record| !record.state.terminal() && management_reference(record) == reference)
+            .map(|record| record.id)
+        else {
+            return json!({"ok":false,"code":"launch_changed"});
+        };
+        if self
+            .records
+            .get(&id)
+            .is_none_or(|record| self.management_revision(record) != revision)
+        {
+            return json!({"ok":false,"code":"launch_changed"});
+        }
+        if self
+            .pending_resume
+            .as_ref()
+            .is_some_and(|pending| pending.record == id)
+            && let Some(pending) = self.pending_resume.take()
+        {
+            self.management_replies.push((
+                pending.connection,
+                private_error(409, "resume cancelled by host"),
+            ));
+        }
+        let record = self
+            .records
+            .get_mut(&id)
+            .expect("selected launch remains present");
+        let already_stopping = record.state == State::Stopping;
+        if record.state == State::CleanupFailed {
+            if let Some((phase, call)) = record.retry_cleanup(now) {
+                self.job = Some(Job {
+                    record: id,
+                    phase,
+                    call,
+                    deadline: record.deadline,
+                });
+            }
+        } else if record.state != State::Stopping {
+            record.request_cleanup(None, now);
+        }
+        if !already_stopping && let Some(job) = self.job.as_mut().filter(|job| job.record == id) {
+            job.call.cancel();
+        }
+        json!({"ok":true,"accepted":true,"reference":reference})
+    }
+
     pub fn launch(
         &mut self,
         connection: u64,
@@ -952,17 +1073,12 @@ impl Controller {
         let bootstrap_capture_provider = config.capture.capture_provider.clone();
         let global_capture_mode = self.configured_capture;
         let selected_capture_mode = peer.client_capture.unwrap_or(global_capture_mode);
-        let (capture_provider, constant_rate) =
-            selected_capture_mode.resolve(bootstrap_capture_provider.clone());
-        let capture_output = if capture_provider == CaptureProvider::PipeWire {
-            if config.capture.output == OWNED_DISPLAY_OUTPUT {
-                OWNED_DISPLAY_OUTPUT.to_owned()
-            } else {
-                PORTAL_SELECTED_SESSION_SOURCE.to_owned()
-            }
-        } else {
-            capture_output
-        };
+        let requested_capture_output = capture_output.clone();
+        let (capture_provider, constant_rate, capture_output) = resolve_capture_route(
+            selected_capture_mode,
+            bootstrap_capture_provider.clone(),
+            &capture_output,
+        );
 
         if let Some(record) = self
             .records
@@ -1036,6 +1152,7 @@ impl Controller {
             connection,
             now + INITIAL_DEADLINE,
         );
+        record.requested_capture_output = requested_capture_output;
         record.desktop = desktop;
         record.video_codec_offer = video_codec_offer;
         record.encoder_snapshot = self.encoder_snapshot.clone();
@@ -1196,7 +1313,7 @@ impl Controller {
         send: &mut Send<'_>,
         mut trusted: impl FnMut(&[u8]) -> bool,
     ) -> Vec<(u64, Reply)> {
-        let mut replies = Vec::new();
+        let mut replies = std::mem::take(&mut self.management_replies);
         if let Some(mut job) = self.job.take() {
             self.advance(&mut job, now, send, &mut replies);
         }
@@ -1468,6 +1585,23 @@ fn random_nonzero_u32() -> Result<u32, &'static str> {
 
 fn operation_id(nonce: &[u8; 16], id: u64, purpose: &str) -> String {
     format!("nvhttp-{}-{id:016x}-{purpose}", hex(nonce))
+}
+
+fn management_reference(record: &Record) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"amaterasu-management-launch-reference-v1\0");
+    digest.update(record.rtsp_operation.as_bytes());
+    hex(&digest.finalize())
+}
+
+fn management_state(state: State) -> &'static str {
+    match state {
+        State::Starting | State::AwaitingDelivery => "starting",
+        State::Ready => "ready",
+        State::Stopping => "stopping",
+        State::Stopped | State::Failed => "ended",
+        State::CleanupFailed => "cleanup_failed",
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {

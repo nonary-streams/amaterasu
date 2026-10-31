@@ -160,6 +160,8 @@ pub struct Record {
     pub application_stream_audio: Option<bool>,
     pub effective_stream_audio: bool,
     pub capture_output: String,
+    /// Frozen output before provider-specific routing and application overrides.
+    pub requested_capture_output: String,
     /// Frozen platform-selected provider used when the configured capture mode is auto.
     pub bootstrap_capture_provider: CaptureProvider,
     pub global_capture_mode: CaptureMode,
@@ -326,6 +328,7 @@ impl Record {
             selected_encoder: amaterasu_module_sdk::EncoderSelection::Index(0),
             application_stream_audio: None,
             effective_stream_audio: global_stream_audio,
+            requested_capture_output: capture_output.clone(),
             capture_output,
             bootstrap_capture_provider,
             global_capture_mode,

@@ -2021,6 +2021,85 @@ fn launch_ready(controller: &mut Controller, broker: &mut Broker, now: Instant) 
 }
 
 #[test]
+fn management_stop_confirms_the_exact_launch_and_reports_owned_cleanup() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    launch_ready(&mut controller, &mut broker, now);
+    let snapshot = controller.management_status(None);
+    let launch = &snapshot["launch"];
+    let reference = launch["reference"].as_str().unwrap();
+    let revision = launch["revision"].as_str().unwrap();
+    assert_eq!(launch["state"], "ready");
+    assert_eq!(reference.len(), 64);
+    assert!(!snapshot.to_string().contains("nvhttp-"));
+    assert_eq!(controller.management_stop(reference, &"0".repeat(64), now)["code"], "launch_changed");
+    assert_eq!(controller.records[&1].state, State::Ready);
+    assert_eq!(controller.management_stop(reference, revision, now)["accepted"], true);
+    assert_eq!(controller.management_status(Some(reference))["launch"]["state"], "stopping");
+    poll_until_stopped(&mut controller, &mut broker, now, 1);
+    assert_eq!(controller.management_status(Some(reference))["launch"]["state"], "ended");
+    assert_eq!(controller.management_status(None)["launch"], Value::Null);
+    assert!(broker.rtsp_closed);
+    assert!(broker.application_stopped);
+    assert!(!broker.history_reserved);
+    assert_eq!(controller.management_stop(reference, revision, now)["code"], "launch_changed");
+}
+
+#[test]
+fn management_stop_fences_a_pending_resume_and_does_not_restart_it() {
+    let now = Instant::now();
+    let mut settings = config();
+    settings.desktop.enabled = true;
+    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut broker = Broker::default();
+    let client = peer(95);
+    let mut first = request(95);
+    first.app_id = DESKTOP_APP_ID;
+    assert!(controller.launch(95, first, client.clone(), now).is_none());
+    let (connection, _) = poll_until_reply(&mut controller, &mut broker, now);
+    controller.reply_delivered(connection, now);
+    let before = controller.management_status(None);
+    let reference = before["launch"]["reference"].as_str().unwrap();
+    let stale_revision = before["launch"]["revision"].as_str().unwrap();
+    let mut resumed = request(95);
+    resumed.app_id = DESKTOP_APP_ID;
+    assert!(controller.resume(96, resumed, &client, now).is_none());
+    assert_eq!(controller.management_stop(reference, stale_revision, now)["code"], "launch_changed");
+    let fresh = controller.management_status(None);
+    assert_eq!(fresh["launch"]["pending_resume"], true);
+    let fresh_revision = fresh["launch"]["revision"].as_str().unwrap();
+    assert_eq!(controller.management_stop(reference, fresh_revision, now)["accepted"], true);
+    let replies = controller.poll(now, &mut |command| broker.send(command));
+    assert!(replies.iter().any(|(connection, reply)| *connection == 96 && reply.status == 409));
+    poll_until_stopped(&mut controller, &mut broker, now, 1);
+    assert_eq!(broker.actions().iter().filter(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open").count(), 1);
+}
+
+#[test]
+fn management_stop_reports_cleanup_failure_and_allows_an_explicit_retry() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    launch_ready(&mut controller, &mut broker, now);
+    broker.history_release_unavailable = true;
+    let status = controller.management_status(None);
+    let reference = status["launch"]["reference"].as_str().unwrap();
+    let revision = status["launch"]["revision"].as_str().unwrap();
+    assert_eq!(controller.management_stop(reference, revision, now)["accepted"], true);
+    for _ in 0..32 {
+        controller.poll(now, &mut |command| broker.send(command));
+        if controller.records[&1].state == State::CleanupFailed { break; }
+    }
+    let failed = controller.management_status(Some(reference));
+    assert_eq!(failed["launch"]["state"], "cleanup_failed");
+    broker.history_release_unavailable = false;
+    assert_eq!(controller.management_stop(reference, failed["launch"]["revision"].as_str().unwrap(), now)["accepted"], true);
+    poll_until_stopped(&mut controller, &mut broker, now, 1);
+    assert!(!broker.history_reserved);
+}
+
+#[test]
 fn desktop_launch_and_cancel_only_manage_rtsp_and_history() {
     let now = Instant::now();
     let mut settings = config();
@@ -2095,6 +2174,221 @@ fn pipewire_launch_carries_the_owned_display_request_to_rtsp() {
         })
         .expect("RTSP open request");
     assert_eq!(rtsp_open["capture"]["output"], OWNED_DISPLAY_OUTPUT);
+}
+
+#[test]
+fn automatic_virtual_capture_routes_explicit_physical_outputs_to_kms() {
+    for alias in ["vkms", "virtual_screen"] {
+        let provider = CaptureProvider::External(alias.into());
+        assert_eq!(
+            resolve_capture_route(CaptureMode::Auto, provider.clone(), "DP-1"),
+            (CaptureProvider::Kms, false, "DP-1".into())
+        );
+        assert_eq!(
+            resolve_capture_route(CaptureMode::Auto, provider.clone(), OWNED_DISPLAY_OUTPUT),
+            (provider.clone(), false, OWNED_DISPLAY_OUTPUT.into())
+        );
+        assert_eq!(
+            resolve_capture_route(CaptureMode::PipeWire, provider, "DP-1"),
+            (CaptureProvider::PipeWire, false, PORTAL_SELECTED_SESSION_SOURCE.into())
+        );
+    }
+    assert_eq!(
+        resolve_capture_route(CaptureMode::Auto, CaptureProvider::Wgc, "DP-1"),
+        (CaptureProvider::Wgc, false, "DP-1".into())
+    );
+}
+
+#[test]
+fn application_physical_output_overrides_owned_capture_in_auto_mode() {
+    let now = Instant::now();
+    let mut settings = config();
+    settings.capture.capture_provider = CaptureProvider::External("vkms".into());
+    settings.capture.output = OWNED_DISPLAY_OUTPUT.into();
+    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut broker = Broker {
+        application_display_settings: Some(json!({"display_output":"DP-1"})),
+        ..Broker::default()
+    };
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let _ = poll_until_reply(&mut controller, &mut broker, now);
+    let record = controller.records.values().next().unwrap();
+    assert_eq!(record.capture_provider, CaptureProvider::Kms);
+    assert_eq!(record.capture_output, "DP-1");
+}
+
+#[test]
+fn application_explicit_capture_mode_remains_authoritative_for_physical_output() {
+    let now = Instant::now();
+    let mut settings = config();
+    settings.capture.capture_provider = CaptureProvider::External("vkms".into());
+    settings.capture.output = OWNED_DISPLAY_OUTPUT.into();
+    let mut controller = Controller::new(Some(settings)).unwrap();
+    let mut broker = Broker {
+        application_display_settings: Some(json!({"display_output":"DP-1"})),
+        application_input_overrides: Some(json!({"capture":"pipewire"})),
+        ..Broker::default()
+    };
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let _ = poll_until_reply(&mut controller, &mut broker, now);
+    let record = controller.records.values().next().unwrap();
+    assert_eq!(record.capture_provider, CaptureProvider::PipeWire);
+    assert_eq!(record.capture_output, PORTAL_SELECTED_SESSION_SOURCE);
+}
+
+#[test]
+fn application_virtual_output_overrides_configured_physical_output_in_auto_mode() {
+    let now = Instant::now();
+    let mut settings = config();
+    settings.capture.capture_provider = CaptureProvider::External("vkms".into());
+    settings.capture.output = OWNED_DISPLAY_OUTPUT.into();
+    let mut controller = Controller::new(Some(settings)).unwrap();
+    controller.set_output_name_settings(true, Some("DP-1"));
+    let mut broker = Broker {
+        application_display_settings: Some(json!({"virtual_screen":true})),
+        ..Broker::default()
+    };
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let _ = poll_until_reply(&mut controller, &mut broker, now);
+    let record = controller.records.values().next().unwrap();
+    assert_eq!(record.capture_provider, CaptureProvider::External("vkms".into()));
+    assert_eq!(record.capture_output, OWNED_DISPLAY_OUTPUT);
+}
+
+#[test]
+fn disabled_virtual_display_without_physical_output_fails_before_rtsp() {
+    for desktop in [false, true] {
+        let now = Instant::now();
+        let mut settings = config();
+        settings.desktop.enabled = true;
+        settings.capture.capture_provider = CaptureProvider::External("vkms".into());
+        settings.capture.output = OWNED_DISPLAY_OUTPUT.into();
+        let mut controller = Controller::new(Some(settings)).unwrap();
+        controller.set_global_display_policy(1, json!({"virtual_display_mode":"disabled"}));
+        let mut broker = Broker::default();
+        let mut launch_request = request(1);
+        if desktop { launch_request.app_id = DESKTOP_APP_ID; }
+        assert!(controller.launch(10, launch_request, peer(1), now).is_none());
+        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        assert_ne!(reply.status, 200);
+        assert!(!broker.actions().iter().any(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open"));
+    }
+}
+
+#[test]
+fn desktop_explicit_virtual_policy_fails_before_rtsp() {
+    let now = Instant::now();
+    let mut settings = config();
+    settings.desktop.enabled = true;
+    settings.capture.capture_provider = CaptureProvider::External("vkms".into());
+    settings.capture.output = OWNED_DISPLAY_OUTPUT.into();
+    let mut controller = Controller::new(Some(settings)).unwrap();
+    controller.set_output_name_settings(true, Some("DP-1"));
+    controller.set_global_display_policy(1, json!({"virtual_display_mode":"per_client"}));
+    let mut broker = Broker::default();
+    let mut launch_request = request(1);
+    launch_request.app_id = DESKTOP_APP_ID;
+    assert!(controller.launch(10, launch_request, peer(1), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_ne!(reply.status, 200);
+    assert!(!broker.actions().iter().any(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open"));
+}
+
+#[test]
+fn desktop_default_linux_virtual_profile_allows_owned_capture() {
+    let now = Instant::now();
+    let mut settings = config();
+    settings.desktop.enabled = true;
+    settings.capture.capture_provider = CaptureProvider::External("vkms".into());
+    settings.capture.output = OWNED_DISPLAY_OUTPUT.into();
+    let mut controller = Controller::new(Some(settings)).unwrap();
+    controller.set_global_display_policy(1, json!({
+        "virtual_display_outputs":["Virtual-1"],
+        "virtual_display_layout":"exclusive", "dd_virtual_display_scale":-1
+    }));
+    let mut broker = Broker::default();
+    let mut launch_request = request(1);
+    launch_request.app_id = DESKTOP_APP_ID;
+    assert!(controller.launch(10, launch_request, peer(1), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    let record = controller.records.values().next().unwrap();
+    assert_eq!(record.capture_output, OWNED_DISPLAY_OUTPUT);
+}
+
+#[test]
+fn desktop_nonvirtual_provider_is_not_rejected_for_display_policy() {
+    for provider in [CaptureProvider::Dxgi, CaptureProvider::Wgc] {
+        let now = Instant::now();
+        let mut settings = config();
+        settings.desktop.enabled = true;
+        settings.capture.capture_provider = provider;
+        let mut controller = Controller::new(Some(settings)).unwrap();
+        controller.set_global_display_policy(1, json!({"virtual_display_mode":"per_client", "dd_virtual_display_scale":125}));
+        let mut broker = Broker::default();
+        let mut launch_request = request(1);
+        launch_request.app_id = DESKTOP_APP_ID;
+        assert!(controller.launch(10, launch_request, peer(1), now).is_none());
+        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        assert_eq!(reply.status, 200);
+    }
+}
+
+#[test]
+fn saved_physical_output_overrides_implicit_virtual_mode() {
+    for desktop in [false, true] {
+        let now = Instant::now();
+        let mut settings = config();
+        settings.desktop.enabled = true;
+        settings.capture.capture_provider = CaptureProvider::External("vkms".into());
+        settings.capture.output = OWNED_DISPLAY_OUTPUT.into();
+        let mut controller = Controller::new(Some(settings)).unwrap();
+        controller.set_output_name_settings(true, Some("DP-1"));
+        controller.set_global_display_policy(1, json!({"virtual_display_outputs":["Virtual-1"]}));
+        let mut broker = Broker::default();
+        let mut launch_request = request(1);
+        if desktop { launch_request.app_id = DESKTOP_APP_ID; }
+        assert!(controller.launch(10, launch_request, peer(1), now).is_none());
+        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        assert_eq!(reply.status, 200);
+        let record = controller.records.values().next().unwrap();
+        assert_eq!(record.capture_provider, CaptureProvider::Kms);
+        assert_eq!(record.capture_output, "DP-1");
+        assert!(record.virtual_display_intent.is_none());
+    }
+}
+
+#[test]
+fn app_disabling_virtual_screen_does_not_create_owned_output() {
+    let now = Instant::now();
+    let mut settings = config();
+    settings.capture.capture_provider = CaptureProvider::External("vkms".into());
+    settings.capture.output = OWNED_DISPLAY_OUTPUT.into();
+    let mut controller = Controller::new(Some(settings)).unwrap();
+    controller.set_global_display_policy(1, json!({"virtual_display_mode":"per_client"}));
+    let mut broker = Broker { application_display_settings: Some(json!({"virtual_screen":false})), ..Broker::default() };
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_ne!(reply.status, 200);
+    assert!(!broker.actions().iter().any(|(service, action)| *service == "amaterasu.rtsp/1" && *action == "open"));
+}
+
+#[test]
+fn activate_virtual_display_is_honored_with_disabled_mode() {
+    let now = Instant::now();
+    let mut settings = config();
+    settings.capture.capture_provider = CaptureProvider::External("vkms".into());
+    settings.capture.output = OWNED_DISPLAY_OUTPUT.into();
+    let mut controller = Controller::new(Some(settings)).unwrap();
+    controller.set_global_display_policy(1, json!({
+        "virtual_display_mode":"disabled", "dd_activate_virtual_display":true
+    }));
+    let mut broker = Broker::default();
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let _ = poll_until_reply(&mut controller, &mut broker, now);
+    let record = controller.records.values().next().unwrap();
+    assert!(record.virtual_display_intent.as_ref().unwrap().dd_activate_virtual_display);
+    assert_eq!(record.capture_output, OWNED_DISPLAY_OUTPUT);
 }
 
 #[test]
@@ -5725,16 +6019,11 @@ fn external_capture_alias_flows_from_startup_to_rtsp() {
     let mut broker = Broker::default();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let _ = poll_until_reply(&mut controller, &mut broker, now);
-    let open = broker
-        .commands
-        .iter()
-        .find_map(|command| match command {
-            Command::Request {
-                service, payload, ..
-            } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
-            _ => None,
-        })
-        .expect("RTSP open request");
+    let open = broker.commands.iter().find_map(|command| match command {
+        Command::Request { service, payload, .. }
+            if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+        _ => None,
+    }).expect("RTSP open request");
     assert_eq!(open["capture"]["capture_provider"], "acme_capture-1");
     assert_eq!(open["capture"]["output"], "display-one");
     assert_eq!(open["capture"]["constant_rate"], false);
@@ -5743,18 +6032,9 @@ fn external_capture_alias_flows_from_startup_to_rtsp() {
 #[test]
 fn external_capture_alias_rejects_invalid_names_and_builtin_override_works() {
     for alias in ["", "Upper", "raw.service/1", "space name", &"a".repeat(65)] {
-        assert!(
-            serde_json::from_value::<CaptureProvider>(json!(alias)).is_err(),
-            "{alias}"
-        );
+        assert!(serde_json::from_value::<CaptureProvider>(json!(alias)).is_err(), "{alias}");
     }
     let external = CaptureProvider::External("acme".into());
-    assert_eq!(
-        CaptureMode::Auto.resolve(external.clone()),
-        (external.clone(), false)
-    );
-    assert_eq!(
-        CaptureMode::Wgcc.resolve(external),
-        (CaptureProvider::Wgc, true)
-    );
+    assert_eq!(CaptureMode::Auto.resolve(external.clone()), (external.clone(), false));
+    assert_eq!(CaptureMode::Wgcc.resolve(external), (CaptureProvider::Wgc, true));
 }

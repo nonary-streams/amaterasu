@@ -21,6 +21,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from test_component_updates import CARGO, ComponentHarness, run
 from test_control_transport import encrypt_control, wait_connected
 from test_host_service import Console
+from test_management_api import Api
 from test_native_media import inverse, parity_row, socket_address
 
 SERVICE = "amaterasu.stream-session/1"
@@ -142,8 +143,10 @@ def stop_client(client):
     client.communicate(timeout=2)
 
 
-def exercise_session(console, oracle, directory):
+def exercise_session(console, oracle, directory, api, reader, unrelated):
     key, key_id, connect_data = secrets.token_bytes(16), secrets.randbits(32), secrets.randbits(32)
+    status, before, _ = api.post("/v1/live-streams/status", token=reader)
+    assert status == 200 and before["sessions"] == [] and len(before["epoch"]) == 32, before
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as video, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as audio:
         video.bind(("127.0.0.1", 0))
         audio.bind(("127.0.0.1", 0))
@@ -177,12 +180,32 @@ def exercise_session(console, oracle, directory):
                     break
                 assert time.monotonic() < deadline, metrics
                 time.sleep(0.005)
+            assert request(console, {"action": "management_live_sessions"})["code"] == "permission_denied"
+            assert api.post("/v1/live-streams/status", token=unrelated)[0] == 403
+            deadline = time.monotonic() + 5
+            while True:
+                status, live, _ = api.post("/v1/live-streams/status", token=reader)
+                assert status == 200 and live["ok"], live
+                streams = live["sessions"]
+                if len(streams) == 1 and int(streams[0]["frames_sent"]) >= 8:
+                    break
+                assert time.monotonic() < deadline, live
+                time.sleep(0.02)
+            stream = streams[0]
+            assert live["epoch"] == before["epoch"], live
+            assert abs(int(live["sampled_at_unix_ms"]) - int(time.time() * 1000)) < 10000, live
+            assert stream["session_id"] == f"stream-session-{session:016x}", stream
+            assert int(stream["bytes_sent"]) > 0 and stream["sequence_gaps"] == "0", stream
+            assert stream["width"] == 16 and stream["height"] == 16 and stream["target_fps"] == 30, stream
+            assert all(field not in stream for field in ("peer_ip", "key_hex", "owner", "operation_id")), stream
             stopped = request(console, {"action": "stop", "session": session})
             assert stopped["ok"] and stopped["state"] == "stopped", stopped
             assert stopped["error"] is None and stopped["cleanup_error"] is None, stopped
             assert stopped["control_messages"] == 1 and stopped["rejected_controls"] == 0, stopped
             assert request(console, {"action": "stop", "session": session}) == stopped
             assert request(console, {"action": "lookup", "operation_id": prepare["operation_id"]}) == stopped
+            after = api.post("/v1/live-streams/status", token=reader)[1]
+            assert after["sessions"] == [] and after["epoch"] == before["epoch"], after
             metrics = console.request(SOURCE, {"action": "status"})
             for kind in ("video", "audio"):
                 assert metrics[kind]["active"] == 0 and metrics[kind]["opened"] == metrics[kind]["closed"] == 1, metrics
@@ -246,6 +269,7 @@ def main():
         bootstrap = json.loads(bootstrap_path.read_text())
         settings = bootstrap["policy"]["settings"]
         settings["amaterasu.audio-encode"] = {"enabled": True}
+        settings["amaterasu.management"] = {"enabled": True, "bind": "127.0.0.1:0"}
         settings["amaterasu.stream-session"] = {"enabled": True, "allowed_principals": ["amaterasu.console"]}
         for component in ("media-transport", "control-transport"):
             settings[f"amaterasu.{component}"] = {"enabled": True, "allowed_principals": ["amaterasu.stream-session"]}
@@ -255,7 +279,27 @@ def main():
         harness.stage(package)
         console = Console(harness)
         try:
-            exercise_session(console, oracle, directory)
+            deadline = time.monotonic() + 60
+            while not any(line.startswith("Development worker ready: pid=") for line in console.errors):
+                assert console.process.poll() is None, "signed host exited before worker readiness: " + "".join(console.errors)
+                assert time.monotonic() < deadline, "signed host worker readiness timed out: " + "".join(console.errors)
+                time.sleep(0.05)
+            api = Api(console)
+            assert console.request("amaterasu.authentication/1", {"action":"setup", "username":"live-test-admin", "password":"private-live-test-password"})["ok"]
+            def token(scopes):
+                issued = console.request("amaterasu.authentication/1", {"action":"issue_token", "scopes":scopes, "ttl_seconds":3600})
+                assert issued.get("ok"), "test token issuance failed"
+                return issued["bearer"]
+            reader = token(["session.read"])
+            unrelated = token(["catalog.read"])
+            settings_token = token(["configuration.read", "configuration.write"])
+            status, initial, _ = api.post("/v1/history/settings_get", token=settings_token)
+            assert status == 200 and initial["ok"], initial
+            status, updated, _ = api.post("/v1/history/settings_update", {
+                "settings":{"enabled":False,"ttl_days":0,"db_size_limit_mb":0}, "expected_revision":initial["revision"]
+            }, token=settings_token)
+            assert status == 200 and updated["ok"] and not updated["effective_enabled"], updated
+            exercise_session(console, oracle, directory, api, reader, unrelated)
             exercise_format_rollback(console, oracle, directory)
             input_status = console.request("test.input-probe/1", {"action": "status"})
             assert input_status["enabled"] is False, input_status
@@ -263,7 +307,7 @@ def main():
             console.eof()
         finally:
             console.close()
-    print("Passed: signed stream-session prepare/authenticate/start/drain/stop, synthetic fragmented video and PCM, real Opus and encrypted UDP, C ENet control IDR, idempotency, provider cleanup and post-open format-failure rollback. Hardware and full client playback remain unqualified.")
+    print("Passed: signed stream-session prepare/authenticate/start/drain/stop, synthetic fragmented video and PCM, real Opus and encrypted UDP, scoped live status with recording disabled, C ENet control IDR, idempotency, provider cleanup and post-open format-failure rollback. Hardware and full client playback remain unqualified.")
 
 
 if __name__ == "__main__":

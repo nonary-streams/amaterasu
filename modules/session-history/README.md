@@ -29,6 +29,9 @@ Management calls are accepted only from `amaterasu.management`:
 - `settings_update {"settings":{"enabled":true,"ttl_days":0,"db_size_limit_mb":0},"expected_revision":1}`
 - `list_sessions {"limit":25,"offset":0}`
 - `session_detail {"session_id":"..."}`
+- `timeline_open {"session_id":"..."}`
+- `timeline_open {"session_id":"...","sample_limit":300}` (most recent 1–2,000 samples)
+- `timeline_page {"session_id":"...","kind":"samples","cursor":{...},"limit":32}`
 - `active_sessions {"limit":16}`
 - `history_status {}`
 - `delete_session {"session_id":"..."}`
@@ -71,7 +74,18 @@ enabled policy. The active list reflects only live sessions admitted by this
 process.
 
 History detail responses cap samples to the latest 32 and events to the latest
-8. Session listing is capped at 25 items per page and active listing at 16.
+8. Timeline open captures the metadata and each retained row-ID range in one
+read transaction. Follow each returned cursor to read samples or events in
+admission order, at most 32 samples or 8 events per page and at most 16 KiB per
+response. Appends after opening are excluded. If a row in the captured range is
+deleted or pruned, a subsequent page returns `history_changed`; open a new
+snapshot instead of combining incompatible data. Cursors are bound to the session,
+kind and captured row range and are not credentials. Session listing is capped
+at 25 items per page and active listing at 16.
+Timeline pages also return `entry_ids`, decimal row identifiers aligned with
+`entries`. They preserve full 64-bit integer precision and allow a client to
+reuse rows across bounded live windows. An omitted `sample_limit` continues to
+capture all retained samples; the limit affects samples only, not events.
 Storage keeps the latest 7,200 samples and 2,000 events per session; inserts
 and trimming commit together so failed trimming cannot leave an unbounded row.
 Retention is applied by age and approximate live SQLite page bytes while the

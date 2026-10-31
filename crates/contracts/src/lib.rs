@@ -14,6 +14,10 @@ pub const HOST_LIFECYCLE_SERVICE: &str = "amaterasu.host-lifecycle/1";
 pub const HOST_LIFECYCLE_CONTROL_PRINCIPAL: &str = "@amaterasu.host-lifecycle";
 pub const DIAGNOSTICS_COMPONENT: &str = "amaterasu.diagnostics";
 
+/// Reserved host-owned product-log service. Only management may call it;
+/// browser authorization is enforced separately by the management module.
+pub const HOST_LOG_SERVICE: &str = "amaterasu.host-logs/1";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostLifecycleAction {

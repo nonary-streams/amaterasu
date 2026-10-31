@@ -77,6 +77,242 @@ fn logging_broker() -> Broker {
 }
 
 #[test]
+fn product_log_service_is_reserved_to_host_and_management() {
+    let configuration = RuntimeConfig {
+        principals: [
+            (
+                "amaterasu.management".into(),
+                Grants {
+                    call: names(&[HOST_LOG_SERVICE]),
+                    ..Default::default()
+                },
+            ),
+            (
+                "outsider".into(),
+                Grants {
+                    call: names(&[HOST_LOG_SERVICE]),
+                    provide: names(&[HOST_LOG_SERVICE]),
+                    ..Default::default()
+                },
+            ),
+            (HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(), Grants::default()),
+        ]
+        .into(),
+        host_lifecycle_control: true,
+        ..Default::default()
+    };
+    let mut broker = Broker::new(configuration).unwrap();
+    assert_error_code(
+        broker.dispatch(
+            "outsider",
+            Command::Register {
+                service: HOST_LOG_SERVICE.into(),
+            },
+        ),
+        "permission_denied",
+    );
+    let request = || Command::Request {
+        service: HOST_LOG_SERVICE.into(),
+        payload: json!({"action":"open"}),
+        timeout_ms: 1000,
+        operation_id: "log.1".into(),
+        parent: None,
+    };
+    assert_error_code(broker.dispatch("outsider", request()), "permission_denied");
+    let id = match broker.dispatch("amaterasu.management", request()) {
+        Response::Accepted { id } => id,
+        other => panic!("unexpected host-log submission: {other:?}"),
+    };
+    assert_error_code(
+        broker.dispatch("outsider", Command::TakeResult { request: id }),
+        "permission_denied",
+    );
+    assert!(matches!(
+        broker.dispatch("amaterasu.management", Command::TakeResult { request: id }),
+        Response::Pending
+    ));
+    assert!(
+        matches!(broker.dispatch(HOST_LIFECYCLE_CONTROL_PRINCIPAL, Command::Poll {}),
+        Response::Request { id: delivered, service, caller, .. }
+        if delivered == id && service == HOST_LOG_SERVICE && caller == "amaterasu.management")
+    );
+    assert_error_code(
+        broker.dispatch(
+            "outsider",
+            Command::Complete {
+                request: id,
+                payload: json!({"ok":true}),
+            },
+        ),
+        "permission_denied",
+    );
+    assert!(matches!(
+        broker.dispatch(
+            HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            Command::CheckRequest { request: id }
+        ),
+        Response::Ok
+    ));
+    assert!(matches!(
+        broker.dispatch(
+            HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            Command::Complete {
+                request: id,
+                payload: json!({"ok":true,"length":12})
+            }
+        ),
+        Response::Ok
+    ));
+    assert!(
+        matches!(broker.dispatch("amaterasu.management", Command::TakeResult { request: id }),
+        Response::Result { payload } if payload == json!({"ok":true,"length":12}))
+    );
+    assert_error_code(
+        broker.dispatch(
+            HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            Command::Complete {
+                request: id,
+                payload: json!({"ok":true}),
+            },
+        ),
+        "request_ended",
+    );
+    assert!(matches!(
+        broker.dispatch(
+            "amaterasu.management",
+            Command::ReleaseResult { request: id }
+        ),
+        Response::Ok
+    ));
+}
+
+#[test]
+fn host_log_service_requires_both_host_control_and_a_management_grant() {
+    let without_control = RuntimeConfig {
+        principals: [(
+            "amaterasu.management".into(),
+            Grants {
+                call: names(&[HOST_LOG_SERVICE]),
+                ..Default::default()
+            },
+        )]
+        .into(),
+        ..Default::default()
+    };
+    let request = || Command::Request {
+        service: HOST_LOG_SERVICE.into(),
+        payload: json!({"action":"open"}),
+        timeout_ms: 1000,
+        operation_id: "log.1".into(),
+        parent: None,
+    };
+    let mut broker = Broker::new(without_control).unwrap();
+    assert_error_code(
+        broker.dispatch("amaterasu.management", request()),
+        "unavailable",
+    );
+    assert_error_code(
+        broker.dispatch(HOST_LIFECYCLE_CONTROL_PRINCIPAL, Command::Poll {}),
+        "permission_denied",
+    );
+    let without_grant = RuntimeConfig {
+        principals: [
+            ("amaterasu.management".into(), Grants::default()),
+            (HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(), Grants::default()),
+        ]
+        .into(),
+        host_lifecycle_control: true,
+        ..Default::default()
+    };
+    let mut broker = Broker::new(without_grant).unwrap();
+    assert_error_code(
+        broker.dispatch("amaterasu.management", request()),
+        "permission_denied",
+    );
+}
+
+#[test]
+fn host_log_requests_honor_cancellation_deadline_and_response_bounds() {
+    let config = RuntimeConfig {
+        principals: [
+            (
+                "amaterasu.management".into(),
+                Grants {
+                    call: names(&[HOST_LOG_SERVICE]),
+                    ..Default::default()
+                },
+            ),
+            (HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(), Grants::default()),
+        ]
+        .into(),
+        host_lifecycle_control: true,
+        ..Default::default()
+    };
+    let mut broker = Broker::new(config).unwrap();
+    let now = Instant::now();
+    let request = |operation: &str| Command::Request {
+        service: HOST_LOG_SERVICE.into(),
+        payload: json!({"action":"open"}),
+        timeout_ms: 100,
+        operation_id: operation.into(),
+        parent: None,
+    };
+    let id = match broker.dispatch_at("amaterasu.management", request("log.cancel"), now) {
+        Response::Accepted { id } => id,
+        other => panic!("unexpected request: {other:?}"),
+    };
+    assert!(matches!(
+        broker.dispatch_at(HOST_LIFECYCLE_CONTROL_PRINCIPAL, Command::Poll {}, now),
+        Response::Request { .. }
+    ));
+    assert_error_code(
+        broker.dispatch_at(
+            HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            Command::Complete {
+                request: id,
+                payload: json!({"data":"x".repeat(20_000)}),
+            },
+            now,
+        ),
+        "invalid_request",
+    );
+    assert!(matches!(
+        broker.dispatch_at("amaterasu.management", Command::Cancel { request: id }, now),
+        Response::Ok
+    ));
+    assert_error_code(
+        broker.dispatch_at(
+            HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            Command::Complete {
+                request: id,
+                payload: json!({"ok":true}),
+            },
+            now,
+        ),
+        "request_ended",
+    );
+    let next = match broker.dispatch_at("amaterasu.management", request("log.timeout"), now) {
+        Response::Accepted { id } => id,
+        other => panic!("unexpected request: {other:?}"),
+    };
+    assert!(matches!(
+        broker.dispatch_at(HOST_LIFECYCLE_CONTROL_PRINCIPAL, Command::Poll {}, now),
+        Response::Request { .. }
+    ));
+    assert_error_code(
+        broker.dispatch_at(
+            HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            Command::Complete {
+                request: next,
+                payload: json!({"ok":true}),
+            },
+            now + Duration::from_millis(101),
+        ),
+        "request_ended",
+    );
+}
+
+#[test]
 fn product_log_events_are_capped_scoped_and_host_drained() {
     let mut broker = logging_broker();
     assert!(matches!(

@@ -1044,6 +1044,80 @@ fn old_paired_fec_override_document_loads_without_audio_migration() {
 }
 
 #[test]
+fn revision_checked_unpair_preserves_trust_on_stale_or_racing_writes() {
+    let mut state = Harness::new();
+    let mut pipeline = Pipeline::new(settings());
+    state.initialize(&mut pipeline);
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "console",
+            json!({
+                "action":"import_client", "client_id":"living-room", "name":"Living room",
+                "certificate_pem":CLIENT_CERT
+            }),
+            now()
+        )["ok"],
+        true
+    );
+    let listed = state.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"list_clients"}),
+        now(),
+    );
+    let certificate_id = listed["clients"][0]["certificate_id"].clone();
+    let revision = listed["revision"].as_u64().unwrap();
+    let writes = state.writes;
+    let stale = state.request(
+        &mut pipeline,
+        "console",
+        json!({
+            "action":"unpair", "certificate_id":certificate_id, "expected_revision":revision - 1
+        }),
+        now(),
+    );
+    assert_eq!(stale["code"], "revision_conflict");
+    assert_eq!(state.writes, writes);
+    state.conflict_next_write = true;
+    let raced = state.request(
+        &mut pipeline,
+        "console",
+        json!({
+            "action":"unpair", "certificate_id":certificate_id, "expected_revision":revision
+        }),
+        now(),
+    );
+    assert_eq!(raced["code"], "revision_conflict");
+    let still_paired = state.request(
+        &mut pipeline,
+        "nvhttp",
+        json!({
+            "action":"check_client_certificate", "certificate_pem":CLIENT_CERT
+        }),
+        now(),
+    );
+    assert_eq!(still_paired["paired"], 1);
+    assert_eq!(still_paired["config_overrides"]["fec_percentage"], 73);
+    let removed = state.request(
+        &mut pipeline,
+        "console",
+        json!({
+            "action":"unpair", "certificate_id":certificate_id, "expected_revision":state.revision
+        }),
+        now(),
+    );
+    assert_eq!(removed["ok"], true);
+    let after = state.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"list_clients"}),
+        now(),
+    );
+    assert_eq!(after["clients"].as_array().unwrap().len(), 0);
+}
+
+#[test]
 fn external_state_cas_conflict_does_not_overwrite_another_admins_committed_value() {
     let mut state = Harness::new();
     let mut pipeline = Pipeline::new(settings());

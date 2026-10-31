@@ -6,8 +6,9 @@ mod hooks;
 mod requests;
 
 use amaterasu_contracts::{
-    Command, DIAGNOSTICS_COMPONENT, HOST_LIFECYCLE_CONTROL_PRINCIPAL, HOST_LIFECYCLE_SERVICE,
-    HostLifecycleAction, HostLogEvent, Response, RuntimeConfig,
+    Command, DIAGNOSTICS_COMPONENT, Grants, HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+    HOST_LIFECYCLE_SERVICE, HOST_LOG_SERVICE, HostLifecycleAction, HostLogEvent, Response,
+    RuntimeConfig,
 };
 use std::collections::VecDeque;
 use std::time::Instant;
@@ -41,11 +42,26 @@ impl Broker {
     pub fn new(configuration: RuntimeConfig) -> Result<Self, String> {
         configuration::validate(&configuration)?;
 
+        let mut requests = RequestRouter::default();
+        if configuration.host_lifecycle_control {
+            let grants = Grants {
+                provide: [HOST_LOG_SERVICE.to_owned()].into(),
+                ..Default::default()
+            };
+            let result = requests.register_service(
+                HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+                &grants,
+                HOST_LOG_SERVICE.into(),
+            );
+            if result.is_error() {
+                return Err("could not register the reserved host log service".into());
+            }
+        }
         Ok(Self {
             hooks: HookRegistry::new(configuration.hooks.clone()),
             api: ApiRegistry::new(&configuration),
             configuration,
-            requests: RequestRouter::default(),
+            requests,
             events: EventBus::default(),
             host_lifecycle: VecDeque::with_capacity(HOST_LIFECYCLE_QUEUE_CAPACITY),
             log_events: VecDeque::with_capacity(LOG_EVENT_QUEUE_CAPACITY),
@@ -86,7 +102,17 @@ impl Broker {
         }
 
         if caller == HOST_LIFECYCLE_CONTROL_PRINCIPAL {
-            return errors::permission_denied();
+            if !self.configuration.host_lifecycle_control {
+                return errors::permission_denied();
+            }
+            return match command {
+                Command::Poll {} => self.requests.poll(caller, now),
+                Command::CheckRequest { request } => self.requests.check_active(caller, request),
+                Command::Complete { request, payload } => {
+                    self.requests.complete(caller, request, payload, now)
+                }
+                _ => errors::permission_denied(),
+            };
         }
 
         let Some(grants) = self.configuration.principals.get(caller) else {
@@ -174,13 +200,16 @@ impl Broker {
                 }
             }
             Command::Register { service } => {
-                if self.api.owns_service(&service) {
+                if service == HOST_LOG_SERVICE || self.api.owns_service(&service) {
                     errors::permission_denied()
                 } else {
                     self.requests.register_service(caller, grants, service)
                 }
             }
             Command::RegisterApi { method } => {
+                if method.service == HOST_LOG_SERVICE {
+                    return errors::permission_denied();
+                }
                 let registered = self.api.register(caller, grants, method.clone());
                 if registered.is_error() {
                     registered
@@ -231,6 +260,9 @@ impl Broker {
                 operation_id,
                 parent,
             } => {
+                if service == HOST_LOG_SERVICE {
+                    return errors::permission_denied();
+                }
                 let initiator = match parent {
                     Some(parent_id) => {
                         match self.requests.initiator_for_parent(caller, parent_id) {
@@ -275,6 +307,9 @@ impl Broker {
                 operation_id,
                 parent,
             } => {
+                if service == HOST_LOG_SERVICE && caller != "amaterasu.management" {
+                    return errors::permission_denied();
+                }
                 if self.api.owns_service(&service) {
                     return errors::permission_denied();
                 }

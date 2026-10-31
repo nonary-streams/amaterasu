@@ -70,6 +70,7 @@ pub enum Operation {
     ListClients {},
     Unpair {
         certificate_id: String,
+        expected_revision: Option<u64>,
     },
     UpdateClientConfigOverrides {
         certificate_id: String,
@@ -146,7 +147,7 @@ impl Operation {
                     && clientpairingsecret.len() >= 544
                     && hex_length(clientpairingsecret, clientpairingsecret.len() / 2)
             }
-            Self::Unpair { certificate_id } => hex_length(certificate_id, 32),
+            Self::Unpair { certificate_id, .. } => hex_length(certificate_id, 32),
             Self::UpdateClientConfigOverrides {
                 certificate_id,
                 config_overrides,

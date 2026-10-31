@@ -2840,10 +2840,11 @@ impl Pipeline {
             let Some(id) = row["key"].as_str() else {
                 return complete(send, context.request_id, malformed());
             };
-            if row["key"].as_str().is_some_and(is_reserved_key) {
-                scan.after = Some(row["key"].as_str().unwrap().into());
-                scan.scanned += 1;
-                continue;
+            if is_reserved_key(id) {
+                // Public application IDs sort before every reserved key. Once
+                // this boundary is reached there can be no further public
+                // entries; never expose a hidden provider key as a cursor.
+                return complete(send, context.request_id, scan.reply(false));
             }
             let entry: Entry = match serde_json::from_value(row["value"].clone()) {
                 Ok(entry) => entry,

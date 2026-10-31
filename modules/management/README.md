@@ -154,9 +154,15 @@ Plaintext requests cannot use browser cookie routes or cookie authentication.
 | `/v1/steam/` | refresh, force_sync | `steam.refresh` |
 | `/v1/history/` | settings_get | `configuration.read` |
 | `/v1/history/` | settings_update | `configuration.write` |
-| `/v1/history/` | list_sessions, session_detail, active_sessions, history_status | `session.read` |
+| `/v1/history/` | list_sessions, session_detail, timeline_open, timeline_page, active_sessions, history_status | `session.read` |
 | `/v1/history/` | delete_session | `session.write` |
+| `/v1/live-streams/` | status | `session.read` |
+| `/v1/nvhttp/` | launch_status | `session.read` |
+| `/v1/nvhttp/` | stop_launch | `application.terminate` |
 | `/v1/lutris/` | artwork_read | `lutris.read` |
+| `/v1/host-logs/` | open, read, export_start, export_status, export_read, close | `host-logs.read` |
+| `/v1/tokens/` | list, issue, revoke | `tokens.manage` and an administrator session |
+| `/v1/account-sessions/` | list, revoke | `configuration.write` and an administrator session |
 | `/v1/diagnostics/` | query, counters, status | `diagnostics.read` |
 | `/v1/diagnostics/` | record, increment | `diagnostics.write` |
 | `/v1/pairing/` | identity, pending, list_clients, approve_pin, unpair | `pairing.admin` |
@@ -167,6 +173,37 @@ Plaintext requests cannot use browser cookie routes or cookie authentication.
 | `/v1/launch/` | start | `application.launch` |
 | `/v1/launch/` | status, list | `application.read` |
 | `/v1/launch/` | stop | `application.terminate` |
+
+Account-session administration requires a live administrator session and
+`configuration.write`. The list exposes only bounded session metadata and a
+stable per-session identifier; it does not expose credentials or invent device
+names or activity timestamps. Revocation refuses the current session, rechecks
+authority in authentication, and removes both access and refresh authority.
+
+Browser token management requires the `tokens.manage` policy scope and a live
+administrator session; API tokens cannot call these routes, even when they
+carry that scope. Authentication rechecks the session at dispatch and limits
+issuance to its granted scopes. New secrets are returned once. Listing and
+revocation cover only browser-issued credentials; native and legacy tokens keep
+their existing ownership boundaries.
+
+Host-log access is restricted to administrators and explicitly scoped API tokens.
+The host provides a bounded current-session snapshot using short-lived handles
+bound to the verified authentication context. The routes do not accept file
+paths or caller-supplied ownership. The snapshot
+freezes retained lengths and open file handles, but external in-place modification
+of a log file is not an integrity guarantee.
+Each open response includes an opaque writer-session `stream_id`. Within the same
+stream and unchanged discarded-segment count, a longer snapshot extends the prior
+byte prefix. A different stream, discarded count or shorter snapshot requires a
+fresh read; `stream_id` is not an authorization credential.
+An asynchronous, owner-bound support export packages current and retained sessions
+in the active log directory. It processes at most 32 segments and 64 MiB of raw
+data, discards incomplete boundary lines, and reports truncation. Common user,
+address, and credential patterns are redacted consistently, but sanitization is
+not exhaustive. Prior configured locations and separate helper logs are not
+included; review the bundle before sharing. Only one export can be in progress or
+retained at a time, and completed or abandoned handles expire.
 
 On Linux, an authenticated operator selects a desktop source before launching
 Desktop: `POST /v1/capture/select_portal_source` with
@@ -243,7 +280,7 @@ Pairing routes require **`pairing.admin`** even for public identity and metadata
 | `/v1/pairing/pending` | `{}` |
 | `/v1/pairing/list_clients` | `{}` |
 | `/v1/pairing/approve_pin` | `{"pairing_id":"<pending id>","pin":"0123"}` |
-| `/v1/pairing/unpair` | `{"certificate_id":"<64 hex fingerprint>"}` |
+| `/v1/pairing/unpair` | `{"certificate_id":"<64 hex fingerprint>","expected_revision":7}` (revision optional for legacy clients) |
 
 The PIN must be a four-digit string, preserving leading zeros. Initialize/import
 of host identity and direct client trust imports remain trusted-console-only.

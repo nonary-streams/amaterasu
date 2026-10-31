@@ -1787,6 +1787,33 @@ fn preparation_and_undo_are_canonically_persisted_across_reload() {
 }
 
 #[test]
+fn public_pages_stop_before_hidden_provider_keys() {
+    let mut backend = Backend::default();
+    let mut pipeline = Pipeline::default();
+    let created = backend.run(
+        &mut pipeline,
+        json!({"action":"create","expected_revision":0,"entry":entry("Alpha")}),
+    );
+    assert_eq!(created["ok"], true);
+    for index in 0..300 {
+        backend.entries.insert(
+            format!("~provider.entry:steam:game-{index:04}"),
+            json!({"internal":true}),
+        );
+    }
+    let listing = backend.run(&mut pipeline, json!({"action":"list","limit":1}));
+    assert_eq!(listing["entries"].as_array().unwrap().len(), 1);
+    assert!(listing["next_cursor"].is_null());
+    let searched = backend.run(
+        &mut pipeline,
+        json!({"action":"search","query":"missing","limit":1}),
+    );
+    assert!(searched["entries"].as_array().unwrap().is_empty());
+    assert!(searched["next_cursor"].is_null());
+    assert!(!searched.to_string().contains("~provider"));
+}
+
+#[test]
 fn ten_thousand_entries_use_single_entry_commits_and_bounded_pages() {
     let mut backend = Backend::default();
     let mut pipeline = Pipeline::default();

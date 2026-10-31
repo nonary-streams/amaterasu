@@ -104,6 +104,7 @@ fn later_module_failure_destroys_loaded_consumers_before_providers_and_runtime()
         runtime(&trace),
         None,
         lifecycle_endpoint(),
+        false,
         ["provider", "consumer", "unavailable-listener"],
         |_, name| {
             if name == "unavailable-listener" {
@@ -125,6 +126,7 @@ fn progress_failure_destroys_just_created_module_before_its_dependencies() {
         runtime(&trace),
         None,
         lifecycle_endpoint(),
+        false,
         ["provider", "consumer"],
         |_, name| Ok(feature(name, &trace)),
         &mut |count| {
@@ -146,6 +148,7 @@ fn runtime_progress_failure_does_not_start_features_and_releases_runtime() {
         runtime(&trace),
         None,
         lifecycle_endpoint(),
+        false,
         ["provider"],
         |_, _| panic!("feature must not start after progress failure"),
         &mut |_| Err("progress transport closed".into()),
@@ -162,6 +165,7 @@ fn completed_load_retains_features_until_reverse_dependency_shutdown() {
         runtime(&trace),
         None,
         lifecycle_endpoint(),
+        false,
         ["provider", "consumer"],
         |_, name| Ok(feature(name, &trace)),
         &mut |count| {

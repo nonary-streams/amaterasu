@@ -520,6 +520,92 @@ fn manual_mutations_cannot_forge_provider_owned_steam_artwork() {
 }
 
 #[test]
+fn editing_metadata_retains_only_existing_artwork_for_the_same_launch_identity() {
+    let mut document = create(Document::default(), "Original");
+    let original = document.entries.get_mut("app-0000000000000001").unwrap();
+    original.artwork = Some(crate::model::ArtworkReference::Steam {
+        app_id: 42,
+        revision: "101".into(),
+    });
+    original.steam_id = Some("42".into());
+    let mut edited = original.clone();
+    edited.artwork = None;
+    edited.description = "Updated notes".into();
+    let Change::Write {
+        document: updated, ..
+    } = apply(
+        Operation::Update {
+            id: "app-0000000000000001".into(),
+            entry: edited.clone(),
+            expected_revision: 1,
+        },
+        Some(document),
+    )
+    .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        updated.entries["app-0000000000000001"].artwork,
+        Some(crate::model::ArtworkReference::Steam {
+            app_id: 42,
+            revision: "101".into()
+        })
+    );
+    edited.steam_id = Some("43".into());
+    let Change::Write {
+        document: changed, ..
+    } = apply(
+        Operation::Update {
+            id: "app-0000000000000001".into(),
+            entry: edited,
+            expected_revision: 2,
+        },
+        Some(updated),
+    )
+    .unwrap()
+    else {
+        panic!()
+    };
+    assert!(changed.entries["app-0000000000000001"].artwork.is_none());
+}
+
+#[test]
+fn artwork_identity_ignores_process_policy_but_tracks_the_launch_target() {
+    let original = Launch::Executable {
+        program: "/games/runner".into(),
+        arguments: vec!["game-one".into()],
+        working_directory: Some("/games".into()),
+        auto_detach: None,
+        wait_all: None,
+        exit_timeout_seconds: None,
+        detached: Vec::new(),
+        preparation: Vec::new(),
+    };
+    let mut edited = original.clone();
+    if let Launch::Executable {
+        auto_detach,
+        wait_all,
+        ..
+    } = &mut edited
+    {
+        *auto_detach = Some(true);
+        *wait_all = Some(true);
+    }
+    assert!(same_artwork_launch_identity(&original, &edited));
+    if let Launch::Executable { arguments, .. } = &mut edited {
+        arguments[0] = "game-two".into();
+    }
+    assert!(!same_artwork_launch_identity(&original, &edited));
+    assert!(!same_artwork_launch_identity(
+        &original,
+        &Launch::Application {
+            path: "/games/runner".into()
+        }
+    ));
+}
+
+#[test]
 fn manual_mutations_cannot_forge_lutris_artwork() {
     let mut artwork_entry = entry("Lutris artwork");
     artwork_entry.artwork = Some(crate::model::ArtworkReference::Lutris {
@@ -550,6 +636,45 @@ fn manual_mutations_cannot_forge_lutris_artwork() {
     .unwrap();
     assert_eq!(update_error["error"]["code"], "provider_artwork_required");
     assert!(document.entries["app-0000000000000001"].artwork.is_none());
+}
+
+#[test]
+fn search_includes_launch_identity_commands_and_linked_providers() {
+    let mut command = entry("Example");
+    command.launch = Launch::Executable {
+        program: "/games/runner".into(),
+        arguments: vec!["--profile".into(), "arcade mode".into()],
+        working_directory: Some("/games/work".into()),
+        auto_detach: None,
+        wait_all: None,
+        exit_timeout_seconds: None,
+        detached: Vec::new(),
+        preparation: Vec::new(),
+    };
+    command.steam_id = Some("1234".into());
+    command.steam_install_dir = Some("/steam/library/game".into());
+    for query in [
+        "runner",
+        "--profile arcade mode",
+        "games/work",
+        "steam",
+        "1234",
+        "steam/library",
+    ] {
+        assert!(matches_query(&command, query), "missing {query}");
+    }
+    assert!(!matches_query(&command, "unrelated"));
+    let playnite = Entry {
+        launch: Launch::Playnite {
+            game_id: "game-xyz".into(),
+            exit_timeout_seconds: 10,
+            working_directory: None,
+            preparation: Vec::new(),
+        },
+        ..entry("Imported")
+    };
+    assert!(matches_query(&playnite, "playnite"));
+    assert!(matches_query(&playnite, "game-xyz"));
 }
 
 #[test]

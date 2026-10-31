@@ -180,6 +180,28 @@ impl Controller {
             return;
         }
         record.application_display_overrides = Some(json!({}));
+        let intent = match virtual_display_intent(record) {
+            Ok(intent) => intent,
+            Err(code) => {
+                fail_record(record, code, now);
+                return;
+            }
+        };
+        if intent.is_some()
+            && is_virtual_bootstrap(record)
+            && desktop_has_explicit_virtual_policy(record)
+        {
+            fail_record(record, "desktop_virtual_policy_unsupported", now);
+            return;
+        }
+        let mode = record
+            .peer
+            .client_capture
+            .unwrap_or(record.global_capture_mode);
+        if let Err(code) = route_capture(record, mode, intent.is_some()) {
+            fail_record(record, code, now);
+            return;
+        }
         // Desktop has no catalog application or display mutation admission.
         // A synthetic snapshot lacks those attestations and RTSP rejects it.
         record.display_policy_snapshot = None;
@@ -529,13 +551,6 @@ impl Controller {
                         .client_capture
                         .or(application_overrides.capture)
                         .unwrap_or(record.global_capture_mode);
-                    (record.capture_provider, record.constant_rate) =
-                        selected_capture_mode.resolve(record.bootstrap_capture_provider.clone());
-                    if record.capture_provider == super::CaptureProvider::PipeWire
-                        && record.capture_output != super::OWNED_DISPLAY_OUTPUT
-                    {
-                        record.capture_output = super::PORTAL_SELECTED_SESSION_SOURCE.to_owned();
-                    }
                     record.application_preflight_token = Some(token);
                     record.application_catalog_revision = Some(catalog_revision);
                     record.application_cleanup_budget_ms = Some(cleanup_budget_ms);
@@ -555,6 +570,15 @@ impl Controller {
                             return;
                         }
                     };
+                    if let Err(code) = route_capture(
+                        record,
+                        selected_capture_mode,
+                        record.virtual_display_intent.is_some(),
+                    ) {
+                        fail_record(record, code, now);
+                        self.finish_or_retain(job.record, now, replies);
+                        return;
+                    }
                     record.display_policy_snapshot = Some(display_policy_snapshot(record));
                     record.frame_limiter_snapshot = Some(frame_limiter_launch_snapshot(record));
                     let frozen_overrides = record
@@ -1416,8 +1440,103 @@ fn display_admission_response(record: &Record, payload: &Value) -> Result<String
     Ok(token.to_owned())
 }
 
+fn is_virtual_bootstrap(record: &Record) -> bool {
+    matches!(&record.bootstrap_capture_provider, super::CaptureProvider::External(alias) if alias == "virtual_screen" || alias == "vkms")
+}
+
+fn desktop_has_explicit_virtual_policy(record: &Record) -> bool {
+    const KEYS: &[&str] = &[
+        "virtual_display_mode",
+        "virtual_display_layout",
+        "dd_virtual_display_scale",
+        "dd_activate_virtual_display",
+        "dd_use_sunshine_virtual_display_driver",
+        "dd_configuration_option",
+        "dd_resolution_option",
+        "dd_manual_resolution",
+        "dd_refresh_rate_option",
+        "dd_manual_refresh_rate",
+        "dd_hdr_option",
+        "dd_hdr_request_override",
+        "dd_mode_remapping",
+    ];
+    [
+        &record.global_display_policy,
+        &record.peer.client_display_overrides,
+    ]
+    .iter()
+    .any(|policy| {
+        KEYS.iter().any(|key| {
+            let Some(value) = policy.get(*key).filter(|value| !value.is_null()) else {
+                return false;
+            };
+            match *key {
+                "virtual_display_layout" => value != "exclusive",
+                "dd_virtual_display_scale" => value != -1,
+                "dd_activate_virtual_display" => value != false,
+                "dd_use_sunshine_virtual_display_driver" => value != true,
+                _ => true,
+            }
+        })
+    })
+}
+
 fn capture_source(record: &Record) -> Result<&str, &'static str> {
     capture_source_for(&record.capture_provider, &record.capture_output)
+}
+
+fn route_capture(
+    record: &mut Record,
+    mode: super::CaptureMode,
+    virtual_intent: bool,
+) -> Result<(), &'static str> {
+    let settings = record.application_display_settings.as_ref();
+    let app_output = settings
+        .and_then(|value| value.get("display_output"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let app_virtual = settings
+        .and_then(|value| value.get("virtual_screen"))
+        .and_then(Value::as_bool);
+    let client = &record.peer.client_display_overrides;
+    let application = record.application_display_overrides.as_ref();
+    let display_mode = client
+        .get("virtual_display_mode")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            settings
+                .and_then(|v| v.get("virtual_display_mode"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            application
+                .and_then(|v| v.get("virtual_display_mode"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            record
+                .global_display_policy
+                .get("virtual_display_mode")
+                .and_then(Value::as_str)
+        });
+    let virtual_bootstrap = is_virtual_bootstrap(record);
+    let explicitly_disabled = app_virtual == Some(false) || display_mode == Some("disabled");
+    let output = if virtual_bootstrap && app_output.is_some() && !virtual_intent {
+        app_output.unwrap_or_default()
+    } else if virtual_bootstrap && virtual_intent {
+        super::OWNED_DISPLAY_OUTPUT
+    } else {
+        &record.requested_capture_output
+    };
+    if explicitly_disabled && !virtual_intent && output == super::OWNED_DISPLAY_OUTPUT {
+        return Err("physical_capture_output_required");
+    }
+    (
+        record.capture_provider,
+        record.constant_rate,
+        record.capture_output,
+    ) = super::resolve_capture_route(mode, record.bootstrap_capture_provider.clone(), output);
+    Ok(())
 }
 
 fn capture_source_for<'a>(
@@ -2362,12 +2481,48 @@ fn virtual_display_intent(record: &Record) -> Result<Option<VirtualDisplayIntent
         .unwrap_or(false);
     let app_requests_virtual = settings
         .as_ref()
-        .and_then(|settings| settings.virtual_screen)
-        .unwrap_or(false);
+        .and_then(|settings| settings.virtual_screen);
+    let virtual_bootstrap = is_virtual_bootstrap(record);
+    let app_mode = settings
+        .as_ref()
+        .and_then(|settings| settings.virtual_display_mode.as_deref());
+    let mode_is_explicit = client
+        .get("virtual_display_mode")
+        .and_then(Value::as_str)
+        .is_some()
+        || app_mode.is_some()
+        || application
+            .get("virtual_display_mode")
+            .and_then(Value::as_str)
+            .is_some()
+        || global
+            .get("virtual_display_mode")
+            .and_then(Value::as_str)
+            .is_some();
+    let saved_physical = record.requested_capture_output != super::OWNED_DISPLAY_OUTPUT
+        && record.requested_capture_output != super::PORTAL_SELECTED_SESSION_SOURCE
+        && !record.requested_capture_output.is_empty();
+    if virtual_bootstrap
+        && saved_physical
+        && app_output.is_none()
+        && app_requests_virtual != Some(true)
+        && !mode_is_explicit
+        && !activate_virtual_display
+    {
+        return Ok(None);
+    }
+    if virtual_bootstrap
+        && app_requests_virtual == Some(false)
+        && app_output.is_none()
+        && app_mode.is_none()
+        && client.get("virtual_display_mode").is_none()
+    {
+        return Ok(None);
+    }
     let request_virtual_display = resolve_virtual_display_request(
         mode,
         activate_virtual_display,
-        app_requests_virtual,
+        app_requests_virtual.unwrap_or(false),
         app_output,
         driver_enabled,
     );

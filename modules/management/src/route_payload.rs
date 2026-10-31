@@ -74,6 +74,7 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         "amaterasu.diagnostics/1" if route.action == "status" || route.action == "counters" => {
             fields(object, &[], &[])
         }
+        amaterasu_contracts::HOST_LOG_SERVICE => host_logs(route.action, object),
         "amaterasu.capture-pipewire/1" => capture_pipewire(route.action, object),
         "amaterasu.diagnostics/1" if route.action == "query" => {
             fields(object, &[], &["after", "limit"])?;
@@ -100,6 +101,39 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
             Ok(())
         }
         _ => Ok(()),
+    }
+}
+
+fn host_logs(action: &str, object: &Object) -> Result<(), &'static str> {
+    match action {
+        "open" | "export_start" => fields(object, &[], &[]),
+        "read" | "export_read" | "close" | "export_status" => {
+            if action == "read" || action == "export_read" {
+                fields(object, &["snapshot", "offset", "limit"], &[])?;
+                if object.get("offset").and_then(Value::as_u64).is_none()
+                    || !object
+                        .get("limit")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|limit| {
+                            (1..=if action == "read" { 4096 } else { 8192 }).contains(&limit)
+                        })
+                {
+                    return Err(INVALID);
+                }
+            } else {
+                fields(object, &["snapshot"], &[])?;
+            }
+            let snapshot = text(object, "snapshot")?;
+            if snapshot.len() != 32
+                || !snapshot
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
+        _ => Err(INVALID),
     }
 }
 
@@ -496,6 +530,64 @@ fn authentication(action: &str, object: &Object) -> Result<(), &'static str> {
             }
             Ok(())
         }
+        "account_sessions_list" => fields(object, &[], &[]),
+        "account_sessions_revoke" => {
+            fields(object, &["session_id"], &[])?;
+            let id = text(object, "session_id")?;
+            if id.len() != 64
+                || !id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
+        "account_tokens_list" => fields(object, &[], &[]),
+        "account_tokens_issue" => {
+            fields(object, &["scopes", "ttl_seconds"], &[])?;
+            let scopes = object
+                .get("scopes")
+                .and_then(Value::as_array)
+                .ok_or(INVALID)?;
+            if scopes.is_empty()
+                || scopes.len() > 64
+                || scopes
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    != scopes.len()
+                || scopes.iter().any(|scope| {
+                    !scope.as_str().is_some_and(|scope| {
+                        !scope.is_empty()
+                            && scope.len() <= 64
+                            && scope.bytes().all(|byte| {
+                                byte.is_ascii_alphanumeric() || b"._-:/".contains(&byte)
+                            })
+                    })
+                })
+                || !object
+                    .get("ttl_seconds")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|seconds| (1..=30 * 24 * 60 * 60).contains(&seconds))
+            {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
+        "account_tokens_revoke" => {
+            fields(object, &["token_id"], &[])?;
+            let id = text(object, "token_id")?;
+            if id.len() != 64
+                || !id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
         "list_accounts" => fields(object, &[], &[]),
         "create_account" => {
             fields(object, &["username", "password", "role"], &[])?;
@@ -661,6 +753,88 @@ fn history(action: &str, object: &Object) -> Result<(), &'static str> {
             fields(object, &["session_id"], &[])?;
             let id = text(object, "session_id")?;
             if id.is_empty() || id.len() > 128 || id.chars().any(char::is_control) {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
+        "timeline_open" => {
+            fields(object, &["session_id"], &["sample_limit"])?;
+            let id = text(object, "session_id")?;
+            if id.is_empty()
+                || id.len() > 128
+                || id.chars().any(char::is_control)
+                || object.get("sample_limit").is_some_and(|value| {
+                    !value
+                        .as_u64()
+                        .is_some_and(|limit| (1..=2000).contains(&limit))
+                })
+            {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
+        "timeline_page" => {
+            fields(object, &["session_id", "kind", "cursor"], &["limit"])?;
+            let id = text(object, "session_id")?;
+            if id.is_empty() || id.len() > 128 || id.chars().any(char::is_control) {
+                return Err(INVALID);
+            }
+            let maximum = match text(object, "kind")? {
+                "samples" => 32,
+                "events" => 8,
+                _ => return Err(INVALID),
+            };
+            if object.get("limit").is_some_and(|value| {
+                !value
+                    .as_u64()
+                    .is_some_and(|limit| (1..=maximum).contains(&limit))
+            }) {
+                return Err(INVALID);
+            }
+            let cursor = object
+                .get("cursor")
+                .and_then(Value::as_object)
+                .ok_or(INVALID)?;
+            fields(
+                cursor,
+                &[
+                    "session_id",
+                    "kind",
+                    "first_id",
+                    "last_id",
+                    "after_id",
+                    "total",
+                ],
+                &[],
+            )?;
+            if text(cursor, "session_id")? != id || text(cursor, "kind")? != text(object, "kind")? {
+                return Err(INVALID);
+            }
+            let parse_id = |value: &Value| {
+                value.as_str().and_then(|value| {
+                    if value.is_empty()
+                        || value.len() > 19
+                        || value.starts_with('0')
+                        || !value.bytes().all(|byte| byte.is_ascii_digit())
+                    {
+                        return None;
+                    }
+                    value.parse::<i64>().ok().filter(|id| *id > 0)
+                })
+            };
+            let first = parse_id(cursor.get("first_id").ok_or(INVALID)?).ok_or(INVALID)?;
+            let last = parse_id(cursor.get("last_id").ok_or(INVALID)?).ok_or(INVALID)?;
+            let after = match cursor.get("after_id").ok_or(INVALID)? {
+                Value::Null => None,
+                value => Some(parse_id(value).ok_or(INVALID)?),
+            };
+            if first > last
+                || after.is_some_and(|value| value < first || value >= last)
+                || !cursor
+                    .get("total")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|total| (1..=9_007_199_254_740_991).contains(&total))
+            {
                 return Err(INVALID);
             }
             Ok(())
@@ -1294,6 +1468,14 @@ fn catalog_entry(value: &Value) -> Result<(), &'static str> {
             "description",
             "tags",
             "config_overrides",
+            "display-output",
+            "display_output",
+            "virtual-screen",
+            "virtual_screen",
+            "virtual-display-mode",
+            "virtual_display_mode",
+            "virtual-display-layout",
+            "virtual_display_layout",
             "steam_id",
             "steam_install_dir",
             "exclude_global_prep_cmd",
@@ -1304,6 +1486,50 @@ fn catalog_entry(value: &Value) -> Result<(), &'static str> {
             "prep-cmd",
         ],
     )?;
+    optional_string(entry, "display-output", "display_output")?;
+    optional_boolean(entry, "virtual-screen", "virtual_screen")?;
+    optional_string(entry, "virtual-display-mode", "virtual_display_mode")?;
+    optional_string(entry, "virtual-display-layout", "virtual_display_layout")?;
+    if entry
+        .get("display-output")
+        .or_else(|| entry.get("display_output"))
+        .and_then(Value::as_str)
+        .is_some_and(|value| value.len() > 1024 || value.chars().any(char::is_control))
+        || entry
+            .get("virtual-display-mode")
+            .or_else(|| entry.get("virtual_display_mode"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| !matches!(value, "disabled" | "per_client" | "shared"))
+        || entry
+            .get("virtual-display-layout")
+            .or_else(|| entry.get("virtual_display_layout"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| {
+                !matches!(
+                    value,
+                    "exclusive"
+                        | "extended"
+                        | "extended_primary"
+                        | "extended_isolated"
+                        | "extended_primary_isolated"
+                )
+            })
+    {
+        return Err(INVALID);
+    }
+    let processless = entry
+        .get("launch")
+        .and_then(Value::as_object)
+        .and_then(|launch| launch.get("kind"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| matches!(kind, "desktop" | "playnite_fullscreen"));
+    if processless
+        && ["steam_id", "steam_install_dir"]
+            .into_iter()
+            .any(|field| entry.get(field).is_some_and(|value| !value.is_null()))
+    {
+        return Err(INVALID);
+    }
     if let Some(output) = entry.get("output") {
         match output {
             Value::Null => {}
@@ -1806,14 +2032,29 @@ fn catalog_launch(value: &Value, raw_preparation_count: usize) -> Result<(), &'s
             fields(launch, &["kind", "path"], &[])?;
             text(launch, "path")?;
         }
-        "playnite_fullscreen" => {
-            fields(launch, &["kind", "exit_timeout_seconds"], &[])?;
-            if !launch
+        "playnite_fullscreen" | "desktop" => {
+            fields(
+                launch,
+                &["kind"],
+                &[
+                    "exit_timeout_seconds",
+                    "working_directory",
+                    "working-dir",
+                    "preparation",
+                ],
+            )?;
+            if launch
                 .get("exit_timeout_seconds")
-                .and_then(Value::as_u64)
-                .is_some_and(|timeout| timeout <= 300)
+                .is_some_and(|value| !value.as_u64().is_some_and(|timeout| timeout <= 300))
             {
                 return Err(INVALID);
+            }
+            optional_string(launch, "working_directory", "working-dir")?;
+            if let Some(preparation) = launch.get("preparation") {
+                catalog_preparation(preparation)?;
+                if preparation.as_array().ok_or(INVALID)?.len() + raw_preparation_count > 8 {
+                    return Err(INVALID);
+                }
             }
         }
         "executable" => {
@@ -2116,8 +2357,37 @@ fn steam_exclusions(value: &Value) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn management_launch_identifier(value: &Value) -> bool {
+    value.as_str().is_some_and(|value| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
 fn nvhttp(action: &str, object: &Object) -> Result<(), &'static str> {
     match action {
+        "management_launch_status" => {
+            fields(object, &[], &["reference"])?;
+            if object
+                .get("reference")
+                .is_some_and(|value| !management_launch_identifier(value))
+            {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
+        "management_stop_launch" => {
+            fields(object, &["reference", "revision"], &[])?;
+            if ["reference", "revision"]
+                .iter()
+                .any(|key| !object.get(*key).is_some_and(management_launch_identifier))
+            {
+                return Err(INVALID);
+            }
+            Ok(())
+        }
         "settings_get" => fields(object, &[], &[]),
         "settings_update" => {
             fields(
@@ -3383,9 +3653,14 @@ fn pairing(action: &str, object: &Object) -> Result<(), &'static str> {
             Ok(())
         }
         "unpair" => {
-            fields(object, &["certificate_id"], &[])?;
+            fields(object, &["certificate_id"], &["expected_revision"])?;
             let id = text(object, "certificate_id")?;
-            if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            if id.len() != 64
+                || !id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || object
+                    .get("expected_revision")
+                    .is_some_and(|value| value.as_u64().is_none())
+            {
                 return Err(INVALID);
             }
             Ok(())
@@ -4554,7 +4829,6 @@ mod catalog_tests {
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"executable","program":"/x","exit-timeout":301}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"executable","program":"/x","detached":["bad\ncommand"]}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"playnite","game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab","exit_timeout_seconds":10}}}),
-            serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"playnite_fullscreen"}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"playnite_fullscreen","exit_timeout_seconds":301}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"playnite_fullscreen","exit_timeout_seconds":-1}}}),
             serde_json::json!({"expected_revision":0,"entry":{"name":"x","launch":{"kind":"playnite_fullscreen","exit_timeout_seconds":10,"path":"/forged"}}}),
@@ -4566,6 +4840,41 @@ mod catalog_tests {
                 "accepted malformed catalog editor payload: {value}"
             );
         }
+    }
+
+    #[test]
+    fn desktop_and_fullscreen_entries_preserve_supported_launch_and_display_fields() {
+        for kind in ["desktop", "playnite_fullscreen"] {
+            let mut request = serde_json::json!({"expected_revision":2,"entry":{
+                "name":"Desktop", "display-output":"Virtual-1", "virtual-screen":false,
+                "virtual-display-mode":"per_client", "virtual-display-layout":"extended",
+                "prep_cmd":[{"do":"prepare","undo":"restore"}],
+                "launch":{"kind":kind,"exit_timeout_seconds":30,"working_directory":"/home/player",
+                    "preparation":[{"run":{"executable":"/usr/bin/true"}}]}
+            }});
+            assert!(validate(route("create"), request.as_object().unwrap()).is_ok());
+            request["entry"]["launch"]["program"] = serde_json::json!("/forged");
+            assert!(validate(route("create"), request.as_object().unwrap()).is_err());
+            request["entry"]["launch"]
+                .as_object_mut()
+                .unwrap()
+                .remove("program");
+            request["entry"]["steam_id"] = serde_json::json!("123");
+            assert!(validate(route("create"), request.as_object().unwrap()).is_err());
+        }
+        let aliases = serde_json::json!({"expected_revision":0,"entry":{
+            "name":"Desktop", "display_output":"Display-1", "virtual_screen":true,
+            "virtual_display_mode":"shared", "virtual_display_layout":"exclusive", "launch":{"kind":"desktop"}}});
+        assert!(validate(route("create"), aliases.as_object().unwrap()).is_ok());
+        let mut duplicate = aliases.clone();
+        duplicate["entry"]["display-output"] = serde_json::json!("conflict");
+        assert!(validate(route("create"), duplicate.as_object().unwrap()).is_err());
+        let mut invalid_mode = aliases.clone();
+        invalid_mode["entry"]["virtual_display_mode"] = serde_json::json!("unknown");
+        assert!(validate(route("create"), invalid_mode.as_object().unwrap()).is_err());
+        let mut oversized = aliases;
+        oversized["entry"]["display_output"] = serde_json::json!("x".repeat(1025));
+        assert!(validate(route("create"), oversized.as_object().unwrap()).is_err());
     }
 
     #[test]

@@ -196,7 +196,7 @@ pub(crate) fn asset_response(status: u16, content_type: &str, body: &[u8]) -> Ve
         "Service Unavailable"
     };
     let mut response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'\r\nReferrer-Policy: no-referrer\r\nCross-Origin-Resource-Policy: same-origin\r\n\r\n", body.len()
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'self'; img-src 'self' blob:; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'\r\nReferrer-Policy: no-referrer\r\nCross-Origin-Resource-Policy: same-origin\r\n\r\n", body.len()
     ).into_bytes();
     response.extend_from_slice(body);
     response
@@ -211,6 +211,20 @@ mod tests {
     };
     use ed25519_dalek::{Signer, SigningKey};
     use std::fs;
+
+    #[test]
+    fn artwork_blob_urls_are_allowed_only_for_images() {
+        let response = String::from_utf8(asset_response(200, "text/html", b"fixture")).unwrap();
+        let policy = response
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Security-Policy: "))
+            .unwrap();
+        assert!(policy.contains("img-src 'self' blob:"));
+        assert!(policy.contains("script-src 'self'"));
+        assert!(policy.contains("style-src 'self'"));
+        assert!(policy.contains("object-src 'none'"));
+        assert_eq!(policy.matches("blob:").count(), 1);
+    }
 
     #[test]
     fn approved_ui_is_served_until_revocation_while_recovery_remains_available() {

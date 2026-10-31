@@ -169,6 +169,19 @@ impl Router {
         self.launches.busy()
     }
 
+    pub fn management_launch_status(&self, reference: Option<&str>) -> Value {
+        self.launches.management_status(reference)
+    }
+
+    pub fn management_stop_launch(
+        &mut self,
+        reference: &str,
+        revision: &str,
+        now: Instant,
+    ) -> Value {
+        self.launches.management_stop(reference, revision, now)
+    }
+
     pub fn set_ports(&mut self, http_port: u16, https_port: u16) {
         self.config.http_port = http_port;
         self.config.https_port = https_port;

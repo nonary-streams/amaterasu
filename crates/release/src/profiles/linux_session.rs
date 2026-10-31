@@ -30,10 +30,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Authorization generations are profile-specific and never reused: the
-/// development policy holds 4 and the installer policy 3. Advance this whenever
+/// development policy holds 13 and the installer policy 14. Advance this whenever
 /// the administrator principals or the allowed scopes below
 /// change, including a revert. TTL-only edits do not bump it.
-pub const AUTHORIZATION_POLICY_GENERATION: u64 = 9;
+pub const AUTHORIZATION_POLICY_GENERATION: u64 = 15;
 
 pub const ADMINISTRATOR_PRINCIPALS: [&str; 1] = ["amaterasu.console"];
 pub const PAIRING_ADMINISTRATOR_PRINCIPALS: [&str; 2] =
@@ -41,7 +41,7 @@ pub const PAIRING_ADMINISTRATOR_PRINCIPALS: [&str; 2] =
 
 /// Management scopes without diagnostics; capture scopes authorize the
 /// current user's explicit XDG Desktop Portal source selection.
-pub const ALLOWED_SCOPES: [&str; 19] = [
+pub const ALLOWED_SCOPES: [&str; 21] = [
     "account.self",
     "catalog.read",
     "catalog.write",
@@ -55,6 +55,8 @@ pub const ALLOWED_SCOPES: [&str; 19] = [
     "steam.read",
     "steam.refresh",
     "lutris.read",
+    "host-logs.read",
+    "tokens.manage",
     "pairing.admin",
     "display.read",
     "display.write",
@@ -241,6 +243,7 @@ const LINUX_SESSION_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
 
 const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "amaterasu.host-logs/1",
         "amaterasu.steam/1",
         "amaterasu.host-metrics/1",
         "amaterasu.lutris/1",
@@ -275,6 +278,7 @@ const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.media-transport/1",
         "amaterasu.control-transport/1",
         "amaterasu.session-history/1",
+        "amaterasu.stream-session/1",
     ],
     dependencies: &[
         "amaterasu.steam",

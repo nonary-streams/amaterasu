@@ -1513,3 +1513,129 @@ fn conflicting_video_codec_shapes_fail_before_video_allocation() {
                 && call.payload["action"] == "open")
     );
 }
+
+#[test]
+fn encoder_provider_and_source_identity_reach_video_and_replay_conflicts() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    let mut request = start(id);
+    let config = request["configuration"].as_object_mut().unwrap();
+    config.remove("capture_provider");
+    config.remove("output");
+    config.insert("encoder_provider".into(), json!("fixture"));
+    config.insert("source_id".into(), json!(42));
+    config.insert(
+        "encoder_options".into(),
+        json!({"profile": "test", "nested": [1, true]}),
+    );
+    config.insert(
+        "encoder".into(),
+        json!({"clsid":"source", "friendly_name":"Source", "hardware_url":null}),
+    );
+    let active = host.response(2, request.clone());
+    assert_eq!(active["state"], "active");
+    assert_eq!(active["encoder_provider"], "fixture");
+    assert_eq!(active["source_id"], 42);
+    let open = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Video.service() && call.payload["action"] == "open")
+        .unwrap();
+    assert_eq!(open.payload["source_id"], 42);
+    assert_eq!(open.payload["encoder_provider"], "fixture");
+    assert_eq!(
+        open.payload["encoder_options"],
+        json!({"profile": "test", "nested": [1, true]})
+    );
+    for key in [
+        "capture_provider",
+        "output",
+        "constant_rate",
+        "minimum_fps_target",
+        "wgc_pacing_smoothing",
+    ] {
+        assert!(open.payload.get(key).is_none(), "{key}");
+    }
+    assert_eq!(host.response(3, request.clone())["state"], "active");
+    request["configuration"]["encoder_options"]["profile"] = json!("changed");
+    assert_eq!(host.response(4, request.clone())["code"], "start_conflict");
+    request["configuration"]["source_id"] = json!(43);
+    assert_eq!(host.response(5, request)["code"], "start_conflict");
+    assert_eq!(
+        host.response(6, json!({"action":"stop", "session":id}))["state"],
+        "stopped"
+    );
+}
+
+#[test]
+fn source_capture_options_and_invalid_alias_fail_before_video_open() {
+    for (field, value) in [
+        ("capture_provider", json!("dxgi")),
+        ("output", json!("")),
+        ("constant_rate", json!(false)),
+    ] {
+        let mut host = Harness::new();
+        let id = host.response(1, prepare())["session"].as_u64().unwrap();
+        let mut request = start(id);
+        let config = request["configuration"].as_object_mut().unwrap();
+        config.remove("capture_provider");
+        config.remove("output");
+        config.insert("encoder_provider".into(), json!("fixture"));
+        config.insert("source_id".into(), json!(42));
+        config.insert(
+            "encoder".into(),
+            json!({"clsid":"source", "friendly_name":"Source", "hardware_url":null}),
+        );
+        config.insert(field.into(), value);
+        assert_ne!(host.response(2, request)["ok"], true);
+        assert!(
+            !host
+                .broker
+                .calls
+                .iter()
+                .any(|call| call.service == Resource::Video.service())
+        );
+    }
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    let mut request = start(id);
+    request["configuration"]["encoder_provider"] = json!("invalid/service");
+    assert_eq!(
+        host.response(2, request)["code"],
+        "invalid_encoder_provider"
+    );
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == Resource::Video.service())
+    );
+}
+
+#[test]
+fn encoder_provider_reaches_capture_video_and_failed_open_cleans_up() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    let mut request = start(id);
+    request["configuration"]["encoder_provider"] = json!("foreign");
+    request["configuration"]["encoder_options"] = json!({});
+    host.broker.fail_open = Some("amaterasu.video/1".into());
+    assert_eq!(host.response(2, request)["state"], "failed");
+    let open = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.service == Resource::Video.service() && call.payload["action"] == "open")
+        .unwrap();
+    assert_eq!(open.payload["encoder_provider"], "foreign");
+    assert_eq!(open.payload["encoder_options"], json!({}));
+    assert_eq!(open.payload["capture_provider"], "dxgi");
+    assert!(open.payload.get("source_id").is_none());
+    assert!(
+        !host.pipeline.records[&id]
+            .resources
+            .contains_key(&Resource::Video)
+    );
+}

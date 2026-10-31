@@ -5,8 +5,19 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base64 = "0.22"
+cap-fs-ext = "3.4.5"
+cap-std = "3.4.5"
+getrandom = "0.2"
 libc = "0.2"
+regex.workspace = true
+serde.workspace = true
 serde_json.workspace = true
+zip = { version = "2.4.2", default-features = false, features = ["deflate-flate2", "flate2"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [lints]
 workspace = true

@@ -93,6 +93,14 @@ fn apply_listener_target(
 #[allow(clippy::large_enum_variant)]
 enum Operation {
     Status,
+    ManagementLaunchStatus {
+        #[serde(default)]
+        reference: Option<String>,
+    },
+    ManagementStopLaunch {
+        reference: String,
+        revision: String,
+    },
     SettingsGet,
     SettingsUpdate {
         hostname: String,
@@ -633,6 +641,56 @@ impl NvhttpModule {
                     }
                 };
                 match operation {
+                    Operation::ManagementLaunchStatus { reference } => {
+                        if caller != MANAGEMENT_PRINCIPAL {
+                            return complete_control(
+                                &self.runtime,
+                                id,
+                                json!({"ok":false,"code":"permission_denied"}),
+                            );
+                        }
+                        if reference
+                            .as_deref()
+                            .is_some_and(|value| !management_identifier(value))
+                        {
+                            return complete_control(
+                                &self.runtime,
+                                id,
+                                json!({"ok":false,"code":"invalid_request"}),
+                            );
+                        }
+                        let result = self.router.as_ref().map_or_else(
+                            || json!({"ok":false,"code":"streaming_unavailable"}),
+                            |router| router.management_launch_status(reference.as_deref()),
+                        );
+                        complete_control(&self.runtime, id, result)
+                    }
+                    Operation::ManagementStopLaunch {
+                        reference,
+                        revision,
+                    } => {
+                        if caller != MANAGEMENT_PRINCIPAL {
+                            return complete_control(
+                                &self.runtime,
+                                id,
+                                json!({"ok":false,"code":"permission_denied"}),
+                            );
+                        }
+                        if !management_identifier(&reference) || !management_identifier(&revision) {
+                            return complete_control(
+                                &self.runtime,
+                                id,
+                                json!({"ok":false,"code":"invalid_request"}),
+                            );
+                        }
+                        let result = self.router.as_mut().map_or_else(
+                            || json!({"ok":false,"code":"streaming_unavailable"}),
+                            |router| {
+                                router.management_stop_launch(&reference, &revision, Instant::now())
+                            },
+                        );
+                        complete_control(&self.runtime, id, result)
+                    }
                     Operation::Status => complete_control(
                         &self.runtime,
                         id,
@@ -819,7 +877,9 @@ impl NvhttpModule {
                                     require_listener_apply: self.server.is_some(),
                                 }
                             }
-                            Operation::Status => unreachable!(),
+                            Operation::Status
+                            | Operation::ManagementLaunchStatus { .. }
+                            | Operation::ManagementStopLaunch { .. } => unreachable!(),
                         };
                         if let Err(code) = self.product_settings.enqueue(id, remaining_ms, action) {
                             complete_control(
@@ -836,6 +896,13 @@ impl NvhttpModule {
             _ => Err("nvhttp poll failed".into()),
         }
     }
+}
+
+fn management_identifier(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn complete_control(

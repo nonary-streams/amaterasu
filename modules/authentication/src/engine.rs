@@ -7,6 +7,10 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use subtle::ConstantTimeEq;
 
+// Reserved owner namespace distinguishes browser-issued credentials without
+// changing the persisted token schema used by older package versions.
+const BROWSER_TOKEN_OWNER: &str = "amaterasu.browser-token";
+
 pub enum Change {
     Read(Value),
     ReadProductSettings,
@@ -134,6 +138,23 @@ impl Engine {
         }
         if matches!(operation, Operation::EnrollFirstAdmin { .. })
             && caller != "amaterasu.management"
+        {
+            return Err("forbidden");
+        }
+        if matches!(
+            operation,
+            Operation::AccountTokensList { .. }
+                | Operation::AccountTokensIssue { .. }
+                | Operation::AccountTokensRevoke { .. }
+        ) && (caller != "amaterasu.management"
+            || !self.settings.allowed_scopes.contains("tokens.manage"))
+        {
+            return Err("forbidden");
+        }
+        if matches!(
+            operation,
+            Operation::AccountSessionsList { .. } | Operation::AccountSessionsRevoke { .. }
+        ) && caller != "amaterasu.management"
         {
             return Err("forbidden");
         }
@@ -381,6 +402,10 @@ impl Engine {
                     Ok(Change::Read(json!({"ok":true})))
                 }
             }
+            Operation::AccountSessionsList { bearer } => self.account_sessions_list(&bearer, now),
+            Operation::AccountSessionsRevoke { bearer, session_id } => {
+                self.account_session_revoke(&bearer, &session_id, now, &scope_digest)
+            }
             Operation::Login {
                 username,
                 password,
@@ -426,6 +451,39 @@ impl Engine {
             } => self.issue_token(document, caller, scopes, ttl_seconds, now),
             Operation::RevokeToken { token_id } => {
                 Self::revoke_token(document, legacy_api_tokens, caller, token_id)
+            }
+            Operation::AccountTokensList { bearer } => {
+                self.require_token_management_session(&bearer, now)?;
+                Ok(Change::Read(
+                    json!({"ok":true,"tokens": document.tokens.iter()
+                    .filter(|token| token.owner == BROWSER_TOKEN_OWNER && self.token_is_active(token, now))
+                    .collect::<Vec<_>>() }),
+                ))
+            }
+            Operation::AccountTokensIssue {
+                bearer,
+                scopes,
+                ttl_seconds,
+            } => {
+                self.require_token_management_session(&bearer, now)?;
+                let session = self.active_session(&bearer, now)?;
+                self.authorize_scopes(&session.scopes, &scopes)?;
+                self.issue_token(document, BROWSER_TOKEN_OWNER, scopes, ttl_seconds, now)
+            }
+            Operation::AccountTokensRevoke { bearer, token_id } => {
+                self.require_token_management_session(&bearer, now)?;
+                let mut document = document;
+                if !document
+                    .tokens
+                    .iter()
+                    .any(|token| token.owner == BROWSER_TOKEN_OWNER && token.token_id == token_id)
+                {
+                    return Err("token_not_found");
+                }
+                document.tokens.retain(|token| {
+                    token.owner != BROWSER_TOKEN_OWNER || token.token_id != token_id
+                });
+                Self::write(document, json!({"ok":true}))
             }
             Operation::ListTokens {} => Ok(Change::Read(json!({
                 "ok":true,
@@ -491,6 +549,18 @@ impl Engine {
             .get(&crypto::token_digest(bearer))
             .filter(|s| s.expires_at > now)
             .ok_or("unauthorized")
+    }
+
+    fn require_token_management_session(&self, bearer: &str, now: u64) -> Result<(), &'static str> {
+        self.require_admin_session(bearer, now)?;
+        if !self
+            .active_session(bearer, now)?
+            .scopes
+            .contains("tokens.manage")
+        {
+            return Err("forbidden");
+        }
+        Ok(())
     }
 
     fn require_admin_session(&self, bearer: &str, now: u64) -> Result<(), &'static str> {
@@ -562,6 +632,57 @@ impl Engine {
             response: json!({"ok":true}),
             invalidate_sessions: true,
         })
+    }
+
+    fn account_sessions_list(&self, bearer: &str, now: u64) -> Result<Change, &'static str> {
+        let current = self.require_session_management(bearer, now)?;
+        let sessions = self
+            .sessions
+            .values()
+            .map(|session| {
+                json!({
+                    "session_id": session.ownership_context_id,
+                    "subject": session.subject,
+                    "expires_at": session.expires_at,
+                    "refresh_expires_at": session.refresh_expires_at,
+                    "remember_me": session.remember_me,
+                    "current": session.ownership_context_id == current.ownership_context_id,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(Change::Read(json!({"ok":true,"sessions":sessions})))
+    }
+
+    fn account_session_revoke(
+        &mut self,
+        bearer: &str,
+        target: &str,
+        now: u64,
+        scope_digest: &str,
+    ) -> Result<Change, &'static str> {
+        let current = self.require_session_management(bearer, now)?;
+        if current.ownership_context_id == target {
+            return Err("current_session");
+        }
+        let access_id = self
+            .sessions
+            .iter()
+            .find_map(|(id, session)| (session.ownership_context_id == target).then(|| id.clone()));
+        if let Some(access_id) = access_id {
+            self.remove_session(&access_id);
+            self.write_sessions(json!({"ok":true,"revoked":true}), scope_digest)
+        } else {
+            Ok(Change::Read(json!({"ok":true,"revoked":false})))
+        }
+    }
+
+    fn require_session_management(&self, bearer: &str, now: u64) -> Result<&Session, &'static str> {
+        self.require_admin_session(bearer, now)?;
+        let session = self.active_session(bearer, now)?;
+        if !session.scopes.contains("configuration.write") {
+            return Err("forbidden");
+        }
+        Ok(session)
     }
 
     fn list_sessions(&self, offset: usize, limit: usize) -> Result<Change, &'static str> {
@@ -924,7 +1045,7 @@ impl Engine {
     fn issue_token(
         &self,
         mut document: Document,
-        caller: &str,
+        owner: &str,
         scopes: BTreeSet<String>,
         ttl_seconds: u64,
         now: u64,
@@ -944,7 +1065,7 @@ impl Engine {
         let response = json!({"ok":true,"bearer":bearer,"token_id":token_id,"scopes":scopes,"expires_at":expires_at});
         document.tokens.push(ApiToken {
             token_id,
-            owner: caller.into(),
+            owner: owner.into(),
             policy_generation: Some(self.settings.authorization_policy_generation),
             scopes,
             issued_at: now,
@@ -1006,10 +1127,13 @@ impl Engine {
     fn token_is_active(&self, token: &ApiToken, now: u64) -> bool {
         token.expires_at > now
             && token.policy_generation == Some(self.settings.authorization_policy_generation)
-            && self
-                .settings
-                .administrator_principals
-                .contains(&token.owner)
+            && if token.owner == BROWSER_TOKEN_OWNER {
+                self.settings.allowed_scopes.contains("tokens.manage")
+            } else {
+                self.settings
+                    .administrator_principals
+                    .contains(&token.owner)
+            }
     }
 
     fn write(document: Document, response: Value) -> Result<Change, &'static str> {

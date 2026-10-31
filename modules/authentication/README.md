@@ -46,7 +46,7 @@ session is bound to the generation at login; the first later auth request under
 a different generation durably prunes the old session before processing the
 request. A new login uses the current bootstrap scopes and generation. Newly
 issued API tokens also bind to that generation and their issuing administrator
-principal. Changing and later restoring the policy revokes those tokens across
+principal or reserved browser-token owner. Changing and later restoring the policy revokes those tokens across
 module restarts. API token records written before this binding have no
 generation; they remain readable as state but fail verification on upgrade.
 Issue new tokens after upgrading if older tokens must be replaced. The scope
@@ -74,6 +74,12 @@ The management runtime principal need not be an authentication administrator.
 Its account and settings requests carry the user's verified bearer, which auth
 checks again. `legacy_verifier_principals` narrowly authorizes legacy request
 verification; it does not authorize setup, token issuance or account management.
+
+Account session administration is a separate management-only path requiring a
+live administrator bearer with `configuration.write`. It lists bounded session
+metadata with a stable identifier retained across refresh, and refuses to
+revoke the caller's current session. It does not expose bearer or refresh
+secrets. A missing target is reported without claiming a new revocation.
 
 The following strict JSON actions include:
 
@@ -103,10 +109,16 @@ before issuing tokens. TTL edits affect subsequently issued tokens but do not
 extend an existing session's absolute refresh expiry; refresh rotation also
 retains that original expiry. Setup succeeds only once. A caller
 can list/revoke only tokens that caller issued; missing and foreign token IDs
-both return `token_not_found`. An administrator login does not grant its frontend
-runtime principal permission to administer credentials or tokens. API token
-issuance requires initialized credentials but is authorized by the configured
-runtime principal, without password or bearer substitution.
+both return `token_not_found`. Those native actions are authorized by the
+configured runtime principal without a bearer. Separate browser token actions
+require the immediate `amaterasu.management` caller, a live administrator
+session and the `tokens.manage` policy scope. The session's scopes bound each
+new token. Browser-issued tokens use a reserved owner namespace, retain the
+existing persisted schema, and remain distinct from native and legacy tokens.
+Removing `tokens.manage` disables browser-issued tokens; advance the policy
+generation on every scope change to prevent later reactivation. Upgrading a
+generated policy to add this scope advances the generation and revokes sessions
+and tokens issued under the prior generation.
 
 `change_password` requires an initialized credential and the same 12–256-byte
 password bounds as setup; it is an administrator reset operation and does not

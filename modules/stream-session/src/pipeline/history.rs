@@ -119,9 +119,12 @@ impl SessionHistory {
             .saturating_add(observed_video_sequence_gaps);
     }
 
-    #[cfg(test)]
     pub(super) fn observed_counters(&self) -> (u64, u64, u64) {
         (self.frames_sent, self.bytes_sent, self.dropped_frames)
+    }
+
+    pub(super) fn live_identity(&self) -> (&str, Option<i64>) {
+        (&self.session_id, self.started_at_unix)
     }
 
     pub(super) fn sample_if_due(&mut self, now: u64) {

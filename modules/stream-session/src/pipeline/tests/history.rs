@@ -3,6 +3,86 @@ use super::*;
 const HISTORY_SERVICE: &str = "amaterasu.session-history/1";
 
 #[test]
+fn management_live_status_is_scoped_and_independent_of_recording() {
+    let mut host = Harness::new();
+    host.broker.history_available = false;
+    let action = json!({"action":"management_live_sessions"});
+    assert_eq!(
+        host.response_from(1, "owner", action.clone())["code"],
+        "permission_denied"
+    );
+    assert!(host.pipeline.live_status_epoch.is_none());
+    let initial = host.response_from(2, "amaterasu.management", action.clone());
+    assert_eq!(initial["epoch"].as_str().unwrap().len(), 32);
+    assert!(initial["sessions"].as_array().unwrap().is_empty());
+    let session = prepare_and_start(&mut host);
+    {
+        let mut plane = host.plane.borrow_mut();
+        plane.accepted_video_access_units = 12;
+        plane.accepted_media_payload_bytes = 3456;
+        plane.observed_video_sequence_gaps = 2;
+    }
+    host.tick();
+    let result = host.response_from(3, "amaterasu.management", action.clone());
+    assert_eq!(result["epoch"], initial["epoch"]);
+    let streams = result["sessions"].as_array().unwrap();
+    assert_eq!(streams.len(), 1);
+    let stream = &streams[0];
+    assert_eq!(
+        stream["session_id"],
+        format!("stream-session-{session:016x}")
+    );
+    assert_eq!(stream["frames_sent"], "12");
+    assert_eq!(stream["bytes_sent"], "3456");
+    assert_eq!(stream["sequence_gaps"], "2");
+    assert!(stream["started_at_unix"].is_i64());
+    assert!(
+        result["sampled_at_ms"]
+            .as_str()
+            .unwrap()
+            .parse::<u64>()
+            .is_ok()
+    );
+    assert!(
+        result["sampled_at_unix_ms"]
+            .as_str()
+            .unwrap()
+            .parse::<i64>()
+            .is_ok()
+    );
+    for private in [
+        "owner",
+        "key_hex",
+        "peer_ip",
+        "control_local",
+        "operation_id",
+    ] {
+        assert!(stream.get(private).is_none());
+    }
+    assert_eq!(
+        host.response_from(4, "other", action.clone())["code"],
+        "permission_denied"
+    );
+    assert_eq!(
+        host.response(5, json!({"action":"stop","session":session}))["state"],
+        "stopped"
+    );
+    assert!(
+        host.response_from(6, "amaterasu.management", action)["sessions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let mut restarted = Harness::new();
+    let fresh = restarted.response_from(
+        1,
+        "amaterasu.management",
+        json!({"action":"management_live_sessions"}),
+    );
+    assert_ne!(fresh["epoch"], initial["epoch"]);
+}
+
+#[test]
 fn reserved_activity_binds_signed_prepare_and_history_session_id() {
     let mut host = Harness::new();
     host.broker.history_available = true;

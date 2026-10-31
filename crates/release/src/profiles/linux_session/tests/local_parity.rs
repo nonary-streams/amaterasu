@@ -127,6 +127,11 @@ fn every_call_targets_a_provider_the_caller_depends_on() {
     for caller in COMPONENTS {
         let closure = dependency_closure(caller.id);
         for service in caller.calls {
+            // This service is supplied by the host, not by a loadable component.
+            if *service == "amaterasu.host-logs/1" {
+                assert_eq!(caller.id, "amaterasu.management");
+                continue;
+            }
             let provider = providers
                 .get(service)
                 .unwrap_or_else(|| panic!("{} calls absent service {service}", caller.id));
@@ -818,6 +823,8 @@ fn authorization_generation_is_bumped_with_principals_and_scopes() {
         "steam.read",
         "steam.refresh",
         "lutris.read",
+        "host-logs.read",
+        "tokens.manage",
         "pairing.admin",
         "display.read",
         "display.write",
@@ -840,7 +847,7 @@ fn authorization_generation_is_bumped_with_principals_and_scopes() {
         json!(["amaterasu.console", "amaterasu.management"])
     );
     assert_eq!(authentication["allowed_scopes"], json!(pinned_scopes));
-    assert_eq!(authentication["authorization_policy_generation"], 9);
+    assert_eq!(authentication["authorization_policy_generation"], 15);
 
     // Generations are profile-specific and never reused.
     let development_root = TemporaryRoot::new("generation-development");

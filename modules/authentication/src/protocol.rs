@@ -146,6 +146,13 @@ pub enum Operation {
     RevokeSession {
         session_id: String,
     },
+    AccountSessionsList {
+        bearer: String,
+    },
+    AccountSessionsRevoke {
+        bearer: String,
+        session_id: String,
+    },
     Login {
         username: String,
         password: String,
@@ -175,6 +182,18 @@ pub enum Operation {
         token_id: String,
     },
     ListTokens {},
+    AccountTokensList {
+        bearer: String,
+    },
+    AccountTokensIssue {
+        bearer: String,
+        scopes: BTreeSet<String>,
+        ttl_seconds: u64,
+    },
+    AccountTokensRevoke {
+        bearer: String,
+        token_id: String,
+    },
 }
 
 impl Operation {
@@ -250,6 +269,10 @@ impl Operation {
             Self::ChangePassword { password } => (12..=256).contains(&password.len()),
             Self::ListSessions { limit, .. } => (1..=4).contains(limit),
             Self::RevokeSession { session_id } => valid_digest(session_id),
+            Self::AccountSessionsList { bearer } => valid_bearer(bearer),
+            Self::AccountSessionsRevoke { bearer, session_id } => {
+                valid_bearer(bearer) && valid_digest(session_id)
+            }
             Self::Login {
                 username, password, ..
             } => identifier(username, 64) && (1..=256).contains(&password.len()),
@@ -282,6 +305,20 @@ impl Operation {
             }
             Self::RevokeToken { token_id } => valid_digest(token_id),
             Self::ListTokens {} => true,
+            Self::AccountTokensList { bearer } => valid_bearer(bearer),
+            Self::AccountTokensIssue {
+                bearer,
+                scopes,
+                ttl_seconds,
+            } => {
+                valid_bearer(bearer)
+                    && !scopes.is_empty()
+                    && valid_scopes(scopes)
+                    && (1..=MAX_TOKEN_SECONDS).contains(ttl_seconds)
+            }
+            Self::AccountTokensRevoke { bearer, token_id } => {
+                valid_bearer(bearer) && valid_digest(token_id)
+            }
         };
         if valid {
             Ok(())

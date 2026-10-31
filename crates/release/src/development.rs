@@ -526,8 +526,18 @@ fn install_existing_installer_root(
             production_authorization_upgrade(&current, &candidate);
         let (upgraded_host, host_result) =
             production_host_configuration_upgrade(&current, &candidate);
-        let has_upgrade = upgraded_auth.is_some() || upgraded_host.is_some() || tls.is_some();
+        let upgraded_management = production_management_log_grant_upgrade(&current, &candidate);
+        let has_upgrade = upgraded_auth.is_some()
+            || upgraded_host.is_some()
+            || upgraded_management.is_some()
+            || tls.is_some();
         let mut upgraded = upgraded_auth.unwrap_or_else(|| current.clone());
+        if let Some(grants) = upgraded_management {
+            upgraded
+                .policy
+                .principals
+                .insert("amaterasu.management".into(), grants);
+        }
         if let Some(grants) = upgraded_host {
             upgraded
                 .policy
@@ -668,6 +678,30 @@ fn production_host_configuration_upgrade(
     )
 }
 
+// Only add the host-owned log grant when the installed management grant is
+// exactly the generated one with that single capability absent. A customized
+// grant, or a candidate offering any other change, is left untouched.
+fn production_management_log_grant_upgrade(
+    current: &BootstrapConfig,
+    candidate: &BootstrapConfig,
+) -> Option<Grants> {
+    let name = "amaterasu.management";
+    let expected = installer_policy(WEB_DIRECTORY_TOKEN, current.trusted_keys.clone())
+        .principals
+        .remove(name)?;
+    let mut previous = expected.clone();
+    if !previous.call.remove(amaterasu_contracts::HOST_LOG_SERVICE) {
+        return None;
+    }
+    let same = |actual: Option<&Grants>, expected: &Grants| {
+        actual.and_then(|grant| serde_json::to_value(grant).ok())
+            == serde_json::to_value(expected).ok()
+    };
+    (same(current.policy.principals.get(name), &previous)
+        && same(candidate.policy.principals.get(name), &expected))
+    .then_some(expected)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ProductionAuthorizationResult {
     Upgraded,
@@ -727,9 +761,23 @@ fn production_authorization_upgrade(
         .as_array_mut()
         .expect("historical installer scopes are an array")
         .insert(11, serde_json::json!("lutris.read"));
+    let mut previous_host_logs = expected_current.clone();
+    previous_host_logs["authorization_policy_generation"] = serde_json::json!(11);
+    previous_host_logs["allowed_scopes"]
+        .as_array_mut()
+        .expect("historical installer scopes are an array")
+        .insert(12, serde_json::json!("host-logs.read"));
+    let mut expected_new = previous_host_logs.clone();
+    expected_new["authorization_policy_generation"] = serde_json::json!(14);
+    expected_new["allowed_scopes"]
+        .as_array_mut()
+        .expect("historical installer scopes are an array")
+        .insert(13, serde_json::json!("tokens.manage"));
     let installed = current.policy.settings.get(name);
     let offered = candidate.policy.settings.get(name);
-    if installed == Some(&previous) && generated == expected_current && offered == Some(&generated)
+    if matches!(installed, Some(value) if value == &previous || value == &expected_current || value == &previous_host_logs)
+        && generated == expected_new
+        && offered == Some(&generated)
     {
         let mut upgraded = current.clone();
         upgraded.policy.settings.insert(name.into(), generated);
@@ -1389,7 +1437,9 @@ mod provision_tests {
         auth["allowed_scopes"]
             .as_array_mut()
             .unwrap()
-            .retain(|scope| scope != "lutris.read");
+            .retain(|scope| {
+                scope != "lutris.read" && scope != "host-logs.read" && scope != "tokens.manage"
+            });
         bootstrap
             .policy
             .principals
@@ -1627,7 +1677,7 @@ mod provision_tests {
         );
         assert_eq!(
             after.policy.settings["amaterasu.authentication"]["authorization_policy_generation"],
-            3
+            14
         );
         assert!(
             after.policy.settings["amaterasu.authentication"]["allowed_scopes"]
@@ -1659,6 +1709,100 @@ mod provision_tests {
             selection_bytes
         );
         assert!(!runtime.join(POLICY_TRANSITION_JOURNAL).exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn generation_three_authentication_upgrade_adds_host_log_scope() {
+        let root = fixture("host-log-auth-upgrade");
+        let artifacts = root.join("artifacts");
+        write_artifacts(&artifacts);
+        let seed = prepare_seed(&root, &artifacts, &SigningKey::from_bytes(&[28; 32]));
+        let runtime = legacy_production_runtime(&root, &seed);
+        let mut current: BootstrapConfig = read_json(&runtime.join("bootstrap.json")).unwrap();
+        let mut candidate = current.clone();
+        candidate.policy.settings.insert(
+            "amaterasu.authentication".into(),
+            installer_policy(WEB_DIRECTORY_TOKEN, current.trusted_keys.clone()).settings["amaterasu.authentication"].clone(),
+        );
+        current.policy.settings.insert(
+            "amaterasu.authentication".into(),
+            candidate.policy.settings["amaterasu.authentication"].clone(),
+        );
+        let auth = current
+            .policy
+            .settings
+            .get_mut("amaterasu.authentication")
+            .unwrap();
+        auth["authorization_policy_generation"] = serde_json::json!(3);
+        auth["allowed_scopes"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|scope| scope != "host-logs.read" && scope != "tokens.manage");
+        let (upgraded, result) = production_authorization_upgrade(&current, &candidate);
+        assert_eq!(result, ProductionAuthorizationResult::Upgraded);
+        let upgraded = upgraded.unwrap();
+        assert_eq!(
+            upgraded.policy.settings["amaterasu.authentication"],
+            candidate.policy.settings["amaterasu.authentication"]
+        );
+        current.policy.settings.insert(
+            "amaterasu.authentication".into(),
+            candidate.policy.settings["amaterasu.authentication"].clone(),
+        );
+        let previous_logs = current
+            .policy
+            .settings
+            .get_mut("amaterasu.authentication")
+            .unwrap();
+        previous_logs["authorization_policy_generation"] = serde_json::json!(11);
+        previous_logs["allowed_scopes"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|scope| scope != "tokens.manage");
+        assert_eq!(
+            production_authorization_upgrade(&current, &candidate).1,
+            ProductionAuthorizationResult::Upgraded
+        );
+        current
+            .policy
+            .settings
+            .get_mut("amaterasu.authentication")
+            .unwrap()["session_token_ttl_seconds"] = serde_json::json!(1234);
+        assert!(
+            production_authorization_upgrade(&current, &candidate)
+                .0
+                .is_none()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn host_log_upgrade_requires_exact_generated_management_grants() {
+        let root = fixture("host-log-grant-upgrade");
+        let artifacts = root.join("artifacts");
+        write_artifacts(&artifacts);
+        let seed = prepare_seed(&root, &artifacts, &SigningKey::from_bytes(&[27; 32]));
+        let runtime = legacy_production_runtime(&root, &seed);
+        let mut current: BootstrapConfig = read_json(&runtime.join("bootstrap.json")).unwrap();
+        let candidate = current.clone();
+        current
+            .policy
+            .principals
+            .get_mut("amaterasu.management")
+            .unwrap()
+            .call
+            .remove(amaterasu_contracts::HOST_LOG_SERVICE);
+        let upgrade = production_management_log_grant_upgrade(&current, &candidate).unwrap();
+        assert!(upgrade.call.contains(amaterasu_contracts::HOST_LOG_SERVICE));
+        current
+            .policy
+            .principals
+            .get_mut("amaterasu.management")
+            .unwrap()
+            .call
+            .remove("amaterasu.steam/1");
+        assert!(production_management_log_grant_upgrade(&current, &candidate).is_none());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1767,7 +1911,7 @@ mod provision_tests {
         );
         assert_eq!(
             after.policy.settings["amaterasu.authentication"]["authorization_policy_generation"],
-            3
+            14
         );
         let _ = fs::remove_dir_all(root);
     }

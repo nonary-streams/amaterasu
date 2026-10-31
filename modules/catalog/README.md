@@ -140,7 +140,9 @@ never reused. They are not portable provider IDs or globally unique UUIDs.
 {"action":"search","query":"arcade","limit":10}
 ```
 
-`update` replaces all entry metadata; description and tags default to empty.
+`update` replaces entry metadata; description and tags default to empty. A trusted
+provider artwork reference is retained when the launch target and Steam identity
+remain unchanged. Callers cannot supply their own provider artwork reference.
 Arguments default to empty; working_directory defaults to null. All three
 mutations require `expected_revision`, referring to the **whole caller catalog**.
 Each successful mutation advances it once. Missing IDs return `not_found`.
@@ -164,7 +166,8 @@ List and search return `ok`, `revision`, `entries:[{"id":...,"entry":...}]`, and
 on the next request, preserving the search query. Cursors contain revision,
 last ID and normalized query; changes to the catalog invalidate them. Results
 are ordered by stable ID. Search performs Unicode lowercase substring matching
-on names, descriptions and tags; no fuzzy matching, ranking or Unicode
+on names, descriptions, tags, launch targets, output, and linked source details;
+no fuzzy matching, ranking or Unicode
 normalization. Search requires 1–160 printable UTF-8 bytes. Page size defaults to
 20 and must be 1–32. Encoded result rows are also capped at 12,000 bytes, so a
 page can contain fewer entries than requested. Search examines at most 256

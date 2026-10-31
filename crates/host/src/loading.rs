@@ -4,9 +4,10 @@ use amaterasu_abi::{
     Status,
 };
 use amaterasu_contracts::{
-    Command, HOST_LIFECYCLE_CONTROL_PRINCIPAL, HostLifecycleAction, HostLogEvent, Response,
+    Command, HOST_LIFECYCLE_CONTROL_PRINCIPAL, HOST_LOG_SERVICE, HostLifecycleAction, HostLogEvent,
+    Response,
 };
-use amaterasu_logging::{LoggerError, ProductLogger};
+use amaterasu_logging::{HostLogService, LoggerError, ProductLogger};
 use amaterasu_package::{PackageResult, VerifiedPackage, ordered_components};
 use libloading::Library;
 use serde_json::json;
@@ -61,6 +62,8 @@ pub struct LoadedComponents {
     // Fields drop in declaration order: modules must stop before their runtime disappears.
     modules: Vec<FeatureLibrary>,
     product_logger: Option<ProductLogger>,
+    host_log_service: Option<HostLogService>,
+    host_logs_enabled: bool,
     pending_log_policy: Option<HostLogEvent>,
     lifecycle_endpoint: HostApi,
     runtime: RuntimeLibrary,
@@ -132,6 +135,10 @@ impl LoadedComponents {
                 .and_then(|path| path_to_unicode_string(&path));
             inject_steam_artwork_cache_parent(&mut runtime_config, cache_parent.ok().as_deref())?;
         }
+        let host_logs_enabled = runtime_config
+            .principals
+            .get("amaterasu.management")
+            .is_some_and(|grants| grants.call.contains(HOST_LOG_SERVICE));
         let configuration =
             serde_json::to_vec(&runtime_config).map_err(|error| error.to_string())?;
         let mut runtime =
@@ -142,6 +149,7 @@ impl LoadedComponents {
             runtime,
             product_logger,
             lifecycle_endpoint,
+            host_logs_enabled,
             components
                 .into_iter()
                 .filter(|component| !component.runtime),
@@ -157,6 +165,7 @@ impl LoadedComponents {
         runtime: RuntimeLibrary,
         product_logger: Option<ProductLogger>,
         lifecycle_endpoint: HostApi,
+        host_logs_enabled: bool,
         components: impl IntoIterator<Item = Component>,
         mut load: impl FnMut(&mut RuntimeLibrary, Component) -> PackageResult<FeatureLibrary>,
         progress: &mut dyn FnMut(usize) -> PackageResult<()>,
@@ -166,6 +175,8 @@ impl LoadedComponents {
         let mut loaded = Self {
             modules: Vec::new(),
             product_logger,
+            host_log_service: None,
+            host_logs_enabled,
             pending_log_policy: None,
             lifecycle_endpoint,
             runtime,
@@ -184,6 +195,7 @@ impl LoadedComponents {
             module.tick()?;
         }
         self.drain_log_events();
+        self.service_host_logs();
         Ok(())
     }
 
@@ -277,6 +289,68 @@ impl LoadedComponents {
             }
         }
         self.pending_log_policy = pending_policy;
+    }
+
+    /// Route a bounded number of host-log requests without performing disk I/O
+    /// on the host tick. RequestRouter enforces ownership and deadlines.
+    fn service_host_logs(&mut self) {
+        if !self.host_logs_enabled {
+            return;
+        }
+        for _ in 0..4 {
+            let result = self
+                .host_log_service
+                .as_ref()
+                .and_then(|service| service.try_complete().ok())
+                .flatten();
+            let Some((request, payload)) = result else {
+                break;
+            };
+            let _ = self.host_control(Command::Complete { request, payload });
+        }
+        for _ in 0..4 {
+            let Some(Response::Request {
+                id,
+                caller,
+                service,
+                payload,
+                ..
+            }) = self.host_control(Command::Poll {})
+            else {
+                break;
+            };
+            if service != HOST_LOG_SERVICE || caller != "amaterasu.management" {
+                let _ = self.host_control(Command::Complete {
+                    request: id,
+                    payload: json!({"ok":false,"code":"permission_denied"}),
+                });
+                continue;
+            }
+            if self.host_log_service.is_none() {
+                self.host_log_service = self
+                    .product_logger
+                    .as_ref()
+                    .and_then(|logger| HostLogService::start(logger.clone()).ok());
+            }
+            let submitted = self
+                .host_log_service
+                .as_ref()
+                .is_some_and(|handler| handler.submit(id, payload).is_ok());
+            if !submitted {
+                let _ = self.host_control(Command::Complete {
+                    request: id,
+                    payload: json!({"ok":false,"code":"log_unavailable"}),
+                });
+            }
+        }
+    }
+
+    fn host_control(&self, command: Command) -> Option<Response> {
+        let input = serde_json::to_vec(&command).ok()?;
+        // SAFETY: the private endpoint belongs to the live runtime and copies
+        // its bounded response before returning; LoadedComponents owns both.
+        let output = unsafe { self.lifecycle_endpoint.call(&input) }.ok()?;
+        serde_json::from_slice(&output).ok()
     }
 
     pub fn health(&self) -> PackageResult<()> {

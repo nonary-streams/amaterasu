@@ -8,6 +8,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod timeline;
+
 const SCHEMA_VERSION: i64 = 3;
 const SECONDS_PER_DAY: i64 = 86_400;
 const PRUNE_INTERVAL_SECONDS: i64 = 3_600;
@@ -29,6 +31,7 @@ pub enum HistoryError {
     NotFound,
     ActiveSession,
     RecordingDisabled,
+    HistoryChanged,
 }
 
 pub struct SessionPage {
@@ -968,6 +971,10 @@ fn apply_schema(connection: &mut Connection) -> Result<(), HistoryError> {
          ON events (session_id, recorded_at_unix, id);",
     )?;
     migrate_nullable_encode_latency(connection)?;
+    connection.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_samples_session_id ON samples (session_id, id);
+         CREATE INDEX IF NOT EXISTS idx_events_session_id ON events (session_id, id);",
+    )?;
     connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -1346,6 +1353,180 @@ mod tests {
 
     fn configure(store: &mut HistoryStore, settings: HistorySettings, now_unix: i64) {
         store.apply_configuration(settings, now_unix).unwrap();
+    }
+
+    #[test]
+    fn timeline_pages_pin_admission_order_and_detect_pruned_rows() {
+        use crate::model::{TimelineCursor, TimelineKind};
+        let database = TemporaryDatabase::new();
+        let mut store = HistoryStore::open(&database.path(), 1).unwrap();
+        configure(&mut store, HistorySettings::default(), 1);
+        store.begin_session_at(&metadata("timeline"), 1, 1).unwrap();
+        store.begin_session_at(&metadata("other"), 1, 1).unwrap();
+        for index in 0..70 {
+            store
+                .record_sample(&SessionSample {
+                    session_id: "timeline".into(),
+                    recorded_at_unix: 100 - index,
+                    frames_sent: index as u64,
+                    bytes_sent: index as u64 * 10,
+                    dropped_frames: 0,
+                    actual_fps: 60.0,
+                    actual_bitrate_kbps: 1000.0,
+                    encode_latency_ms: None,
+                })
+                .unwrap();
+            if index % 10 == 0 {
+                store
+                    .record_sample(&SessionSample {
+                        session_id: "other".into(),
+                        recorded_at_unix: 100,
+                        frames_sent: 1,
+                        bytes_sent: 10,
+                        dropped_frames: 0,
+                        actual_fps: 1.0,
+                        actual_bitrate_kbps: 1.0,
+                        encode_latency_ms: None,
+                    })
+                    .unwrap();
+            }
+        }
+        for index in 0..12 {
+            store
+                .record_event(&event(
+                    "timeline",
+                    index,
+                    json!({"index":index,"data":"x".repeat(4000)}),
+                ))
+                .unwrap();
+        }
+        let opened = store.timeline_open("timeline", None).unwrap();
+        assert_eq!(opened["samples"]["total"], 70);
+        assert_eq!(opened["events"]["total"], 13);
+        let recent = store.timeline_open("timeline", Some(7)).unwrap();
+        assert_eq!(recent["samples"]["total"], 7);
+        assert_eq!(recent["events"]["total"], 13);
+        assert_eq!(
+            store.timeline_open("timeline", Some(2000)).unwrap()["samples"]["total"],
+            70
+        );
+        let recent_cursor: TimelineCursor =
+            serde_json::from_value(recent["samples"]["cursor"].clone()).unwrap();
+        let recent_page = store
+            .timeline_page("timeline", TimelineKind::Samples, recent_cursor, None)
+            .unwrap();
+        assert_eq!(recent_page["entries"].as_array().unwrap().len(), 7);
+        let ids = recent_page["entry_ids"].as_array().unwrap();
+        assert_eq!(ids.len(), 7);
+        assert!(
+            ids.windows(2)
+                .all(|pair| pair[0].as_str().unwrap().parse::<i64>().unwrap()
+                    < pair[1].as_str().unwrap().parse::<i64>().unwrap())
+        );
+        assert_eq!(recent_page["entries"][0]["recorded_at_unix"], 37);
+        assert_eq!(recent_page["entries"][6]["recorded_at_unix"], 31);
+        assert!(recent_page["next_cursor"].is_null());
+        assert!(matches!(
+            store.timeline_open("timeline", Some(0)),
+            Err(HistoryError::Invalid(_))
+        ));
+        assert!(matches!(
+            store.timeline_open("timeline", Some(2001)),
+            Err(HistoryError::Invalid(_))
+        ));
+        let mut sample_cursor: TimelineCursor =
+            serde_json::from_value(opened["samples"]["cursor"].clone()).unwrap();
+        let first = store
+            .timeline_page(
+                "timeline",
+                TimelineKind::Samples,
+                sample_cursor.clone(),
+                Some(32),
+            )
+            .unwrap();
+        assert_eq!(first["entries"].as_array().unwrap().len(), 32);
+        assert_eq!(first["entries"][0]["recorded_at_unix"], 100);
+        sample_cursor = serde_json::from_value(first["next_cursor"].clone()).unwrap();
+        // Later appends remain outside this snapshot, including for an active stream.
+        store
+            .record_sample(&SessionSample {
+                session_id: "timeline".into(),
+                recorded_at_unix: 200,
+                frames_sent: 70,
+                bytes_sent: 700,
+                dropped_frames: 0,
+                actual_fps: 60.0,
+                actual_bitrate_kbps: 1000.0,
+                encode_latency_ms: None,
+            })
+            .unwrap();
+        let mut samples = 32;
+        loop {
+            let page = store
+                .timeline_page("timeline", TimelineKind::Samples, sample_cursor, Some(32))
+                .unwrap();
+            assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_DETAIL_RESPONSE_BYTES);
+            samples += page["entries"].as_array().unwrap().len();
+            if page["next_cursor"].is_null() {
+                break;
+            }
+            sample_cursor = serde_json::from_value(page["next_cursor"].clone()).unwrap();
+        }
+        assert_eq!(samples, 70);
+        let mut cursor: TimelineCursor =
+            serde_json::from_value(opened["events"]["cursor"].clone()).unwrap();
+        let mut events = 0;
+        loop {
+            let page = store
+                .timeline_page("timeline", TimelineKind::Events, cursor, Some(8))
+                .unwrap();
+            assert!(serde_json::to_vec(&page).unwrap().len() <= MAX_DETAIL_RESPONSE_BYTES);
+            events += page["entries"].as_array().unwrap().len();
+            if page["next_cursor"].is_null() {
+                break;
+            }
+            cursor = serde_json::from_value(page["next_cursor"].clone()).unwrap();
+        }
+        assert_eq!(events, 13);
+        let cursor: TimelineCursor =
+            serde_json::from_value(opened["samples"]["cursor"].clone()).unwrap();
+        let foreign_id: i64 = store
+            .connection
+            .query_row(
+                "SELECT min(id) FROM samples WHERE session_id = 'other'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut foreign_cursor = cursor.clone();
+        foreign_cursor.after_id = Some(foreign_id.to_string());
+        assert!(matches!(
+            store.timeline_page("timeline", TimelineKind::Samples, foreign_cursor, None),
+            Err(HistoryError::Invalid(_))
+        ));
+        let mut wrong_session = cursor.clone();
+        wrong_session.session_id = "other".to_owned();
+        assert!(matches!(
+            store.timeline_page("timeline", TimelineKind::Samples, wrong_session, None),
+            Err(HistoryError::Invalid(_))
+        ));
+        let mut wrong_kind = cursor.clone();
+        wrong_kind.kind = TimelineKind::Events;
+        assert!(matches!(
+            store.timeline_page("timeline", TimelineKind::Samples, wrong_kind, None),
+            Err(HistoryError::Invalid(_))
+        ));
+        store
+            .connection
+            .execute(
+                "DELETE FROM samples WHERE session_id = ?1 AND id = ?2",
+                params!["timeline", cursor.first_id.parse::<i64>().unwrap()],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.timeline_page("timeline", TimelineKind::Samples, cursor, None),
+            Err(HistoryError::HistoryChanged)
+        ));
     }
 
     #[test]
