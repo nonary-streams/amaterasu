@@ -586,6 +586,25 @@ fn nested_finalize_plan_refresh_checks_exact_owner_and_request() {
         coordinator.verify_provider("owner", &verification(&forged_observation))["status"],
         "rejected"
     );
+    let refresh = json!({"operation_id":"observe-refresh", "target":stream,
+        "provider_request":observed_request, "domains":[{"domain":"domain","revision":2,"borrowers":{}}], "resources":[]});
+    let mut forged_refresh = refresh.clone();
+    forged_refresh["provider_request"]["provider_sequence"] = json!(10);
+    assert!(
+        coordinator
+            .refresh_provider_observations(
+                "owner",
+                "owner",
+                forged_refresh,
+                "forged-observe".into()
+            )
+            .is_err()
+    );
+    assert!(
+        coordinator
+            .refresh_provider_observations("owner", "owner", refresh, "exact-observe".into())
+            .is_ok()
+    );
     save(&coordinator.shared, original.clone()).unwrap();
     let mut root_request = plan_request.clone();
     root_request["dependency_inputs"] = json!([output]);
