@@ -266,6 +266,18 @@ resource identity under fresh owner authorization. It never replays an unknown
 preparation. Missing receipts, uncertain native effects, or unconfirmed retirement
 remain `recovery_required`; that state is not successful restoration.
 
+The planned `lookup_control_baseline` operation lets only the selected
+virtual-screen owner read an owner-acknowledged original configure settlement
+while its baseline remains pinned. The request contains `operation`,
+`session_target`, `resource_generation`, the full authenticated `root_output`,
+`operation_id`, and `request_digest`. The digest is lowercase SHA-256 over
+`serde_json::to_vec` of the original typed `ResourceControlRequest`. A matching
+response contains `session_target`, `target`, `root_output`,
+`resource_generation`, and `settlement` with its `request`, `output`, and
+`settlement_id`; other requests receive a generic rejection. The serialized
+response is limited to 16 KiB. This read-only lookup grants no effect authority;
+the endpoint and its integrated recovery path require qualification.
+
 A failed or rejected preparation callback does not establish that its effects
 were absent or cleaned up. Its admission remains held for recovery. A known
 partial preparation cannot currently settle as a clean failure; that requires
