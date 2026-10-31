@@ -10,12 +10,18 @@ use crate::requests::IncomingRequest;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
+
+pub mod speaker_pcm;
+pub mod steam_attributes;
 
 pub const SERVICE: &str = "amaterasu.input-extension/1";
 pub const MAX_ROUTES: usize = 32;
 pub const MAX_CAPABILITIES: usize = 32;
 pub const MAX_PAYLOAD_BYTES: usize = 2048;
 pub const MAX_REQUEST_BYTES: usize = 16_384;
+pub const MAX_PENDING_SAMPLES: usize = 32;
+pub const MAX_SAMPLE_AGE_MS: u64 = 1_000;
 
 fn valid_name(value: &str) -> bool {
     !value.is_empty()
@@ -92,6 +98,12 @@ pub struct RoutePolicy {
     pub provider_offer: BTreeSet<Capability>,
     pub adapter_offer: BTreeSet<Capability>,
     pub required: BTreeSet<Capability>,
+    /// Capabilities using a bounded latest-value lane and their local age limit.
+    /// All other capabilities use strict, synchronous control ordering.
+    pub sampled: BTreeMap<Capability, u64>,
+    /// Successful terminal controls fence these sampled capabilities until the
+    /// route is retired and recreated with a fresh generation.
+    pub terminal: BTreeMap<Capability, BTreeSet<Capability>>,
     pub to_device: Vec<Principal>,
     pub to_client: Vec<Principal>,
 }
@@ -101,7 +113,8 @@ pub struct RoutePolicy {
 pub struct Message {
     pub route: Route,
     pub capability: Capability,
-    /// Strictly increasing per route and direction; first accepted value is 1.
+    /// Controls are contiguous per direction from 1. Sampled messages increase
+    /// per capability and may have gaps. Neither number proves remote delivery.
     pub sequence: u64,
     pub payload: Vec<u8>,
 }
@@ -144,6 +157,8 @@ pub enum SubmitError {
 pub trait Endpoint {
     /// Actual provider implementation support; declarations alone are insufficient.
     fn supports(&self, capability: &Capability) -> bool;
+    /// Validate schema-specific payload before admission or queue replacement.
+    fn validate(&self, message: &Message) -> Result<(), &'static str>;
     fn submit(&mut self, message: &Message) -> Result<(), SubmitError>;
 }
 
@@ -153,6 +168,29 @@ struct ActiveRoute {
     to_client: Vec<Principal>,
     device_sequence: u64,
     client_sequence: u64,
+    sampled: BTreeMap<Capability, SamplePolicy>,
+    terminal: BTreeMap<Capability, BTreeSet<Capability>>,
+    stopped: BTreeSet<Capability>,
+}
+
+struct SamplePolicy {
+    max_age: Duration,
+    last_sequence: u64,
+}
+
+struct PendingSample {
+    message: Message,
+    expires: Instant,
+}
+
+/// Result of attempting to flush one local latest-value slot.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SampleDrain {
+    Empty,
+    Expired,
+    Busy,
+    Rejected,
+    Accepted,
 }
 
 /// Adapter for an independently built provider. It validates routing before the
@@ -161,6 +199,7 @@ pub struct ExtensionAdapter<E> {
     endpoint: E,
     routes: BTreeMap<Route, ActiveRoute>,
     generations: BTreeMap<(String, String, String, String), u64>,
+    samples: BTreeMap<(Route, Capability), PendingSample>,
 }
 
 impl<E: Endpoint> ExtensionAdapter<E> {
@@ -169,6 +208,7 @@ impl<E: Endpoint> ExtensionAdapter<E> {
             endpoint,
             routes: BTreeMap::new(),
             generations: BTreeMap::new(),
+            samples: BTreeMap::new(),
         };
         for policy in policies {
             adapter.install(policy)?;
@@ -214,6 +254,26 @@ impl<E: Endpoint> ExtensionAdapter<E> {
         if !policy.required.is_subset(&capabilities) {
             return Err("required_capability_unavailable");
         }
+        if policy.sampled.len() > MAX_CAPABILITIES
+            || policy.sampled.iter().any(|(capability, age)| {
+                !capabilities.contains(capability) || !(1..=MAX_SAMPLE_AGE_MS).contains(age)
+            })
+        {
+            return Err("invalid_sample_policy");
+        }
+        if policy.terminal.len() > MAX_CAPABILITIES
+            || policy.terminal.iter().any(|(control, samples)| {
+                !capabilities.contains(control)
+                    || policy.sampled.contains_key(control)
+                    || samples.is_empty()
+                    || samples.len() > MAX_CAPABILITIES
+                    || samples
+                        .iter()
+                        .any(|sample| !policy.sampled.contains_key(sample))
+            })
+        {
+            return Err("invalid_terminal_policy");
+        }
         let key = (
             policy.route.host_epoch.clone(),
             policy.route.session.clone(),
@@ -246,6 +306,21 @@ impl<E: Endpoint> ExtensionAdapter<E> {
             to_client: policy.to_client,
             device_sequence: 0,
             client_sequence: 0,
+            sampled: policy
+                .sampled
+                .into_iter()
+                .map(|(cap, age)| {
+                    (
+                        cap,
+                        SamplePolicy {
+                            max_age: Duration::from_millis(age),
+                            last_sequence: 0,
+                        },
+                    )
+                })
+                .collect(),
+            terminal: policy.terminal,
+            stopped: BTreeSet::new(),
         };
         self.generations.insert(key, policy.route.generation);
         self.routes.insert(policy.route, active);
@@ -255,6 +330,8 @@ impl<E: Endpoint> ExtensionAdapter<E> {
     /// Fence future submissions before retiring endpoint-owned device resources.
     /// This does not cancel work already admitted by the endpoint.
     pub fn retire(&mut self, route: &Route) -> bool {
+        self.samples
+            .retain(|(sample_route, _), _| sample_route != route);
         self.routes.remove(route).is_some()
     }
 
@@ -262,14 +339,27 @@ impl<E: Endpoint> ExtensionAdapter<E> {
         &self.endpoint
     }
 
+    pub fn pending_sample_count(&self) -> usize {
+        self.samples.len()
+    }
+
     pub fn dispatch(&mut self, request: &IncomingRequest<Value>) -> Value {
-        match self.submit(request) {
+        self.dispatch_at(request, Instant::now())
+    }
+
+    /// The caller must use a monotonic clock and serialize this with retirement.
+    pub fn dispatch_at(&mut self, request: &IncomingRequest<Value>, now: Instant) -> Value {
+        match self.submit(request, now) {
             Ok(()) => json!({"ok": true, "accepted": true}),
             Err(code) => json!({"ok": false, "error": {"code": code}}),
         }
     }
 
-    fn submit(&mut self, request: &IncomingRequest<Value>) -> Result<(), &'static str> {
+    fn submit(
+        &mut self,
+        request: &IncomingRequest<Value>,
+        now: Instant,
+    ) -> Result<(), &'static str> {
         if request.service != SERVICE || request.remaining_ms == 0 {
             return Err("invalid_request");
         }
@@ -284,9 +374,9 @@ impl<E: Endpoint> ExtensionAdapter<E> {
             return Err("invalid_request");
         }
         let route = self.routes.get_mut(&message.route).ok_or("unauthorized")?;
-        let (principals, sequence) = match message.capability.direction {
-            Direction::ToDevice => (&route.to_device, &mut route.device_sequence),
-            Direction::ToClient => (&route.to_client, &mut route.client_sequence),
+        let principals = match message.capability.direction {
+            Direction::ToDevice => &route.to_device,
+            Direction::ToClient => &route.to_client,
         };
         if !principals
             .iter()
@@ -297,16 +387,79 @@ impl<E: Endpoint> ExtensionAdapter<E> {
         if !route.capabilities.contains(&message.capability) {
             return Err("unsupported_capability");
         }
+        self.endpoint
+            .validate(&message)
+            .map_err(|_| "invalid_payload")?;
+        if let Some(sample) = route.sampled.get_mut(&message.capability) {
+            if route.stopped.contains(&message.capability) {
+                return Err("stream_stopped");
+            }
+            if message.sequence <= sample.last_sequence {
+                return Err("invalid_sequence");
+            }
+            self.samples.retain(|_, pending| now < pending.expires);
+            let key = (message.route.clone(), message.capability.clone());
+            if !self.samples.contains_key(&key) && self.samples.len() >= MAX_PENDING_SAMPLES {
+                return Err("busy");
+            }
+            let expires = now.checked_add(sample.max_age).ok_or("invalid_request")?;
+            sample.last_sequence = message.sequence;
+            self.samples.insert(key, PendingSample { message, expires });
+            return Ok(());
+        }
+        let sequence = match message.capability.direction {
+            Direction::ToDevice => &mut route.device_sequence,
+            Direction::ToClient => &mut route.client_sequence,
+        };
         if sequence.checked_add(1) != Some(message.sequence) {
             return Err("invalid_sequence");
         }
         match self.endpoint.submit(&message) {
             Ok(()) => {
                 *sequence = message.sequence;
+                if let Some(samples) = route.terminal.get(&message.capability) {
+                    for sample in samples {
+                        route.stopped.insert(sample.clone());
+                        self.samples
+                            .remove(&(message.route.clone(), sample.clone()));
+                    }
+                }
                 Ok(())
             }
             Err(SubmitError::Busy) => Err("busy"),
             Err(SubmitError::Rejected) => Err("rejected"),
         }
     }
+
+    /// Drain exactly one route/capability slot. Busy retains it until expiry;
+    /// rejection discards it. Retirement removes it before another drain.
+    pub fn drain_sample_at(
+        &mut self,
+        route: &Route,
+        capability: &Capability,
+        now: Instant,
+    ) -> SampleDrain {
+        let key = (route.clone(), capability.clone());
+        let Some(pending) = self.samples.get(&key) else {
+            return SampleDrain::Empty;
+        };
+        if now >= pending.expires {
+            self.samples.remove(&key);
+            return SampleDrain::Expired;
+        }
+        match self.endpoint.submit(&pending.message) {
+            Ok(()) => {
+                self.samples.remove(&key);
+                SampleDrain::Accepted
+            }
+            Err(SubmitError::Busy) => SampleDrain::Busy,
+            Err(SubmitError::Rejected) => {
+                self.samples.remove(&key);
+                SampleDrain::Rejected
+            }
+        }
+    }
 }
+
+#[cfg(test)]
+mod tests;

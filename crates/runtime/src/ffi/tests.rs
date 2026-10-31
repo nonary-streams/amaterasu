@@ -171,6 +171,9 @@ fn input_extension_sdk_client_and_provider_round_trip_over_ffi_broker() {
                 && capability.version == 1
                 && capability.direction == Direction::ToDevice
         }
+        fn validate(&self, _message: &Message) -> Result<(), &'static str> {
+            Ok(())
+        }
         fn submit(&mut self, message: &Message) -> Result<(), SubmitError> {
             self.0 = message.payload.clone();
             Ok(())
@@ -232,6 +235,8 @@ fn input_extension_sdk_client_and_provider_round_trip_over_ffi_broker() {
                 provider_offer: offer,
                 adapter_offer: [capability.clone()].into(),
                 required: [capability.clone()].into(),
+                sampled: Default::default(),
+                terminal: Default::default(),
                 to_device: vec![Principal {
                     caller: "adapter".into(),
                     initiator: "adapter".into(),

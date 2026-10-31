@@ -19,6 +19,9 @@ impl Endpoint for FakeEndpoint {
     fn supports(&self, capability: &Capability) -> bool {
         *capability == attributes() || *capability == speaker()
     }
+    fn validate(&self, _message: &Message) -> Result<(), &'static str> {
+        Ok(())
+    }
     fn submit(&mut self, message: &Message) -> Result<(), SubmitError> {
         if self.busy || self.messages.len() == 4 {
             return Err(SubmitError::Busy);
@@ -33,6 +36,9 @@ struct OtherEndpoint(Vec<Message>);
 impl Endpoint for OtherEndpoint {
     fn supports(&self, capability: &Capability) -> bool {
         *capability == attributes() || *capability == speaker()
+    }
+    fn validate(&self, _message: &Message) -> Result<(), &'static str> {
+        Ok(())
     }
     fn submit(&mut self, message: &Message) -> Result<(), SubmitError> {
         if self.0.len() == 4 {
@@ -78,6 +84,8 @@ fn policy() -> RoutePolicy {
         provider_offer: offer.clone(),
         adapter_offer: offer.clone(),
         required: offer,
+        sampled: Default::default(),
+        terminal: Default::default(),
         to_device: vec![principal("protocol")],
         to_client: vec![principal("feedback")],
     }
@@ -392,4 +400,490 @@ fn input_extension_retirement_requires_fresh_generation_and_negotiation() {
         adapter.install(unimplemented),
         Err("provider_capability_unavailable")
     );
+}
+
+mod sampled_tests {
+    use super::*;
+    use amaterasu_module_sdk::input::extensions::{SampleDrain, speaker_pcm, steam_attributes};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+        time::{Duration, Instant},
+    };
+
+    fn control_capability() -> Capability {
+        capability("example.controller.control", Direction::ToClient)
+    }
+    fn terminal_capability() -> Capability {
+        capability("example.controller.stop", Direction::ToClient)
+    }
+    fn validate_schema(message: &Message) -> Result<(), &'static str> {
+        if message.capability == steam_attributes::capability() {
+            steam_attributes::Attributes::decode(&message.payload).map(|_| ())
+        } else if message.capability == speaker_pcm::capability() {
+            speaker_pcm::Block::decode(&message.payload).map(|_| ())
+        } else if (message.capability == control_capability()
+            || message.capability == terminal_capability())
+            && message.payload.is_empty()
+        {
+            Ok(())
+        } else {
+            Err("unsupported")
+        }
+    }
+    #[derive(Default, Clone)]
+    struct Trace {
+        busy_audio: Rc<Cell<bool>>,
+        busy_terminal: Rc<Cell<bool>>,
+        messages: Rc<RefCell<Vec<Message>>>,
+    }
+    struct ProviderA(Trace);
+    struct ProviderB(Trace);
+    impl Endpoint for ProviderA {
+        fn supports(&self, capability: &Capability) -> bool {
+            *capability == steam_attributes::capability()
+                || *capability == speaker_pcm::capability()
+                || *capability == control_capability()
+                || *capability == terminal_capability()
+        }
+        fn validate(&self, message: &Message) -> Result<(), &'static str> {
+            validate_schema(message)
+        }
+        fn submit(&mut self, message: &Message) -> Result<(), SubmitError> {
+            if message.capability == terminal_capability() && self.0.busy_terminal.get() {
+                return Err(SubmitError::Busy);
+            }
+            if message.capability == speaker_pcm::capability() && self.0.busy_audio.get() {
+                return Err(SubmitError::Busy);
+            }
+            let mut messages = self.0.messages.borrow_mut();
+            if messages.len() >= 16 {
+                return Err(SubmitError::Busy);
+            }
+            messages.push(message.clone());
+            Ok(())
+        }
+    }
+    impl Endpoint for ProviderB {
+        fn supports(&self, capability: &Capability) -> bool {
+            [
+                steam_attributes::capability(),
+                speaker_pcm::capability(),
+                control_capability(),
+                terminal_capability(),
+            ]
+            .contains(capability)
+        }
+        fn validate(&self, message: &Message) -> Result<(), &'static str> {
+            if message.capability == steam_attributes::capability() {
+                steam_attributes::Attributes::decode(&message.payload)?
+                    .encode()
+                    .map(|_| ())
+            } else if message.capability == speaker_pcm::capability() {
+                speaker_pcm::Block::decode(&message.payload)?
+                    .encode()
+                    .map(|_| ())
+            } else if [control_capability(), terminal_capability()].contains(&message.capability)
+                && message.payload.is_empty()
+            {
+                Ok(())
+            } else {
+                Err("unsupported")
+            }
+        }
+        fn submit(&mut self, message: &Message) -> Result<(), SubmitError> {
+            if message.capability == terminal_capability() && self.0.busy_terminal.get() {
+                return Err(SubmitError::Busy);
+            }
+            let payload = if message.capability == speaker_pcm::capability() {
+                if self.0.busy_audio.get() {
+                    return Err(SubmitError::Busy);
+                }
+                speaker_pcm::Block::decode(&message.payload)
+                    .map_err(|_| SubmitError::Rejected)?
+                    .encode()
+                    .map_err(|_| SubmitError::Rejected)?
+            } else if message.capability == steam_attributes::capability() {
+                steam_attributes::Attributes::decode(&message.payload)
+                    .map_err(|_| SubmitError::Rejected)?
+                    .encode()
+                    .map_err(|_| SubmitError::Rejected)?
+            } else {
+                message.payload.clone()
+            };
+            if self.0.messages.borrow().len() >= 16 {
+                return Err(SubmitError::Busy);
+            }
+            let mut copy = message.clone();
+            copy.payload = payload;
+            self.0.messages.borrow_mut().push(copy);
+            Ok(())
+        }
+    }
+
+    fn policy_for(route: Route, feedback_caller: &str) -> RoutePolicy {
+        let capabilities = [
+            steam_attributes::capability(),
+            speaker_pcm::capability(),
+            control_capability(),
+            terminal_capability(),
+        ]
+        .into();
+        RoutePolicy {
+            route,
+            provider_offer: capabilities,
+            adapter_offer: [
+                steam_attributes::capability(),
+                speaker_pcm::capability(),
+                control_capability(),
+                terminal_capability(),
+            ]
+            .into(),
+            required: [steam_attributes::capability(), speaker_pcm::capability()].into(),
+            sampled: [(speaker_pcm::capability(), 50)].into(),
+            terminal: [(terminal_capability(), [speaker_pcm::capability()].into())].into(),
+            to_device: vec![principal("protocol")],
+            to_client: vec![principal(feedback_caller)],
+        }
+    }
+    fn attribute_payload() -> Vec<u8> {
+        steam_attributes::Attributes {
+            transport: 2,
+            valid_mask: 0xff,
+            firmware_build_time: 1234,
+            bootloader_build_time: 5,
+            board_revision: 6,
+            capabilities: 7,
+            radio_firmware_build_time: 8,
+            dongle_firmware_build_time: 9,
+            build_id: *b"build-id-1234567",
+            unit_serial: *b"unit-serial-1234",
+            board_serial: *b"board-serial-123",
+        }
+        .encode()
+        .unwrap()
+    }
+    fn sample_payload(source_sequence: u32) -> Vec<u8> {
+        speaker_pcm::Block {
+            owner: 9,
+            generation: 8,
+            sequence: source_sequence,
+            sample_position: u64::from(source_sequence) * u64::from(speaker_pcm::FRAMES),
+            flags: if source_sequence == 0 {
+                speaker_pcm::START
+            } else {
+                0
+            },
+            samples: [source_sequence as u8; speaker_pcm::SAMPLE_BYTES],
+        }
+        .encode()
+        .unwrap()
+    }
+    fn exercise<E: Endpoint>(endpoint: E, trace: Trace, provider: &str) {
+        let mut route_b = route();
+        route_b.source = "client-b".into();
+        let mut adapter = ExtensionAdapter::new(
+            endpoint,
+            vec![
+                policy_for(route(), "feedback"),
+                policy_for(route_b.clone(), "intruder"),
+            ],
+        )
+        .unwrap();
+        let mut broker = broker(provider);
+        let attrs = Message {
+            route: route(),
+            capability: steam_attributes::capability(),
+            sequence: 1,
+            payload: attribute_payload(),
+        };
+        assert_eq!(
+            call(
+                &mut broker,
+                &mut adapter,
+                provider,
+                "protocol",
+                attrs.clone(),
+                "attrs"
+            )["ok"],
+            true
+        );
+        let mut malformed = attrs.clone();
+        malformed.sequence = 2;
+        malformed.payload.pop();
+        assert_eq!(
+            call(
+                &mut broker,
+                &mut adapter,
+                provider,
+                "protocol",
+                malformed,
+                "bad-attrs"
+            )["error"]["code"],
+            "invalid_payload"
+        );
+        let mut oversized = attrs.clone();
+        oversized.sequence = 2;
+        oversized.payload = vec![0; MAX_PAYLOAD_BYTES + 1];
+        assert_eq!(
+            call(
+                &mut broker,
+                &mut adapter,
+                provider,
+                "protocol",
+                oversized,
+                "large"
+            )["error"]["code"],
+            "invalid_request"
+        );
+        let sample = |source: Route, seq: u64, value: u32| Message {
+            route: source,
+            capability: speaker_pcm::capability(),
+            sequence: seq,
+            payload: sample_payload(value),
+        };
+        assert_eq!(
+            call(
+                &mut broker,
+                &mut adapter,
+                provider,
+                "intruder",
+                sample(route(), 1, 0),
+                "wrong-source"
+            )["error"]["code"],
+            "unauthorized"
+        );
+        let mut malformed = sample(route(), 1, 0);
+        malformed.payload[0..8].fill(0);
+        assert_eq!(
+            call(
+                &mut broker,
+                &mut adapter,
+                provider,
+                "feedback",
+                malformed,
+                "bad-sample"
+            )["error"]["code"],
+            "invalid_payload"
+        );
+        let mut unsupported = sample(route(), 1, 0);
+        unsupported.capability.version = 2;
+        assert_eq!(
+            call(
+                &mut broker,
+                &mut adapter,
+                provider,
+                "feedback",
+                unsupported,
+                "unsupported"
+            )["error"]["code"],
+            "unsupported_capability"
+        );
+        trace.busy_audio.set(true);
+        assert_eq!(
+            call(
+                &mut broker,
+                &mut adapter,
+                provider,
+                "feedback",
+                sample(route(), 1, 0),
+                "sample-a1"
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            adapter.drain_sample_at(&route(), &speaker_pcm::capability(), Instant::now()),
+            SampleDrain::Busy
+        );
+        for seq in 2..=12 {
+            assert_eq!(
+                call(
+                    &mut broker,
+                    &mut adapter,
+                    provider,
+                    "feedback",
+                    sample(route(), seq, (seq - 1) as u32),
+                    &format!("sample-a{seq}")
+                )["ok"],
+                true
+            );
+        }
+        assert_eq!(
+            call(
+                &mut broker,
+                &mut adapter,
+                provider,
+                "intruder",
+                sample(route_b.clone(), 1, 22),
+                "sample-b"
+            )["ok"],
+            true
+        );
+        assert_eq!(adapter.pending_sample_count(), 2);
+        // Strict control in the same direction remains independent of sample pressure.
+        let control = |sequence| Message {
+            route: route(),
+            capability: control_capability(),
+            sequence,
+            payload: vec![],
+        };
+        assert_eq!(
+            call(
+                &mut broker,
+                &mut adapter,
+                provider,
+                "feedback",
+                control(1),
+                "control-1"
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            call(
+                &mut broker,
+                &mut adapter,
+                provider,
+                "feedback",
+                control(3),
+                "control-gap"
+            )["error"]["code"],
+            "invalid_sequence"
+        );
+        assert_eq!(
+            call(
+                &mut broker,
+                &mut adapter,
+                provider,
+                "feedback",
+                control(2),
+                "control-2"
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            call(
+                &mut broker,
+                &mut adapter,
+                provider,
+                "feedback",
+                sample(route(), 12, 11),
+                "sample-replay"
+            )["error"]["code"],
+            "invalid_sequence"
+        );
+        trace.busy_audio.set(false);
+        assert_eq!(
+            adapter.drain_sample_at(&route(), &speaker_pcm::capability(), Instant::now()),
+            SampleDrain::Accepted
+        );
+        let recorded = trace.messages.borrow();
+        let last = speaker_pcm::Block::decode(&recorded.last().unwrap().payload).unwrap();
+        assert_eq!(last.sequence, 11);
+        assert_eq!(last.sample_position, 11 * 240);
+        drop(recorded);
+        assert_eq!(
+            call(
+                &mut broker,
+                &mut adapter,
+                provider,
+                "feedback",
+                sample(route(), 13, 12),
+                "sample-a13"
+            )["ok"],
+            true
+        );
+        let terminal = Message {
+            route: route(),
+            capability: terminal_capability(),
+            sequence: 3,
+            payload: vec![],
+        };
+        trace.busy_terminal.set(true);
+        assert_eq!(
+            call(
+                &mut broker,
+                &mut adapter,
+                provider,
+                "feedback",
+                terminal.clone(),
+                "terminal-busy"
+            )["error"]["code"],
+            "busy"
+        );
+        assert_eq!(adapter.pending_sample_count(), 2);
+        trace.busy_terminal.set(false);
+        assert_eq!(
+            call(
+                &mut broker,
+                &mut adapter,
+                provider,
+                "feedback",
+                terminal,
+                "terminal"
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            adapter.drain_sample_at(&route(), &speaker_pcm::capability(), Instant::now()),
+            SampleDrain::Empty
+        );
+        assert_eq!(
+            call(
+                &mut broker,
+                &mut adapter,
+                provider,
+                "feedback",
+                sample(route(), 14, 13),
+                "after-terminal"
+            )["error"]["code"],
+            "stream_stopped"
+        );
+        assert_eq!(adapter.pending_sample_count(), 1);
+        assert_eq!(
+            adapter.drain_sample_at(
+                &route_b,
+                &speaker_pcm::capability(),
+                Instant::now() + Duration::from_secs(1)
+            ),
+            SampleDrain::Expired
+        );
+        assert_eq!(
+            call(
+                &mut broker,
+                &mut adapter,
+                provider,
+                "intruder",
+                sample(route_b.clone(), 2, 23),
+                "sample-b2"
+            )["ok"],
+            true
+        );
+        assert!(adapter.retire(&route_b));
+        assert_eq!(
+            adapter.drain_sample_at(&route_b, &speaker_pcm::capability(), Instant::now()),
+            SampleDrain::Empty
+        );
+        let mut next = route_b.clone();
+        next.generation += 1;
+        adapter.install(policy_for(next, "intruder")).unwrap();
+        assert_eq!(
+            call(
+                &mut broker,
+                &mut adapter,
+                provider,
+                "intruder",
+                sample(route_b, 3, 24),
+                "stale-b"
+            )["error"]["code"],
+            "unauthorized"
+        );
+    }
+
+    #[test]
+    fn sampled_schemas_and_isolation_survive_broker_provider_replacement() {
+        let trace = Trace::default();
+        exercise(ProviderA(trace.clone()), trace, "sample-provider-a");
+        let trace = Trace::default();
+        exercise(ProviderB(trace.clone()), trace, "sample-provider-b");
+    }
 }
