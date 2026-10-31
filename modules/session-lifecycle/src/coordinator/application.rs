@@ -25,6 +25,7 @@ pub(super) enum ApplicationRetirementProof {
         service: String,
         request_operation_id: String,
         broker_request: u64,
+        result_request: u64,
         request_payload: Value,
         response: Value,
     },
@@ -56,12 +57,15 @@ pub(super) fn valid_retirement_proof(session: &SessionRecord, target: &Lifecycle
             no_launch,
             service,
             request_operation_id,
-            broker_request: _,
+            broker_request,
+            result_request,
             request_payload,
             response,
         }) => {
             proof_target == target
                 && service == "amaterasu.launch/1"
+                && *broker_request > 0
+                && broker_request == result_request
                 && valid_id(request_operation_id)
                 && request_operation_id.starts_with("retirement-")
                 && *request_payload == retirement_payload(binding, *no_launch)
@@ -93,7 +97,7 @@ pub(super) struct ApplicationJob {
     target: LifecycleTarget,
     binding: ApplicationBinding,
     request: Option<u64>,
-    result: Option<Value>,
+    result: Option<(u64, Value)>,
     query_id: String,
     deadline: Instant,
     no_launch: bool,
@@ -237,19 +241,21 @@ impl Coordinator {
         let keys: Vec<_> = self.application_jobs.keys().take(8).cloned().collect();
         for key in keys {
             let mut job = self.application_jobs.remove(&key).unwrap();
-            if let Some(result) = job.result.take() {
-                if let Some(id) = job.request {
-                    match send(Command::ReleaseResult { request: id }) {
+            if let Some((result_request, result)) = job.result.take() {
+                if job.request == Some(result_request) {
+                    match send(Command::ReleaseResult {
+                        request: result_request,
+                    }) {
                         Ok(Response::Ok) => {}
                         Ok(Response::Error { code, .. }) if code == "not_found" => {}
                         _ => {
-                            job.result = Some(result);
+                            job.result = Some((result_request, result));
                             self.application_jobs.insert(key, job);
                             continue;
                         }
                     }
                 }
-                self.finish_application(&job, Some(result))?;
+                self.finish_application(&job, Some((result_request, result)))?;
                 continue;
             }
             if Instant::now() >= job.deadline {
@@ -257,8 +263,8 @@ impl Coordinator {
                 if let Some(id) = job.request {
                     let _ = send(Command::Cancel { request: id });
                 }
-                if job.request.is_some() {
-                    job.result = Some(Value::Null);
+                if let Some(id) = job.request {
+                    job.result = Some((id, Value::Null));
                     self.application_jobs.insert(key, job);
                 } else {
                     self.finish_application(&job, None)?;
@@ -268,9 +274,9 @@ impl Coordinator {
             if let Some(id) = job.request {
                 match send(Command::TakeResult { request: id }) {
                     Ok(Response::Pending) => {}
-                    Ok(Response::Result { payload }) => job.result = Some(payload),
+                    Ok(Response::Result { payload }) => job.result = Some((id, payload)),
                     _ => {
-                        job.result = Some(Value::Null);
+                        job.result = Some((id, Value::Null));
                     }
                 }
             } else {
@@ -295,16 +301,21 @@ impl Coordinator {
         Ok(())
     }
 
-    fn finish_application(&self, job: &ApplicationJob, result: Option<Value>) -> ModuleResult<()> {
+    fn finish_application(
+        &self,
+        job: &ApplicationJob,
+        result: Option<(u64, Value)>,
+    ) -> ModuleResult<()> {
         let mut next = self.shared.borrow().value.clone();
         let (_, session_id, stream, generation) = super::operations::target_parts(&job.target)?;
         if stream.is_some() {
             return Err("session_target_required".into());
         }
         let session = next.sessions.get_mut(session_id).ok_or("unknown_session")?;
-        let valid = job.request.is_some()
-            && result.as_ref().is_some_and(|r| {
-                r["ok"] == true
+        let valid = job.request.is_some_and(|id| id > 0)
+            && result.as_ref().is_some_and(|(result_id, r)| {
+                Some(*result_id) == job.request
+                    && r["ok"] == true
                     && r["retired"] == true
                     && r["owner"] == job.binding.owner
                     && if job.no_launch {
@@ -334,8 +345,9 @@ impl Coordinator {
                 service: "amaterasu.launch/1".into(),
                 request_operation_id: format!("retirement-{}", job.query_id),
                 broker_request: job.request.expect("validated broker request"),
+                result_request: result.as_ref().expect("validated response").0,
                 request_payload: retirement_payload(&job.binding, job.no_launch),
-                response: result.clone().expect("validated response"),
+                response: result.clone().expect("validated response").1,
             });
             if !valid_retirement_proof(session, &job.target) {
                 return Err("invalid_application_retirement_proof".into());
@@ -501,6 +513,31 @@ mod tests {
             panic!("missing launch proof");
         }
         assert!(validate_journal(&altered).is_err());
+        let mut missing_request = stored.clone();
+        if let Some(ApplicationRetirementProof::Launch { broker_request, .. }) =
+            &mut missing_request
+                .sessions
+                .get_mut("session")
+                .unwrap()
+                .application_retirement_proof
+        {
+            *broker_request = 0;
+        } else {
+            panic!("missing launch proof");
+        }
+        assert!(validate_journal(&missing_request).is_err());
+        let mut wrong_result = stored.clone();
+        if let Some(ApplicationRetirementProof::Launch { result_request, .. }) = &mut wrong_result
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .application_retirement_proof
+        {
+            *result_request += 1;
+        } else {
+            panic!("missing launch proof");
+        }
+        assert!(validate_journal(&wrong_result).is_err());
         let restored: Journal =
             serde_json::from_slice(&serde_json::to_vec(&stored).unwrap()).unwrap();
         assert!(validate_journal(&restored).is_ok());
