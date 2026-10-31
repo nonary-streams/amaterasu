@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import export_session_extension_split as migration
 
@@ -69,6 +70,16 @@ class SplitTest(unittest.TestCase):
         self.document["layers"][0]["values"]["width"] = True
         with self.assertRaisesRegex(ValueError, "invalid or unsupported"):
             self.split()
+
+    def test_schema_validation_includes_inherited_scope_combinations(self):
+        client = {"kind": "paired_client", "id": "client"}
+        layers = self.document["layers"] + [{"scope": client, "values": {"width": 2000}}]
+        with mock.patch.object(migration.subprocess, "run") as runner:
+            migration.validate_with_publisher(Path("release"), Path("descriptor"), layers)
+        batches = json.loads(runner.call_args.kwargs["input"])
+        self.assertIn({"enabled": False, "retention": "after_disconnect", "width": 2000, "retention_seconds": 25}, batches)
+        self.assertIn({"enabled": True, "retention": "after_disconnect", "width": 2000}, batches)
+        self.assertIn({"enabled": False, "retention": "after_disconnect", "width": 1920, "retention_seconds": 25}, batches)
 
     def test_output_preserves_source_bytes_and_refuses_overwrite(self):
         with tempfile.TemporaryDirectory() as tmp:
