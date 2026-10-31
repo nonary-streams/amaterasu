@@ -19,6 +19,28 @@ struct Backend<'a> {
     coordinator: &'a mut Coordinator,
 }
 
+fn target_phase_allowed(
+    phase: &LifecyclePhase,
+    stream: &StreamRecord,
+    session: &SessionRecord,
+) -> bool {
+    match phase {
+        LifecyclePhase::StreamPrepare => {
+            stream.phase == StreamPhase::Preparing
+                && matches!(session.phase, SessionPhase::Ready | SessionPhase::Paused)
+        }
+        LifecyclePhase::StreamRelease => {
+            stream.phase == StreamPhase::Quiescing
+                && stream.retirements == stream.required
+                && matches!(
+                    session.phase,
+                    SessionPhase::Ready | SessionPhase::Paused | SessionPhase::Ending
+                )
+        }
+        _ => false,
+    }
+}
+
 impl Backend<'_> {
     fn authority(&self) -> ModuleResult<CoordinatorPrepareAuthority<Writer>> {
         CoordinatorPrepareAuthority::new(
@@ -46,7 +68,11 @@ impl ControlEndpointBackend for Backend<'_> {
             let state = work.states.get(dependent)?;
             (state.admission_id.as_deref() == Some(request.admission_id.as_str())
                 && state.plan.as_ref() == Some(&admission.plan)
-                && work.phase == LifecyclePhase::StreamPrepare
+                && matches!(
+                    work.phase,
+                    LifecyclePhase::StreamPrepare | LifecyclePhase::StreamRelease
+                )
+                && state.request.phase == work.phase
                 && work.target == request.target
                 && work.transition_id == request.transition_id
                 && !work.waiting_retirement
@@ -67,19 +93,46 @@ impl ControlEndpointBackend for Backend<'_> {
             .get(dependent)
             .is_some_and(|deps| deps.contains(owner))
             || !admission.plan.control_proposals.contains(&request.proposal)
+            || (work.phase == LifecyclePhase::StreamRelease && work.cleanup_blocked(dependent))
         {
             return Err("control_not_in_frozen_graph_or_plan".into());
         }
-        let selection = journal
-            .composition
-            .selection(
-                &work.target,
-                &work.transition_id,
+        let progress = work
+            .composition_progress
+            .as_ref()
+            .ok_or("control_stage_unavailable")?;
+        let mut selections = progress.selections.iter().filter(|selection| {
+            selection.target == work.target
+                && selection.control_policy.dependent_provider == *dependent
+                && selection.control_policy.owner_provider == *owner
+                && selection.input.output.output_id == request.proposal.output_id
+                && (work.phase == LifecyclePhase::StreamRelease
+                    || selection.transition_id == work.transition_id)
+        });
+        let selection = selections.next().ok_or("control_selection_unavailable")?;
+        if selections.next().is_some()
+            || journal.composition.selection(
+                &selection.target,
+                &selection.transition_id,
                 dependent,
                 owner,
-                &request.proposal.output_id,
-            )
-            .ok_or("control_selection_unavailable")?;
+                &selection.input.output.output_id,
+            ) != Some(selection)
+        {
+            return Err("control_selection_mismatch".into());
+        }
+        let mut controls = progress.controls.iter().filter(|control| {
+            control.request == *request
+                && control.dependency == selection.input.output
+                && matches!(control.phase, super::control_dispatch::ControlPhase::Effect)
+        });
+        if controls.next().is_none()
+            || controls.next().is_some()
+            || !progress.selections.contains(selection)
+            || !progress.inputs.contains(&selection.input)
+        {
+            return Err("control_stage_mismatch".into());
+        }
         let input = &selection.input;
         let output = &input.output;
         if !state.request.dependency_inputs.contains(output)
@@ -144,9 +197,9 @@ impl ControlEndpointBackend for Backend<'_> {
         if epoch != journal.host_epoch
             || session.host_epoch != epoch
             || stream.generation != generation
-            || stream.phase != StreamPhase::Preparing
-            || !matches!(session.phase, SessionPhase::Ready | SessionPhase::Paused)
+            || !target_phase_allowed(&work.phase, stream, session)
             || session.admission_targets.get(&request.admission_id) != Some(&work.target)
+            || session.admission_phases.get(&request.admission_id) != Some(&work.phase)
             || journal.admission_transitions.get(&request.admission_id) != Some(&work.transition_id)
             || session.streams.iter().any(|(id, other)| {
                 Some(id.as_str()) != stream_id
@@ -190,6 +243,21 @@ impl ControlEndpointBackend for Backend<'_> {
             .schema_catalog()?
             .validate(schema, arguments)
     }
+    fn describe(
+        &mut self,
+        owner: &str,
+        resolved: &ResolvedControl,
+        request: &ResourceControlRequest,
+    ) -> ModuleResult<()> {
+        let catalog = self.coordinator.settings.schema_catalog()?;
+        self.authority()?.describe_control_permit(
+            owner,
+            &resolved.participant,
+            &resolved.context,
+            request,
+            |schema, value| catalog.validate(schema, value),
+        )
+    }
     fn consume(
         &mut self,
         owner: &str,
@@ -232,6 +300,56 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn restore_requires_exact_quiescence_and_consumer_retirement() {
+        let mut stream = StreamRecord {
+            provider_graph: None,
+            generation: 1,
+            phase: StreamPhase::Preparing,
+            candidate: None,
+            required: ["capture".into()].into(),
+            acknowledgements: BTreeSet::new(),
+            retirements: BTreeSet::new(),
+            binding_owner: String::new(),
+            preparation_transition: String::new(),
+            provider_settings: BTreeMap::new(),
+        };
+        let mut session: SessionRecord = serde_json::from_value(json!({"host_epoch":"epoch","id":"session","generation":1,"phase":"ready","owner":{"caller":"c","initiator":"i"},"delegates":[],"application_ref":{},"settings_revision":"one","application_retired":false,"streams":{}})).unwrap();
+        assert!(target_phase_allowed(
+            &LifecyclePhase::StreamPrepare,
+            &stream,
+            &session
+        ));
+        assert!(!target_phase_allowed(
+            &LifecyclePhase::StreamRelease,
+            &stream,
+            &session
+        ));
+        stream.phase = StreamPhase::Quiescing;
+        assert!(!target_phase_allowed(
+            &LifecyclePhase::StreamRelease,
+            &stream,
+            &session
+        ));
+        stream.retirements.insert("capture".into());
+        assert!(target_phase_allowed(
+            &LifecyclePhase::StreamRelease,
+            &stream,
+            &session
+        ));
+        session.phase = SessionPhase::Ending;
+        assert!(target_phase_allowed(
+            &LifecyclePhase::StreamRelease,
+            &stream,
+            &session
+        ));
+        session.phase = SessionPhase::RecoveryRequired;
+        assert!(!target_phase_allowed(
+            &LifecyclePhase::StreamRelease,
+            &stream,
+            &session
+        ));
+    }
     #[test]
     fn request_without_durable_admission_cannot_create_authority() {
         let path = std::env::temp_dir().join(format!(

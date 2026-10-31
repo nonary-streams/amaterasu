@@ -19,8 +19,12 @@ struct Envelope {
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Operation {
-    VerifyResourceFinalize,
-    ValidateResourceFinalize,
+    #[serde(rename = "describe_resource_finalize")]
+    Describe,
+    #[serde(rename = "verify_resource_finalize")]
+    Verify,
+    #[serde(rename = "validate_resource_finalize")]
+    Validate,
 }
 
 /// Constructed from the durable coordinator graph, owner selection and output,
@@ -40,6 +44,12 @@ pub(super) struct ResolvedFinalize {
 pub(super) trait FinalizeEndpointBackend {
     fn resolve(&mut self, request: &ResourceFinalizeRequest) -> ModuleResult<ResolvedFinalize>;
     fn validate_output(&mut self, output: &ResourceOutput) -> ModuleResult<()>;
+    fn describe(
+        &mut self,
+        owner: &str,
+        resolved: &ResolvedFinalize,
+        request: &ResourceFinalizeRequest,
+    ) -> ModuleResult<()>;
     fn consume(
         &mut self,
         owner: &str,
@@ -103,11 +113,15 @@ fn authorize(
         backend.validate_output(&result.output)?;
     }
     let status = match envelope.operation {
-        Operation::VerifyResourceFinalize => match backend.consume(caller, &resolved, request)? {
+        Operation::Describe => {
+            backend.describe(caller, &resolved, request)?;
+            "described"
+        }
+        Operation::Verify => match backend.consume(caller, &resolved, request)? {
             ControlPermitUse::Execute => "execute",
             ControlPermitUse::ReattachOnly => "reattach_only",
         },
-        Operation::ValidateResourceFinalize => {
+        Operation::Validate => {
             backend.validate(caller, &resolved, request)?;
             "valid"
         }
@@ -158,6 +172,18 @@ mod tests {
                 Ok(ControlPermitUse::Execute)
             }
         }
+        fn describe(
+            &mut self,
+            _: &str,
+            _: &ResolvedFinalize,
+            _: &ResourceFinalizeRequest,
+        ) -> ModuleResult<()> {
+            if self.consumed {
+                Err("already consumed".into())
+            } else {
+                Ok(())
+            }
+        }
         fn validate(
             &mut self,
             _: &str,
@@ -198,6 +224,13 @@ mod tests {
     #[test]
     fn separate_finalize_permit_is_one_use_and_revalidated() {
         let (mut backend, mut payload) = fixture();
+        payload["operation"] = json!("describe_resource_finalize");
+        assert_eq!(
+            finalize_endpoint("owner", payload.clone(), &mut backend)["status"],
+            "described"
+        );
+        assert_eq!(backend.calls, 0);
+        payload["operation"] = json!("verify_resource_finalize");
         let first = finalize_endpoint("owner", payload.clone(), &mut backend);
         assert_eq!(first["status"], "execute");
         assert_eq!(first["session_target"]["generation"], 1);

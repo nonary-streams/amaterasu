@@ -23,8 +23,12 @@ struct Envelope {
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Operation {
-    VerifyResourceControl,
-    ValidateResourceControl,
+    #[serde(rename = "describe_resource_control")]
+    Describe,
+    #[serde(rename = "verify_resource_control")]
+    Verify,
+    #[serde(rename = "validate_resource_control")]
+    Validate,
 }
 
 /// A snapshot reconstructed from trusted frozen policy and live journal state.
@@ -48,6 +52,13 @@ pub(super) struct ResolvedControl {
 pub(super) trait ControlEndpointBackend {
     fn resolve(&mut self, request: &ResourceControlRequest) -> ModuleResult<ResolvedControl>;
     fn validate_arguments(&mut self, schema: &SchemaRef, arguments: &Value) -> ModuleResult<()>;
+    /// Verify an unconsumed permit without creating effect authority.
+    fn describe(
+        &mut self,
+        owner: &str,
+        resolved: &ResolvedControl,
+        request: &ResourceControlRequest,
+    ) -> ModuleResult<()>;
     fn consume(
         &mut self,
         owner: &str,
@@ -112,11 +123,15 @@ fn authorize(
     }
     backend.validate_arguments(&context.policy.argument_schema, &request.proposal.arguments)?;
     let status = match envelope.operation {
-        Operation::VerifyResourceControl => match backend.consume(caller, &resolved, request)? {
+        Operation::Describe => {
+            backend.describe(caller, &resolved, request)?;
+            "described"
+        }
+        Operation::Verify => match backend.consume(caller, &resolved, request)? {
             ControlPermitUse::Execute => "execute",
             ControlPermitUse::ReattachOnly => "reattach_only",
         },
-        Operation::ValidateResourceControl => {
+        Operation::Validate => {
             backend.validate(caller, &resolved, request)?;
             "valid"
         }
@@ -168,6 +183,18 @@ mod tests {
                 Ok(ControlPermitUse::Execute)
             }
         }
+        fn describe(
+            &mut self,
+            _: &str,
+            _: &ResolvedControl,
+            _: &ResourceControlRequest,
+        ) -> ModuleResult<()> {
+            if self.consumed {
+                Err("already consumed".into())
+            } else {
+                Ok(())
+            }
+        }
         fn validate(
             &mut self,
             _: &str,
@@ -186,7 +213,7 @@ mod tests {
         let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1});
         let resource = json!({"provider":"owner","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":null,"mutation_domains":[]});
         let schema = json!({"id":"schema","major":1,"minor":0,"digest":"a".repeat(64)});
-        let context: ControlContext = serde_json::from_value(json!({"policy":{"dependent_provider":"consumer","owner_provider":"owner","owner_service":"owner/2","owner_method":method,"argument_schema":schema,"output_capability":"display","output_schema":schema,"max_access":"exclusive","mutation_domains":[]},"output":{"output_id":"out","capability":"display","schema":schema,"producer":"owner","producer_service":"owner/2","origin":target,"resource":resource,"data":{}},"target":target,"transition_id":"transition","parent_generation":1})).unwrap();
+        let context: ControlContext = serde_json::from_value(json!({"policy":{"dependent_provider":"consumer","owner_provider":"owner","owner_service":"owner/2","owner_method":method,"status_method":method,"settlement_method":method,"settlement_status_method":method,"argument_schema":schema,"output_capability":"display","output_schema":schema,"max_access":"exclusive","mutation_domains":[]},"output":{"output_id":"out","capability":"display","schema":schema,"producer":"owner","producer_service":"owner/2","origin":target,"resource":resource,"data":{}},"target":target,"transition_id":"transition","parent_generation":1})).unwrap();
         let participant: ParticipantSettings = serde_json::from_value(json!({"provider":"consumer","plan_method":method,"callback_method":method,"status_method":method,"capabilities":[],"cleanup_methods":[],"settings_revision":"one","settings":{}})).unwrap();
         let request = json!({"version":2,"transition_id":"transition","operation_id":"effect","provider_sequence":1,"target":target,"proposal":{"proposal_id":"proposal","output_id":"out","owner_provider":"owner","owner_service":"owner/2","target":target,"resource":resource,"method":method,"argument_schema":schema,"arguments":{"width":1920},"access":"exclusive","mutation_domains":[]},"admission_id":"admission","permit_id":"permit","remaining_ms":5000});
         (
@@ -207,6 +234,13 @@ mod tests {
     #[test]
     fn verify_consumes_once_and_pre_effect_validation_is_read_only() {
         let (mut backend, mut payload) = fixture();
+        payload["operation"] = json!("describe_resource_control");
+        assert_eq!(
+            control_endpoint("owner", payload.clone(), &mut backend)["status"],
+            "described"
+        );
+        assert_eq!(backend.consume_calls, 0);
+        payload["operation"] = json!("verify_resource_control");
         let first = control_endpoint("owner", payload.clone(), &mut backend);
         assert_eq!(first["status"], "execute");
         assert_eq!(first["session_target"]["generation"], 1);
