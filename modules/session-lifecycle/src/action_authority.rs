@@ -129,6 +129,8 @@ struct ActionExecution {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActionApprovalSnapshot {
+    #[serde(default)]
+    pub invoke: Option<amaterasu_extension_api::ActionInvoke>,
     pub descriptor: amaterasu_extension_api::ActionDescriptor,
     pub execute_approval: amaterasu_contracts::ApiMethodApproval,
     pub status_approval: Option<amaterasu_contracts::ApiMethodApproval>,
@@ -152,10 +154,15 @@ fn valid_approval_snapshot(
     snapshot: &ActionApprovalSnapshot,
     provider: &str,
     method: &amaterasu_extension_api::MethodRef,
-    action_id: &str,
+    binding: &ActionBinding,
     action_service: &str,
 ) -> bool {
-    snapshot.descriptor.id == action_id
+    snapshot.invoke.as_ref().is_none_or(|invoke| {
+        invoke.operation_id == binding.operation_id
+            && invoke.action_id == binding.action_id
+            && serde_json::to_value(&invoke.target).ok()
+                == serde_json::to_value(&binding.target).ok()
+    }) && snapshot.descriptor.id == binding.action_id
         && snapshot.descriptor.execute == *method
         && approval_matches(&snapshot.execute_approval, provider, method, action_service)
         && match (&snapshot.descriptor.status, &snapshot.status_approval) {
@@ -312,7 +319,7 @@ impl ActionAuthority {
                                     snapshot,
                                     &execution.provider,
                                     &execution.method,
-                                    &reservation.binding.action_id,
+                                    &reservation.binding,
                                     &reservation.action_service,
                                 )
                             })
@@ -622,7 +629,7 @@ impl ActionAuthority {
             &snapshot,
             &execution.provider,
             &execution.method,
-            &binding.action_id,
+            binding,
             caller,
         ) {
             return Err(AuthorityError::Invalid);
@@ -1091,28 +1098,48 @@ mod tests {
             &snapshot,
             "display",
             &snapshot.descriptor.execute,
-            "display/remove",
+            &binding(),
             "action-service"
         ));
         assert!(!valid_approval_snapshot(
             &snapshot,
             "foreign",
             &snapshot.descriptor.execute,
-            "display/remove",
+            &binding(),
             "action-service"
         ));
         assert!(!valid_approval_snapshot(
             &snapshot,
             "display",
             &snapshot.descriptor.execute,
-            "display/remove",
+            &binding(),
             "other-service"
         ));
         assert!(!valid_approval_snapshot(
             &snapshot,
             "display",
             &snapshot.descriptor.execute,
-            "display/other",
+            &ActionBinding {
+                action_id: "display/other".into(),
+                ..binding()
+            },
+            "action-service"
+        ));
+        let mut invoked = snapshot.clone();
+        invoked.invoke = Some(serde_json::from_value(json!({"epoch":"epoch","sequence":1,"operation_id":"op","action_id":"display/remove","target":binding().target,"arguments":{},"expected_settings_revision":null,"input_reservation_id":null})).unwrap());
+        assert!(valid_approval_snapshot(
+            &invoked,
+            "display",
+            &snapshot.descriptor.execute,
+            &binding(),
+            "action-service"
+        ));
+        invoked.invoke.as_mut().unwrap().operation_id = "other".into();
+        assert!(!valid_approval_snapshot(
+            &invoked,
+            "display",
+            &snapshot.descriptor.execute,
+            &binding(),
             "action-service"
         ));
         let mut changed = snapshot.clone();
@@ -1121,7 +1148,7 @@ mod tests {
             &changed,
             "display",
             &snapshot.descriptor.execute,
-            "display/remove",
+            &binding(),
             "action-service"
         ));
     }

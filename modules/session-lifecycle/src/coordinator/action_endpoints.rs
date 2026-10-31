@@ -446,7 +446,16 @@ impl Coordinator {
                     else {
                         return rejection("action_approval_invalid");
                     };
+                    let Ok(invoke) = serde_json::from_value::<
+                        Option<amaterasu_extension_api::ActionInvoke>,
+                    >(payload["invoke"].clone()) else {
+                        return rejection("action_invoke_invalid");
+                    };
+                    if plan.resource_disposition.is_some() && invoke.is_none() {
+                        return rejection("action_invoke_required");
+                    }
                     let snapshot = crate::action_authority::ActionApprovalSnapshot {
+                        invoke,
                         descriptor,
                         execute_approval,
                         status_approval,
