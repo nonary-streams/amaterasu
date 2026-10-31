@@ -10,8 +10,8 @@
 //! The production coordinator currently gates dependent profiles. This ignored
 //! test may run against an isolated qualification build; the gate remains in
 //! place until the full flow and bounded retirement are qualified. It reports
-//! logical namespace/collection counts and bytes, but does not assert a storage
-//! bound. Run `cargo test -p amaterasu-session-lifecycle --test
+//! logical namespace/collection counts and checks full-record growth after
+//! warmup. Run `cargo test -p amaterasu-session-lifecycle --test
 //! real_composition_cycles -- --ignored --nocapture` with matching artifacts.
 #![cfg(target_os = "linux")]
 use amaterasu_module_sdk::{Command, Response, abi};
@@ -277,7 +277,7 @@ impl Fixture {
             native_calls: Vec::new(),
             references: BTreeMap::new(),
             borrows: BTreeMap::new(),
-            domain_revision: 1,
+            domain_revision: 0,
             borrow_sequence: 0,
             mode: (1920, 1080, 60000),
             reconfigurations: BTreeMap::new(),
@@ -539,6 +539,7 @@ struct StateUsage {
     files: usize,
     bytes: u64,
     namespace_keys: usize,
+    tombstone_keys: usize,
     collection_records: usize,
     max_record_bytes: usize,
 }
@@ -552,6 +553,7 @@ fn state_disk_usage(path: &std::path::Path) -> StateUsage {
                 result.files += child.files;
                 result.bytes += child.bytes;
                 result.namespace_keys += child.namespace_keys;
+                result.tombstone_keys += child.tombstone_keys;
                 result.collection_records += child.collection_records;
                 result.max_record_bytes = result.max_record_bytes.max(child.max_record_bytes);
             } else {
@@ -573,6 +575,10 @@ fn state_disk_usage(path: &std::path::Path) -> StateUsage {
                         let entries = entries.as_object().unwrap();
                         if name == "state.json" {
                             result.namespace_keys += entries.len();
+                            result.tombstone_keys += entries
+                                .keys()
+                                .filter(|key| key.starts_with("virtual-screen/gc-tombstone/"))
+                                .count();
                         }
                         for value in entries.values() {
                             result.max_record_bytes = result
@@ -624,6 +630,7 @@ fn real_participants_prepare_resume_and_release_in_dependency_order() {
     assert_eq!(stream["status"], "succeeded", "{stream}");
     assert_eq!(stream["candidate"]["resource"]["provider"], SCREEN);
     let mut target = start_capture(&mut f, &stream, &initial, "initial");
+    let mut warmup_full_records = None;
     for cycle in 0..10 {
         let pause_id = format!("pause-{cycle}");
         let paused =
@@ -659,10 +666,22 @@ fn real_participants_prepare_resume_and_release_in_dependency_order() {
             ),
             "resume must configure requested mode"
         );
-        eprintln!(
-            "qualification cycle {cycle}: state_usage={:?}",
-            state_disk_usage(&f.root.join("owner-state/namespaces"))
+        let usage = state_disk_usage(&f.root.join("owner-state/namespaces"));
+        eprintln!("qualification cycle {cycle}: state_usage={usage:?}");
+        assert!(usage.tombstone_keys <= 8192, "tombstone capacity exceeded");
+        let full_records = (
+            usage.namespace_keys - usage.tombstone_keys,
+            usage.collection_records,
         );
+        if cycle == 2 {
+            warmup_full_records = Some(full_records);
+        } else if cycle > 2 {
+            let warmup = warmup_full_records.expect("warmup measurement");
+            assert!(
+                full_records.0 <= warmup.0 && full_records.1 <= warmup.1,
+                "full records grew after warmup: {warmup:?} -> {full_records:?}"
+            );
+        }
     }
     let end =
         f.call(json!({"operation":"end_session","operation_id":"end","target":session["target"]}));
