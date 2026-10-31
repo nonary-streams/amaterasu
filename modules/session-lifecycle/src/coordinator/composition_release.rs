@@ -97,12 +97,12 @@ fn validate_prior_cleanup(
 
 impl Coordinator {
     /// Reconstruct the exact authenticated owner binding for one release step.
-    pub(super) fn resolve_release_binding(
+    fn resolve_release_state(
         &self,
         work: &Work,
         dependent: &str,
     ) -> ModuleResult<(
-        super::composition::CompositionSelectionSnapshot,
+        Option<super::composition::CompositionSelectionSnapshot>,
         ResourceOutput,
     )> {
         if work.phase != LifecyclePhase::StreamRelease || work.waiting_retirement {
@@ -123,7 +123,9 @@ impl Coordinator {
             .dependencies
             .get(dependent)
             .ok_or("dependent_not_in_graph")?;
-        if dependencies.is_empty() {
+        let owner_step =
+            dependencies.is_empty() && graph.order.first().is_some_and(|owner| owner == dependent);
+        if dependencies.is_empty() && !owner_step {
             return Err("dependent_has_no_inputs".into());
         }
         let journal = self.shared.borrow().value.clone();
@@ -149,7 +151,11 @@ impl Coordinator {
         validate_prior_cleanup(&journal, work, session)?;
         let mut results = journal.finalize_results.records().filter(|result| {
             result.request.target == work.target
-                && dependencies.contains(&result.selection.policy.owner_provider)
+                && if owner_step {
+                    result.selection.policy.owner_provider == dependent
+                } else {
+                    dependencies.contains(&result.selection.policy.owner_provider)
+                }
         });
         let result = results.next().ok_or("release_finalize_missing")?.clone();
         if results.next().is_some()
@@ -263,7 +269,10 @@ impl Coordinator {
                             == Some(control.dispatch.request.admission_id.as_str())
                     });
                 let Some(prior) = prior else {
-                    if work.states.get(dependent).and_then(|state| state.admission_id.as_deref())
+                    if work
+                        .states
+                        .get(dependent)
+                        .and_then(|state| state.admission_id.as_deref())
                         == Some(control.dispatch.request.admission_id.as_str())
                     {
                         continue;
@@ -335,32 +344,38 @@ impl Coordinator {
                 && selection.control_policy.owner_provider == current.producer
                 && selection.input.output.output_id == current.output_id
         });
-        let selection = selected.next().ok_or("release_selection_missing")?.clone();
-        if selected.next().is_some()
-            || !selection.validate_structure()
-            || !dependencies.contains(&selection.control_policy.owner_provider)
-            || !self
-                .settings
-                .control_policies
-                .contains(&selection.control_policy)
-            || journal.composition.selection(
-                &selection.target,
-                &selection.transition_id,
-                dependent,
-                &selection.control_policy.owner_provider,
-                &selection.input.output.output_id,
-            ) != Some(&selection)
-        {
-            return Err("release_selection_invalid".into());
-        }
+        let selection = if owner_step {
+            None
+        } else {
+            let selection = selected.next().ok_or("release_selection_missing")?.clone();
+            if selected.next().is_some()
+                || !selection.validate_structure()
+                || !dependencies.contains(&selection.control_policy.owner_provider)
+                || !self
+                    .settings
+                    .control_policies
+                    .contains(&selection.control_policy)
+                || journal.composition.selection(
+                    &selection.target,
+                    &selection.transition_id,
+                    dependent,
+                    &selection.control_policy.owner_provider,
+                    &selection.input.output.output_id,
+                ) != Some(&selection)
+            {
+                return Err("release_selection_invalid".into());
+            }
+            Some(selection)
+        };
         let owner = self
             .selections
             .get(&current.producer)
             .ok_or("release_owner_unavailable")?;
-        if !owner.approvals.contains(&selection.control_approval)
-            || !owner.approvals.contains(&selection.control_status_approval)
-            || !owner.approvals.contains(&selection.settlement_approval)
-            || !owner.approvals.contains(&frozen.finalize_approval)
+        if selection.as_ref().is_some_and(|selection| {
+            !owner.approvals.contains(&selection.control_approval)
+                || !owner.approvals.contains(&selection.control_status_approval)
+                || !owner.approvals.contains(&selection.settlement_approval)
+        }) || !owner.approvals.contains(&frozen.finalize_approval)
             || !owner.approvals.contains(&frozen.finalize_status_approval)
         {
             return Err("release_approval_changed".into());
@@ -409,6 +424,32 @@ impl Coordinator {
             .schema_catalog()?
             .validate(&current.schema, &current.data)?;
         Ok((selection, current))
+    }
+
+    /// Reconstruct a dependent's frozen policy and current input.
+    pub(super) fn resolve_release_binding(
+        &self,
+        work: &Work,
+        dependent: &str,
+    ) -> ModuleResult<(
+        super::composition::CompositionSelectionSnapshot,
+        ResourceOutput,
+    )> {
+        let (selection, output) = self.resolve_release_state(work, dependent)?;
+        Ok((selection.ok_or("release_selection_missing")?, output))
+    }
+
+    /// Reconstruct the final acknowledged input for the selected owner cleanup.
+    pub(super) fn resolve_owner_release_input(
+        &self,
+        work: &Work,
+        owner: &str,
+    ) -> ModuleResult<ResourceOutput> {
+        let (selection, output) = self.resolve_release_state(work, owner)?;
+        if selection.is_some() || output.producer != owner {
+            return Err("release_owner_mismatch".into());
+        }
+        Ok(output)
     }
 
     /// Atomically freeze the reconstructed binding before the dependent plan.
