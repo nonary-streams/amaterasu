@@ -1687,7 +1687,6 @@ mod tests {
     }
     fn selection() -> ProviderSelection {
         let participant = ParticipantSettings {
-            depends_on: vec![],
             provider: "display".into(),
             depends_on: vec![],
             plan_method: method("plan"),
@@ -1889,7 +1888,7 @@ mod tests {
         plan.candidate_constraint = Some(serde_json::from_value(json!({"capture_provider":"capture", "selector_schema":"selector", "resource_provider":"display", "resource_id":"output", "incarnation":"native", "execution_domain":"seat", "mode":null, "plan_revision":1})).unwrap());
         let target = json!({"kind":"stream","host_epoch":"host","session_id":"session","stream_id":"stream","generation":2});
         let schema = json!({"id":"schema","major":1,"minor":0,"digest":"a".repeat(64)});
-        let output = json!({"output_id":"output-id","capability":"display","schema":schema,"producer":"display","producer_service":"display/2","origin":target,"resource":{"provider":"display","resource_id":"output","incarnation":"native","revision":2,"execution_domain":"seat","mutation_domain":"topology","mutation_domains":["topology"]},"data":{}});
+        let output = json!({"output_id":"output-id","capability":"display","schema":schema,"producer":"display","producer_service":"display/2","origin":target,"resource":{"provider":"display","resource_id":"output","incarnation":"native","revision":2,"execution_domain":"seat","mutation_domain":"topology","mutation_domains":["topology"]},"domain_observations":[{"domain":"topology","revision":4,"borrowers":{"stream":1},"complete":true}],"data":{}});
         let context: FinalizeContext = serde_json::from_value(json!({"policy":{"owner_provider":"display","owner_service":"display/2","method":{"service":"display/2","method":"finalize","interface_major":2,"interface_minor":0,"schema_revision":2},"output_capability":"display","output_schema":schema,"capture_provider":"capture","selector_schema":"selector","required_access":"exclusive","mutation_domains":["topology"]},"output":output,"control_results":[],"target":target,"transition_id":"transition","parent_generation":1})).unwrap();
         let mut authority = CoordinatorPrepareAuthority::new(
             AuthorityState::default(),
