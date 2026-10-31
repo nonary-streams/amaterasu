@@ -127,9 +127,29 @@ impl Backend<'_> {
         {
             return Err("control_selection_mismatch".into());
         }
+        let input = &selection.input;
+        let stage = if matches!(input.output.origin, LifecycleTarget::Session { .. }) {
+            if !journal.composition.validate_structure() {
+                return Err("control_stage_proof_invalid".into());
+            }
+            let stage =
+                journal
+                    .composition
+                    .staged_for(&work.target, owner, &input.output.output_id)?;
+            if stage.before != input.output
+                || (work.phase == LifecyclePhase::StreamPrepare
+                    && stage.transition_id != work.transition_id)
+            {
+                return Err("control_stage_provenance_mismatch".into());
+            }
+            Some(stage)
+        } else {
+            None
+        };
+        let output = stage.map_or(&input.output, |stage| &stage.after);
         let mut controls = progress.controls.iter().filter(|control| {
             control.dispatch.request == *request
-                && control.dispatch.dependency == selection.input.output
+                && control.dispatch.dependency == *output
                 && match (&control.dispatch.phase, settlement) {
                     (super::control_dispatch::ControlPhase::Effect, None) => true,
                     (super::control_dispatch::ControlPhase::Applied { result }, Some(tuple)) => {
@@ -152,12 +172,10 @@ impl Backend<'_> {
         {
             return Err("control_stage_mismatch".into());
         }
-        let input = &selection.input;
-        let output = &input.output;
         if !state.request.dependency_inputs.contains(output)
             || journal
                 .composition
-                .get(owner, &output.output_id, &output.origin)
+                .get(owner, &input.output.output_id, &input.output.origin)
                 != Some(input)
             || !selection.validate_structure()
             || !self
@@ -249,6 +267,34 @@ impl Backend<'_> {
             })
         {
             return Err("control_target_or_consumers_stale".into());
+        }
+        if let Some(stage) = stage {
+            let stage_admission = journal
+                .authority
+                .admissions
+                .get(&stage.admission_id)
+                .or_else(|| journal.authority.settled.get(&stage.admission_id))
+                .ok_or("control_stage_admission_unavailable")?;
+            if stage.parent_generation != session.generation
+                || !session.admission_ids.contains(&stage.admission_id)
+                || session.admission_targets.get(&stage.admission_id) != Some(&stage.target)
+                || session.admission_phases.get(&stage.admission_id)
+                    != Some(&LifecyclePhase::StreamPrepare)
+                || journal.admission_transitions.get(&stage.admission_id)
+                    != Some(&stage.transition_id)
+                || stage_admission.provider != *owner
+                || stage_admission.plan != stage.plan
+                || stage_admission.selection.participant != stage.callback_proof.participant
+                || !stage_admission.selection.approvals.iter().any(|approval| {
+                    approval.broker_approval == stage.callback_proof.terminal.call.approval
+                        && super::composition::approval_matches_call(
+                            approval,
+                            &stage.callback_proof.terminal.call,
+                        )
+                })
+            {
+                return Err("control_stage_provenance_mismatch".into());
+            }
         }
         if let LifecycleTarget::Session {
             generation: parent, ..
