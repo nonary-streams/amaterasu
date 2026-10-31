@@ -62,6 +62,8 @@ pub struct ControlPolicy {
     pub owner_service: String,
     pub owner_method: MethodRef,
     pub status_method: MethodRef,
+    pub settlement_method: MethodRef,
+    pub settlement_status_method: MethodRef,
     pub argument_schema: SchemaRef,
     pub output_capability: String,
     pub output_schema: SchemaRef,
@@ -405,6 +407,8 @@ fn validate_control_binding(
         || policy.owner_method.interface_major == 0
         || policy.owner_method.schema_revision == 0
         || !valid_status_method(&policy.status_method, &policy.owner_service)
+        || !valid_status_method(&policy.settlement_method, &policy.owner_service)
+        || !valid_status_method(&policy.settlement_status_method, &policy.owner_service)
         || !valid_id(&request.transition_id)
         || !valid_id(&request.operation_id)
         || !valid_id(&proposal.proposal_id)
@@ -1219,6 +1223,45 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
         Ok(())
     }
 
+    /// Inspect an unconsumed permit without granting permission to execute.
+    /// The coordinator must independently authenticate the caller and rebuild
+    /// context from the current canonical journal and installed policy.
+    pub fn describe_control_permit(
+        &mut self,
+        owner_caller: &str,
+        participant: &ParticipantSettings,
+        context: &ControlContext,
+        request: &ResourceControlRequest,
+        validate_arguments: impl Fn(&SchemaRef, &Value) -> ModuleResult<()>,
+    ) -> ModuleResult<()> {
+        if self.poisoned {
+            return Err("authority journal requires recovery".into());
+        }
+        let permit = self
+            .state
+            .control_permits
+            .get(&request.permit_id)
+            .ok_or("unknown control permit")?;
+        if permit.consumed
+            || permit.settled
+            || owner_caller != context.policy.owner_provider
+            || permit.context != *context
+            || permit.request != *request
+        {
+            return Err("control permit is not available for preflight".into());
+        }
+        amaterasu_extension_api::validate_resource_control_request(request)?;
+        let admission = self
+            .state
+            .admissions
+            .get(&request.admission_id)
+            .ok_or("unknown admission")?
+            .clone();
+        self.validate_rights(participant, &admission.plan, &request.admission_id)?;
+        validate_control_binding(&admission, context, request, &self.state.snapshot)?;
+        validate_arguments(&context.policy.argument_schema, &request.proposal.arguments)
+    }
+
     /// Authenticated owner consumes exactly once. Replays may only reattach to
     /// status; they never authorize another native effect.
     pub fn consume_control_permit(
@@ -1395,6 +1438,41 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
         self.persist(next)?;
         request.permit_id = permit_id;
         Ok(())
+    }
+
+    /// Inspect a fresh finalize permit without consuming or authorizing it.
+    pub fn describe_finalize_permit(
+        &mut self,
+        owner_caller: &str,
+        participant: &ParticipantSettings,
+        context: &FinalizeContext,
+        request: &ResourceFinalizeRequest,
+    ) -> ModuleResult<()> {
+        if self.poisoned {
+            return Err("authority journal requires recovery".into());
+        }
+        let permit = self
+            .state
+            .finalize_permits
+            .get(&request.permit_id)
+            .ok_or("unknown finalize permit")?;
+        if permit.consumed
+            || permit.settled
+            || owner_caller != context.policy.owner_provider
+            || permit.context != *context
+            || permit.request != *request
+        {
+            return Err("finalize permit is not available for preflight".into());
+        }
+        amaterasu_extension_api::validate_resource_finalize_request(request)?;
+        let admission = self
+            .state
+            .admissions
+            .get(&request.admission_id)
+            .ok_or("unknown admission")?
+            .clone();
+        self.validate_rights(participant, &admission.plan, &request.admission_id)?;
+        validate_finalize_binding(&admission, context, request, &self.state.snapshot)
     }
 
     pub fn consume_finalize_permit(
@@ -1870,7 +1948,7 @@ mod tests {
         plan.control_proposals
             .push(serde_json::from_value(proposal.clone()).unwrap());
         let mut context: ControlContext = serde_json::from_value(json!({
-            "policy":{"dependent_provider":"display", "owner_provider":"owner", "owner_service":"display/2", "owner_method":method, "status_method":{"service":"display/2","method":"status","interface_major":2,"interface_minor":0,"schema_revision":2}, "argument_schema":schema, "output_capability":"display", "output_schema":schema, "max_access":"exclusive", "mutation_domains":["topology"]},
+            "policy":{"dependent_provider":"display", "owner_provider":"owner", "owner_service":"display/2", "owner_method":method, "status_method":{"service":"display/2","method":"status","interface_major":2,"interface_minor":0,"schema_revision":2}, "settlement_method":{"service":"display/2","method":"settle","interface_major":2,"interface_minor":0,"schema_revision":2}, "settlement_status_method":{"service":"display/2","method":"settle_status","interface_major":2,"interface_minor":0,"schema_revision":2}, "argument_schema":schema, "output_capability":"display", "output_schema":schema, "max_access":"exclusive", "mutation_domains":["topology"]},
             "output":{"output_id":"output-id", "capability":"display", "schema":schema, "producer":"owner", "producer_service":"display/2", "origin":target, "resource":resource, "domain_observations":[{"domain":"topology","revision":4,"borrowers":{"stream":1},"complete":true}], "data":{}},
             "target":target, "transition_id":"transition", "parent_generation":null
         })).unwrap();
@@ -1924,6 +2002,41 @@ mod tests {
         authority
             .issue_control_permit(&selected.participant, &context, &mut request, validate)
             .unwrap();
+        let before = authority.journal.snapshots.len();
+        assert!(
+            authority
+                .describe_control_permit(
+                    "owner",
+                    &selected.participant,
+                    &context,
+                    &request,
+                    validate
+                )
+                .is_ok()
+        );
+        assert!(
+            authority
+                .describe_control_permit(
+                    "foreign",
+                    &selected.participant,
+                    &context,
+                    &request,
+                    validate
+                )
+                .is_err()
+        );
+        assert!(
+            authority
+                .describe_control_permit(
+                    "owner",
+                    &selected.participant,
+                    &context,
+                    &request,
+                    |_, _| Err("invalid schema".into())
+                )
+                .is_err()
+        );
+        assert_eq!(authority.journal.snapshots.len(), before);
         let mut retry = request.clone();
         retry.permit_id.clear();
         authority
@@ -1980,6 +2093,17 @@ mod tests {
                 )
                 .unwrap(),
             ControlPermitUse::Execute
+        );
+        assert!(
+            authority
+                .describe_control_permit(
+                    "owner",
+                    &selected.participant,
+                    &context,
+                    &request,
+                    validate
+                )
+                .is_err()
         );
         assert!(
             authority
@@ -2047,6 +2171,18 @@ mod tests {
         authority
             .issue_finalize_permit(&selected.participant, &context, &mut request)
             .unwrap();
+        let before = authority.journal.snapshots.len();
+        assert!(
+            authority
+                .describe_finalize_permit("display", &selected.participant, &context, &request)
+                .is_ok()
+        );
+        assert!(
+            authority
+                .describe_finalize_permit("foreign", &selected.participant, &context, &request)
+                .is_err()
+        );
+        assert_eq!(authority.journal.snapshots.len(), before);
         let mut retry = request.clone();
         retry.permit_id.clear();
         authority
@@ -2075,6 +2211,11 @@ mod tests {
                 .consume_finalize_permit("display", &selected.participant, &context, &request)
                 .unwrap(),
             ControlPermitUse::Execute
+        );
+        assert!(
+            authority
+                .describe_finalize_permit("display", &selected.participant, &context, &request)
+                .is_err()
         );
         assert!(
             authority
