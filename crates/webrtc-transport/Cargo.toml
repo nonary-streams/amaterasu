@@ -1,0 +1,18 @@
+[package]
+name = "amaterasu-webrtc-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+amaterasu-media.workspace = true
+amaterasu-network-policy.workspace = true
+getrandom.workspace = true
+sha2.workspace = true
+str0m = { version = "=0.24.1", default-features = false, features = ["aws-lc-rs"] }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

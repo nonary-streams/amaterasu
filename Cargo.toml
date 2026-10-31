@@ -8,6 +8,7 @@ members = [
     "crates/gamestream",
     "crates/input-policy",
     "crates/network-policy",
+    "crates/webrtc-transport",
     "crates/logging",
     "crates/contracts",
     "crates/input-companion",
