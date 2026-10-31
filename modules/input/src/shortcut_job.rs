@@ -17,7 +17,7 @@ use amaterasu_extension_api::{ActionInvoke, ActionTarget, BindingSource, Lifecyc
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::time::Instant;
+use std::{collections::BTreeMap, time::Instant};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -73,6 +73,7 @@ pub(crate) struct ShortcutJob {
     input_boot_epoch: String,
     discovery: Option<DiscoveryJob>,
     cache_snapshot: Option<Snapshot>,
+    binding_revisions: BTreeMap<String, u64>,
     matcher: Matcher,
     staged: Option<StagedBatch>,
     store: Option<ShortcutStore>,
@@ -141,6 +142,7 @@ impl ShortcutJob {
             input_boot_epoch,
             discovery: None,
             cache_snapshot: None,
+            binding_revisions: BTreeMap::new(),
             matcher: Matcher::default(),
             staged: None,
             store: None,
@@ -408,7 +410,11 @@ impl ShortcutJob {
                                 entry.action.id == entry.binding.action_id
                                     && authority.allowed_actions.contains(&entry.binding.action_id)
                             })
-                            .map(|entry| entry.binding)
+                            .map(|entry| {
+                                self.binding_revisions
+                                    .insert(entry.binding.id.clone(), entry.settings_revision);
+                                entry.binding
+                            })
                             .collect::<Vec<_>>();
                         let discovery = self.discovery.as_ref().unwrap();
                         self.cache_snapshot = Some(Snapshot {
@@ -604,7 +610,12 @@ impl ShortcutJob {
                             .clone()
                             .ok_or("action target unavailable")?,
                         arguments: intent.arguments.clone(),
-                        expected_settings_revision: None,
+                        expected_settings_revision: Some(
+                            self.binding_revisions
+                                .get(&intent.binding_id)
+                                .ok_or("shortcut settings revision unavailable")?
+                                .to_string(),
+                        ),
                         input_reservation_id: None,
                     };
                     let timeout = self
@@ -825,6 +836,7 @@ mod tests {
                             match payload["operation"].as_str().unwrap() {
                                 "open_epoch" => json!({"status":"ok","epoch":"action"}),
                                 "reserve_input" => {
+                                    assert_eq!(payload["expected_settings_revision"], "1");
                                     json!({"status":"reserved","operation_id":"action:1"})
                                 }
                                 "close_epoch" | "retire_epoch" => json!({"status":"ok"}),

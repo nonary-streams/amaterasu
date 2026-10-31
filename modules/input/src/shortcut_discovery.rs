@@ -29,6 +29,7 @@ pub(crate) struct CanonicalContext {
 pub(crate) struct ApprovedBinding {
     pub binding: Keybinding,
     pub action: ActionDescriptor,
+    pub settings_revision: u64,
 }
 
 #[derive(Deserialize)]
@@ -303,6 +304,7 @@ impl DiscoveryJob {
                     self.bindings.push(ApprovedBinding {
                         binding,
                         action: action.clone(),
+                        settings_revision: settings.revision,
                     });
                 }
                 self.stage = Stage::Settings { index: index + 1 };
