@@ -423,8 +423,11 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                                     journal, receipt, work, transfer,
                                 )
                             }
-                            // The rebind writer is not installed; do not accept a claimed stage.
-                            ActionTransferStage::Rebound => true,
+                            ActionTransferStage::Rebound => {
+                                !action_release_proof::validate_rebound_stage(
+                                    journal, receipt, work, transfer,
+                                )
+                            }
                         }
                     })
             })
@@ -1004,6 +1007,7 @@ impl Coordinator {
                 | "consume_action_permit"
                 | "complete_action"
                 | "begin_action_transition"
+                | "rebind_action_plan"
                 | "consume_input_reservation"
                 | "cancel_input_reservation"
                 | "inspect_action_effect"

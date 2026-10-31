@@ -860,6 +860,7 @@ impl Coordinator {
                     | "consume_action_permit"
                     | "complete_action"
                     | "begin_action_transition"
+                    | "rebind_action_plan"
                     | "consume_input_reservation"
                     | "cancel_input_reservation"
                     | "inspect_action_effect"

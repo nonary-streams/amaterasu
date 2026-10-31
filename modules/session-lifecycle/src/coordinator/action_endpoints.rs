@@ -6,6 +6,7 @@ use crate::action_authority::{
     ActionBinding, ActionOutcome, ActionTarget, CanonicalAction, Principal,
 };
 use crate::plan_validation::{AdmissionContext, validate_effect_plan};
+use crate::prepare_driver::PrepareAuthority;
 use amaterasu_extension_api::{ConsumerChange, ResourcePlan};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -51,6 +52,17 @@ pub(super) fn graph_proves_no_dependents(
     !dependencies
         .values()
         .any(|parents| parents.iter().any(|parent| parent == provider))
+}
+
+// Admission is staged in memory and committed with the permit and transfer.
+struct ActionRebindWriter;
+impl crate::prepare_authority::AuthorityJournal for ActionRebindWriter {
+    fn persist(
+        &mut self,
+        _state: &crate::prepare_authority::AuthorityState,
+    ) -> amaterasu_module_sdk::ModuleResult<()> {
+        Ok(())
+    }
 }
 
 struct ActionFinishWriter {
@@ -473,6 +485,7 @@ impl Coordinator {
                 }
                 json!({"status":"succeeded","operation_id":operation_id,"target":target,"permit":token})
             }
+            "rebind_action_plan" => self.rebind_action_plan(caller, payload, journal),
             "begin_action_transition" => {
                 let Some(token) = payload["permit"].as_str() else {
                     return rejection("invalid_permit");
@@ -779,6 +792,167 @@ impl Coordinator {
             _ => rejection("unsupported_operation"),
         }
     }
+    fn rebind_action_plan(
+        &self,
+        caller: &str,
+        payload: &Value,
+        mut journal: super::Journal,
+    ) -> Value {
+        let (Some(old_token), Some(transition_id), Some(old_digest), Some(new_digest)) = (
+            payload["old_permit"].as_str(),
+            payload["transition_id"].as_str(),
+            payload["old_plan_digest"].as_str(),
+            payload["new_plan_digest"].as_str(),
+        ) else {
+            return rejection("invalid_action");
+        };
+        let Ok(old_binding) = journal.actions.binding_for_rebind(caller, old_token) else {
+            return rejection("invalid_permit");
+        };
+        if payload["operation_id"].as_str() != Some(old_binding.operation_id.as_str())
+            || payload["target"] != serde_json::to_value(&old_binding.target).unwrap_or(Value::Null)
+            || old_digest != old_binding.plan_digest
+        {
+            return rejection("action_binding_mismatch");
+        }
+        let Ok(plan) = serde_json::from_value::<ResourcePlan>(payload["new_plan"].clone()) else {
+            return rejection("invalid_plan");
+        };
+        let Ok(plan_value) = serde_json::to_value(&plan) else {
+            return rejection("invalid_plan");
+        };
+        if digest(&plan_value).as_deref() != Some(new_digest) {
+            return rejection("plan_digest_mismatch");
+        }
+        let key = super::receipt_key(caller, "action-transition", &old_binding.operation_id);
+        let Some(receipt) = journal.receipts.get(&key).cloned() else {
+            return rejection("action_transition_missing");
+        };
+        let Some(work) = receipt.work.clone() else {
+            return rejection("action_transition_missing");
+        };
+        let Some(transfer) = work.action_transfer.as_ref() else {
+            return rejection("action_transition_missing");
+        };
+        if transfer.stage == super::ActionTransferStage::Rebound {
+            let Ok((token, binding)) = journal.actions.rebind_transferred(
+                caller,
+                old_token,
+                &old_binding,
+                transition_id,
+                &plan,
+                new_digest,
+            ) else {
+                return rejection("action_rebind_invalid");
+            };
+            if transfer.service != caller
+                || transfer.permit != token
+                || transfer.binding != binding
+                || work.transition_id != transition_id
+            {
+                return rejection("action_rebind_invalid");
+            }
+            return json!({"status":"succeeded","operation_id":binding.operation_id,"transition_id":transition_id,"target":binding.target,"plan_digest":binding.plan_digest,"permit_id":token});
+        }
+        if transfer.stage != super::ActionTransferStage::ReplanRequired
+            || transfer.service != caller
+            || transfer.permit != old_token
+            || transfer.binding != old_binding
+            || work.transition_id != transition_id
+            || !super::action_release_proof::validate_replan_stage(
+                &journal, &receipt, &work, transfer,
+            )
+        {
+            return rejection("action_cleanup_unproven");
+        }
+        let Ok((provider, _, _)) = journal.actions.execution_for_permit(caller, old_token) else {
+            return rejection("action_execution_unavailable");
+        };
+        let Some(mut selected) = self.selections.get(&provider).cloned() else {
+            return rejection("provider_unavailable");
+        };
+        if !rebind_root_current(&journal, &work.target, &provider, &plan) {
+            return rejection("action_root_unavailable");
+        }
+
+        let Ok(borrowers) = rebind_borrower_scope(&journal, &work.target, &provider, &plan) else {
+            return rejection("action_borrowers_unavailable");
+        };
+        selected.authorized_borrowers = borrowers;
+        let participant = selected.participant.clone();
+        let mut selections: Vec<_> = self
+            .selections
+            .values()
+            .filter(|item| item.participant.provider != provider)
+            .cloned()
+            .collect();
+        selections.push(selected);
+        let Ok(mut authority) = crate::prepare_authority::CoordinatorPrepareAuthority::new(
+            journal.authority.clone(),
+            selections,
+            ActionRebindWriter,
+        ) else {
+            return rejection("action_authority_unavailable");
+        };
+        let Ok(admission_id) = authority.admit_plan(&participant, &plan) else {
+            return rejection("plan_not_admitted");
+        };
+        if authority
+            .validate_rights(&participant, &plan, &admission_id)
+            .is_err()
+        {
+            return rejection("action_rights_unavailable");
+        }
+        journal.authority = authority.state().clone();
+        let Ok((token, binding)) = journal.actions.rebind_transferred(
+            caller,
+            old_token,
+            &old_binding,
+            transition_id,
+            &plan,
+            new_digest,
+        ) else {
+            return rejection("action_rebind_invalid");
+        };
+        if journal
+            .actions
+            .mark_transition_ready(caller, &token, &binding, transition_id)
+            .is_err()
+        {
+            return rejection("action_rebind_invalid");
+        }
+        let Ok((_, session_id, _, _)) = super::operations::target_parts(&work.target) else {
+            return rejection("invalid_target");
+        };
+        if super::providers::record_admission(
+            &mut journal,
+            session_id,
+            &admission_id,
+            &work.target,
+            &work.phase,
+            transition_id,
+        )
+        .is_err()
+        {
+            return rejection("action_admission_invalid");
+        }
+        let receipt = journal.receipts.get_mut(&key).expect("checked receipt");
+        let transfer = receipt
+            .work
+            .as_mut()
+            .and_then(|work| work.action_transfer.as_mut())
+            .expect("checked transfer");
+        transfer.permit = token.clone();
+        transfer.binding = binding.clone();
+        transfer.admission_id = Some(admission_id);
+        transfer.stage = super::ActionTransferStage::Rebound;
+        receipt.response["status"] = json!("succeeded");
+        receipt.response["plan_digest"] = json!(new_digest);
+        if save(&self.shared, journal).is_err() {
+            return json!({"status":"recovery_required","reason":"journal_write_failed"});
+        }
+        json!({"status":"succeeded","operation_id":binding.operation_id,"transition_id":transition_id,"target":binding.target,"plan_digest":binding.plan_digest,"permit_id":token})
+    }
 }
 
 fn action_transfer_in_progress(journal: &super::Journal) -> bool {
@@ -1078,6 +1252,104 @@ pub(super) fn action_borrower_scope(
     Ok(result)
 }
 
+pub(super) fn rebind_root_current(
+    journal: &super::Journal,
+    target: &amaterasu_extension_api::LifecycleTarget,
+    provider: &str,
+    plan: &ResourcePlan,
+) -> bool {
+    let amaterasu_extension_api::LifecycleTarget::Stream { session_id, .. } = target else {
+        return false;
+    };
+    let Some(session) = journal.sessions.get(session_id) else {
+        return false;
+    };
+    if session
+        .streams
+        .values()
+        .any(|stream| stream.phase != StreamPhase::Retired)
+        || session
+            .provider_settings
+            .get(provider)
+            .is_none_or(|settings| {
+                plan.constraints
+                    .get("selected_settings_revision")
+                    .and_then(Value::as_str)
+                    != Some(settings.revision.as_str())
+            })
+    {
+        return false;
+    }
+    let Some(disposition) = plan.resource_disposition.as_deref() else {
+        return false;
+    };
+    let expected_origin = amaterasu_extension_api::LifecycleTarget::Session {
+        host_epoch: session.host_epoch.clone(),
+        session_id: session.id.clone(),
+        generation: session.generation,
+    };
+    if disposition.origin != expected_origin {
+        return false;
+    }
+    let mut roots = journal.composition.records().filter(|root| {
+        root.output.producer == provider
+            && root.output.origin == disposition.origin
+            && root.output.output_id == disposition.output_id
+            && root.state == super::composition::OutputState::Retained
+    });
+    let Some(root) = roots.next() else {
+        return false;
+    };
+    if roots.next().is_some()
+        || super::resource_generation::current_root_generation(journal, root).ok()
+            != Some(disposition.resource_generation)
+    {
+        return false;
+    }
+    let old = &root.output.resource;
+    let new = &disposition.resource;
+    old.provider == new.provider
+        && old.resource_id == new.resource_id
+        && old.incarnation == new.incarnation
+        && old.execution_domain == new.execution_domain
+        && old.mutation_domain == new.mutation_domain
+        && old.mutation_domains == new.mutation_domains
+}
+
+fn rebind_borrower_scope(
+    journal: &super::Journal,
+    target: &amaterasu_extension_api::LifecycleTarget,
+    provider: &str,
+    plan: &ResourcePlan,
+) -> Result<BTreeSet<String>, &'static str> {
+    let amaterasu_extension_api::LifecycleTarget::Stream {
+        session_id,
+        stream_id,
+        ..
+    } = target
+    else {
+        return Err("stream_target_required");
+    };
+    if plan
+        .mutation_domains
+        .iter()
+        .any(|domain| domain.borrowers.contains_key(stream_id))
+    {
+        return Err("retired_stream_borrowed");
+    }
+    let mut scope = journal.clone();
+    let stream = scope
+        .sessions
+        .get_mut(session_id)
+        .and_then(|session| session.streams.get_mut(stream_id))
+        .ok_or("unknown_stream")?;
+    if stream.phase != StreamPhase::Retired {
+        return Err("stream_not_retired");
+    }
+    stream.phase = StreamPhase::Quiescing;
+    action_borrower_scope(&scope, target, provider, plan)
+}
+
 fn action_dependencies_clear(
     journal: &super::Journal,
     target: &amaterasu_extension_api::LifecycleTarget,
@@ -1174,6 +1446,14 @@ fn effect_rights_current(
     };
     if transfer.service != service || transfer.permit != token || transfer.binding != *binding {
         return false;
+    }
+    if transfer.stage == super::ActionTransferStage::Rebound {
+        let Ok((owner, _, plan)) = journal.actions.execution_for_permit(service, token) else {
+            return false;
+        };
+        return super::action_release_proof::validate_rebound_stage(
+            journal, receipt, work, transfer,
+        ) && rebind_root_current(journal, &work.target, &owner, &plan);
     }
     let Some(admission_id) = &transfer.admission_id else {
         return false;
@@ -1396,6 +1676,17 @@ mod tests {
         assert_eq!(
             coordinator.action_operation(&service, "service", &consume)["status"],
             "rejected"
+        );
+        let canonical_plan: ResourcePlan = serde_json::from_value(plan.clone()).unwrap();
+        let canonical_plan = serde_json::to_value(canonical_plan).unwrap();
+        let rebind = json!({"operation":"rebind_action_plan","operation_id":"op","transition_id":"transition","target":target,"old_permit":reply["permit"],"old_plan_digest":request["plan_digest"],"new_plan_digest":digest(&canonical_plan).unwrap(),"new_plan":canonical_plan});
+        assert_eq!(
+            coordinator.action_operation("evil", "evil", &rebind)["reason"],
+            "permission_denied"
+        );
+        assert_eq!(
+            coordinator.action_operation(&service, "service", &rebind)["reason"],
+            "action_transition_missing"
         );
         let complete = json!({"operation":"complete_action","operation_id":"op","action_id":"example/read","target":request["target"],"plan_digest":request["plan_digest"],"permit":reply["permit"],"outcome":"succeeded","provider_receipt":{}});
         assert_eq!(

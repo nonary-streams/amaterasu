@@ -309,6 +309,48 @@ pub(super) fn validate_replan_stage(
             .has_valid_released(journal, &work.target)
 }
 
+/// Rebound reservations retain all cleanup evidence and their exact new rights.
+pub(super) fn validate_rebound_stage(
+    journal: &Journal,
+    receipt: &Receipt,
+    work: &Work,
+    transfer: &ActionTransfer,
+) -> bool {
+    let Some(proof) = &transfer.release_proof else {
+        return false;
+    };
+    let Some(id) = &transfer.admission_id else {
+        return false;
+    };
+    let Some(admission) = journal.authority.admissions.get(id) else {
+        return false;
+    };
+    let Ok((owner, _, plan)) = journal
+        .actions
+        .execution_for_permit(&transfer.service, &transfer.permit)
+    else {
+        return false;
+    };
+    receipt.response["status"] == "succeeded"
+        && receipt.response["operation_id"].as_str() == Some(transfer.binding.operation_id.as_str())
+        && receipt.response["target"]
+            == serde_json::to_value(&transfer.binding.target).unwrap_or(Value::Null)
+        && receipt.response["plan_digest"].as_str() == Some(transfer.binding.plan_digest.as_str())
+        && admission.provider == owner
+        && admission.plan == plan
+        && admission
+            .rights
+            .iter()
+            .all(|(domain, _)| journal.authority.domain_locks.get(domain) == Some(id))
+        && validate_graph_callbacks(journal, work, proof)
+        && journal
+            .stream_releases
+            .has_released_for(&work.target, &owner, &work.transition_id)
+        && journal
+            .stream_releases
+            .has_valid_released(journal, &work.target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
