@@ -18,7 +18,6 @@ mod finalize_dispatch;
 mod finalize_endpoints;
 #[allow(dead_code)]
 mod finalize_result;
-mod finalize_endpoints;
 mod finalize_result_verify;
 #[allow(dead_code)] // Finalization selection remains gated until composition sequencing is wired.
 mod finalize_selection;
