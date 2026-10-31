@@ -253,6 +253,9 @@ pub struct SourceEncoderRegistration {
     pub control_service: String,
     pub native_service: String,
     pub source_ids: BTreeSet<u64>,
+    /// Trusted startup allowlist; a provider claim alone does not add a profile.
+    #[serde(default)]
+    pub extension_profiles: Vec<amaterasu_contracts::media_profile::VideoProfile>,
 }
 
 #[derive(Deserialize)]
@@ -260,6 +263,9 @@ pub struct SourceEncoderRegistration {
 pub struct Settings {
     #[serde(default)]
     pub enabled: bool,
+    /// Separately granted negotiated-unit service, absent in legacy deployments.
+    #[serde(default)]
+    pub unit_service: Option<String>,
     #[serde(default = "default_providers")]
     pub capture_providers: BTreeSet<CaptureProvider>,
     #[serde(default)]
@@ -299,6 +305,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: false,
+            unit_service: None,
             capture_providers: default_providers(),
             external_capture_providers: BTreeMap::new(),
             external_encoder_providers: BTreeMap::new(),
@@ -316,6 +323,13 @@ impl Settings {
     fn source_services_distinct(&self) -> bool {
         let mut occupied: BTreeSet<&str> = BTreeSet::new();
         occupied.insert("amaterasu.encode/1");
+        if self
+            .unit_service
+            .as_deref()
+            .is_some_and(|service| !occupied.insert(service))
+        {
+            return false;
+        }
         for provider in &self.capture_providers {
             if !occupied.insert(provider.service()) {
                 return false;
@@ -360,9 +374,13 @@ impl Settings {
         })
     }
     pub fn validate(&self) -> Result<(), &'static str> {
-        if (self.capture_providers.is_empty()
-            && self.external_capture_providers.is_empty()
-            && self.source_encoder_providers.is_empty())
+        if self
+            .unit_service
+            .as_deref()
+            .is_some_and(|name| !valid_external_service(name) || name == "amaterasu.video/1")
+            || (self.capture_providers.is_empty()
+                && self.external_capture_providers.is_empty()
+                && self.source_encoder_providers.is_empty())
             || !self.source_services_distinct()
             || self
                 .capture_providers
@@ -408,6 +426,10 @@ impl Settings {
                         || !valid_external_service(&registration.control_service)
                         || !valid_external_service(&registration.native_service)
                         || registration.control_service == registration.native_service
+                        || !(amaterasu_contracts::media_profile::VideoProfileSnapshot {
+                            profiles: registration.extension_profiles.clone(),
+                        })
+                        .validate()
                         || registration.control_service == "amaterasu.encode/1"
                         || registration.source_ids.is_empty()
                         || registration.source_ids.contains(&0)
@@ -477,6 +499,9 @@ impl Settings {
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Configuration {
+    /// Extension identity, only valid for an independently allowlisted source encoder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_profile: Option<amaterasu_contracts::media_profile::VideoProfile>,
     /// Codec and range accepted by the authenticated RTSP ANNOUNCE.
     #[serde(
         default = "default_video_stream_format",
@@ -612,7 +637,11 @@ impl Configuration {
     }
 
     pub fn validate_source(&self) -> bool {
-        self.video_stream_format.validate().is_ok()
+        self.extension_profile.as_ref().is_none_or(|profile| {
+            profile.is_valid()
+                && self.video_stream_format == default_video_stream_format()
+                && self.codec == VideoCodec::H264
+        }) && self.video_stream_format.validate().is_ok()
             && ((self.video_stream_format.bit_depth == 8
                 && self.video_stream_format.dynamic_range
                     == amaterasu_module_sdk::DynamicRange::Sdr)
@@ -636,7 +665,8 @@ impl Configuration {
     }
 
     pub fn validate(&self) -> bool {
-        self.video_stream_format.validate().is_ok()
+        self.extension_profile.is_none()
+            && self.video_stream_format.validate().is_ok()
             && ((self.video_stream_format.bit_depth == 8
                 && self.video_stream_format.dynamic_range
                     == amaterasu_module_sdk::DynamicRange::Sdr)
@@ -1439,6 +1469,7 @@ mod tests {
 
         let settings = Settings {
             enabled: true,
+            unit_service: None,
             capture_providers: [CaptureProvider::X11].into(),
             external_capture_providers: BTreeMap::new(),
             external_encoder_providers: BTreeMap::new(),
@@ -1465,6 +1496,7 @@ mod tests {
 
         let settings = Settings {
             enabled: true,
+            unit_service: None,
             capture_providers: [CaptureProvider::Kms].into(),
             external_capture_providers: BTreeMap::new(),
             external_encoder_providers: BTreeMap::new(),

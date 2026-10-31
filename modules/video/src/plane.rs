@@ -695,6 +695,28 @@ impl Plane for NativePlane {
         if !encoder_provider_available(api.base.header) {
             return Err("encoder_interface");
         }
+        if let Some(profile) = &configuration.extension_profile {
+            let id = |format: amaterasu_contracts::media_profile::FormatId| EncoderFormatId {
+                namespace_id: format.namespace_id,
+                value: format.value,
+                schema: format.schema,
+            };
+            let selection = crate::queue::UnitSelection {
+                stream: video,
+                generation: video,
+                offer_id: u64::from(profile.wire_selector),
+                source_id,
+                config_generation: 1,
+                codec: id(profile.codec),
+                framing: id(profile.framing),
+                clock_epoch,
+            };
+            self.queues
+                .lock()
+                .map_err(|_| "queue_failed")?
+                .configure_units(video, selection)
+                .map_err(|_| "unit_queue_configuration_failed")?;
+        }
         // SAFETY: control service authorized this session and bindings outlive it.
         let source = unsafe {
             source::Source::open(
@@ -1792,6 +1814,7 @@ mod tests {
             drain,
         };
         let configuration = Configuration {
+            extension_profile: None,
             video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 16,
             height: 16,
@@ -1873,6 +1896,7 @@ mod tests {
             drain,
         };
         let configuration = Configuration {
+            extension_profile: None,
             video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 16,
             height: 16,
@@ -1992,6 +2016,7 @@ mod tests {
             drain,
         };
         let configuration = Configuration {
+            extension_profile: None,
             video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 16,
             height: 16,
@@ -2180,6 +2205,7 @@ mod tests {
             drain,
         };
         let configuration = Configuration {
+            extension_profile: None,
             video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 16,
             height: 16,
@@ -2249,6 +2275,7 @@ mod tests {
             drain,
         };
         let configuration = Configuration {
+            extension_profile: None,
             video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             width: 16,
             height: 16,

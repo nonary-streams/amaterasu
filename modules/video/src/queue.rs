@@ -1,9 +1,13 @@
 //! Bounded encoded packet ownership shared with native consumer bindings.
 use amaterasu_media::{
-    EncodedPacket, FLAG_END_OF_STREAM, MAX_PACKET_BYTES, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_PENDING,
-    PacketSink,
+    ENCODER_CHUNK_ACCESS_UNIT_END, ENCODER_CHUNK_ACCESS_UNIT_START, ENCODER_CHUNK_END_OF_STREAM,
+    ENCODER_CHUNK_KEYFRAME, EncodedPacket, EncoderFormatId, EncoderOutputChunk, FLAG_END_OF_STREAM,
+    FRAME_CLOCK_STREAM_RELATIVE, FrameClockMetadata, MAX_PACKET_BYTES, MAX_VIDEO_ACCESS_UNIT_BYTES,
+    MAX_VIDEO_ACCESS_UNIT_FRAGMENTS, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_PENDING, NegotiatedVideoUnit,
+    NegotiatedVideoUnitSink, PacketSink, VIDEO_UNIT_END_OF_STREAM, VIDEO_UNIT_KEYFRAME,
+    VIDEO_UNIT_VERSION,
 };
-use amaterasu_module_sdk::abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
+use amaterasu_module_sdk::abi::{BorrowedBytes, STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
 use std::collections::{BTreeMap, VecDeque};
 
 struct Packet {
@@ -24,6 +28,38 @@ struct Stream {
     geometry: Option<amaterasu_media::CaptureGeometry>,
     hdr: Option<amaterasu_media::HdrMetadata>,
     packets: VecDeque<Packet>,
+    bytes: usize,
+    eos_queued: bool,
+    eos_accepted: bool,
+    negotiated: Option<UnitQueue>,
+}
+
+/// Authenticated session composition fixes these values before output begins.
+#[derive(Clone, Copy)]
+pub struct UnitSelection {
+    pub stream: u64,
+    pub generation: u64,
+    pub offer_id: u64,
+    pub source_id: u64,
+    pub config_generation: u64,
+    pub codec: EncoderFormatId,
+    pub framing: EncoderFormatId,
+    pub clock_epoch: [u8; 16],
+}
+
+struct Unit {
+    access_unit_id: u64,
+    submission_id: u64,
+    timestamp_us: u64,
+    flags: u32,
+    bytes: Vec<u8>,
+    fragments: usize,
+}
+
+struct UnitQueue {
+    selection: UnitSelection,
+    current: Option<Unit>,
+    ready: VecDeque<Unit>,
     bytes: usize,
     eos_queued: bool,
     eos_accepted: bool,
@@ -51,6 +87,7 @@ impl Queues {
                 bytes: 0,
                 eos_queued: false,
                 eos_accepted: false,
+                negotiated: None,
             },
         );
     }
@@ -93,16 +130,220 @@ impl Queues {
         self.streams.remove(&id);
     }
 
+    pub fn configure_units(&mut self, id: u64, selection: UnitSelection) -> Result<(), Status> {
+        let stream = self.streams.get_mut(&id).ok_or(MEDIA_CLOSED)?;
+        let valid = |id: EncoderFormatId| id.namespace_id != 0 && id.value != 0 && id.schema != 0;
+        if selection.stream != id
+            || selection.generation == 0
+            || selection.offer_id == 0
+            || selection.source_id == 0
+            || selection.config_generation == 0
+            || selection.clock_epoch == [0; 16]
+            || !valid(selection.codec)
+            || !valid(selection.framing)
+            || stream.negotiated.is_some()
+            || !stream.packets.is_empty()
+            || stream.eos_queued
+        {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        stream.negotiated = Some(UnitQueue {
+            selection,
+            current: None,
+            ready: VecDeque::new(),
+            bytes: 0,
+            eos_queued: false,
+            eos_accepted: false,
+        });
+        Ok(())
+    }
+
+    /// # Safety
+    /// The encoder owns initialized chunk bytes throughout this synchronous call.
+    pub unsafe fn push_unit_chunk(&mut self, id: u64, chunk: &EncoderOutputChunk) -> Status {
+        let Some(queue) = self
+            .streams
+            .get_mut(&id)
+            .and_then(|s| s.negotiated.as_mut())
+        else {
+            return MEDIA_CLOSED;
+        };
+        if queue.eos_queued {
+            return MEDIA_CLOSED;
+        }
+        let selection = queue.selection;
+        let same = |a: EncoderFormatId, b: EncoderFormatId| {
+            a.namespace_id == b.namespace_id && a.value == b.value && a.schema == b.schema
+        };
+        let flags = chunk.flags;
+        let eos = flags == ENCODER_CHUNK_END_OF_STREAM;
+        let start = flags & ENCODER_CHUNK_ACCESS_UNIT_START != 0;
+        let end = flags & ENCODER_CHUNK_ACCESS_UNIT_END != 0;
+        let picture = flags & ENCODER_CHUNK_KEYFRAME != 0;
+        if chunk.size < std::mem::size_of::<EncoderOutputChunk>() as u32
+            || chunk.source_id != selection.source_id
+            || chunk.config_generation != selection.config_generation
+            || !same(chunk.codec, selection.codec)
+            || !same(chunk.framing, selection.framing)
+            || flags
+                & !(ENCODER_CHUNK_ACCESS_UNIT_START
+                    | ENCODER_CHUNK_ACCESS_UNIT_END
+                    | ENCODER_CHUNK_KEYFRAME
+                    | ENCODER_CHUNK_END_OF_STREAM)
+                != 0
+            || (flags & ENCODER_CHUNK_END_OF_STREAM != 0 && !eos)
+            || (eos && (chunk.bytes.len != 0 || queue.current.is_some()))
+            || (!eos
+                && (chunk.access_unit_id == 0
+                    || chunk.bytes.len == 0
+                    || chunk.bytes.len > MAX_PACKET_BYTES
+                    || chunk.bytes.ptr.is_null()))
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        if queue
+            .current
+            .as_ref()
+            .map_or(0, |unit| unit.bytes.len())
+            .checked_add(chunk.bytes.len)
+            .is_none_or(|n| n > MAX_VIDEO_ACCESS_UNIT_BYTES)
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        if queue.ready.len() >= 4
+            || queue
+                .bytes
+                .checked_add(chunk.bytes.len)
+                .is_none_or(|n| n > MAX_VIDEO_ACCESS_UNIT_BYTES)
+        {
+            return MEDIA_BUSY;
+        }
+        match &queue.current {
+            Some(unit)
+                if eos
+                    || start
+                    || unit.access_unit_id != chunk.access_unit_id
+                    || unit.submission_id != chunk.submission_id
+                    || unit.timestamp_us != chunk.timestamp_us
+                    || (unit.flags == VIDEO_UNIT_KEYFRAME) != picture
+                    || unit.fragments >= MAX_VIDEO_ACCESS_UNIT_FRAGMENTS =>
+            {
+                return STATUS_INVALID_ARGUMENT;
+            }
+            None if !eos && !start => return STATUS_INVALID_ARGUMENT,
+            _ => {}
+        }
+        let bytes = if chunk.bytes.len == 0 {
+            &[][..]
+        } else {
+            // SAFETY: caller guarantees this chunk allocation remains live.
+            unsafe { std::slice::from_raw_parts(chunk.bytes.ptr, chunk.bytes.len) }
+        };
+        if eos {
+            queue.eos_queued = true;
+            queue.ready.push_back(Unit {
+                access_unit_id: chunk.access_unit_id,
+                submission_id: chunk.submission_id,
+                timestamp_us: chunk.timestamp_us,
+                flags: VIDEO_UNIT_END_OF_STREAM,
+                bytes: Vec::new(),
+                fragments: 0,
+            });
+            return STATUS_OK;
+        }
+        let unit = queue.current.get_or_insert_with(|| Unit {
+            access_unit_id: chunk.access_unit_id,
+            submission_id: chunk.submission_id,
+            timestamp_us: chunk.timestamp_us,
+            flags: if picture { VIDEO_UNIT_KEYFRAME } else { 0 },
+            bytes: Vec::new(),
+            fragments: 0,
+        });
+        unit.bytes.extend_from_slice(bytes);
+        unit.fragments += 1;
+        queue.bytes += bytes.len();
+        if end {
+            queue
+                .ready
+                .push_back(queue.current.take().expect("unit initialized"));
+        }
+        STATUS_OK
+    }
+
+    /// # Safety
+    /// Sink must obey the synchronous borrowed-unit contract and not reenter.
+    pub unsafe fn receive_unit(
+        &mut self,
+        owner: &str,
+        id: u64,
+        sink: NegotiatedVideoUnitSink,
+    ) -> Status {
+        let Some(queue) = self
+            .streams
+            .get_mut(&id)
+            .filter(|s| s.owner == owner)
+            .and_then(|s| s.negotiated.as_mut())
+        else {
+            return MEDIA_CLOSED;
+        };
+        let Some(unit) = queue.ready.front() else {
+            return if queue.eos_accepted {
+                MEDIA_CLOSED
+            } else {
+                MEDIA_PENDING
+            };
+        };
+        let s = queue.selection;
+        let header = NegotiatedVideoUnit {
+            size: std::mem::size_of::<NegotiatedVideoUnit>() as u32,
+            version: VIDEO_UNIT_VERSION,
+            stream: s.stream,
+            generation: s.generation,
+            offer_id: s.offer_id,
+            codec: s.codec,
+            framing: s.framing,
+            access_unit_id: unit.access_unit_id,
+            submission_id: unit.submission_id,
+            source_id: s.source_id,
+            config_generation: s.config_generation,
+            timestamp_us: unit.timestamp_us,
+            clock: FrameClockMetadata {
+                size: std::mem::size_of::<FrameClockMetadata>() as u32,
+                version: 1,
+                domain: FRAME_CLOCK_STREAM_RELATIVE,
+                reserved: 0,
+                epoch_id: s.clock_epoch,
+            },
+            flags: unit.flags,
+            reserved: 0,
+            data: BorrowedBytes::new(&unit.bytes),
+        };
+        // SAFETY: queue retains header and bytes during this synchronous callback.
+        let status = unsafe { (sink.write)(sink.context, &header) };
+        if status == STATUS_OK {
+            queue.eos_accepted = unit.flags == VIDEO_UNIT_END_OF_STREAM;
+            queue.bytes -= unit.bytes.len();
+            queue.ready.pop_front();
+        }
+        status
+    }
+
     pub fn eos_queued(&self, id: u64) -> bool {
-        self.streams
-            .get(&id)
-            .is_some_and(|stream| stream.eos_queued)
+        self.streams.get(&id).is_some_and(|stream| {
+            stream
+                .negotiated
+                .as_ref()
+                .map_or(stream.eos_queued, |q| q.eos_queued)
+        })
     }
 
     pub fn eos_accepted(&self, id: u64) -> bool {
-        self.streams
-            .get(&id)
-            .is_some_and(|stream| stream.eos_accepted)
+        self.streams.get(&id).is_some_and(|stream| {
+            stream
+                .negotiated
+                .as_ref()
+                .map_or(stream.eos_accepted, |q| q.eos_accepted)
+        })
     }
 
     /// # Safety
@@ -111,6 +352,9 @@ impl Queues {
         let Some(stream) = self.streams.get_mut(&id) else {
             return MEDIA_CLOSED;
         };
+        if stream.negotiated.is_some() {
+            return STATUS_INVALID_ARGUMENT;
+        }
         if stream.eos_queued {
             return MEDIA_CLOSED;
         }
@@ -154,6 +398,9 @@ impl Queues {
         else {
             return MEDIA_CLOSED;
         };
+        if stream.negotiated.is_some() {
+            return STATUS_INVALID_ARGUMENT;
+        }
         let Some(packet) = stream.packets.front() else {
             return if stream.eos_accepted {
                 MEDIA_CLOSED

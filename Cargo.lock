@@ -900,6 +900,7 @@ dependencies = [
 name = "amaterasu-video"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-contracts",
  "amaterasu-media",
  "amaterasu-module-sdk",
  "cc",

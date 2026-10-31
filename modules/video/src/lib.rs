@@ -39,6 +39,7 @@ pub struct Video {
     pipeline: Pipeline,
     plane: Box<dyn Plane>,
     _factory: Box<native::Factory>,
+    _unit_factory: Option<Box<native::unit::Factory>>,
 }
 
 impl ManagedModule for Video {
@@ -70,11 +71,15 @@ impl ManagedModule for Video {
         };
         let mut random = [0u8; 8];
         getrandom::fill(&mut random).map_err(|_| "video entropy unavailable")?;
+        let unit_service = settings.unit_service.clone();
         let pipeline = Pipeline::new(
             settings,
             format!("{:016x}", u64::from_le_bytes(random)),
             queues.clone(),
         );
+        let unit_factory = unit_service
+            .as_ref()
+            .map(|_| native::unit::Factory::new(queues.clone()));
         let factory = native::Factory::new(queues);
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
@@ -82,11 +87,22 @@ impl ManagedModule for Video {
         // SAFETY: factory is boxed before registration and retained through module
         // lifetime. Signed dependency order stops consumers before destroying video.
         unsafe { amaterasu_module_sdk::video::register(&runtime, SERVICE, &factory.api) }?;
+        if let (Some(service), Some(factory)) = (unit_service, &unit_factory) {
+            // SAFETY: the optional factory is boxed and retained until module unload.
+            unsafe {
+                amaterasu_module_sdk::video_framing::register_video(
+                    &runtime,
+                    &service,
+                    &factory.api,
+                )
+            }?;
+        }
         Ok(Self {
             runtime,
             pipeline,
             plane,
             _factory: factory,
+            _unit_factory: unit_factory,
         })
     }
 

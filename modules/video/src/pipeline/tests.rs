@@ -718,6 +718,7 @@ fn open() -> Operation {
         encoder: EncoderSelection::Identity(encoder_identity()),
         encoder_provider: None,
         configuration: Box::new(Configuration {
+            extension_profile: None,
             video_stream_format: amaterasu_module_sdk::VideoStreamFormat::H264_SDR,
             slices_per_frame: 1,
             qp: 28,
@@ -4536,6 +4537,7 @@ fn source_open_owns_operation_without_opening_capture_and_routes_cleanup() {
     pipeline.source_encoders.insert(
         "fixture".into(),
         crate::model::SourceEncoderRegistration {
+            extension_profiles: Vec::new(),
             control_service: "example.encode/1".into(),
             native_service: "example.encode-provider/1".into(),
             source_ids: [42].into(),
@@ -4584,6 +4586,74 @@ fn source_open_owns_operation_without_opening_capture_and_routes_cleanup() {
     assert!(!pipeline.streams.contains_key(&1));
     assert!(runtime.commands.iter().any(|command| matches!(command, Command::Request {service, payload, ..} if service == "example.encode/1" && payload["action"] == "close" && payload["session_id"] == 51)));
     assert!(!runtime.commands.iter().any(|command| matches!(command, Command::Request {service, payload, ..} if capture_provider_for_service(service).is_some() && matches!(payload["action"].as_str(), Some("lookup" | "close")))));
+}
+
+#[test]
+fn extension_source_requires_trusted_profile_and_configured_unit_service() {
+    use amaterasu_contracts::media_profile::{FormatId, VideoProfile};
+    let profile = VideoProfile {
+        codec: FormatId {
+            namespace_id: 7,
+            value: 8,
+            schema: 1,
+        },
+        framing: FormatId {
+            namespace_id: 7,
+            value: 9,
+            schema: 1,
+        },
+        wire_selector: 4,
+        payload_type: 100,
+        encoding_name: "EXAMPLE".into(),
+    };
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline.source_encoders.insert(
+        "fixture".into(),
+        crate::model::SourceEncoderRegistration {
+            control_service: "example.encode/1".into(),
+            native_service: "example.encode-native/1".into(),
+            source_ids: [42].into(),
+            extension_profiles: vec![profile.clone()],
+        },
+    );
+    let source = || {
+        let mut configuration = open_configuration();
+        configuration.extension_profile = Some(profile.clone());
+        Operation::OpenSource {
+            packet_boundaries: true,
+            operation_id: None,
+            source_id: 42,
+            encoder_options: None,
+            encoder_provider: "fixture".into(),
+            encoder: EncoderSelection::Identity(encoder_identity()),
+            configuration: Box::new(configuration),
+        }
+    };
+    pipeline.handle("alice", 91, source(), &mut |command| runtime.send(command));
+    assert_eq!(
+        runtime.completed.last().unwrap().1["code"],
+        "encoder_extension_profile_not_allowed"
+    );
+    pipeline.unit_service_enabled = true;
+    pipeline.handle("alice", 92, source(), &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 5);
+    assert_eq!(plane.source_starts, [(1, 51, 42)]);
+    let response = &runtime
+        .completed
+        .iter()
+        .find(|(id, _)| *id == 92)
+        .unwrap_or_else(|| {
+            panic!(
+                "completed {:?}; parent {:?}; stage {:?}",
+                runtime.completed,
+                pipeline.streams[&1].parent,
+                stage_name(pipeline.streams[&1].stage)
+            )
+        })
+        .1;
+    assert_eq!(response["negotiated_unit"]["stream"], 1);
+    assert_eq!(response["negotiated_unit"]["offer_id"], 4);
+    assert_eq!(response["negotiated_unit"]["source_id"], 42);
 }
 
 #[test]
@@ -4679,6 +4749,7 @@ fn source_options_are_forwarded_and_part_of_operation_identity() {
     pipeline.source_encoders.insert(
         "fixture".into(),
         crate::model::SourceEncoderRegistration {
+            extension_profiles: Vec::new(),
             control_service: "example.encode/1".into(),
             native_service: "example.encode-provider/1".into(),
             source_ids: [42].into(),

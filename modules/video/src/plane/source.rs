@@ -117,22 +117,45 @@ impl Source {
                 size_of::<EncoderCommonConfigV1>(),
             )
         };
+        let (codec, framing) = if let Some(profile) = &configuration.extension_profile {
+            (
+                EncoderFormatId {
+                    namespace_id: profile.codec.namespace_id,
+                    value: profile.codec.value,
+                    schema: profile.codec.schema,
+                },
+                EncoderFormatId {
+                    namespace_id: profile.framing.namespace_id,
+                    value: profile.framing.value,
+                    schema: profile.framing.schema,
+                },
+            )
+        } else {
+            (
+                id(u64::from(configuration.codec.abi_id())),
+                id(if configuration.codec == VideoCodec::Av1 {
+                    ENCODER_FRAMING_AV1_OBU
+                } else {
+                    ENCODER_FRAMING_ANNEX_B
+                }),
+            )
+        };
         let config = EncoderSessionConfig {
             size: size_of::<EncoderSessionConfig>() as u32,
             mode: ENCODER_SESSION_SOURCE,
-            codec: id(u64::from(configuration.codec.abi_id())),
-            framing: id(if configuration.codec == VideoCodec::Av1 {
-                ENCODER_FRAMING_AV1_OBU
-            } else {
-                ENCODER_FRAMING_ANNEX_B
-            }),
+            codec,
+            framing,
             source_id: source,
             config_generation: 1,
             options_schema: id(ENCODER_SCHEMA_COMMON_CONFIG),
             options: BorrowedBytes::new(bytes),
         };
-        let output = ProviderOutput::new(session, video, &config)
-            .map_err(|_| "encoder_format_unsupported")?;
+        let output = if configuration.extension_profile.is_some() {
+            ProviderOutput::new_negotiated(session, video, &config)
+        } else {
+            ProviderOutput::new(session, video, &config)
+        }
+        .map_err(|_| "encoder_format_unsupported")?;
         let mut probe = Reply {
             calls: 0,
             request: 0,

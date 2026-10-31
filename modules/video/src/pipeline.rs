@@ -399,6 +399,17 @@ impl Stream {
         if let Some(touch_port) = &self.touch_port {
             response["touch_port"] = touch_port.clone();
         }
+        if self.source_started
+            && let (Some(profile), Some(source_id)) =
+                (&self.configuration.extension_profile, self.source_id)
+        {
+            response["negotiated_unit"] = json!({
+                "stream": id, "generation": id, "offer_id": profile.wire_selector,
+                "source_id": source_id, "config_generation": 1,
+                "codec": profile.codec, "framing": profile.framing,
+                "clock_epoch": self.clock_epoch, "clock_origin_us": self.clock_origin_us,
+            });
+        }
         if let Some(frame) = self.last_frame {
             response["last_capture_frame"] = json!({
                 "width": frame.width,
@@ -431,6 +442,7 @@ impl Stream {
 
 pub struct Pipeline {
     require_frame_lease: bool,
+    unit_service_enabled: bool,
     enabled: bool,
     providers: BTreeSet<CaptureProvider>,
     encoder_providers: BTreeMap<String, String>,
@@ -464,6 +476,7 @@ impl Pipeline {
     pub fn new(settings: Settings, epoch: String, queues: Arc<Mutex<Queues>>) -> Self {
         Self {
             require_frame_lease: settings.require_frame_lease,
+            unit_service_enabled: settings.unit_service.is_some(),
             enabled: settings.enabled,
             providers: settings.resolved_providers(),
             encoder_providers: settings.external_encoder_providers,
@@ -723,6 +736,17 @@ impl Pipeline {
                 rpc::complete(send, request, error("encoder_source_not_allowed"));
                 return;
             };
+            if let Some(profile) = &specification.configuration.extension_profile
+                && (!self.unit_service_enabled
+                    || !registration.extension_profiles.contains(profile))
+            {
+                rpc::complete(
+                    send,
+                    request,
+                    error("encoder_extension_profile_not_allowed"),
+                );
+                return;
+            }
             if !matches!(specification.encoder, EncoderSelection::Identity(_)) {
                 rpc::complete(send, request, error("source_encoder_identity_required"));
                 return;
@@ -1032,7 +1056,17 @@ impl Pipeline {
                         stream.clock_origin_us,
                         stream.clock_epoch,
                     ) {
-                        Ok(()) => stream.source_started = true,
+                        Ok(()) => {
+                            stream.source_started = true;
+                            if stream.configuration.extension_profile.is_some()
+                                && let Some(parent) = stream.parent.take()
+                                && !rpc::complete(send, parent, stream.response(id))
+                            {
+                                stream.ending_parent = Some(parent);
+                                stream.cleanup("completion_lost");
+                                return;
+                            }
+                        }
                         Err(code) => {
                             stream.cleanup(code);
                             return;
@@ -2055,6 +2089,14 @@ fn apply_result(
                 stream.frame_path = FramePath::Generic;
             }
             if let Some(source_id) = stream.source_id {
+                if stream.configuration.extension_profile.is_some() {
+                    let Ok(mut guard) = queues.lock() else {
+                        stream.cleanup("queue_failed");
+                        return false;
+                    };
+                    guard.open(id, &stream.owner, stream.clock_origin_us);
+                    guard.set_geometry(id, stream.desktop_geometry);
+                }
                 if let Err(code) = plane.start_source(
                     id,
                     stream.session.unwrap(),
@@ -2063,6 +2105,11 @@ fn apply_result(
                     stream.clock_origin_us,
                     stream.clock_epoch,
                 ) {
+                    if stream.configuration.extension_profile.is_some()
+                        && let Ok(mut guard) = queues.lock()
+                    {
+                        guard.close(id);
+                    }
                     stream.cleanup(code);
                     return false;
                 }
@@ -3177,8 +3224,10 @@ fn activate(stream: &mut Stream, id: u64, queues: &Arc<Mutex<Queues>>, send: &mu
         stream.cleanup("queue_failed");
         return;
     };
-    guard.open(id, &stream.owner, stream.clock_origin_us);
-    guard.set_geometry(id, stream.desktop_geometry);
+    if stream.configuration.extension_profile.is_none() {
+        guard.open(id, &stream.owner, stream.clock_origin_us);
+        guard.set_geometry(id, stream.desktop_geometry);
+    }
     drop(guard);
     stream.stage = Stage::Running;
     if let Some(parent) = stream.parent.take()
