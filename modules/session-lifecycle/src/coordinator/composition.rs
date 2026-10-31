@@ -5,9 +5,11 @@
 //! schema validation and active-resource reobservation are external prerequisites;
 //! this module never treats serialized provider data as authorization.
 use crate::adapter::SchemaDocument;
+use crate::prepare_authority::{Admission, ControlPermit};
 use crate::prepare_authority::{ControlPolicy, FinalizePolicy, MethodApproval};
 use amaterasu_extension_api::{
-    LifecycleTarget, ResourceAccess, ResourceOutput, ResourcePlan, SchemaRef,
+    LifecycleTarget, ResourceAccess, ResourceControlRequest, ResourceObligation, ResourceOutput,
+    ResourcePlan, SchemaRef,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -34,6 +36,16 @@ pub struct StoredOutput {
     pub transition_id: String,
     pub plan: ResourcePlan,
     pub state: OutputState,
+}
+
+/// Authenticated control confirmation retained alongside its original
+/// pre-effect obligation; no field of that obligation is replaced.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObligationRefinement {
+    pub request: ResourceControlRequest,
+    pub original: ResourceObligation,
+    pub confirmed: ResourceOutput,
 }
 
 /// Frozen installed selection, broker approvals and exact upstream provenance.
@@ -140,6 +152,8 @@ pub struct CompositionBook {
     /// Selected dependencies and approvals survive completed work and pause.
     #[serde(default)]
     selections: Vec<CompositionSelectionSnapshot>,
+    #[serde(default)]
+    refinements: Vec<ObligationRefinement>,
 }
 
 /// A policy-selected direct dependency. Schema is immutable and pinned by digest.
@@ -163,6 +177,7 @@ impl CompositionBook {
     pub fn validate_structure(&self) -> bool {
         self.outputs.len() <= MAX_OUTPUTS
             && self.selections.len() <= MAX_OUTPUTS
+            && self.refinements.len() <= MAX_OUTPUTS
             && self.outputs.iter().enumerate().all(|(index, item)| {
                 valid_stored(item)
                     && !self.outputs[..index]
@@ -179,6 +194,13 @@ impl CompositionBook {
                             .iter()
                             .any(|old| same_selection(old, selection))
                 })
+            && self.refinements.iter().enumerate().all(|(index, item)| {
+                valid_refinement_shape(item)
+                    && !self.refinements[..index].iter().any(|old| {
+                        old.request.permit_id == item.request.permit_id
+                            && old.original.obligation_id == item.original.obligation_id
+                    })
+            })
     }
 
     pub fn records(&self) -> impl Iterator<Item = &StoredOutput> {
@@ -193,6 +215,71 @@ impl CompositionBook {
                 .selections
                 .iter()
                 .any(|selection| selection.input.admission_id == admission_id)
+            || self
+                .refinements
+                .iter()
+                .any(|item| item.request.admission_id == admission_id)
+    }
+
+    pub fn refinements(&self) -> impl Iterator<Item = &ObligationRefinement> {
+        self.refinements.iter()
+    }
+
+    /// The immutable settlement identity is the consumed permit ID plus the
+    /// original obligation ID. These selectors never grant authority by themselves.
+    pub fn refinement(
+        &self,
+        permit_id: &str,
+        obligation_id: &str,
+    ) -> Option<&ObligationRefinement> {
+        self.refinements.iter().find(|item| {
+            item.request.permit_id == permit_id && item.original.obligation_id == obligation_id
+        })
+    }
+
+    /// The consumed permit and admission must come from the locked journal;
+    /// caller authenticates the owner result. The verifier checks installed
+    /// schema semantics and a confirmed non-null native snapshot/readback.
+    pub fn record_refinement(
+        &mut self,
+        item: ObligationRefinement,
+        permit: &ControlPermit,
+        admission: &Admission,
+        verify_snapshot: &impl Fn(&ObligationRefinement) -> bool,
+    ) -> Result<(), &'static str> {
+        if !permit.consumed
+            || permit.request != item.request
+            || permit.context.target != item.request.target
+            || permit.context.transition_id != item.request.transition_id
+            || permit.context.output.schema != item.confirmed.schema
+            || permit.context.output.origin != item.confirmed.origin
+            || permit.context.output.capability != item.confirmed.capability
+            || admission.provider != permit.context.policy.dependent_provider
+            || !admission.plan.obligations.contains(&item.original)
+            || !admission
+                .plan
+                .control_proposals
+                .contains(&item.request.proposal)
+            || !valid_refinement_shape(&item)
+            || !verify_snapshot(&item)
+        {
+            return Err("invalid_obligation_refinement");
+        }
+        if let Some(old) = self.refinements.iter().find(|old| {
+            old.request.permit_id == item.request.permit_id
+                && old.original.obligation_id == item.original.obligation_id
+        }) {
+            return if old == &item {
+                Ok(())
+            } else {
+                Err("obligation_refinement_conflict")
+            };
+        }
+        if self.refinements.len() >= MAX_OUTPUTS {
+            return Err("refinement_capacity");
+        }
+        self.refinements.push(item);
+        Ok(())
     }
 
     pub fn selections(&self) -> impl Iterator<Item = &CompositionSelectionSnapshot> {
@@ -378,6 +465,32 @@ impl CompositionBook {
 
 fn same_key(a: &ResourceOutput, b: &ResourceOutput) -> bool {
     a.producer == b.producer && a.output_id == b.output_id && a.origin == b.origin
+}
+fn valid_refinement_shape(item: &ObligationRefinement) -> bool {
+    let request = &item.request;
+    let proposal = &request.proposal;
+    let output = &item.confirmed;
+    valid_text(&request.operation_id)
+        && valid_text(&request.transition_id)
+        && valid_text(&request.admission_id)
+        && valid_text(&request.permit_id)
+        && request.provider_sequence > 0
+        && request.target == proposal.target
+        && valid_text(&item.original.obligation_id)
+        && valid_text(&item.original.provider)
+        && item.original.payload.is_object()
+        && output.output_id == proposal.output_id
+        && output.producer == proposal.owner_provider
+        && output.producer_service == proposal.owner_service
+        && output.resource.provider == proposal.resource.provider
+        && output.resource.resource_id == proposal.resource.resource_id
+        && output.resource.incarnation == proposal.resource.incarnation
+        && output.resource.execution_domain == proposal.resource.execution_domain
+        && output.resource.revision >= proposal.resource.revision
+        && output.resource.mutation_domains == proposal.resource.mutation_domains
+        && output.resource.mutation_domain == proposal.resource.mutation_domain
+        && output.data.is_object()
+        && serde_json::to_vec(item).is_ok_and(|bytes| bytes.len() <= 12 * 1024)
 }
 fn same_selection(a: &CompositionSelectionSnapshot, b: &CompositionSelectionSnapshot) -> bool {
     a.target == b.target
@@ -678,5 +791,23 @@ mod tests {
             )
             .is_some()
         );
+    }
+
+    #[test]
+    fn refinement_keeps_original_obligation_and_rejects_foreign_native_resource() {
+        let original: ResourceObligation = serde_json::from_value(json!({"obligation_id":"restore","provider":"settings","resource_id":"display","mutation_domain":null,"depends_on":[],"cleanup_method":{"service":"settings/1","method":"restore","interface_major":1,"interface_minor":0,"schema_revision":1},"payload":{"output_id":"output"}})).unwrap();
+        let input = output();
+        let request: ResourceControlRequest = serde_json::from_value(json!({"version":1,"transition_id":"transition","operation_id":"operation","provider_sequence":1,"target":target(),"proposal":{"proposal_id":"proposal","output_id":"output","owner_provider":"screen","owner_service":"screen/1","target":target(),"resource":input.resource,"method":{"service":"screen/1","method":"control","interface_major":1,"interface_minor":0,"schema_revision":1},"argument_schema":input.schema,"arguments":{},"access":"exclusive","mutation_domains":[]},"admission_id":"admission","permit_id":"permit","remaining_ms":1000})).unwrap();
+        let item = ObligationRefinement {
+            request,
+            original: original.clone(),
+            confirmed: input,
+        };
+        assert!(valid_refinement_shape(&item));
+        assert_eq!(item.original, original);
+        assert_eq!(item.original.payload, json!({"output_id":"output"}));
+        let mut forged = item;
+        forged.confirmed.resource.incarnation = "replacement".into();
+        assert!(!valid_refinement_shape(&forged));
     }
 }

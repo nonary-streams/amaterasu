@@ -422,6 +422,55 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                         == Some(&selection.target))
             })
         })
+        || journal.composition.refinements().any(|item| {
+            let Some(permit) = journal
+                .authority
+                .control_permits
+                .get(&item.request.permit_id)
+            else {
+                return true;
+            };
+            let Some(admission) = journal
+                .authority
+                .admissions
+                .get(&item.request.admission_id)
+                .or_else(|| journal.authority.settled.get(&item.request.admission_id))
+            else {
+                return true;
+            };
+            let Some(selection) = journal.composition.selection(
+                &item.request.target,
+                &item.request.transition_id,
+                &permit.context.policy.dependent_provider,
+                &item.request.proposal.owner_provider,
+                &item.request.proposal.output_id,
+            ) else {
+                return true;
+            };
+            let catalog = amaterasu_extension_api::schemas::SchemaCatalog::compile(
+                selection
+                    .schema_documents
+                    .iter()
+                    .map(|doc| (doc.reference.clone(), doc.document.as_str())),
+            );
+            !permit.consumed
+                || permit.request != item.request
+                || permit.context.policy != selection.control_policy
+                || permit.context.output != selection.input.output
+                || admission.provider != selection.control_policy.dependent_provider
+                || !admission.plan.obligations.contains(&item.original)
+                || !admission
+                    .plan
+                    .control_proposals
+                    .contains(&item.request.proposal)
+                || item.confirmed.schema != selection.input.output.schema
+                || item.confirmed.origin != selection.input.output.origin
+                || !catalog.is_ok_and(|catalog| {
+                    catalog
+                        .validate(&item.confirmed.schema, &item.confirmed.data)
+                        .is_ok()
+                })
+        })
         || !journal.inputs.validate()
         || journal.actions.validate().is_err()
         || journal
