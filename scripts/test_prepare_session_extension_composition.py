@@ -47,7 +47,9 @@ class PrepareCompositionTest(unittest.TestCase):
                     root.mkdir()
                     (root / "bootstrap.json").write_text(json.dumps({"policy": {
                         "principals": {identity: {"call": []} for identity in identities},
-                        "settings": {legacy.NVHTTP: {"streaming": {"capture": {}}}}, "api_methods": []}}))
+                        "settings": {legacy.NVHTTP: {"streaming": {"capture": {"capture_provider": "pipewire"}}},
+                                     "amaterasu.virtual-display": {"enabled": False},
+                                     "amaterasu.capture-pipewire": {"enabled": True}}, "api_methods": []}}))
                 if arguments[1] == "pack-linux-session-extensions":
                     self.assertEqual(arguments.count("--external-component"), 2)
                     for i in (arguments.index("--external-component"), len(arguments) - 5):
@@ -55,9 +57,14 @@ class PrepareCompositionTest(unittest.TestCase):
                         self.assertTrue(Path(arguments[i + 2]).is_file())
                 return ""
             with mock.patch.object(prepare.legacy, "run", side_effect=run), mock.patch.object(prepare, "validated_runtime_configuration", return_value={"journal_path": "/new/journal", "operation_grants": {}}):
-                prepare.pack_profile(Path("release"), root, directory, package, 1, inputs, [])
+                prepare.pack_profile(Path("release"), root, directory, package, 1, inputs, [],
+                                     enable_virtual_display=True)
             self.assertEqual([call[1] for call in calls], ["init-linux-session", "pack-linux-session-extensions", "verify"])
             self.assertTrue(json.loads((root / "bootstrap.json").read_text())["policy"]["settings"][legacy.NVHTTP]["session_lifecycle_required"])
+            settings = json.loads((root / "bootstrap.json").read_text())["policy"]["settings"]
+            self.assertTrue(settings["amaterasu.virtual-display"]["enabled"])
+            self.assertTrue(settings["amaterasu.capture-pipewire"]["allow_named_outputs"])
+            self.assertEqual(settings[legacy.NVHTTP]["streaming"]["capture"]["capture_provider"], "pipewire")
 
     def test_changed_artifact_is_rejected_before_root_creation(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -73,6 +80,16 @@ class PrepareCompositionTest(unittest.TestCase):
             with mock.patch.object(prepare, "validated_runtime_configuration", return_value={}):
                 with self.assertRaisesRegex(ValueError, "artifact changed"):
                     prepare.pack_profile(Path("release"), root, directory, directory / "package", 1, inputs, [])
+            self.assertFalse(root.exists())
+
+    def test_forwarded_capture_selection_is_rejected_before_initialization(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            root = directory / "root"
+            with mock.patch.object(prepare, "validated_runtime_configuration", return_value={}):
+                with self.assertRaisesRegex(ValueError, "composition profile options"):
+                    prepare.pack_profile(Path("release"), root, directory, directory / "package", 1, [],
+                                         ["--enable-virtual-display"])
             self.assertFalse(root.exists())
 
 

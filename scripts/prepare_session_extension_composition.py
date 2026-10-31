@@ -53,7 +53,7 @@ def validated_runtime_configuration() -> dict:
 
 def pack_profile(publisher: Path, root: Path, artifacts: Path, package: Path, sequence: int,
                  selections: list[dict], linux_options: list[str],
-                 enable_action: bool = False) -> None:
+                 enable_action: bool = False, enable_virtual_display: bool = False) -> None:
     """Construct and verify a development package from already validated inputs.
 
     Invoked only after the release-controlled runtime qualification gate.
@@ -64,6 +64,9 @@ def pack_profile(publisher: Path, root: Path, artifacts: Path, package: Path, se
     lifecycle_settings = validated_runtime_configuration()
     if root.exists() or root.is_symlink() or package.exists() or package.is_symlink():
         raise ValueError("root and package must be new paths")
+    if any(option in {"--enable-virtual-display", "--enable-virtual-screen-capture", "--capture-output"}
+           or option.startswith("--capture-output=") for option in linux_options):
+        raise ValueError("select virtual display and PipeWire using the composition profile options")
     selected = [item["selected"] for item in selections]
     entries = composition.provider_entries(selected, enable_action)
     with tempfile.TemporaryDirectory(prefix="amaterasu-split-profile-") as temporary:
@@ -83,6 +86,16 @@ def pack_profile(publisher: Path, root: Path, artifacts: Path, package: Path, se
         legacy.run(publisher, "init-linux-session", root, *linux_options)
         bootstrap_path = root / "bootstrap.json"
         bootstrap = json.loads(bootstrap_path.read_text())
+        if enable_virtual_display:
+            settings = bootstrap["policy"]["settings"]
+            virtual_display = settings["amaterasu.virtual-display"]
+            if virtual_display.get("enabled") is not False:
+                raise ValueError("existing virtual display configuration conflicts with the profile")
+            virtual_display["enabled"] = True
+            capture = settings["amaterasu.capture-pipewire"]
+            if "allow_named_outputs" in capture and capture["allow_named_outputs"] is not True:
+                raise ValueError("existing PipeWire named-output setting conflicts with the profile")
+            capture["allow_named_outputs"] = True
         bootstrap, calls = composition.build_bootstrap(bootstrap, selected, entries, lifecycle_settings, enable_action)
         bootstrap_path.write_text(json.dumps(bootstrap, indent=2) + "\n")
         calls_path = directory / "calls.json"
@@ -98,6 +111,10 @@ def pack_profile(publisher: Path, root: Path, artifacts: Path, package: Path, se
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--enable-display-actions", action="store_true")
+    parser.add_argument("--capture-provider", choices=["pipewire"], required=True,
+                        help="explicitly select the supported PipeWire capture adapter")
+    parser.add_argument("--enable-virtual-display", action="store_true",
+                        help="enable native virtual-display support and named PipeWire outputs")
     parser.add_argument("--approved-display-methods-sha256", required=True)
     parser.add_argument("--approved-virtual-methods-sha256", required=True)
     for name in ("publisher", "root", "artifacts", "package"):
@@ -120,7 +137,7 @@ def main() -> None:
     # This non-overridable gate runs before creating root or package paths.
     options = args.linux_options[1:] if args.linux_options[:1] == ["--"] else args.linux_options
     pack_profile(args.publisher, args.root, args.artifacts, args.package, args.sequence,
-                 selected, options, args.enable_display_actions)
+                 selected, options, args.enable_display_actions, args.enable_virtual_display)
     print("Prepared and verified the signed split profile; it has not been activated.")
 
 
