@@ -674,6 +674,17 @@ impl Coordinator {
                 self.fail_work(&key, "restart_requires_cleanup")?;
                 continue;
             }
+            // Unsupported v2 phases must be rejected before settings discovery or
+            // any provider call. A session output alone does not authorize a
+            // stream attachment or cleanup callback.
+            if self.settings.participants.iter().any(|participant| {
+                &participant.provider == provider
+                    && participant.contract_version == amaterasu_extension_api::COMPOSITION_VERSION
+            }) && work.phase != LifecyclePhase::SessionPrepare
+            {
+                self.fail_work(&key, "composition_path_not_supported")?;
+                continue;
+            }
             match self.ensure_settings(&work, send) {
                 Ok(true) => {}
                 Ok(false) => continue,
@@ -702,6 +713,28 @@ impl Coordinator {
                 }
                 continue;
             };
+            let standalone_v2 = participant.contract_version
+                == amaterasu_extension_api::COMPOSITION_VERSION
+                && matches!(work.phase, LifecyclePhase::SessionPrepare)
+                && work.provider_graph.as_ref().is_some_and(|graph| {
+                    graph.order == [participant.provider.clone()]
+                        && graph
+                            .dependencies
+                            .get(&participant.provider)
+                            .is_some_and(Vec::is_empty)
+                })
+                && self.settings.control_policies.is_empty()
+                && self
+                    .settings
+                    .finalize_policies
+                    .iter()
+                    .filter(|policy| policy.owner_provider == participant.provider)
+                    .count()
+                    == 1;
+            if participant.contract_version != 1 && !standalone_v2 {
+                self.fail_work(&key, "composition_path_not_supported")?;
+                continue;
+            }
             let runtime_key = format!("{key}/{}", work.index);
             let mut authority = match self.authority_for_work(&work) {
                 Ok(a) => a,
@@ -712,7 +745,7 @@ impl Coordinator {
                 let request = ProviderRequest {
                     provider_sequence: sequence,
                     operation: ProviderOperation::ResourcePlan,
-                    version: 1,
+                    version: participant.contract_version,
                     transition_id: work.transition_id.clone(),
                     operation_id,
                     target: work.target.clone(),
@@ -754,10 +787,15 @@ impl Coordinator {
                 work.states.insert(provider.clone(), state);
             }
             if !self.drivers.contains_key(&runtime_key) {
-                self.drivers.insert(
-                    runtime_key.clone(),
-                    PrepareDriver::new(work.states[provider].clone(), &effective_settings)?,
-                );
+                let driver = if standalone_v2 {
+                    PrepareDriver::new_standalone_prepare(
+                        work.states[provider].clone(),
+                        &effective_settings,
+                    )?
+                } else {
+                    PrepareDriver::new(work.states[provider].clone(), &effective_settings)?
+                };
+                self.drivers.insert(runtime_key.clone(), driver);
             }
             let mut writer = WorkWriter {
                 shared: self.shared.clone(),
@@ -833,6 +871,11 @@ impl Coordinator {
                     {
                         self.fail_work(&key, &reason)?;
                     }
+                    self.drivers.remove(&runtime_key);
+                    continue;
+                }
+                if standalone_v2 {
+                    self.fail_work(&key, "composition_output_missing")?;
                     self.drivers.remove(&runtime_key);
                     continue;
                 }

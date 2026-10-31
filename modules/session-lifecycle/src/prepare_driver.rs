@@ -108,7 +108,7 @@ impl PrepareDriver {
     /// Caller must durably reserve the operation and matching provider sequence
     /// before constructing this driver. No plan or effect is implied by creation.
     pub fn new(state: PrepareState, settings: &LifecycleSettings) -> ModuleResult<Self> {
-        Self::new_inner(state, settings, false)
+        Self::new_inner(state, settings, false, false)
     }
 
     /// Only the coordinator may call this after validating the pinned owner,
@@ -119,16 +119,46 @@ impl PrepareDriver {
         state: PrepareState,
         settings: &LifecycleSettings,
     ) -> ModuleResult<Self> {
-        Self::new_inner(state, settings, true)
+        Self::new_inner(state, settings, true, false)
+    }
+
+    /// Coordinator-only v2 producer prepare with no dependency controls. The
+    /// caller must first pin the installed single-owner graph and policies.
+    #[allow(dead_code)] // Only enabled after the complete standalone path is wired.
+    pub(crate) fn new_standalone_prepare(
+        state: PrepareState,
+        settings: &LifecycleSettings,
+    ) -> ModuleResult<Self> {
+        Self::new_inner(state, settings, false, true)
     }
 
     fn new_inner(
         state: PrepareState,
         settings: &LifecycleSettings,
         finalize_plan: bool,
+        standalone_prepare: bool,
     ) -> ModuleResult<Self> {
         // Regular v2 prepare/control remains fenced until all stages are wired.
-        if (!finalize_plan && state.request.version != 1)
+        if (!finalize_plan && !standalone_prepare && state.request.version != 1)
+            || (standalone_prepare
+                && (state.request.version != api::COMPOSITION_VERSION
+                    || !state.request.dependency_inputs.is_empty()
+                    || !state.request.control_results.is_empty()
+                    || !matches!(
+                        state.request.operation,
+                        ProviderOperation::ResourcePlan | ProviderOperation::LifecycleCallback
+                    )
+                    || state.request.phase != api::LifecyclePhase::SessionPrepare
+                    || !matches!(
+                        state.phase,
+                        PreparePhase::Plan
+                            | PreparePhase::PlanStatus
+                            | PreparePhase::Callback
+                            | PreparePhase::CallbackStatus
+                            | PreparePhase::Prepared
+                            | PreparePhase::Rejected
+                            | PreparePhase::RecoveryRequired
+                    )))
             || (finalize_plan
                 && (state.request.version != api::COMPOSITION_VERSION
                     || state.request.operation != ProviderOperation::ResourceFinalizePlan
@@ -142,6 +172,19 @@ impl PrepareDriver {
                     )))
         {
             return Err("provider composition is not supported".into());
+        }
+        if (finalize_plan || standalone_prepare)
+            && (state.participant.contract_version != api::COMPOSITION_VERSION
+                || state.participant.plan_method.interface_major != api::COMPOSITION_VERSION
+                || state.participant.callback_method.interface_major != api::COMPOSITION_VERSION
+                || state.participant.status_method.interface_major != api::COMPOSITION_VERSION
+                || state
+                    .participant
+                    .binding_validate_method
+                    .as_ref()
+                    .is_some_and(|method| method.interface_major != api::COMPOSITION_VERSION))
+        {
+            return Err("composition_method_version_mismatch".into());
         }
         if participant(settings, &state.provider)? != &state.participant
             || state.request.settings_revision != state.participant.settings_revision
@@ -374,7 +417,9 @@ impl PrepareDriver {
         api::validate_provider_response(&self.state.request, &response)?;
         let terminal_response = matches!(
             response,
-            ProviderResponse::Prepared { .. } | ProviderResponse::Cleanup { .. }
+            ProviderResponse::Planned { .. }
+                | ProviderResponse::Prepared { .. }
+                | ProviderResponse::Cleanup { .. }
         );
         let mut next = self.state.clone();
         match &response {
@@ -400,6 +445,11 @@ impl PrepareDriver {
                 };
             }
             ProviderResponse::Pending { receipt_id } => {
+                // Version 2 status receipts need an authenticated pending-proof
+                // chain before they can authorize output or finalization.
+                if next.request.version == api::COMPOSITION_VERSION {
+                    return Err("composition_pending_requires_recovery".into());
+                }
                 next.pending_receipt = Some(receipt_id.clone());
                 next.phase = match next.phase {
                     PreparePhase::Plan | PreparePhase::PlanStatus => PreparePhase::PlanStatus,
@@ -691,7 +741,17 @@ mod tests {
 
     #[test]
     fn finalize_plan_admits_fresh_rights_without_dispatching_callback() {
-        let (settings, mut state) = fixture();
+        let (mut settings, mut state) = fixture();
+        settings.participants[0].contract_version = api::COMPOSITION_VERSION;
+        settings.participants[0].plan_method.interface_major = api::COMPOSITION_VERSION;
+        settings.participants[0].callback_method.interface_major = api::COMPOSITION_VERSION;
+        settings.participants[0].status_method.interface_major = api::COMPOSITION_VERSION;
+        settings.participants[0]
+            .binding_validate_method
+            .as_mut()
+            .unwrap()
+            .interface_major = api::COMPOSITION_VERSION;
+        state.participant = settings.participants[0].clone();
         state.request.version = api::COMPOSITION_VERSION;
         state.request.operation = ProviderOperation::ResourceFinalizePlan;
         state.request.target = serde_json::from_value(
@@ -727,6 +787,10 @@ mod tests {
         }
         assert_eq!(calls, ["plan"]);
         assert_eq!(driver.state().phase, PreparePhase::FinalizePlanAdmitted);
+        assert!(
+            matches!(driver.state().terminal_dispatch.as_ref().map(|record| &record.state),
+            Some(DispatchState::Completed { payload }) if payload["status"] == "planned")
+        );
         assert_eq!(driver.state().admission_id.as_deref(), Some("admission"));
         assert!(authority.rights);
         driver
@@ -734,6 +798,27 @@ mod tests {
                 panic!("finalize planning must not dispatch a callback")
             })
             .unwrap();
+    }
+
+    #[test]
+    fn standalone_v2_allows_only_session_prepare_without_dependencies() {
+        let (mut settings, mut state) = fixture();
+        let participant = &mut settings.participants[0];
+        participant.contract_version = api::COMPOSITION_VERSION;
+        participant.plan_method.interface_major = api::COMPOSITION_VERSION;
+        participant.callback_method.interface_major = api::COMPOSITION_VERSION;
+        participant.status_method.interface_major = api::COMPOSITION_VERSION;
+        participant
+            .binding_validate_method
+            .as_mut()
+            .unwrap()
+            .interface_major = api::COMPOSITION_VERSION;
+        state.participant = participant.clone();
+        state.request.version = api::COMPOSITION_VERSION;
+        state.request.phase = api::LifecyclePhase::SessionPrepare;
+        assert!(PrepareDriver::new_standalone_prepare(state.clone(), &settings).is_ok());
+        state.request.phase = api::LifecyclePhase::StreamPrepare;
+        assert!(PrepareDriver::new_standalone_prepare(state, &settings).is_err());
     }
 
     #[test]
