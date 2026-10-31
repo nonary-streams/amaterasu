@@ -649,7 +649,8 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
             let Some(session) = journal.sessions.get(session_id) else {
                 return true;
             };
-            !permit.consumed
+            !item.validate_control_chain(journal)
+                || !permit.consumed
                 || !permit.settled
                 || !journal
                     .authority

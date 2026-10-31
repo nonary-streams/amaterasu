@@ -15,6 +15,9 @@ const MAX_RESULTS: usize = 128;
 #[serde(deny_unknown_fields)]
 pub(super) struct FinalizeResultRecord {
     pub selection: FinalizeSelectionSnapshot,
+    /// Frozen completed participant state needed to authenticate the control chain after restart.
+    #[serde(default)]
+    pub chain_work: Option<Box<super::Work>>,
     pub plan_request: ProviderRequest,
     pub plan: ResourcePlan,
     #[serde(default)]
@@ -30,6 +33,35 @@ pub(super) struct FinalizeResultRecord {
 }
 
 impl FinalizeResultRecord {
+    pub fn validate_control_chain(&self, journal: &super::Journal) -> bool {
+        let Some(work) = &self.chain_work else {
+            return self.request.control_results.is_empty();
+        };
+        let Ok((_, session_id, Some(stream_id), generation)) =
+            super::operations::target_parts(&self.request.target)
+        else {
+            return false;
+        };
+        let Some(stream) = journal
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.streams.get(stream_id))
+        else {
+            return false;
+        };
+        stream.generation == generation
+            && serde_json::to_value(&stream.provider_graph).ok()
+                == serde_json::to_value(&work.provider_graph).ok()
+            && super::composition_finalize::resolve_historical_control_chain(
+                journal,
+                work,
+                &self.selection,
+            )
+            .is_ok_and(|(output, controls)| {
+                output == self.request.output && controls == self.request.control_results
+            })
+    }
+
     pub fn validate_structure(&self) -> bool {
         let selection = &self.selection;
         let request = &self.request;
@@ -113,7 +145,11 @@ impl FinalizeResultRecord {
             && api::validate_provider_response(&self.plan_request, &planned).is_ok()
             && request.target == selection.target
             && request.transition_id == selection.transition_id
-            && request.output == *selection.current_output()
+            && if request.control_results.is_empty() {
+                self.chain_work.is_none() && request.output == *selection.current_output()
+            } else {
+                self.chain_work.is_some()
+            }
             && api::validate_resource_finalize_response(request, &self.applied).is_ok()
             && serde_json::from_value::<ResourceControlResponse>(payload.clone())
                 .ok()
@@ -121,7 +157,6 @@ impl FinalizeResultRecord {
                 == Some(&self.applied)
             && ((effect_match && self.pending_receipt.is_none() && self.pending_proof.is_none())
                 || status_match)
-            && request.control_results.is_empty()
             && candidate.geometry_revision == geometry
             && candidate.plan_revision == constraint.plan_revision
             && candidate.capture_provider == constraint.capture_provider
@@ -190,7 +225,7 @@ impl FinalizeResultBook {
 
 /// Called on a private clone of the locked journal. The caller atomically saves
 /// that clone together with settled authority and the candidate; this function
-/// never publishes it. Only standalone finalization is admitted at present.
+/// never publishes it. Control lineage is reconstructed from durable owner acknowledgements.
 pub(super) fn record_finalize_result(
     journal: &mut super::Journal,
     settings: &crate::adapter::LifecycleSettings,
@@ -211,9 +246,8 @@ pub(super) fn record_finalize_result(
         .and_then(|progress| progress.finalize.as_ref())
         .ok_or("finalize_progress_missing")?;
     let selected = &progress.selection;
-    if !dispatch.request.control_results.is_empty()
-        || serde_json::to_value(progress.dispatch.as_ref()).ok()
-            != serde_json::to_value(Some(dispatch)).ok()
+    if serde_json::to_value(progress.dispatch.as_ref()).ok()
+        != serde_json::to_value(Some(dispatch)).ok()
         || !journal.receipts.values().any(|receipt| {
             receipt.work.as_ref().is_some_and(|saved| {
                 serde_json::to_value(saved).ok() == serde_json::to_value(work).ok()
@@ -222,6 +256,19 @@ pub(super) fn record_finalize_result(
     {
         return Err("finalize_context_mismatch".into());
     }
+    let chain_work = if dispatch.request.control_results.is_empty() {
+        if dispatch.request.output != *selected.current_output() {
+            return Err("finalize_output_mismatch".into());
+        }
+        None
+    } else {
+        let (output, controls) =
+            super::composition_finalize::resolve_control_chain(journal, work, selected)?;
+        if output != dispatch.request.output || controls != dispatch.request.control_results {
+            return Err("finalize_control_chain_mismatch".into());
+        }
+        Some(Box::new(work.clone()))
+    };
     let installed = selections
         .get(&selected.policy.owner_provider)
         .ok_or("finalize_owner_not_selected")?;
@@ -305,6 +352,7 @@ pub(super) fn record_finalize_result(
         });
     let record = FinalizeResultRecord {
         selection: selected.clone(),
+        chain_work,
         plan_request: progress.owner_plan.request.clone(),
         plan,
         plan_approval: Some(plan_approval),
@@ -354,6 +402,7 @@ mod tests {
         let plan_terminal = serde_json::from_value(json!({"call":{"service":"owner/2","method":"finalize","interface_major":2,"interface_minor":0,"approval":plan_approval.broker_approval,"arguments":plan_request,"timeout_ms":1000,"operation_id":"plan-operation"},"state":{"state":"completed","payload":{"status":"planned","plan":plan}}})).unwrap();
         FinalizeResultRecord {
             selection,
+            chain_work: None,
             plan_request,
             plan: serde_json::from_value(plan).unwrap(),
             plan_approval: Some(plan_approval),
@@ -365,6 +414,22 @@ mod tests {
             pending_proof: None,
         }
     }
+    #[test]
+    fn control_result_requires_durable_chain_evidence() {
+        let mut record = fixture();
+        let control = api::ConfirmedControl {
+            proposal_id: "proposal".into(),
+            output: record.request.output.clone(),
+            candidate: None,
+        };
+        record.request.control_results.push(control.clone());
+        record.plan_request.control_results.push(control);
+        record.terminal.call.arguments = serde_json::to_value(&record.request).unwrap();
+        record.plan_terminal.as_mut().unwrap().call.arguments =
+            serde_json::to_value(&record.plan_request).unwrap();
+        assert!(!record.validate_structure());
+    }
+
     #[test]
     fn pending_status_requires_exact_effect_receipt_and_selected_status() {
         let mut record = fixture();

@@ -12,6 +12,66 @@ pub(super) fn resolve_control_chain(
     work: &Work,
     selection: &FinalizeSelectionSnapshot,
 ) -> ModuleResult<(ResourceOutput, Vec<ConfirmedControl>)> {
+    if journal.composition.get(
+        &selection.input.output.producer,
+        &selection.input.output.output_id,
+        &selection.input.output.origin,
+    ) != Some(&selection.input)
+    {
+        return Err("composition_chain_context_invalid".into());
+    }
+    let current =
+        super::finalize_backend::authenticated_current_output(&journal.composition, selection)?
+            .clone();
+    resolve_chain(journal, work, selection, current)
+}
+
+/// Validate immutable historical evidence only; this must never authorize an effect.
+pub(super) fn resolve_historical_control_chain(
+    journal: &Journal,
+    work: &Work,
+    selection: &FinalizeSelectionSnapshot,
+) -> ModuleResult<(ResourceOutput, Vec<ConfirmedControl>)> {
+    let mut matches = journal.composition.records().filter(|record| {
+        record.output.producer == selection.input.output.producer
+            && record.output.output_id == selection.input.output.output_id
+            && record.output.origin == selection.input.output.origin
+    });
+    let root = matches.next().ok_or("historical_root_missing")?;
+    if matches.next().is_some() {
+        return Err("historical_root_ambiguous".into());
+    }
+    let mut original = root.clone();
+    original.state = super::composition::OutputState::Retained;
+    if original != selection.input {
+        return Err("historical_root_mismatch".into());
+    }
+    if root.state == super::composition::OutputState::Released
+        && !journal.session_releases.has_valid_released(
+            journal,
+            &root.output.origin,
+            &root.output.producer,
+        )
+    {
+        return Err("historical_root_release_unproven".into());
+    }
+    let stage = selection.stage.as_ref().ok_or("historical_stage_missing")?;
+    if !journal
+        .composition
+        .staged_outputs()
+        .any(|saved| saved == stage)
+    {
+        return Err("historical_stage_mismatch".into());
+    }
+    resolve_chain(journal, work, selection, stage.after.clone())
+}
+
+fn resolve_chain(
+    journal: &Journal,
+    work: &Work,
+    selection: &FinalizeSelectionSnapshot,
+    mut current: ResourceOutput,
+) -> ModuleResult<(ResourceOutput, Vec<ConfirmedControl>)> {
     let graph = work
         .provider_graph
         .as_ref()
@@ -22,11 +82,6 @@ pub(super) fn resolve_control_chain(
         || work.index < work.providers.len()
         || graph.order != work.providers
         || !selection.validate_structure()
-        || journal.composition.get(
-            &selection.input.output.producer,
-            &selection.input.output.output_id,
-            &selection.input.output.origin,
-        ) != Some(&selection.input)
         || !journal.control_settlements.validate_structure()
     {
         return Err("composition_chain_context_invalid".into());
@@ -35,9 +90,6 @@ pub(super) fn resolve_control_chain(
         .composition_progress
         .as_ref()
         .ok_or("composition_progress_missing")?;
-    let mut current =
-        super::finalize_backend::authenticated_current_output(&journal.composition, selection)?
-            .clone();
     let owner = &selection.policy.owner_provider;
     let mut expected = Vec::new();
     for provider in &graph.order {

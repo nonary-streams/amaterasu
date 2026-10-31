@@ -21,6 +21,17 @@ pub(super) struct SessionReleaseBook {
     proofs: Vec<SessionReleaseProof>,
 }
 impl SessionReleaseBook {
+    pub fn has_valid_released(
+        &self,
+        journal: &Journal,
+        target: &LifecycleTarget,
+        provider: &str,
+    ) -> bool {
+        self.proofs.iter().any(|proof| {
+            &proof.target == target && proof.provider == provider && validate_proof(journal, proof)
+        })
+    }
+
     pub fn validate(&self, journal: &Journal) -> bool {
         self.proofs.len() <= MAX_RELEASES
             && self.proofs.iter().enumerate().all(|(index, proof)| {
