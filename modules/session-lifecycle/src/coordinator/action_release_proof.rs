@@ -73,6 +73,9 @@ pub(super) fn validate_graph_callbacks(
     let Some(transfer) = &work.action_transfer else {
         return false;
     };
+    let Some(snapshot) = &transfer.snapshot else {
+        return false;
+    };
     let LifecycleTarget::Stream {
         host_epoch,
         session_id,
@@ -132,6 +135,7 @@ pub(super) fn validate_graph_callbacks(
         || proof.callbacks.len() != work.providers.len() || work.index != work.providers.len()
         || work.waiting_retirement || work.failure.is_some() || !work.cleanup_blockers.is_empty()
         || transfer.binding.source != session.owner
+        || super::action_endpoints::capture_action_snapshot(journal, &work.target).ok().as_ref() != Some(snapshot)
         || !target_matches
         // Stream cleanup does not prove session-scoped dependent restoration.
         || !super::action_endpoints::graph_proves_no_dependents(&session_graph.order, &session_graph.dependencies, &owner)
@@ -147,7 +151,9 @@ pub(super) fn validate_graph_callbacks(
         })
         .cloned()
         .collect();
-    if original_admissions != proof.original_admissions {
+    if original_admissions != proof.original_admissions
+        || proof.original_admissions != snapshot.stream_admissions.keys().cloned().collect()
+    {
         return false;
     }
     for (provider, callback) in work.providers.iter().zip(&proof.callbacks) {
