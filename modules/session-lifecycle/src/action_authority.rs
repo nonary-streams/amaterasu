@@ -1564,6 +1564,48 @@ mod tests {
                 .check_effect("other", &token, &binding, &method, "gap-2")
                 .is_err()
         );
+        let receipt = json!({"removed":true});
+        assert!(!authority.terminal_succeeded_for("action-service", &token, &binding, &receipt));
+        authority
+            .complete_action(
+                "action-service",
+                &binding,
+                ActionOutcome::Succeeded,
+                receipt.clone(),
+                false,
+            )
+            .unwrap();
+        let mut recovered: ActionAuthority =
+            serde_json::from_value(serde_json::to_value(&authority).unwrap()).unwrap();
+        assert!(recovered.terminal_succeeded_for("action-service", &token, &binding, &receipt));
+        assert!(
+            recovered
+                .complete_action(
+                    "action-service",
+                    &binding,
+                    ActionOutcome::Succeeded,
+                    receipt.clone(),
+                    false
+                )
+                .is_ok()
+        );
+        assert!(!recovered.terminal_succeeded_for(
+            "action-service",
+            &token,
+            &binding,
+            &json!({"removed":false})
+        ));
+        assert!(
+            recovered
+                .complete_action(
+                    "action-service",
+                    &binding,
+                    ActionOutcome::Succeeded,
+                    json!({"removed":false}),
+                    false
+                )
+                .is_err()
+        );
     }
 
     #[test]
