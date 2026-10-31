@@ -694,3 +694,21 @@ fn real_participants_end_active_stream() {
 fn real_participants_end_paused_stream() {
     run_real_participants_end(true);
 }
+
+#[test]
+#[ignore = "requires a lock-enabled owner and broker host-state grant"]
+fn real_owner_holds_lifetime_lock() {
+    let fixture = Fixture::new();
+    let path = fixture
+        .root
+        .join("owner-state/nonary.virtual-screen/owner.lock");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("owner did not create its lock file");
+    assert!(lock.try_lock().is_err(), "owner lifetime lock is not held");
+    drop(fixture);
+    lock.try_lock()
+        .expect("owner lock was not released after destroy");
+}
