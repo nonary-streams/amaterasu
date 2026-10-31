@@ -582,6 +582,7 @@ fn nvhttp_chain_grants_match_the_agreed_services_exactly() {
             "amaterasu.pairing/1",
             "amaterasu.state/1",
             "amaterasu.catalog/1",
+            "amaterasu.library/1",
             "amaterasu.launch/1",
             "amaterasu.display/1",
             "amaterasu.virtual-display/1",

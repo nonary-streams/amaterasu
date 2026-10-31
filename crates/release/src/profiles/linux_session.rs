@@ -18,8 +18,8 @@ mod tests;
 use super::{
     APPLICATION, AUDIO, AUDIO_ENCODE, AUTHENTICATION, CAPTURE_KMS, CAPTURE_PIPEWIRE, CAPTURE_VKMS,
     CATALOG, CONFIGURATION, CONTROL_TRANSPORT, ComponentDefinition, DISPLAY, ENCODE, FRAME_LIMITER,
-    HOST_METRICS, INPUT, LAUNCH, LUTRIS, MANAGEMENT, MEDIA_TRANSPORT, NVHTTP, PAIRING, RTSP,
-    RUNTIME, RUNTIME_ID, SESSION, SESSION_HISTORY, STATE, STEAM, STREAM_SESSION, VIDEO,
+    HOST_METRICS, INPUT, LAUNCH, LIBRARY, LUTRIS, MANAGEMENT, MEDIA_TRANSPORT, NVHTTP, PAIRING,
+    RTSP, RUNTIME, RUNTIME_ID, SESSION, SESSION_HISTORY, STATE, STEAM, STREAM_SESSION, VIDEO,
     VIRTUAL_DISPLAY, names,
 };
 use amaterasu_contracts::{Grants, RuntimeConfig};
@@ -150,6 +150,7 @@ const LINUX_SESSION_NVHTTP: ComponentDefinition = ComponentDefinition {
         "amaterasu.pairing/1",
         "amaterasu.state/1",
         "amaterasu.catalog/1",
+        "amaterasu.library/1",
         "amaterasu.launch/1",
         "amaterasu.display/1",
         "amaterasu.virtual-display/1",
@@ -173,6 +174,7 @@ const LINUX_SESSION_NVHTTP: ComponentDefinition = ComponentDefinition {
         "amaterasu.pairing",
         "amaterasu.state",
         "amaterasu.catalog",
+        "amaterasu.library",
         "amaterasu.launch",
         "amaterasu.display",
         "amaterasu.rtsp",
@@ -318,6 +320,7 @@ pub const COMPONENTS: &[ComponentDefinition] = &[
     STEAM,
     LUTRIS,
     CATALOG,
+    LIBRARY,
     APPLICATION,
     AUTHENTICATION,
     LINUX_SESSION_MANAGEMENT,
@@ -386,6 +389,7 @@ pub const EXTENSION_COMPONENTS: &[ComponentDefinition] = &[
     STEAM,
     LUTRIS,
     CATALOG,
+    LIBRARY,
     APPLICATION,
     AUTHENTICATION,
     LINUX_SESSION_MANAGEMENT,

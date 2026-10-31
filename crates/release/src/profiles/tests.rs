@@ -1771,3 +1771,36 @@ fn linux_probe_scopes_portal_capture_to_an_explicit_composition() {
         );
     }
 }
+
+#[test]
+fn catalog_profiles_package_library_with_scoped_calls() {
+    for profile in [
+        PackageProfile::Platform,
+        PackageProfile::ExtensionExample,
+        PackageProfile::StreamProbe,
+        PackageProfile::SoftwareProbe,
+        PackageProfile::LinuxProbe,
+        PackageProfile::LinuxSession,
+        PackageProfile::LinuxSessionExtensions,
+    ] {
+        let components = profile.components();
+        let library = components
+            .iter()
+            .find(|component| component.id == LIBRARY.id)
+            .unwrap();
+        assert_eq!(library.provides, &["amaterasu.library/1"]);
+        assert_eq!(library.calls, &["amaterasu.catalog/1"]);
+        let nvhttp = components
+            .iter()
+            .find(|component| component.id == NVHTTP.id)
+            .unwrap();
+        assert!(nvhttp.calls.contains(&"amaterasu.library/1"));
+        assert!(nvhttp.calls.contains(&"amaterasu.catalog/1"));
+    }
+    assert!(
+        !PackageProfile::DesktopStreamSmoke
+            .components()
+            .iter()
+            .any(|component| component.id == LIBRARY.id)
+    );
+}
