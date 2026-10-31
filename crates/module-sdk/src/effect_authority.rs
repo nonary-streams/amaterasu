@@ -88,3 +88,6 @@ pub enum Request {
         ticket: String,
     },
 }
+
+/// Owner-side ticket lifecycle; does not authenticate a source or activate routes.
+pub mod consumer;

@@ -518,14 +518,16 @@ fn alternative_provider_roles_bind_and_release_the_exact_selected_interfaces() {
     assert_eq!(host.released, [1, 2, 3, 4, 5]);
 }
 
+#[path = "../../../../input/src/controller/effect_authority_test.rs"]
+mod effect_authority_test;
+
 #[test]
-fn test_ticket_harness_holds_drain_until_native_feedback_send_returns() {
-    use std::sync::{Arc, RwLock, mpsc};
+fn authority_ticket_spans_native_feedback_and_awaits_transport_retirement() {
+    use amaterasu_module_sdk::effect_authority::consumer::{State, TransportRetirement};
+    use amaterasu_module_sdk::transport::control_retirement::Receipt;
+    use std::sync::mpsc;
     use std::time::Duration;
-    // This lock only models the future protocol-owned gate. It does not install
-    // a source route or authorize production feedback.
-    let gate = Arc::new(RwLock::new(true));
-    let worker_gate = Arc::clone(&gate);
+    let (mut authority, mut ticket) = effect_authority_test::Fixture::admitted();
     let (entered_tx, entered_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -543,37 +545,37 @@ fn test_ticket_harness_holds_drain_until_native_feedback_send_returns() {
             high_frequency: 2,
         })
         .unwrap();
-        let ticket = worker_gate.read().unwrap();
-        assert!(*ticket);
-        let accepted = backend.send_feedback(&message).unwrap();
-        drop(ticket);
+        let retirement = TransportRetirement {
+            stream: 7,
+            operation_id: "retire".into(),
+            provider_epoch: "c".repeat(32),
+        };
+        let accepted = ticket
+            .run_transport(retirement, || backend.send_feedback(&message))
+            .unwrap()
+            .unwrap();
         drop(backend);
-        (accepted, host.provider.sent_control.len())
+        (ticket, accepted, host.provider.sent_control.len())
     });
     entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert!(
-        gate.try_write().is_err(),
-        "drain must not complete inside native send"
-    );
-    let revoke_gate = Arc::clone(&gate);
-    let (started_tx, started_rx) = mpsc::channel();
-    let (drained_tx, drained_rx) = mpsc::channel();
-    let revoke = std::thread::spawn(move || {
-        started_tx.send(()).unwrap();
-        let mut state = revoke_gate.write().unwrap();
-        *state = false;
-        drained_tx.send(()).unwrap();
-    });
-    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert!(drained_rx.try_recv().is_err());
+    authority.fence();
     resume_tx.send(()).unwrap();
-    let (accepted, deliveries) = worker.join().unwrap();
-    drained_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    revoke.join().unwrap();
+    let (mut ticket, accepted, deliveries) = worker.join().unwrap();
     assert!(accepted);
     assert_eq!(deliveries, 1);
-    assert!(
-        !*gate.read().unwrap(),
-        "future admission must fail after drain"
-    );
+    assert_eq!(ticket.state(), State::AwaitTransportRetirement);
+    assert!(ticket.completion_request().is_err());
+    // This synthetic receipt exercises the owner state machine. The separate
+    // control-transport test validates a real retirement receipt and queued ENet.
+    let receipt = Receipt {
+        ok: true,
+        state: "retired".into(),
+        scope: "whole_control_stream".into(),
+        stream: 7,
+        operation_id: "retire".into(),
+        provider_epoch: "c".repeat(32),
+    };
+    ticket.transport_retired(&receipt).unwrap();
+    authority.complete(&mut ticket);
+    authority.drain();
 }

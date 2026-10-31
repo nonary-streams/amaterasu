@@ -1,9 +1,8 @@
 # Input and feedback effect-boundary checkpoint
 
-This checkpoint prepares tests only. Source-scoped route installation and effects
-remain disabled until the app/lifecycle owner delivers the protocol-owned effect
-admission and revoke/drain API. A source label is not authority. The test locks
-below are local test doubles, not a production gate or a second authority.
+Source-scoped route installation and effects remain disabled. The pairing-owned
+admission and drain contract has been imported, but its authenticated lifecycle
+join and effect-owner integration are not complete. A source label is not authority.
 
 ## Exact boundaries
 
@@ -40,28 +39,36 @@ below are local test doubles, not a production gate or a second authority.
   already handed-off kernel datagram cannot be recalled; the guarantee is no
   new local socket handoff after a completed barrier, not no remote arrival.
 
-## Prepared tests and remaining tests
+## Effect-owner state and remaining tests
 
-`controller::tests::test_ticket_harness_holds_drain_until_actual_input_backend_returns`
-blocks the actual controller's fake backend `inject` call, and
-`plane::native::tests::test_ticket_harness_holds_drain_until_native_feedback_send_returns`
-blocks the actual native transport callback. Their `RwLock` is a deterministic
-test-only stand-in, and their assertions prove only that the test harness holds
-its simulated ticket across the synchronous boundary. They do not test the
-upcoming app authority or socket flush. `stop_discards_busy_feedback_before_transport_retry`
-checks the existing plane queue is discarded on stop after a busy response; it
-does not retire a datagram already accepted by the transport.
+`effect_authority::consumer::EffectTicket` constructs the pairing authority's
+requests, rejects mismatched replies, preserves uncertain admissions for lookup,
+and holds queued or uncertain feedback until an exact whole-stream retirement
+receipt. It does not authenticate the broker reply, schedule requests, or install
+a route; trusted composition must select the authority and transport providers.
+Sequences are unique and monotonically increasing across the entire authority
+epoch, not merely a device. Completion is valid only after the provider's
+asynchronous work has retired as well as its synchronous call.
 
-After the authority API lands, replace the stand-in with the real ticket and
-exercise actual lifecycle/protocol/input/feedback integration over the broker.
-Required races: revoke before ticket acquisition, while backend injection is
-blocked, while native send is blocked, after ENet admission but before socket
-handoff, while a socket send is blocked, during retransmission, and on lost
-admission or release replies. Assert fence immediately, no new effects, drain
-ack only after all admitted effects and callbacks retire, and no stale source,
-stream, device or boot generation is accepted. Cover busy, cancellation,
-expiry, failed cleanup, worker restart, independent sources and all queue limits.
-Tests must use loopback or injected socket fakes and must not claim remote delivery.
+The input and native feedback boundary tests compile the pairing provider's
+actual ledger and hold its ticket across the controller fake-backend injection
+and the native transport callback. The feedback test uses a synthetic transport
+receipt: the separate control-transport test validates actual ENet queue
+retirement, including a blocked local send. These are not a combined production
+pairing/broker/lifecycle/transport test and do not prove an authenticated source
+join. `stop_discards_busy_feedback_before_transport_retry` covers a separate
+plane queue. Lost admission, cancellation and mismatched receipts are covered by
+SDK state-machine tests.
+
+The authority accepts only one selected direct effect owner. That owner must
+retain a ticket while an input request runs through the broker and while any
+feedback remains in the selected transport. Holding each feedback ticket until
+whole-stream retirement is safe but exhausts the authority's 256-record limit
+in normal operation. Production activation therefore requires an independently
+verified bounded completion or cancellation mechanism (or another coherent
+batching design), and a real broker integration proving the complete fence,
+worker and transport drain barrier. Keep the route disabled until then. Tests
+must use loopback or injected socket fakes and cannot claim remote delivery.
 
 `amaterasu_module_sdk::input::extensions::source_label::observe` parses the
 negotiated lifecycle source label against an expected stream target only. It is
@@ -94,7 +101,7 @@ Only combine that receipt with settled input/backend work and the app worker's
 revocation barrier. Do not grant a protocol caller ownership of another module's
 stream, treat a label as authority, or fall back to a bare close/status when a
 receipt is unavailable. This checkpoint does not connect any production route
-or acknowledge source revocation. The pending protocol gate remains required.
+or acknowledge source revocation. The authenticated protocol binding and combined barrier remain required.
 
 The new control-provider tests use only loopback and cover unsent datagram
 retirement, rejection of late native sends, owner and epoch mismatch, status
