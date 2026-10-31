@@ -224,6 +224,73 @@ pub(super) mod tests {
         }
     }
     #[test]
+    fn session_finalization_freezes_exact_durable_stage() {
+        use super::super::composition::{
+            CompositionBook, OutputSelection, ProducerCallbackProof, StagedOutputRefinement,
+        };
+        use crate::provider_dispatch::{DispatchRecord, DispatchState, ProviderCall};
+        let mut selection = fixture();
+        let root = selection.input.clone();
+        let selected = OutputSelection {
+            producer: root.output.producer.clone(),
+            service: root.output.producer_service.clone(),
+            capability: root.output.capability.clone(),
+            schema: root.output.schema.clone(),
+        };
+        let mut book = CompositionBook::default();
+        book.record(root.clone(), &selected, &root.output.origin, &|_| true)
+            .unwrap();
+        let mut plan = root.plan.clone();
+        plan.resources[0].incarnation = Some(root.output.resource.incarnation.clone());
+        plan.resources[0].expected_revision = Some(root.output.resource.revision);
+        let method = json!({"service":"owner/2","method":"callback","interface_major":2,"interface_minor":0,"schema_revision":1});
+        let participant = serde_json::from_value(json!({"provider":"owner","plan_method":method,"callback_method":method,"status_method":method,"capabilities":[],"cleanup_methods":[],"settings_revision":"revision","settings":{}})).unwrap();
+        let request: api::ProviderRequest = serde_json::from_value(json!({"provider_sequence":1,"operation":"lifecycle_callback","version":2,"transition_id":selection.transition_id,"operation_id":"stage-call","target":selection.target,"phase":"stream.prepare","settings_revision":"revision","settings":{},"intent":"initial","reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector/1"]},"remaining_ms":1000,"plan_revision":plan.revision,"admission_id":"stage-admission","approved_plan":plan})).unwrap();
+        let response: api::ProviderResponse = serde_json::from_value(
+            json!({"status":"prepared","candidate":null,"obligations":[],"outputs":[root.output]}),
+        )
+        .unwrap();
+        let terminal = DispatchRecord {
+            call: ProviderCall {
+                service: "owner/2".into(),
+                method: "callback".into(),
+                interface_major: 2,
+                interface_minor: 0,
+                approval: json!({"provider":"owner"}),
+                arguments: serde_json::to_value(&request).unwrap(),
+                timeout_ms: 1000,
+                operation_id: "stage-call".into(),
+            },
+            state: DispatchState::Completed {
+                payload: serde_json::to_value(response).unwrap(),
+            },
+        };
+        let stage = StagedOutputRefinement {
+            target: selection.target.clone(),
+            parent_generation: 3,
+            admission_id: "stage-admission".into(),
+            transition_id: selection.transition_id.clone(),
+            plan,
+            before: root.output.clone(),
+            after: root.output.clone(),
+            callback_proof: ProducerCallbackProof {
+                participant,
+                request,
+                terminal,
+                pending_receipt: None,
+            },
+        };
+        book.record_stage(stage.clone(), &|_| true).unwrap();
+        selection.stage = Some(stage);
+        book.record_finalize_selection(selection.clone(), &|_| true)
+            .unwrap();
+        assert_eq!(selection.current_output(), &root.output);
+        let mut tampered = selection;
+        tampered.stage.as_mut().unwrap().after.data = json!({"mode":"other"});
+        assert!(book.record_finalize_selection(tampered, &|_| true).is_err());
+    }
+
+    #[test]
     fn session_output_cannot_finalize_for_stream_without_durable_stage() {
         use super::super::composition::{CompositionBook, OutputSelection};
         let selection = fixture();
