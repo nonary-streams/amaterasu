@@ -715,11 +715,13 @@ dependencies = [
 name = "amaterasu-session-lifecycle"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-extension-api",
  "amaterasu-module-sdk",
  "amaterasu-runtime",
  "amaterasu-storage",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

@@ -1,8 +1,33 @@
-//! Durable admission and replay protection for lifecycle transitions.
+//! Durable lifecycle authority; native work advances outside request handlers.
+mod action_endpoints;
+mod application;
+mod operations;
+mod providers;
+mod recovery;
+mod retention;
+mod security;
+
+use crate::adapter::LifecycleSettings;
+use crate::prepare_authority::{AuthorityState, ProviderSelection};
+use crate::prepare_driver::{PrepareDriver, PrepareState};
 use crate::store::LifecycleStore;
+use amaterasu_extension_api::{
+    CaptureBinding, LifecyclePhase, LifecycleTarget, ReleaseReason, StreamIntent, VideoMode,
+};
+use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, io, path::Path};
+use std::time::{Duration, Instant};
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
+    io,
+    path::Path,
+    rc::Rc,
+};
+
+const MAX_RECEIPTS: usize = 4096;
+const MAX_SESSIONS: usize = 128;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -11,6 +36,114 @@ struct Receipt {
     initiator: String,
     request: Value,
     response: Value,
+    #[serde(default)]
+    work: Option<Work>,
+    #[serde(default)]
+    wait_target: Option<LifecycleTarget>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Work {
+    phase: LifecyclePhase,
+    target: LifecycleTarget,
+    intent: Option<StreamIntent>,
+    reason: Option<ReleaseReason>,
+    video: Option<VideoMode>,
+    transition_id: String,
+    providers: Vec<String>,
+    index: usize,
+    states: BTreeMap<String, PrepareState>,
+    candidate: Option<CaptureBinding>,
+    waiting_retirement: bool,
+    #[serde(default)]
+    failure: Option<String>,
+    #[serde(default)]
+    failed_preparation: Option<FailedPreparation>,
+    #[serde(default)]
+    action_transfer: Option<ActionTransfer>,
+    #[serde(default)]
+    recovery_authorized_epoch: Option<String>,
+}
+
+/// Exact reservation ownership transferred to a durable teardown work item.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActionTransfer {
+    service: String,
+    permit: String,
+    binding: crate::action_authority::ActionBinding,
+    input_reservation_id: Option<String>,
+    #[serde(default)]
+    admission_id: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FailedPreparation {
+    reason: String,
+    uncertain: bool,
+    states: BTreeMap<String, PrepareState>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SessionPhase {
+    Preparing,
+    Ready,
+    Paused,
+    Ending,
+    Retired,
+    Ended,
+    RecoveryRequired,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum StreamPhase {
+    Preparing,
+    Ready,
+    Active,
+    Quiescing,
+    Retired,
+    RecoveryRequired,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StreamRecord {
+    generation: u64,
+    phase: StreamPhase,
+    candidate: Option<CaptureBinding>,
+    required: BTreeSet<String>,
+    acknowledgements: BTreeSet<String>,
+    retirements: BTreeSet<String>,
+    #[serde(default)]
+    binding_owner: String,
+    #[serde(default)]
+    preparation_transition: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionRecord {
+    host_epoch: String,
+    id: String,
+    generation: u64,
+    phase: SessionPhase,
+    owner: crate::action_authority::Principal,
+    delegates: BTreeSet<String>,
+    application_ref: Value,
+    settings_revision: String,
+    application_retired: bool,
+    streams: BTreeMap<String, StreamRecord>,
+    #[serde(default)]
+    obligations: Vec<amaterasu_extension_api::ResourceObligation>,
+    #[serde(default)]
+    required_consumers: Option<BTreeSet<String>>,
+    #[serde(default)]
+    application: Option<application::ApplicationBinding>,
+    #[serde(default)]
+    application_operation_id: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -19,155 +152,276 @@ struct Journal {
     version: u32,
     host_epoch: String,
     receipts: BTreeMap<String, Receipt>,
+    #[serde(default)]
+    sessions: BTreeMap<String, SessionRecord>,
+    #[serde(default)]
+    authority: AuthorityState,
+    #[serde(default)]
+    inputs: crate::input_authority::InputAuthority,
+    #[serde(default)]
+    actions: crate::action_authority::ActionAuthority,
+    #[serde(default)]
+    input_bindings: BTreeMap<String, crate::input_authority::ActiveBinding>,
+    #[serde(default)]
+    revoked_inputs: BTreeSet<String>,
+    #[serde(default)]
+    recovery_sources: BTreeMap<String, String>,
+    #[serde(default)]
+    input_boot_epochs: BTreeMap<String, String>,
+    #[serde(default)]
+    retention: retention::Retention,
 }
 
-// JSON array encoding is unambiguous for arbitrary authenticated identity strings.
+struct SharedJournal {
+    store: LifecycleStore,
+    value: Journal,
+}
+type Shared = Rc<RefCell<SharedJournal>>;
+
 fn receipt_key(caller: &str, initiator: &str, operation_id: &str) -> String {
     serde_json::to_string(&(caller, initiator, operation_id)).expect("string tuple serializes")
 }
-
+fn identifier() -> ModuleResult<String> {
+    amaterasu_storage::random_identifier().map_err(|_| "entropy_unavailable".into())
+}
+fn rejection(reason: &str) -> Value {
+    json!({"status":"rejected","reason":reason})
+}
+fn valid_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+}
+fn save(shared: &Shared, mut next: Journal) -> ModuleResult<()> {
+    retention::compact(&mut next);
+    let mut shared = shared.borrow_mut();
+    shared
+        .store
+        .replace(&next)
+        .map_err(|_| "journal_write_failed".to_owned())?;
+    shared.value = next;
+    Ok(())
+}
 fn validate_journal(journal: &Journal) -> io::Result<()> {
-    let valid_text = |value: Option<&str>| value.is_some_and(|text| !text.is_empty());
-    let valid = !journal.host_epoch.is_empty()
-        && journal.receipts.len() <= 4096
-        && journal.receipts.iter().all(|(key, receipt)| {
-            let operation_id = receipt.request.get("operation_id").and_then(Value::as_str);
-            let response = &receipt.response;
-            let status = response.get("status").and_then(Value::as_str);
-            !receipt.caller.is_empty()
-                && !receipt.initiator.is_empty()
-                && operation_id.is_some_and(|id| {
-                    !id.is_empty()
-                        && id.len() <= 128
-                        && *key == receipt_key(&receipt.caller, &receipt.initiator, id)
-                })
-                && receipt.request.get("operation").and_then(Value::as_str) == Some("prepare")
-                && response.get("operation_id").and_then(Value::as_str) == operation_id
-                && valid_text(response.get("host_epoch").and_then(Value::as_str))
-                && valid_text(response.get("session_id").and_then(Value::as_str))
-                && valid_text(response.get("transition_id").and_then(Value::as_str))
-                && response.get("generation").and_then(Value::as_u64) == Some(1)
-                && (status == Some("pending")
-                    || (status == Some("recovery_required")
-                        && response.get("reason").and_then(Value::as_str)
-                            == Some("coordinator_restarted")))
-        });
-    if valid {
-        Ok(())
-    } else {
-        Err(io::Error::new(
+    if !matches!(journal.version, 2 | 3)
+        || !valid_id(&journal.host_epoch)
+        || journal.receipts.len() > MAX_RECEIPTS
+        || journal.sessions.len() > MAX_SESSIONS
+        || !retention::validate(journal)
+        || !journal.inputs.validate()
+        || journal.actions.validate().is_err()
+        || journal
+            .input_boot_epochs
+            .iter()
+            .any(|(token, epoch)| !journal.input_bindings.contains_key(token) || !valid_id(epoch))
+        || journal.receipts.iter().any(|(key, receipt)| {
+            let id = receipt.request.get("operation_id").and_then(Value::as_str);
+            id.is_none_or(|id| {
+                !valid_id(id)
+                    || *key != receipt_key(&receipt.caller, &receipt.initiator, id)
+                    || receipt.response.get("operation_id").and_then(Value::as_str) != Some(id)
+            }) || receipt.caller.is_empty()
+                || receipt.initiator.is_empty()
+        })
+    {
+        return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid lifecycle journal",
-        ))
+        ));
     }
+    Ok(())
 }
 
 pub struct Coordinator {
-    store: LifecycleStore,
-    journal: Journal,
+    shared: Shared,
+    settings: LifecycleSettings,
+    configured: bool,
+    selections: BTreeMap<String, ProviderSelection>,
+    approval_cursor: usize,
+    drivers: BTreeMap<String, PrepareDriver>,
+    validations: BTreeMap<String, security::ValidationJob>,
+    revocations: BTreeMap<String, security::RevocationJob>,
+    application_jobs: BTreeMap<String, application::ApplicationJob>,
+    ephemeral: BTreeMap<String, (Receipt, Instant)>,
+    work_cursor: usize,
 }
 
 impl Coordinator {
     pub fn open(path: &Path) -> io::Result<Self> {
         let mut store = LifecycleStore::new(path.to_path_buf())?;
-        let previous: Option<Journal> = store.load()?;
-        let epoch = amaterasu_storage::random_identifier().map_err(io::Error::other)?;
-        let mut journal = match previous {
-            Some(journal) if journal.version == 2 => journal,
-            Some(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "unsupported lifecycle journal version",
-                ));
-            }
-            None => Journal {
-                version: 2,
-                host_epoch: epoch.clone(),
-                receipts: BTreeMap::new(),
-            },
-        };
+        let epoch = identifier().map_err(io::Error::other)?;
+        let mut journal: Journal = store.load()?.unwrap_or_else(|| Journal {
+            version: 3,
+            host_epoch: epoch.clone(),
+            receipts: BTreeMap::new(),
+            sessions: BTreeMap::new(),
+            authority: AuthorityState::default(),
+            inputs: Default::default(),
+            actions: Default::default(),
+            input_bindings: BTreeMap::new(),
+            revoked_inputs: BTreeSet::new(),
+            recovery_sources: BTreeMap::new(),
+            input_boot_epochs: BTreeMap::new(),
+            retention: Default::default(),
+        });
         validate_journal(&journal)?;
-        // In-flight operations from the old process require reconciliation; never
-        // replay their native work merely because the process was restarted.
+        journal.version = 3;
         for receipt in journal.receipts.values_mut() {
-            if receipt.response.get("status").and_then(Value::as_str) == Some("pending") {
+            if receipt.response["status"] == "pending" {
                 receipt.response["status"] = json!("recovery_required");
                 receipt.response["reason"] = json!("coordinator_restarted");
             }
         }
+        for session in journal.sessions.values_mut() {
+            if session.phase != SessionPhase::Ended {
+                session.phase = SessionPhase::RecoveryRequired;
+            }
+            for stream in session.streams.values_mut() {
+                if stream.phase != StreamPhase::Retired {
+                    stream.phase = StreamPhase::RecoveryRequired;
+                }
+            }
+        }
+        journal.inputs.recover_after_restart();
+        journal.input_bindings.clear();
+        journal.input_boot_epochs.clear();
+        journal.revoked_inputs.clear();
+        journal.actions.recover_after_restart().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid action recovery state")
+        })?;
         journal.host_epoch = epoch;
+        retention::compact(&mut journal);
         store.replace(&journal)?;
-        Ok(Self { store, journal })
+        Ok(Self {
+            shared: Rc::new(RefCell::new(SharedJournal {
+                store,
+                value: journal,
+            })),
+            settings: LifecycleSettings::default(),
+            configured: false,
+            selections: BTreeMap::new(),
+            approval_cursor: 0,
+            drivers: BTreeMap::new(),
+            validations: BTreeMap::new(),
+            revocations: BTreeMap::new(),
+            application_jobs: BTreeMap::new(),
+            ephemeral: BTreeMap::new(),
+            work_cursor: 0,
+        })
+    }
+
+    pub fn configured(settings: &LifecycleSettings) -> ModuleResult<Self> {
+        settings.validate()?;
+        let mut coordinator =
+            Self::open(Path::new(&settings.journal_path)).map_err(|e| e.to_string())?;
+        coordinator.settings = settings.clone();
+        coordinator.configured = true;
+        Ok(coordinator)
     }
 
     pub fn handle(&mut self, caller: &str, initiator: &str, payload: Value) -> Value {
         if caller.is_empty() || initiator.is_empty() {
-            return json!({"status":"rejected","reason":"missing_authenticated_identity"});
+            return rejection("missing_authenticated_identity");
         }
         let Some(operation) = payload.get("operation").and_then(Value::as_str) else {
-            return json!({"status":"rejected","reason":"invalid_request"});
+            return rejection("invalid_request");
         };
         if operation == "snapshot" {
-            return json!({"status":"ok","host_epoch":self.journal.host_epoch});
+            return self.snapshot(caller, initiator);
         }
-        let Some(operation_id) = payload
+        if operation == "verify_provider_epoch" {
+            return self.verify_provider(caller, &payload);
+        }
+        if matches!(
+            operation,
+            "issue_input_binding"
+                | "validate_input_binding"
+                | "reserve_input_action"
+                | "lookup_input_action"
+                | "finish_input_action"
+                | "authorize_action"
+                | "consume_action_permit"
+                | "complete_action"
+                | "begin_action_transition"
+                | "consume_input_reservation"
+                | "verify_action_effect"
+                | "check_action_effect"
+        ) {
+            return self.security_operation(caller, initiator, &payload);
+        }
+        let Some(id) = payload
             .get("operation_id")
             .and_then(Value::as_str)
-            .filter(|id| !id.is_empty() && id.len() <= 128)
+            .filter(|id| valid_id(id))
         else {
-            return json!({"status":"rejected","reason":"invalid_operation_id"});
+            return rejection("invalid_operation_id");
         };
-        let receipt_key = receipt_key(caller, initiator, operation_id);
-        if operation == "lookup" {
-            return match self.journal.receipts.get(&receipt_key) {
-                Some(receipt) if receipt.caller == caller && receipt.initiator == initiator => {
-                    receipt.response.clone()
-                }
-                _ => json!({"status":"not_found"}),
-            };
+        let key = receipt_key(caller, initiator, id);
+        self.ephemeral.retain(|_, (receipt, created)| {
+            receipt.response["status"] == "pending" || created.elapsed() < Duration::from_secs(5)
+        });
+        if let Some((receipt, _)) = self.ephemeral.get(&key) {
+            if operation == "lookup" || receipt.request == payload {
+                return receipt.response.clone();
+            }
+            return rejection("operation_id_conflict");
         }
-        if let Some(receipt) = self.journal.receipts.get(&receipt_key) {
-            return if receipt.caller == caller
-                && receipt.initiator == initiator
-                && receipt.request == payload
+        let journal = self.shared.borrow().value.clone();
+        if retention::expired(&journal, &key) {
+            return rejection("receipt_expired");
+        }
+        if operation == "lookup" {
+            if let Some(source) = journal.recovery_sources.get(&key)
+                && let Some(original) = journal.receipts.get(source)
             {
+                let mut response = original.response.clone();
+                response["operation_id"] = json!(id);
+                response["original_operation_id"] = original.request["operation_id"].clone();
+                return response;
+            }
+            return journal
+                .receipts
+                .get(&key)
+                .map(|r| r.response.clone())
+                .unwrap_or_else(|| json!({"status":"not_found"}));
+        }
+        if let Some(receipt) = journal.receipts.get(&key) {
+            return if receipt.request == payload {
                 receipt.response.clone()
             } else {
-                json!({"status":"rejected","reason":"operation_id_conflict"})
+                rejection("operation_id_conflict")
             };
         }
-        if operation != "prepare" {
-            return json!({"status":"rejected","reason":"unsupported_operation"});
+        if matches!(operation, "prepare" | "prepare_stream" | "resume_stream")
+            && retention::at_capacity(&journal)
+        {
+            return rejection("retention_capacity_exhausted");
         }
-        if self.journal.receipts.len() >= 4096 {
-            return json!({"status":"rejected","reason":"capacity_exhausted"});
+        if journal.receipts.len() >= MAX_RECEIPTS {
+            return rejection("capacity_exhausted");
         }
-        // This stage only admits preparation; it does not assert that providers
-        // prepared resources or that an application may launch.
-        let session_id = match amaterasu_storage::random_identifier() {
-            Ok(id) => id,
-            Err(_) => return json!({"status":"rejected","reason":"entropy_unavailable"}),
+        let result = if operation == "recover_session" {
+            self.recover_session(caller, initiator, payload, key)
+        } else {
+            self.admit(caller, initiator, payload, key)
         };
-        let transition_id = match amaterasu_storage::random_identifier() {
-            Ok(id) => id,
-            Err(_) => return json!({"status":"rejected","reason":"entropy_unavailable"}),
-        };
-        let response = json!({"status":"pending","operation_id":operation_id,"host_epoch":self.journal.host_epoch,"session_id":session_id,"transition_id":transition_id,"generation":1});
-        let mut next = self.journal.clone();
-        next.receipts.insert(
-            receipt_key,
-            Receipt {
-                caller: caller.into(),
-                initiator: initiator.into(),
-                request: payload.clone(),
-                response: response.clone(),
-            },
-        );
-        if self.store.replace(&next).is_err() {
-            return json!({"status":"recovery_required","reason":"journal_write_failed"});
+        match result {
+            Ok(response) => response,
+            Err(reason) if reason == "journal_write_failed" => {
+                json!({"status":"recovery_required","reason":reason})
+            }
+            Err(reason) => rejection(&reason),
         }
-        self.journal = next;
-        response
+    }
+
+    pub fn advance(
+        &mut self,
+        send: &mut dyn FnMut(Command) -> ModuleResult<Response>,
+    ) -> ModuleResult<()> {
+        if !self.configured {
+            return Ok(());
+        }
+        self.refresh_approvals(send)?;
+        self.advance_applications(send)?;
+        self.advance_work(send)
     }
 }
 

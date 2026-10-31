@@ -1,0 +1,609 @@
+//! Coordinator-owned input binding and in-flight reservation state.
+//!
+//! This is not an authentication boundary by itself. The coordinator must use
+//! broker-attested identities, resolve `ActiveBinding` exclusively from its own
+//! validated active stream and exact consumer acknowledgements, and serialize
+//! all calls with quiescence. Clone, mutate, and persist this state atomically
+//! with the canonical stream before exposing any result or dispatching effects.
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+
+const MAX_BINDINGS: usize = 64;
+const MAX_RESERVATIONS: usize = 256;
+const MAX_ACTIONS: usize = 32;
+const MAX_TEXT: usize = 128;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActiveBinding {
+    pub host_epoch: String,
+    pub session_id: String,
+    pub stream_id: String,
+    pub generation: u64,
+    pub geometry_revision: u64,
+    /// Broker identity of the approved input service, resolved from policy.
+    pub input_consumer: String,
+    pub allowed_actions: BTreeSet<String>,
+}
+
+impl ActiveBinding {
+    fn valid(&self) -> bool {
+        [
+            &self.host_epoch,
+            &self.session_id,
+            &self.stream_id,
+            &self.input_consumer,
+        ]
+        .into_iter()
+        .all(|s| valid_text(s))
+            && self.generation > 0
+            && self.geometry_revision > 0
+            && self.allowed_actions.len() <= MAX_ACTIONS
+            && self.allowed_actions.iter().all(|s| valid_text(s))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    Running,
+    Completed,
+    Cancelled,
+    RecoveryRequired,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Reservation {
+    pub reservation_id: String,
+    pub operation_id: String,
+    pub token: String,
+    pub caller: String,
+    pub initiator: String,
+    pub binding: ActiveBinding,
+    pub action_id: String,
+    pub outcome: Outcome,
+    #[serde(default)]
+    pub transferred_to: Option<String>,
+}
+
+impl std::fmt::Debug for Reservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Reservation")
+            .field("reservation_id", &"[redacted]")
+            .field("token", &"[redacted]")
+            .field("operation_id", &self.operation_id)
+            .field("caller", &self.caller)
+            .field("initiator", &self.initiator)
+            .field("binding", &self.binding)
+            .field("action_id", &self.action_id)
+            .field("outcome", &self.outcome)
+            .finish()
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InputAuthority {
+    bindings: BTreeMap<String, ActiveBinding>,
+    // Durable tombstones prevent operation ID reuse after completion.
+    reservations: BTreeMap<String, Reservation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Error {
+    Invalid,
+    Unauthorized,
+    Conflict,
+    Capacity,
+    RandomUnavailable,
+    NotFound,
+    UnknownOutcome,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReservationResult {
+    Admitted(Reservation),
+    Existing(Reservation),
+}
+
+impl InputAuthority {
+    pub fn validate(&self) -> bool {
+        self.bindings.len() <= MAX_BINDINGS
+            && self.reservations.len() <= MAX_RESERVATIONS
+            && self
+                .bindings
+                .iter()
+                .all(|(token, binding)| valid_token(token) && binding.valid())
+            && self.reservations.iter().all(|(key, r)| {
+                *key == operation_key(&r.caller, &r.initiator, &r.operation_id)
+                    && valid_token(&r.reservation_id)
+                    && valid_token(&r.token)
+                    && valid_text(&r.operation_id)
+                    && valid_text(&r.caller)
+                    && valid_text(&r.initiator)
+                    && r.binding.valid()
+                    && r.caller == r.binding.input_consumer
+                    && r.binding.allowed_actions.contains(&r.action_id)
+                    && r.transferred_to.as_deref().is_none_or(valid_text)
+            })
+            && self
+                .reservations
+                .values()
+                .map(|r| &r.reservation_id)
+                .collect::<BTreeSet<_>>()
+                .len()
+                == self.reservations.len()
+    }
+
+    /// Only a coordinator-validated active binding and policy-selected consumer
+    /// may be passed here. Persist the returned token before delivering it.
+    pub fn issue_input_binding(&mut self, active: &ActiveBinding) -> Result<String, Error> {
+        if !active.valid() {
+            return Err(Error::Invalid);
+        }
+        if self.bindings.len() >= MAX_BINDINGS {
+            return Err(Error::Capacity);
+        }
+        let token = unique_id(|id| self.bindings.contains_key(id))?;
+        self.bindings.insert(token.clone(), active.clone());
+        Ok(token)
+    }
+
+    /// The coordinator must independently resolve `active` for every call.
+    pub fn validate_input_binding(
+        &self,
+        caller: &str,
+        token: &str,
+        active: &ActiveBinding,
+    ) -> Result<ActiveBinding, Error> {
+        let binding = self.bindings.get(token).ok_or(Error::Unauthorized)?;
+        if caller != binding.input_consumer || active != binding || !active.valid() {
+            return Err(Error::Unauthorized);
+        }
+        Ok(binding.clone())
+    }
+
+    /// Only `Admitted` permits dispatch, after persistence. Existing is a
+    /// receipt lookup, never authority to dispatch the native effect again.
+    pub fn reserve_input_action(
+        &mut self,
+        caller: &str,
+        initiator: &str,
+        operation_id: &str,
+        token: &str,
+        action_id: &str,
+        active: &ActiveBinding,
+    ) -> Result<ReservationResult, Error> {
+        if !valid_text(caller)
+            || !valid_text(initiator)
+            || !valid_text(operation_id)
+            || !valid_text(action_id)
+        {
+            return Err(Error::Invalid);
+        }
+        let key = operation_key(caller, initiator, operation_id);
+        if let Some(old) = self.reservations.get(&key) {
+            return if old.token == token
+                && old.action_id == action_id
+                && old.binding == *active
+                && caller == old.binding.input_consumer
+            {
+                Ok(ReservationResult::Existing(old.clone()))
+            } else {
+                Err(Error::Conflict)
+            };
+        }
+        let binding = self.validate_input_binding(caller, token, active)?;
+        if !binding.allowed_actions.contains(action_id) {
+            return Err(Error::Unauthorized);
+        }
+        if self.reservations.len() >= MAX_RESERVATIONS {
+            return Err(Error::Capacity);
+        }
+        let reservation_id =
+            unique_id(|id| self.reservations.values().any(|r| r.reservation_id == id))?;
+        let reservation = Reservation {
+            reservation_id,
+            operation_id: operation_id.into(),
+            token: token.into(),
+            caller: caller.into(),
+            initiator: initiator.into(),
+            binding,
+            action_id: action_id.into(),
+            outcome: Outcome::Running,
+            transferred_to: None,
+        };
+        self.reservations.insert(key, reservation.clone());
+        Ok(ReservationResult::Admitted(reservation))
+    }
+
+    pub fn lookup_input_action(
+        &self,
+        caller: &str,
+        initiator: &str,
+        operation_id: &str,
+    ) -> Result<Reservation, Error> {
+        self.reservations
+            .get(&operation_key(caller, initiator, operation_id))
+            .cloned()
+            .ok_or(Error::NotFound)
+    }
+
+    /// An uncertain effect cannot be completed by a normal finish call.
+    pub fn finish_input_action(
+        &mut self,
+        caller: &str,
+        initiator: &str,
+        operation_id: &str,
+        reservation_id: &str,
+        outcome: Outcome,
+    ) -> Result<Reservation, Error> {
+        if outcome == Outcome::Running {
+            return Err(Error::Invalid);
+        }
+        let r = self
+            .reservations
+            .get_mut(&operation_key(caller, initiator, operation_id))
+            .ok_or(Error::NotFound)?;
+        if r.reservation_id != reservation_id {
+            return Err(Error::Unauthorized);
+        }
+        if r.outcome == outcome {
+            return Ok(r.clone());
+        }
+        if r.outcome == Outcome::RecoveryRequired {
+            return Err(Error::UnknownOutcome);
+        }
+        if r.outcome != Outcome::Running {
+            return Err(Error::Conflict);
+        }
+        r.outcome = outcome;
+        Ok(r.clone())
+    }
+
+    /// Lookup of an exact opaque reservation for authenticated coordinator use.
+    pub fn resolve_reservation(&self, reservation_id: &str) -> Result<Reservation, Error> {
+        if !self.validate() {
+            return Err(Error::Invalid);
+        }
+        self.reservations
+            .values()
+            .find(|reservation| reservation.reservation_id == reservation_id)
+            .cloned()
+            .ok_or(Error::NotFound)
+    }
+
+    /// Resolve only a live reservation; the caller must authenticate the
+    /// action service and independently validate the canonical session owner.
+    pub fn resolve_running_reservation(&self, reservation_id: &str) -> Result<Reservation, Error> {
+        if !self.validate() {
+            return Err(Error::Invalid);
+        }
+        self.reservations
+            .values()
+            .find(|reservation| {
+                reservation.reservation_id == reservation_id
+                    && reservation.outcome == Outcome::Running
+            })
+            .cloned()
+            .ok_or(Error::NotFound)
+    }
+
+    /// Transfer one exact running reservation to an authenticated action
+    /// service. Persist before returning; retries by the same owner are safe.
+    pub fn transfer_reservation(
+        &mut self,
+        reservation_id: &str,
+        action_service: &str,
+        operation_id: &str,
+        action_id: &str,
+    ) -> Result<Reservation, Error> {
+        if !valid_text(action_service) {
+            return Err(Error::Invalid);
+        }
+        let reservation = self
+            .reservations
+            .values_mut()
+            .find(|entry| entry.reservation_id == reservation_id)
+            .ok_or(Error::NotFound)?;
+        if reservation.outcome != Outcome::Running
+            || reservation.operation_id != operation_id
+            || reservation.action_id != action_id
+        {
+            return Err(Error::Unauthorized);
+        }
+        if reservation
+            .transferred_to
+            .as_deref()
+            .is_some_and(|owner| owner != action_service)
+        {
+            return Err(Error::Conflict);
+        }
+        reservation.transferred_to = Some(action_service.into());
+        Ok(reservation.clone())
+    }
+
+    /// Fence the exact generation, excluding only an exact running reservation
+    /// already transferred to the supplied authenticated action service.
+    pub fn fence_except(
+        &mut self,
+        active: &ActiveBinding,
+        reservation_id: &str,
+        action_service: &str,
+    ) -> Result<usize, Error> {
+        let reservation = self.resolve_running_reservation(reservation_id)?;
+        if &reservation.binding != active
+            || reservation.transferred_to.as_deref() != Some(action_service)
+        {
+            return Err(Error::Unauthorized);
+        }
+        self.bindings
+            .retain(|_, binding| !same_generation(binding, active));
+        Ok(self
+            .reservations
+            .values()
+            .filter(|entry| {
+                same_generation(&entry.binding, active)
+                    && entry.reservation_id != reservation_id
+                    && matches!(entry.outcome, Outcome::Running | Outcome::RecoveryRequired)
+            })
+            .count())
+    }
+
+    /// Called under the same coordinator lock as the canonical generation fence.
+    /// A nonzero return means retirement must wait or report recovery required.
+    pub fn fence(&mut self, active: &ActiveBinding) -> usize {
+        self.bindings
+            .retain(|_, binding| !same_generation(binding, active));
+        self.reservations
+            .values()
+            .filter(|r| {
+                same_generation(&r.binding, active)
+                    && matches!(r.outcome, Outcome::Running | Outcome::RecoveryRequired)
+            })
+            .count()
+    }
+
+    pub fn has_unresolved_session(&self, _host_epoch: &str, session_id: &str) -> bool {
+        self.bindings
+            .values()
+            .any(|binding| binding.session_id == session_id)
+            || self.reservations.values().any(|entry| {
+                entry.binding.session_id == session_id
+                    && matches!(entry.outcome, Outcome::Running | Outcome::RecoveryRequired)
+            })
+    }
+
+    pub fn has_unresolved_stream(
+        &self,
+        _host_epoch: &str,
+        session_id: &str,
+        stream_id: &str,
+    ) -> bool {
+        self.bindings
+            .values()
+            .any(|binding| binding.session_id == session_id && binding.stream_id == stream_id)
+            || self.reservations.values().any(|entry| {
+                entry.binding.session_id == session_id
+                    && entry.binding.stream_id == stream_id
+                    && matches!(entry.outcome, Outcome::Running | Outcome::RecoveryRequired)
+            })
+    }
+
+    /// Prior tokens cannot cross a host epoch and running effects become unknown.
+    pub fn recover_after_restart(&mut self) {
+        self.bindings.clear();
+        for r in self.reservations.values_mut() {
+            if r.outcome == Outcome::Running {
+                r.outcome = Outcome::RecoveryRequired;
+            }
+        }
+    }
+}
+
+fn valid_text(value: &str) -> bool {
+    !value.is_empty() && value.len() <= MAX_TEXT && !value.chars().any(char::is_control)
+}
+fn same_generation(a: &ActiveBinding, b: &ActiveBinding) -> bool {
+    a.host_epoch == b.host_epoch
+        && a.session_id == b.session_id
+        && a.stream_id == b.stream_id
+        && a.generation == b.generation
+}
+fn valid_token(token: &str) -> bool {
+    token.len() == 32
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+fn operation_key(caller: &str, initiator: &str, operation: &str) -> String {
+    serde_json::to_string(&(caller, initiator, operation)).expect("string tuple serializes")
+}
+fn unique_id(exists: impl Fn(&str) -> bool) -> Result<String, Error> {
+    for _ in 0..4 {
+        let id = amaterasu_storage::random_identifier().map_err(|_| Error::RandomUnavailable)?;
+        if !exists(&id) {
+            return Ok(id);
+        }
+    }
+    Err(Error::RandomUnavailable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn binding() -> ActiveBinding {
+        ActiveBinding {
+            host_epoch: "host".into(),
+            session_id: "session".into(),
+            stream_id: "stream".into(),
+            generation: 1,
+            geometry_revision: 2,
+            input_consumer: "input".into(),
+            allowed_actions: BTreeSet::from(["display".into()]),
+        }
+    }
+    #[test]
+    fn only_exact_transferred_input_reservation_is_exempted() {
+        let mut authority = InputAuthority::default();
+        let active = binding();
+        let token = authority.issue_input_binding(&active).unwrap();
+        let ReservationResult::Admitted(first) = authority
+            .reserve_input_action("input", "client", "one", &token, "display", &active)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let ReservationResult::Admitted(second) = authority
+            .reserve_input_action("input", "client", "two", &token, "display", &active)
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(
+            authority
+                .fence_except(&active, &first.reservation_id, "actions")
+                .is_err()
+        );
+        assert!(
+            authority
+                .transfer_reservation(&first.reservation_id, "actions", "wrong", "display")
+                .is_err()
+        );
+        authority
+            .transfer_reservation(&first.reservation_id, "actions", "one", "display")
+            .unwrap();
+        assert_eq!(
+            authority.fence_except(&active, &first.reservation_id, "actions"),
+            Ok(1)
+        );
+        assert!(
+            authority
+                .validate_input_binding("input", &token, &active)
+                .is_err()
+        );
+        authority
+            .finish_input_action(
+                "input",
+                "client",
+                "two",
+                &second.reservation_id,
+                Outcome::Completed,
+            )
+            .unwrap();
+        assert_eq!(
+            authority.fence_except(&active, &first.reservation_id, "actions"),
+            Ok(0)
+        );
+        assert!(
+            authority
+                .fence_except(&active, &first.reservation_id, "other")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn active_binding_and_inflight_fence_survive_restart() {
+        let mut book = InputAuthority::default();
+        let active = binding();
+        let token = book.issue_input_binding(&active).unwrap();
+        assert_eq!(
+            book.validate_input_binding("foreign", &token, &active),
+            Err(Error::Unauthorized)
+        );
+        let mut stale = active.clone();
+        stale.geometry_revision += 1;
+        assert_eq!(
+            book.validate_input_binding("input", &token, &stale),
+            Err(Error::Unauthorized)
+        );
+        let admitted = book
+            .reserve_input_action("input", "client", "op", &token, "display", &active)
+            .unwrap();
+        let ReservationResult::Admitted(reservation) = admitted else {
+            panic!()
+        };
+        let rendered = format!("{reservation:?}");
+        assert!(!rendered.contains(&reservation.token));
+        assert!(!rendered.contains(&reservation.reservation_id));
+        assert!(matches!(
+            book.reserve_input_action("input", "client", "op", &token, "display", &active),
+            Ok(ReservationResult::Existing(_))
+        ));
+        assert_eq!(book.fence(&active), 1);
+        assert_eq!(
+            book.reserve_input_action("input", "client", "op2", &token, "display", &active),
+            Err(Error::Unauthorized)
+        );
+        let mut restored: InputAuthority =
+            serde_json::from_slice(&serde_json::to_vec(&book).unwrap()).unwrap();
+        assert!(restored.validate());
+        restored.recover_after_restart();
+        assert_eq!(restored.fence(&active), 1);
+        assert_eq!(
+            restored.finish_input_action(
+                "input",
+                "client",
+                "op",
+                &reservation.reservation_id,
+                Outcome::Completed
+            ),
+            Err(Error::UnknownOutcome)
+        );
+        assert_eq!(
+            restored
+                .lookup_input_action("input", "client", "op")
+                .unwrap()
+                .outcome,
+            Outcome::RecoveryRequired
+        );
+    }
+    #[test]
+    fn finish_and_duplicate_conflict_do_not_reexecute() {
+        let mut book = InputAuthority::default();
+        let active = binding();
+        let token = book.issue_input_binding(&active).unwrap();
+        let ReservationResult::Admitted(r) = book
+            .reserve_input_action("input", "client", "op", &token, "display", &active)
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            book.reserve_input_action("input", "client", "op", &token, "different", &active),
+            Err(Error::Conflict)
+        );
+        book.finish_input_action(
+            "input",
+            "client",
+            "op",
+            &r.reservation_id,
+            Outcome::Completed,
+        )
+        .unwrap();
+        assert_eq!(book.fence(&active), 0);
+        assert!(matches!(
+            book.reserve_input_action("input", "client", "op", &token, "display", &active),
+            Ok(ReservationResult::Existing(_))
+        ));
+    }
+
+    #[test]
+    fn binding_without_actions_allows_input_but_no_action_reservation() {
+        let mut book = InputAuthority::default();
+        let mut active = binding();
+        active.allowed_actions.clear();
+        let token = book.issue_input_binding(&active).unwrap();
+        assert_eq!(
+            book.validate_input_binding("input", &token, &active),
+            Ok(active.clone())
+        );
+        assert_eq!(
+            book.reserve_input_action("input", "client", "op", &token, "display", &active),
+            Err(Error::Unauthorized)
+        );
+        assert!(book.validate());
+    }
+}

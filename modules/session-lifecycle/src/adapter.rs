@@ -1,16 +1,16 @@
 //! Broker adapter for the lifecycle authority. Request payloads do not establish identity.
+use amaterasu_extension_api::{ConsumerRequirements, MethodRef};
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
 pub const SERVICE: &str = "amaterasu.session-lifecycle/1";
 
 /// Receives identities assigned by the broker, never identity fields from a request.
 pub trait LifecycleHandler: Sized {
     /// Opens and recovers durable authority state before service registration.
-    fn from_journal_path(path: &Path) -> ModuleResult<Self>;
+    fn from_settings(settings: &LifecycleSettings) -> ModuleResult<Self>;
 
     fn handle(&mut self, caller: &str, initiator: &str, payload: Value) -> Value;
 
@@ -26,12 +26,215 @@ pub trait LifecycleHandler: Sized {
     }
 }
 
-#[derive(Default, Deserialize)]
+/// Installed policy; request payloads cannot supply or amend this selection.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
-struct Settings {
-    trusted_callers: BTreeSet<String>,
-    journal_path: String,
-    operation_grants: BTreeMap<String, BTreeSet<String>>,
+pub struct LifecycleSettings {
+    pub trusted_callers: BTreeSet<String>,
+    /// Broker identities granted delegation by installed operator policy.
+    pub session_delegates: BTreeSet<String>,
+    pub input_actions: BTreeSet<String>,
+    pub action_service: String,
+    /// Broker identity allowed to attest settings-scope request sources.
+    pub settings_registry_caller: String,
+    pub journal_path: String,
+    pub operation_grants: BTreeMap<String, BTreeSet<String>>,
+    pub participants: Vec<ParticipantSettings>,
+    pub consumers: ConsumerSettings,
+    pub consumer_requirements: ConsumerRequirements,
+}
+
+impl Default for LifecycleSettings {
+    fn default() -> Self {
+        Self {
+            trusted_callers: BTreeSet::new(),
+            session_delegates: BTreeSet::new(),
+            input_actions: BTreeSet::new(),
+            action_service: "amaterasu.extension-actions".into(),
+            settings_registry_caller: String::new(),
+            journal_path: String::new(),
+            operation_grants: BTreeMap::new(),
+            participants: Vec::new(),
+            consumers: ConsumerSettings::default(),
+            consumer_requirements: ConsumerRequirements {
+                execution_domain: String::new(),
+                capture_providers: Vec::new(),
+                selector_schemas: Vec::new(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ParticipantSettings {
+    pub provider: String,
+    pub plan_method: MethodSettings,
+    pub callback_method: MethodSettings,
+    pub status_method: MethodSettings,
+    #[serde(default)]
+    pub binding_validate_method: Option<MethodSettings>,
+    pub capabilities: BTreeSet<String>,
+    pub cleanup_methods: Vec<MethodRef>,
+    pub settings_revision: String,
+    pub settings: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MethodSettings {
+    pub service: String,
+    pub method: String,
+    pub interface_major: u32,
+    pub interface_minor: u32,
+    pub schema_revision: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConsumerSettings {
+    pub capture: BTreeSet<String>,
+    pub input: BTreeSet<String>,
+}
+
+fn valid_identifier(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-' | b'/')
+        })
+}
+
+impl LifecycleSettings {
+    pub(crate) fn validate(&self) -> ModuleResult<()> {
+        if self.journal_path.is_empty() {
+            return Err("lifecycle journal path is required".into());
+        }
+        let requirements = &self.consumer_requirements;
+        if requirements.execution_domain.is_empty()
+            || requirements.execution_domain.len() > 256
+            || requirements.execution_domain.chars().any(char::is_control)
+            || [
+                &requirements.capture_providers,
+                &requirements.selector_schemas,
+            ]
+            .into_iter()
+            .any(|values| {
+                values.is_empty()
+                    || values.len() > 32
+                    || values.iter().any(|value| {
+                        value.is_empty()
+                            || value.len() > 128
+                            || !value.bytes().all(|b| {
+                                b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/')
+                            })
+                    })
+            })
+        {
+            return Err("invalid lifecycle consumer requirements".into());
+        }
+        if self.trusted_callers.len() > 256
+            || self
+                .trusted_callers
+                .iter()
+                .any(|caller| !valid_identifier(caller))
+        {
+            return Err("invalid lifecycle trusted callers".into());
+        }
+        if self.session_delegates.len() > 128
+            || self.session_delegates.iter().any(|delegate| {
+                !valid_identifier(delegate) || !self.trusted_callers.contains(delegate)
+            })
+        {
+            return Err("invalid lifecycle session delegates".into());
+        }
+        if !valid_identifier(&self.action_service)
+            || self.input_actions.len() > 32
+            || self
+                .input_actions
+                .iter()
+                .any(|action| !valid_identifier(action))
+        {
+            return Err("invalid lifecycle input action policy".into());
+        }
+        if !self.settings_registry_caller.is_empty()
+            && (!valid_identifier(&self.settings_registry_caller)
+                || !self
+                    .trusted_callers
+                    .contains(&self.settings_registry_caller))
+        {
+            return Err("invalid lifecycle settings registry caller".into());
+        }
+        if self.operation_grants.iter().any(|(caller, operations)| {
+            !self.trusted_callers.contains(caller)
+                || operations.len() > 128
+                || operations
+                    .iter()
+                    .any(|operation| !valid_identifier(operation))
+        }) {
+            return Err("invalid lifecycle operation grants".into());
+        }
+        for consumers in [&self.consumers.capture, &self.consumers.input] {
+            if consumers.len() > 128
+                || consumers.iter().any(|caller| {
+                    !valid_identifier(caller) || !self.trusted_callers.contains(caller)
+                })
+            {
+                return Err("invalid lifecycle consumers".into());
+            }
+        }
+        let mut providers = BTreeSet::new();
+        if self.participants.len() > 32 {
+            return Err("too many lifecycle participants".into());
+        }
+        for participant in &self.participants {
+            if !valid_identifier(&participant.provider)
+                || !providers.insert(&participant.provider)
+                || participant.capabilities.len() > 32
+                || participant
+                    .capabilities
+                    .iter()
+                    .any(|id| !valid_identifier(id))
+                || participant.cleanup_methods.len() > 32
+                || participant
+                    .cleanup_methods
+                    .iter()
+                    .enumerate()
+                    .any(|(index, method)| {
+                        !valid_identifier(&method.service)
+                            || !valid_identifier(&method.method)
+                            || method.interface_major == 0
+                            || method.schema_revision == 0
+                            || participant.cleanup_methods[..index].contains(method)
+                    })
+                || !valid_identifier(&participant.settings_revision)
+                || !participant.settings.is_object()
+                || serde_json::to_vec(&participant.settings)
+                    .map_err(|e| e.to_string())?
+                    .len()
+                    > 8192
+            {
+                return Err("invalid lifecycle participant".into());
+            }
+            for method in [
+                &participant.plan_method,
+                &participant.callback_method,
+                &participant.status_method,
+            ]
+            .into_iter()
+            .chain(participant.binding_validate_method.iter())
+            {
+                if !valid_identifier(&method.service)
+                    || !valid_identifier(&method.method)
+                    || method.interface_major == 0
+                    || method.schema_revision == 0
+                {
+                    return Err("invalid lifecycle participant method".into());
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct LifecycleAdapter<H> {
@@ -46,29 +249,10 @@ impl<H: LifecycleHandler> ManagedModule for LifecycleAdapter<H> {
         let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
             return Err("lifecycle settings unavailable".into());
         };
-        let settings: Settings =
+        let settings: LifecycleSettings =
             serde_json::from_value(payload).map_err(|_| "invalid lifecycle settings".to_owned())?;
-        if settings
-            .trusted_callers
-            .iter()
-            .any(|caller| caller.is_empty())
-        {
-            return Err("invalid lifecycle trusted caller".into());
-        }
-        if settings
-            .operation_grants
-            .iter()
-            .any(|(caller, operations)| {
-                !settings.trusted_callers.contains(caller)
-                    || operations.iter().any(|operation| operation.is_empty())
-            })
-        {
-            return Err("invalid lifecycle operation grants".into());
-        }
-        if settings.journal_path.is_empty() {
-            return Err("lifecycle journal path is required".into());
-        }
-        let handler = H::from_journal_path(Path::new(&settings.journal_path))?;
+        settings.validate()?;
+        let handler = H::from_settings(&settings)?;
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
@@ -149,7 +333,7 @@ mod tests {
     struct Handler;
 
     impl LifecycleHandler for Handler {
-        fn from_journal_path(_path: &Path) -> ModuleResult<Self> {
+        fn from_settings(_settings: &LifecycleSettings) -> ModuleResult<Self> {
             Ok(Self)
         }
 
@@ -243,6 +427,7 @@ mod tests {
             object
                 .entry("journal_path")
                 .or_insert(json!("/test/journal"));
+            object.entry("consumer_requirements").or_insert(json!({"execution_domain":"desktop", "capture_providers":["capture"], "selector_schemas":["selector/1"]}));
         }
         Broker {
             settings,
@@ -314,7 +499,7 @@ mod tests {
     fn background_work_advances_on_idle_and_busy_ticks() {
         struct Advancing;
         impl LifecycleHandler for Advancing {
-            fn from_journal_path(_: &Path) -> ModuleResult<Self> {
+            fn from_settings(_: &LifecycleSettings) -> ModuleResult<Self> {
                 Ok(Self)
             }
             fn handle(&mut self, _: &str, _: &str, _: Value) -> Value {
@@ -351,5 +536,110 @@ mod tests {
         drop(module);
         assert_eq!(broker.advances, 2);
         assert_eq!(broker.completions.len(), 1);
+    }
+    #[test]
+    fn participants_and_consumers_require_bounded_trusted_policy() {
+        let method = json!({"service":"provider/1", "method":"prepare", "interface_major":1, "interface_minor":0, "schema_revision":1});
+        let participant = json!({"provider":"provider", "plan_method":method, "callback_method":method, "status_method":method, "capabilities":["display/change"], "cleanup_methods":[method], "settings_revision":"rev-1", "settings":{}});
+        let policy = json!({"journal_path":"/test/journal", "trusted_callers":["capture", "input"], "consumers":{"capture":["capture"], "input":["input"]}, "participants":[participant], "consumer_requirements":{"execution_domain":"desktop", "capture_providers":["capture"], "selector_schemas":["selector/1"]}});
+        let parse = |value| {
+            serde_json::from_value::<LifecycleSettings>(value)
+                .unwrap()
+                .validate()
+        };
+        assert!(parse(policy.clone()).is_ok());
+        let mut registry = policy.clone();
+        registry["settings_registry_caller"] = json!("input");
+        assert!(parse(registry).is_ok());
+        let mut untrusted_registry = policy.clone();
+        untrusted_registry["settings_registry_caller"] = json!("foreign");
+        assert!(parse(untrusted_registry).is_err());
+        let mut actions = policy.clone();
+        actions["input_actions"] = json!(["display/remove"]);
+        actions["action_service"] = json!("amaterasu.extension-actions");
+        assert!(parse(actions).is_ok());
+        let mut invalid_action = policy.clone();
+        invalid_action["input_actions"] = json!(["invalid\naction"]);
+        assert!(parse(invalid_action).is_err());
+        let mut invalid_service = policy.clone();
+        invalid_service["action_service"] = json!("");
+        assert!(parse(invalid_service).is_err());
+        let mut many_actions = policy.clone();
+        many_actions["input_actions"] =
+            json!((0..33).map(|n| format!("action-{n}")).collect::<Vec<_>>());
+        assert!(parse(many_actions).is_err());
+        let mut binding = policy.clone();
+        binding["participants"][0]["binding_validate_method"] = method.clone();
+        assert!(parse(binding.clone()).is_ok());
+        binding["participants"][0]["binding_validate_method"]["interface_major"] = json!(0);
+        assert!(parse(binding).is_err());
+        let mut binding = policy.clone();
+        binding["participants"][0]["binding_validate_method"] = method.clone();
+        binding["participants"][0]["binding_validate_method"]["schema_revision"] = json!(0);
+        assert!(parse(binding).is_err());
+        let mut delegated = policy.clone();
+        delegated["session_delegates"] = json!(["input"]);
+        assert!(parse(delegated).is_ok());
+        let mut untrusted_delegate = policy.clone();
+        untrusted_delegate["session_delegates"] = json!(["other"]);
+        assert!(parse(untrusted_delegate).is_err());
+        let mut too_many_delegates = policy.clone();
+        let delegates: Vec<_> = (0..129).map(|index| format!("delegate-{index}")).collect();
+        too_many_delegates["trusted_callers"] = json!(delegates);
+        too_many_delegates["session_delegates"] = json!(delegates);
+        too_many_delegates["consumers"] = json!({});
+        assert!(parse(too_many_delegates).is_err());
+        for field in ["capabilities", "cleanup_methods"] {
+            let mut empty = policy.clone();
+            empty["participants"][0][field] = json!([]);
+            assert!(parse(empty).is_ok());
+            let mut missing = policy.clone();
+            missing["participants"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(serde_json::from_value::<LifecycleSettings>(missing).is_err());
+        }
+        let mut malformed_cleanup = policy.clone();
+        malformed_cleanup["participants"][0]["cleanup_methods"][0]["schema_revision"] = json!(0);
+        assert!(parse(malformed_cleanup).is_err());
+        let mut duplicate_cleanup = policy.clone();
+        duplicate_cleanup["participants"][0]["cleanup_methods"] = json!([method, method]);
+        assert!(parse(duplicate_cleanup).is_err());
+        let mut missing = policy.clone();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("consumer_requirements");
+        assert!(parse(missing).is_err());
+        for field in ["capture_providers", "selector_schemas"] {
+            let mut empty = policy.clone();
+            empty["consumer_requirements"][field] = json!([]);
+            assert!(parse(empty).is_err());
+            let mut many = policy.clone();
+            many["consumer_requirements"][field] = json!(vec!["valid"; 33]);
+            assert!(parse(many).is_err());
+            let mut invalid = policy.clone();
+            invalid["consumer_requirements"][field] = json!(["bad\n"]);
+            assert!(parse(invalid).is_err());
+        }
+        let mut invalid_domain = policy.clone();
+        invalid_domain["consumer_requirements"]["execution_domain"] = json!("");
+        assert!(parse(invalid_domain).is_err());
+        let mut untrusted = policy.clone();
+        untrusted["consumers"]["capture"] = json!(["other"]);
+        assert!(parse(untrusted).is_err());
+        let mut duplicate = policy.clone();
+        duplicate["participants"] = json!([participant, participant]);
+        assert!(parse(duplicate).is_err());
+        let mut invalid_major = policy.clone();
+        invalid_major["participants"][0]["plan_method"]["interface_major"] = json!(0);
+        assert!(parse(invalid_major).is_err());
+        let mut invalid_settings = policy.clone();
+        invalid_settings["participants"][0]["settings"] = json!([]);
+        assert!(parse(invalid_settings).is_err());
+        let mut oversize = policy;
+        oversize["participants"][0]["settings"] = json!({"data":"a".repeat(8192)});
+        assert!(parse(oversize).is_err());
     }
 }

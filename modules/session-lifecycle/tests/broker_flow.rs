@@ -2,6 +2,7 @@
 use amaterasu_module_sdk::{Command, Response, abi};
 use amaterasu_runtime::Broker;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::path::PathBuf;
@@ -51,10 +52,17 @@ struct Harness {
     instance: *mut c_void,
     root: PathBuf,
     request_sequence: u64,
+    provider_calls: Vec<Value>,
+    pending_callbacks: Vec<(u64, Value)>,
+    provider: bool,
 }
 
 impl Harness {
     fn new() -> Self {
+        Self::with_provider(false)
+    }
+
+    fn with_provider(provider: bool) -> Self {
         let root = std::env::temp_dir().join(format!(
             "amaterasu-lifecycle-broker-{}-{}",
             std::process::id(),
@@ -66,7 +74,7 @@ impl Harness {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
-        let configuration = serde_json::from_value(json!({
+        let mut configuration = json!({
             "principals": {
                 COORDINATOR: {"provide": [SERVICE]},
                 "transport": {"call": [SERVICE]},
@@ -76,6 +84,7 @@ impl Harness {
             "settings": {
                 COORDINATOR: {
                     "journal_path": root.join("journal.json"),
+                    "consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["example/1"]},
                     "trusted_callers": ["transport", "other-transport"],
                     "operation_grants": {
                         "transport": ["prepare", "lookup", "snapshot"],
@@ -83,9 +92,36 @@ impl Harness {
                     }
                 }
             }
-        }))
-        .unwrap();
+        });
+        let mut methods = Vec::new();
+        if provider {
+            configuration["principals"][COORDINATOR]["call"] = json!(["example.display/1"]);
+            configuration["principals"]["display"] =
+                json!({"provide":["example.display/1"],"call":[SERVICE]});
+            configuration["settings"][COORDINATOR]["trusted_callers"] =
+                json!(["transport", "other-transport", "display"]);
+            configuration["settings"][COORDINATOR]["operation_grants"]["display"] =
+                json!(["verify_provider_epoch"]);
+            let method_ref = |name: &str| json!({"service":"example.display/1","method":name,"interface_major":1,"interface_minor":0,"schema_revision":1});
+            configuration["settings"][COORDINATOR]["consumer_requirements"] = json!({"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["example/1"]});
+            configuration["settings"][COORDINATOR]["participants"] = json!([{"provider":"display","plan_method":method_ref("resource_plan"),"callback_method":method_ref("lifecycle_callback"),"status_method":method_ref("lifecycle_status"),"settings_revision":"one","settings":{},"capabilities":[],"cleanup_methods":[]}]);
+            for name in ["resource_plan", "lifecycle_callback", "lifecycle_status"] {
+                let method = json!({"service":"example.display/1","method":name,"interface_major":1,"interface_minor":0,"request":{"required":{},"optional":{},"allow_extra":true},"response":{"required":{},"optional":{},"allow_extra":true},"privilege":"user"});
+                methods.push(method);
+            }
+            configuration["api_methods"]=json!(methods.iter().map(|method|json!({"provider":"display","callers":[COORDINATOR],"method":method})).collect::<Vec<_>>());
+        }
+        let configuration = serde_json::from_value(configuration).unwrap();
         let broker = Rc::new(RefCell::new(Broker::new(configuration).unwrap()));
+        for method in methods {
+            let response = broker.borrow_mut().dispatch(
+                "display",
+                Command::RegisterApi {
+                    method: serde_json::from_value(method).unwrap(),
+                },
+            );
+            assert!(matches!(response, Response::Ok));
+        }
         let endpoint = Box::new(Endpoint {
             broker: broker.clone(),
             principal: COORDINATOR,
@@ -100,6 +136,9 @@ impl Harness {
             instance: std::ptr::null_mut(),
             root,
             request_sequence: 0,
+            provider_calls: Vec::new(),
+            pending_callbacks: Vec::new(),
+            provider,
         };
         harness.start();
         harness
@@ -123,6 +162,37 @@ impl Harness {
     fn tick(&mut self) {
         // SAFETY: instance is a live module created by this exact table.
         assert_eq!(unsafe { (self.api.tick)(self.instance) }, abi::STATUS_OK);
+        if self.provider {
+            let request = self
+                .broker
+                .borrow_mut()
+                .dispatch("display", Command::Poll {});
+            if let Response::Request {
+                id,
+                caller,
+                payload,
+                ..
+            } = request
+            {
+                assert_eq!(caller, COORDINATOR);
+                self.provider_calls.push(payload.clone());
+                if payload["method"] == "resource_plan" {
+                    let plan = json!({"plan_id":"plan","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]});
+                    assert!(matches!(
+                        self.broker.borrow_mut().dispatch(
+                            "display",
+                            Command::Complete {
+                                request: id,
+                                payload: json!({"status":"planned","plan":plan})
+                            }
+                        ),
+                        Response::Ok
+                    ));
+                } else {
+                    self.pending_callbacks.push((id, payload));
+                }
+            }
+        }
     }
 
     fn call(&mut self, caller: &str, payload: Value) -> Value {
@@ -188,13 +258,12 @@ fn real_broker_identity_controls_admission_and_receipt_visibility() {
         json!({"operation":"prepare", "operation_id":"one"}),
     );
     assert_eq!(admission["status"], "pending");
-    assert_eq!(
-        harness.call(
-            "transport",
-            json!({"operation":"lookup", "operation_id":"one"})
-        ),
-        admission
+    let looked_up = harness.call(
+        "transport",
+        json!({"operation":"lookup", "operation_id":"one"}),
     );
+    assert_eq!(looked_up["session_id"], admission["session_id"]);
+    assert_eq!(looked_up["status"], "succeeded");
     assert_eq!(
         harness.call(
             "other-transport",
@@ -202,4 +271,62 @@ fn real_broker_identity_controls_admission_and_receipt_visibility() {
         )["status"],
         "not_found"
     );
+}
+
+#[test]
+fn preparation_waits_for_provider_and_verifies_its_exact_durable_callback() {
+    let mut harness = Harness::with_provider(true);
+    let admitted = harness.call(
+        "transport",
+        json!({"operation":"prepare","operation_id":"session-one"}),
+    );
+    assert_eq!(admitted["status"], "pending");
+    for _ in 0..64 {
+        if !harness.pending_callbacks.is_empty() {
+            break;
+        }
+        harness.tick();
+    }
+    assert_eq!(harness.pending_callbacks.len(), 1);
+    let (request, payload) = harness.pending_callbacks[0].clone();
+    let callback: amaterasu_module_sdk::extension_api::ProviderRequest =
+        serde_json::from_value(payload["arguments"].clone()).unwrap();
+    let digest = format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&callback).unwrap())
+    );
+    let target = callback.target.clone();
+    let epoch = admitted["host_epoch"].clone();
+    let verification = json!({"operation":"verify_provider_epoch","host_epoch":epoch,"provider_sequence":callback.provider_sequence,"operation_id":callback.operation_id,"transition_id":callback.transition_id,"target":target,"fingerprint":digest});
+    assert_eq!(
+        harness.call("display", verification.clone())["status"],
+        "succeeded"
+    );
+    let mut forged = verification;
+    forged["fingerprint"] = json!("0".repeat(64));
+    assert_eq!(harness.call("display", forged)["status"], "rejected");
+    assert!(matches!(
+        harness.broker.borrow_mut().dispatch(
+            "display",
+            Command::Complete {
+                request,
+                payload: json!({"status":"prepared","candidate":null,"obligations":[]})
+            }
+        ),
+        Response::Ok
+    ));
+    let mut final_receipt = Value::Null;
+    for _ in 0..64 {
+        final_receipt = harness.call(
+            "transport",
+            json!({"operation":"lookup","operation_id":"session-one"}),
+        );
+        if final_receipt["status"] != "pending" {
+            break;
+        }
+    }
+    assert_eq!(final_receipt["status"], "succeeded");
+    assert_eq!(harness.provider_calls.len(), 2);
+    assert_eq!(harness.provider_calls[0]["method"], "resource_plan");
+    assert_eq!(harness.provider_calls[1]["method"], "lifecycle_callback");
 }
