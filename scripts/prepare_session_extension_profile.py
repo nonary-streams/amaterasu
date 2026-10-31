@@ -53,7 +53,8 @@ def method_ref(name: str) -> dict:
             "interface_minor": 0, "schema_revision": 1}
 
 
-def prepare(bootstrap: dict, root: Path, descriptor: dict, descriptor_digest: str, approvals: list[dict], component: dict, enable_display_actions: bool = False) -> dict:
+def validate_provider(descriptor: dict, approvals: list[dict], component: dict,
+                      enable_display_actions: bool) -> None:
     if descriptor.get("provider") != PROVIDER or component.get("id") != PROVIDER:
         raise ValueError("unexpected display provider identity")
     if any(approval.get("provider") != PROVIDER or approval.get("method", {}).get("service") != PROVIDER_SERVICE for approval in approvals):
@@ -77,6 +78,11 @@ def prepare(bootstrap: dict, root: Path, descriptor: dict, descriptor_digest: st
         raise ValueError("selected provider does not advertise a supported remove-owned action")
     if len(approvals) != len(expected) or {item["method"]["method"] for item in approvals} != expected:
         raise ValueError("provider API approvals are incomplete or duplicated")
+
+
+def prepare(bootstrap: dict, root: Path, descriptor: dict, descriptor_digest: str, approvals: list[dict], component: dict, enable_display_actions: bool = False) -> dict:
+    validate_provider(descriptor, approvals, component, enable_display_actions)
+    action_id = PROVIDER + "/remove-owned"
     policy = bootstrap["policy"]
     principals = policy["principals"]
     settings = policy["settings"]
@@ -172,10 +178,11 @@ def main() -> None:
     if any(option == "--capture-output" or option.startswith("--capture-output=")
            or option == "--enable-virtual-screen-capture" for option in options):
         parser.error("session-extension capture currently requires PipeWire; KMS output and virtual-screen capture selection are unsupported")
+    validate_provider(descriptor, approvals, component, args.enable_display_actions)
+    descriptor_digest = run(args.publisher, "extension-descriptor-digest", examples / "settings-descriptor.json")
     run(args.publisher, "init-linux-session", args.root, *options)
     bootstrap_path = args.root / "bootstrap.json"
     bootstrap = json.loads(bootstrap_path.read_text())
-    descriptor_digest = run(args.publisher, "extension-descriptor-digest", examples / "settings-descriptor.json")
     calls = prepare(bootstrap, args.root.resolve(), descriptor, descriptor_digest, approvals, component, args.enable_display_actions)
     bootstrap_path.write_text(json.dumps(bootstrap, indent=2) + "\n")
     with tempfile.TemporaryDirectory(prefix="amaterasu-extension-grants-") as temporary:
