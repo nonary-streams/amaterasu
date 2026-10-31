@@ -1,9 +1,9 @@
 //! Durable lifecycle authority; native work advances outside request handlers.
+#[allow(dead_code)] // Closure preflight is not enabled until atomic retirement exists.
+mod action_closed_history;
 #[allow(dead_code)]
 // Frozen dispatch evidence is not authority until cleanup and cursor checks are wired.
 mod action_dispatch_proof;
-#[allow(dead_code)] // Closure preflight is not enabled until atomic retirement exists.
-mod action_closed_history;
 mod action_disposition;
 mod action_endpoints;
 #[allow(dead_code)] // Action replan remains fenced until all proof writers are wired.
