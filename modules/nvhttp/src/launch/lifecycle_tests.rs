@@ -447,3 +447,78 @@ fn uncertain_abandoned_resume_keeps_application_fenced() {
     assert_eq!(record.application_launch, Some(42));
     assert!(record.application_requested);
 }
+
+#[test]
+fn connected_resume_history_settlement_uncertainty_preserves_application() {
+    for fail_release in [false, true] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        assert!(controller.launch(10, request(1), peer(1), now).is_none());
+        let record = controller.records.values_mut().next().unwrap();
+        let id = record.id;
+        record.resumed = true;
+        record.lifecycle_session_target = serde_json::from_value(
+            json!({"kind":"session","host_epoch":"e","session_id":"s","generation":1}),
+        )
+        .ok();
+        record.application_requested = true;
+        record.application_launch = Some(42);
+        record.stage = Stage::ReserveHistory;
+        let mut job = workflow::Job {
+            record: id,
+            phase: workflow::Phase::ReserveHistory,
+            call: call::Call::new(
+                "amaterasu.stream-session/1",
+                json!({}),
+                "resume-history".into(),
+                5000,
+            ),
+            deadline: now + Duration::from_secs(10),
+        };
+        let mut replies = Vec::new();
+        let mut commands = Vec::new();
+        for _ in 0..8 {
+            controller.advance(
+                &mut job,
+                now,
+                &mut |command| {
+                    commands.push(command.clone());
+                    match command {
+                        Command::Request { .. } => Ok(Response::Accepted { id: 7 }),
+                        Command::TakeResult { .. } => Err("lost result".into()),
+                        Command::Cancel { .. } if fail_release => Ok(Response::Ok),
+                        Command::Cancel { .. } | Command::ReleaseResult { .. } => {
+                            Err("lost settlement".into())
+                        }
+                        _ => panic!("unexpected broker call"),
+                    }
+                },
+                &mut replies,
+            );
+            if let Some(next) = controller.job.take() {
+                job = next;
+            } else {
+                break;
+            }
+        }
+        let record = &controller.records[&id];
+        assert_eq!(record.state, State::CleanupFailed);
+        assert_eq!(record.cleanup_error, Some("resume_settlement_unconfirmed"));
+        assert_eq!(record.application_launch, Some(42));
+        assert!(record.application_requested);
+        assert_eq!(record.uncertain.len(), 1);
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, Command::Cancel { request: 7 }))
+        );
+        if fail_release {
+            assert!(
+                commands
+                    .iter()
+                    .any(|command| matches!(command, Command::ReleaseResult { request: 7 }))
+            );
+        }
+        assert!(!commands.iter().any(|command| matches!(command, Command::Request { service, .. } if service == "amaterasu.launch/1")));
+    }
+}

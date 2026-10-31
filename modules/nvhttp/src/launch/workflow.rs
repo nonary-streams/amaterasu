@@ -192,7 +192,14 @@ impl Controller {
                 record.uncertain.push_back((job.phase, take_call(job)));
                 record.retrying_uncertainty = false;
                 record.cleanup_error = Some("broker_settlement_unconfirmed");
-                if record.resume_abandoned {
+                if record.resume_abandoned
+                    || (record.resumed
+                        && record.lifecycle_session_target.is_some()
+                        && record.state != State::Stopping
+                        && matches!(job.phase, Phase::ReserveHistory)
+                        && !record.rtsp_requested
+                        && record.rtsp_ticket.is_none())
+                {
                     record.fail_cleanup("resume_settlement_unconfirmed");
                     reply_failure(record, replies);
                     return;
