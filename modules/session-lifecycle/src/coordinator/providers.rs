@@ -215,12 +215,26 @@ impl AuthorityJournal for SessionReleaseWriter {
             .get(&self.key)
             .and_then(|receipt| receipt.work.clone())
             .ok_or("unknown_transition")?;
-        super::session_release::record_session_release_proof(
-            &mut next,
-            &work,
-            &self.provider,
-            &self.state,
-        )?;
+        let owner = work
+            .provider_graph
+            .as_ref()
+            .and_then(|graph| graph.order.first())
+            .ok_or("provider_graph_missing")?;
+        if owner == &self.provider {
+            super::session_release::record_session_release_proof(
+                &mut next,
+                &work,
+                &self.provider,
+                &self.state,
+            )?;
+        } else {
+            super::session_release::record_noop_session_release(
+                &mut next,
+                &work,
+                &self.provider,
+                &self.state,
+            )?;
+        }
         let admission = self
             .state
             .admission_id
@@ -1154,7 +1168,9 @@ impl Coordinator {
                 == amaterasu_extension_api::COMPOSITION_VERSION
                 && matches!(
                     work.phase,
-                    LifecyclePhase::SessionPrepare | LifecyclePhase::StreamPrepare
+                    LifecyclePhase::SessionPrepare
+                        | LifecyclePhase::StreamPrepare
+                        | LifecyclePhase::SessionRelease
                 )
                 && work.provider_graph.as_ref().is_some_and(|graph| {
                     graph.order.len() > 1
@@ -1259,7 +1275,14 @@ impl Coordinator {
                             continue;
                         }
                     }
-                } else if standalone_v2 && work.phase == LifecyclePhase::SessionRelease {
+                } else if (standalone_v2 || composed_v2)
+                    && work.phase == LifecyclePhase::SessionRelease
+                    && work
+                        .provider_graph
+                        .as_ref()
+                        .and_then(|graph| graph.order.first())
+                        == Some(provider)
+                {
                     let shared = self.shared.borrow();
                     let mut roots = shared.value.composition.records().filter(|record| {
                         record.output.origin == work.target
@@ -1398,13 +1421,20 @@ impl Coordinator {
                 continue;
             }
             if !self.drivers.contains_key(&runtime_key) {
-                let driver = if composed_v2 {
+                let session_release_owner = work.phase == LifecyclePhase::SessionRelease
+                    && work
+                        .provider_graph
+                        .as_ref()
+                        .and_then(|graph| graph.order.first())
+                        == Some(provider);
+                let driver = if composed_v2 && !session_release_owner {
                     PrepareDriver::new_composed(work.states[provider].clone(), &effective_settings)?
-                } else if standalone_v2
-                    && matches!(
-                        work.phase,
-                        LifecyclePhase::StreamRelease | LifecyclePhase::SessionRelease
-                    )
+                } else if (composed_v2 && session_release_owner)
+                    || (standalone_v2
+                        && matches!(
+                            work.phase,
+                            LifecyclePhase::StreamRelease | LifecyclePhase::SessionRelease
+                        ))
                 {
                     PrepareDriver::new_standalone_release(
                         work.states[provider].clone(),
@@ -1545,7 +1575,7 @@ impl Coordinator {
                     self.drivers.remove(&runtime_key);
                     continue;
                 }
-                if standalone_v2 && work.phase == LifecyclePhase::SessionRelease {
+                if (standalone_v2 || composed_v2) && work.phase == LifecyclePhase::SessionRelease {
                     let admission = state.admission_id.as_deref().ok_or("admission_missing")?;
                     let writer = SessionReleaseWriter {
                         shared: self.shared.clone(),
@@ -1990,9 +2020,23 @@ impl Coordinator {
             receipt.work = Some((*continuation.next).clone());
             return save(&self.shared, next);
         }
+        let composed_release = work.phase == LifecyclePhase::StreamRelease
+            && work
+                .provider_graph
+                .as_ref()
+                .is_some_and(|graph| graph.order.len() > 1)
+            && !work.states.is_empty()
+            && work
+                .states
+                .values()
+                .all(|state| state.request.version == amaterasu_extension_api::COMPOSITION_VERSION);
+        if composed_release {
+            super::composed_release_proof::record_composed_release_proof(&mut next, work)?;
+        }
         let session_release_proven = work.phase == LifecyclePhase::SessionRelease
-            && work.providers.len() == 1
-            && next.session_releases.has_valid_released(&next, &work.target, &work.providers[0])
+            && work.provider_graph.as_ref().and_then(|graph| graph.order.first()).is_some_and(|owner| {
+                next.session_releases.has_valid_released(&next, &work.target, owner)
+            })
             && next.sessions.get(id).is_some_and(|session| {
                 session.admission_ids.iter().all(|admission| {
                     !next.authority.admissions.contains_key(admission)
@@ -2141,6 +2185,9 @@ impl Coordinator {
             .as_ref()
             .is_some_and(|failed| failed.uncertain)
             .then(|| work.clone());
+        if composed_release {
+            validate_journal(&next).map_err(|_| "invalid_composed_release_journal")?;
+        }
         save(&self.shared, next)
     }
 
