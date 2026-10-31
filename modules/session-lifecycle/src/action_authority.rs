@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 const MAX_OPERATIONS: usize = 1024;
+const MAX_RETIRED_OPERATIONS: usize = 1024;
 const MAX_ID: usize = 128;
 const MAX_RECEIPT: usize = 4096;
 
@@ -197,10 +198,20 @@ struct Reservation {
     state: ReservationState,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetiredAction {
+    service_operation_digest: String,
+    permit_digest: String,
+    old_permit_digest: Option<String>,
+}
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActionAuthority {
     reservations: BTreeMap<String, Reservation>,
+    #[serde(default)]
+    retired: BTreeMap<String, RetiredAction>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -258,6 +269,28 @@ fn key(binding: &ActionBinding) -> String {
     ))
     .expect("string tuple serializes")
 }
+fn fence_digest<T: Serialize>(kind: &str, value: &T) -> String {
+    let bytes = serde_json::to_vec(&(kind, value)).expect("serializable replay identity");
+    format!("{:x}", Sha256::digest(bytes))
+}
+fn operation_fence(binding: &ActionBinding) -> String {
+    fence_digest("action-operation", &key(binding))
+}
+fn service_operation_fence(service: &str, operation_id: &str, action_id: &str) -> String {
+    fence_digest(
+        "action-service-operation",
+        &(service, operation_id, action_id),
+    )
+}
+fn permit_fence(token: &str) -> String {
+    fence_digest("action-permit", &token)
+}
+fn valid_fence(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
 fn receipt_valid(receipt: &Value) -> bool {
     receipt.is_object() && serde_json::to_vec(receipt).is_ok_and(|bytes| bytes.len() <= MAX_RECEIPT)
 }
@@ -290,10 +323,31 @@ fn check_canonical(
 }
 
 impl ActionAuthority {
+    fn retired_token(&self, token: &str) -> bool {
+        let digest = permit_fence(token);
+        self.retired.values().any(|item| {
+            item.permit_digest == digest || item.old_permit_digest.as_ref() == Some(&digest)
+        })
+    }
+
     /// Validate untrusted persisted data before making it authoritative.
     pub fn validate(&self) -> Result<(), AuthorityError> {
-        if self.reservations.len() > MAX_OPERATIONS {
+        if self.reservations.len() > MAX_OPERATIONS || self.retired.len() > MAX_RETIRED_OPERATIONS {
             return Err(AuthorityError::InvalidState);
+        }
+        let mut retired_tokens = std::collections::BTreeSet::new();
+        for (operation, item) in &self.retired {
+            if !valid_fence(operation)
+                || !valid_fence(&item.service_operation_digest)
+                || !valid_fence(&item.permit_digest)
+                || !retired_tokens.insert(&item.permit_digest)
+                || item
+                    .old_permit_digest
+                    .as_ref()
+                    .is_some_and(|old| !valid_fence(old) || !retired_tokens.insert(old))
+            {
+                return Err(AuthorityError::InvalidState);
+            }
         }
         let mut tokens = std::collections::BTreeSet::new();
         for (stored_key, reservation) in &self.reservations {
@@ -342,6 +396,10 @@ impl ActionAuthority {
                         })
                 })
                 || !tokens.insert(&reservation.permit_token)
+                || retired_tokens.contains(&permit_fence(&reservation.permit_token))
+                || self
+                    .retired
+                    .contains_key(&operation_fence(&reservation.binding))
                 || *stored_key != key(&reservation.binding)
             {
                 return Err(AuthorityError::InvalidState);
@@ -361,7 +419,8 @@ impl ActionAuthority {
         }
         for reservation in self.reservations.values() {
             if let Some(old) = &reservation.rebind
-                && !tokens.insert(&old.old_token)
+                && (!tokens.insert(&old.old_token)
+                    || retired_tokens.contains(&permit_fence(&old.old_token)))
             {
                 return Err(AuthorityError::InvalidState);
             }
@@ -385,6 +444,9 @@ impl ActionAuthority {
             return Err(AuthorityError::Expired);
         }
         let operation_key = key(binding);
+        if self.retired.contains_key(&operation_fence(binding)) {
+            return Err(AuthorityError::Conflict);
+        }
         if let Some(existing) = self.reservations.get(&operation_key) {
             if existing.binding != *binding || existing.action_service != caller {
                 return Err(AuthorityError::Conflict);
@@ -411,13 +473,15 @@ impl ActionAuthority {
         for _ in 0..4 {
             let token = amaterasu_storage::random_identifier()
                 .map_err(|_| AuthorityError::RandomUnavailable)?;
-            if !self.reservations.values().any(|item| {
-                item.permit_token == token
-                    || item
-                        .rebind
-                        .as_ref()
-                        .is_some_and(|old| old.old_token == token)
-            }) {
+            if !self.retired_token(&token)
+                && !self.reservations.values().any(|item| {
+                    item.permit_token == token
+                        || item
+                            .rebind
+                            .as_ref()
+                            .is_some_and(|old| old.old_token == token)
+                })
+            {
                 self.reservations.insert(
                     operation_key,
                     Reservation {
@@ -816,13 +880,15 @@ impl ActionAuthority {
         for _ in 0..8 {
             let candidate = amaterasu_storage::random_identifier()
                 .map_err(|_| AuthorityError::RandomUnavailable)?;
-            if !self.reservations.values().any(|other| {
-                other.permit_token == candidate
-                    || other
-                        .rebind
-                        .as_ref()
-                        .is_some_and(|old| old.old_token == candidate)
-            }) {
+            if !self.retired_token(&candidate)
+                && !self.reservations.values().any(|other| {
+                    other.permit_token == candidate
+                        || other
+                            .rebind
+                            .as_ref()
+                            .is_some_and(|old| old.old_token == candidate)
+                })
+            {
                 token = Some(candidate);
                 break;
             }
@@ -1075,12 +1141,73 @@ impl ActionAuthority {
         Ok(blocked)
     }
 
+    /// Retire only an exact successful action after the coordinator has
+    /// independently verified its terminal certificate. The caller must persist
+    /// this mutation atomically with that certificate; exact completion retries
+    /// are served by the certificate, never by this replay fence.
+    #[allow(dead_code)] // Used by the checkpoint writer when integrated.
+    pub(crate) fn retire_certified_success(
+        &mut self,
+        service: &str,
+        token: &str,
+        binding: &ActionBinding,
+    ) -> Result<(), AuthorityError> {
+        self.validate()?;
+        let operation = key(binding);
+        let item = self
+            .reservations
+            .get(&operation)
+            .ok_or(AuthorityError::NotAuthorized)?;
+        if item.action_service != service
+            || item.permit_token != token
+            || item.binding != *binding
+            || !matches!(item.state, ReservationState::Succeeded { .. })
+        {
+            return Err(AuthorityError::InvalidState);
+        }
+        if self.retired.len() >= MAX_RETIRED_OPERATIONS {
+            return Err(AuthorityError::Capacity);
+        }
+        let retired = RetiredAction {
+            service_operation_digest: service_operation_fence(
+                service,
+                &binding.operation_id,
+                &binding.action_id,
+            ),
+            permit_digest: permit_fence(token),
+            old_permit_digest: item.rebind.as_ref().map(|old| permit_fence(&old.old_token)),
+        };
+        let digest = operation_fence(binding);
+        if self.retired.contains_key(&digest) {
+            return Err(AuthorityError::Conflict);
+        }
+        self.reservations.remove(&operation);
+        self.retired.insert(digest, retired);
+        Ok(())
+    }
+
     /// Conservatively detects any prior permit for this action operation.
     pub fn has_operation(&self, service: &str, operation_id: &str, action_id: &str) -> bool {
         self.reservations.values().any(|entry| {
             entry.action_service == service
                 && entry.binding.operation_id == operation_id
                 && entry.binding.action_id == action_id
+        }) || self.retired.values().any(|entry| {
+            entry.service_operation_digest
+                == service_operation_fence(service, operation_id, action_id)
+        })
+    }
+
+    /// Terminal reservations are references too; a host target aliases all
+    /// sessions. Compact replay fences hold no resource or session reference.
+    #[allow(dead_code)] // Consumed by the terminal session checkpoint preflight.
+    pub(crate) fn has_any_session_reference(&self, session_id: &str) -> bool {
+        self.reservations.values().any(|entry| {
+            entry
+                .binding
+                .target
+                .session()
+                .is_none_or(|id| id == session_id)
         })
     }
 
@@ -1233,6 +1360,85 @@ mod tests {
             plan_digest: &binding.plan_digest,
             active: true,
         }
+    }
+
+    #[test]
+    fn certified_terminal_retirement_fences_replay_and_preserves_capacity_boundary() {
+        let mut authority = ActionAuthority::default();
+        let binding = binding();
+        let token = authority
+            .authorize_action("action-service", &binding, &canonical(&binding), 10, 20)
+            .unwrap();
+        assert!(authority.has_any_session_reference("session"));
+        assert_eq!(
+            authority.retire_certified_success("action-service", &token, &binding),
+            Err(AuthorityError::InvalidState)
+        );
+        authority
+            .reservations
+            .get_mut(&key(&binding))
+            .unwrap()
+            .state = ReservationState::Succeeded {
+            receipt: json!({"status":"ok"}),
+        };
+        let mut changed = binding.clone();
+        changed.target = ActionTarget::Host {
+            host_epoch: "epoch".into(),
+        };
+        assert_eq!(
+            authority.retire_certified_success("action-service", &token, &changed),
+            Err(AuthorityError::InvalidState)
+        );
+        assert_eq!(
+            authority.retire_certified_success("wrong-service", &token, &binding),
+            Err(AuthorityError::InvalidState)
+        );
+        authority
+            .retire_certified_success("action-service", &token, &binding)
+            .unwrap();
+        assert!(!authority.has_any_session_reference("session"));
+        let mut recovered: ActionAuthority =
+            serde_json::from_slice(&serde_json::to_vec(&authority).unwrap()).unwrap();
+        assert!(recovered.validate().is_ok());
+        assert!(recovered.has_operation("action-service", "op", "display/remove"));
+        assert_eq!(
+            recovered.authorize_action("action-service", &binding, &canonical(&binding), 10, 20),
+            Err(AuthorityError::Conflict)
+        );
+        assert!(recovered.retired_token(&token));
+        assert_eq!(
+            recovered.retire_certified_success("action-service", &token, &binding),
+            Err(AuthorityError::NotAuthorized)
+        );
+        for index in 1..MAX_RETIRED_OPERATIONS {
+            let mut other = binding.clone();
+            other.operation_id = format!("operation-{index}");
+            recovered.retired.insert(
+                operation_fence(&other),
+                RetiredAction {
+                    service_operation_digest: service_operation_fence(
+                        "action-service",
+                        &other.operation_id,
+                        &other.action_id,
+                    ),
+                    permit_digest: permit_fence(&format!("token-{index}")),
+                    old_permit_digest: None,
+                },
+            );
+        }
+        let mut next = binding.clone();
+        next.operation_id = "next".into();
+        let next_token = recovered
+            .authorize_action("action-service", &next, &canonical(&next), 10, 20)
+            .unwrap();
+        recovered.reservations.get_mut(&key(&next)).unwrap().state = ReservationState::Succeeded {
+            receipt: json!({"status":"ok"}),
+        };
+        assert_eq!(
+            recovered.retire_certified_success("action-service", &next_token, &next),
+            Err(AuthorityError::Capacity)
+        );
+        assert!(recovered.has_any_session_reference("session"));
     }
 
     #[test]
