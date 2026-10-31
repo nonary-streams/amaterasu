@@ -226,9 +226,17 @@ impl Schema {
                     {
                         return Err("empty or duplicate enum".into());
                     }
+                    if values.iter().any(contains_number) {
+                        return Err("numeric enum values are unsupported".into());
+                    }
                     out.enumeration = Some(values.clone());
                 }
-                "const" => out.constant = Some(value.clone()),
+                "const" => {
+                    if contains_number(value) {
+                        return Err("numeric const values are unsupported".into());
+                    }
+                    out.constant = Some(value.clone());
+                }
                 "oneOf" => out.one_of = Self::compile_array(value, depth, nodes)?,
                 "allOf" => out.all_of = Self::compile_array(value, depth, nodes)?,
                 "if" | "then" => {}
@@ -391,6 +399,22 @@ fn is_integer(value: &Value) -> bool {
             .is_some_and(|n| n.is_finite() && n.fract() == 0.0)
 }
 
+// JSON Schema compares numbers mathematically, including inside arrays and objects.
+// Until that equality is implemented, reject those constants instead of letting
+// serde_json's representation-sensitive equality change conditional behavior.
+fn contains_number(value: &Value) -> bool {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Number(_) => return true,
+            Value::Array(values) => pending.extend(values),
+            Value::Object(values) => pending.extend(values.values()),
+            _ => {}
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,6 +495,23 @@ mod tests {
                 SchemaCatalog::compile([(pin(&document), document.as_str())]).is_err(),
                 "{document}"
             );
+        }
+    }
+
+    #[test]
+    fn rejects_numeric_constants_before_a_conditional_can_be_bypassed() {
+        for condition in [
+            json!({"const": 1}),
+            json!({"enum": [1.0]}),
+            json!({"const": {"nested": [1]}}),
+            json!({"enum": [{"nested": [1.0]}]}),
+        ] {
+            // A representation-sensitive comparison could let 1.0 skip the
+            // consequence of an `if` whose const is 1 (or vice versa).
+            let document = json!({"$id":"test/1", "$schema":DIALECT,
+                "if":condition, "then":{"const":"required"}})
+            .to_string();
+            assert!(SchemaCatalog::compile([(pin(&document), document.as_str())]).is_err());
         }
     }
 
