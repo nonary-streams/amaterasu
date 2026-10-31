@@ -420,6 +420,7 @@ mod provider_tests {
 pub mod artwork;
 /// Private, selected application-policy resolver profile.
 pub mod policy;
+pub mod preflight;
 /// Adapter for a broker-registered provider service. Host-side routing and
 /// lifecycle ownership remain separate responsibilities.
 pub mod provider_adapter;

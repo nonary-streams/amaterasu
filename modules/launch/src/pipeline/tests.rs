@@ -5312,6 +5312,54 @@ fn independently_selected_policy_is_frozen_before_session_and_provider_effects()
             .as_deref(),
         Some("policy:opaque-v1")
     );
+    let identity = pipeline
+        .records
+        .values
+        .values()
+        .next()
+        .unwrap()
+        .library_policy_identity
+        .as_ref()
+        .unwrap();
+    let amaterasu_module_sdk::application_library::preflight::PolicyIdentity::Library {
+        version: 1,
+        application,
+        entry_revision,
+        policy_revision,
+        snapshot_id,
+    } = identity
+    else {
+        panic!("expected library policy identity")
+    };
+    assert_eq!(application.library, "games");
+    assert_eq!(application.id, "opaque/game");
+    assert_eq!(entry_revision, "v1");
+    assert_eq!(policy_revision, "policy:opaque-v1");
+    assert_eq!(snapshot_id.len(), 64);
+    let record = pipeline.records.values.values_mut().next().unwrap();
+    let identity = record.library_policy_identity.as_mut().unwrap();
+    let amaterasu_module_sdk::application_library::preflight::PolicyIdentity::Library {
+        policy_revision,
+        ..
+    } = identity
+    else {
+        unreachable!()
+    };
+    *policy_revision = "changed-policy".into();
+    let mut workflow = Workflow::launch(record.launch_id, 7, 1000);
+    workflow.step = Step::CreateSession;
+    assert_eq!(
+        workflow.command(record, &BTreeMap::new()).unwrap_err(),
+        "policy_identity_mismatch"
+    );
+    let amaterasu_module_sdk::application_library::preflight::PolicyIdentity::Library {
+        policy_revision,
+        ..
+    } = record.library_policy_identity.as_mut().unwrap()
+    else {
+        unreachable!()
+    };
+    *policy_revision = "policy:opaque-v1".into();
     let stopped = harness.request(
         &mut pipeline,
         "alice",

@@ -73,6 +73,10 @@ pub struct Record {
     pub library_policy_service: Option<String>,
     #[serde(skip)]
     pub library_policy_revision: Option<String>,
+    /// Immutable source-qualified identity; it is not an authorization token.
+    #[serde(skip)]
+    pub library_policy_identity:
+        Option<amaterasu_module_sdk::application_library::preflight::PolicyIdentity>,
     #[serde(skip)]
     pub generic_provider_incarnation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -149,6 +153,39 @@ pub fn random_display_admission_token() -> Result<String, &'static str> {
     Ok(hex(&bytes))
 }
 impl Record {
+    /// Recheck the complete selected-library policy identity immediately before
+    /// forward effects. This is a consistency check, not a freshness proof.
+    pub fn validate_library_policy_identity(&self) -> Result<(), &'static str> {
+        use amaterasu_module_sdk::application_library::preflight::PolicyIdentity;
+        if self.catalog_selection != CatalogSelection::Library
+            || self.library_policy_service.is_none()
+        {
+            return Ok(());
+        }
+        let Some(selection) = &self.library_selection else {
+            return Err("policy_identity_mismatch");
+        };
+        let Some(
+            identity @ PolicyIdentity::Library {
+                application,
+                entry_revision,
+                policy_revision,
+                ..
+            },
+        ) = &self.library_policy_identity
+        else {
+            return Err("policy_identity_mismatch");
+        };
+        if identity.validate().is_err()
+            || application != &selection.application
+            || entry_revision != &selection.revision
+            || Some(policy_revision.as_str()) != self.library_policy_revision.as_deref()
+        {
+            return Err("policy_identity_mismatch");
+        }
+        Ok(())
+    }
+
     pub fn response(&self) -> Value {
         json!({"ok":true,"launch":self})
     }
@@ -302,6 +339,7 @@ impl Records {
                 generic_provider_service: None,
                 library_policy_service: None,
                 library_policy_revision: None,
+                library_policy_identity: None,
                 generic_provider_incarnation: None,
                 config_overrides: None,
                 application_display_settings: None,
