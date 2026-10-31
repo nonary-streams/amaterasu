@@ -395,6 +395,7 @@ impl CompositionBook {
             && proof.request.phase == amaterasu_extension_api::LifecyclePhase::StreamPrepare
             && proof.request.transition_id == stage.transition_id
             && proof.request.admission_id.as_deref() == Some(stage.admission_id.as_str())
+            && proof.request.dependency_inputs.as_slice() == [stage.before.clone()]
             && proof.request.approved_plan.as_ref() == Some(&stage.plan)
             && matches!(&response, amaterasu_extension_api::ProviderResponse::Prepared { outputs, .. } if outputs.contains(&stage.after))
             && valid_callback_proof(proof, &response)
@@ -1358,7 +1359,7 @@ mod tests {
         plan.resources[0].expected_revision = Some(root.output.resource.revision);
         let method = json!({"service":"screen/2","method":"callback","interface_major":2,"interface_minor":0,"schema_revision":1});
         let participant = serde_json::from_value(json!({"provider":"screen","plan_method":method,"callback_method":method,"status_method":method,"capabilities":[],"cleanup_methods":[],"settings_revision":"revision","settings":{}})).unwrap();
-        let request: amaterasu_extension_api::ProviderRequest = serde_json::from_value(json!({"provider_sequence":2,"operation":"lifecycle_callback","version":2,"transition_id":"stage-transition","operation_id":"stage-call","target":stream,"phase":"stream.prepare","settings_revision":"revision","settings":{},"intent":"initial","reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector/1"]},"remaining_ms":1000,"plan_revision":plan.revision,"admission_id":"stage-admission","approved_plan":plan})).unwrap();
+        let request: amaterasu_extension_api::ProviderRequest = serde_json::from_value(json!({"provider_sequence":2,"operation":"lifecycle_callback","version":2,"transition_id":"stage-transition","operation_id":"stage-call","target":stream,"phase":"stream.prepare","settings_revision":"revision","settings":{},"intent":"initial","reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector/1"]},"remaining_ms":1000,"plan_revision":plan.revision,"admission_id":"stage-admission","approved_plan":plan,"dependency_inputs":[root.output]})).unwrap();
         let response: amaterasu_extension_api::ProviderResponse = serde_json::from_value(
             json!({"status":"prepared","candidate":null,"obligations":[],"outputs":[root.output]}),
         )
@@ -1400,6 +1401,15 @@ mod tests {
         let mut wrong_call = stage.clone();
         wrong_call.callback_proof.terminal.call.arguments["operation_id"] = json!("different");
         assert!(book.record_stage(wrong_call, &|_| true).is_err());
+        let mut missing_input = stage.clone();
+        missing_input
+            .callback_proof
+            .request
+            .dependency_inputs
+            .clear();
+        missing_input.callback_proof.terminal.call.arguments =
+            serde_json::to_value(&missing_input.callback_proof.request).unwrap();
+        assert!(book.record_stage(missing_input, &|_| true).is_err());
         book.record_stage(stage.clone(), &|_| true).unwrap();
         assert_eq!(book.records().next().unwrap(), &root);
         assert_eq!(
