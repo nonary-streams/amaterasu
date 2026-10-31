@@ -1013,6 +1013,7 @@ impl Coordinator {
             .get(&binding.stream_id)
             .ok_or("unknown_stream")?;
         if binding.host_epoch != next.host_epoch
+            || binding.host_epoch != session.host_epoch
             || binding.generation != stream.generation
             || !matches!(stream.phase, StreamPhase::Ready | StreamPhase::Active)
         {
@@ -1048,12 +1049,35 @@ impl Coordinator {
         let result = match operation {
             "reserve_input_action" => {
                 let action = payload["action_id"].as_str().ok_or("action_required")?;
+                use crate::action_authority::ActionTarget;
+                let session_target = ActionTarget::Session {
+                    host_epoch: session.host_epoch.clone(),
+                    session_id: session.id.clone(),
+                    expected_generation: session.generation,
+                };
+                let stream_target = ActionTarget::Stream {
+                    host_epoch: binding.host_epoch.clone(),
+                    session_id: binding.session_id.clone(),
+                    stream_id: binding.stream_id.clone(),
+                    expected_generation: binding.generation,
+                };
+                let target = if payload.get("target").is_none() {
+                    session_target.clone()
+                } else {
+                    serde_json::from_value(payload["target"].clone())
+                        .map_err(|_| "invalid_target")?
+                };
+                if target != session_target && target != stream_target {
+                    return Err("input_action_target_mismatch".into());
+                }
                 let reservation = next
                     .inputs
-                    .reserve_input_action(caller, initiator, id, token, action, &binding)
+                    .reserve_input_action_for_target(
+                        caller, initiator, id, token, action, &binding, &target,
+                    )
                     .map_err(|_| "input_reservation_rejected")?;
                 let (ReservationResult::Admitted(r) | ReservationResult::Existing(r)) = reservation;
-                json!({"status":"reserved","operation_id":id,"reservation_id":r.reservation_id,"target":{"kind":"session","host_epoch":session.host_epoch,"session_id":session.id,"expected_generation":session.generation},"action_id":action})
+                json!({"status":"reserved","operation_id":id,"reservation_id":r.reservation_id,"target":r.target,"action_id":action})
             }
             "lookup_input_action" => serde_json::to_value(
                 next.inputs

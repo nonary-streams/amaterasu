@@ -5,6 +5,7 @@
 //! validated active stream and exact consumer acknowledgements, and serialize
 //! all calls with quiescence. Clone, mutate, and persist this state atomically
 //! with the canonical stream before exposing any result or dispatching effects.
+use crate::action_authority::ActionTarget;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -24,6 +25,32 @@ pub struct ActiveBinding {
     /// Broker identity of the approved input service, resolved from policy.
     pub input_consumer: String,
     pub allowed_actions: BTreeSet<String>,
+}
+
+fn target_matches_binding(target: &ActionTarget, binding: &ActiveBinding) -> bool {
+    match target {
+        ActionTarget::Session {
+            host_epoch,
+            session_id,
+            expected_generation,
+        } => {
+            host_epoch == &binding.host_epoch
+                && session_id == &binding.session_id
+                && *expected_generation > 0
+        }
+        ActionTarget::Stream {
+            host_epoch,
+            session_id,
+            stream_id,
+            expected_generation,
+        } => {
+            host_epoch == &binding.host_epoch
+                && session_id == &binding.session_id
+                && stream_id == &binding.stream_id
+                && *expected_generation == binding.generation
+        }
+        ActionTarget::Host { .. } => false,
+    }
 }
 
 impl ActiveBinding {
@@ -62,6 +89,9 @@ pub struct Reservation {
     pub initiator: String,
     pub binding: ActiveBinding,
     pub action_id: String,
+    /// Exact canonical target selected when the reservation was admitted.
+    #[serde(default)]
+    pub target: Option<ActionTarget>,
     pub outcome: Outcome,
     #[serde(default)]
     pub transferred_to: Option<String>,
@@ -126,6 +156,9 @@ impl InputAuthority {
                     && r.binding.valid()
                     && r.caller == r.binding.input_consumer
                     && r.binding.allowed_actions.contains(&r.action_id)
+                    && r.target
+                        .as_ref()
+                        .is_none_or(|target| target_matches_binding(target, &r.binding))
                     && r.transferred_to.as_deref().is_none_or(valid_text)
             })
             && self
@@ -176,7 +209,53 @@ impl InputAuthority {
         action_id: &str,
         active: &ActiveBinding,
     ) -> Result<ReservationResult, Error> {
-        if !valid_text(caller)
+        self.reserve_input_action_inner(
+            caller,
+            initiator,
+            operation_id,
+            token,
+            action_id,
+            active,
+            None,
+        )
+    }
+
+    /// Bind the reservation to the exact coordinator-validated target.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_input_action_for_target(
+        &mut self,
+        caller: &str,
+        initiator: &str,
+        operation_id: &str,
+        token: &str,
+        action_id: &str,
+        active: &ActiveBinding,
+        target: &ActionTarget,
+    ) -> Result<ReservationResult, Error> {
+        self.reserve_input_action_inner(
+            caller,
+            initiator,
+            operation_id,
+            token,
+            action_id,
+            active,
+            Some(target),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reserve_input_action_inner(
+        &mut self,
+        caller: &str,
+        initiator: &str,
+        operation_id: &str,
+        token: &str,
+        action_id: &str,
+        active: &ActiveBinding,
+        target: Option<&ActionTarget>,
+    ) -> Result<ReservationResult, Error> {
+        if target.is_some_and(|target| !target_matches_binding(target, active))
+            || !valid_text(caller)
             || !valid_text(initiator)
             || !valid_text(operation_id)
             || !valid_text(action_id)
@@ -188,6 +267,7 @@ impl InputAuthority {
             return if old.token == token
                 && old.action_id == action_id
                 && old.binding == *active
+                && old.target.as_ref() == target
                 && caller == old.binding.input_consumer
             {
                 Ok(ReservationResult::Existing(old.clone()))
@@ -212,6 +292,7 @@ impl InputAuthority {
             initiator: initiator.into(),
             binding,
             action_id: action_id.into(),
+            target: target.cloned(),
             outcome: Outcome::Running,
             transferred_to: None,
         };
@@ -477,6 +558,77 @@ mod tests {
             allowed_actions: BTreeSet::from(["display".into()]),
         }
     }
+    #[test]
+    fn target_is_durable_exact_and_cannot_change_on_retry() {
+        let mut authority = InputAuthority::default();
+        let active = binding();
+        let token = authority.issue_input_binding(&active).unwrap();
+        let stream = ActionTarget::Stream {
+            host_epoch: "host".into(),
+            session_id: "session".into(),
+            stream_id: "stream".into(),
+            expected_generation: 1,
+        };
+        let session = ActionTarget::Session {
+            host_epoch: "host".into(),
+            session_id: "session".into(),
+            expected_generation: 7,
+        };
+        let ReservationResult::Admitted(reservation) = authority
+            .reserve_input_action_for_target(
+                "input", "client", "op", &token, "display", &active, &stream,
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        let mut restored: InputAuthority =
+            serde_json::from_slice(&serde_json::to_vec(&authority).unwrap()).unwrap();
+        assert_eq!(
+            restored
+                .resolve_reservation(&reservation.reservation_id)
+                .unwrap()
+                .target,
+            Some(stream.clone())
+        );
+        assert!(matches!(
+            restored.reserve_input_action_for_target(
+                "input", "client", "op", &token, "display", &active, &stream
+            ),
+            Ok(ReservationResult::Existing(_))
+        ));
+        assert_eq!(
+            restored.reserve_input_action_for_target(
+                "input", "client", "op", &token, "display", &active, &session
+            ),
+            Err(Error::Conflict)
+        );
+        let wrong = ActionTarget::Stream {
+            host_epoch: "host".into(),
+            session_id: "session".into(),
+            stream_id: "other".into(),
+            expected_generation: 1,
+        };
+        assert_eq!(
+            restored.reserve_input_action_for_target(
+                "input", "client", "other", &token, "display", &active, &wrong
+            ),
+            Err(Error::Invalid)
+        );
+        assert!(matches!(
+            restored.reserve_input_action_for_target(
+                "input",
+                "client",
+                "session-op",
+                &token,
+                "display",
+                &active,
+                &session
+            ),
+            Ok(ReservationResult::Admitted(_))
+        ));
+    }
+
     #[test]
     fn transferred_cancellation_is_owner_bound_and_idempotent() {
         let mut authority = InputAuthority::default();
