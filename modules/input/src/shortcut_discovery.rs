@@ -290,7 +290,7 @@ impl DiscoveryJob {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
@@ -312,10 +312,10 @@ mod tests {
             Value::Null => panic!("unsupported test default"),
         }
     }
-    fn binding() -> Value {
+    pub(crate) fn binding() -> Value {
         json!({"id":"binding","enabled":true,"source":"session_input","context":"active","trigger":{"platform":"linux_evdev","code":30},"modifiers":[],"propagation":"consume_trigger","action_id":"provider/action","arguments":{},"target":"current_session"})
     }
-    fn descriptor() -> Value {
+    pub(crate) fn descriptor() -> Value {
         let method = json!({"service":"provider.api/1","method":"execute","interface_major":1,"interface_minor":0,"schema_revision":1});
         json!({"provider":"provider","revision":1,"options":[{"id":"shortcut","label":"Shortcut","help":"","definition":schema(&binding()),"presentation":"keybinding","allowed_scopes":["host","session"],"apply_policy":"next_session","required_capabilities":[]}],"actions":[{"id":"provider/action","label":"Action","description":"","execution":"read_only","arguments":{},"allowed_targets":["session"],"required_capabilities":[],"plan":null,"execute":method,"status":null}],"capabilities":[],"settings_validate":method})
     }

@@ -13,6 +13,8 @@ pub(crate) struct Journal {
     pub epoch: String,
     pub revision: u64,
     pub next_sequence: u64,
+    #[serde(default)]
+    pub retired_sequence: u64,
     pub receipts: BTreeMap<u64, Record>,
 }
 
@@ -69,6 +71,7 @@ pub(crate) enum JournalError {
     Invalid,
     RevisionConflict,
     SequenceConflict,
+    ReceiptExpired,
     IdentityConflict,
     Capacity,
     InvalidTransition,
@@ -83,6 +86,7 @@ impl Journal {
             epoch,
             revision: 0,
             next_sequence: 1,
+            retired_sequence: 0,
             receipts: BTreeMap::new(),
         })
     }
@@ -93,14 +97,19 @@ impl Journal {
             || self.epoch.len() > 256
             || self.epoch.chars().any(char::is_control)
             || self.receipts.len() > MAX_RECORDS
-            || self.next_sequence != self.receipts.len() as u64 + 1
-            || self.revision < self.receipts.len() as u64
+            || self
+                .retired_sequence
+                .checked_add(self.receipts.len() as u64)
+                .and_then(|n| n.checked_add(1))
+                != Some(self.next_sequence)
+            || (self.retired_sequence > 0 && self.receipts.is_empty())
+            || self.revision < self.next_sequence.saturating_sub(1)
             || self
                 .receipts
                 .iter()
                 .enumerate()
                 .any(|(index, (sequence, record))| {
-                    *sequence != index as u64 + 1
+                    *sequence != self.retired_sequence + index as u64 + 1
                         || (record.phase == Phase::Armed && record.result.is_some())
                         || record.intents.len() > 64
                         || record.intents.iter().enumerate().any(|(i, intent)| {
@@ -146,6 +155,9 @@ impl Journal {
         if self.revision != expected_revision {
             return Err(JournalError::RevisionConflict);
         }
+        if sequence <= self.retired_sequence {
+            return Err(JournalError::ReceiptExpired);
+        }
         if let Some(existing) = self.receipts.get(&sequence) {
             return if existing.fingerprint == record.fingerprint {
                 Ok(Admission::Existing(existing.clone()))
@@ -165,9 +177,6 @@ impl Journal {
         {
             return Err(JournalError::Invalid);
         }
-        if self.receipts.len() >= MAX_RECORDS {
-            return Err(JournalError::Capacity);
-        }
         let mut proposed = self.clone();
         proposed.next_sequence = sequence.checked_add(1).ok_or(JournalError::Capacity)?;
         proposed.revision = proposed
@@ -175,6 +184,28 @@ impl Journal {
             .checked_add(1)
             .ok_or(JournalError::Capacity)?;
         proposed.receipts.insert(sequence, record);
+        while proposed.receipts.len() > MAX_RECORDS
+            || serde_json::to_vec(&proposed)
+                .map_err(|_| JournalError::Invalid)?
+                .len()
+                > MAX_JOURNAL_BYTES
+        {
+            let Some((&oldest, entry)) = proposed.receipts.first_key_value() else {
+                return Err(JournalError::Capacity);
+            };
+            if oldest == sequence
+                || entry.phase != Phase::Delivered
+                || entry.result.is_none()
+                || entry
+                    .intents
+                    .iter()
+                    .any(|intent| intent.phase != IntentPhase::Terminal)
+            {
+                return Err(JournalError::Capacity);
+            }
+            proposed.receipts.remove(&oldest);
+            proposed.retired_sequence = oldest;
+        }
         self.replace_checked(proposed)?;
         Ok(Admission::New)
     }
@@ -406,6 +437,78 @@ mod tests {
             journal.transition_intent(4, 1, 0, IntentPhase::Dispatching, None),
             Err(JournalError::InvalidTransition)
         );
+    }
+
+    #[test]
+    fn finished_batches_roll_over_without_replaying_expired_identities() {
+        let mut journal = Journal::new("epoch".into()).unwrap();
+        for sequence in 1..=80 {
+            let mut record = armed("batch");
+            record.intents.clear();
+            let revision = journal.revision;
+            journal.admit(revision, sequence, record).unwrap();
+            let revision = journal.revision;
+            journal
+                .finish(
+                    revision,
+                    sequence,
+                    Phase::Delivered,
+                    Some(json!({"ok":true})),
+                )
+                .unwrap();
+        }
+        assert!(journal.retired_sequence > 0);
+        assert_eq!(journal.lookup(80).unwrap().held, json!(["key"]));
+        assert_eq!(
+            journal.admit(journal.revision, 1, armed("batch")),
+            Err(JournalError::ReceiptExpired)
+        );
+        journal.validate().unwrap();
+    }
+
+    #[test]
+    fn byte_limit_retires_completed_receipts_before_count_limit() {
+        let mut journal = Journal::new("epoch".into()).unwrap();
+        for sequence in 1..=5 {
+            let mut record = armed(&"x".repeat(3000));
+            record.intents.clear();
+            journal.admit(journal.revision, sequence, record).unwrap();
+            journal
+                .finish(
+                    journal.revision,
+                    sequence,
+                    Phase::Delivered,
+                    Some(json!({"ok":true})),
+                )
+                .unwrap();
+        }
+        assert!(journal.retired_sequence > 0);
+        assert!(journal.receipts.len() < MAX_RECORDS);
+        assert!(journal.lookup(5).is_some());
+    }
+
+    #[test]
+    fn recovery_records_block_eviction_instead_of_losing_unknown_effects() {
+        let mut journal = Journal::new("epoch".into()).unwrap();
+        for sequence in 1..=MAX_RECORDS as u64 {
+            let mut record = armed("batch");
+            record.intents.clear();
+            journal.admit(journal.revision, sequence, record).unwrap();
+            let phase = if sequence == 1 {
+                Phase::RecoveryRequired
+            } else {
+                Phase::Delivered
+            };
+            journal
+                .finish(journal.revision, sequence, phase, None)
+                .unwrap();
+        }
+        let before = journal.clone();
+        assert_eq!(
+            journal.admit(journal.revision, MAX_RECORDS as u64 + 1, armed("new")),
+            Err(JournalError::Capacity)
+        );
+        assert_eq!(journal, before);
     }
 
     #[test]
