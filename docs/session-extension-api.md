@@ -12,12 +12,16 @@ components and routes their broker calls; it does not contain display policy.
 | `amaterasu.session-lifecycle/1` | Durable session transitions, provider admissions, consumer bindings, retirement, and recovery. |
 | `amaterasu.extension-registry/1` | Approved descriptors, typed settings, revisions, and authorized scope resolution. |
 | `amaterasu.extension-actions/1` | Action planning, durable invocation receipts, cancellation, and lifecycle permits. |
-| `nonary.display-settings/1` | Independently installed display settings and provider callbacks. |
+| `nonary.virtual-screen/2` | Session-owned virtual-screen resources, native leases, and owner callbacks. |
+| `nonary.display-settings/2` | Stream display configuration and restoration callbacks. |
 
 Use [the opt-in local profile](session-extensions-local-profile.md) to compose a
 package. Components, registered method schemas, callers, and grants must agree.
 Native modules are trusted code; broker grants are not a native-code sandbox.
 Neither the test profiles nor a successful package verification deploy a service.
+The generic `amaterasu.host-state-context/1` call grant lets an approved module
+request the trusted host's runtime state root. It does not expose package metadata
+or allow a module setting to substitute a different root.
 
 ## Lifetimes and callbacks
 
@@ -55,22 +59,23 @@ checks the common negotiated mode and exact binding identity.
 
 ### Dependent-provider composition
 
-The planned split uses separately approved `nonary.virtual-screen/2` and
+The split uses separately approved `nonary.virtual-screen/2` and
 `nonary.display-settings/2` services, built independently in the
 [virtual-screen](https://github.com/nonary-streams/amaterasu-virtual-screen) and
 [display-settings](https://github.com/nonary-streams/amaterasu-display-settings)
 repositories. Virtual-screen owns the session-retained producer and its native
 leases; display-settings consumes its selected output and applies configuration
-for the stream. A resumed stream receives a fresh configuration while the
-session's producer may be retained. The existing v1 provider contracts remain
-unchanged. The split SDK and coordinator contracts exist in source; the current
-single-provider profile does not implement this composition, and the complete
-provider, cleanup, and action paths still require integration and qualification.
+for the stream and restores it on cleanup. A resumed stream receives a fresh
+configuration while the session's producer may be retained. The existing v1
+provider contracts remain unchanged; the legacy single-provider profile does
+not implement this composition.
 
 The session-owned output has a resource generation distinct from the session
 and stream generations. Dependent requests bind to the selected producer output
 and its resource generation; a stale generation cannot authorize effects on a
-replacement. Disconnect retires the stream and its configuration while retaining
+replacement. Desired activation and observed native state are recorded separately;
+an intended on, off, or retained state is not proof of native readback.
+Disconnect retires the stream and its configuration while retaining
 the application and eligible session resource. Session end additionally requires
 application retirement and release of the root resource after its dependents.
 Cleanup and action wiring for this split must be qualified before relying on
@@ -90,7 +95,7 @@ references are `amaterasu.display-target/1` (SHA-256
 `ededc620113268bcae3990d492deeef039c5e9c5ff28067a676dd992fe6324ce`)
 and `amaterasu.display-control/1` (SHA-256
 `c2c3ce866277cb29bbd9fbd947899917538d46b1020df3197fbd264159607d87`).
-The owner service `nonary.virtual-screen/2` is intended to expose
+The owner service `nonary.virtual-screen/2` uses
 `resource_control`, `resource_finalize`, and `resource_status` methods.
 
 Release and rollback proceed in reverse dependency order. Independent cleanup
@@ -231,7 +236,7 @@ release followed by resume requires a new resource generation rather than reuse
 of the released generation. End-to-end action release and new-generation resume
 remain subject to wiring and qualification.
 
-The planned `nonary.virtual-screen/remove-owned` action is restricted to an
+The `nonary.virtual-screen/remove-owned` action is restricted to an
 active stream target. A session target, including a paused session without an
 active stream, is unsupported. Its intended shortcut behavior is to retire the
 stream and remove the owned producer while retaining the application; a later
@@ -252,6 +257,9 @@ lease; other input work must drain before display mutation. Ordinary nonkeyboard
 input avoids the action journal. Shortcut discovery has a bounded cache; a newly
 saved binding can take up to one second to become visible. A fresh input-module
 boot epoch cannot reuse a previous instance's token.
+The optional shortcut may be unset (`null`); when configured, its
+`current_stream` target resolves to the triggering stream and must be permitted
+by the action descriptor.
 
 ## Recovery and limits
 
@@ -259,6 +267,9 @@ Receipts are caller/initiator scoped. Repeating an admitted operation returns it
 receipt; using its ID for different data is rejected. Completed target history
 can be compacted into replay-blocking tombstones. Storage and tombstones are
 bounded; exhaustion rejects admission rather than forgetting unresolved effects.
+Replay and closed-stream scope fences have finite limits, including 8,192-entry
+bounds. Exhaustion fences further admission; it does not make old operation IDs
+safe to reuse.
 
 Restart creates a new host epoch and fences old live bindings. Explicit
 `recover_session` can query a known, persisted provider receipt using its original
@@ -266,7 +277,7 @@ resource identity under fresh owner authorization. It never replays an unknown
 preparation. Missing receipts, uncertain native effects, or unconfirmed retirement
 remain `recovery_required`; that state is not successful restoration.
 
-The planned `lookup_control_baseline` operation lets only the selected
+The `lookup_control_baseline` operation lets only the selected
 virtual-screen owner read an owner-acknowledged original configure settlement
 while its baseline remains pinned. The request contains `operation`,
 `session_target`, `resource_generation`, the full authenticated `root_output`,
@@ -278,7 +289,7 @@ response contains `session_target`, `target`, `root_output`,
 response is limited to 16 KiB. This read-only lookup grants no effect authority;
 the endpoint and its integrated recovery path require qualification.
 
-The planned `lookup_stream_closure` operation provides read-only historical
+The `lookup_stream_closure` operation provides read-only historical
 evidence that an exact owner control belongs to a closed stream. Its request is
 `{operation: "lookup_stream_closure", target, resource_generation, resource_id,
 incarnation, operation_id, request_digest}`. The target is the exact stream
@@ -287,6 +298,10 @@ SHA-256 of `serde_json::to_vec` of the exact typed `ResourceControlRequest`.
 Only the configured and selected owner may query it. A verified result echoes the
 identity fields with `status: "closed"`; failures return `status: "rejected"`
 and `reason: "stream_closure_unavailable"`.
+An optional `require_retirement_safe: true` requests the additional conservative
+old-scope check; a successful response then includes `retirement_safe: true`.
+This checks coordinator-side unresolved work and does not attest that the owner
+has drained its own local state. Without the request the field is omitted.
 
 The live proof checks the release graph and the owner's acknowledged settlement;
 the archived path checks the selected checkpoint against current policy and
@@ -317,4 +332,7 @@ Opt-in tests additionally exercise independently built module ABIs through the
 real broker. Their native display, capture, input, and state peers may be
 simulated; consult each test's environment requirements and the display plugin's
 README. These tests do not establish live display, Windows driver, network-client,
-or hardware behavior.
+or hardware behavior. Linux fake-native and real-broker tests are separate from
+hardware qualification. Windows virtual-screen owner startup is fenced while
+its DACL and process-lock security remain incomplete. Building the public plugin
+repositories currently requires a compatible private Amaterasu SDK checkout.
