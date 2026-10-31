@@ -2,11 +2,45 @@
 //!
 //! These identifiers describe the interface family independently of a service
 //! alias. Signed composition still controls provider selection and authorization.
+mod negotiation;
+pub use negotiation::{AudioFormat, AudioNegotiationError, AudioSelection, negotiate};
+
 use crate::{ModuleResult, NativeBinding, RuntimeClient, abi::NativeServiceFactory};
-use amaterasu_media::{AudioCaptureApi, AudioEncoderApi, INTERFACE_MAJOR};
+use amaterasu_media::{
+    AudioCaptureApi, AudioEncoderApi, INTERFACE_MAJOR, NegotiatedAudioEncoderApi,
+};
 
 pub const CAPTURE_CONTRACT: &str = "amaterasu.audio-capture.native/1";
 pub const ENCODER_CONTRACT: &str = "amaterasu.audio-encoder.native/1";
+/// Separate family; the legacy Opus table and behavior remain unchanged.
+pub const NEGOTIATED_ENCODER_CONTRACT: &str = "amaterasu.audio-encoder-negotiated.native/1";
+
+/// # Safety
+/// Factory implements the negotiated table and remains live through binding release.
+pub unsafe fn register_negotiated_encoder(
+    runtime: &RuntimeClient,
+    service: &str,
+    factory: &NativeServiceFactory,
+) -> ModuleResult<()> {
+    unsafe { runtime.register_native_typed(service, NEGOTIATED_ENCODER_CONTRACT, factory) }
+}
+
+/// # Safety
+/// The runtime and provider outlive the binding and all stream operations.
+pub unsafe fn bind_negotiated_encoder(
+    runtime: &RuntimeClient,
+    service: &str,
+) -> ModuleResult<NativeBinding> {
+    unsafe {
+        runtime.bind_native_typed(
+            service,
+            NEGOTIATED_ENCODER_CONTRACT,
+            1,
+            0,
+            size_of::<NegotiatedAudioEncoderApi>() as u32,
+        )
+    }
+}
 
 /// Register the PCM capture table for a selected service alias.
 ///

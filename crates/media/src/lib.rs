@@ -7,6 +7,8 @@ mod audio;
 pub use audio::*;
 mod audio_encoder;
 pub use audio_encoder::*;
+mod audio_negotiated;
+pub use audio_negotiated::*;
 mod control;
 pub use control::*;
 mod clock;

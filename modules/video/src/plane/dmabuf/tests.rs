@@ -1035,6 +1035,7 @@ fn native_plane_drop_retires_encoder_and_processor_before_releasing_source_bindi
             &std::collections::BTreeMap::new(),
             None,
             Some("fixture.gpu-processor/1"),
+            None,
         )
         .unwrap();
         let config = configuration();
@@ -1093,6 +1094,7 @@ fn completed_stream_retires_leases_once_without_growing_shutdown_history() {
         &std::collections::BTreeMap::new(),
         None,
         Some("fixture.gpu-processor/1"),
+        None,
     )
     .unwrap();
     let config = configuration();
@@ -1311,6 +1313,7 @@ fn native_plane_selects_exact_registered_encoder_table() {
         &[("vendor".to_owned(), "example.encode/1".to_owned())].into(),
         &std::collections::BTreeMap::new(),
         &std::collections::BTreeMap::new(),
+        None,
         None,
         None,
     )

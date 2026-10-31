@@ -1,0 +1,10 @@
+[package]
+name = "audio-fixture-eac3"
+version = "0.1.0"
+edition = "2024"
+publish = false
+[lib]
+crate-type = ["cdylib"]
+[dependencies]
+amaterasu-media = { path = "../../../crates/media" }
+amaterasu-abi = { path = "../../../crates/abi" }

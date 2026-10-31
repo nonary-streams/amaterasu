@@ -235,6 +235,8 @@ pub struct NativePlane {
     source_encoders: BTreeMap<String, NativeBinding>,
     resource_consumers: BTreeMap<String, NativeBinding>,
     resource_bridges: BTreeMap<u64, (String, resource_generic::ResourceBridge)>,
+    processor_bridges: BTreeMap<u64, (String, resource_generic::ProcessorBridge)>,
+    generic_processor: Option<NativeBinding>,
     stream_clocks: BTreeMap<u64, (u64, [u8; 16])>,
     sources: BTreeMap<u64, (String, source::Source)>,
     gpu_processor: Option<NativeBinding>,
@@ -266,6 +268,7 @@ impl NativePlane {
         consumer_providers: &BTreeMap<String, String>,
         processor_service: Option<&str>,
         gpu_processor_service: Option<&str>,
+        generic_processor_service: Option<&str>,
     ) -> ModuleResult<Self> {
         let mut captures = BTreeMap::new();
         let mut unbound = BTreeMap::new();
@@ -336,6 +339,12 @@ impl NativePlane {
                 require_frame_lease: false,
                 resource_consumers,
                 resource_bridges: BTreeMap::new(),
+                processor_bridges: BTreeMap::new(),
+                generic_processor: generic_processor_service
+                    .map(|service| {
+                        amaterasu_module_sdk::media::bind_frame_resource_processor(runtime, service)
+                    })
+                    .transpose()?,
                 stream_clocks: BTreeMap::new(),
                 source_encoders,
                 sources: BTreeMap::new(),
@@ -385,6 +394,18 @@ impl Drop for NativePlane {
             {
                 // SAFETY: consumer binding remains live through cancellation.
                 unsafe { bridge.cancel(api) };
+            }
+        }
+        for (_, (service, mut bridge)) in std::mem::take(&mut self.processor_bridges) {
+            if let (Some(processor), Some(encoder)) = (
+                self.generic_processor.as_ref(),
+                self.resource_consumers.get(&service),
+            ) && let (Ok(processor), Ok(encoder)) = (
+                unsafe { processor.table::<FrameResourceProcessorApi>() },
+                unsafe { encoder.table::<FrameResourceConsumerApi>() },
+            ) {
+                // SAFETY: both provider bindings remain live until the barriers return.
+                unsafe { bridge.cancel(processor, encoder) };
             }
         }
         for (_, (service, source)) in std::mem::take(&mut self.sources) {
@@ -661,6 +682,9 @@ impl Plane for NativePlane {
         clock_origin_us: u64,
         clock_epoch: [u8; 16],
     ) -> Result<(), &'static str> {
+        if self.generic_processor.is_some() {
+            return Err("generic_processor_requires_generic_path");
+        }
         let binding = self
             .source_encoders
             .get(&self.active_encoder)
@@ -869,6 +893,9 @@ impl Plane for NativePlane {
             .map_err(|_| "encoder_interface")?;
             return self.receive_packets(encoder, &input, progress);
         }
+        if self.generic_processor.is_some() {
+            return Err("generic_processor_requires_generic_path");
+        }
         if input.frame_path == FramePath::DmaBuf {
             if self.processor.is_some() {
                 return Err("processor_requires_cpu");
@@ -1017,6 +1044,19 @@ impl Plane for NativePlane {
             // SAFETY: the consumer binding remains live until cancellation completes.
             unsafe { bridge.cancel(api) };
         }
+        if let Some((service, mut bridge)) = self.processor_bridges.remove(&video)
+            && let (Some(processor), Some(encoder)) = (
+                self.generic_processor.as_ref(),
+                self.resource_consumers.get(&service),
+            )
+            && let (Ok(processor), Ok(encoder)) = (
+                unsafe { processor.table::<FrameResourceProcessorApi>() },
+                unsafe { encoder.table::<FrameResourceConsumerApi>() },
+            )
+        {
+            // SAFETY: both provider bindings remain live through cancellation.
+            unsafe { bridge.cancel(processor, encoder) };
+        }
         if let Some((service, source)) = self.sources.remove(&video)
             && let Some(binding) = self.source_encoders.get(&service)
             && let Ok(api) = unsafe { binding.table::<EncoderProviderApi>() }
@@ -1084,40 +1124,59 @@ impl NativePlane {
             .get(&input.video)
             .copied()
             .ok_or("resource_clock_unavailable")?;
-        let (_, bridge) = match self.resource_bridges.entry(input.video) {
-            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::btree_map::Entry::Vacant(entry) => entry.insert((
-                self.active_encoder.clone(),
-                resource_generic::ResourceBridge::new(input.capture, input.encoder, 0, epoch)
-                    .map_err(|_| "resource_negotiation_failed")?,
-            )),
+        let flags = if input.force_idr {
+            FRAME_RESOURCE_SUBMIT_FORCE_IDR
+        } else {
+            0
         };
-        // SAFETY: both session-owned bindings remain live through cancellation.
-        let status = match unsafe {
-            bridge.forward(
-                capture,
-                consumer,
-                if input.force_idr {
-                    FRAME_RESOURCE_SUBMIT_FORCE_IDR
-                } else {
-                    0
-                },
-            )
-        } {
-            Ok(status) => status,
-            Err(resource_generic::ConnectionError::Native(MEDIA_BUSY | MEDIA_PENDING))
-                if !bridge.is_retired() =>
-            {
+        let result = if let Some(binding) = &self.generic_processor {
+            // SAFETY: the typed binding requires the pipeline-safe processor minor.
+            let processor = unsafe { binding.table::<FrameResourceProcessorApi>() }
+                .map_err(|_| "processor_interface")?;
+            let (_, bridge) = match self.processor_bridges.entry(input.video) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => entry.insert((
+                    self.active_encoder.clone(),
+                    resource_generic::ProcessorBridge::new(
+                        input.capture,
+                        input.video,
+                        input.encoder,
+                        epoch,
+                    )
+                    .map_err(|_| "resource_negotiation_failed")?,
+                )),
+            };
+            let result = unsafe { bridge.forward(capture, processor, consumer, flags) };
+            (result, bridge.is_retired(), bridge.output_delivered())
+        } else {
+            let (_, bridge) = match self.resource_bridges.entry(input.video) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => entry.insert((
+                    self.active_encoder.clone(),
+                    resource_generic::ResourceBridge::new(input.capture, input.encoder, 0, epoch)
+                        .map_err(|_| "resource_negotiation_failed")?,
+                )),
+            };
+            let result = unsafe { bridge.forward(capture, consumer, flags) };
+            (result, bridge.is_retired(), true)
+        };
+        let (status, output_delivered) = match result {
+            (Ok(status), _, delivered) => (status, delivered),
+            (
+                Err(resource_generic::ConnectionError::Native(MEDIA_BUSY | MEDIA_PENDING)),
+                false,
+                _,
+            ) => {
                 return Ok(Progress {
                     capture_deferred: true,
                     ..Progress::default()
                 });
             }
-            Err(_) => return Err("resource_negotiation_failed"),
+            _ => return Err("resource_negotiation_failed"),
         };
         match status {
             STATUS_OK => Ok(Progress {
-                submitted: true,
+                submitted: output_delivered,
                 capture_frame_count: 1,
                 ..Progress::default()
             }),

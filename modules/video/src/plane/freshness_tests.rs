@@ -196,6 +196,7 @@ fn pump_external(mode: u32, legacy: bool) -> (Result<Progress, &'static str>, Bo
         &BTreeMap::new(),
         None,
         None,
+        None,
     )
     .unwrap();
     let progress = plane.pump(Pump {

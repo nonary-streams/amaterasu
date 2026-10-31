@@ -894,6 +894,7 @@ dependencies = [
  "amaterasu-module-sdk",
  "cc",
  "getrandom 0.3.4",
+ "libloading",
  "pkg-config",
  "serde",
  "serde_json",

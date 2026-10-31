@@ -61,6 +61,7 @@ impl ManagedModule for Video {
                     &settings.external_encoder_consumers,
                     settings.cpu_processor_service.as_deref(),
                     settings.gpu_processor_service.as_deref(),
+                    settings.generic_processor_service.as_deref(),
                 )?
                 .with_required_frame_leases(settings.require_frame_lease),
             )

@@ -603,3 +603,17 @@ output path carrying those agreed schemas end to end. Adding a provider alias
 does not remove those constraints. The generic binary transfer API supplies a
 buffer primitive; migrating this output path and validating its transport is
 separate integration work.
+
+An optional `generic_processor_service` selects a separately registered
+`amaterasu.frame-resource-processor.native/1` provider for the generic resource
+path. It is mutually exclusive with the legacy CPU and DMA-BUF processors and
+is mandatory when configured: a stream using a different frame path fails
+rather than bypassing it. The provider must advertise processor minor 1 and the
+complete v1.0 table size. Minor 1 adds synchronous, retry-safe callback semantics;
+minor 0 does not promise them. Video negotiates capture-to-processor and
+processor-to-encoder offers independently, propagates the processor output's
+color metadata, and preserves clocks, sequence, timestamps and freshness. A
+rejected downstream frame is not accepted; cancellation retires the encoder
+before the processor while both bindings remain live. These requirements do not
+prove GPU or operating-system support, and signed grants do not sandbox native
+providers.

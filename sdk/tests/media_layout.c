@@ -77,6 +77,10 @@ _Static_assert(offsetof(AmaterasuVideoApiV1_1, geometry) == 40, "video geometry 
 _Static_assert(sizeof(AmaterasuAudioFrame) == 56, "audio frame layout");
 _Static_assert(offsetof(AmaterasuAudioFrame, data) == 24, "audio data offset");
 _Static_assert(sizeof(AmaterasuAudioCaptureApi) == 40, "audio table layout");
+_Static_assert(sizeof(AmaterasuAudioFormatDescriptor) == 72, "audio format descriptor layout");
+_Static_assert(sizeof(AmaterasuAudioFormatOffer) == 80, "audio format offer layout");
+_Static_assert(sizeof(AmaterasuNegotiatedAudioPacket) == 64, "negotiated audio packet layout");
+_Static_assert(sizeof(AmaterasuNegotiatedAudioEncoderApi) == 72, "negotiated audio encoder layout");
 _Static_assert(sizeof(AmaterasuEncodedAudioPacket) == 56, "encoded audio layout");
 _Static_assert(offsetof(AmaterasuEncodedAudioPacket, data) == 24, "encoded audio data offset");
 _Static_assert(offsetof(AmaterasuEncodedAudioPacket, timestamp_us) == 40, "encoded audio timestamp offset");

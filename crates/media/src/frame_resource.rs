@@ -8,6 +8,8 @@ pub const FRAME_RESOURCE_CONSUMER_INTERFACE_MAJOR: u32 = 1;
 pub const FRAME_RESOURCE_CONSUMER_INTERFACE_MINOR: u32 = 0;
 pub const FRAME_RESOURCE_PROCESSOR_INTERFACE_MAJOR: u32 = 1;
 pub const FRAME_RESOURCE_PROCESSOR_INTERFACE_MINOR: u32 = 0;
+/// Minor 1 opts into retry-safe synchronous pipeline processing semantics.
+pub const FRAME_RESOURCE_PROCESSOR_PIPELINE_MINOR: u32 = 1;
 pub const FRAME_RESOURCE_CPU: u32 = 1;
 pub const FRAME_RESOURCE_DMABUF: u32 = 2;
 /// Resource and synchronization kinds >= this value require an independently
@@ -272,6 +274,17 @@ pub struct FrameResourceConsumerApi {
 /// the same descriptor and retain/release rules, and preserve source sequence,
 /// timestamps and freshness. The output offer is independently negotiated;
 /// process never invokes the sink after returning.
+///
+/// Minor 1 additionally promises that process propagates the sink status exactly,
+/// and any non-OK return consumes no input and retains no work or output. OK with
+/// no callback consumes the input without producing a frame. A callback happens
+/// on the calling thread; its output preserves the input clocks and epoch as
+/// well as its timestamps, sequence and freshness. The sink may submit the
+/// borrowed output to another provider before process returns. Minor 0 does not
+/// promise these pipeline semantics and must not be used where retries matter.
+/// Process and negotiation must not wait for GPU completion, queue space, or
+/// another worker; report BUSY/PENDING without consumption instead. Cancel is
+/// the explicit synchronous retirement barrier.
 #[repr(C)]
 pub struct FrameResourceProcessorApi {
     pub base: FrameResourceConsumerApi,

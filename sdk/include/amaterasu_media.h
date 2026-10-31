@@ -28,10 +28,12 @@ extern "C" {
 #define AMATERASU_VIDEO_ENCODER_CONTRACT "amaterasu.video-encoder.native/1"
 #define AMATERASU_ENCODER_PROVIDER_CONTRACT "amaterasu.encoder-provider.native/1"
 #define AMATERASU_FRAME_RESOURCE_CONSUMER_CONTRACT "amaterasu.frame-resource-consumer.native/1"
+#define AMATERASU_FRAME_RESOURCE_PROCESSOR_CONTRACT "amaterasu.frame-resource-processor.native/1"
 #define AMATERASU_CPU_FRAME_PROCESSOR_CONTRACT "amaterasu.cpu-frame-processor.native/1"
 #define AMATERASU_GPU_FRAME_PROCESSOR_CONTRACT "amaterasu.gpu-frame-processor.native/1"
 #define AMATERASU_AUDIO_CAPTURE_CONTRACT "amaterasu.audio-capture.native/1"
 #define AMATERASU_AUDIO_ENCODER_CONTRACT "amaterasu.audio-encoder.native/1"
+#define AMATERASU_NEGOTIATED_AUDIO_ENCODER_CONTRACT "amaterasu.audio-encoder-negotiated.native/1"
 #define AMATERASU_PCM_F32 1
 #define AMATERASU_PCM_I16 2
 #define AMATERASU_AUDIO_DISCONTINUITY 1
@@ -84,6 +86,55 @@ typedef struct {
     AmaterasuStatus (*receive)(void *context, uint64_t stream, AmaterasuAudioPacketSink sink);
     AmaterasuStatus (*drain)(void *context, uint64_t stream);
 } AmaterasuAudioEncoderApi;
+
+/* Independent negotiated encoder family. Existing Opus tables are unchanged.
+ * Namespace zero denotes standard codecs; vendor namespaces require a separately
+ * agreed schema. Valid structure does not imply codec or client support. Offers,
+ * config bytes and packet bytes are borrowed only during synchronous callbacks. */
+#define AMATERASU_AUDIO_FORMAT_VERSION 1u
+#define AMATERASU_AUDIO_FORMAT_MAX_CONFIG_BYTES 4096u
+#define AMATERASU_AUDIO_FORMAT_MAX_OFFERS 32u
+#define AMATERASU_AUDIO_CODEC_OPUS 2u
+#define AMATERASU_AUDIO_CODEC_AC3 3u
+#define AMATERASU_AUDIO_CODEC_EAC3 4u
+#define AMATERASU_AUDIO_FRAMING_OPUS_PACKET 1u
+#define AMATERASU_AUDIO_FRAMING_AC3_SYNCFRAME 2u
+#define AMATERASU_AUDIO_FRAMING_EAC3_SYNCFRAME 3u
+typedef struct {
+    uint32_t size, version;
+    uint8_t namespace_id[16];
+    uint32_t codec, framing, sample_rate, channels;
+    uint64_t channel_mask;
+    uint32_t frame_samples, reserved;
+    AmaterasuBorrowedBytes config;
+} AmaterasuAudioFormatDescriptor;
+typedef struct { uint64_t id; AmaterasuAudioFormatDescriptor format; } AmaterasuAudioFormatOffer;
+typedef struct {
+    void *context;
+    AmaterasuStatus (*write)(void *, const AmaterasuAudioFormatOffer *);
+} AmaterasuAudioFormatOfferSink;
+typedef struct {
+    uint64_t stream, generation, offer_id;
+    uint32_t flags, frames;
+    uint64_t timestamp_us, sequence;
+    AmaterasuBorrowedBytes data;
+} AmaterasuNegotiatedAudioPacket;
+typedef struct {
+    void *context;
+    AmaterasuStatus (*write)(void *, const AmaterasuNegotiatedAudioPacket *);
+} AmaterasuNegotiatedAudioPacketSink;
+/* Enumerate has unique nonzero offers and nonzero generation. configure accepts
+ * an exact offered generation and ID or leaves selection unchanged. Rejection
+ * preserves the packet for retry; drain stops admission and emits EOS. Stream
+ * teardown retires pending work before the binding is released. */
+typedef struct {
+    AmaterasuNativeInterface base;
+    AmaterasuStatus (*enumerate)(void *, uint64_t, AmaterasuAudioFormatOfferSink, uint64_t *);
+    AmaterasuStatus (*configure)(void *, uint64_t, uint64_t generation, uint64_t offer_id);
+    AmaterasuStatus (*submit)(void *, uint64_t, const AmaterasuAudioFrame *);
+    AmaterasuStatus (*receive)(void *, uint64_t, AmaterasuNegotiatedAudioPacketSink);
+    AmaterasuStatus (*drain)(void *, uint64_t);
+} AmaterasuNegotiatedAudioEncoderApi;
 
 /* CPU bytes are borrowed only during submit or a synchronous frame callback.
  * NV12 is Y then UV, both with the same stride and even width/height. */
@@ -336,6 +387,8 @@ typedef struct {
 #define AMATERASU_FRAME_RESOURCE_CONSUMER_INTERFACE_MINOR 0u
 #define AMATERASU_FRAME_RESOURCE_PROCESSOR_INTERFACE_MAJOR 1u
 #define AMATERASU_FRAME_RESOURCE_PROCESSOR_INTERFACE_MINOR 0u
+/* Minor 1 opts in to synchronous retry-safe processor pipeline semantics. */
+#define AMATERASU_FRAME_RESOURCE_PROCESSOR_PIPELINE_MINOR 1u
 #define AMATERASU_FRAME_RESOURCE_CPU 1u
 #define AMATERASU_FRAME_RESOURCE_DMABUF 2u
 #define AMATERASU_FRAME_RESOURCE_VENDOR_BASE 0x80000000u
@@ -469,7 +522,12 @@ typedef struct {
     void (*cancel)(void *, uint64_t);
 } AmaterasuFrameResourceConsumerApi;
 /* The processor follows the same lifetime rules; process delivers at most one
- * output synchronously, preserving sequence, timestamps and freshness. */
+ * output synchronously, preserving sequence, timestamps and freshness.
+ * Minor 1 propagates the sink status exactly; non-OK consumes no input and
+ * retains no work or output. OK without a callback consumes input with no output.
+ * Its callback runs on the calling thread; output preserves both clock descriptors
+ * and can be submitted to another provider before process returns. Minor 0 does
+ * not promise these retry-safe pipeline semantics. */
 typedef struct {
     AmaterasuFrameResourceConsumerApi base;
     AmaterasuStatus (*enumerate_outputs)(void *, uint64_t, AmaterasuCaptureResourceOfferSink, uint64_t *generation);

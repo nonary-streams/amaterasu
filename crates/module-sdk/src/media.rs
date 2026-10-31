@@ -7,8 +7,43 @@ pub mod native_contracts {
     pub const ENCODER: &str = "amaterasu.video-encoder.native/1";
     pub const ENCODER_PROVIDER: &str = "amaterasu.encoder-provider.native/1";
     pub const FRAME_RESOURCE_CONSUMER: &str = "amaterasu.frame-resource-consumer.native/1";
+    pub const FRAME_RESOURCE_PROCESSOR: &str = "amaterasu.frame-resource-processor.native/1";
     pub const CPU_PROCESSOR: &str = "amaterasu.cpu-frame-processor.native/1";
     pub const GPU_PROCESSOR: &str = "amaterasu.gpu-frame-processor.native/1";
+}
+
+/// Register a retry-safe negotiated resource processor.
+///
+/// # Safety
+/// The factory must implement the resource-processor pipeline minor contract,
+/// keep its table live through binding release, and obey callback and lease rules.
+pub unsafe fn register_frame_resource_processor(
+    runtime: &crate::RuntimeClient,
+    service: &str,
+    factory: &crate::abi::NativeServiceFactory,
+) -> crate::ModuleResult<()> {
+    unsafe {
+        runtime.register_native_typed(service, native_contracts::FRAME_RESOURCE_PROCESSOR, factory)
+    }
+}
+
+/// Bind a processor that explicitly opts into retry-safe pipeline semantics.
+///
+/// # Safety
+/// The provider and runtime must outlive the binding and all retained resources.
+pub unsafe fn bind_frame_resource_processor(
+    runtime: &crate::RuntimeClient,
+    service: &str,
+) -> crate::ModuleResult<crate::NativeBinding> {
+    unsafe {
+        runtime.bind_native_typed(
+            service,
+            native_contracts::FRAME_RESOURCE_PROCESSOR,
+            amaterasu_media::FRAME_RESOURCE_PROCESSOR_INTERFACE_MAJOR,
+            amaterasu_media::FRAME_RESOURCE_PROCESSOR_PIPELINE_MINOR,
+            amaterasu_media::FRAME_RESOURCE_PROCESSOR_API_V1_0_SIZE,
+        )
+    }
 }
 
 mod generic;

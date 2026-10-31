@@ -1,10 +1,13 @@
 //! Synchronous, schema-agnostic capture-to-consumer forwarding.
+mod processor;
 use amaterasu_media::{
     CaptureApiV1_8, CaptureResourceFrame, CaptureResourceFrameSink, CaptureResourceOffer,
     CaptureResourceOfferSink, FRAME_ACCESS_CPU, FRAME_ACCESS_GPU, FrameResourceConsumerApi,
-    MEDIA_UNSUPPORTED,
+    FrameResourceProcessorApi, MEDIA_UNSUPPORTED,
 };
 use amaterasu_module_sdk::abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
+pub(super) use processor::ProcessorBridge;
+use processor::ProcessorDelivery;
 use std::{ffi::c_void, marker::PhantomData, rc::Rc};
 
 const MAX_OFFERS: usize = 64;
@@ -69,6 +72,42 @@ unsafe extern "C" fn collect(context: *mut c_void, offer: *const CaptureResource
         STATUS_OK
     } else {
         STATUS_INVALID_ARGUMENT
+    }
+}
+
+enum Producer<'a> {
+    Capture(&'a CaptureApiV1_8),
+    Processor(&'a FrameResourceProcessorApi),
+}
+
+impl Producer<'_> {
+    /// Bindings, stream and the synchronous sink must remain live for this call.
+    unsafe fn enumerate(
+        &self,
+        stream: u64,
+        sink: CaptureResourceOfferSink,
+        generation: &mut u64,
+    ) -> Status {
+        match self {
+            Self::Capture(api) => unsafe {
+                (api.enumerate_resources)(api.base.base.base.context, stream, sink, generation)
+            },
+            Self::Processor(api) => unsafe {
+                (api.enumerate_outputs)(api.base.base.context, stream, sink, generation)
+            },
+        }
+    }
+
+    /// Binding and stream must remain live through selection.
+    unsafe fn select(&self, stream: u64, generation: u64, offer: u64) -> Status {
+        match self {
+            Self::Capture(api) => unsafe {
+                (api.select_resource)(api.base.base.base.context, stream, generation, offer)
+            },
+            Self::Processor(api) => unsafe {
+                (api.select_output)(api.base.base.context, stream, generation, offer)
+            },
+        }
     }
 }
 
@@ -164,7 +203,10 @@ struct Delivery<'a> {
     calls: u32,
     result: Status,
     invalid: bool,
+    processor: Option<ProcessorDelivery<'a>>,
+    output_delivered: bool,
 }
+
 unsafe extern "C" fn deliver(context: *mut c_void, frame: *const CaptureResourceFrame) -> Status {
     if context.is_null() {
         return STATUS_INVALID_ARGUMENT;
@@ -192,15 +234,30 @@ unsafe extern "C" fn deliver(context: *mut c_void, frame: *const CaptureResource
         state.invalid = true;
         return STATUS_INVALID_ARGUMENT;
     }
-    // SAFETY: the consumer binding and borrowed frame remain live during submission.
-    state.result = unsafe {
-        (state.consumer.submit)(
-            state.consumer.base.context,
-            state.stream,
-            frame,
-            state.flags,
-        )
-    };
+    if let Some(processor) = &state.processor {
+        // SAFETY: all bindings and the borrowed frame remain live through process.
+        match unsafe { processor::process(processor, frame, state.flags) } {
+            Ok((status, delivered)) => {
+                state.output_delivered = delivered;
+                state.result = status;
+            }
+            Err(()) => {
+                state.invalid = true;
+                return STATUS_INVALID_ARGUMENT;
+            }
+        }
+    } else {
+        // SAFETY: the consumer binding and borrowed frame remain live during submission.
+        state.result = unsafe {
+            (state.consumer.submit)(
+                state.consumer.base.context,
+                state.stream,
+                frame,
+                state.flags,
+            )
+        };
+        state.output_delivered = state.result == STATUS_OK;
+    }
     if state.result == STATUS_OK {
         state.accepted_sequence = Some(frame.sequence);
     }
@@ -219,6 +276,8 @@ pub(super) struct ResourceBridge {
     required: u32,
     expected_epoch: [u8; 16],
     last_sequence: u64,
+    pending_flags: u32,
+    output_delivered: bool,
     thread: PhantomData<Rc<()>>,
 }
 
@@ -242,6 +301,8 @@ impl ResourceBridge {
             required,
             expected_epoch: expected_host_epoch,
             last_sequence: 0,
+            pending_flags: 0,
+            output_delivered: false,
             thread: PhantomData,
         })
     }
@@ -263,21 +324,14 @@ impl ResourceBridge {
         self.selected = None;
     }
 
-    unsafe fn enumerate_capture(
+    unsafe fn enumerate_producer(
         &self,
-        capture: &CaptureApiV1_8,
+        producer: &Producer<'_>,
         sink: CaptureResourceOfferSink,
     ) -> Result<u64, ConnectionError> {
         let mut generation = 0;
         // SAFETY: caller guarantees the binding and stream; callback is synchronous.
-        let status = unsafe {
-            (capture.enumerate_resources)(
-                capture.base.base.base.context,
-                self.capture_stream,
-                sink,
-                &mut generation,
-            )
-        };
+        let status = unsafe { producer.enumerate(self.capture_stream, sink, &mut generation) };
         if status != STATUS_OK {
             return Err(ConnectionError::Native(status));
         }
@@ -294,6 +348,14 @@ impl ResourceBridge {
     pub(super) unsafe fn negotiate(
         &mut self,
         capture: &CaptureApiV1_8,
+        consumer: &FrameResourceConsumerApi,
+    ) -> Result<(), ConnectionError> {
+        unsafe { self.negotiate_producer(&Producer::Capture(capture), consumer) }
+    }
+
+    unsafe fn negotiate_producer(
+        &mut self,
+        producer: &Producer<'_>,
         consumer: &FrameResourceConsumerApi,
     ) -> Result<(), ConnectionError> {
         if self.retired {
@@ -332,7 +394,7 @@ impl ResourceBridge {
             write: collect,
         };
         // SAFETY: the caller guarantees a live capture binding.
-        let first_result = unsafe { self.enumerate_capture(capture, sink) };
+        let first_result = unsafe { self.enumerate_producer(producer, sink) };
         if first.invalid {
             return Err(ConnectionError::Protocol);
         }
@@ -353,7 +415,7 @@ impl ResourceBridge {
             write: configure,
         };
         // SAFETY: the caller guarantees both live bindings.
-        let second = unsafe { self.enumerate_capture(capture, sink) };
+        let second = unsafe { self.enumerate_producer(producer, sink) };
         self.active = state.selected.is_some();
         let error = if state.ids.invalid {
             Some(ConnectionError::Protocol)
@@ -384,14 +446,7 @@ impl ResourceBridge {
             return Err(ConnectionError::NoCompatibleOffer);
         };
         // SAFETY: the caller guarantees the live capture binding and stream.
-        let status = unsafe {
-            (capture.select_resource)(
-                capture.base.base.base.context,
-                self.capture_stream,
-                producer_generation,
-                offer,
-            )
-        };
+        let status = unsafe { producer.select(self.capture_stream, producer_generation, offer) };
         if status != STATUS_OK {
             // SAFETY: the caller guarantees the live consumer binding.
             unsafe { self.cancel(consumer) };
@@ -413,23 +468,36 @@ impl ResourceBridge {
         consumer: &FrameResourceConsumerApi,
         flags: u32,
     ) -> Result<Status, ConnectionError> {
+        unsafe { self.forward_with_processor(capture, consumer, flags, None) }
+    }
+
+    unsafe fn forward_with_processor(
+        &mut self,
+        capture: &CaptureApiV1_8,
+        consumer: &FrameResourceConsumerApi,
+        flags: u32,
+        processor: Option<ProcessorDelivery<'_>>,
+    ) -> Result<Status, ConnectionError> {
         if self.selected.is_none() {
             // SAFETY: caller supplies both live bindings.
             unsafe { self.negotiate(capture, consumer) }?;
         }
         let (generation, offer) = self.selected.expect("negotiated selection");
+        self.output_delivered = false;
         let mut delivery = Delivery {
             consumer,
             stream: self.consumer_stream,
             generation,
             offer,
-            flags,
+            flags: flags | self.pending_flags,
             expected_epoch: self.expected_epoch,
             last_sequence: self.last_sequence,
             accepted_sequence: None,
             calls: 0,
             result: STATUS_OK,
             invalid: false,
+            processor,
+            output_delivered: false,
         };
         let sink = CaptureResourceFrameSink {
             context: (&mut delivery as *mut Delivery<'_>).cast(),
@@ -444,17 +512,26 @@ impl ResourceBridge {
             || (delivery.calls == 1 && status != delivery.result)
             || (delivery.calls == 0 && status == STATUS_OK)
         {
-            // SAFETY: caller supplies a live consumer binding.
-            unsafe { self.cancel(consumer) };
+            // A composed bridge must retire the downstream encoder first.
+            if delivery.processor.is_none() {
+                unsafe { self.cancel(consumer) };
+            }
             return Err(ConnectionError::Protocol);
         }
         if delivery.calls == 0 && status == MEDIA_UNSUPPORTED {
-            // SAFETY: caller supplies a live consumer binding.
-            unsafe { self.cancel(consumer) };
+            if delivery.processor.is_none() {
+                unsafe { self.cancel(consumer) };
+            }
             return Err(ConnectionError::Stale);
         }
         if let Some(sequence) = delivery.accepted_sequence {
             self.last_sequence = sequence;
+            self.output_delivered = delivery.output_delivered;
+            self.pending_flags = if delivery.output_delivered {
+                0
+            } else {
+                delivery.flags
+            };
         }
         Ok(status)
     }
@@ -482,6 +559,10 @@ mod tests {
         seen_generation: u64,
         seen_producer_generation: u64,
         namespace: Option<[u8; 16]>,
+        last_flags: u32,
+        hold: bool,
+        held: Option<CaptureResourceFrame>,
+        cancel_log: Option<std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>>,
     }
     unsafe extern "C" fn enumerate(
         _: *mut c_void,
@@ -520,13 +601,21 @@ mod tests {
         context: *mut c_void,
         _: u64,
         frame: *const CaptureResourceFrame,
-        _: u32,
+        flags: u32,
     ) -> Status {
         // SAFETY: fixture supplies the consumer context and borrowed frame.
         unsafe {
             let consumer = &mut *context.cast::<Consumer>();
+            consumer.last_flags = flags;
             if consumer.busy {
                 return amaterasu_media::MEDIA_BUSY;
+            }
+            if consumer.hold {
+                let status = ((*frame).retain)((*frame).context);
+                if status != STATUS_OK {
+                    return status;
+                }
+                consumer.held = Some(*frame);
             }
             consumer.submitted += 1;
             consumer.transfer = (*frame).color.transfer;
@@ -537,7 +626,15 @@ mod tests {
     unsafe extern "C" fn cancel(context: *mut c_void, _: u64) {
         // SAFETY: fixture supplies the consumer context.
         unsafe {
-            (*context.cast::<Consumer>()).cancelled += 1;
+            let consumer = &mut *context.cast::<Consumer>();
+            consumer.cancelled += 1;
+            if let Some(frame) = consumer.held.take() {
+                let completion = descriptor(amaterasu_media::FRAME_SYNC_VENDOR_BASE);
+                (frame.release)(frame.context, &completion);
+            }
+            if let Some(log) = &consumer.cancel_log {
+                log.borrow_mut().push("encoder");
+            }
         }
     }
     fn table(consumer: &mut Consumer) -> FrameResourceConsumerApi {
@@ -648,6 +745,8 @@ mod tests {
             calls: 0,
             result: STATUS_OK,
             invalid: false,
+            processor: None,
+            output_delivered: false,
         };
         assert_eq!(
             unsafe { deliver((&mut delivery as *mut Delivery<'_>).cast(), &frame) },
@@ -1190,5 +1289,498 @@ mod tests {
             Err(ConnectionError::Protocol)
         );
         assert_eq!((consumer.submitted, consumer.cancelled), (0, 1));
+    }
+
+    #[derive(Default)]
+    struct TestProcessor {
+        input: Consumer,
+        selected: bool,
+        transfer: u32,
+        drop_output: bool,
+        swallow_error: bool,
+        corrupt_clock: bool,
+        lease: Option<*mut TestLease>,
+        cancellations: u32,
+        log: Option<std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>>,
+    }
+
+    unsafe extern "C" fn processor_config(
+        context: *mut c_void,
+        stream: u64,
+        generation: u64,
+        id: u64,
+        source_generation: u64,
+        offer: *const CaptureResourceOffer,
+    ) -> Status {
+        // SAFETY: test context points to a live processor for this call.
+        let processor = unsafe { &mut *context.cast::<TestProcessor>() };
+        unsafe {
+            config(
+                (&mut processor.input as *mut Consumer).cast(),
+                stream,
+                generation,
+                id,
+                source_generation,
+                offer,
+            )
+        }
+    }
+    unsafe extern "C" fn processor_cancel(context: *mut c_void, _: u64) {
+        let processor = unsafe { &mut *context.cast::<TestProcessor>() };
+        processor.cancellations += 1;
+        if let Some(log) = &processor.log {
+            log.borrow_mut().push("processor");
+        }
+    }
+    unsafe extern "C" fn processor_outputs(
+        _: *mut c_void,
+        _: u64,
+        sink: CaptureResourceOfferSink,
+        generation: *mut u64,
+    ) -> Status {
+        let mut candidate = offer();
+        candidate.accessibility = FRAME_ACCESS_GPU;
+        unsafe {
+            *generation = 9;
+            (sink.write)(sink.context, &candidate)
+        }
+    }
+    unsafe extern "C" fn processor_select(
+        context: *mut c_void,
+        _: u64,
+        generation: u64,
+        offer: u64,
+    ) -> Status {
+        let processor = unsafe { &mut *context.cast::<TestProcessor>() };
+        if generation != 9 || offer != 5 {
+            return MEDIA_UNSUPPORTED;
+        }
+        processor.selected = true;
+        STATUS_OK
+    }
+    unsafe extern "C" fn processor_process(
+        context: *mut c_void,
+        _: u64,
+        input: *const CaptureResourceFrame,
+        sink: CaptureResourceFrameSink,
+    ) -> Status {
+        let processor = unsafe { &mut *context.cast::<TestProcessor>() };
+        if !processor.selected {
+            return MEDIA_UNSUPPORTED;
+        }
+        if processor.drop_output {
+            return STATUS_OK;
+        }
+        let mut output = unsafe { *input };
+        output.offer_generation = 9;
+        output.offer_id = 5;
+        output.color = amaterasu_media::FrameColorMetadata {
+            version: 1,
+            size: std::mem::size_of::<amaterasu_media::FrameColorMetadata>() as u32,
+            transfer: processor.transfer,
+            ..Default::default()
+        };
+        if processor.corrupt_clock {
+            output.clock.epoch_id = [7; 16];
+        }
+        if let Some(lease) = processor.lease {
+            output.context = lease.cast();
+            output.retain = lease_retain;
+            output.release = lease_release;
+        }
+        let status = unsafe { (sink.write)(sink.context, &output) };
+        if processor.swallow_error {
+            STATUS_OK
+        } else {
+            status
+        }
+    }
+    fn processor_table(processor: &mut TestProcessor) -> FrameResourceProcessorApi {
+        FrameResourceProcessorApi {
+            base: FrameResourceConsumerApi {
+                base: NativeInterface {
+                    header: AbiHeader {
+                        size: size_of::<FrameResourceProcessorApi>() as u32,
+                        major: 1,
+                        minor: 1,
+                    },
+                    context: (processor as *mut TestProcessor).cast(),
+                    release: None,
+                },
+                enumerate_resources: consumer_enumerate,
+                configure: processor_config,
+                submit,
+                cancel: processor_cancel,
+            },
+            enumerate_outputs: processor_outputs,
+            select_output: processor_select,
+            process: processor_process,
+        }
+    }
+
+    #[test]
+    fn two_processors_negotiate_and_forward_with_retry_and_ordered_retirement() {
+        for transfer in [
+            amaterasu_media::FRAME_TRANSFER_PQ,
+            amaterasu_media::FRAME_TRANSFER_SRGB,
+        ] {
+            let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let mut source = Producer::default();
+            let capture = capture_table(&mut source);
+            let mut processor = TestProcessor {
+                transfer,
+                log: Some(log.clone()),
+                ..Default::default()
+            };
+            let processor_api = processor_table(&mut processor);
+            let mut encoder = Consumer {
+                busy: true,
+                cancel_log: Some(log.clone()),
+                ..Default::default()
+            };
+            let mut encoder_api = table(&mut encoder);
+            encoder_api.enumerate_resources = consumer_enumerate;
+            let mut bridge = ProcessorBridge::new(1, 2, 3, [1; 16]).unwrap();
+            let force = amaterasu_media::FRAME_RESOURCE_SUBMIT_FORCE_IDR;
+            assert_eq!(
+                unsafe { bridge.forward(&capture, &processor_api, &encoder_api, force) },
+                Ok(amaterasu_media::MEDIA_BUSY)
+            );
+            assert_eq!(encoder.submitted, 0);
+            encoder.busy = false;
+            std::hint::black_box(&encoder);
+            assert_eq!(
+                unsafe { bridge.forward(&capture, &processor_api, &encoder_api, force) },
+                Ok(STATUS_OK)
+            );
+            assert_eq!(
+                (encoder.submitted, encoder.transfer, encoder.last_flags),
+                (1, transfer, force)
+            );
+            assert_eq!(processor.input.configured, 1);
+            assert_eq!(encoder.configured, 1);
+            unsafe { bridge.cancel(&processor_api, &encoder_api) };
+            assert_eq!(&*log.borrow(), &["encoder", "processor"]);
+            unsafe { bridge.cancel(&processor_api, &encoder_api) };
+            assert_eq!(&*log.borrow(), &["encoder", "processor"]);
+        }
+    }
+
+    #[test]
+    fn processor_rejection_violation_and_bad_clock_fail_closed() {
+        for bad_clock in [false, true] {
+            let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let mut source = Producer::default();
+            let capture = capture_table(&mut source);
+            let mut processor = TestProcessor {
+                swallow_error: !bad_clock,
+                corrupt_clock: bad_clock,
+                log: Some(log.clone()),
+                ..Default::default()
+            };
+            let processor_api = processor_table(&mut processor);
+            let mut encoder = Consumer {
+                busy: true,
+                cancel_log: Some(log.clone()),
+                ..Default::default()
+            };
+            let mut encoder_api = table(&mut encoder);
+            encoder_api.enumerate_resources = consumer_enumerate;
+            let mut bridge = ProcessorBridge::new(1, 2, 3, [1; 16]).unwrap();
+            assert_eq!(
+                unsafe { bridge.forward(&capture, &processor_api, &encoder_api, 0) },
+                Err(ConnectionError::Protocol)
+            );
+            assert_eq!(encoder.submitted, 0);
+            assert_eq!(&*log.borrow(), &["encoder", "processor"]);
+            assert!(bridge.is_retired());
+        }
+    }
+
+    #[test]
+    fn processor_drop_preserves_keyframe_request_until_output() {
+        let mut source = Producer::default();
+        let capture = capture_table(&mut source);
+        let mut processor = TestProcessor {
+            drop_output: true,
+            ..Default::default()
+        };
+        let processor_api = processor_table(&mut processor);
+        let mut encoder = Consumer::default();
+        let mut encoder_api = table(&mut encoder);
+        encoder_api.enumerate_resources = consumer_enumerate;
+        let mut bridge = ProcessorBridge::new(1, 2, 3, [1; 16]).unwrap();
+        let force = amaterasu_media::FRAME_RESOURCE_SUBMIT_FORCE_IDR;
+        assert_eq!(
+            unsafe { bridge.forward(&capture, &processor_api, &encoder_api, force) },
+            Ok(STATUS_OK)
+        );
+        processor.drop_output = false;
+        std::hint::black_box(&processor);
+        assert_eq!(
+            unsafe { bridge.forward(&capture, &processor_api, &encoder_api, 0) },
+            Ok(STATUS_OK)
+        );
+        assert_eq!(encoder.last_flags, force);
+        unsafe { bridge.cancel(&processor_api, &encoder_api) };
+    }
+
+    struct PipelineHost {
+        capture: CaptureApiV1_8,
+        encoder: amaterasu_media::EncoderApi,
+        consumer: FrameResourceConsumerApi,
+        processor: *const FrameResourceProcessorApi,
+    }
+    unsafe extern "C" fn runtime_invoke(
+        context: *mut c_void,
+        bytes: amaterasu_module_sdk::abi::BorrowedBytes,
+        sink: amaterasu_module_sdk::abi::ReplySink,
+    ) -> Status {
+        use amaterasu_module_sdk::{Command, Response};
+        let host = unsafe { &mut *context.cast::<PipelineHost>() };
+        let bytes = match unsafe { bytes.read() } {
+            Ok(bytes) => bytes,
+            Err(_) => return STATUS_INVALID_ARGUMENT,
+        };
+        let command: Command = match serde_json::from_slice(bytes) {
+            Ok(command) => command,
+            Err(_) => return STATUS_INVALID_ARGUMENT,
+        };
+        let response = match command {
+            Command::NativeBindTyped {
+                service, contract, ..
+            } => {
+                let address = match (service.as_str(), contract.as_str()) {
+                    ("example.capture/1", "amaterasu.video-capture.native/1") => {
+                        &host.capture as *const _ as usize
+                    }
+                    (
+                        "amaterasu.encode/1" | "example.encode/1",
+                        "amaterasu.video-encoder.native/1",
+                    ) => &host.encoder as *const _ as usize,
+                    (
+                        "example.resource-consumer/1",
+                        "amaterasu.frame-resource-consumer.native/1",
+                    ) => &host.consumer as *const _ as usize,
+                    ("example.processor/1", "amaterasu.frame-resource-processor.native/1") => {
+                        host.processor as usize
+                    }
+                    _ => 0,
+                };
+                if address == 0 {
+                    Response::error("unexpected_binding", "unknown service")
+                } else {
+                    Response::NativeBound {
+                        binding: address as u64,
+                        address,
+                    }
+                }
+            }
+            Command::NativeRelease { .. } => Response::Ok,
+            _ => Response::error("unexpected_request", "test only"),
+        };
+        unsafe { sink.send(&serde_json::to_vec(&response).unwrap()) };
+        STATUS_OK
+    }
+    unsafe extern "C" fn legacy_submit(
+        _: *mut c_void,
+        _: u64,
+        _: *const amaterasu_media::CpuFrame,
+        _: u32,
+    ) -> Status {
+        MEDIA_UNSUPPORTED
+    }
+    unsafe extern "C" fn legacy_receive(
+        _: *mut c_void,
+        _: u64,
+        _: amaterasu_media::PacketSink,
+    ) -> Status {
+        amaterasu_media::MEDIA_PENDING
+    }
+    unsafe extern "C" fn legacy_drain(_: *mut c_void, _: u64) -> Status {
+        STATUS_OK
+    }
+
+    fn run_video_plane_with_processor(processor: *const FrameResourceProcessorApi, transfer: u32) {
+        use crate::plane::{FramePath, NativePlane, Plane, Pump};
+        use amaterasu_module_sdk::RuntimeClient;
+        use std::sync::{Arc, Mutex};
+        let mut source = Box::new(Producer::default());
+        let mut consumer = Box::new(Consumer::default());
+        let mut capture = capture_table(&mut source);
+        capture.base.base.base.header = AbiHeader {
+            size: size_of::<CaptureApiV1_8>() as u32,
+            major: 1,
+            minor: 8,
+        };
+        let mut consumer_api = table(&mut consumer);
+        consumer_api.enumerate_resources = consumer_enumerate;
+        let mut host = Box::new(PipelineHost {
+            capture,
+            encoder: amaterasu_media::EncoderApi {
+                base: NativeInterface {
+                    header: AbiHeader::of::<amaterasu_media::EncoderApi>(),
+                    context: ptr::null_mut(),
+                    release: None,
+                },
+                submit: legacy_submit,
+                receive: legacy_receive,
+                drain: legacy_drain,
+            },
+            consumer: consumer_api,
+            processor,
+        });
+        let runtime = unsafe {
+            RuntimeClient::from_endpoint(amaterasu_module_sdk::abi::HostApi {
+                header: AbiHeader::of::<amaterasu_module_sdk::abi::HostApi>(),
+                context: (&mut *host as *mut PipelineHost).cast(),
+                invoke: runtime_invoke,
+            })
+        };
+        let settings: crate::model::Settings = serde_json::from_value(serde_json::json!({
+            "capture_providers": [],
+            "external_capture_providers": {"vendor": {"service":"example.capture/1", "frame_transport":"generic_cpu"}},
+            "external_encoder_providers": {"vendor":"example.encode/1"},
+            "external_encoder_consumers": {"vendor":"example.resource-consumer/1"},
+            "generic_processor_service":"example.processor/1"
+        })).unwrap();
+        settings.validate().unwrap();
+        let providers = settings.resolved_providers();
+        let provider = *providers.first().unwrap();
+        let mut plane = NativePlane::bind(
+            &runtime,
+            Arc::new(Mutex::new(crate::queue::Queues::default())),
+            &providers,
+            &settings.external_encoder_providers,
+            &settings.source_encoder_providers,
+            &settings.external_encoder_consumers,
+            None,
+            None,
+            settings.generic_processor_service.as_deref(),
+        )
+        .unwrap();
+        plane.select_encoder("example.encode/1");
+        plane.set_stream_clock(1, 0, [1; 16]);
+        let configuration: crate::model::Configuration = serde_json::from_value(
+            serde_json::json!({"width":16,"height":16,"fps":60,"bitrate":100000}),
+        )
+        .unwrap();
+        let progress = plane
+            .pump(Pump {
+                video: 1,
+                provider,
+                frame_path: FramePath::Generic,
+                capture: 1,
+                encoder: 3,
+                configuration: &configuration,
+                capture_due: true,
+                constant_rate: false,
+                repeat_due: false,
+                repeat_frame: None,
+                timestamp_us: 1,
+                sequence: 1,
+                force_idr: false,
+            })
+            .unwrap();
+        assert!(progress.submitted);
+        assert_eq!((consumer.submitted, consumer.transfer), (1, transfer));
+        plane.finish_stream(1);
+        assert_eq!(consumer.cancelled, 1);
+        drop(plane);
+    }
+
+    #[test]
+    fn selected_processor_runs_in_actual_video_plane_with_two_replacements() {
+        for transfer in [
+            amaterasu_media::FRAME_TRANSFER_PQ,
+            amaterasu_media::FRAME_TRANSFER_SRGB,
+        ] {
+            let mut processor = Box::new(TestProcessor {
+                transfer,
+                ..Default::default()
+            });
+            let api = processor_table(&mut processor);
+            run_video_plane_with_processor(&api, transfer);
+            assert_eq!(processor.cancellations, 1);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires separately built processor provider artifacts"]
+    fn unchanged_video_plane_loads_two_processor_provider_artifacts() {
+        for (variable, transfer) in [
+            ("PROCESSOR_FIXTURE_PQ", amaterasu_media::FRAME_TRANSFER_PQ),
+            (
+                "PROCESSOR_FIXTURE_SRGB",
+                amaterasu_media::FRAME_TRANSFER_SRGB,
+            ),
+        ] {
+            let path = std::env::var(variable).expect("processor fixture path");
+            // SAFETY: test libraries expose these C signatures; they remain loaded
+            // through the complete plane lifetime and provider destruction.
+            unsafe {
+                let library = libloading::Library::new(path).unwrap();
+                let create: libloading::Symbol<
+                    unsafe extern "C" fn() -> *mut FrameResourceProcessorApi,
+                > = library.get(b"fixture_processor_create\0").unwrap();
+                let destroy: libloading::Symbol<
+                    unsafe extern "C" fn(*mut FrameResourceProcessorApi),
+                > = library.get(b"fixture_processor_destroy\0").unwrap();
+                let cancellations: libloading::Symbol<
+                    unsafe extern "C" fn(*mut FrameResourceProcessorApi) -> u32,
+                > = library.get(b"fixture_processor_cancellations\0").unwrap();
+                let processor = create();
+                assert!(!processor.is_null());
+                run_video_plane_with_processor(processor, transfer);
+                assert_eq!(cancellations(processor), 1);
+                destroy(processor);
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct TestLease {
+        references: u32,
+        completion: u32,
+    }
+    unsafe extern "C" fn lease_retain(context: *mut c_void) -> Status {
+        let lease = unsafe { &mut *context.cast::<TestLease>() };
+        lease.references += 1;
+        STATUS_OK
+    }
+    unsafe extern "C" fn lease_release(context: *mut c_void, completion: *const FrameDescriptor) {
+        let lease = unsafe { &mut *context.cast::<TestLease>() };
+        lease.references -= 1;
+        lease.completion = unsafe { (*completion).kind };
+    }
+    #[test]
+    fn cancellation_releases_retained_processed_frame_with_completion_before_processor() {
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut source = Producer::default();
+        let capture = capture_table(&mut source);
+        let mut lease = TestLease::default();
+        let mut processor = TestProcessor {
+            lease: Some(&mut lease),
+            log: Some(log.clone()),
+            ..Default::default()
+        };
+        let processor_api = processor_table(&mut processor);
+        let mut encoder = Consumer {
+            hold: true,
+            cancel_log: Some(log.clone()),
+            ..Default::default()
+        };
+        let mut encoder_api = table(&mut encoder);
+        encoder_api.enumerate_resources = consumer_enumerate;
+        let mut bridge = ProcessorBridge::new(1, 2, 3, [1; 16]).unwrap();
+        assert_eq!(
+            unsafe { bridge.forward(&capture, &processor_api, &encoder_api, 0) },
+            Ok(STATUS_OK)
+        );
+        assert_eq!(lease.references, 1);
+        unsafe { bridge.cancel(&processor_api, &encoder_api) };
+        assert_eq!(lease.references, 0);
+        assert_eq!(lease.completion, amaterasu_media::FRAME_SYNC_VENDOR_BASE);
+        assert_eq!(&*log.borrow(), &["encoder", "processor"]);
     }
 }

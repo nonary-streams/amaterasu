@@ -1,0 +1,3 @@
+[workspace]
+resolver = "2"
+members = ["ac3", "eac3", "consumer", "harness"]

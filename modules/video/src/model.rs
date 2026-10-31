@@ -274,6 +274,8 @@ pub struct Settings {
     pub cpu_processor_service: Option<String>,
     #[serde(default)]
     pub gpu_processor_service: Option<String>,
+    #[serde(default)]
+    pub generic_processor_service: Option<String>,
     /// Refuse borrowed/CPU fallbacks when this composition requires retained GPU frames.
     #[serde(default)]
     pub require_frame_lease: bool,
@@ -304,6 +306,7 @@ impl Default for Settings {
             source_encoder_providers: BTreeMap::new(),
             cpu_processor_service: None,
             gpu_processor_service: None,
+            generic_processor_service: None,
             require_frame_lease: false,
             drain_timeout_ms: default_drain_timeout(),
         }
@@ -331,6 +334,7 @@ impl Settings {
         for service in [
             self.cpu_processor_service.as_deref(),
             self.gpu_processor_service.as_deref(),
+            self.generic_processor_service.as_deref(),
         ]
         .into_iter()
         .flatten()
@@ -372,7 +376,19 @@ impl Settings {
                 .gpu_processor_service
                 .as_ref()
                 .is_some_and(|service| !valid_external_service(service))
-            || (self.cpu_processor_service.is_some() && self.gpu_processor_service.is_some())
+            || self
+                .generic_processor_service
+                .as_ref()
+                .is_some_and(|service| !valid_external_service(service))
+            || [
+                self.cpu_processor_service.is_some(),
+                self.gpu_processor_service.is_some(),
+                self.generic_processor_service.is_some(),
+            ]
+            .into_iter()
+            .filter(|selected| *selected)
+            .count()
+                > 1
             || self.external_encoder_consumers.len() > 16
             || self
                 .external_encoder_consumers
@@ -1430,6 +1446,7 @@ mod tests {
             source_encoder_providers: BTreeMap::new(),
             cpu_processor_service: None,
             gpu_processor_service: None,
+            generic_processor_service: None,
             require_frame_lease: false,
             drain_timeout_ms: 5000,
         };
@@ -1455,6 +1472,7 @@ mod tests {
             source_encoder_providers: BTreeMap::new(),
             cpu_processor_service: None,
             gpu_processor_service: None,
+            generic_processor_service: None,
             require_frame_lease: false,
             drain_timeout_ms: 5000,
         };
@@ -1548,6 +1566,14 @@ mod tests {
         assert!(valid.validate().is_ok());
         let both: Settings = serde_json::from_value(json!({"gpu_processor_service":"example.gpu/1", "cpu_processor_service":"example.cpu/1"})).unwrap();
         assert_eq!(both.validate(), Err("invalid_video_settings"));
+        let generic: Settings =
+            serde_json::from_value(json!({"generic_processor_service":"example.generic/1"}))
+                .unwrap();
+        assert!(generic.validate().is_ok());
+        let mixed: Settings = serde_json::from_value(json!({"gpu_processor_service":"example.gpu/1", "generic_processor_service":"example.generic/1"})).unwrap();
+        assert_eq!(mixed.validate(), Err("invalid_video_settings"));
+        let collision: Settings = serde_json::from_value(json!({"generic_processor_service":"example.capture/1", "external_capture_providers":{"vendor":"example.capture/1"}})).unwrap();
+        assert_eq!(collision.validate(), Err("invalid_video_settings"));
         for service in ["", "no-version", "example /1", "../service/1"] {
             let settings: Settings =
                 serde_json::from_value(json!({"gpu_processor_service":service})).unwrap();
