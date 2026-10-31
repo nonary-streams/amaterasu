@@ -274,6 +274,30 @@ fn opted_in_input_source_is_private_unique_and_fenced_by_binding_state() {
     assert_eq!(active["source"]["generation"], 4);
     assert_ne!(active["source"]["id"], first["token"]);
     assert!(active["paired_client"].is_null());
+    let resolve = json!({"operation":"resolve_effect_sources","target":session["target"]});
+    for (caller, initiator) in [
+        ("input", "input"),
+        ("amaterasu.nvhttp", "input"),
+        ("foreign", "amaterasu.nvhttp"),
+    ] {
+        assert_eq!(
+            coordinator.handle(caller, initiator, resolve.clone())["reason"],
+            "permission_denied"
+        );
+    }
+    let resolved = coordinator.handle("amaterasu.nvhttp", "amaterasu.nvhttp", resolve.clone());
+    assert_eq!(resolved["status"], "succeeded");
+    assert_eq!(resolved["sources"].as_array().unwrap().len(), 1);
+    assert_eq!(resolved["sources"][0]["source"], active["source"]);
+    assert_eq!(resolved["sources"][0]["target"], target);
+    assert_eq!(resolved["sources"][0]["input_consumer"], "input");
+    assert!(resolved.to_string().find(token).is_none());
+    let mut forged = resolve.clone();
+    forged["client_id"] = json!("forged");
+    assert_eq!(
+        coordinator.handle("amaterasu.nvhttp", "amaterasu.nvhttp", forged)["reason"],
+        "invalid_request"
+    );
     let legacy = coordinator.handle(
         "input",
         "input",
@@ -307,6 +331,8 @@ fn opted_in_input_source_is_private_unique_and_fenced_by_binding_state() {
         coordinator.handle("input", "input", validate.clone())["reason"],
         "stale_input_binding"
     );
+    let stale = coordinator.handle("amaterasu.nvhttp", "amaterasu.nvhttp", resolve.clone());
+    assert!(stale["sources"].as_array().unwrap().is_empty());
     coordinator
         .shared
         .borrow_mut()
