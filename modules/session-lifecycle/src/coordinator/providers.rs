@@ -573,6 +573,14 @@ impl Coordinator {
         let (_, id, stream_id, _) = super::operations::target_parts(&work.target)?;
         let session = next.sessions.get_mut(id).ok_or("unknown_session")?;
         let mut response = json!({"status":"succeeded","target":work.target,"transition_id":work.transition_id,"host_epoch":session.host_epoch,"session_id":session.id,"generation":session.generation});
+        if let Some(stream) = stream_id.and_then(|id| session.streams.get(id)) {
+            response["plan_revision"] = json!(
+                stream
+                    .candidate
+                    .as_ref()
+                    .map(|binding| binding.plan_revision)
+            );
+        }
         let deferred=work.states.values().any(|state|matches!(&state.response,Some(ProviderResponse::Cleanup{outcomes}) if outcomes.iter().any(|o|o.state==amaterasu_extension_api::CleanupState::DeferredRestoration)));
         match work.phase {
             LifecyclePhase::SessionPrepare => {

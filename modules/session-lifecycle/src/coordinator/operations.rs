@@ -307,8 +307,17 @@ impl Coordinator {
                         .streams
                         .get_mut(&stream_id)
                         .unwrap();
+                    let plan_revision = stream
+                        .candidate
+                        .as_ref()
+                        .map(|binding| binding.plan_revision);
+                    if let Some(expected) = payload.get("plan_revision")
+                        && plan_revision.is_some_and(|revision| *expected != json!(revision))
+                    {
+                        return Err("plan_revision_mismatch".into());
+                    }
                     if stream.phase == StreamPhase::Quiescing {
-                        response = json!({"status":"pending","target":target,"fenced":true});
+                        response = json!({"status":"pending","target":target,"fenced":true,"plan_revision":plan_revision});
                         wait_target = Some(target.clone());
                     } else {
                         if !matches!(
@@ -323,7 +332,7 @@ impl Coordinator {
                         current.reason = Some(ReleaseReason::Pause);
                         current.waiting_retirement = true;
                         self.fence_stream(&mut next, &target)?;
-                        response = json!({"status":"pending","target":target,"fenced":true,"transition_id":current.transition_id});
+                        response = json!({"status":"pending","target":target,"fenced":true,"transition_id":current.transition_id,"plan_revision":plan_revision});
                         work = Some(current);
                     }
                 }
