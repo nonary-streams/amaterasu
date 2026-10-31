@@ -20,10 +20,75 @@ pub(super) fn authenticated_input(
                     LifecyclePhase::StreamPrepare | LifecyclePhase::StreamRelease
                 )
         });
-    let work = works.next()?;
+    let live = works.next();
     if works.next().is_some() {
         return None;
     }
+    let mut historical = journal.finalize_results.records().filter(|record| {
+        record.request.target == request.target
+            && record.chain_work.as_ref().is_some_and(|work| {
+                work.target == request.target && work.transition_id == request.transition_id
+            })
+    });
+    let historical_record = historical.next();
+    if historical.next().is_some() {
+        return None;
+    }
+    let work = if let Some(work) = live {
+        Some(work)
+    } else if let Some(record) = historical_record {
+        let permit = journal
+            .authority
+            .finalize_permits
+            .get(&record.request.permit_id)?;
+        if !record.validate_structure()
+            || !record.validate_control_chain(journal)
+            || !permit.consumed
+            || !permit.settled
+            || permit.request != record.request
+            || permit.context.output != record.request.output
+            || permit.context.policy != record.selection.policy
+            || journal.composition.finalize_selection(
+                &record.selection.target,
+                &record.selection.transition_id,
+                &record.selection.policy.owner_provider,
+                &record.selection.input.output.output_id,
+            ) != Some(&record.selection)
+        {
+            return None;
+        }
+        record.chain_work.as_deref()
+    } else {
+        None
+    };
+    let Some(work) = work else {
+        // Legacy direct-root controls may outlive their completed Work. They
+        // can only refer to the coordinator's exact canonical root, and never
+        // bypass an existing staged output or select caller-provided data.
+        if journal.composition.staged_outputs().any(|stage| {
+            stage.target == request.target
+                && stage.after.producer == selection.input.output.producer
+                && stage.after.output_id == selection.input.output.output_id
+        }) || request.target != selection.target
+            || request.proposal.resource != selection.input.output.resource
+        {
+            return None;
+        }
+        let root = journal.composition.records().find(|record| {
+            record.output == selection.input.output
+                && record.admission_id == selection.input.admission_id
+                && record.transition_id == selection.input.transition_id
+                && record.plan == selection.input.plan
+                && record.callback_proof == selection.input.callback_proof
+        })?;
+        let admission = journal
+            .authority
+            .settled
+            .get(&root.admission_id)
+            .or_else(|| journal.authority.admissions.get(&root.admission_id))?;
+        return composition::validate_callback_provenance(root, admission)
+            .then(|| root.output.clone());
+    };
     let (epoch, session_id, Some(stream_id), generation) =
         operations::target_parts(&work.target).ok()?
     else {
