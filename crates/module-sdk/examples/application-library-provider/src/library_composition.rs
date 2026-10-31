@@ -17,6 +17,7 @@ use std::{cell::RefCell, ffi::c_void, rc::Rc};
 const LIBRARY: &str = "example.independent-library/2";
 const LAUNCH: &str = "amaterasu.launch";
 const SESSION: &str = "amaterasu.session/1";
+const APPLICATION: &str = "amaterasu.application/1";
 
 #[derive(Default)]
 struct Session {
@@ -31,6 +32,8 @@ struct Shared {
     lose_start_reply: bool,
     corrupt_target: bool,
     session: Session,
+    preparation: Option<(String, &'static str)>,
+    fail_preparation: bool,
 }
 struct Endpoint {
     name: &'static str,
@@ -282,17 +285,29 @@ impl Composition {
     }
 
     fn with_artifact(generated: bool, artifact: Option<&std::path::Path>) -> Self {
+        Self::with_preparation(generated, artifact, false, false)
+    }
+
+    fn with_preparation(
+        generated: bool,
+        artifact: Option<&std::path::Path>,
+        use_preparation: bool,
+        fail_preparation: bool,
+    ) -> Self {
         let mut config = RuntimeConfig::default();
         for principal in ["alice", "mallory"] {
             config.principals.insert(
                 principal.into(),
-                grants(&[v2::LAUNCH_SERVICE, LIBRARY, SESSION, SERVICE], &[]),
+                grants(
+                    &[v2::LAUNCH_SERVICE, LIBRARY, SESSION, SERVICE, APPLICATION],
+                    &[],
+                ),
             );
         }
         config.principals.insert(
             LAUNCH.into(),
             grants(
-                &[LIBRARY, SESSION, SERVICE],
+                &[LIBRARY, SESSION, SERVICE, APPLICATION],
                 &["amaterasu.launch/1", v2::LAUNCH_SERVICE],
             ),
         );
@@ -305,10 +320,22 @@ impl Composition {
         config
             .principals
             .insert("session".into(), grants(&[], &[SESSION]));
+        config
+            .principals
+            .insert("application".into(), grants(&[], &[APPLICATION]));
+        let policy = if use_preparation {
+            let command = json!({"executable":std::env::current_exe().unwrap()});
+            let settings =
+                json!({"revision":"entry-v7","preparation":[{"run":command,"undo":command}]});
+            json!({"opaque/library/game":settings,"generated:application":settings})
+        } else {
+            json!({})
+        };
         config.settings.insert(
             LAUNCH.into(),
             json!({"library_routes":{"games":{
-            "service":LIBRARY,"callers":["alice"],"executors":{"runner":SERVICE}}}}),
+            "service":LIBRARY,"callers":["alice"],"executors":{"runner":SERVICE},
+            "require_application_policy":use_preparation,"application_policies":policy}}}),
         );
         config.settings.insert(
             "provider".into(),
@@ -328,6 +355,15 @@ impl Composition {
             ),
             Response::Ok
         ));
+        assert!(matches!(
+            broker.dispatch(
+                "application",
+                Command::Register {
+                    service: APPLICATION.into()
+                }
+            ),
+            Response::Ok
+        ));
         let shared = Rc::new(RefCell::new(Shared {
             broker,
             requests: vec![],
@@ -335,6 +371,8 @@ impl Composition {
             lose_start_reply: false,
             corrupt_target: false,
             session: Session::default(),
+            preparation: None,
+            fail_preparation,
         }));
         let mut launch_endpoint = endpoint(LAUNCH, shared.clone());
         let mut library_endpoint = endpoint("library", shared.clone());
@@ -375,6 +413,46 @@ impl Composition {
         self.library.tick();
         self.provider.tick().unwrap();
         let mut shared = self.shared.borrow_mut();
+        if let Response::Request { id, payload, .. } =
+            shared.broker.dispatch("application", Command::Poll {})
+        {
+            let action = payload["action"].as_str().unwrap();
+            let operation = payload["operation_id"].as_str().unwrap().to_owned();
+            let state = match action {
+                "prepare" => {
+                    let state = if shared.fail_preparation {
+                        "preparation_failed"
+                    } else {
+                        "ready"
+                    };
+                    shared.preparation = Some((operation.clone(), state));
+                    state
+                }
+                "preparation_stop" => {
+                    let (_, state) = shared.preparation.as_mut().expect("owned preparation");
+                    *state = if *state == "preparation_failed" {
+                        "preparation_failed"
+                    } else {
+                        "complete"
+                    };
+                    *state
+                }
+                "preparation_status" => shared.preparation.as_ref().expect("owned preparation").1,
+                other => panic!("unexpected application action {other}"),
+            };
+            let reply = json!({"ok":true,"preparation":{"operation_id":operation,"state":state,
+                "preparation":{"completed":1},"cleanup":{"state":if state == "complete" {"complete"} else {"pending"}}}});
+            assert!(matches!(
+                shared.broker.dispatch(
+                    "application",
+                    Command::Complete {
+                        request: id,
+                        payload: reply
+                    }
+                ),
+                Response::Ok
+            ));
+        }
         let Response::Request { id, payload, .. } =
             shared.broker.dispatch("session", Command::Poll {})
         else {
@@ -528,6 +606,60 @@ fn two_library_implementations_browse_launch_retry_and_stop_without_catalog() {
 }
 
 #[test]
+fn selected_preparation_is_preserved_across_library_replacements_and_failure() {
+    for generated in [false, true] {
+        for fail_preparation in [false, true] {
+            let mut composition =
+                Composition::with_preparation(generated, None, true, fail_preparation);
+            let launch = composition.selection();
+            let result = composition.request("alice", v2::LAUNCH_SERVICE, launch);
+            if fail_preparation {
+                assert_eq!(result["launch"]["state"], "failed", "{result}");
+            } else {
+                assert_eq!(result["launch"]["state"], "active", "{result}");
+                let stopped = composition.request(
+                    "alice",
+                    v2::LAUNCH_SERVICE,
+                    json!({"action":"stop","launch_id":result["launch"]["launch_id"]}),
+                );
+                assert_eq!(stopped["launch"]["state"], "stopped", "{stopped}");
+            }
+            let state = composition.shared.borrow();
+            assert!(state.session.lease.is_none());
+            let actions: Vec<_> = state
+                .requests
+                .iter()
+                .map(|(service, payload, _)| {
+                    (service.as_str(), payload["action"].as_str().unwrap())
+                })
+                .collect();
+            let prepare = actions
+                .iter()
+                .position(|action| *action == (APPLICATION, "prepare"))
+                .unwrap();
+            let cleanup = actions
+                .iter()
+                .position(|action| *action == (APPLICATION, "preparation_stop"))
+                .unwrap();
+            assert!(prepare < cleanup);
+            let provider = actions
+                .iter()
+                .position(|action| *action == (SERVICE, "launch"));
+            if fail_preparation {
+                assert!(provider.is_none());
+            } else {
+                assert!(prepare < provider.unwrap());
+                let provider_stop = actions
+                    .iter()
+                    .position(|action| *action == (SERVICE, "recover_stop"))
+                    .unwrap();
+                assert!(provider_stop < cleanup);
+            }
+        }
+    }
+}
+
+#[test]
 fn unauthorized_stale_and_unapproved_handoffs_fail_before_execution() {
     for (caller, stale, corrupt) in [
         ("mallory", false, false),
@@ -580,7 +712,8 @@ fn lost_executor_acknowledgment_reconciles_and_retires_before_releasing_lease() 
 #[ignore = "requires AMATERASU_LIBRARY_V2_ARTIFACT pointing to the separately built fixture cdylib"]
 fn separately_built_library_artifact_browses_launches_and_stops() {
     let artifact = std::env::var_os("AMATERASU_LIBRARY_V2_ARTIFACT").expect("artifact path");
-    let mut composition = Composition::with_artifact(false, Some(std::path::Path::new(&artifact)));
+    let mut composition =
+        Composition::with_preparation(false, Some(std::path::Path::new(&artifact)), true, false);
     let launch = composition.selection();
     let started = composition.request("alice", v2::LAUNCH_SERVICE, launch);
     assert_eq!(started["launch"]["state"], "active", "{started}");
@@ -591,4 +724,18 @@ fn separately_built_library_artifact_browses_launches_and_stops() {
     );
     assert_eq!(stopped["launch"]["state"], "stopped", "{stopped}");
     assert!(composition.shared.borrow().session.lease.is_none());
+    let state = composition.shared.borrow();
+    assert!(
+        state
+            .requests
+            .iter()
+            .any(|(service, payload, _)| service == APPLICATION && payload["action"] == "prepare")
+    );
+    assert!(
+        state
+            .requests
+            .iter()
+            .any(|(service, payload, _)| service == APPLICATION
+                && payload["action"] == "preparation_stop")
+    );
 }

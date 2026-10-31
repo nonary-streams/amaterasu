@@ -577,7 +577,7 @@ fn default_command_timeout_ms() -> u64 {
     DEFAULT_COMMAND_TIMEOUT_MS
 }
 
-const MAX_EXIT_TIMEOUT_SECONDS: u64 = 300;
+pub(crate) const MAX_EXIT_TIMEOUT_SECONDS: u64 = 300;
 const MAX_DETACHED_COMMANDS: usize = 16;
 const MAX_DETACHED_COMMAND_BYTES: usize = 2048;
 
@@ -962,7 +962,7 @@ fn catalog_legacy_preparation(
     Ok(preparation)
 }
 
-fn merge_preparation_plan(
+pub(crate) fn merge_preparation_plan(
     global_preparation: &[PreparationStep],
     legacy_global_preparation: &[LegacyPreparationCommand],
     application_preparation: Vec<PlannedPreparationStep>,
@@ -2213,7 +2213,7 @@ pub fn valid_catalog_principal(value: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
-fn valid_native_path(value: &str) -> bool {
+pub(crate) fn valid_native_path(value: &str) -> bool {
     Path::new(value).is_absolute() && value.len() <= 1024 && !value.contains('\0')
 }
 fn valid_arguments(arguments: &[String]) -> bool {
@@ -2233,7 +2233,7 @@ fn valid_environment_binding(key: &str, value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
-fn valid_preparation(steps: &[PreparationStep]) -> bool {
+pub(crate) fn valid_preparation(steps: &[PreparationStep]) -> bool {
     steps.len() <= MAX_PREPARATION_STEPS
         && steps.iter().all(|step| {
             valid_configured_command(&step.run)

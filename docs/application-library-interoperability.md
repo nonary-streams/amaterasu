@@ -106,6 +106,42 @@ The consumer submits:
 {"action":"launch","operation_id":"consumer-owned-stable-operation","application":{"library":"games","id":"opaque-library-id"},"revision":"entry-v7"}
 ```
 
+Optional startup-owned preparation can be selected by the logical library and
+opaque application ID. For example, inside the `games` route above:
+
+```json
+{
+  "require_application_policy": true,
+  "application_policies": {
+    "opaque-library-id": {
+      "revision": "entry-v7",
+      "working_directory": "/srv/games/example",
+      "exit_timeout_seconds": 10,
+      "preparation": [
+        {
+          "run": {"executable": "/usr/local/bin/before-game"},
+          "undo": {"executable": "/usr/local/bin/after-game"}
+        }
+      ]
+    }
+  }
+}
+```
+
+These are trusted operator-supplied commands, not library response fields. The
+settings are validated at startup, bounded to 256 applications per route and
+eight structured preparation steps per application. If policy is present its
+revision must match the requested library entry; otherwise launch fails before
+session or preparation effects. `require_application_policy` also rejects an
+application without an explicit policy. Without this flag, an unlisted entry
+retains the original empty-plan behavior. An explicit empty plan is allowed.
+Preparation runs before the executor starts; confirmed provider retirement
+precedes preparation cleanup and session lease release. Failure or cancellation
+uses the existing application preparation lease and cleanup reconciliation. The
+policy has no raw or elevated command form, and settings cannot be changed live.
+This does not implement global preparation, client-specific preparation, a
+versioned policy resolver or NVHTTP preflight for `/2`.
+
 The logical library key is fixed in startup settings. Launch asks that library
 to resolve the exact ID/revision, validates the echoed identity, then maps the
 executor key through that library's fixed routes. Neither request nor response

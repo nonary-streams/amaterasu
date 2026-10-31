@@ -43,6 +43,7 @@ struct Harness {
     root_active: bool,
     cancel_after_spawn: bool,
     cancel_after_session: bool,
+    cancel_after_preparation: bool,
     fail_activate: bool,
     fail_terminate: bool,
     commands: Vec<(String, Value, Option<u64>)>,
@@ -119,6 +120,7 @@ impl Harness {
             root_active: true,
             cancel_after_spawn: false,
             cancel_after_session: false,
+            cancel_after_preparation: false,
             fail_activate: false,
             fail_terminate: false,
             commands: Vec::new(),
@@ -585,6 +587,10 @@ impl Harness {
                     assert!(self.released > 0, "lookup must follow release");
                 }
                 let result = match service.as_str() {
+                    "selected.library/2" => json!({"ok":true,"target":{
+                        "id":payload["id"],"revision":payload["revision"],
+                        "executor":"runner","application_id":"fixture-game"
+                    }}),
                     crate::workflow::CATALOG => {
                         assert_eq!(parent, Some(7));
                         assert!(matches!(
@@ -741,6 +747,7 @@ impl Harness {
                 };
                 if (action == "launch" && self.cancel_after_spawn)
                     || (action == "create" && self.cancel_after_session)
+                    || (action == "prepare" && self.cancel_after_preparation)
                 {
                     self.root_active = false;
                     self.reply = Some(Response::error("cancelled", "mutation response hidden"));
@@ -835,12 +842,22 @@ impl Harness {
         initiator: &str,
         payload: Value,
     ) -> Value {
+        self.request_service(pipeline, SERVICE, caller, initiator, payload)
+    }
+    fn request_service(
+        &mut self,
+        pipeline: &mut Pipeline,
+        service: &str,
+        caller: &str,
+        initiator: &str,
+        payload: Value,
+    ) -> Value {
         self.output = None;
         self.incoming = Some(Response::Request {
             id: 7,
             caller: caller.into(),
             initiator: initiator.into(),
-            service: SERVICE.into(),
+            service: service.into(),
             payload,
             remaining_ms: 30_000,
         });
@@ -5109,4 +5126,132 @@ fn generic_provider_invalid_stop_fence_retains_lease_and_allows_owner_retry() {
     );
     assert_eq!(stopped["launch"]["state"], "stopped", "{stopped}");
     assert!(harness.sessions[0].lease.is_none());
+}
+
+fn selected_library_pipeline() -> Pipeline {
+    let mut pipeline = pipeline();
+    let routes = serde_json::from_value(json!({
+        "games": {
+            "service":"selected.library/2",
+            "callers":["alice"],
+            "executors":{"runner":"example.provider/1"},
+            "require_application_policy":true,
+            "application_policies":{
+                "opaque/game": {
+                    "revision":"v1",
+                    "preparation":[{"run":{"executable":std::env::current_exe().unwrap()},
+                        "undo":{"executable":std::env::current_exe().unwrap()}}]
+                }
+            }
+        }
+    }))
+    .unwrap();
+    pipeline.set_library_routes(routes);
+    pipeline
+}
+
+fn selected_library_request(operation: &str) -> Value {
+    json!({"action":"launch","operation_id":operation,
+        "application":{"library":"games","id":"opaque/game"},"revision":"v1"})
+}
+
+#[test]
+fn selected_library_preparation_runs_before_start_and_stops_after_provider() {
+    let mut harness = Harness::new();
+    let mut pipeline = selected_library_pipeline();
+    let started = harness.request_service(
+        &mut pipeline,
+        "amaterasu.launch/2",
+        "alice",
+        "alice",
+        selected_library_request("prepared-library"),
+    );
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    let preparation = harness
+        .commands
+        .iter()
+        .position(|(service, payload, _)| {
+            service == crate::workflow::APPLICATION && payload["action"] == "prepare"
+        })
+        .unwrap();
+    let provider = harness
+        .commands
+        .iter()
+        .position(|(service, payload, _)| {
+            service == "example.provider/1" && payload["action"] == "launch"
+        })
+        .unwrap();
+    assert!(preparation < provider);
+    assert_eq!(harness.preparations[0].plan.as_array().unwrap().len(), 1);
+    let stopped = harness.request(
+        &mut pipeline,
+        "alice",
+        json!({"action":"stop","launch_id":started["launch"]["launch_id"]}),
+    );
+    assert_eq!(stopped["launch"]["state"], "stopped", "{stopped}");
+    let provider_stop = harness
+        .commands
+        .iter()
+        .position(|(service, payload, _)| {
+            service == "example.provider/1" && payload["action"] == "recover_stop"
+        })
+        .unwrap();
+    let preparation_stop = harness
+        .commands
+        .iter()
+        .position(|(service, payload, _)| {
+            service == crate::workflow::APPLICATION && payload["action"] == "preparation_stop"
+        })
+        .unwrap();
+    assert!(provider_stop < preparation_stop);
+    assert_eq!(harness.preparations[0].state, "complete");
+}
+
+#[test]
+fn selected_library_failed_preparation_is_cleaned_before_provider_start() {
+    let mut harness = Harness::new();
+    harness.fail_global_preparation = true;
+    let mut pipeline = selected_library_pipeline();
+    let response = harness.request_service(
+        &mut pipeline,
+        "amaterasu.launch/2",
+        "alice",
+        "alice",
+        selected_library_request("failed-library"),
+    );
+    assert_eq!(response["launch"]["state"], "failed", "{response}");
+    assert!(!harness.generic_started);
+    assert!(harness.commands.iter().any(|(service, payload, _)| service
+        == crate::workflow::APPLICATION
+        && payload["action"] == "preparation_stop"));
+    assert!(
+        harness
+            .sessions
+            .iter()
+            .all(|session| session.lease.is_none())
+    );
+}
+
+#[test]
+fn selected_library_cancel_after_preparation_retires_lease() {
+    let mut harness = Harness::new();
+    harness.cancel_after_preparation = true;
+    let mut pipeline = selected_library_pipeline();
+    let _ = harness.request_service(
+        &mut pipeline,
+        "amaterasu.launch/2",
+        "alice",
+        "alice",
+        selected_library_request("cancel-library"),
+    );
+    assert!(!harness.generic_started);
+    assert!(harness.commands.iter().any(|(service, payload, _)| service
+        == crate::workflow::APPLICATION
+        && payload["action"] == "preparation_stop"));
+    assert!(
+        harness
+            .sessions
+            .iter()
+            .all(|session| session.lease.is_none())
+    );
 }
