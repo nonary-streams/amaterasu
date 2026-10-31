@@ -628,6 +628,13 @@ fn permission_api_reads_current_committed_certificate_policy() {
         STATUS_OK
     );
     let api = unsafe { &*output.cast::<IdentityApiV1_1>() };
+    // These are the runtime's table compatibility checks, not merely the
+    // factory's own query validation. Version 1.0 remains a valid prefix.
+    let header = api.v1_0.base.header;
+    assert_eq!(header.major, query.interface_major);
+    assert!(header.minor >= query.min_minor);
+    assert!(header.size >= query.min_size);
+    assert!(header.size as usize >= size_of::<IdentityApi>());
     let context = api.v1_0.base.context;
     let client = crypto_certificate_der(CLIENT_CERT);
     let check = |permission| unsafe {

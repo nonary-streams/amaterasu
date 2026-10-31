@@ -78,7 +78,10 @@ unsafe extern "C" fn bind(
             api: IdentityApiV1_1 {
                 v1_0: IdentityApi {
                     base: NativeInterface {
-                        header: AbiHeader::of::<IdentityApiV1_1>(),
+                        header: AbiHeader {
+                            minor: INTERFACE_MINOR_PERMISSIONS,
+                            ..AbiHeader::of::<IdentityApiV1_1>()
+                        },
                         context: std::ptr::null_mut(),
                         release: Some(release),
                     },
