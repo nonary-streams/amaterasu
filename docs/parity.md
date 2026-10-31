@@ -28,13 +28,34 @@ HTTP regression verifies durable updates,
 conflict handling, live Moonlight server-info naming (including the PC-name
 fallback), listener rebinding, Steam discovery gating, and settings after
 restart. Legacy host-name consumers, exact validation, RTSP/UDP port
-propagation, and Steam catalog sync, artwork, and launch behavior still need
+propagation, and full provider behavior and platform qualification still need
 parity work. The inventory statuses stay pending accordingly.
 The application catalog accepts Vibeshine's `working-dir` spelling and applies
 its directory precedence to launch, preparation and undo commands. Its
 `auto-detach` policy retains a quick successful launcher for explicit cleanup.
 Those IDs remain pending because Vibeshine also accepts shell/PATH command
 forms and further process-group behavior that Amaterasu does not represent.
+
+The unified library now fronts client-facing catalog reads and artwork, while
+the launch coordinator retains application ownership and retirement proofs.
+Steam, Lutris, and Playnite request staged provider snapshots; a complete scan
+reconciles provider-owned rows and publishes through a revision-checked State
+draft. Manual edits and existing catalog IDs are preserved by the catalog's
+ownership checks. Artwork is served in bounded, revision-checked transfers,
+and provider-specific and generic launch paths have explicit identity and
+lifecycle contracts. Native providers are trusted code; API grants are not a
+sandbox. Discovery and generic launch support do not establish game liveness or
+termination on every provider.
+
+Drafts are bounded to 1,024 chunks, 100,000 edits and 16 MiB of encoded chunk
+data, in addition to per-chunk and catalog limits; some maximum-size catalogs
+cannot fit one publication. Oversized snapshots fail without partial
+publication. Linux and Windows execution, installed packages, provider artwork,
+and live Moonlight library, artwork and gameplay behavior still need target
+qualification. Client permission enforcement is configurable and remains
+distinct from module call grants. Development packaging can select a separately
+approved library as part of a signed complete component set at the next worker
+start; it is not a live swap or a production trust/update system.
 
 The pinned [route declaration inventory](reference-routes.json) and
 [Windows regression gates](windows-regression-gates.md) make part of that audit
@@ -56,7 +77,7 @@ feature parity with a deployed streaming host. **Pending** means not implemented
 | Package integrity and local activation | Implemented foundation | Online update manager, production root trust, key rotation/revocation and catalog |
 | Unsigned module mode | Development-only | Administrator-only installed toggle, restart enforcement and visible frontend status |
 | Historical component selection | Implemented local mechanism | Authenticated historical catalog, dependency ranges and compatible data snapshots |
-| Authentication and permissions | Implemented credentials, session/token revocation and route scopes | Production recovery/provisioning, remote TLS, session refresh and multi-user policy |
+| Authentication and permissions | Credentials, route scopes and optional certificate-bound client permission enforcement implemented | Production recovery/provisioning, remote TLS, session refresh, multi-user policy and live client revocation qualification |
 | Pairing and host identity | Implemented Gen7 HTTP/TLS pairing, durable identity and native TLS signing | Existing clients pair; imported host identity/pairings remain usable |
 | Moonlight-compatible streaming | Mac Moonlight paired and briefly displayed the KDE desktop; the live session froze after a few seconds | Sustained video and audio, input, reconnect/resume, broader negotiation and real client qualification |
 | Media UDP transport | Implemented separate native provider, audio/video FEC, media encryption and ticket-token destination discovery | Session scheduling, pacing, control feedback, network qualification and client playback |
@@ -75,8 +96,9 @@ feature parity with a deployed streaming host. **Pending** means not implemented
 | Keyboard/mouse | Implemented authenticated session dispatch, captured-monitor coordinate validation, expiring input leases, Windows SendInput and Linux uinput backends; hardware unqualified | Native multi-monitor/mixed-DPI qualification, layout-change continuity, layouts/text, desktop ownership and crash-surviving release cleanup |
 | Controller input | Default-off Linux uinput gamepad path with digest-bound host grant and per-session cleanup; no live grant or device qualification | Independent security review, explicit activation approval, client input tests, feedback and additional controller profiles |
 | Application lifecycle | Implemented process containment, catalog/session launch, ordered preparation, reverse undo and retained cleanup failures | Windows/Linux runtime qualification, Windows graceful quit, launcher handoff, resume, durable restart reconciliation and crash-surviving cleanup watchers |
-| Library/catalog | Implemented scalable manual catalog and authorized name/ID export; 10k durable entries tested | Artwork, provider reconciliation, legacy aliases and per-app overrides |
-| Steam/Playnite/Lutris | Implemented explicit-root Steam discovery | Session-user discovery, sync/reconciliation, artwork, launch behavior, Playnite/Lutris providers and cleanup |
+| Library/catalog | Unified client facade, catalog-backed artwork, generic provider launch identity and atomic staged reconciliation implemented; draft limits apply | Live Moonlight and target-platform qualification, full provider lifecycle and catalog-size limits, legacy aliases and remaining per-app parity |
+| Steam/Playnite/Lutris | Provider discovery, staged catalog reconciliation, artwork and launch paths implemented | Windows interactive/SYSTEM and Linux native/Flatpak runtime qualification, real games, artwork and cleanup behavior, and remaining reference parity |
+| Library replacement | Signed development complete-set selection for an approved component at worker start; fixture is not a complete replacement | Installed production trust and updates, replacement artwork and gameplay, lifecycle/rollback and platform qualification |
 | Activity detection | Pending | Foreground/fullscreen/overlay handling without alt-tab capture stalls |
 | Performance integrations | Pending | RTSS, NVIDIA settings, Smooth Motion, Lossless Scaling and Linux providers |
 | Management API/adapters | Implemented explicit versioned loopback routes | Remote HTTPS, complete domain routes, selected legacy compatibility and workload qualification |
@@ -100,6 +122,20 @@ The current unit tests cover abstract ownership and state behavior; they do not
 claim those hardware-specific regressions are fixed in this new project.
 
 ## Current verification evidence
+
+### Unified library development candidate (2026-10-31)
+
+An isolated [signed paired replacement test](../scripts/test_signed_application_library_replacement.py)
+on production source `150744d0`, with fixture changes `7783e2c1` and
+`9b4578c9` and test changes `261bb231`, `59a41996` and `d60a842a`, served a
+catalog entry through mutual-TLS `/applist`. Production commit `7ccc0d56`
+postdates that test. This is evidence for that development component-set path,
+not for replacement artwork, gameplay, installation, or a live Moonlight
+client. Catalog and State tests exercise
+staged publication, retry and concurrent-edit behavior; they do not establish
+power-cut recovery or native provider runtime qualification. See the
+[provider configuration](application-library-provider-configuration.md) and
+[State draft limits](../modules/state/README.md#durable-collection-drafts).
 
 ### Linux desktop-stream candidate (2026-10-24)
 
