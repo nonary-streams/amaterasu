@@ -179,7 +179,17 @@ impl Coordinator {
                     || state.request.transition_id != work.transition_id
                     || selection.target != work.target
                     || selection.transition_id != work.transition_id
-                    || state.request.dependency_inputs != vec![selection.current_output().clone()]
+                    || if state.request.control_results.is_empty() {
+                        state.request.dependency_inputs != vec![selection.current_output().clone()]
+                    } else {
+                        !super::composition_finalize::resolve_control_chain(
+                            journal, work, selection,
+                        )
+                        .is_ok_and(|(output, controls)| {
+                            state.request.dependency_inputs == vec![output]
+                                && state.request.control_results == controls
+                        })
+                    }
                     || state.request.settings_revision != state.participant.settings_revision
                     || serde_json::to_value(&state.request.settings).ok().as_ref()
                         != Some(&state.participant.settings)
