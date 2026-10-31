@@ -16,6 +16,8 @@ mod composition_control;
 #[allow(dead_code)] // Composed finalization is still gated.
 mod composition_finalize;
 mod composition_prepare;
+#[allow(dead_code)] // Release remains gated until provider and proof hooks are wired.
+mod composition_release;
 mod composition_progress;
 mod control_backend;
 #[allow(dead_code)] // Control dispatch remains gated until coordinator sequencing is wired.
