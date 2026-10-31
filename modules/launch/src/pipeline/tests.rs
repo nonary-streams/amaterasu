@@ -4848,9 +4848,19 @@ fn retirement_tombstones_completed_preflight_before_delayed_launch() {
 fn resumed_limiter_attestation_binds_only_validated_cadence_to_one_rtsp_operation() {
     let mut harness = Harness::new();
     let mut pipeline = pipeline();
-    let operation = "resume-policy-owner";
+    let epoch = harness.request(
+        &mut pipeline,
+        "amaterasu.nvhttp",
+        json!({"action":"operation_epoch"}),
+    )["operation_epoch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let operation = format!(
+        "ale1:{epoch}:nvhttp-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-0000000000000001-application"
+    );
     let preflight = harness.request(&mut pipeline, "amaterasu.nvhttp", json!({"action":"preflight_export","operation_id":operation,"app_id":"app-0000000000000001"}));
-    let mut start = launch_export(operation);
+    let mut start = launch_export(&operation);
     start["preflight_token"] = preflight["preflight_token"].clone();
     start["frame_limiter_settings"] = frame_limiter_snapshot();
     start["client_frame_limiter_overrides"] = json!({});
@@ -4858,7 +4868,7 @@ fn resumed_limiter_attestation_binds_only_validated_cadence_to_one_rtsp_operatio
     assert_eq!(started["launch"]["state"], "active", "{started}");
     let mut snapshot = frame_limiter_snapshot();
     snapshot["requested_stream_fps_millihz"] = json!(120000);
-    let authorize = json!({"action":"authorize_stream_snapshot","launch_id":1,"application_operation_id":operation,"rtsp_operation_id":"rtsp-resume-1","frame_limiter_settings":snapshot});
+    let authorize = json!({"action":"authorize_stream_snapshot","launch_id":1,"application_operation_id":operation,"rtsp_operation_id":"nvhttp-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-0000000000000002-rtsp","frame_limiter_settings":snapshot});
     assert_eq!(
         harness.request(&mut pipeline, "mallory", authorize.clone())["code"],
         "stream_snapshot_denied"
@@ -4877,7 +4887,7 @@ fn resumed_limiter_attestation_binds_only_validated_cadence_to_one_rtsp_operatio
         harness.request(&mut pipeline, "amaterasu.nvhttp", altered)["code"],
         "stream_snapshot_denied"
     );
-    let mut verify = json!({"action":"verify_frame_limiter_snapshot","application_operation_id":operation,"rtsp_operation_id":"rtsp-resume-1","app_id":"app-0000000000000001","catalog_revision":1,"frame_limiter_settings":snapshot,"frame_limiter_executable_path":preflight["executable_path"]});
+    let mut verify = json!({"action":"verify_frame_limiter_snapshot","application_operation_id":operation,"rtsp_operation_id":"nvhttp-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-0000000000000002-rtsp","app_id":"app-0000000000000001","catalog_revision":1,"frame_limiter_settings":snapshot,"frame_limiter_executable_path":preflight["executable_path"]});
     assert_eq!(
         harness.request(&mut pipeline, "amaterasu.rtsp", verify.clone())["ok"],
         true
@@ -4893,6 +4903,31 @@ fn resumed_limiter_attestation_binds_only_validated_cadence_to_one_rtsp_operatio
             .as_ref()
             .unwrap()["requested_stream_fps_millihz"],
         60000
+    );
+    for sequence in 3..=25_u64 {
+        let mut next = authorize.clone();
+        next["rtsp_operation_id"] = json!(format!(
+            "nvhttp-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-{sequence:016x}-rtsp"
+        ));
+        assert_eq!(
+            harness.request(&mut pipeline, "amaterasu.nvhttp", next)["ok"],
+            true
+        );
+    }
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.nvhttp", authorize.clone())["code"],
+        "stream_snapshot_denied"
+    );
+    let old_verify = json!({"action":"verify_frame_limiter_snapshot","application_operation_id":operation,"rtsp_operation_id":"nvhttp-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-0000000000000002-rtsp","app_id":"app-0000000000000001","catalog_revision":1,"frame_limiter_settings":snapshot,"frame_limiter_executable_path":preflight["executable_path"]});
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.rtsp", old_verify.clone())["code"],
+        "frame_limiter_snapshot_denied"
+    );
+    let mut old_original = old_verify;
+    old_original["frame_limiter_settings"] = frame_limiter_snapshot();
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.rtsp", old_original)["code"],
+        "frame_limiter_snapshot_denied"
     );
     assert_eq!(
         harness.request(
@@ -4912,11 +4947,12 @@ fn resumed_limiter_attestation_binds_only_validated_cadence_to_one_rtsp_operatio
 fn resumed_limiter_lossless_target_only_tracks_fps_when_not_explicit() {
     let mut harness = Harness::new();
     let mut pipeline = pipeline();
-    let preflight = harness.request(&mut pipeline, "amaterasu.nvhttp", json!({"action":"preflight_export","operation_id":"lossless-resume","app_id":"app-0000000000000001"}));
+    let preflight = harness.request(&mut pipeline, "amaterasu.nvhttp", json!({"action":"preflight_export","operation_id":"nvhttp-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-0000000000000001-application","app_id":"app-0000000000000001"}));
     let mut original = frame_limiter_snapshot();
     original["game_frame_generation_mode"] = json!("lossless-scaling");
     original["lossless_scaling_limit_millihz"] = json!(60000);
-    let mut start = launch_export("lossless-resume");
+    let mut start =
+        launch_export("nvhttp-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-0000000000000001-application");
     start["preflight_token"] = preflight["preflight_token"].clone();
     start["frame_limiter_settings"] = original.clone();
     start["client_frame_limiter_overrides"] = json!({});
@@ -4926,7 +4962,7 @@ fn resumed_limiter_lossless_target_only_tracks_fps_when_not_explicit() {
     );
     let mut resumed = original;
     resumed["requested_stream_fps_millihz"] = json!(120000);
-    let mut authorize = json!({"action":"authorize_stream_snapshot","launch_id":1,"application_operation_id":"lossless-resume","rtsp_operation_id":"rtsp-lossless","frame_limiter_settings":resumed});
+    let mut authorize = json!({"action":"authorize_stream_snapshot","launch_id":1,"application_operation_id":"nvhttp-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-0000000000000001-application","rtsp_operation_id":"nvhttp-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-0000000000000002-rtsp","frame_limiter_settings":resumed});
     assert_eq!(
         harness.request(&mut pipeline, "amaterasu.nvhttp", authorize.clone())["code"],
         "stream_snapshot_denied"

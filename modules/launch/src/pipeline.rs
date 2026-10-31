@@ -2,7 +2,7 @@ use crate::{
     SERVICE,
     protocol::*,
     records::{
-        CatalogSelection, DisplayAdmission, GlobalPreparation, Records,
+        CatalogSelection, DisplayAdmission, GlobalPreparation, Records, StreamLimiterSnapshot,
         random_display_admission_token,
     },
     responses,
@@ -377,6 +377,38 @@ fn valid_resumed_stream_snapshot(
         original.get("lossless_scaling_limit_millihz")
     };
     candidate.get("lossless_scaling_limit_millihz") == expected_lossless
+}
+
+/// RTSP identities are minted by NVHTTP's monotonically increasing record
+/// counter, under the same random process nonce as the application identity.
+fn stream_sequence(application_operation: &str, rtsp_operation: &str) -> Option<u64> {
+    fn parse<'a>(value: &'a str, purpose: &str) -> Option<(&'a str, u64)> {
+        let mut pieces = value.split('-');
+        if pieces.next()? != "nvhttp" {
+            return None;
+        }
+        let nonce = pieces.next()?;
+        let sequence = pieces.next()?;
+        if nonce.len() != 32
+            || sequence.len() != 16
+            || !nonce
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || !sequence
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || pieces.next()? != purpose
+            || pieces.next().is_some()
+        {
+            return None;
+        }
+        Some((nonce, u64::from_str_radix(sequence, 16).ok()?))
+    }
+    let application = application_operation.rsplit(':').next()?;
+    let (application_nonce, application_sequence) = parse(application, "application")?;
+    let (stream_nonce, stream_sequence) = parse(rtsp_operation, "rtsp")?;
+    (application_nonce == stream_nonce && stream_sequence > application_sequence)
+        .then_some(stream_sequence)
 }
 pub struct Pipeline {
     records: Records,
@@ -1133,12 +1165,16 @@ impl Pipeline {
                             && record.operation_id == application_operation_id
                             && record.app_id == app_id
                             && record.catalog_revision == Some(catalog_revision)
-                            && (record.frame_limiter_settings.as_ref()
-                                == Some(&frame_limiter_settings)
-                                || rtsp_operation_id
-                                    .as_ref()
-                                    .and_then(|id| record.stream_limiter_snapshots.get(id))
-                                    == Some(&frame_limiter_settings))
+                            && match (&rtsp_operation_id, &record.stream_limiter_snapshot) {
+                                (Some(id), Some(active)) => {
+                                    active.rtsp_operation_id == *id
+                                        && active.settings == frame_limiter_settings
+                                }
+                                (_, None) | (None, Some(_)) => {
+                                    record.frame_limiter_settings.as_ref()
+                                        == Some(&frame_limiter_settings)
+                                }
+                            }
                             && record.executable_path.as_deref()
                                 == Some(frame_limiter_executable_path.as_str())
                     });
@@ -1168,18 +1204,23 @@ impl Pipeline {
                 let Ok(record) = self.records.owned(caller, launch_id) else {
                     return complete(send, request, error("stream_snapshot_denied"));
                 };
+                let Some(sequence) = stream_sequence(&application_operation_id, &rtsp_operation_id)
+                else {
+                    return complete(send, request, error("stream_snapshot_denied"));
+                };
                 if caller != "amaterasu.nvhttp"
                     || record.state != State::Active
                     || record.operation_id != application_operation_id
                     || !valid_resumed_stream_snapshot(record, &frame_limiter_settings)
                     || record
-                        .stream_limiter_snapshots
-                        .get(&rtsp_operation_id)
-                        .is_some_and(|existing| existing != &frame_limiter_settings)
-                    || (!record
-                        .stream_limiter_snapshots
-                        .contains_key(&rtsp_operation_id)
-                        && record.stream_limiter_snapshots.len() >= 16)
+                        .stream_limiter_snapshot
+                        .as_ref()
+                        .is_some_and(|active| {
+                            sequence < active.sequence
+                                || (sequence == active.sequence
+                                    && (active.rtsp_operation_id != rtsp_operation_id
+                                        || active.settings != frame_limiter_settings))
+                        })
                 {
                     return complete(send, request, error("stream_snapshot_denied"));
                 }
@@ -1188,9 +1229,11 @@ impl Pipeline {
                     .values
                     .get_mut(&launch_id)
                     .expect("verified owned record");
-                record
-                    .stream_limiter_snapshots
-                    .insert(rtsp_operation_id.clone(), frame_limiter_settings.clone());
+                record.stream_limiter_snapshot = Some(StreamLimiterSnapshot {
+                    rtsp_operation_id: rtsp_operation_id.clone(),
+                    sequence,
+                    settings: frame_limiter_settings.clone(),
+                });
                 complete(
                     send,
                     request,

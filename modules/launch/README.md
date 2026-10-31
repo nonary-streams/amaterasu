@@ -189,7 +189,9 @@ array defaults to empty.
 An active exported launch owner can authorize a distinct frame-limiter snapshot
 for a new RTSP operation with `authorize_stream_snapshot`. The operation ID is
 bound to that snapshot, exact retries are allowed, and conflicting reuse is
-rejected. Without a fresh authoritative global-settings read, only the requested
+rejected. The latest admitted resume supersedes older resume snapshots using
+NVHTTP's monotonic operation sequence; stale IDs cannot be reauthorized or
+verified. Without a fresh authoritative global-settings read, only the requested
 stream FPS, client display refresh, and implied Lossless Scaling target may
 change; other limiter settings must match the immutable launch snapshot. RTSP
 must supply the same operation ID when verifying an authorized resume snapshot.

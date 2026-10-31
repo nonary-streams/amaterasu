@@ -75,7 +75,7 @@ pub struct Record {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame_limiter_settings: Option<BTreeMap<String, Value>>,
     #[serde(skip)]
-    pub stream_limiter_snapshots: BTreeMap<String, BTreeMap<String, Value>>,
+    pub stream_limiter_snapshot: Option<StreamLimiterSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_frame_limiter_overrides: Option<BTreeMap<String, Value>>,
     pub application_display_overrides: BTreeMap<String, Value>,
@@ -124,6 +124,12 @@ pub struct DisplayAdmission {
     pub rtsp_operation_id: String,
     pub request_sha256: String,
     pub snapshot: Value,
+}
+
+pub struct StreamLimiterSnapshot {
+    pub rtsp_operation_id: String,
+    pub sequence: u64,
+    pub settings: BTreeMap<String, Value>,
 }
 
 pub fn random_display_admission_token() -> Result<String, &'static str> {
@@ -281,7 +287,7 @@ impl Records {
                 application_display_settings: None,
                 executable_path: None,
                 frame_limiter_settings: None,
-                stream_limiter_snapshots: BTreeMap::new(),
+                stream_limiter_snapshot: None,
                 client_frame_limiter_overrides: None,
                 application_display_overrides: BTreeMap::new(),
                 display_admission: None,
