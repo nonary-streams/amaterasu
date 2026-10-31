@@ -531,7 +531,15 @@ impl EndedSessionCertificate {
             return false;
         }
         let obligations = &self.owner_release.admission.plan.obligations;
-        if request.dependency_inputs != [self.root.output.clone()]
+        if request.dependency_inputs.len() != 1
+            || !self.children.as_ref().map_or(
+                request.dependency_inputs.first() == Some(&self.root.output),
+                |children| {
+                    request.dependency_inputs.first().is_some_and(|input| {
+                        children.release_input_matches(&self.root, self.resource_generation, input)
+                    })
+                },
+            )
             || !request.control_results.is_empty()
             || request.resource_generation != Some(self.resource_generation)
             || outcomes.len() != obligations.len()

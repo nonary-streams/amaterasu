@@ -22,7 +22,7 @@ pub(super) struct ClosedStreamBook {
 
 /// Compact owner-query commitments extracted from authenticated child history.
 /// This snapshot alone does not prove that other books have no inbound pins.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SessionChildrenSnapshot {
     scopes: BTreeSet<String>,
@@ -33,9 +33,94 @@ pub(super) struct SessionChildrenSnapshot {
     control_policies: BTreeSet<String>,
     finalize_policies: BTreeSet<String>,
     schema_documents: BTreeSet<String>,
+    #[serde(default)]
+    latest_release: Option<LatestReleaseWitness>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LatestReleaseWitness {
+    target: LifecycleTarget,
+    admission_id: String,
+    output: amaterasu_extension_api::ResourceOutput,
+    release_commitment: String,
+    linkage: String,
 }
 
 impl SessionChildrenSnapshot {
+    #[cfg(test)]
+    pub(super) fn test_set_latest_release(
+        &mut self,
+        root: &composition::StoredOutput,
+        target: LifecycleTarget,
+        generation: u64,
+    ) -> amaterasu_extension_api::ResourceOutput {
+        let mut output = root.output.clone();
+        output.resource.revision += 1;
+        let admission_id = "child-release".to_string();
+        let release_commitment = "f".repeat(64);
+        let linkage = commitment(&(
+            "ended-session-latest-release-v1",
+            &target,
+            &admission_id,
+            &output,
+            &root.admission_id,
+            &root.output,
+            generation,
+            &release_commitment,
+        ))
+        .unwrap();
+        self.latest_release = Some(LatestReleaseWitness {
+            target,
+            admission_id,
+            output: output.clone(),
+            release_commitment,
+            linkage,
+        });
+        output
+    }
+    pub(super) fn release_input_matches(
+        &self,
+        root: &composition::StoredOutput,
+        generation: u64,
+        input: &amaterasu_extension_api::ResourceOutput,
+    ) -> bool {
+        let Some(witness) = &self.latest_release else {
+            return input == &root.output;
+        };
+        operations::target_parts(&root.output.origin)
+            .ok()
+            .zip(operations::target_parts(&witness.target).ok())
+            .is_some_and(
+                |(
+                    (epoch, id, parent_stream, _),
+                    (child_epoch, child_id, child_stream, child_generation),
+                )| {
+                    epoch == child_epoch
+                        && id == child_id
+                        && parent_stream.is_none()
+                        && child_stream.is_some()
+                        && child_generation > 0
+                },
+            )
+            && self.contains_scope(&witness.target)
+            && valid_id(&witness.admission_id)
+            && valid_digest(&witness.release_commitment)
+            && witness.output == *input
+            && amaterasu_extension_api::validate_output_refinement(&root.output, input).is_ok()
+            && commitment(&(
+                "ended-session-latest-release-v1",
+                &witness.target,
+                &witness.admission_id,
+                &witness.output,
+                &root.admission_id,
+                &root.output,
+                generation,
+                &witness.release_commitment,
+            ))
+            .as_deref()
+                == Some(&witness.linkage)
+    }
     pub(super) fn len(&self) -> usize {
         self.scopes.len()
     }
@@ -768,7 +853,7 @@ impl ClosedStreamBook {
         {
             return None;
         }
-        let snapshot = self.session_children_raw(target)?;
+        let mut snapshot = self.session_children_raw(target)?;
         if session.streams.iter().any(|(stream_id, stream)| {
             let child = LifecycleTarget::Stream {
                 host_epoch: epoch.into(),
@@ -780,6 +865,33 @@ impl ClosedStreamBook {
                 || scope_digest(&child).is_none_or(|key| !snapshot.scopes.contains(&key))
         }) {
             return None;
+        }
+        if let Some(anchor) = journal.composition.stage_anchor(&root.output) {
+            let record = self.unique_record(journal, &anchor.target)?;
+            if !self.validates_anchor(journal, anchor)
+                || journal.verified_released_output(&anchor.target)
+                    != Some((anchor.release_admission.as_str(), &anchor.released))
+                || session_release::session_release_input(journal, root).ok()? != anchor.released
+            {
+                return None;
+            }
+            let linkage = commitment(&(
+                "ended-session-latest-release-v1",
+                &anchor.target,
+                &anchor.release_admission,
+                &anchor.released,
+                &root.admission_id,
+                &root.output,
+                resource_generation,
+                &record.release_commitment,
+            ))?;
+            snapshot.latest_release = Some(LatestReleaseWitness {
+                target: anchor.target.clone(),
+                admission_id: anchor.release_admission.clone(),
+                output: anchor.released.clone(),
+                release_commitment: record.release_commitment.clone(),
+                linkage,
+            });
         }
         Some(snapshot)
     }
@@ -802,6 +914,7 @@ impl ClosedStreamBook {
             control_policies: BTreeSet::new(),
             finalize_policies: BTreeSet::new(),
             schema_documents: BTreeSet::new(),
+            latest_release: None,
         };
         let mut capture = |child: &LifecycleTarget,
                            parent_generation: u64,

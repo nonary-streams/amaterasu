@@ -2348,6 +2348,31 @@ pub(in crate::coordinator) mod tests {
             )
             .unwrap();
         assert!(actual_child_cert == child_cert);
+        let mut rolling = child_cert.clone();
+        let latest = rolling.children.as_mut().unwrap().test_set_latest_release(
+            &rolling.root,
+            stream.clone(),
+            rolling.resource_generation,
+        );
+        rolling.owner_release.callback.request.dependency_inputs = vec![latest.clone()];
+        rolling.owner_release.callback.terminal.call.arguments =
+            serde_json::to_value(&rolling.owner_release.callback.request).unwrap();
+        assert!(rolling.validate());
+        let mut stale = rolling.clone();
+        stale.owner_release.callback.request.dependency_inputs = vec![stale.root.output.clone()];
+        stale.owner_release.callback.terminal.call.arguments =
+            serde_json::to_value(&stale.owner_release.callback.request).unwrap();
+        assert!(!stale.validate());
+        let mut forged = serde_json::to_value(&rolling).unwrap();
+        forged["children"]["latest_release"]["admission_id"] = json!("other-release");
+        let forged: super::session_closed_history::EndedSessionCertificate =
+            serde_json::from_value(forged).unwrap();
+        assert!(!forged.validate());
+        let mut forged = serde_json::to_value(&rolling).unwrap();
+        forged["children"]["latest_release"]["output"]["resource"]["revision"] = json!(999);
+        let forged: super::session_closed_history::EndedSessionCertificate =
+            serde_json::from_value(forged).unwrap();
+        assert!(!forged.validate());
         let mut transferred = source_with_child.clone();
         super::session_closure::retire_ended_session(&mut transferred, &work.target).unwrap();
         assert!(!transferred.closed_streams.contains_target(&stream));
