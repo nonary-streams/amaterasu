@@ -297,7 +297,11 @@ fn production_linux_manager_routes_fenced_requests_to_fake_worker_via_broker() {
                 operation_id: "unknown".into()
             }
         ),
-        Reply::Unavailable
+        Reply::Effect {
+            state: EffectState::Unknown,
+            topology: None,
+            observation: display::ModeObservation::NotObserved
+        }
     );
     assert_eq!(
         exchange(
@@ -305,7 +309,9 @@ fn production_linux_manager_routes_fenced_requests_to_fake_worker_via_broker() {
             &mut adapter,
             &bob,
             "foreign",
-            Request::Inspect { owner: first }
+            Request::Inspect {
+                owner: first.clone()
+            }
         ),
         Reply::NotOwned
     );
@@ -323,6 +329,165 @@ fn production_linux_manager_routes_fenced_requests_to_fake_worker_via_broker() {
         ),
         Reply::StaleTopology { .. }
     ));
+    let Reply::Capabilities { capabilities } = exchange(
+        &mut manager,
+        &mut adapter,
+        &alice,
+        "before-remove",
+        Request::Capabilities,
+    ) else {
+        panic!("missing capabilities")
+    };
+    let removal_topology = capabilities.topology.unwrap();
+    let removal = Request::Remove {
+        owner: first.clone(),
+        operation_id: "remove-first".into(),
+        expected: removal_topology.clone(),
+    };
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "remove-first",
+            removal.clone()
+        ),
+        Reply::Effect {
+            state: EffectState::Pending,
+            ..
+        }
+    ));
+    assert_eq!(
+        observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "remove"
+    );
+    assert_eq!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "release-pending",
+            Request::ReleaseOperation {
+                owner: first.clone(),
+                operation_id: "remove-first".into()
+            }
+        ),
+        Reply::OperationNotSettled
+    );
+    events
+        .send(Event::Removed {
+            key: ("alice".into(), first.identity.clone()),
+            result: Err("fake cleanup failure".into()),
+        })
+        .unwrap();
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "failed-removal",
+            Request::Recover {
+                owner: first.clone(),
+                operation_id: "remove-first".into()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Failed,
+            ..
+        }
+    ));
+    assert_eq!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "release-failed",
+            Request::ReleaseOperation {
+                owner: first.clone(),
+                operation_id: "remove-first".into()
+            }
+        ),
+        Reply::OperationNotSettled
+    );
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "retry-stale",
+            Request::RetryCleanup {
+                owner: first.clone(),
+                operation_id: "remove-first".into(),
+                expected: removal_topology
+            }
+        ),
+        Reply::StaleTopology { .. }
+    ));
+    let Reply::Capabilities { capabilities } = exchange(
+        &mut manager,
+        &mut adapter,
+        &alice,
+        "retry-caps",
+        Request::Capabilities,
+    ) else {
+        panic!("missing capabilities")
+    };
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "retry-cleanup",
+            Request::RetryCleanup {
+                owner: first.clone(),
+                operation_id: "remove-first".into(),
+                expected: capabilities.topology.unwrap()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Pending,
+            ..
+        }
+    ));
+    assert_eq!(
+        observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "remove"
+    );
+    events
+        .send(Event::Removed {
+            key: ("alice".into(), first.identity.clone()),
+            result: Ok(()),
+        })
+        .unwrap();
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "settled",
+            Request::Recover {
+                owner: first.clone(),
+                operation_id: "remove-first".into()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Completed,
+            ..
+        }
+    ));
+    assert_eq!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "release-settled",
+            Request::ReleaseOperation {
+                owner: first.clone(),
+                operation_id: "remove-first".into()
+            }
+        ),
+        Reply::OperationReleased
+    );
     let Reply::Capabilities { capabilities } = exchange(
         &mut manager,
         &mut adapter,
@@ -368,7 +533,7 @@ fn production_linux_manager_routes_fenced_requests_to_fake_worker_via_broker() {
             }
         ),
         Reply::Effect {
-            state: EffectState::RecoveryRequired,
+            state: EffectState::Pending,
             ..
         }
     ));
@@ -391,6 +556,41 @@ fn production_linux_manager_routes_fenced_requests_to_fake_worker_via_broker() {
             &mut adapter,
             &alice,
             "release",
+            Request::ReleaseOperation {
+                owner: second.clone(),
+                operation_id: "uncertain".into()
+            }
+        ),
+        Reply::OperationNotSettled
+    );
+    events
+        .send(Event::Removed {
+            key: ("alice".into(), second.identity.clone()),
+            result: Ok(()),
+        })
+        .unwrap();
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "cancel-settled",
+            Request::Recover {
+                owner: second.clone(),
+                operation_id: "uncertain".into()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Completed,
+            ..
+        }
+    ));
+    assert_eq!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "release-cancel-settled",
             Request::ReleaseOperation {
                 owner: second,
                 operation_id: "uncertain".into()

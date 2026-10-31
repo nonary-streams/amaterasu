@@ -152,8 +152,15 @@ pub enum Request {
         owner: OwnerReference,
         operation_id: String,
     },
-    /// Forget an outcome after the caller has reconciled it. This does not
-    /// cancel or undo an effect. Never reuse the released operation ID.
+    /// Retry a retained failed or uncertain cleanup against the current topology.
+    /// This never creates a new ownership reference.
+    RetryCleanup {
+        owner: OwnerReference,
+        operation_id: String,
+        expected: TopologyRevision,
+    },
+    /// Forget a settled outcome. This does not cancel or undo an effect.
+    /// Never reuse the released operation ID.
     ReleaseOperation {
         owner: OwnerReference,
         operation_id: String,
@@ -223,6 +230,11 @@ impl Request {
                     && topology(expected)
                     && mode(m, acceptance)
             }
+            Self::RetryCleanup {
+                owner: o,
+                operation_id,
+                expected,
+            } => owner(o) && token(operation_id) && topology(expected),
             Self::Recover {
                 owner: o,
                 operation_id,
@@ -244,6 +256,12 @@ pub enum EffectState {
     Applied,
     Removed,
     Absent,
+    /// The owned reference was released and required cleanup has settled.
+    Completed,
+    /// Cleanup failed and retains an obligation to reconcile or retry.
+    Failed,
+    /// Available evidence cannot establish the outcome.
+    Unknown,
     RecoveryRequired,
 }
 
@@ -269,6 +287,8 @@ pub enum Reply {
     NotOwned,
     /// The provider forgot its retry record; this is not display removal.
     OperationReleased,
+    /// An operation record still has an unresolved effect or cleanup obligation.
+    OperationNotSettled,
     Conflict,
     InvalidRequest,
     ResourceExhausted,
