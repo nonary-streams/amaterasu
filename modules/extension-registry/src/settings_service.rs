@@ -33,6 +33,8 @@ pub enum SettingsOperation {
         target: Option<LifecycleTarget>,
         #[serde(default)]
         input_binding: Option<String>,
+        #[serde(default)]
+        input_boot_epoch: Option<String>,
     },
     #[serde(rename = "settings_migrate")]
     Migrate {
@@ -68,6 +70,7 @@ enum Stage {
     Authorizing {
         target: LifecycleTarget,
         input_binding: Option<String>,
+        input_boot_epoch: Option<String>,
         scopes: Vec<Scope>,
         index: usize,
         child: Option<u64>,
@@ -156,6 +159,25 @@ impl SettingsService {
                 "invalid_request",
                 "input binding requires target",
             ));
+        }
+        if let SettingsOperation::Get {
+            input_binding,
+            input_boot_epoch,
+            ..
+        } = &operation
+        {
+            let valid_epoch = input_boot_epoch.as_deref().is_none_or(|epoch| {
+                epoch.len() == 32
+                    && epoch
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            });
+            if input_binding.is_some() != input_boot_epoch.is_some() || !valid_epoch {
+                return Err(discovery::failure(
+                    "invalid_request",
+                    "input binding requires a valid boot epoch",
+                ));
+            }
         }
         let dynamic = matches!(
             &operation,
@@ -269,6 +291,7 @@ impl SettingsService {
             SettingsOperation::Get {
                 target: Some(target),
                 input_binding,
+                input_boot_epoch,
                 ..
             } => {
                 if dynamic_scopes.is_empty() {
@@ -280,6 +303,7 @@ impl SettingsService {
                 Stage::Authorizing {
                     target: target.clone(),
                     input_binding: input_binding.clone(),
+                    input_boot_epoch: input_boot_epoch.clone(),
                     scopes: dynamic_scopes.into_iter().collect(),
                     index: 0,
                     child: None,
@@ -612,6 +636,7 @@ impl SettingsService {
             let Stage::Authorizing {
                 target,
                 input_binding,
+                input_boot_epoch,
                 scopes,
                 index,
                 child,
@@ -721,7 +746,7 @@ impl SettingsService {
                 .saturating_duration_since(Instant::now())
                 .as_millis()
                 .min(30_000) as u64;
-            let payload = json!({"operation":"resolve_settings_scope","operation_id":operation_id,"target":target,"scope":kind,"scope_id":scope_id,"access":"read","source":{"caller":pending.source_caller,"initiator":pending.source_initiator},"input_binding":input_binding});
+            let payload = json!({"operation":"resolve_settings_scope","operation_id":operation_id,"target":target,"scope":kind,"scope_id":scope_id,"access":"read","source":{"caller":pending.source_caller,"initiator":pending.source_initiator},"input_binding":input_binding,"input_boot_epoch":input_boot_epoch});
             match runtime.send(Command::Request {
                 service: "amaterasu.session-lifecycle/1".into(),
                 payload,

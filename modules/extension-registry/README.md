@@ -22,7 +22,8 @@ are installed policy and must explicitly rename, remove, or replace changed
 values. `write_outcome_unknown` requires reloading before any further update.
 
 Dynamic application and session reads may include a `target` (tagged
-`LifecycleTarget`) and optional `input_binding`. The registry requests lifecycle
+`LifecycleTarget`) and optional `input_binding` plus its `input_boot_epoch`
+(32 lowercase hex characters). The registry requests lifecycle
 authorization for every selected scope, relaying only the caller and initiator
 provided by the broker. It accepts only the coordinator's matching canonical
 target and scope. A read is authorized when lifecycle accepts its scope request;

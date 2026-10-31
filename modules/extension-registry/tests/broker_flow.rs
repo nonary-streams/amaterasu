@@ -188,6 +188,12 @@ impl Harness {
         } = scope_request
         {
             self.scope_calls += 1;
+            if payload["input_binding"].is_string() {
+                assert_eq!(
+                    payload["input_boot_epoch"],
+                    "0123456789abcdef0123456789abcdef"
+                );
+            }
             self.scope_source = Some(payload["source"].clone());
             assert_eq!(caller, COORDINATOR);
             assert_eq!(initiator, "management");
@@ -417,7 +423,7 @@ fn installed_migration_plan_validates_and_commits_through_broker() {
 fn dynamic_scope_requires_matching_lifecycle_authority() {
     let mut harness = Harness::new();
     let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":7});
-    let request = || json!({"operation":"settings_get","provider":"example.demo","scope":{"kind":"session","id":"session"},"application":"app","paired_client":null,"session":"session","target":target,"input_binding":"token"});
+    let request = || json!({"operation":"settings_get","provider":"example.demo","scope":{"kind":"session","id":"session"},"application":"app","paired_client":null,"session":"session","target":target,"input_binding":"token","input_boot_epoch":"0123456789abcdef0123456789abcdef"});
     let result = harness.call("management", request());
     assert_eq!(result["ok"], true);
     assert_eq!(harness.scope_calls, 2);
@@ -440,8 +446,23 @@ fn dynamic_scope_requires_matching_lifecycle_authority() {
         harness.call("management", no_target)["error"]["code"],
         "invalid_request"
     );
+    let mut missing_epoch = request();
+    missing_epoch
+        .as_object_mut()
+        .unwrap()
+        .remove("input_boot_epoch");
+    assert_eq!(
+        harness.call("management", missing_epoch)["error"]["code"],
+        "invalid_request"
+    );
+    let mut malformed_epoch = request();
+    malformed_epoch["input_boot_epoch"] = json!("ABC");
+    assert_eq!(
+        harness.call("management", malformed_epoch)["error"]["code"],
+        "invalid_request"
+    );
     let before = harness.scope_calls;
-    let rejected=harness.call("management",json!({"operation":"settings_get","provider":"example.demo","scope":{"kind":"session","id":"session"},"application":null,"paired_client":"client","session":"session","target":target,"input_binding":"token"}));
+    let rejected=harness.call("management",json!({"operation":"settings_get","provider":"example.demo","scope":{"kind":"session","id":"session"},"application":null,"paired_client":"client","session":"session","target":target,"input_binding":"token","input_boot_epoch":"0123456789abcdef0123456789abcdef"}));
     assert_eq!(rejected["error"]["code"], "permission_denied");
     assert_eq!(before, harness.scope_calls);
 }
@@ -466,7 +487,7 @@ fn delegated_input_source_is_attested_by_broker_not_request_payload() {
         matches!(harness.broker.borrow_mut().dispatch("input",Command::Poll {}), Response::Request {id,..} if id==parent)
     );
     let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":7});
-    let payload = json!({"operation":"settings_get","provider":"example.demo","scope":{"kind":"session","id":"session"},"application":null,"paired_client":null,"session":"session","target":target,"input_binding":"token"});
+    let payload = json!({"operation":"settings_get","provider":"example.demo","scope":{"kind":"session","id":"session"},"application":null,"paired_client":null,"session":"session","target":target,"input_binding":"token","input_boot_epoch":"0123456789abcdef0123456789abcdef"});
     let child = harness.broker.borrow_mut().dispatch(
         "input",
         Command::Request {
@@ -510,7 +531,7 @@ fn canonical_scope_also_selects_effective_overlay() {
     );
     harness.state_revision = 1;
     let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":7});
-    let result=harness.call("management",json!({"operation":"settings_get","provider":"example.demo","scope":{"kind":"session","id":"session"},"application":null,"paired_client":null,"session":null,"target":target,"input_binding":"token"}));
+    let result=harness.call("management",json!({"operation":"settings_get","provider":"example.demo","scope":{"kind":"session","id":"session"},"application":null,"paired_client":null,"session":null,"target":target,"input_binding":"token","input_boot_epoch":"0123456789abcdef0123456789abcdef"}));
     assert_eq!(result["ok"], true);
     assert_eq!(result["values"]["enabled"], false);
     assert_eq!(result["effective"]["enabled"]["value"], false);
@@ -518,6 +539,6 @@ fn canonical_scope_also_selects_effective_overlay() {
         result["effective"]["enabled"]["source"],
         json!({"kind":"session","id":"session"})
     );
-    let mismatch=harness.call("management",json!({"operation":"settings_get","provider":"example.demo","scope":{"kind":"session","id":"session"},"application":null,"paired_client":null,"session":"other","target":target,"input_binding":"token"}));
+    let mismatch=harness.call("management",json!({"operation":"settings_get","provider":"example.demo","scope":{"kind":"session","id":"session"},"application":null,"paired_client":null,"session":"other","target":target,"input_binding":"token","input_boot_epoch":"0123456789abcdef0123456789abcdef"}));
     assert_eq!(mismatch["error"]["code"], "invalid_request");
 }
