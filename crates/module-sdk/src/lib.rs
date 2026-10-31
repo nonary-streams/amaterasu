@@ -5,6 +5,7 @@ pub mod capture;
 pub mod configuration;
 pub mod data_plane;
 pub mod encode;
+pub mod events;
 pub mod exports;
 pub mod input;
 pub mod media;
