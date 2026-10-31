@@ -140,6 +140,7 @@ enum Stage {
         invoke: Box<ActionInvoke>,
     },
     Plan(Box<PlanContext>),
+    Settings(Box<PlanContext>),
     InputReservation(Box<ReservationContext>),
     ConfirmInput(Box<CommitContext>),
 }
@@ -370,7 +371,7 @@ impl ActionsModule {
             | Stage::ReservedCancelWrite { parent, .. }
             | Stage::ReservedCancelReply { parent, .. } => *parent,
             Stage::Descriptor { incoming, .. } => incoming.id,
-            Stage::Plan(context) => context.incoming.id,
+            Stage::Plan(context) | Stage::Settings(context) => context.incoming.id,
             Stage::InputReservation(context) => context.incoming.id,
             Stage::ConfirmInput(context) => context.incoming.id,
             Stage::DispatchReply { .. }
@@ -380,7 +381,7 @@ impl ActionsModule {
                 return Err("invalid submission stage".into());
             }
         };
-        let descriptor = matches!(stage, Stage::Descriptor { .. });
+        let descriptor = matches!(stage, Stage::Descriptor { .. } | Stage::Settings(_));
         let lifecycle = matches!(
             stage,
             Stage::InputReservation(_) | Stage::ReservedCancelReply { .. }
@@ -392,6 +393,7 @@ impl ActionsModule {
             Stage::ReservedCancelReply { .. } => "cancel-input-reservation",
             Stage::Descriptor { .. } => "descriptor",
             Stage::Plan(_) => "plan",
+            Stage::Settings(_) => "settings",
             Stage::InputReservation(_) => "input-reservation",
             Stage::ConfirmInput(_) => "input-confirm",
             Stage::DispatchReply { .. }
@@ -449,6 +451,23 @@ impl ActionsModule {
                     } => self
                         .after_descriptor(incoming, revision, metadata, *epoch, *invoke, payload),
                     Stage::Plan(context) => self.after_plan(*context, payload),
+                    Stage::Settings(context) => {
+                        let expected = context.invoke.expected_settings_revision.as_deref();
+                        let actual = payload
+                            .get("revision")
+                            .and_then(Value::as_u64)
+                            .map(|revision| revision.to_string());
+                        if payload.get("ok") != Some(&Value::Bool(true))
+                            || actual.as_deref() != expected
+                        {
+                            self.complete(
+                                context.incoming.id,
+                                failure("settings_revision_mismatch"),
+                            )
+                        } else {
+                            self.plan_action(*context)
+                        }
+                    }
                     Stage::InputReservation(context) => {
                         self.after_input_reservation(*context, payload)
                     }
@@ -512,7 +531,7 @@ impl ActionsModule {
                     | Stage::ReservedCancelWrite { parent, .. }
                     | Stage::ReservedCancelReply { parent, .. } => parent,
                     Stage::Descriptor { incoming, .. } => incoming.id,
-                    Stage::Plan(context) => context.incoming.id,
+                    Stage::Plan(context) | Stage::Settings(context) => context.incoming.id,
                     Stage::InputReservation(context) => context.incoming.id,
                     Stage::ConfirmInput(context) => context.incoming.id,
                     Stage::DispatchReply { key } => {
@@ -888,22 +907,7 @@ impl ActionsModule {
         {
             return self.complete(incoming.id, failure("permission_denied"));
         }
-        let Some(method) = action.plan.clone() else {
-            return self.complete(incoming.id, failure("plan_unavailable"));
-        };
-        let payload = json!({"version":1,"operation_id":invoke.operation_id,"action_id":invoke.action_id,"target":invoke.target,"arguments":invoke.arguments,"expected_settings_revision":invoke.expected_settings_revision});
-        let request = Command::CallApi {
-            service: method.service,
-            method: method.method,
-            interface_major: method.interface_major,
-            interface_minor: method.interface_minor,
-            payload,
-            timeout_ms: 5_000,
-            operation_id: format!("actions-{}-plan", incoming.id),
-            parent: Some(incoming.id),
-        };
-        let parent = incoming.id;
-        let stage = Stage::Plan(Box::new(PlanContext {
+        let context = PlanContext {
             incoming,
             revision,
             metadata,
@@ -912,10 +916,36 @@ impl ActionsModule {
             action,
             provider: provider.to_owned(),
             registry_revision,
-        }));
+        };
+        if context.invoke.expected_settings_revision.is_some() {
+            let payload = json!({"operation":"settings_get","provider":context.provider,"scope":{"kind":"host"},"application":null,"paired_client":null,"session":null});
+            return self.submit(payload, Stage::Settings(Box::new(context)));
+        }
+        self.plan_action(context)
+    }
+    fn plan_action(&mut self, context: PlanContext) -> ModuleResult<()> {
+        let Some(method) = context.action.plan.clone() else {
+            return self.complete(context.incoming.id, failure("plan_unavailable"));
+        };
+        let invoke = &context.invoke;
+        let payload = json!({"version":1,"operation_id":invoke.operation_id,"action_id":invoke.action_id,"target":invoke.target,"arguments":invoke.arguments,"expected_settings_revision":invoke.expected_settings_revision});
+        let request = Command::CallApi {
+            service: method.service,
+            method: method.method,
+            interface_major: method.interface_major,
+            interface_minor: method.interface_minor,
+            payload,
+            timeout_ms: 5_000,
+            operation_id: format!("actions-{}-plan", context.incoming.id),
+            parent: Some(context.incoming.id),
+        };
+        let parent = context.incoming.id;
         match self.runtime.send(request)? {
             Response::Accepted { id } => {
-                self.pending.push_back(Pending { request: id, stage });
+                self.pending.push_back(Pending {
+                    request: id,
+                    stage: Stage::Plan(Box::new(context)),
+                });
                 Ok(())
             }
             _ => self.complete(parent, failure("plan_unavailable")),
@@ -1771,6 +1801,8 @@ mod tests {
         transition_count: usize,
         delivery_confirmed: bool,
         last_source: Value,
+        settings_revision: u64,
+        plan_calls: usize,
     }
     impl Host {
         fn dispatch(&mut self, command: Command) -> Response {
@@ -1793,6 +1825,12 @@ mod tests {
                     self.next += 1;
                     let value = if service == amaterasu_extension_api::EXTENSION_REGISTRY_SERVICE {
                         assert!(parent.is_some());
+                        if payload["operation"] == "settings_get" {
+                            assert_eq!(payload["provider"], "example.provider");
+                            let response = json!({"ok":true,"revision":self.settings_revision});
+                            self.results.insert(self.next, response);
+                            return Response::Accepted { id: self.next };
+                        }
                         let method = json!({"service":"example.provider/1","method":"action_execute","interface_major":1,"interface_minor":0,"schema_revision":1});
                         let plan = json!({"service":"example.provider/1","method":"action_plan","interface_major":1,"interface_minor":0,"schema_revision":1});
                         let status = json!({"service":"example.provider/1","method":"action_status","interface_major":1,"interface_minor":0,"schema_revision":1});
@@ -1907,6 +1945,7 @@ mod tests {
                 } => {
                     self.next += 1;
                     let result = if method == "action_plan" {
+                        self.plan_calls += 1;
                         assert!(parent.is_some());
                         json!({"status":"planned","operation_id":payload["operation_id"],"action_id":payload["action_id"],"target":payload["target"],"plan":{"plan_id":"p1","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]}})
                     } else if method == "action_status" {
@@ -2253,6 +2292,31 @@ mod tests {
         assert_eq!(host.replies[66]["code"], "receipt_expired");
         assert_eq!(host.replies[67]["code"], "receipt_expired");
         assert_eq!(host.effects, 65);
+    }
+    #[test]
+    fn selected_settings_revision_is_checked_before_planning() {
+        let mut host = Host {
+            allow_permit: true,
+            settings_revision: 7,
+            ..Host::default()
+        };
+        host.request(
+            1,
+            "alice",
+            json!({"operation":"open_epoch","operation_id":"open"}),
+        );
+        host.run();
+        let epoch = host.replies[0]["epoch"].as_str().unwrap().to_owned();
+        host.request(2, "alice", json!({"operation":"invoke","epoch":epoch,"sequence":1,"operation_id":format!("{epoch}:1"),"action_id":"example/action","target":{"kind":"session","host_epoch":"h","session_id":"s","expected_generation":1},"arguments":{},"expected_settings_revision":"6"}));
+        host.run();
+        assert_eq!(host.replies[1]["code"], "settings_revision_mismatch");
+        assert_eq!(host.plan_calls, 0);
+        assert_eq!(host.effects, 0);
+        host.request(3, "alice", json!({"operation":"invoke","epoch":epoch,"sequence":1,"operation_id":format!("{epoch}:1"),"action_id":"example/action","target":{"kind":"session","host_epoch":"h","session_id":"s","expected_generation":1},"arguments":{},"expected_settings_revision":"7"}));
+        host.run();
+        assert_eq!(host.replies[2]["status"], "queued");
+        assert_eq!(host.plan_calls, 1);
+        assert_eq!(host.effects, 1);
     }
     #[test]
     fn cancelling_reserved_input_is_durable_before_revocation_and_blocks_commit() {
