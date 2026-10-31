@@ -2510,6 +2510,26 @@ impl Coordinator {
         if composed_release {
             validate_journal(&next).map_err(|_| "invalid_composed_release_journal")?;
         }
+        // Once the exact session work is complete, optionally compact closed
+        // children on a private clone. Keep all source proofs on any failure.
+        if work.phase == LifecyclePhase::SessionRelease
+            && next
+                .sessions
+                .get(id)
+                .is_some_and(|session| session.phase == SessionPhase::Ended)
+            && next.receipts.get(key).is_some_and(|receipt| {
+                receipt.response["status"] == "succeeded" && receipt.work.is_none()
+            })
+        {
+            let mut candidate = next.clone();
+            if self
+                .prepare_stream_history(&mut candidate, &work.target)
+                .is_ok()
+                && validate_journal(&candidate).is_ok()
+            {
+                next = candidate;
+            }
+        }
         save(&self.shared, next)
     }
 

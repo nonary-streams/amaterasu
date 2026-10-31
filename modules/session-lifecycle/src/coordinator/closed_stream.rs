@@ -823,6 +823,48 @@ fn schema_commitments(documents: &[crate::adapter::SchemaDocument]) -> Option<Ve
     Some(values)
 }
 
+/// Resolve the exact source root without granting any new effect. During an
+/// active session it must be the live root; after End it must additionally have
+/// a complete authenticated session-release proof.
+fn closed_source_generation(journal: &Journal, source: &composition::StoredOutput) -> Option<u64> {
+    let mut roots = journal
+        .composition
+        .records()
+        .filter(|root| root.admission_id == source.admission_id && root.output == source.output);
+    let root = roots.next()?;
+    if roots.next().is_some() {
+        return None;
+    }
+    let mut normalized = root.clone();
+    normalized.state = composition::OutputState::Retained;
+    if &normalized != source {
+        return None;
+    }
+    match root.state {
+        composition::OutputState::Retained => {
+            resource_generation::current_root_generation(journal, root).ok()
+        }
+        composition::OutputState::Released => {
+            let (_, session_id, None, _) = operations::target_parts(&root.output.origin).ok()?
+            else {
+                return None;
+            };
+            let session = journal.sessions.get(session_id)?;
+            if session.phase != SessionPhase::Ended
+                || !journal.session_releases.has_valid_released(
+                    journal,
+                    &root.output.origin,
+                    &root.output.producer,
+                )
+            {
+                return None;
+            }
+            resource_generation::historical_generation(journal, root).ok()
+        }
+        _ => None,
+    }
+}
+
 impl ClosedStream {
     fn historical_proof<'a>(&self, journal: &'a Journal) -> Option<HistoricalProof<'a>> {
         let mut roots = journal.composition.records().filter(|item| {
@@ -947,11 +989,10 @@ impl ClosedStream {
             target: target.clone(),
             transition_id: transition_id.into(),
             parent_generation: proof.finalized.selection.parent_generation?,
-            resource_generation: resource_generation::current_root_generation(
+            resource_generation: closed_source_generation(
                 journal,
                 &proof.finalized.selection.input,
-            )
-            .ok()?,
+            )?,
             graph: proof.work.provider_graph.clone()?,
             root_admission: proof.finalized.selection.input.admission_id.clone(),
             root_output: commitment(&proof.finalized.selection.input.output)?,
@@ -1169,6 +1210,21 @@ fn valid_schemas(values: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn released_source_cannot_checkpoint_without_exact_session_proof() {
+        let target =
+            json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1});
+        let output = json!({"output_id":"output","capability":"screen","schema":{"id":"screen/2","major":1,"minor":0,"digest":"a".repeat(64)},"producer":"owner","producer_service":"owner/2","origin":target,"resource":{"provider":"owner","resource_id":"display","incarnation":"native","revision":2,"execution_domain":"seat","mutation_domain":null,"mutation_domains":[]},"data":{}});
+        let plan = json!({"plan_id":"plan","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]});
+        let root = json!({"output":output,"admission_id":"root","transition_id":"prepare","plan":plan,"state":"released","callback_proof":null});
+        let journal: Journal = serde_json::from_value(json!({"version":3,"host_epoch":"epoch","receipts":{},"sessions":{"session":{"host_epoch":"epoch","id":"session","generation":1,"phase":"ended","owner":{"caller":"caller","initiator":"client"},"delegates":[],"application_ref":null,"settings_revision":"revision","application_retired":true,"streams":{}}},"composition":{"outputs":[root]}})).unwrap();
+        let mut source = journal.composition.records().next().unwrap().clone();
+        source.state = composition::OutputState::Retained;
+        assert!(closed_source_generation(&journal, &source).is_none());
+        source.admission_id = "foreign".into();
+        assert!(closed_source_generation(&journal, &source).is_none());
+    }
 
     #[test]
     fn commitments_are_bounded_sorted_unique_and_owner_scoped() {
