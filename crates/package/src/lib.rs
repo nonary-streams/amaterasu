@@ -12,6 +12,7 @@ pub mod migration;
 pub mod playnite_extension;
 mod privileged;
 pub mod repository;
+mod service_selection;
 mod staging;
 mod storage;
 mod verification;

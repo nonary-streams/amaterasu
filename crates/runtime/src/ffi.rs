@@ -31,9 +31,10 @@ unsafe extern "C" fn create_runtime(config: BorrowedBytes, output: *mut *mut c_v
         // SAFETY: The bootstrap caller supplies readable configuration bytes for this call.
         let config: RuntimeConfig = serde_json::from_slice(unsafe { config.read()? })
             .map_err(|_| STATUS_INVALID_ARGUMENT)?;
-        let native = Arc::new(crate::native::NativeServices::new(
+        let native = Arc::new(crate::native::NativeServices::with_selections(
             config.principals.clone(),
             config.legacy_native_contracts.clone(),
+            config.service_selections.clone(),
         ));
         let principals: Vec<_> = config.principals.keys().cloned().collect();
         let broker = Arc::new(Mutex::new(

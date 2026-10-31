@@ -153,6 +153,8 @@ mod tests {
             expires_unix: unix_timestamp() + 3600,
             target: current_target(),
             components: vec![ComponentManifest {
+                service_provides: Vec::new(),
+                service_requires: Vec::new(),
                 id: "amaterasu.runtime".into(),
                 version: "1".into(),
                 file: "runtime.bin".into(),

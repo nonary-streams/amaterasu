@@ -1793,6 +1793,8 @@ esac
             .components()
             .iter()
             .map(|component| ComponentManifest {
+                service_provides: Vec::new(),
+                service_requires: Vec::new(),
                 id: component.id.into(),
                 version: "0.1.0".into(),
                 file: format!("{}.so", component.library),

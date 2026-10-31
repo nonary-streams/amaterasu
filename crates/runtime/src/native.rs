@@ -1,7 +1,7 @@
 //! Native pointer handling is confined to this trusted-code ABI boundary.
 //! Registry locks protect metadata only; no provider callback runs under a lock.
 use amaterasu_abi::*;
-use amaterasu_contracts::{Command, Grants, Response, valid_name};
+use amaterasu_contracts::{Command, Grants, Response, ServiceSelections, valid_name};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -39,17 +39,28 @@ struct Registry {
 pub(crate) struct NativeServices {
     grants: BTreeMap<String, Grants>,
     legacy_contracts: BTreeMap<String, BTreeMap<String, String>>,
+    selections: ServiceSelections,
     registry: Mutex<Registry>,
 }
 
 impl NativeServices {
+    #[cfg(test)]
     pub fn new(
         grants: BTreeMap<String, Grants>,
         legacy_contracts: BTreeMap<String, BTreeMap<String, String>>,
     ) -> Self {
+        Self::with_selections(grants, legacy_contracts, ServiceSelections::default())
+    }
+
+    pub fn with_selections(
+        grants: BTreeMap<String, Grants>,
+        legacy_contracts: BTreeMap<String, BTreeMap<String, String>>,
+        selections: ServiceSelections,
+    ) -> Self {
         Self {
             grants,
             legacy_contracts,
+            selections,
             registry: Mutex::new(Registry::default()),
         }
     }
@@ -128,7 +139,11 @@ impl NativeServices {
         contract: Option<String>,
     ) -> Response {
         // Authorization precedes even the first pointer read.
-        if !self.permitted(caller, &service, true) {
+        if !self.permitted(caller, &service, true)
+            || !self
+                .selections
+                .allows_native(&service, caller, contract.as_deref())
+        {
             return denied();
         }
         if contract

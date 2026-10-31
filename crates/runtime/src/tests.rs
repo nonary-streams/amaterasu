@@ -2102,3 +2102,97 @@ fn legacy_native_contract_approval_requires_valid_names_and_provider_grant() {
         assert!(Broker::new(config.clone()).is_err());
     }
 }
+
+#[test]
+fn startup_broker_selection_preserves_grants_and_denies_other_or_disabled_providers() {
+    let mut config = RuntimeConfig::default();
+    for principal in ["selected", "competitor"] {
+        config.principals.insert(
+            principal.into(),
+            Grants {
+                provide: names(&["echo/1", "disabled/1"]),
+                ..Default::default()
+            },
+        );
+    }
+    config.principals.insert(
+        "client".into(),
+        Grants {
+            call: names(&["echo/1"]),
+            ..Default::default()
+        },
+    );
+    config.service_selections.broker.insert(
+        "echo/1".into(),
+        Some(SelectedService {
+            provider: "selected".into(),
+            contract: "example.echo/1".into(),
+        }),
+    );
+    config
+        .service_selections
+        .broker
+        .insert("disabled/1".into(), None);
+    let mut broker = Broker::new(config).unwrap();
+    let register = |service: &str| Command::Register {
+        service: service.into(),
+    };
+    assert_error_code(
+        broker.dispatch("competitor", register("echo/1")),
+        "permission_denied",
+    );
+    assert_error_code(
+        broker.dispatch("selected", register("disabled/1")),
+        "permission_denied",
+    );
+    assert!(matches!(
+        broker.dispatch("selected", register("echo/1")),
+        Response::Ok
+    ));
+    let id = accepted_id(broker.dispatch(
+        "client",
+        Command::Request {
+            service: "echo/1".into(),
+            payload: json!({"message":"hello"}),
+            timeout_ms: 1000,
+            operation_id: "selected-test".into(),
+            parent: None,
+        },
+    ));
+    assert!(
+        matches!(broker.dispatch("selected", Command::Poll {}), Response::Request { id: delivered, caller, payload, .. } if delivered == id && caller == "client" && payload == json!({"message":"hello"}))
+    );
+    assert!(matches!(
+        broker.dispatch(
+            "selected",
+            Command::Complete {
+                request: id,
+                payload: json!({"reply":"ok"})
+            }
+        ),
+        Response::Ok
+    ));
+    assert!(
+        matches!(broker.dispatch("client", Command::TakeResult { request: id }), Response::Result { payload } if payload == json!({"reply":"ok"}))
+    );
+}
+
+#[test]
+fn startup_broker_selection_cannot_override_installed_api_approval() {
+    let (mut config, method) = synthetic_api(ApiPrivilege::User);
+    config.principals.insert(
+        "competitor".into(),
+        Grants {
+            provide: names(&["org.example.paint/1"]),
+            ..Default::default()
+        },
+    );
+    config.service_selections.broker.insert(
+        method.service.clone(),
+        Some(SelectedService {
+            provider: "competitor".into(),
+            contract: "example.paint/1".into(),
+        }),
+    );
+    assert!(Broker::new(config).is_err());
+}

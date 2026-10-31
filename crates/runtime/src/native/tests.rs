@@ -407,3 +407,96 @@ fn legacy_contract_approval_is_scoped_and_does_not_override_typed_registration()
         }
     }
 }
+
+#[test]
+fn startup_selection_checks_identity_before_reading_factory_and_keeps_disabled_closed() {
+    use amaterasu_contracts::SelectedService;
+    let grants = BTreeMap::from([
+        (
+            "selected".into(),
+            Grants {
+                native_provide: ["frames/1".into(), "disabled/1".into()].into(),
+                ..Default::default()
+            },
+        ),
+        (
+            "competitor".into(),
+            Grants {
+                native_provide: ["frames/1".into()].into(),
+                ..Default::default()
+            },
+        ),
+        (
+            "consumer".into(),
+            Grants {
+                native_use: ["frames/1".into()].into(),
+                ..Default::default()
+            },
+        ),
+    ]);
+    let selections = ServiceSelections {
+        native: [
+            (
+                "frames/1".into(),
+                Some(SelectedService {
+                    provider: "selected".into(),
+                    contract: "example.frames/1".into(),
+                }),
+            ),
+            ("disabled/1".into(), None),
+        ]
+        .into(),
+        ..Default::default()
+    };
+    let services = NativeServices::with_selections(grants, BTreeMap::new(), selections);
+    let register = |service: &str, contract: &str, factory| Command::NativeRegisterTyped {
+        service: service.into(),
+        contract: contract.into(),
+        factory,
+    };
+    for (principal, service, contract) in [
+        ("competitor", "frames/1", "example.frames/1"),
+        ("selected", "frames/1", "wrong/1"),
+        ("selected", "disabled/1", "example.frames/1"),
+    ] {
+        assert!(
+            matches!(unsafe { services.dispatch(principal, register(service, contract, 1)) }, Response::Error { code, .. } if code == "permission_denied")
+        );
+    }
+    let context = context(&services, false);
+    let descriptor = factory(&context);
+    assert!(matches!(
+        unsafe {
+            services.dispatch(
+                "selected",
+                register(
+                    "frames/1",
+                    "example.frames/1",
+                    &descriptor as *const _ as usize,
+                ),
+            )
+        },
+        Response::Ok
+    ));
+    let result = unsafe {
+        services.dispatch(
+            "consumer",
+            Command::NativeBindTyped {
+                service: "frames/1".into(),
+                contract: "example.frames/1".into(),
+                interface_major: 1,
+                min_minor: 0,
+                min_size: size_of::<Table>() as u32,
+            },
+        )
+    };
+    let Response::NativeBound { binding, .. } = result else {
+        panic!("selected provider did not bind")
+    };
+    assert!(matches!(
+        unsafe { services.dispatch("consumer", Command::NativeRelease { binding }) },
+        Response::Ok
+    ));
+    assert_eq!(context.binds.load(Ordering::SeqCst), 1);
+    assert_eq!(context.releases.load(Ordering::SeqCst), 1);
+}

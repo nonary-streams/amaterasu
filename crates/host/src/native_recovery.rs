@@ -125,6 +125,7 @@ mod tests {
         production_bootstrap.development = false;
         write_json_atomically(&root.join("bootstrap.json"), &production_bootstrap).unwrap();
         let verified = VerifiedPackage {
+            service_diagnostics: Vec::new(),
             signer_fingerprint: None,
             privileged_requests: Vec::new(),
             manifest: ReleaseManifest {

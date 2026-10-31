@@ -76,6 +76,10 @@ pub struct HookSpec {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     pub principals: BTreeMap<String, Grants>,
+    /// Trusted startup routing policy. Empty maps retain legacy registration behavior.
+    /// Nonempty selections require a runtime that understands this field.
+    #[serde(default, skip_serializing_if = "ServiceSelections::is_empty")]
+    pub service_selections: ServiceSelections,
     /// Trusted composition approvals for legacy untyped native factories, keyed
     /// by provider principal and exact service. This does not grant native access.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -95,6 +99,44 @@ pub struct RuntimeConfig {
     /// the host sets it after verification when creating its private control endpoint.
     #[serde(default)]
     pub host_lifecycle_control: bool,
+}
+
+/// A missing key retains legacy behavior; a null value disables registration.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceSelections {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub broker: BTreeMap<String, Option<SelectedService>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub native: BTreeMap<String, Option<SelectedService>>,
+}
+impl ServiceSelections {
+    pub fn is_empty(&self) -> bool {
+        self.broker.is_empty() && self.native.is_empty()
+    }
+
+    pub fn allows_broker(&self, service: &str, principal: &str) -> bool {
+        self.broker.get(service).is_none_or(|selection| {
+            selection
+                .as_ref()
+                .is_some_and(|selection| selection.provider == principal)
+        })
+    }
+
+    pub fn allows_native(&self, service: &str, principal: &str, contract: Option<&str>) -> bool {
+        self.native.get(service).is_none_or(|selection| {
+            selection.as_ref().is_some_and(|selection| {
+                selection.provider == principal && Some(selection.contract.as_str()) == contract
+            })
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectedService {
+    pub provider: String,
+    pub contract: String,
 }
 
 /// A wire contract can describe arbitrary namespaced methods. `Any` and
@@ -523,6 +565,31 @@ mod tests {
                 "action":"execute"
             }))
             .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod service_selection_tests {
+    use super::*;
+    #[test]
+    fn empty_selections_are_omitted_and_disabled_is_distinct_from_legacy() {
+        let mut config = RuntimeConfig::default();
+        let serialized = serde_json::to_value(&config).unwrap();
+        assert!(serialized.get("service_selections").is_none());
+        let old: RuntimeConfig = serde_json::from_value(serialized).unwrap();
+        assert!(old.service_selections.is_empty());
+        assert!(old.service_selections.allows_broker("echo/1", "provider"));
+        config
+            .service_selections
+            .broker
+            .insert("echo/1".into(), None);
+        let round_trip: RuntimeConfig =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert!(
+            !round_trip
+                .service_selections
+                .allows_broker("echo/1", "provider")
         );
     }
 }

@@ -410,6 +410,8 @@ mod tests {
                 let bytes = format!("fixture bytes for {id}");
                 fs::write(package.join(file), &bytes).unwrap();
                 ComponentManifest {
+                    service_provides: Vec::new(),
+                    service_requires: Vec::new(),
                     id: id.into(),
                     version: "0.1.0".into(),
                     file: file.into(),

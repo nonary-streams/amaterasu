@@ -3242,6 +3242,8 @@ fn copy_component_bytes(
     fs::write(output.join(&filename), bytes).map_err(|error| error.to_string())?;
 
     Ok(ComponentManifest {
+        service_provides: Vec::new(),
+        service_requires: Vec::new(),
         id: definition.id.into(),
         version: version.into(),
         file: filename,
@@ -3337,6 +3339,8 @@ mod external_component_tests {
     fn added_calls_require_a_selected_service_and_operator_approval() {
         let external = ExternalComponent {
             manifest: ComponentManifest {
+                service_provides: Vec::new(),
+                service_requires: Vec::new(),
                 id: "example.provider".into(),
                 version: "0.1.0".into(),
                 file: "provider.so".into(),
@@ -3416,6 +3420,8 @@ mod external_component_tests {
         let id = "example.library-replacement";
         let mut replacement = ExternalComponent {
             manifest: ComponentManifest {
+                service_provides: Vec::new(),
+                service_requires: Vec::new(),
                 id: id.into(),
                 version: "0.1.0".into(),
                 file: "replacement.so".into(),
@@ -3518,6 +3524,8 @@ mod external_component_tests {
     fn selected_set_rejects_duplicate_ordinary_and_native_services() {
         let mut component = ExternalComponent {
             manifest: ComponentManifest {
+                service_provides: Vec::new(),
+                service_requires: Vec::new(),
                 id: "example.provider".into(),
                 version: "0.1.0".into(),
                 file: "provider.so".into(),
@@ -3568,6 +3576,8 @@ mod external_component_tests {
     fn library_selection_rejects_conflicts_and_preserves_default_profile() {
         let component = |id: &str| ExternalComponent {
             manifest: ComponentManifest {
+                service_provides: Vec::new(),
+                service_requires: Vec::new(),
                 id: id.into(),
                 version: "0.1.0".into(),
                 file: format!("{id}.so"),
@@ -3644,6 +3654,8 @@ mod external_component_tests {
             .unwrap();
         }
         let mut replacement = ComponentManifest {
+            service_provides: Vec::new(),
+            service_requires: Vec::new(),
             id: "example.library-replacement".into(),
             version: "0.4.0".into(),
             file: "replacement.so".into(),
@@ -3875,6 +3887,8 @@ mod external_component_tests {
         let mut paths = Vec::new();
         for name in ["first", "second"] {
             let manifest = ComponentManifest {
+                service_provides: Vec::new(),
+                service_requires: Vec::new(),
                 id: format!("example.{name}"),
                 version: "0.1.0".into(),
                 file: format!("{name}.so"),
@@ -4033,6 +4047,8 @@ mod external_component_tests {
         let template = base.join("component.json");
         fs::write(&artifact, b"independently built").unwrap();
         let manifest = ComponentManifest {
+            service_provides: Vec::new(),
+            service_requires: Vec::new(),
             id: "example.display".into(),
             version: "0.1.0".into(),
             file: "example_display.so".into(),
@@ -4147,6 +4163,8 @@ mod external_component_tests {
         let template = root.join("component.json");
         let artifact = root.join("independent-library");
         let manifest = ComponentManifest {
+            service_provides: Vec::new(),
+            service_requires: Vec::new(),
             id: "example.display".into(),
             version: "0.1.0".into(),
             file: "example_display.so".into(),

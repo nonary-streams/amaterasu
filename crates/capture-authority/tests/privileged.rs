@@ -118,6 +118,8 @@ fn real_broker_scopes_sessions_and_revokes_a_running_unprivileged_worker() {
     json(&package_root.join("bootstrap.json"), &bootstrap);
     let artifact = b"not loaded: fixture worker implements only the broker protocol";
     let component = |id: &str, file: &str, runtime| ComponentManifest {
+        service_provides: Vec::new(),
+        service_requires: Vec::new(),
         id: id.into(),
         version: "0.1.0".into(),
         file: file.into(),

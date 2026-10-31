@@ -67,6 +67,53 @@ pub(super) fn validate(configuration: &RuntimeConfig) -> Result<(), String> {
         validate_hook(name, hook, configuration)?;
     }
     super::api::validate_approvals(configuration)?;
+    validate_selections(configuration)?;
+    Ok(())
+}
+
+fn validate_selections(configuration: &RuntimeConfig) -> Result<(), String> {
+    for (native, entries) in [
+        (false, &configuration.service_selections.broker),
+        (true, &configuration.service_selections.native),
+    ] {
+        if entries.len() > MAX_GRANTS_PER_KIND {
+            return Err("too many service selections".into());
+        }
+        for (service, selection) in entries {
+            if !valid_name(service) || service == amaterasu_contracts::HOST_LOG_SERVICE {
+                return Err(format!("invalid selected service: {service}"));
+            }
+            if let Some(selection) = selection {
+                let grants = configuration
+                    .principals
+                    .get(&selection.provider)
+                    .ok_or_else(|| format!("unknown selected provider for {service}"))?;
+                if !valid_name(&selection.contract)
+                    || !(if native {
+                        &grants.native_provide
+                    } else {
+                        &grants.provide
+                    })
+                    .contains(service)
+                {
+                    return Err(format!("ungranted selected provider for {service}"));
+                }
+            }
+        }
+    }
+    for approval in &configuration.api_methods {
+        if let Some(Some(selection)) = configuration
+            .service_selections
+            .broker
+            .get(&approval.method.service)
+            && selection.provider != approval.provider
+        {
+            return Err(format!(
+                "service selection conflicts with API approval for {}",
+                approval.method.service
+            ));
+        }
+    }
     Ok(())
 }
 

@@ -15,7 +15,50 @@ pub struct ComponentManifest {
     pub runtime: bool,
     #[serde(default)]
     pub requires: BTreeMap<String, String>,
+    /// Signed service metadata is a declaration, not runtime attestation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_provides: Vec<ServiceOffer>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub service_requires: Vec<ServiceRequirement>,
     pub requested: Grants,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ServiceTransport {
+    Raw,
+    Api,
+    Native,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceOffer {
+    pub transport: ServiceTransport,
+    pub service: String,
+    pub contract: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    pub major: u32,
+    pub minor: u32,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub capabilities: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceRequirement {
+    pub transport: ServiceTransport,
+    pub service: String,
+    pub contract: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    pub major: u32,
+    pub minor: u32,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub capabilities: BTreeSet<String>,
+    #[serde(default)]
+    pub optional: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -92,4 +135,12 @@ pub struct VerifiedPackage {
     pub signer_fingerprint: Option<String>,
     pub privileged_requests: Vec<crate::VerifiedPrivilegedRequest>,
     pub runtime_config: RuntimeConfig,
+    pub service_diagnostics: Vec<ServiceDiagnostic>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceDiagnostic {
+    pub consumer: String,
+    pub service: String,
+    pub transport: ServiceTransport,
 }

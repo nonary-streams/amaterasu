@@ -49,7 +49,12 @@ pub fn verify_package_with_progress(
         &digest,
         signer_fingerprint.as_deref(),
     )?;
-    let runtime_config = resolve_runtime_grants(bootstrap, &manifest.components);
+    let mut runtime_config = resolve_runtime_grants(bootstrap, &manifest.components);
+    let service_diagnostics = crate::service_selection::resolve(
+        &manifest.components,
+        &bootstrap.policy.service_selections,
+        &mut runtime_config,
+    )?;
 
     Ok(VerifiedPackage {
         manifest,
@@ -58,6 +63,7 @@ pub fn verify_package_with_progress(
         signer_fingerprint,
         privileged_requests,
         runtime_config,
+        service_diagnostics,
     })
 }
 
@@ -217,6 +223,7 @@ fn resolve_runtime_grants(
 ) -> RuntimeConfig {
     let mut runtime = RuntimeConfig {
         principals: BTreeMap::new(),
+        service_selections: Default::default(),
         legacy_native_contracts: BTreeMap::new(),
         api_methods: Vec::new(),
         hooks: bootstrap.policy.hooks.clone(),
@@ -343,6 +350,8 @@ mod tests {
                 .is_empty()
         );
         let mut component = ComponentManifest {
+            service_provides: Vec::new(),
+            service_requires: Vec::new(),
             id: principal.into(),
             version: "1".into(),
             file: "x".into(),

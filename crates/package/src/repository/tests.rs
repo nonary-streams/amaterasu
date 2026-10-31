@@ -104,6 +104,8 @@ impl Fixture {
         fs::write(output.join("runtime.bin"), artifact).unwrap();
         fs::write(output.join("capture.bin"), artifact).unwrap();
         let component = |id: &str, file: &str, runtime| ComponentManifest {
+            service_provides: Vec::new(),
+            service_requires: Vec::new(),
             id: id.into(),
             version: version.into(),
             file: file.into(),

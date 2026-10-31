@@ -87,6 +87,15 @@ impl LoadedComponents {
         progress: &mut dyn FnMut(usize) -> PackageResult<()>,
     ) -> PackageResult<Self> {
         crate::privilege::require_user_process()?;
+        if let Some(logger) = &product_logger {
+            for diagnostic in &package.service_diagnostics {
+                let message = format!(
+                    "optional {:?} service {} for {} is absent",
+                    diagnostic.transport, diagnostic.service, diagnostic.consumer
+                );
+                let _ = logger.emit(2, "host::services", &message);
+            }
+        }
         let runtime_component = package
             .manifest
             .components

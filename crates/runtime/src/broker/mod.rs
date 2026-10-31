@@ -203,14 +203,25 @@ impl Broker {
                 }
             }
             Command::Register { service } => {
-                if service == HOST_LOG_SERVICE || self.api.owns_service(&service) {
+                if service == HOST_LOG_SERVICE
+                    || self.api.owns_service(&service)
+                    || !self
+                        .configuration
+                        .service_selections
+                        .allows_broker(&service, caller)
+                {
                     errors::permission_denied()
                 } else {
                     self.requests.register_service(caller, grants, service)
                 }
             }
             Command::RegisterApi { method } => {
-                if method.service == HOST_LOG_SERVICE {
+                if method.service == HOST_LOG_SERVICE
+                    || !self
+                        .configuration
+                        .service_selections
+                        .allows_broker(&method.service, caller)
+                {
                     return errors::permission_denied();
                 }
                 let registered = self.api.register(caller, grants, method.clone());
