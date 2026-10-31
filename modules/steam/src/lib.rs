@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 const SERVICE: &str = "amaterasu.steam/1";
 const MANAGEMENT_CALLER: &str = "amaterasu.management";
+const LIBRARY_CALLER: &str = "amaterasu.library";
 
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -861,7 +862,12 @@ impl SteamModule {
                 | Action::ArtworkRead { .. }
                 | Action::ForceSync {}
         );
-        if is_management_action && !is_management_caller(caller) {
+        let library_artwork_read =
+            caller == LIBRARY_CALLER && matches!(&action, Action::ArtworkRead { .. });
+        if caller == "amaterasu.nvhttp"
+            || (caller == LIBRARY_CALLER && !library_artwork_read)
+            || (is_management_action && !is_management_caller(caller) && !library_artwork_read)
+        {
             return self.complete(id, json!({"ok":false,"code":"forbidden"}));
         }
         let is_settings_action = matches!(

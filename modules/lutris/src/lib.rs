@@ -20,6 +20,7 @@ use steam_catalog::{Progress as SteamProgress, SteamCatalogRead};
 
 pub const SERVICE: &str = "amaterasu.lutris/1";
 const MANAGEMENT_CALLER: &str = "amaterasu.management";
+const LIBRARY_CALLER: &str = "amaterasu.library";
 const LAUNCH_CALLER: &str = "amaterasu.launch";
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 const RECONCILIATION_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -598,7 +599,7 @@ fn artwork_response(
     game_id: i64,
     read: Option<(&str, u64)>,
 ) -> Value {
-    if !is_management_caller(caller) {
+    if !is_management_caller(caller) && !(caller == LIBRARY_CALLER && read.is_some()) {
         return json!({"ok":false,"code":"forbidden"});
     }
     if !enabled {
@@ -942,6 +943,35 @@ mod tests {
             manual: false,
             settings_epoch: 3,
         }
+    }
+
+    #[test]
+    fn library_caller_can_only_read_artwork() {
+        let read = Action::ArtworkRead {
+            game_id: 7,
+            revision: "revision".into(),
+            offset: 0,
+        };
+        assert!(caller_can_access(LIBRARY_CALLER, &read));
+        assert!(!caller_can_access(
+            LIBRARY_CALLER,
+            &Action::ArtworkGet { game_id: 7 }
+        ));
+        assert!(!caller_can_access(LIBRARY_CALLER, &Action::Refresh {}));
+        assert!(!caller_can_access(LIBRARY_CALLER, &Action::Status {}));
+        let store = artwork::ArtworkStore::default();
+        assert_ne!(
+            artwork_response(&store, true, LIBRARY_CALLER, 7, Some(("revision", 0)))["code"],
+            "forbidden"
+        );
+        assert_eq!(
+            artwork_response(&store, true, LIBRARY_CALLER, 7, None)["code"],
+            "forbidden"
+        );
+        assert_eq!(
+            artwork_response(&store, true, "amaterasu.other", 7, Some(("revision", 0)))["code"],
+            "forbidden"
+        );
     }
 
     #[test]
@@ -1514,7 +1544,9 @@ fn is_management_caller(caller: &str) -> bool {
 }
 
 fn caller_can_access(caller: &str, action: &Action) -> bool {
-    is_management_caller(caller) || (caller == LAUNCH_CALLER && matches!(action, Action::Status {}))
+    is_management_caller(caller)
+        || (caller == LAUNCH_CALLER && matches!(action, Action::Status {}))
+        || (caller == LIBRARY_CALLER && matches!(action, Action::ArtworkRead { .. }))
 }
 
 #[cfg(test)]

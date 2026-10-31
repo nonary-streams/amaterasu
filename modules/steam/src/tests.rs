@@ -505,7 +505,7 @@ fn product_settings_actions_require_the_management_principal() {
 }
 
 #[test]
-fn artwork_reads_are_management_only_and_require_a_current_discovery_record() {
+fn artwork_reads_allow_library_and_require_a_current_discovery_record() {
     let mut host = Box::new(FakeHost::default());
     host.product_get_results
         .push_back(persisted_settings(true, 1));
@@ -519,10 +519,18 @@ fn artwork_reads_are_management_only_and_require_a_current_discovery_record() {
         MANAGEMENT_CALLER,
         json!({"action":"artwork_read","app_id":42,"revision":"1","offset":0}),
     );
+    host.queue_service_request(
+        12,
+        LIBRARY_CALLER,
+        json!({"action":"artwork_read","app_id":42,"revision":"1","offset":0}),
+    );
+    host.queue_service_request(13, LIBRARY_CALLER, json!({"action":"refresh"}));
+    host.queue_service_request(14, LIBRARY_CALLER, json!({"action":"status"}));
     let mut module = start_test_module(&mut host);
 
-    module.tick().unwrap();
-    module.tick().unwrap();
+    for _ in 0..5 {
+        module.tick().unwrap();
+    }
 
     assert_eq!(
         host.completed[0],
@@ -531,6 +539,43 @@ fn artwork_reads_are_management_only_and_require_a_current_discovery_record() {
     assert_eq!(host.completed[1].0, 11);
     assert_eq!(host.completed[1].1["ok"], false);
     assert_eq!(host.completed[1].1["code"], "artwork_unavailable");
+    assert_eq!(host.completed[2].1["code"], "artwork_unavailable");
+    assert_eq!(host.completed[3].1["code"], "forbidden");
+    assert_eq!(host.completed[4].1["code"], "forbidden");
+}
+
+#[test]
+fn nvhttp_cannot_call_steam_directly_but_library_may_forward_artwork() {
+    let mut host = Box::new(FakeHost::default());
+    host.product_get_results
+        .push_back(persisted_settings(true, 1));
+    for (id, payload) in [
+        (20, json!({"action":"status"})),
+        (21, json!({"action":"list"})),
+        (22, json!({"action":"refresh"})),
+        (
+            23,
+            json!({"action":"artwork_read","app_id":42,"revision":"1","offset":0}),
+        ),
+    ] {
+        host.queue_service_request(id, "amaterasu.nvhttp", payload);
+    }
+    host.service_requests.push_back(Response::Request {
+        id: 24,
+        caller: LIBRARY_CALLER.into(),
+        initiator: "amaterasu.nvhttp".into(),
+        service: SERVICE.into(),
+        payload: json!({"action":"artwork_read","app_id":42,"revision":"1","offset":0}),
+        remaining_ms: CONFIGURATION_TIMEOUT_MS,
+    });
+    let mut module = start_test_module(&mut host);
+    for _ in 0..5 {
+        module.tick().unwrap();
+    }
+    for (_, response) in &host.completed[..4] {
+        assert_eq!(response["code"], "forbidden");
+    }
+    assert_eq!(host.completed[4].1["code"], "artwork_unavailable");
 }
 
 #[test]

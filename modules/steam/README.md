@@ -26,8 +26,9 @@ Explicit roots override platform defaults. Up to 32 configured roots and 64
 discovered libraries are supported. Paths must be native absolute paths. Root
 symlinks are canonicalized to support ordinary Steam layouts; manifest symlinks are
 rejected. This is trusted local-user discovery, not a filesystem sandbox or a
-cross-user session broker. Every caller granted `call` for this service can read
-the configured library metadata and initiate refresh. Payloads cannot supply new
+cross-user session broker. Callers granted `call` can read configured library
+metadata and initiate refresh, except `amaterasu.library`, which is restricted to
+artwork reads. Payloads cannot supply new
 filesystem roots. Provider requires `provide` for its service only.
 
 The domain-owned product setting `enabled` controls discovery. It defaults to
@@ -156,7 +157,7 @@ supported local PNG is served from its source file; local JPEG and WebP are
 decoded to bounded PNG and cached by source revision for chunk reads. Otherwise list records
 carry a stable opaque reference to the fixed Steam CDN portrait. The authenticated
 `POST /v1/steam/artwork_read` action fetches that image on demand and returns the
-same bounded chunks as local artwork. The CDN fetch follows no redirects, uses
+same bounded chunks as local artwork. The trusted `amaterasu.library` service may call `artwork_read` only. The CDN fetch follows no redirects, uses
 an eight-second timeout, accepts only JPEG portraits up to 16 MiB, converts
 them to bounded PNG before publication, keeps up to four images in memory,
 and cools down failed app IDs for ten minutes. The
