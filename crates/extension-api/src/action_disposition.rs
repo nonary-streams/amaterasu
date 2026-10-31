@@ -14,6 +14,7 @@ pub enum ActionResourceDispositionIntent {
 #[serde(deny_unknown_fields)]
 pub struct ActionResourceDispositionPlan {
     pub output_id: String,
+    pub resource_generation: u64,
     pub resource: ResourceRef,
     pub origin: LifecycleTarget,
     pub intent: ActionResourceDispositionIntent,
@@ -29,6 +30,7 @@ pub enum ActionResourceDispositionState {
 #[serde(deny_unknown_fields)]
 pub struct ActionResourceDispositionResult {
     pub output_id: String,
+    pub resource_generation: u64,
     pub resource: ResourceRef,
     pub origin: LifecycleTarget,
     pub state: ActionResourceDispositionState,
@@ -104,6 +106,7 @@ pub fn validate_action_disposition_plan(
     plan: &ActionResourceDispositionPlan,
 ) -> Result<(), String> {
     if !crate::valid_opaque_id(&plan.output_id)
+        || plan.resource_generation == 0
         || !valid_resource(&plan.resource)
         || !valid_origin(&plan.origin)
     {
@@ -122,6 +125,7 @@ pub fn validate_action_disposition_result(
     let new = &result.resource;
     if !valid_resource(new)
         || result.output_id != plan.output_id
+        || result.resource_generation != plan.resource_generation
         || result.origin != plan.origin
         || old.provider != new.provider
         || old.resource_id != new.resource_id
@@ -176,9 +180,9 @@ mod tests {
         let resource = json!({"provider":"owner","resource_id":"display","incarnation":"native","revision":3,"execution_domain":"seat","mutation_domain":"topology","mutation_domains":["topology"]});
         let origin =
             json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":2});
-        let plan = serde_json::from_value(json!({"plan_id":"plan","revision":1,"resources":[{"provider":"owner","resource_id":"display","incarnation":"native","expected_revision":3,"execution_domain":"seat","mutation_domains":["topology"],"access":"exclusive"}],"mutation_domains":[{"domain":"topology","expected_revision":1,"borrowers":{},"access":"exclusive"}],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[],"resource_disposition":{"output_id":"screen","resource":resource,"origin":origin,"intent":"release"}})).unwrap();
+        let plan = serde_json::from_value(json!({"plan_id":"plan","revision":1,"resources":[{"provider":"owner","resource_id":"display","incarnation":"native","expected_revision":3,"execution_domain":"seat","mutation_domains":["topology"],"access":"exclusive"}],"mutation_domains":[{"domain":"topology","expected_revision":1,"borrowers":{},"access":"exclusive"}],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[],"resource_disposition":{"output_id":"screen","resource_generation":7,"resource":resource,"origin":origin,"intent":"release"}})).unwrap();
         let result = serde_json::from_value(
-            json!({"output_id":"screen","resource":resource,"origin":origin,"state":"released"}),
+            json!({"output_id":"screen","resource_generation":7,"resource":resource,"origin":origin,"state":"released"}),
         )
         .unwrap();
         (plan, result)
@@ -191,6 +195,9 @@ mod tests {
         assert!(validate_action_disposition_result(&disposition, &result).is_ok());
         result.resource.revision += 1;
         assert!(validate_action_disposition_result(&disposition, &result).is_ok());
+        result.resource_generation = 8;
+        assert!(validate_action_disposition_result(&disposition, &result).is_err());
+        result.resource_generation = 7;
         result.resource.incarnation = "different".into();
         assert!(validate_action_disposition_result(&disposition, &result).is_err());
         result = fixtures().1;
