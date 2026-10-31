@@ -8,6 +8,8 @@ mod action_endpoints;
 mod action_release_proof;
 mod action_target;
 mod application;
+#[allow(dead_code)] // Checkpoint integration is not yet enabled.
+mod closed_stream;
 mod composed_release_proof;
 #[allow(dead_code)] // Admission and control remain disabled until schema verification is wired.
 mod composition;
