@@ -96,6 +96,7 @@ fn setup(enabled: bool) -> (Manager<Fake>, Rc<RefCell<Calls>>) {
 }
 fn create() -> Operation {
     Operation::Create {
+        hdr_enabled: false,
         identity: ID.into(),
         width: 1920,
         height: 1080,
@@ -107,6 +108,7 @@ fn create() -> Operation {
 }
 fn create_with_scale(dd_virtual_display_scale: i32) -> Operation {
     Operation::Create {
+        hdr_enabled: false,
         identity: ID.into(),
         width: 1920,
         height: 1080,
@@ -118,6 +120,7 @@ fn create_with_scale(dd_virtual_display_scale: i32) -> Operation {
 }
 fn create_with_reference(reference_id: &str) -> Operation {
     Operation::Create {
+        hdr_enabled: false,
         identity: ID.into(),
         width: 1920,
         height: 1080,
@@ -239,6 +242,7 @@ fn recovery_record(prospective_lease: Option<u64>) -> Record {
             name,
             ..
         } => Specification {
+            hdr_enabled: false,
             identity,
             width,
             height,

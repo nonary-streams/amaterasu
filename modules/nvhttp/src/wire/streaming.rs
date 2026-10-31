@@ -50,6 +50,7 @@ pub(super) fn launch_request(query: &Query) -> Result<LaunchRequest, &'static st
         return Err("invalid device name");
     }
     Ok(LaunchRequest {
+        hdr: query.get("hdrMode") == Some("1"),
         app_id,
         width,
         height,
@@ -80,31 +81,22 @@ fn validate_metadata(query: &Query) -> Result<(), &'static str> {
     // Moonlight can request SOPS for a Desktop stream. It is a client hint;
     // Amaterasu never changes the host display or application settings for it.
     optional_boolean(query, "sops")?;
-    require_optional_value(query, "hdrMode", "0", "HDR streaming is unsupported")?;
-    require_optional_value(
-        query,
-        "clientHdrCapVersion",
-        "0",
-        "HDR streaming is unsupported",
-    )?;
-    require_optional_value(
-        query,
-        "clientHdrCapSupportedFlagsInUint32",
-        "0",
-        "HDR streaming is unsupported",
-    )?;
-    require_optional_value(
-        query,
-        "clientHdrCapMetaDataId",
-        "0",
-        "HDR streaming is unsupported",
-    )?;
-    require_optional_value(
-        query,
-        "clientHdrCapDisplayData",
-        "",
-        "HDR streaming is unsupported",
-    )?;
+    optional_boolean(query, "hdrMode")?;
+    optional_decimal_mask(query, "clientHdrCapVersion", u32::MAX)?;
+    optional_decimal_mask(query, "clientHdrCapSupportedFlagsInUint32", u32::MAX)?;
+    if let Some(kind) = query.get("clientHdrCapMetaDataId")
+        && !matches!(kind, "0" | "NV_STATIC_METADATA_TYPE_1")
+    {
+        return Err("unsupported HDR metadata type");
+    }
+    if let Some(data) = query.get("clientHdrCapDisplayData")
+        && (data.len() > 512
+            || !data
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() || byte == b'x'))
+    {
+        return Err("invalid HDR display metadata");
+    }
     optional_boolean(query, "localAudioPlayMode")?;
     optional_boolean(query, "continuousAudio")?;
     // Slot hints are independent from permission to inject native input. Moonlight
@@ -329,7 +321,7 @@ mod tests {
             "&rikeyid=1"
         );
         for field in [
-            "hdrMode=1",
+            "hdrMode=2",
             "sops=2",
             "surroundAudioInfo=393223",
             "localAudioPlayMode=2",
@@ -442,15 +434,15 @@ mod tests {
     }
 
     #[test]
-    fn hdr_launch_request_from_moonlight_qt_is_still_refused() {
-        let error = parse(concat!(
+    fn hdr_launch_request_from_moonlight_qt_preserves_hdr_request() {
+        let request = parse(concat!(
             "appid=1&mode=1920x1080x60&rikey=00112233445566778899aabbccddeeff&rikeyid=1",
             "&hdrMode=1&clientHdrCapVersion=0&clientHdrCapSupportedFlagsInUint32=0",
             "&clientHdrCapMetaDataId=NV_STATIC_METADATA_TYPE_1",
             "&clientHdrCapDisplayData=0x0x0x0x0x0x0x0x0x0x0"
         ))
-        .err();
-        assert_eq!(error, Some("HDR streaming is unsupported"));
+        .unwrap();
+        assert!(request.hdr);
     }
 
     #[test]

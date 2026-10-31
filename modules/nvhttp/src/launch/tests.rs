@@ -361,6 +361,7 @@ fn peer_with_ds4_back_as_touchpad_click(
 
 fn request(key: u8) -> LaunchRequest {
     LaunchRequest {
+        hdr: false,
         app_id: 1,
         width: 1280,
         height: 720,
@@ -5538,6 +5539,7 @@ fn uhd_profile(encoder: EncoderSelection) -> StreamingConfig {
 
 fn uhd_request(key: u8) -> LaunchRequest {
     LaunchRequest {
+        hdr: false,
         width: 3840,
         height: 2160,
         fps: 120,
@@ -5624,6 +5626,7 @@ fn software_codecs_keep_negotiation_within_the_software_limit() {
     ]));
     let mut broker = Broker::default();
     let full_hd = LaunchRequest {
+        hdr: false,
         width: 1920,
         height: 1080,
         fps: 60,
@@ -5722,11 +5725,16 @@ fn external_capture_alias_flows_from_startup_to_rtsp() {
     let mut broker = Broker::default();
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
     let _ = poll_until_reply(&mut controller, &mut broker, now);
-    let open = broker.commands.iter().find_map(|command| match command {
-        Command::Request { service, payload, .. }
-            if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
-        _ => None,
-    }).expect("RTSP open request");
+    let open = broker
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.rtsp/1" && payload["action"] == "open" => Some(payload),
+            _ => None,
+        })
+        .expect("RTSP open request");
     assert_eq!(open["capture"]["capture_provider"], "acme_capture-1");
     assert_eq!(open["capture"]["output"], "display-one");
     assert_eq!(open["capture"]["constant_rate"], false);
@@ -5735,9 +5743,18 @@ fn external_capture_alias_flows_from_startup_to_rtsp() {
 #[test]
 fn external_capture_alias_rejects_invalid_names_and_builtin_override_works() {
     for alias in ["", "Upper", "raw.service/1", "space name", &"a".repeat(65)] {
-        assert!(serde_json::from_value::<CaptureProvider>(json!(alias)).is_err(), "{alias}");
+        assert!(
+            serde_json::from_value::<CaptureProvider>(json!(alias)).is_err(),
+            "{alias}"
+        );
     }
     let external = CaptureProvider::External("acme".into());
-    assert_eq!(CaptureMode::Auto.resolve(external.clone()), (external.clone(), false));
-    assert_eq!(CaptureMode::Wgcc.resolve(external), (CaptureProvider::Wgc, true));
+    assert_eq!(
+        CaptureMode::Auto.resolve(external.clone()),
+        (external.clone(), false)
+    );
+    assert_eq!(
+        CaptureMode::Wgcc.resolve(external),
+        (CaptureProvider::Wgc, true)
+    );
 }

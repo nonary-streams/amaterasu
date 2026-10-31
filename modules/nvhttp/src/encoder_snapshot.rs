@@ -14,6 +14,8 @@ use serde_json::Value;
 const SCM_H264: u32 = 0x0000_0001;
 const SCM_HEVC: u32 = 0x0000_0100;
 const SCM_AV1_MAIN8: u32 = 0x0001_0000;
+const SCM_HEVC_MAIN10: u32 = 0x0000_0200;
+const SCM_AV1_MAIN10: u32 = 0x0002_0000;
 
 /// Moonlight treats any nonzero `MaxLumaPixelsHEVC` as HEVC encode support and
 /// zero as none. This is the luma rate Sunshine reports for HEVC hosts.
@@ -33,6 +35,7 @@ struct EncoderEntry {
     codec: Option<VideoCodec>,
     identity: Option<EncoderIdentity>,
     hardware: bool,
+    hdr10: bool,
 }
 
 /// Enumerated encoders in registry order, so a numeric encoder selection
@@ -114,6 +117,20 @@ impl EncoderSnapshot {
         if self.has(VideoCodec::Av1) {
             codec_mode_support |= SCM_AV1_MAIN8;
         }
+        if self
+            .entries
+            .iter()
+            .any(|e| e.codec == Some(VideoCodec::Hevc) && e.hdr10)
+        {
+            codec_mode_support |= SCM_HEVC_MAIN10;
+        }
+        if self
+            .entries
+            .iter()
+            .any(|e| e.codec == Some(VideoCodec::Av1) && e.hdr10)
+        {
+            codec_mode_support |= SCM_AV1_MAIN10;
+        }
         CodecAdvertisement {
             codec_mode_support,
             max_luma_pixels_hevc: if self.has(VideoCodec::Hevc) {
@@ -188,6 +205,21 @@ impl EncoderSnapshot {
         })
     }
 
+    pub fn hdr_offer(
+        &self,
+        selection: EncoderSelection,
+        mode: StreamMode,
+    ) -> Result<CodecOffer, &'static str> {
+        let mut snapshot = self.clone();
+        // Keep indices stable for an explicitly numbered selection.
+        for entry in &mut snapshot.entries {
+            if !entry.hdr10 {
+                entry.codec = None;
+            }
+        }
+        snapshot.offer(selection, mode)
+    }
+
     fn has(&self, codec: VideoCodec) -> bool {
         self.entries.iter().any(|entry| entry.codec == Some(codec))
     }
@@ -228,6 +260,11 @@ fn encoder_entry(encoder: &Value) -> Result<EncoderEntry, &'static str> {
             _ => None,
         },
         hardware,
+        hdr10: hardware
+            && encoder
+                .get("hdr10")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
     })
 }
 

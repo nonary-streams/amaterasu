@@ -222,6 +222,7 @@ impl Manager {
                 None,
             ),
             Operation::Create {
+                hdr_enabled,
                 identity,
                 width,
                 height,
@@ -251,6 +252,7 @@ impl Manager {
                     return (failure("startup_reconciliation_pending"), None);
                 }
                 let specification = Specification {
+                    hdr_enabled,
                     identity,
                     width,
                     height,

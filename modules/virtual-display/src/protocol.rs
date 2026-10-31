@@ -234,6 +234,7 @@ mod tests {
     #[test]
     fn fixed_wire_layout_uses_documented_offsets_and_owned_capability() {
         let spec = Specification {
+            hdr_enabled: false,
             identity: "00000000-0000-0000-0000-000000000001".into(),
             width: 1920,
             height: 1080,
@@ -294,6 +295,7 @@ mod tests {
     #[test]
     fn state_requires_unique_exact_specification() {
         let spec = Specification {
+            hdr_enabled: false,
             identity: "00000000-0000-0000-0000-000000000001".into(),
             width: 1920,
             height: 1080,

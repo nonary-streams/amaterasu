@@ -315,3 +315,11 @@ authorization generation, revoking existing sessions when the host next starts.
 It retains the staged bundle and publisher history. Close every browser tab that
 was open before withdrawal: a script already loaded in a tab can still execute.
 This local action does not revoke the publisher's key elsewhere.
+
+The default plugin uses the released `WAIT_PRESENT` / `GET_FRAME` driver ABI and
+borrows DMA-BUF descriptors through capture v1.5, without a capture-side copy or
+a driver upgrade. It does not promise immutable retained pixels.
+`gpu_snapshot:true` requests private GPU copies and retained-frame interfaces.
+The experimental `driver-read-leases` build feature must be enabled on both
+plugin and helper to use the new driver lease ABI; only that mode requires a
+matching driver upgrade and delays buffer retirement while a frame is held.

@@ -41,6 +41,7 @@ const PCM_READ_BUDGET: usize = 32;
 #[derive(Clone, Copy)]
 pub struct Handles {
     pub video: u64,
+    pub hdr: bool,
     pub audio_capture: Option<u64>,
     pub audio_encoder: Option<u64>,
     pub media_transport: u64,

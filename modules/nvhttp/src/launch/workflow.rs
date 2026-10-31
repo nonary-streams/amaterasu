@@ -320,6 +320,9 @@ impl Controller {
                     "encrypt_audio": config.profile.encrypt_audio,
                     "permit_legacy_audio_iv_wrap": config.profile.permit_legacy_audio_iv_wrap,
                 });
+                if record.request.hdr {
+                    profile["hdr"] = json!(true);
+                }
                 let offer = &record.video_codec_offer;
                 if offer.codecs != [amaterasu_media::VideoCodec::H264] {
                     profile["codecs"] = json!(offer.codecs);
@@ -1263,16 +1266,6 @@ fn build_display_request(record: &Record) -> Result<Option<Value>, &'static str>
     let refresh_rate_option = effective
         .get("dd_refresh_rate_option")
         .and_then(Value::as_str);
-    if effective.get("dd_hdr_option").and_then(Value::as_str) == Some("auto")
-        || matches!(
-            effective
-                .get("dd_hdr_request_override")
-                .and_then(Value::as_str),
-            Some("auto" | "force_on")
-        )
-    {
-        return Err("display_hdr_fact_unavailable");
-    }
     // The current authenticated launch request carries no optimize-game-settings
     // choice. Only policies that cannot observe that choice are projected.
     if !client_mode_override
@@ -1341,6 +1334,7 @@ fn build_display_request(record: &Record) -> Result<Option<Value>, &'static str>
     });
     let mut policy = json!({
         "display_id":selected,
+        "effective_client_hdr_request":record.request.hdr,
         "configuration_option":option,
         "remapping":remapping,
         "context":{
@@ -1800,7 +1794,11 @@ fn project_application_policy(
         fps: record.request.fps,
     };
     record.video_codec_offer = match &record.encoder_snapshot {
+        Some(snapshot) if record.request.hdr => {
+            snapshot.hdr_offer(record.selected_encoder.clone(), mode)?
+        }
         Some(snapshot) => snapshot.offer(record.selected_encoder.clone(), mode)?,
+        None if record.request.hdr => return Err("HDR encoder capabilities are not known yet"),
         None => crate::encoder_snapshot::unknown_encoders_offer(mode)?,
     };
     record.scoped_ds4_back_as_touchpad_click = record
@@ -2605,9 +2603,7 @@ fn virtual_display_mode_policy(
             .and_then(Value::as_str)
             .map(str::to_owned),
         hdr_option: Some(hdr_option),
-        // The NVHTTP wire contract rejects hdrMode=1 today, so false is an
-        // explicit fact rather than an inference from missing SDP data.
-        effective_client_hdr_request: Some(false),
+        effective_client_hdr_request: Some(record.request.hdr),
     };
     policy
         .validate()

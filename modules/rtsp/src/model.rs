@@ -345,6 +345,8 @@ impl<'de> Deserialize<'de> for CaptureProvider {
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Profile {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hdr: bool,
     /// The only codec the client may negotiate when `codecs` is empty.
     #[serde(
         default,
@@ -381,6 +383,7 @@ pub(crate) struct EncryptionSnapshot {
 impl Default for Profile {
     fn default() -> Self {
         Self {
+            hdr: false,
             codec: amaterasu_media::VideoCodec::H264,
             codecs: Vec::new(),
             width: 1920,
@@ -933,8 +936,13 @@ impl Open {
         } else {
             profile.matches_video(announce)
         };
-        if announce.video.format.bit_depth != 8
-            || announce.video.format.dynamic_range != amaterasu_module_sdk::DynamicRange::Sdr
+        let hdr = announce.video.format.dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr;
+        let format_allowed = if profile.hdr {
+            cfg!(target_os = "linux") && hdr && announce.video.format.bit_depth == 10
+        } else {
+            !hdr && announce.video.format.bit_depth == 8
+        };
+        if !format_allowed
             || !video_matches
             || !audio_matches
             || !profile.matches_transport(announce)

@@ -233,6 +233,7 @@ mod tests {
         ));
         let path = root.join("leases.jsonl");
         let specification = Specification {
+            hdr_enabled: false,
             identity: "00000000-0000-0000-0000-000000000001".into(),
             width: 1920,
             height: 1080,

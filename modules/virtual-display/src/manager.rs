@@ -326,6 +326,7 @@ impl<D: Driver> Manager<D> {
                 reference_id,
             } => self.status(caller, identity, reference_id),
             Operation::Create {
+                hdr_enabled,
                 identity,
                 width,
                 height,
@@ -360,6 +361,7 @@ impl<D: Driver> Manager<D> {
                 self.create(
                     caller,
                     Specification {
+                        hdr_enabled,
                         identity,
                         width,
                         height,

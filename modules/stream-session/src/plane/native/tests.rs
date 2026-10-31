@@ -207,6 +207,7 @@ unsafe extern "C" fn drain(_: *mut c_void, _: u64) -> Status {
 
 fn handles() -> Handles {
     Handles {
+        hdr: false,
         video: 10,
         audio_capture: Some(20),
         audio_encoder: Some(30),
@@ -220,6 +221,7 @@ fn handles() -> Handles {
 
 fn disabled_audio_handles() -> Handles {
     Handles {
+        hdr: false,
         video: 10,
         audio_capture: None,
         audio_encoder: None,

@@ -191,3 +191,32 @@ fn sdk_identity_selection_pins_the_exact_encoder_and_software_filters_hardware()
         Err("no hardware encoder for this stream mode")
     );
 }
+
+#[test]
+fn hdr_offers_require_explicit_ten_bit_capability_and_preserve_indices() {
+    let mut hdr = encoder("amaterasu.hardware.nvenc-cuda.hevc", "hevc", true);
+    hdr["hdr10"] = json!(true);
+    let snapshot = snapshot(vec![
+        encoder("sdr-hevc", "hevc", true),
+        hdr,
+        encoder("software", "hevc", false),
+    ]);
+    assert_eq!(snapshot.advertisement().codec_mode_support & 0x200, 0x200);
+    assert!(
+        snapshot
+            .hdr_offer(EncoderSelection::Index(0), FULL_HD_60)
+            .is_err()
+    );
+    assert_eq!(
+        snapshot
+            .hdr_offer(EncoderSelection::Index(1), FULL_HD_60)
+            .unwrap()
+            .codecs,
+        [VideoCodec::Hevc]
+    );
+    assert!(
+        snapshot
+            .hdr_offer(EncoderSelection::Index(2), FULL_HD_60)
+            .is_err()
+    );
+}

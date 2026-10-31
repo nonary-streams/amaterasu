@@ -295,6 +295,14 @@ impl Record {
         let audio_handle = |resource| self.config.stream_audio.then(|| get(resource)).transpose();
         Ok(Handles {
             video: get(Resource::Video)?,
+            hdr: self
+                .start
+                .as_ref()
+                .ok_or("missing_start_configuration")?
+                .configuration
+                .video_stream_format
+                .dynamic_range
+                == amaterasu_module_sdk::DynamicRange::Hdr,
             audio_capture: audio_handle(Resource::AudioCapture)?,
             audio_encoder: audio_handle(Resource::AudioEncoder)?,
             media_transport: get(Resource::Media)?,

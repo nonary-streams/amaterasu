@@ -335,15 +335,18 @@ request for frame export. The generated provider selects `authority_channel:true
 and `gpu_snapshot:true`. The protected broker launches the approved unprivileged
 worker and the host injects its private channel; user policy cannot name an
 authoritative descriptor. Build capture-vkms with
-`linux-kwin-geometry,linux-gpu-snapshot` for this mode. Its snapshot implementation
-must preserve immutable frame contents, rather than merely duplicate mutable
-scanout descriptors. Missing snapshot support or unavailable approved authority
-fails explicitly.
+`linux-kwin-geometry` for this mode. The default build uses the existing `WAIT_PRESENT` / `GET_FRAME` driver ABI
+and advertises capture v1.5 borrowed DMA-BUF delivery. It does not require the
+experimental driver lease ioctl. `linux-gpu-snapshot` and `gpu_snapshot:true`
+opt into private GPU copies and retained-frame interfaces. Only building both
+provider and helper with `driver-read-leases` requires the experimental leased
+export; that mode fails explicitly if the matching driver is unavailable.
+Unavailable approved authority always fails explicitly.
 
 Private snapshots preserve supported 8-bit and 10-bit RGB storage; unsupported
 imports or insufficient framebuffer precision fail instead of reducing precision.
 Rendered pixel accuracy and multi-GPU operation still need hardware testing.
-PQ/BT.2020 HDR signaling remains unsupported in this KMS pipeline.
+The guarded HDR path uses capture v1.9 metadata, preserves PQ/BT.2020 RGB10, and supplies HDR10 to the native NVENC/CUDA HEVC and AV1 encoders. See [HDR capture](hdr-capture.md) for its requirements and qualification boundary.
 
 The older `--frame-helper ABSOLUTE_PATH` remains a mutually exclusive,
 separately authorized compatibility mode. Package authority never falls back to
@@ -355,3 +358,20 @@ service.
 
 Unit and simulated integration tests do not establish a real KWin, driver,
 GPU-encoder or client playback result. Qualify those paths on the target host.
+
+### Required GPU leases
+
+The VKMS plugin accepts `require_lease:true` with `gpu_snapshot:true` when built
+with `driver-read-leases,linux-kwin-geometry,linux-gpu-snapshot`; its helper must
+also be built with `driver-read-leases`. This requests the new driver read guard,
+waits for the GPU snapshot and releases its temporary source import, then lends
+the independent immutable snapshot. This introduces one GPU capture copy and
+performs no CPU pixel readback.
+
+Set `require_frame_lease:true` in the video component as well. The video pipeline
+then requires both capture and encoder lease interfaces and refuses borrowed or
+CPU fallback on startup and runtime failures. The plugin independently refuses
+its ordinary borrowed read callback when `require_lease` is set. A missing driver,
+helper, GPU snapshot backend or encoder lease interface is a failure, not a
+silently different delivery mode. The encoder completes GPU source reads before
+returning a synchronous lease submission, and cancellation joins that work.

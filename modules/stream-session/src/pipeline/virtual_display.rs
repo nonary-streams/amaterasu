@@ -23,6 +23,7 @@ pub(super) fn create(record: &Record) -> Value {
         "width":intent.width,
         "height":intent.height,
         "refresh_millihz":intent.refresh_millihz,
+        "hdr_enabled":intent.display_policy.as_ref().and_then(|policy| policy.effective_client_hdr_request).unwrap_or(false),
         "dd_virtual_display_scale":intent.dd_virtual_display_scale,
     })
 }
@@ -496,7 +497,8 @@ mod owned {
             .expect("start precedes virtual display allocation")
             .configuration;
         json!({"action":"create","identity":identity(record),"width":configuration.width,"height":configuration.height,
-        "refresh_millihz":configuration.fps*1000,"name":"Amaterasu"})
+        "refresh_millihz":configuration.fps*1000,"name":"Amaterasu",
+        "hdr_enabled":configuration.video_stream_format.dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr})
     }
     pub(in super::super) fn owned_status(record: &Record) -> Value {
         json!({"action":"status","identity":identity(record)})

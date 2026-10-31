@@ -133,6 +133,7 @@ fn fixture() -> (
 }
 fn specification(identity: &str) -> Specification {
     Specification {
+        hdr_enabled: false,
         identity: identity.into(),
         width: 1920,
         height: 1080,
@@ -432,6 +433,7 @@ fn linux_shared_references_persist_and_release_only_the_last_connector_owner() {
         stopped,
     };
     let create = |reference: Option<&str>| crate::model::Operation::Create {
+        hdr_enabled: false,
         identity: FIRST.into(),
         width: 1920,
         height: 1080,

@@ -11,6 +11,8 @@ mod control;
 pub use control::*;
 mod clock;
 pub use clock::*;
+mod hdr;
+pub use hdr::*;
 mod color;
 pub use color::*;
 mod dmabuf;

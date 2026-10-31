@@ -62,6 +62,7 @@ pub(crate) struct VideoEncryptionPolicySnapshot {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct LaunchRequest {
+    pub hdr: bool,
     pub app_id: u32,
     pub width: u32,
     pub height: u32,

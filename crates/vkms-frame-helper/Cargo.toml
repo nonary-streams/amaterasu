@@ -5,6 +5,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+driver-read-leases = []
+
 # The library holds only the unprivileged wire protocol and descriptor channel
 # shared with the capture module. The provider builds the privileged binary.
 [lib]

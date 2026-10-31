@@ -156,6 +156,8 @@ impl Default for Settings {
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
     Create {
+        #[serde(default)]
+        hdr_enabled: bool,
         identity: String,
         width: u32,
         height: u32,
@@ -185,6 +187,8 @@ pub enum Operation {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Specification {
+    #[serde(default)]
+    pub hdr_enabled: bool,
     pub identity: String,
     pub width: u32,
     pub height: u32,

@@ -16,9 +16,48 @@ pub(super) struct NativeBackend {
     media: NativeBinding,
     control: NativeBinding,
     handles: Handles,
+    last_hdr: Option<HdrMetadata>,
 }
 
 impl NativeBackend {
+    fn update_hdr(&mut self) -> PlaneResult<()> {
+        if !self.handles.hdr {
+            return Ok(());
+        }
+        // SAFETY: header is inspected before the additive video v1.2 tail.
+        let prefix =
+            unsafe { self.video.table::<VideoApi>() }.map_err(|_| "native_layout_mismatch")?;
+        if prefix.base.header.minor < 2 {
+            return Err("video_hdr_metadata_unsupported");
+        }
+        let api =
+            unsafe { self.video.table::<VideoApiV1_2>() }.map_err(|_| "native_layout_mismatch")?;
+        let mut metadata = HdrMetadata::default();
+        match unsafe { (api.hdr_metadata)(api.base.context, self.handles.video, &mut metadata) } {
+            MEDIA_PENDING | MEDIA_BUSY => return Ok(()),
+            STATUS_OK if metadata.enabled == 1 && metadata.reserved == 0 => {}
+            _ => return Err("video_hdr_metadata_unavailable"),
+        }
+        if self.last_hdr == Some(metadata) {
+            return Ok(());
+        }
+        let mut payload = vec![1u8];
+        for field in metadata.fields {
+            payload.extend_from_slice(&field.to_le_bytes());
+        }
+        payload.extend_from_slice(&0u16.to_le_bytes()); // optional max full-frame luminance
+        let message = HostFeedbackMessage {
+            message_type: 0x010e,
+            channel: 0,
+            delivery: HostFeedbackDelivery::Reliable,
+            payload,
+        };
+        if self.send_feedback(&message)? {
+            self.last_hdr = Some(metadata);
+        }
+        Ok(())
+    }
+
     pub(super) fn new(runtime: &RuntimeClient, handles: Handles) -> PlaneResult<Self> {
         let video = bind::<VideoApi>(runtime, "amaterasu.video/1")?;
         let (capture, encoder) = match (
@@ -43,6 +82,7 @@ impl NativeBackend {
             media: bind::<MediaTransportApi>(runtime, "amaterasu.media-transport/1")?,
             control: bind::<ControlTransportApi>(runtime, "amaterasu.control-transport/1")?,
             handles,
+            last_hdr: None,
         })
     }
 }
@@ -58,6 +98,7 @@ fn bind<T>(runtime: &RuntimeClient, service: &str) -> PlaneResult<NativeBinding>
 
 impl Backend for NativeBackend {
     fn desktop_geometry(&mut self) -> PlaneResult<Option<CaptureGeometry>> {
+        self.update_hdr()?;
         // SAFETY: the retained binding was validated for the v1.0 prefix. Only
         // inspect the optional v1.1 tail when both version and size advertise it.
         let prefix =

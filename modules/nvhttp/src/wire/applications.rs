@@ -46,6 +46,7 @@ pub(super) struct Applications {
     entries: usize,
     pages: usize,
     desktop_enabled: bool,
+    hdr_supported: bool,
     body: String,
 }
 
@@ -57,6 +58,7 @@ impl Applications {
             entries: 0,
             pages: 0,
             desktop_enabled,
+            hdr_supported: false,
             body: PREFIX.into(),
         }
     }
@@ -149,6 +151,12 @@ impl Applications {
             self.body.push_str(&desktop_xml());
         }
         self.body.push_str(SUFFIX);
+        if self.hdr_supported {
+            self.body = self.body.replace(
+                "<IsHdrSupported>0</IsHdrSupported>",
+                "<IsHdrSupported>1</IsHdrSupported>",
+            );
+        }
         Reply {
             status: 200,
             content_type: "application/xml; charset=utf-8",
@@ -255,6 +263,8 @@ impl Router {
             );
             return None;
         };
+        applications.hdr_supported =
+            self.launches.codec_advertisement().codec_mode_support & 0x20200 != 0;
         let result = match result {
             Ok(payload)
                 if applications.desktop_enabled

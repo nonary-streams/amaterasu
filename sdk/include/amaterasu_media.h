@@ -558,6 +558,17 @@ typedef struct {
     AmaterasuStatus (*send)(void *context, uint64_t stream, const AmaterasuControlMessage *message);
     AmaterasuStatus (*receive)(void *context, uint64_t stream, AmaterasuControlMessageSink sink);
 } AmaterasuControlTransportApi;
+/* HDR metadata is tied to a completed capture presentation. Fields: RGB xy,
+ * white xy (1/50000), max nits, min 1/10000 nit, MaxCLL and MaxFALL. */
+typedef struct { uint32_t enabled; uint16_t fields[12]; uint32_t reserved; } AmaterasuHdrMetadata;
+typedef struct {
+    AmaterasuCaptureApiV1_8 base;
+    AmaterasuStatus (*hdr_metadata)(void *, uint64_t, AmaterasuHdrMetadata *);
+} AmaterasuCaptureApiV1_9;
+typedef struct {
+    AmaterasuVideoApiV1_1 base;
+    AmaterasuStatus (*hdr_metadata)(void *, uint64_t, AmaterasuHdrMetadata *);
+} AmaterasuVideoApiV1_2;
 #ifdef __cplusplus
 }
 #endif

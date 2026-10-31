@@ -1267,10 +1267,10 @@ fn apply_actions(
             .hdr_enabled
             .is_some_and(|hdr| output.get("hdr").and_then(Value::as_bool) != Some(hdr))
         {
-            return Err(DisplayError::new(
-                "unsupported_topology",
-                "KScreen apply does not support changing HDR state",
-            ));
+            actions.push(KScreenAction::Hdr {
+                output: output_name(output)?.to_owned(),
+                enabled: display.hdr_enabled.expect("checked HDR request"),
+            });
         }
     }
     Ok(actions)

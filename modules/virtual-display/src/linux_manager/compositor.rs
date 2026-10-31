@@ -83,6 +83,7 @@ impl Compositor for KScreen {
             .ok_or("requested owned display mode is unavailable")?;
         let target = OwnedTarget {
             mode: selected,
+            hdr: specification.hdr_enabled,
             scale: scale.factor(specification.width, specification.height),
         };
         if let Placement::Exclusive { keep } = placement {
@@ -175,6 +176,7 @@ fn valid_output_name(name: &str) -> bool {
 struct OwnedTarget {
     mode: String,
     scale: Option<f64>,
+    hdr: bool,
 }
 impl OwnedTarget {
     /// Like Vibeshine, ask for adaptive sync so the compositor presents at the
@@ -186,8 +188,14 @@ impl OwnedTarget {
             format!("output.{output}.mode.{}", self.mode),
             format!("output.{output}.rotation.none"),
             format!("output.{output}.position.{x},0"),
-            format!("output.{output}.hdr.disable"),
-            format!("output.{output}.wcg.disable"),
+            format!(
+                "output.{output}.hdr.{}",
+                if self.hdr { "enable" } else { "disable" }
+            ),
+            format!(
+                "output.{output}.wcg.{}",
+                if self.hdr { "enable" } else { "disable" }
+            ),
             format!("output.{output}.vrrpolicy.always"),
             format!("output.{output}.priority.{priority}"),
         ];
@@ -209,8 +217,8 @@ impl OwnedTarget {
             && actual["pos"]["y"].as_i64() == Some(0)
             && actual["currentModeId"].as_str() == Some(&self.mode)
             && actual["rotation"] == 1
-            && actual["hdr"] == false
-            && actual["wcg"] == false
+            && actual["hdr"] == self.hdr
+            && actual["wcg"] == self.hdr
     }
 }
 fn query() -> Result<Value, String> {
@@ -367,6 +375,7 @@ mod tests {
         assert_eq!(right_edge_of(&configuration, kept).unwrap(), 4480);
         assert_eq!(right_edge_of(&configuration, |_| false).unwrap(), 0);
         let automatic = OwnedTarget {
+            hdr: false,
             mode: "7".into(),
             scale: Some(2.5),
         };
@@ -376,6 +385,7 @@ mod tests {
         assert!(arguments.contains(&"output.Virtual-3.scale.2.5".into()));
         assert!(arguments.contains(&"output.Virtual-3.vrrpolicy.always".into()));
         let retained = OwnedTarget {
+            hdr: false,
             mode: "7".into(),
             scale: None,
         };
