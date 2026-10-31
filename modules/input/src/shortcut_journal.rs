@@ -46,6 +46,7 @@ pub(crate) struct DispatchIntent {
 pub(crate) enum IntentPhase {
     Pending,
     Dispatching,
+    Finishing,
     Terminal,
     RecoveryRequired,
 }
@@ -124,8 +125,10 @@ impl Journal {
                                     intent.phase,
                                     IntentPhase::Pending | IntentPhase::Dispatching
                                 ) && intent.result.is_some())
-                                || (intent.phase == IntentPhase::Terminal
-                                    && intent.result.is_none())
+                                || (matches!(
+                                    intent.phase,
+                                    IntentPhase::Finishing | IntentPhase::Terminal
+                                ) && intent.result.is_none())
                                 || (record.phase != Phase::Delivered
                                     && intent.phase != IntentPhase::Pending)
                         })
@@ -268,11 +271,13 @@ impl Journal {
             (IntentPhase::Pending, IntentPhase::Dispatching)
                 | (
                     IntentPhase::Dispatching,
-                    IntentPhase::Terminal | IntentPhase::RecoveryRequired
+                    IntentPhase::Finishing | IntentPhase::RecoveryRequired
                 )
+                | (IntentPhase::Finishing, IntentPhase::Terminal)
         );
         if !valid
-            || (phase == IntentPhase::Terminal && result.is_none())
+            || (matches!(phase, IntentPhase::Finishing | IntentPhase::Terminal) && result.is_none())
+            || (phase == IntentPhase::Terminal && result != intent.result)
             || (phase == IntentPhase::Dispatching && result.is_some())
         {
             return Err(JournalError::InvalidTransition);
@@ -464,6 +469,40 @@ mod tests {
             Err(JournalError::ReceiptExpired)
         );
         journal.validate().unwrap();
+    }
+
+    #[test]
+    fn unfinished_lifecycle_confirmation_survives_recovery_and_blocks_eviction() {
+        let mut journal = Journal::new("epoch".into()).unwrap();
+        journal.admit(0, 1, armed("a")).unwrap();
+        journal
+            .finish(1, 1, Phase::Delivered, Some(json!({"ok":true})))
+            .unwrap();
+        journal
+            .transition_intent(2, 1, 0, IntentPhase::Dispatching, None)
+            .unwrap();
+        let result = json!({"status":"succeeded"});
+        journal
+            .transition_intent(3, 1, 0, IntentPhase::Finishing, Some(result.clone()))
+            .unwrap();
+        assert!(!journal.recover(4).unwrap());
+        assert_eq!(
+            journal.lookup(1).unwrap().intents[0].phase,
+            IntentPhase::Finishing
+        );
+        assert_eq!(
+            journal.transition_intent(
+                4,
+                1,
+                0,
+                IntentPhase::Terminal,
+                Some(json!({"status":"other"}))
+            ),
+            Err(JournalError::InvalidTransition)
+        );
+        journal
+            .transition_intent(4, 1, 0, IntentPhase::Terminal, Some(result))
+            .unwrap();
     }
 
     #[test]
