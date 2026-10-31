@@ -1061,15 +1061,39 @@ impl Coordinator {
                 next.receipts.get_mut(&key).unwrap().work = Some(work.clone());
                 save(&self.shared, next)?;
             }
-            if work.action_transfer.is_some() {
-                if !work.providers.is_empty() {
-                    self.fail_work(&key, "action_provider_cleanup_not_implemented")?;
+            if let Some(transfer) = &work.action_transfer {
+                if transfer.stage != ActionTransferStage::CleanupPending {
                     continue;
                 }
-                if let Err(reason) = self.complete_action_barrier(&key, &work) {
-                    self.fail_work(&key, &reason)?;
+                let composed_release = work.phase == LifecyclePhase::StreamRelease
+                    && work
+                        .provider_graph
+                        .as_ref()
+                        .is_some_and(|graph| graph.order.len() > 1)
+                    && work.providers.iter().all(|provider| {
+                        self.settings.participants.iter().any(|participant| {
+                            participant.provider == *provider
+                                && participant.contract_version
+                                    == amaterasu_extension_api::COMPOSITION_VERSION
+                        })
+                    });
+                if composed_release {
+                    if work.index >= work.providers.len() {
+                        if let Err(reason) = self.complete_composed_action_release(&key, &work) {
+                            self.fail_work(&key, &reason)?;
+                        }
+                        continue;
+                    }
+                } else {
+                    if !work.providers.is_empty() {
+                        self.fail_work(&key, "action_provider_cleanup_not_implemented")?;
+                        continue;
+                    }
+                    if let Err(reason) = self.complete_action_barrier(&key, &work) {
+                        self.fail_work(&key, &reason)?;
+                    }
+                    continue;
                 }
-                continue;
             }
             if matches!(
                 work.phase,
@@ -1906,6 +1930,87 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Preserve the transferred action while atomically publishing a verified
+    /// graph release and requiring a fresh owner plan before any owner effect.
+    fn complete_composed_action_release(&self, key: &str, work: &Work) -> ModuleResult<()> {
+        let transfer = work
+            .action_transfer
+            .as_ref()
+            .ok_or("action_transition_missing")?;
+        if transfer.stage != ActionTransferStage::CleanupPending
+            || work.failure.is_some()
+            || !work.cleanup_blockers.is_empty()
+            || work.waiting_retirement
+            || work.index != work.providers.len()
+        {
+            return Err("action_cleanup_unresolved".into());
+        }
+        let mut next = self.shared.borrow().value.clone();
+        super::composed_release_proof::record_composed_release_proof(&mut next, work)?;
+        let LifecycleTarget::Stream {
+            session_id,
+            stream_id,
+            generation,
+            ..
+        } = &work.target
+        else {
+            return Err("stream_target_required".into());
+        };
+        let session = next.sessions.get_mut(session_id).ok_or("unknown_session")?;
+        if session.phase != SessionPhase::Ready {
+            return Err("action_session_not_ready".into());
+        }
+        let stream = session.streams.get_mut(stream_id).ok_or("unknown_stream")?;
+        if stream.generation != *generation
+            || stream.phase != StreamPhase::Quiescing
+            || stream.retirements != stream.required
+        {
+            return Err("action_consumers_not_retired".into());
+        }
+        stream.phase = StreamPhase::Retired;
+        if session
+            .streams
+            .values()
+            .all(|stream| stream.phase == StreamPhase::Retired)
+            && session.phase != SessionPhase::Ending
+        {
+            session.phase = SessionPhase::Paused;
+        }
+        let proof = super::action_release_proof::proof_from_composed_release(&next, work)
+            .ok_or("action_cleanup_proof_unavailable")?;
+        let receipt = next.receipts.get_mut(key).ok_or("unknown_transition")?;
+        let saved = receipt.work.as_mut().ok_or("action_transition_missing")?;
+        let saved_transfer = saved
+            .action_transfer
+            .as_mut()
+            .ok_or("action_transition_missing")?;
+        if saved_transfer.binding != transfer.binding
+            || saved_transfer.permit != transfer.permit
+            || saved.transition_id != work.transition_id
+        {
+            return Err("action_transition_changed".into());
+        }
+        saved_transfer.release_proof = Some(proof);
+        saved_transfer.stage = ActionTransferStage::ReplanRequired;
+        receipt.response = json!({"status":"replan_required","operation_id":transfer.binding.operation_id,"target":transfer.binding.target,"plan_digest":transfer.binding.plan_digest,"transition_id":work.transition_id});
+        let receipt = next.receipts.get(key).ok_or("unknown_transition")?;
+        let saved = receipt.work.as_ref().ok_or("action_transition_missing")?;
+        let saved_transfer = saved
+            .action_transfer
+            .as_ref()
+            .ok_or("action_transition_missing")?;
+        if !super::action_release_proof::validate_replan_stage(
+            &next,
+            receipt,
+            saved,
+            saved_transfer,
+        ) {
+            return Err("action_cleanup_proof_invalid".into());
+        }
+        validate_journal(&next).map_err(|_| "invalid_action_release_journal")?;
+        save(&self.shared, next)
+    }
+
     fn complete_action_barrier(&self, key: &str, work: &Work) -> ModuleResult<()> {
         let transfer = work
             .action_transfer
@@ -2528,6 +2633,49 @@ impl Coordinator {
 #[cfg(test)]
 mod admission_target_tests {
     use super::*;
+
+    #[test]
+    fn action_cleanup_never_replans_while_retirement_or_callbacks_are_incomplete() {
+        let root = std::env::temp_dir().join(format!(
+            "action-cleanup-fence-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let coordinator = Coordinator::open(&root.join("journal")).unwrap();
+        let mut work: Work = serde_json::from_value(json!({"phase":"stream.release","target":{"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1},"intent":null,"reason":null,"video":null,"transition_id":"transition","providers":["dependent","owner"],"index":0,"states":{},"candidate":null,"waiting_retirement":true,"action_transfer":{"service":"action-service","permit":"a".repeat(32),"binding":{"operation_id":"op","action_id":"owner/remove","target":{"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","expected_generation":1},"plan_digest":"a".repeat(64),"source":{"caller":"transport","initiator":"user"}},"input_reservation_id":null,"admission_id":null,"snapshot":null,"stage":"cleanup_pending","release_proof":null}})).unwrap();
+        assert_eq!(
+            coordinator
+                .complete_composed_action_release("missing", &work)
+                .unwrap_err(),
+            "action_cleanup_unresolved"
+        );
+        work.waiting_retirement = false;
+        assert_eq!(
+            coordinator
+                .complete_composed_action_release("missing", &work)
+                .unwrap_err(),
+            "action_cleanup_unresolved"
+        );
+        work.index = work.providers.len();
+        work.cleanup_blockers.insert("dependent".into());
+        assert_eq!(
+            coordinator
+                .complete_composed_action_release("missing", &work)
+                .unwrap_err(),
+            "action_cleanup_unresolved"
+        );
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn session(id: &str) -> SessionRecord {
         SessionRecord {
