@@ -33,6 +33,7 @@ members = [
     "modules/state",
     "modules/session",
     "modules/session-lifecycle",
+    "modules/extension-actions",
     "modules/configuration",
     "modules/host-configuration",
     "modules/catalog",
