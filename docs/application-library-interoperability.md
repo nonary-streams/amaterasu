@@ -142,6 +142,27 @@ policy has no raw or elevated command form, and settings cannot be changed live.
 This does not implement global preparation, client-specific preparation, a
 versioned policy resolver or NVHTTP preflight for `/2`.
 
+The provider example has opt-in preparation tests using the real runtime
+broker, the Launch module, a separately built Application module, and two
+library implementations. The first library may also be separately built:
+
+```sh
+cargo build --offline --locked -p amaterasu-application
+CARGO_TARGET_DIR=/tmp/amaterasu-library-v2 cargo build --offline \
+  --manifest-path crates/module-sdk/examples/application-library-v2/Cargo.toml
+AMATERASU_APPLICATION_ARTIFACT="$PWD/target/debug/libamaterasu_application.so" \
+AMATERASU_LIBRARY_V2_ARTIFACT=/tmp/amaterasu-library-v2/debug/libexample_application_library_v2.so \
+  cargo test --offline --locked \
+  --manifest-path crates/module-sdk/examples/application-library-provider/Cargo.toml \
+  real_preparation_ -- --ignored
+```
+
+The example library's baseline lock file may need an offline dependency update
+for its standalone build; the command does not require a network. The test
+runs harmless test subprocesses and checks reverse undo after failure and
+cancellation. Its session and executor remain synthetic. It does not exercise
+NVHTTP, RTSP, a real game, or a complete separately built replacement executor.
+
 The logical library key is fixed in startup settings. Launch asks that library
 to resolve the exact ID/revision, validates the echoed identity, then maps the
 executor key through that library's fixed routes. Neither request nor response
