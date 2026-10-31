@@ -576,6 +576,8 @@ before retiring the stream and application. An authenticated stream disconnect
 can leave the application paused for a later resume, after confirming coordinator
 state. Resume rebuilds the stream snapshot and admits a new RTSP operation;
 frame-limiter policy changes beyond cadence require a fresh application session.
+Legacy display mutation requests conflict with extension-owned display planning
+and must be disabled when using the lifecycle extension.
 Uncertain effects remain fenced. Restart reconciliation, live hardware and
 end-to-end client behavior require separate validation.
 

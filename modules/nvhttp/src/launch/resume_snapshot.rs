@@ -8,6 +8,17 @@ pub(super) struct ResumeSnapshot {
 }
 
 impl ResumeSnapshot {
+    pub(super) fn legacy_display_conflict(&self) -> bool {
+        self.stream.virtual_display_intent.is_some()
+            || self
+                .stream
+                .display_policy_snapshot
+                .as_ref()
+                .and_then(|snapshot| {
+                    snapshot["effective_overrides"]["dd_configuration_option"].as_str()
+                })
+                .is_some_and(|option| option != "disabled")
+    }
     pub(super) fn build(
         controller: &Controller,
         retained: &Record,

@@ -1332,6 +1332,7 @@ impl Controller {
             record.rtsp_operation = operation;
             record.resumed = true;
             record.adopted = false;
+            record.resume_abandoned = false;
             record.launch_connection = Some(connection);
             record.state = State::Starting;
             record.stage = Stage::VerifyResumeSession;
@@ -1491,7 +1492,15 @@ impl Controller {
             if record.launch_connection == Some(connection) {
                 record.launch_connection = None;
                 if !record.adopted {
-                    record.request_cleanup(Some("launch_response_unavailable"), now);
+                    if record.resumed
+                        && record.lifecycle_session_target.is_some()
+                        && !record.rtsp_requested
+                        && record.rtsp_ticket.is_none()
+                    {
+                        record.resume_abandoned = true;
+                    } else {
+                        record.request_cleanup(Some("launch_response_unavailable"), now);
+                    }
                     affected = Some(record.id);
                 }
             }
@@ -1501,6 +1510,10 @@ impl Controller {
         }
         if let Some(job) = self.job.as_mut().filter(|job| Some(job.record) == affected) {
             job.call.cancel();
+        } else if let Some(record) = affected.and_then(|id| self.records.get_mut(&id))
+            && record.resume_abandoned
+        {
+            workflow::reject_resume(record, &mut self.management_replies);
         }
     }
 

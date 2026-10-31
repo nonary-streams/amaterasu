@@ -118,6 +118,13 @@ impl Controller {
             self.records.insert(id, record);
             return;
         }
+        if phase == Phase::PrepareLifecycle
+            && (record.virtual_display_intent.is_some() || record.display_request.is_some())
+        {
+            record.request_cleanup(Some("legacy_display_policy_conflict"), now);
+            self.records.insert(id, record);
+            return;
+        }
         eprintln!("amaterasu launch phase start={phase:?}");
         let call = self.make_call(&mut record, phase);
         let deadline = if matches!(
@@ -185,6 +192,11 @@ impl Controller {
                 record.uncertain.push_back((job.phase, take_call(job)));
                 record.retrying_uncertainty = false;
                 record.cleanup_error = Some("broker_settlement_unconfirmed");
+                if record.resume_abandoned {
+                    record.fail_cleanup("resume_settlement_unconfirmed");
+                    reply_failure(record, replies);
+                    return;
+                }
                 match job.phase {
                     Phase::ReadLaunchEpoch
                     | Phase::PrepareLifecycle
@@ -665,7 +677,9 @@ impl Controller {
             let Some(mut record) = self.records.remove(&job.record) else {
                 return;
             };
-            if record.state == State::Stopping {
+            if record.resume_abandoned && record.state != State::Stopping {
+                reject_resume(&mut record, replies);
+            } else if record.state == State::Stopping {
                 record.stage = Stage::Cleanup;
             } else {
                 let pending = self
@@ -685,7 +699,9 @@ impl Controller {
                     )
                     .ok()
                 });
-                if let Some(candidate) = candidate {
+                if let Some(candidate) =
+                    candidate.filter(|candidate| !candidate.legacy_display_conflict())
+                {
                     candidate.apply(&mut record);
                     record.stage = Stage::ReserveHistory;
                 } else {
@@ -697,6 +713,10 @@ impl Controller {
             return;
         }
         let record = self.records.get_mut(&job.record).expect("workflow record");
+        if record.resume_abandoned && record.state != State::Stopping {
+            reject_resume(record, replies);
+            return;
+        }
         if record.state == State::Stopping
             && matches!(
                 job.phase,
@@ -1224,6 +1244,10 @@ impl Controller {
     fn rejected(&mut self, job: &Job, now: Instant, replies: &mut Vec<(u64, Reply)>) {
         eprintln!("amaterasu launch phase rejected={:?}", job.phase);
         let record = self.records.get_mut(&job.record).expect("workflow record");
+        if record.resume_abandoned && record.state != State::Stopping {
+            reject_resume(record, replies);
+            return;
+        }
         if record.state == State::Stopping
             && matches!(
                 job.phase,
@@ -1272,7 +1296,11 @@ impl Controller {
                 record.history_state = "unavailable";
                 record.history_release_required = false;
                 if record.state == State::Starting {
-                    record.stage = Stage::ReadProtonPolicy;
+                    if record.resumed && record.lifecycle_session_target.is_some() {
+                        Self::advance_after_history(self.config.as_ref(), record, now);
+                    } else {
+                        record.stage = Stage::ReadProtonPolicy;
+                    }
                 }
             }
             Phase::ReadProtonPolicy => {
@@ -1335,6 +1363,10 @@ impl Controller {
     fn settled(&mut self, job: &Job, now: Instant, replies: &mut Vec<(u64, Reply)>) {
         eprintln!("amaterasu launch phase settled={:?}", job.phase);
         let record = self.records.get_mut(&job.record).expect("workflow record");
+        if record.resume_abandoned && record.state != State::Stopping {
+            reject_resume(record, replies);
+            return;
+        }
         let releasing_paused_history = matches!(
             record.stage,
             Stage::ReleasePausedHistory | Stage::ReleaseRejectedResumeHistory
@@ -1376,7 +1408,11 @@ impl Controller {
                 }
                 record.history_state = "unavailable";
                 if record.state == State::Starting {
-                    record.stage = Stage::ReadProtonPolicy;
+                    if record.resumed && record.lifecycle_session_target.is_some() {
+                        Self::advance_after_history(self.config.as_ref(), record, now);
+                    } else {
+                        record.stage = Stage::ReadProtonPolicy;
+                    }
                 }
             }
             Phase::ReleaseHistory => {
@@ -2497,6 +2533,7 @@ fn fail_before_resume_stream(
 }
 
 pub(super) fn reject_resume(record: &mut Record, replies: &mut Vec<(u64, Reply)>) {
+    record.resume_abandoned = false;
     if let Some(connection) = record.launch_connection.take() {
         replies.push((
             connection,
