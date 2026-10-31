@@ -115,6 +115,38 @@ pub(super) struct ActionReleaseProof {
     pub callbacks: Vec<super::composition::ProducerCallbackProof>,
 }
 
+fn frozen_admissions_still_present(
+    journal: &Journal,
+    session: &SessionRecord,
+    snapshot: &ActionReleaseSnapshot,
+) -> bool {
+    let check = |id: &String,
+                 original: &ActionSnapshotAdmission,
+                 target: &LifecycleTarget,
+                 phase: LifecyclePhase| {
+        session.admission_ids.contains(id)
+            && session.admission_targets.get(id) == Some(target)
+            && session.admission_phases.get(id) == Some(&phase)
+            && journal.admission_transitions.get(id) == Some(&original.transition_id)
+            && journal.authority.settled.get(id) == Some(&original.admission)
+    };
+    snapshot.session_admissions.iter().all(|(id, original)| {
+        check(
+            id,
+            original,
+            &snapshot.session_target,
+            LifecyclePhase::SessionPrepare,
+        )
+    }) && snapshot.stream_admissions.iter().all(|(id, original)| {
+        check(
+            id,
+            original,
+            &snapshot.stream_target,
+            LifecyclePhase::StreamPrepare,
+        )
+    })
+}
+
 /// Verify complete cleanup against the durable action work and retained
 /// authority admissions. Missing provenance, deferred work and unknown broker
 /// outcomes do not prove cleanup, even when the associated plan is empty.
@@ -122,6 +154,24 @@ pub(super) fn validate_graph_callbacks(
     journal: &Journal,
     work: &Work,
     proof: &ActionReleaseProof,
+) -> bool {
+    validate_graph_callbacks_inner(journal, work, proof, false)
+}
+
+/// Historical proof remains valid after later admissions and streams exist.
+pub(super) fn validate_historical_graph_callbacks(
+    journal: &Journal,
+    work: &Work,
+    proof: &ActionReleaseProof,
+) -> bool {
+    validate_graph_callbacks_inner(journal, work, proof, true)
+}
+
+fn validate_graph_callbacks_inner(
+    journal: &Journal,
+    work: &Work,
+    proof: &ActionReleaseProof,
+    historical: bool,
 ) -> bool {
     let Some(transfer) = &work.action_transfer else {
         return false;
@@ -178,14 +228,14 @@ pub(super) fn validate_graph_callbacks(
     if host_epoch != &session.host_epoch
         || stream.generation != *generation || stream.phase != StreamPhase::Retired
         || stream.retirements != stream.required || work.phase != LifecyclePhase::StreamRelease
-        || session.streams.iter().any(|(id, other)| id != stream_id && other.phase != StreamPhase::Retired)
+        || (!historical && session.streams.iter().any(|(id, other)| id != stream_id && other.phase != StreamPhase::Retired))
         || proof.target != work.target || proof.transition_id != work.transition_id
         || graph.order != work_graph.order || graph.dependencies != work_graph.dependencies
         || !complete_provider_order(graph, &work.providers, &owner)
         || proof.callbacks.len() != work.providers.len() || work.index != work.providers.len()
         || work.waiting_retirement || work.failure.is_some() || !work.cleanup_blockers.is_empty()
         || transfer.binding.source != session.owner
-        || super::action_endpoints::capture_action_snapshot(journal, &work.target).ok().as_ref() != Some(snapshot)
+        || if historical { !frozen_admissions_still_present(journal, session, snapshot) } else { super::action_endpoints::capture_action_snapshot(journal, &work.target).ok().as_ref() != Some(snapshot) }
         || !target_matches
         // Stream cleanup does not prove session-scoped dependent restoration;
         // each selected dependent must have authentic frozen no-op evidence.

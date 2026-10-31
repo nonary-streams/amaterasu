@@ -460,8 +460,17 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
             let LifecycleTarget::Session { session_id, .. } = &marker.session_target else {
                 return true;
             };
-            key != &action_disposition::marker_key(session_id, &marker.owner)
-                || action_disposition::verified_marker(journal, session_id, &marker.owner).is_none()
+            key != &action_disposition::marker_key(
+                session_id,
+                &marker.owner,
+                marker.resource_generation,
+            ) || action_disposition::verified_marker_at(
+                journal,
+                session_id,
+                &marker.owner,
+                marker.resource_generation,
+            )
+            .is_none()
         })
         || !retention::validate(journal)
         || journal.admission_transitions.len() > 128

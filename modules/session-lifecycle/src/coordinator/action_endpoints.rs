@@ -80,6 +80,28 @@ impl crate::prepare_authority::AuthorityJournal for ActionFinishWriter {
     }
 }
 
+struct ActionDispositionWriter {
+    shared: super::Shared,
+    next: Option<super::Journal>,
+    session_id: String,
+    owner: String,
+}
+impl crate::prepare_authority::AuthorityJournal for ActionDispositionWriter {
+    fn persist(
+        &mut self,
+        state: &crate::prepare_authority::AuthorityState,
+    ) -> amaterasu_module_sdk::ModuleResult<()> {
+        let mut next = self.next.take().ok_or("duplicate_finish")?;
+        next.authority = state.clone();
+        if super::action_disposition::verified_marker(&next, &self.session_id, &self.owner)
+            .is_none()
+        {
+            return Err("action_disposition_proof_invalid".into());
+        }
+        save(&self.shared, next)
+    }
+}
+
 fn timestamp() -> Option<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -693,10 +715,8 @@ impl Coordinator {
                             .execution_for_permit(caller, token)
                             .is_ok_and(|(_, _, plan)| plan.resource_disposition.is_some())
                     {
-                        // A typed disposition needs authenticated owner dispatch,
-                        // cleanup closure and an atomic output/cursor update.
-                        // Until that writer is installed, retain the transfer.
-                        return rejection("action_disposition_proof_unavailable");
+                        return self
+                            .complete_released_action(caller, payload, token, &binding, journal);
                     }
                     let receipt = payload["provider_receipt"].clone();
                     let succeeded = outcome == ActionOutcome::Succeeded;
@@ -792,6 +812,195 @@ impl Coordinator {
             _ => rejection("unsupported_operation"),
         }
     }
+    fn complete_released_action(
+        &self,
+        caller: &str,
+        payload: &Value,
+        token: &str,
+        binding: &ActionBinding,
+        mut journal: super::Journal,
+    ) -> Value {
+        use amaterasu_extension_api::{
+            ActionProviderCompletionStatus, ActionResourceDispositionState, LifecycleTarget,
+        };
+        let session_id = match &binding.target {
+            ActionTarget::Session { session_id, .. } | ActionTarget::Stream { session_id, .. } => {
+                session_id
+            }
+            ActionTarget::Host { .. } => return rejection("invalid_target"),
+        };
+        let Ok((owner, _, plan)) = journal.actions.execution_for_permit(caller, token) else {
+            return rejection("action_execution_unavailable");
+        };
+        let Some(generation) = journal
+            .sessions
+            .get(session_id)
+            .and_then(|session| session.resource_generations.get(&owner))
+            .copied()
+        else {
+            return rejection("action_root_unavailable");
+        };
+        let marker_key = super::action_disposition::marker_key(session_id, &owner, generation);
+        if let Some(marker) = journal.action_dispositions.get(&marker_key) {
+            let same = marker.binding == *binding
+                && marker.permit == token
+                && marker.dispatch_proof == payload["dispatch_proof"]
+                && journal
+                    .sessions
+                    .get(session_id)
+                    .and_then(|session| session.resource_generations.get(&owner))
+                    == Some(&marker.resource_generation)
+                && super::action_disposition::verified_marker(&journal, session_id, &owner)
+                    .is_some();
+            return if same {
+                json!({"status":"succeeded","operation_id":binding.operation_id,"target":binding.target,"plan_digest":binding.plan_digest})
+            } else {
+                rejection("action_completion_conflict")
+            };
+        }
+        if !effect_rights_current(&journal, caller, token, binding) {
+            return rejection("action_effect_not_authorized");
+        }
+        let Ok(approvals) = journal.actions.approval_snapshot_for_permit(caller, token) else {
+            return rejection("action_approval_invalid");
+        };
+        let Ok(completed) = super::action_dispatch_proof::validate_dispatch_proof(
+            &payload["dispatch_proof"],
+            binding,
+            token,
+            &plan,
+            &approvals,
+        ) else {
+            return rejection("action_dispatch_proof_invalid");
+        };
+        let Some(result) = completed.resource_disposition.as_ref() else {
+            return rejection("action_disposition_missing");
+        };
+        if completed.status != ActionProviderCompletionStatus::Succeeded
+            || result.state != ActionResourceDispositionState::Released
+        {
+            return rejection("action_not_released");
+        }
+        let key = super::receipt_key(caller, "action-transition", &binding.operation_id);
+        let Some(work) = journal
+            .receipts
+            .get(&key)
+            .and_then(|receipt| receipt.work.clone())
+        else {
+            return rejection("action_transition_missing");
+        };
+        let Some(transfer) = work.action_transfer.as_ref() else {
+            return rejection("action_transition_missing");
+        };
+        let Some(admission_id) = transfer.admission_id.clone() else {
+            return rejection("action_admission_missing");
+        };
+        let LifecycleTarget::Session {
+            session_id: root_session,
+            ..
+        } = &result.origin
+        else {
+            return rejection("action_root_invalid");
+        };
+        if root_session != session_id {
+            return rejection("action_root_invalid");
+        }
+        let Some(root) = journal
+            .composition
+            .records()
+            .find(|root| {
+                root.output.producer == owner
+                    && root.output.output_id == result.output_id
+                    && root.output.origin == result.origin
+                    && root.state == super::composition::OutputState::Retained
+            })
+            .cloned()
+        else {
+            return rejection("action_root_unavailable");
+        };
+        if super::resource_generation::current_root_generation(&journal, &root).ok()
+            != Some(result.resource_generation)
+        {
+            return rejection("action_root_unavailable");
+        }
+        let marker = super::action_disposition::ReleasedActionMarker {
+            session_target: result.origin.clone(),
+            owner: owner.clone(),
+            root_admission_id: root.admission_id.clone(),
+            root_transition_id: root.transition_id.clone(),
+            output_id: root.output.output_id.clone(),
+            resource: root.output.resource.clone(),
+            resource_generation: result.resource_generation,
+            binding: binding.clone(),
+            permit: token.into(),
+            approval_snapshot: approvals,
+            plan,
+            dispatch_proof: payload["dispatch_proof"].clone(),
+            cleanup_work: work,
+        };
+        if journal
+            .composition
+            .set_state(
+                &owner,
+                &root.output.output_id,
+                &root.output.origin,
+                super::composition::OutputState::Released,
+            )
+            .is_err()
+        {
+            return rejection("action_root_unavailable");
+        }
+        if journal
+            .actions
+            .complete_action(
+                caller,
+                binding,
+                ActionOutcome::Succeeded,
+                completed.receipt,
+                false,
+            )
+            .is_err()
+        {
+            return rejection("action_completion_invalid");
+        }
+        journal.action_dispositions.insert(marker_key, marker);
+        let Some(receipt) = journal.receipts.get_mut(&key) else {
+            return rejection("action_transition_missing");
+        };
+        receipt.work = None;
+        let Some(session) = journal.sessions.get_mut(session_id) else {
+            return rejection("unknown_session");
+        };
+        if session
+            .streams
+            .values()
+            .all(|stream| stream.phase == StreamPhase::Retired)
+            && session.phase != SessionPhase::Ending
+        {
+            session.phase = SessionPhase::Paused;
+        }
+        let writer = ActionDispositionWriter {
+            shared: self.shared.clone(),
+            next: Some(journal.clone()),
+            session_id: session_id.clone(),
+            owner: owner.clone(),
+        };
+        let Ok(mut authority) = crate::prepare_authority::CoordinatorPrepareAuthority::new(
+            journal.authority.clone(),
+            self.selections.values().cloned().collect(),
+            writer,
+        ) else {
+            return rejection("action_authority_unavailable");
+        };
+        if authority
+            .finish_admission_retained(&owner, &admission_id)
+            .is_err()
+        {
+            return json!({"status":"recovery_required","reason":"action_admission_finish_failed"});
+        }
+        json!({"status":"succeeded","operation_id":binding.operation_id,"target":binding.target,"plan_digest":binding.plan_digest})
+    }
+
     fn rebind_action_plan(
         &self,
         caller: &str,
