@@ -71,6 +71,17 @@ pub struct StagedOutputRefinement {
     pub callback_proof: ProducerCallbackProof,
 }
 
+/// Structural predecessor data. It is authoritative only after the enclosing
+/// Journal matches it to the independently validated closed-stream checkpoint.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct StageAnchor {
+    pub target: LifecycleTarget,
+    pub release_admission: String,
+    pub staged: ResourceOutput,
+    pub released: ResourceOutput,
+}
+
 /// Authenticated control confirmation retained alongside its original
 /// pre-effect obligation; no field of that obligation is replaced.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -207,6 +218,8 @@ pub struct CompositionBook {
     refinements: Vec<ObligationRefinement>,
     #[serde(default)]
     staged_outputs: Vec<StagedOutputRefinement>,
+    #[serde(default)]
+    stage_anchors: Vec<StageAnchor>,
 }
 
 /// A policy-selected direct dependency. Schema is immutable and pinned by digest.
@@ -238,6 +251,24 @@ impl CompositionBook {
             && self.finalize_selections.len() <= MAX_OUTPUTS
             && self.refinements.len() <= MAX_OUTPUTS
             && self.staged_outputs.len() <= MAX_OUTPUTS
+            && self.stage_anchors.len() <= MAX_OUTPUTS
+            && self
+                .stage_anchors
+                .iter()
+                .enumerate()
+                .all(|(index, anchor)| {
+                    valid_target(&anchor.target)
+                        && valid_text(&anchor.release_admission)
+                        && amaterasu_extension_api::validate_cleanup_output(
+                            &anchor.staged.producer,
+                            &anchor.staged,
+                            &anchor.released,
+                        )
+                        .is_ok()
+                        && !self.stage_anchors[..index]
+                            .iter()
+                            .any(|old| same_key(&old.staged, &anchor.staged))
+                })
             && self
                 .staged_outputs
                 .iter()
@@ -308,6 +339,61 @@ impl CompositionBook {
         self.staged_outputs.iter()
     }
 
+    pub(super) fn stage_anchors(&self) -> impl Iterator<Item = &StageAnchor> {
+        self.stage_anchors.iter()
+    }
+
+    pub(super) fn stage_anchor(&self, output: &ResourceOutput) -> Option<&StageAnchor> {
+        let mut anchors = self
+            .stage_anchors
+            .iter()
+            .filter(|anchor| same_key(&anchor.staged, output));
+        let anchor = anchors.next()?;
+        anchors.next().is_none().then_some(anchor)
+    }
+
+    /// Caller has verified all removed stages are closed and atomically binds
+    /// the replacement anchor to the current authenticated checkpoint.
+    pub(super) fn replace_closed_stages(
+        &mut self,
+        anchor: StageAnchor,
+    ) -> Result<(), &'static str> {
+        let matching: Vec<_> = self
+            .staged_outputs
+            .iter()
+            .filter(|stage| stage.target == anchor.target)
+            .collect();
+        if matching.len() != 1
+            || matching[0].after != anchor.staged
+            || amaterasu_extension_api::validate_cleanup_output(
+                &anchor.staged.producer,
+                &anchor.staged,
+                &anchor.released,
+            )
+            .is_err()
+        {
+            return Err("closed_stage_anchor_mismatch");
+        }
+        self.staged_outputs
+            .retain(|stage| !same_key(&stage.after, &anchor.staged));
+        self.stage_anchors
+            .retain(|old| !same_key(&old.staged, &anchor.staged));
+        self.stage_anchors.push(anchor);
+        Ok(())
+    }
+
+    /// The enclosing transaction must prove the exact stream closed and replace
+    /// every removed history reference with a validated checkpoint first. The
+    /// staged output remains pinned for successor validation.
+    pub(super) fn retire_stream_history(&mut self, target: &LifecycleTarget) {
+        self.selections
+            .retain(|selection| &selection.target != target);
+        self.finalize_selections
+            .retain(|selection| &selection.target != target);
+        self.refinements
+            .retain(|item| &item.request.target != target);
+    }
+
     /// A target may use only its one exact staged result, and only while the
     /// producing session output remains retained. Ambiguity is fenced.
     pub fn staged_for(
@@ -369,6 +455,11 @@ impl CompositionBook {
                     )
                     .is_ok()
             }
+            (None, Some(admission)) => self.stage_anchor(&stage.before).is_some_and(|anchor| {
+                &anchor.release_admission == admission
+                    && anchor.target != stage.target
+                    && anchor.released == stage.before
+            }),
             _ => false,
         };
         let proof = &stage.callback_proof;
@@ -986,6 +1077,9 @@ pub(super) fn collect_verified_outputs(
     if !graph.order.iter().any(|id| id == provider) {
         return Err("provider_graph_mismatch".into());
     }
+    if !journal.validate_composition() {
+        return Err("composition_history_invalid".into());
+    }
     let catalog = settings.schema_catalog()?;
     let mut next = journal.composition.clone();
     for output in outputs {
@@ -1040,6 +1134,14 @@ pub(super) fn collect_verified_outputs(
                 let (id, released) = journal
                     .verified_released_output(&previous.target)
                     .ok_or("prior_stream_release_readback_missing")?;
+                (Some(id.to_owned()), released.clone())
+            } else if let Some(anchor) = next.stage_anchor(output) {
+                let (id, released) = journal
+                    .verified_released_output(&anchor.target)
+                    .ok_or("prior_stream_release_readback_missing")?;
+                if id != anchor.release_admission || released != &anchor.released {
+                    return Err("prior_stream_release_anchor_mismatch".into());
+                }
                 (Some(id.to_owned()), released.clone())
             } else {
                 (None, root.output.clone())

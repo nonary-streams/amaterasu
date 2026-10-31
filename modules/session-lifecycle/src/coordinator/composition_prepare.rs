@@ -959,6 +959,9 @@ pub(super) fn standalone_stream_input(
     super::resource_generation::current_root_generation(journal, &input)?;
     // Resume must consume the most recent authenticated release readback;
     // falling back to the original session snapshot would resurrect stale state.
+    if !journal.validate_composition() {
+        return Err("composition_history_invalid".into());
+    }
     let current = if let Some(previous) = journal.composition.staged_outputs().rev().find(|stage| {
         stage.after.producer == input.output.producer
             && stage.after.output_id == input.output.output_id
@@ -968,6 +971,14 @@ pub(super) fn standalone_stream_input(
             .verified_released_output(&previous.target)
             .map(|(_, output)| output.clone())
             .ok_or("prior_stream_release_readback_missing")?
+    } else if let Some(anchor) = journal.composition.stage_anchor(&input.output) {
+        let (admission, released) = journal
+            .verified_released_output(&anchor.target)
+            .ok_or("prior_stream_release_readback_missing")?;
+        if admission != anchor.release_admission || released != &anchor.released {
+            return Err("prior_stream_release_anchor_mismatch".into());
+        }
+        released.clone()
     } else {
         input.output
     };

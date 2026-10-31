@@ -29,6 +29,36 @@ pub(super) struct VerifiedRelease<'a> {
 }
 
 impl ComposedReleaseBook {
+    /// Candidate identities only. Each candidate still requires full verification.
+    pub(super) fn candidate_keys(&self) -> impl Iterator<Item = (&LifecycleTarget, &str)> {
+        self.proofs
+            .iter()
+            .map(|proof| (&proof.work.target, proof.work.transition_id.as_str()))
+    }
+
+    /// The caller must verify the exact proof and atomically replace every
+    /// inbound reference with a checkpoint and replay fences before saving.
+    pub(super) fn remove_exact(
+        &mut self,
+        target: &LifecycleTarget,
+        transition_id: &str,
+    ) -> Result<(), &'static str> {
+        let count = self
+            .proofs
+            .iter()
+            .filter(|proof| &proof.work.target == target)
+            .count();
+        if count != 1
+            || self
+                .unique_proof(target)
+                .is_none_or(|proof| proof.work.transition_id != transition_id)
+        {
+            return Err("composed_release_identity_mismatch");
+        }
+        self.proofs.retain(|proof| &proof.work.target != target);
+        Ok(())
+    }
+
     fn unique_proof(&self, target: &LifecycleTarget) -> Option<&Proof> {
         let mut matches = self
             .proofs
@@ -96,6 +126,15 @@ impl ComposedReleaseBook {
             finalized,
             released_output: &proof.released_output,
         })
+    }
+    /// Resolve only a unique, fully verified release for an exact stream.
+    pub(super) fn verified_evidence_for_target<'a>(
+        &'a self,
+        journal: &'a Journal,
+        target: &LifecycleTarget,
+    ) -> Option<VerifiedRelease<'a>> {
+        let proof = self.unique_proof(target)?;
+        self.verified_evidence_for(journal, target, &proof.work.transition_id)
     }
     /// A graph-wide proof discharges only the exact provider obligation it
     /// retained in that provider's source and completed cleanup admission.

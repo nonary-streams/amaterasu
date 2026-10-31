@@ -64,7 +64,7 @@ impl Coordinator {
                 .map_err(|_| "invalid_session_target")?;
         let shared = self.shared.borrow();
         let journal = &shared.value;
-        if !journal.composition.validate_structure() {
+        if !journal.validate_composition() {
             return Err("invalid_composition_journal".into());
         }
         let selection = journal

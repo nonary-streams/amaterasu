@@ -1018,6 +1018,58 @@ impl Coordinator {
         Ok(selections)
     }
 
+    /// Retire proven closed stream history in the same transaction that admits
+    /// a new stream. No provider may run until that transaction is durable.
+    pub(super) fn prepare_stream_history(
+        &self,
+        next: &mut Journal,
+        session_target: &LifecycleTarget,
+    ) -> ModuleResult<()> {
+        let (epoch, session_id, None, _) = operations::target_parts(session_target)? else {
+            return Err("session_target_required".into());
+        };
+        let candidates: Vec<_> = next
+            .composed_releases
+            .candidate_keys()
+            .filter(|(target, _)| {
+                operations::target_parts(target).is_ok_and(|(candidate_epoch, id, stream, _)| {
+                    candidate_epoch == epoch && id == session_id && stream.is_some()
+                })
+            })
+            .map(|(target, transition)| (target.clone(), transition.to_owned()))
+            .collect();
+        for (target, transition) in candidates {
+            let mut receipts = next.receipts.iter().filter(|(_, receipt)| {
+                receipt.response["status"] == "succeeded"
+                    && receipt.work.is_none()
+                    && receipt.response["transition_id"].as_str() == Some(transition.as_str())
+                    && serde_json::from_value::<LifecycleTarget>(receipt.response["target"].clone())
+                        .ok()
+                        .as_ref()
+                        == Some(&target)
+            });
+            receipts.next().ok_or("closed_stream_receipt_missing")?;
+            if receipts.next().is_some() {
+                return Err("closed_stream_receipt_ambiguous".into());
+            }
+            if !self.drivers.is_empty()
+                || !self.finalize_drivers.is_empty()
+                || !self.observation_drivers.is_empty()
+                || !self.control_drivers.is_empty()
+                || !self.settlement_drivers.is_empty()
+            {
+                return Err("closed_stream_history_in_use".into());
+            }
+            match super::closed_stream::retire_closed_stream(next, &target, &transition)? {
+                super::closed_stream::RetirementOutcome::Retired => {}
+                super::closed_stream::RetirementOutcome::NotReady => {
+                    return Err("closed_stream_history_not_ready".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn advance_work(
         &mut self,
         send: &mut dyn FnMut(Command) -> ModuleResult<Response>,

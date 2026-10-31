@@ -352,8 +352,23 @@ fn stage_input_is_authenticated(
         }
     }
     found
+        && journal.validate_composition()
         && match (previous, &stage.prior_release_admission) {
             (None, None) => stage.before == *root,
+            (None, Some(admission)) => {
+                journal
+                    .composition
+                    .stage_anchor(root)
+                    .is_some_and(|anchor| {
+                        anchor.release_admission == *admission
+                            && anchor.released == stage.before
+                            && prior_release_matches(
+                                admission,
+                                &stage.before,
+                                journal.verified_released_output(&anchor.target),
+                            )
+                    })
+            }
             (Some(previous), Some(admission)) => prior_release_matches(
                 admission,
                 &stage.before,
@@ -448,7 +463,7 @@ impl Backend<'_> {
         }
         let input = &selection.input;
         let stage = if matches!(input.output.origin, LifecycleTarget::Session { .. }) {
-            if !journal.composition.validate_structure() {
+            if !journal.validate_composition() {
                 return Err("control_stage_proof_invalid".into());
             }
             let stage =
@@ -958,7 +973,7 @@ impl Coordinator {
                 .ok_or("settlement_stage_admission_unavailable")?;
             let (_, session_id, _, _) = super::operations::target_parts(&stage.target)?;
             let stage_session = journal.sessions.get(session_id).ok_or("unknown_session")?;
-            if !journal.composition.validate_structure()
+            if !journal.validate_composition()
                 || !stage_input_is_authenticated(journal, &selection.input.output, stage)
                 || stage.transition_id != record.selection_transition_id
                 || stage.parent_generation != stage_session.generation

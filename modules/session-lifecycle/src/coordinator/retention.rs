@@ -188,6 +188,70 @@ fn target_is_absent(journal: &Journal, target: &LifecycleTarget) -> bool {
     }
 }
 
+/// Completed stream receipts may expire once the exact closed-stream
+/// certificate replaces their historical proof. The stream record and owner
+/// root remain available; the receipt tombstone still fences operation reuse.
+fn target_has_closed_certificate(journal: &Journal, target: &LifecycleTarget) -> bool {
+    let LifecycleTarget::Stream {
+        host_epoch,
+        session_id,
+        stream_id,
+        generation,
+    } = target
+    else {
+        return false;
+    };
+    let Some(session) = journal.sessions.get(session_id) else {
+        return false;
+    };
+    session.host_epoch == *host_epoch
+        && session.streams.get(stream_id).is_some_and(|stream| {
+            stream.generation == *generation && stream.phase == StreamPhase::Retired
+        })
+        && journal.closed_streams.contains_target(target)
+        && journal.verified_released_output(target).is_some()
+        && !journal
+            .inputs
+            .has_unresolved_stream(host_epoch, session_id, stream_id)
+        && !journal
+            .actions
+            .has_unresolved_stream(host_epoch, session_id, stream_id)
+        && !journal
+            .input_bindings
+            .values()
+            .any(|binding| binding.session_id == *session_id && binding.stream_id == *stream_id)
+        && !journal.receipts.values().any(|receipt| {
+            receipt.work.as_ref().is_some_and(|work| {
+                operations::target_parts(&work.target)
+                    .is_ok_and(|(epoch, id, _, _)| epoch == host_epoch && id == session_id)
+            }) || receipt.wait_target.as_ref().is_some_and(|wait| {
+                operations::target_parts(wait)
+                    .is_ok_and(|(epoch, id, _, _)| epoch == host_epoch && id == session_id)
+            })
+        })
+}
+
+fn receipt_targets_match(
+    journal: &Journal,
+    receipt: &Receipt,
+    stream_target: &LifecycleTarget,
+) -> bool {
+    let Some(request_target) = target(&receipt.request) else {
+        return true;
+    };
+    if request_target == *stream_target {
+        return true;
+    }
+    matches!(
+        (&request_target, stream_target),
+        (
+            LifecycleTarget::Session { host_epoch: a, session_id: b, generation },
+            LifecycleTarget::Stream { host_epoch: c, session_id: d, .. }
+        ) if a == c && b == d
+            && journal.sessions.get(b).is_some_and(|session| session.generation == *generation)
+    )
+}
+
 /// Compact only closed records. The caller persists this journal atomically
 /// before admitting further work; any write failure fences later admission.
 pub(super) fn compact(journal: &mut Journal) {
@@ -340,7 +404,11 @@ pub(super) fn compact(journal: &mut Journal) {
             )
             && target(&receipt.response)
                 .or_else(|| target(&receipt.request))
-                .is_some_and(|target| target_is_absent(journal, &target));
+                .is_some_and(|target| {
+                    target_is_absent(journal, &target)
+                        || (receipt_targets_match(journal, receipt, &target)
+                            && target_has_closed_certificate(journal, &target))
+                });
         if (remaining > 0 || estimated_bytes > TARGET_JOURNAL_BYTES)
             && closed
             && journal.retention.tombstones.len() < MAX_TOMBSTONES
@@ -414,6 +482,46 @@ mod tests {
             "retention_capacity_exhausted"
         );
         assert_eq!(journal.retention.tombstones, before);
+    }
+
+    #[test]
+    fn closed_receipt_requires_certificate_and_consistent_stream_scope() {
+        let target: LifecycleTarget = serde_json::from_value(json!({
+            "kind":"stream", "host_epoch":"epoch", "session_id":"session",
+            "stream_id":"stream", "generation":1
+        }))
+        .unwrap();
+        let mut journal = journal();
+        let session: SessionRecord = serde_json::from_value(json!({
+            "host_epoch":"epoch", "id":"session", "generation":1, "phase":"paused",
+            "owner":{"caller":"transport","initiator":"client"},
+            "delegates":[], "application_ref":null, "settings_revision":"one",
+            "application_retired":false,
+            "streams":{"stream":{"generation":1,"phase":"retired","candidate":null,
+                "required":[],"acknowledgements":[],"retirements":[]}},
+            "obligations":[]
+        }))
+        .unwrap();
+        journal.sessions.insert("session".into(), session);
+        assert!(!target_has_closed_certificate(&journal, &target));
+        let mut receipt = Receipt {
+            caller: "transport".into(),
+            initiator: "client".into(),
+            request: json!({"target":{"kind":"session","host_epoch":"epoch",
+                "session_id":"session","generation":1}}),
+            response: json!({"status":"succeeded","target":target}),
+            work: None,
+            wait_target: None,
+        };
+        assert!(receipt_targets_match(&journal, &receipt, &target));
+        receipt.request["target"]["generation"] = json!(2);
+        assert!(!receipt_targets_match(&journal, &receipt, &target));
+        receipt.request["target"]["generation"] = json!(1);
+        receipt.request["target"]["session_id"] = json!("other");
+        assert!(!receipt_targets_match(&journal, &receipt, &target));
+        receipt.request["target"] = json!({"kind":"stream","host_epoch":"epoch",
+            "session_id":"session","stream_id":"other","generation":1});
+        assert!(!receipt_targets_match(&journal, &receipt, &target));
     }
 
     fn insert_ended(journal: &mut Journal, id: usize, status: &str) -> String {

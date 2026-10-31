@@ -197,6 +197,32 @@ impl FinalizeResultBook {
     pub fn records(&self) -> impl Iterator<Item = &FinalizeResultRecord> {
         self.records.iter()
     }
+
+    /// Remove only the exact finalized record already incorporated into the
+    /// enclosing verified closure transaction.
+    pub(super) fn retire_exact(
+        &mut self,
+        target: &api::LifecycleTarget,
+        permit_id: &str,
+    ) -> Result<(), &'static str> {
+        let matches = self
+            .records
+            .iter()
+            .filter(|record| {
+                &record.request.target == target && record.request.permit_id == permit_id
+            })
+            .count();
+        if matches != 1
+            || self.records.iter().any(|record| {
+                &record.request.target == target && record.request.permit_id != permit_id
+            })
+        {
+            return Err("ambiguous_finalized_stream");
+        }
+        self.records
+            .retain(|record| &record.request.target != target);
+        Ok(())
+    }
     pub fn validate_structure(&self) -> bool {
         self.records.len() <= MAX_RESULTS
             && self.records.iter().enumerate().all(|(index, record)| {

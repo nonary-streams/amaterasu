@@ -280,6 +280,10 @@ impl Coordinator {
             let target: LifecycleTarget =
                 serde_json::from_value(payload.get("target").cloned().ok_or("target_required")?)
                     .map_err(|_| "invalid_target")?;
+            checked_target(&next, &target, caller, initiator)?;
+            if matches!(operation, "prepare_stream" | "resume_stream") {
+                self.prepare_stream_history(&mut next, &target)?;
+            }
             let (session, stream_id) = checked_target(&next, &target, caller, initiator)?;
             let session_id = session.id.clone();
             response = json!({"status":"succeeded","target":target,"plan_revision":payload.get("plan_revision")});
@@ -321,6 +325,9 @@ impl Coordinator {
                         stream_id: stream_id.clone(),
                         generation: 1,
                     };
+                    if next.closed_streams.scope_fenced(&current.target) {
+                        return Err("stream_identifier_retired".into());
+                    }
                     let required: BTreeSet<String> = payload
                         .get("consumer_requirements")
                         .cloned()

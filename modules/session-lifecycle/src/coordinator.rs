@@ -60,6 +60,7 @@ mod settings_snapshot;
 #[allow(dead_code)] // Settlement dispatch is gated until composition sequencing is wired.
 mod settlement_dispatch;
 mod stage_backend;
+mod stream_closure_lookup;
 #[allow(dead_code)]
 mod stream_release;
 
@@ -476,6 +477,14 @@ struct Journal {
 }
 
 impl Journal {
+    fn validate_composition(&self) -> bool {
+        self.composition.validate_structure()
+            && self
+                .composition
+                .stage_anchors()
+                .all(|anchor| self.closed_streams.validates_anchor(self, anchor))
+    }
+
     fn verified_released_output(
         &self,
         target: &LifecycleTarget,
@@ -483,13 +492,15 @@ impl Journal {
         match (
             self.stream_releases.has_released(target),
             self.composed_releases.contains_target(target),
+            self.closed_streams.released_output_for_target(self, target),
         ) {
-            (true, false) if self.stream_releases.has_valid_released(self, target) => {
+            (true, false, None) if self.stream_releases.has_valid_released(self, target) => {
                 self.stream_releases.released_output_for_target(target)
             }
-            (false, true) if self.composed_releases.has_valid_release(self, target) => {
+            (false, true, None) if self.composed_releases.has_valid_release(self, target) => {
                 self.composed_releases.released_output_for_target(target)
             }
+            (false, false, Some(output)) => Some(output),
             _ => None,
         }
     }
@@ -630,7 +641,7 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                         && !journal.authority.settled.contains_key(id))
             })
         || !journal.closed_streams.validate(journal)
-        || !journal.composition.validate_structure()
+        || !journal.validate_composition()
         || !composition::validate_finalize_selections(journal)
         || journal.composition.records().any(|record| {
             let target = &record.output.origin;
@@ -763,6 +774,11 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                     (None, None) => true,
                     (Some(admission), Some(previous)) => journal
                         .verified_released_output(&previous.target)
+                        .is_some_and(|(id, output)| id == admission && output == &stage.before),
+                    (Some(admission), None) => journal
+                        .composition
+                        .stage_anchor(&stage.before)
+                        .and_then(|anchor| journal.verified_released_output(&anchor.target))
                         .is_some_and(|(id, output)| id == admission && output == &stage.before),
                     _ => false,
                 };
@@ -1148,6 +1164,9 @@ impl Coordinator {
         }
         if operation == "lookup_control_baseline" {
             return self.lookup_control_baseline(caller, payload);
+        }
+        if operation == "lookup_stream_closure" {
+            return self.lookup_stream_closure(caller, payload);
         }
         if operation == "verify_control_settlement" {
             return self.verify_control_settlement(caller, payload);
