@@ -3,6 +3,7 @@ use amaterasu_extension_api::{ActionInvoke, EXTENSION_ACTIONS_SERVICE};
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 const STATE: &str = "amaterasu.state/1";
@@ -15,6 +16,7 @@ const MAX_EPOCH_BYTES: usize = 8_000;
 struct Epoch {
     caller: String,
     initiator: String,
+    open_index: String,
     closed: bool,
     receipts: BTreeMap<u64, Record>,
 }
@@ -25,6 +27,63 @@ struct Record {
     receipt: Value,
 }
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Policy {
+    #[serde(default)]
+    grants: Vec<Grant>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Grant {
+    principal: String,
+    action_ids: Vec<String>,
+    target_kinds: Vec<String>,
+    execution_classes: Vec<String>,
+}
+impl Policy {
+    fn has_principal(&self, principal: &str) -> bool {
+        self.grants.iter().any(|grant| grant.principal == principal)
+    }
+    fn permits(&self, principal: &str, action: &str, target: &str) -> bool {
+        self.grants.iter().any(|grant| {
+            grant.principal == principal
+                && grant.action_ids.iter().any(|id| id == action)
+                && grant.target_kinds.iter().any(|kind| kind == target)
+                && !grant.execution_classes.is_empty()
+        })
+    }
+    fn permits_class(&self, principal: &str, action: &str, target: &str, class: &str) -> bool {
+        self.grants.iter().any(|grant| {
+            grant.principal == principal
+                && grant.action_ids.iter().any(|id| id == action)
+                && grant.target_kinds.iter().any(|kind| kind == target)
+                && grant
+                    .execution_classes
+                    .iter()
+                    .any(|candidate| candidate == class)
+        })
+    }
+    fn validate(&self) -> bool {
+        self.grants.len() <= 128
+            && self.grants.iter().all(|grant| {
+                !grant.principal.is_empty()
+                    && grant.principal.len() <= 256
+                    && grant.action_ids.len() <= 128
+                    && grant
+                        .action_ids
+                        .iter()
+                        .all(|id| !id.is_empty() && id.len() <= 256)
+                    && grant
+                        .target_kinds
+                        .iter()
+                        .all(|kind| ["session", "stream", "host"].contains(&kind.as_str()))
+                    && grant.execution_classes.iter().all(|class| {
+                        ["read_only", "session_mutation", "host_mutation"].contains(&class.as_str())
+                    })
+            })
+    }
+}
 struct Incoming {
     id: u64,
     caller: String,
@@ -33,7 +92,17 @@ struct Incoming {
 }
 enum Stage {
     Read(Incoming),
-    Write { parent: u64, result: Value },
+    Write {
+        parent: u64,
+        result: Value,
+    },
+    Descriptor {
+        incoming: Incoming,
+        revision: u64,
+        metadata: Value,
+        epoch: Box<Epoch>,
+        invoke: Box<ActionInvoke>,
+    },
 }
 struct Pending {
     request: u64,
@@ -43,15 +112,24 @@ struct Pending {
 pub struct ActionsModule {
     runtime: RuntimeClient,
     pending: Option<Pending>,
+    policy: Policy,
 }
 impl ManagedModule for ActionsModule {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
+        let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
+            return Err("action policy unavailable".into());
+        };
+        let policy: Policy = serde_json::from_value(payload).map_err(|error| error.to_string())?;
+        if !policy.validate() {
+            return Err("invalid action policy".into());
+        }
         runtime.require_success(Command::Register {
             service: EXTENSION_ACTIONS_SERVICE.into(),
         })?;
         Ok(Self {
             runtime,
             pending: None,
+            policy,
         })
     }
     fn tick(&mut self) -> ModuleResult<()> {
@@ -81,6 +159,11 @@ impl ManagedModule for ActionsModule {
 }
 impl ActionsModule {
     fn receive(&mut self, incoming: Incoming) -> ModuleResult<()> {
+        if !self.policy.has_principal(&incoming.caller)
+            || !self.policy.has_principal(&incoming.initiator)
+        {
+            return self.complete(incoming.id, failure("permission_denied"));
+        }
         let operation = incoming
             .payload
             .get("operation")
@@ -88,12 +171,26 @@ impl ActionsModule {
             .unwrap_or("");
         if !matches!(
             operation,
-            "open_epoch" | "invoke" | "status" | "lookup" | "cancel" | "close_epoch"
+            "open_epoch"
+                | "invoke"
+                | "status"
+                | "lookup"
+                | "cancel"
+                | "close_epoch"
+                | "retire_epoch"
         ) {
             return self.complete(incoming.id, failure("invalid_request"));
         }
         let key = if operation == "open_epoch" {
-            None
+            let Some(open_id) = incoming
+                .payload
+                .get("operation_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty() && id.len() <= 128)
+            else {
+                return self.complete(incoming.id, failure("invalid_operation_id"));
+            };
+            Some(open_key(&incoming.caller, &incoming.initiator, open_id))
         } else {
             let Some(epoch) = incoming
                 .payload
@@ -112,20 +209,24 @@ impl ActionsModule {
         let parent = match &stage {
             Stage::Read(incoming) => incoming.id,
             Stage::Write { parent, .. } => *parent,
+            Stage::Descriptor { incoming, .. } => incoming.id,
+        };
+        let descriptor = matches!(stage, Stage::Descriptor { .. });
+        let phase = match &stage {
+            Stage::Read(_) => "read",
+            Stage::Write { .. } => "write",
+            Stage::Descriptor { .. } => "descriptor",
         };
         match self.runtime.send(Command::Request {
-            service: STATE.into(),
+            service: if descriptor {
+                amaterasu_extension_api::EXTENSION_REGISTRY_SERVICE.into()
+            } else {
+                STATE.into()
+            },
             payload,
             timeout_ms: 5_000,
-            operation_id: format!(
-                "actions-state-{parent}-{}",
-                if matches!(stage, Stage::Read(_)) {
-                    "read"
-                } else {
-                    "write"
-                }
-            ),
-            parent: None,
+            operation_id: format!("actions-{parent}-{phase}"),
+            parent: if descriptor { Some(parent) } else { None },
         })? {
             Response::Accepted { id } => {
                 self.pending = Some(Pending { request: id, stage });
@@ -151,6 +252,14 @@ impl ActionsModule {
                 }
                 match pending.stage {
                     Stage::Read(incoming) => self.after_read(incoming, payload),
+                    Stage::Descriptor {
+                        incoming,
+                        revision,
+                        metadata,
+                        epoch,
+                        invoke,
+                    } => self
+                        .after_descriptor(incoming, revision, metadata, *epoch, *invoke, payload),
                     Stage::Write { parent, result } => {
                         if payload.get("ok") == Some(&Value::Bool(true)) {
                             self.complete(parent, result)
@@ -164,6 +273,7 @@ impl ActionsModule {
                 let parent = match pending.stage {
                     Stage::Read(incoming) => incoming.id,
                     Stage::Write { parent, .. } => parent,
+                    Stage::Descriptor { incoming, .. } => incoming.id,
                 };
                 self.complete(parent, failure("state_unavailable"))
             }
@@ -188,7 +298,23 @@ impl ActionsModule {
                 .get("count")
                 .and_then(Value::as_u64)
                 .unwrap_or(MAX_EPOCHS);
-            if count >= MAX_EPOCHS {
+            if state
+                .get("value")
+                .and_then(|value| value.get("retired"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                return self.complete(incoming.id, failure("receipt_expired"));
+            }
+            if let Some(epoch) = state
+                .get("value")
+                .and_then(|value| value.get("epoch"))
+                .and_then(Value::as_str)
+            {
+                return self.complete(incoming.id, json!({"status":"ok","epoch":epoch}));
+            }
+            let active = metadata.get("active").and_then(Value::as_u64).unwrap_or(0);
+            if active >= MAX_EPOCHS || count >= 4096 {
                 return self.complete(incoming.id, failure("capacity"));
             }
             let mut bytes = [0_u8; 16];
@@ -196,19 +322,23 @@ impl ActionsModule {
                 return self.complete(incoming.id, failure("entropy"));
             }
             let epoch: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+            let open_id = incoming.payload["operation_id"].as_str().unwrap_or("");
+            let index = open_key(&incoming.caller, &incoming.initiator, open_id);
             let record = Epoch {
                 caller: incoming.caller,
                 initiator: incoming.initiator,
+                open_index: index.clone(),
                 closed: false,
                 receipts: BTreeMap::new(),
             };
-            return self.write(
-                incoming.id,
-                revision,
-                metadata,
-                &epoch,
-                &record,
-                json!({"status":"ok","epoch":epoch}),
+            let metadata = json!({"active":active + 1});
+            let payload = json!({"action":"collection_commit","collection":COLLECTION,"expected_revision":revision,"metadata":metadata,"edits":[{"key":format!("epoch/{epoch}"),"value":record},{"key":index,"value":{"epoch":epoch}}]});
+            return self.submit(
+                payload,
+                Stage::Write {
+                    parent: incoming.id,
+                    result: json!({"status":"ok","epoch":epoch}),
+                },
             );
         }
         let epoch_id = incoming.payload["epoch"].as_str().unwrap_or("");
@@ -219,6 +349,27 @@ impl ActionsModule {
         };
         if epoch.caller != incoming.caller || epoch.initiator != incoming.initiator {
             return self.complete(incoming.id, failure("unknown_epoch"));
+        }
+        if operation == "retire_epoch" {
+            if !epoch.closed
+                || epoch.receipts.values().any(|entry| {
+                    entry.receipt.get("status").and_then(Value::as_str) != Some("rejected")
+                })
+            {
+                return self.complete(incoming.id, failure("epoch_not_retirable"));
+            }
+            let active = metadata.get("active").and_then(Value::as_u64).unwrap_or(0);
+            if active == 0 {
+                return self.complete(incoming.id, failure("state_corrupt"));
+            }
+            let payload = json!({"action":"collection_commit","collection":COLLECTION,"expected_revision":revision,"metadata":{"active":active - 1},"edits":[{"key":format!("epoch/{epoch_id}"),"value":null},{"key":epoch.open_index,"value":{"retired":true}}]});
+            return self.submit(
+                payload,
+                Stage::Write {
+                    parent: incoming.id,
+                    result: json!({"status":"ok"}),
+                },
+            );
         }
         if operation == "close_epoch" {
             epoch.closed = true;
@@ -255,6 +406,20 @@ impl ActionsModule {
         let Ok(invoke) = serde_json::from_value::<ActionInvoke>(request) else {
             return self.complete(incoming.id, failure("invalid_request"));
         };
+        let target_kind = match invoke.target {
+            amaterasu_extension_api::ActionTarget::Session { .. } => "session",
+            amaterasu_extension_api::ActionTarget::Stream { .. } => "stream",
+            amaterasu_extension_api::ActionTarget::Host { .. } => "host",
+        };
+        if !self
+            .policy
+            .permits(&incoming.caller, &invoke.action_id, target_kind)
+            || !self
+                .policy
+                .permits(&incoming.initiator, &invoke.action_id, target_kind)
+        {
+            return self.complete(incoming.id, failure("permission_denied"));
+        }
         if invoke.epoch != epoch_id || invoke.operation_id != format!("{epoch_id}:{sequence}") {
             return self.complete(incoming.id, failure("invalid_operation_id"));
         }
@@ -271,15 +436,69 @@ impl ActionsModule {
         if epoch.closed {
             return self.complete(incoming.id, failure("epoch_closed"));
         }
-        let receipt = json!({"status":"rejected","receipt_id":invoke.operation_id,"operation_id":invoke.operation_id,"result":null,"reason":"action_dispatch_unavailable"});
+        let payload = json!({"operation":"describe_action","action_id":invoke.action_id});
+        self.submit(
+            payload,
+            Stage::Descriptor {
+                incoming,
+                revision,
+                metadata,
+                epoch: Box::new(epoch),
+                invoke: Box::new(invoke),
+            },
+        )
+    }
+    fn after_descriptor(
+        &mut self,
+        incoming: Incoming,
+        revision: u64,
+        metadata: Value,
+        mut epoch: Epoch,
+        invoke: ActionInvoke,
+        response: Value,
+    ) -> ModuleResult<()> {
+        let Ok(action) = serde_json::from_value::<amaterasu_extension_api::ActionDescriptor>(
+            response.get("action").cloned().unwrap_or(Value::Null),
+        ) else {
+            return self.complete(incoming.id, failure("descriptor_unavailable"));
+        };
+        if response.get("ok") != Some(&Value::Bool(true))
+            || crate::validation::validate_request(&action, &invoke).is_err()
+        {
+            return self.complete(incoming.id, failure("invalid_action"));
+        }
+        let class = match action.execution {
+            amaterasu_extension_api::ExecutionClass::ReadOnly => "read_only",
+            amaterasu_extension_api::ExecutionClass::SessionMutation => "session_mutation",
+            amaterasu_extension_api::ExecutionClass::HostMutation => "host_mutation",
+        };
+        let target_kind = match &invoke.target {
+            amaterasu_extension_api::ActionTarget::Session { .. } => "session",
+            amaterasu_extension_api::ActionTarget::Stream { .. } => "stream",
+            amaterasu_extension_api::ActionTarget::Host { .. } => "host",
+        };
+        if !self
+            .policy
+            .permits_class(&incoming.caller, &invoke.action_id, target_kind, class)
+            || !self.policy.permits_class(
+                &incoming.initiator,
+                &invoke.action_id,
+                target_kind,
+                class,
+            )
+        {
+            return self.complete(incoming.id, failure("permission_denied"));
+        }
+        let receipt = json!({"status":"rejected","receipt_id":invoke.operation_id,"operation_id":invoke.operation_id,"result":null,"reason":"lifecycle_permit_unavailable"});
+        let epoch_id = invoke.epoch.clone();
         epoch.receipts.insert(
-            sequence,
+            invoke.sequence,
             Record {
                 request: invoke,
                 receipt: receipt.clone(),
             },
         );
-        self.write(incoming.id, revision, metadata, epoch_id, &epoch, receipt)
+        self.write(incoming.id, revision, metadata, &epoch_id, &epoch, receipt)
     }
     fn write(
         &mut self,
@@ -311,6 +530,16 @@ impl ActionsModule {
         }
     }
 }
+fn open_key(caller: &str, initiator: &str, operation_id: &str) -> String {
+    let mut digest = Sha256::new();
+    for part in [caller, initiator, operation_id] {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    let hash = digest.finalize();
+    let suffix: String = hash.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!("open/{suffix}")
+}
 fn valid_epoch(epoch: &str) -> bool {
     epoch.len() == 32
         && epoch
@@ -336,39 +565,57 @@ mod tests {
         results: BTreeMap<u64, Value>,
         revision: u64,
         next: u64,
+        metadata: Value,
     }
     impl Host {
         fn dispatch(&mut self, command: Command) -> Response {
             match command {
                 Command::Register { .. } | Command::ReleaseResult { .. } => Response::Ok,
+                Command::GetSettings {} => Response::Result {
+                    payload: json!({"grants":[{"principal":"management","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["session_mutation"]},{"principal":"alice","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["session_mutation"]},{"principal":"bob","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["session_mutation"]}]}),
+                },
                 Command::Poll {} => self.incoming.pop_front().unwrap_or(Response::Pending),
                 Command::Complete { payload, .. } => {
                     self.replies.push(payload);
                     Response::Ok
                 }
-                Command::Request { payload, .. } => {
+                Command::Request {
+                    service,
+                    payload,
+                    parent,
+                    ..
+                } => {
                     self.next += 1;
-                    let value = match payload["action"].as_str() {
-                        Some("collection_get") => {
-                            let value = payload["key"]
-                                .as_str()
-                                .and_then(|key| self.state.get(key))
-                                .cloned();
-                            json!({"ok":true,"revision":self.revision,"count":self.state.len(),"metadata":null,"value":value})
-                        }
-                        Some("collection_commit")
-                            if payload["expected_revision"] == self.revision =>
-                        {
-                            for edit in payload["edits"].as_array().unwrap() {
-                                self.state.insert(
-                                    edit["key"].as_str().unwrap().into(),
-                                    edit["value"].clone(),
-                                );
+                    let value = if service == amaterasu_extension_api::EXTENSION_REGISTRY_SERVICE {
+                        assert!(parent.is_some());
+                        let method = json!({"service":"example.provider/1","method":"action_execute","interface_major":1,"interface_minor":0,"schema_revision":1});
+                        json!({"ok":true,"action":{"id":"example/action","label":"Example","description":"Example","execution":"session_mutation","arguments":{},"allowed_targets":["session"],"required_capabilities":[],"plan":method,"execute":method,"status":null}})
+                    } else {
+                        match payload["action"].as_str() {
+                            Some("collection_get") => {
+                                let value = payload["key"]
+                                    .as_str()
+                                    .and_then(|key| self.state.get(key))
+                                    .cloned();
+                                json!({"ok":true,"revision":self.revision,"count":self.state.len(),"metadata":self.metadata,"value":value})
                             }
-                            self.revision += 1;
-                            json!({"ok":true,"revision":self.revision})
+                            Some("collection_commit")
+                                if payload["expected_revision"] == self.revision =>
+                            {
+                                for edit in payload["edits"].as_array().unwrap() {
+                                    let key = edit["key"].as_str().unwrap();
+                                    if edit["value"].is_null() {
+                                        self.state.remove(key);
+                                    } else {
+                                        self.state.insert(key.into(), edit["value"].clone());
+                                    }
+                                }
+                                self.metadata = payload["metadata"].clone();
+                                self.revision += 1;
+                                json!({"ok":true,"revision":self.revision})
+                            }
+                            _ => json!({"ok":false}),
                         }
-                        _ => json!({"ok":false}),
                     };
                     self.results.insert(self.next, value);
                     Response::Accepted { id: self.next }
@@ -424,14 +671,18 @@ mod tests {
     #[test]
     fn receipts_survive_restart_and_do_not_execute_effects() {
         let mut host = Host::default();
-        host.request(1, "alice", json!({"operation":"open_epoch"}));
+        host.request(
+            1,
+            "alice",
+            json!({"operation":"open_epoch","operation_id":"open-1"}),
+        );
         host.run();
         let epoch = host.replies[0]["epoch"].as_str().unwrap().to_owned();
         let invoke = json!({"operation":"invoke","epoch":epoch,"sequence":1,"operation_id":format!("{epoch}:1"),"action_id":"example/action","target":{"kind":"session","host_epoch":"h","session_id":"s","expected_generation":1},"arguments":{},"expected_settings_revision":null});
         host.request(2, "alice", invoke.clone());
         host.run();
         assert_eq!(host.replies[1]["status"], "rejected");
-        assert_eq!(host.replies[1]["reason"], "action_dispatch_unavailable");
+        assert_eq!(host.replies[1]["reason"], "lifecycle_permit_unavailable");
         host.request(3, "alice", invoke.clone());
         host.request(
             4,
@@ -446,5 +697,44 @@ mod tests {
         assert_eq!(host.replies[3]["code"], "unknown_epoch");
         assert_eq!(host.replies[4]["code"], "operation_conflict");
         assert_eq!(host.revision, 2);
+    }
+    #[test]
+    fn epoch_open_is_idempotent_across_restart_and_scoped_by_initiator() {
+        let mut host = Host::default();
+        let open = json!({"operation":"open_epoch","operation_id":"client-open-7"});
+        host.request(1, "alice", open.clone());
+        host.run();
+        host.request(2, "alice", open.clone());
+        host.request(3, "bob", open);
+        host.run();
+        assert_eq!(host.replies[0], host.replies[1]);
+        assert_ne!(host.replies[1]["epoch"], host.replies[2]["epoch"]);
+        assert_eq!(host.revision, 2);
+    }
+    #[test]
+    fn retired_epoch_cannot_be_reopened_by_replaying_its_open_id() {
+        let mut host = Host::default();
+        let open = json!({"operation":"open_epoch","operation_id":"old"});
+        host.request(1, "alice", open.clone());
+        host.run();
+        let epoch = host.replies[0]["epoch"].as_str().unwrap().to_owned();
+        host.request(2, "alice", json!({"operation":"close_epoch","epoch":epoch}));
+        host.request(
+            3,
+            "alice",
+            json!({"operation":"retire_epoch","epoch":epoch}),
+        );
+        host.request(4, "alice", open);
+        host.request(
+            5,
+            "alice",
+            json!({"operation":"open_epoch","operation_id":"new"}),
+        );
+        host.run();
+        assert_eq!(host.replies[1]["status"], "ok");
+        assert_eq!(host.replies[2]["status"], "ok");
+        assert_eq!(host.replies[3]["code"], "receipt_expired");
+        assert_ne!(host.replies[4]["epoch"], epoch);
+        assert_eq!(host.metadata["active"], 1);
     }
 }
