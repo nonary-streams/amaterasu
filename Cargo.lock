@@ -653,6 +653,7 @@ version = "0.1.0"
 dependencies = [
  "amaterasu-abi",
  "amaterasu-capture-authority",
+ "amaterasu-configuration-schema",
  "amaterasu-contracts",
  "amaterasu-extension-api",
  "amaterasu-nvhttp",

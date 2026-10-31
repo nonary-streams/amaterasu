@@ -2844,6 +2844,33 @@ pub fn read_extension_descriptor_digest(path: &Path) -> PackageResult<String> {
     extension_descriptor_digest(&descriptor)
 }
 
+/// Validate partial layers and complete effective values against a descriptor.
+pub fn validate_extension_settings(
+    path: &Path,
+    batches: &[serde_json::Value],
+) -> PackageResult<()> {
+    let descriptor: amaterasu_extension_api::ExtensionDescriptor = read_json(path)?;
+    amaterasu_extension_api::validate_descriptor(&descriptor)?;
+    let fields = descriptor
+        .options
+        .into_iter()
+        .map(|option| (option.id, option.definition))
+        .collect();
+    let defaults = amaterasu_configuration_schema::defaults(&fields)?;
+    if batches.len() > 4096 {
+        return Err("too many effective settings".into());
+    }
+    for batch in batches {
+        let values: amaterasu_configuration_schema::Values =
+            serde_json::from_value(batch.clone()).map_err(|error| error.to_string())?;
+        amaterasu_configuration_schema::validate_values(&fields, &values)?;
+        let mut effective = defaults.clone();
+        effective.extend(values);
+        amaterasu_configuration_schema::validate_values(&fields, &effective)?;
+    }
+    Ok(())
+}
+
 fn extension_descriptor_digest(
     descriptor: &amaterasu_extension_api::ExtensionDescriptor,
 ) -> PackageResult<String> {
@@ -3022,6 +3049,31 @@ mod external_component_tests {
             extension_descriptor_digest(&first).unwrap(),
             extension_descriptor_digest(&second).unwrap()
         );
+    }
+
+    #[test]
+    fn settings_validation_uses_the_shared_schema_for_layers() {
+        let directory = std::env::temp_dir().join(format!(
+            "amaterasu-settings-schema-{}",
+            random_identifier().unwrap()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("descriptor.json");
+        let descriptor = serde_json::json!({"provider":"example.demo","revision":1,
+            "options":[{"id":"width","label":"Width","help":"", "definition":{"type":"integer","default":2,"minimum":1,"maximum":4},"allowed_scopes":["host"],"apply_policy":"next_session","required_capabilities":[]}],
+            "actions":[],"capabilities":[],"settings_validate":{"service":"example.demo/1","method":"validate","interface_major":1,"interface_minor":0,"schema_revision":1}});
+        fs::write(&path, serde_json::to_vec(&descriptor).unwrap()).unwrap();
+        assert!(
+            validate_extension_settings(
+                &path,
+                &[serde_json::json!({}), serde_json::json!({"width":4})]
+            )
+            .is_ok()
+        );
+        assert!(validate_extension_settings(&path, &[serde_json::json!({"width":5})]).is_err());
+        assert!(validate_extension_settings(&path, &[serde_json::json!({"width":true})]).is_err());
+        assert!(validate_extension_settings(&path, &[serde_json::json!({"other":1})]).is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

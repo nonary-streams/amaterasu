@@ -15,6 +15,7 @@ use amaterasu_package::{
     BootstrapConfig, PackageResult, RootLock, VerificationPolicy, read_json, stage_package,
     unix_timestamp, verify_package,
 };
+use std::io::Read;
 use std::path::Path;
 
 fn main() {
@@ -197,6 +198,19 @@ fn run() -> PackageResult<()> {
                 development::read_extension_descriptor_digest(Path::new(descriptor))?
             );
             Ok(())
+        }
+        [command, descriptor] if command == "extension-validate-settings" => {
+            let mut input = Vec::new();
+            std::io::stdin()
+                .take(1024 * 1024 + 1)
+                .read_to_end(&mut input)
+                .map_err(|error| error.to_string())?;
+            if input.len() > 1024 * 1024 {
+                return Err("settings validation input exceeds 1 MiB".into());
+            }
+            let batches: Vec<serde_json::Value> =
+                serde_json::from_slice(&input).map_err(|error| error.to_string())?;
+            development::validate_extension_settings(Path::new(descriptor), &batches)
         }
         [command, root, source] if command == "stage" => stage(root, source, false),
         [command, root, source, option] if command == "stage" && option == "--historical" => {
