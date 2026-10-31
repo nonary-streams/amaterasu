@@ -37,7 +37,7 @@ OPERATIONS = {
     INPUT: ["validate_input_binding", "reserve_input_action", "finish_input_action", "lookup_input_action"],
     ACTIONS: ["authorize_action", "consume_action_permit", "begin_action_transition", "complete_action", "consume_input_reservation", "cancel_input_reservation", "lookup"],
     REGISTRY: ["resolve_settings_scope"],
-    PROVIDER: ["describe_action_target", "verify_provider_epoch", "verify_action_effect", "check_action_effect"],
+    PROVIDER: ["describe_action_target", "refresh_provider_observations", "verify_provider_epoch", "verify_action_effect", "check_action_effect"],
 }
 
 
