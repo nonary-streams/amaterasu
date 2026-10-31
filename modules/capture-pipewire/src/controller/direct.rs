@@ -32,10 +32,7 @@ impl DirectSources {
         now: u64,
         timeout: u32,
     ) -> CaptureResult<Reply> {
-        let Some(name) = output
-            .strip_prefix("kwin:")
-            .filter(|name| (1..=8).any(|index| *name == format!("Virtual-{index}")))
-        else {
+        let Some(name) = output.strip_prefix("kwin:").filter(|name| valid_name(name)) else {
             return Err("invalid_named_output");
         };
         let operation = operation.ok_or("operation_id_required")?;
@@ -168,5 +165,39 @@ fn response(source: &Source) -> Value {
         response["desktop_geometry"] = json!(geometry);
         response["geometry_supported"] = json!(true);
     }
+    if matches!(source.session.state(), SourceState::Ready { .. })
+        && let Some(observed) = source.session.observed_capture()
+    {
+        response["observed_capture"] = json!(observed);
+    }
     response
+}
+
+fn valid_name(name: &str) -> bool {
+    name.strip_prefix("Virtual-")
+        .filter(|number| !number.starts_with('0') && number.bytes().all(|b| b.is_ascii_digit()))
+        .and_then(|number| number.parse::<u32>().ok())
+        .is_some_and(|number| number > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_name;
+
+    #[test]
+    fn named_output_accepts_bounded_positive_indices() {
+        for name in ["Virtual-1", "Virtual-9", "Virtual-4294967295"] {
+            assert!(valid_name(name));
+        }
+        for name in [
+            "Virtual-0",
+            "Virtual-01",
+            "Virtual-",
+            "Virtual--1",
+            "Virtual-4294967296",
+            "Virtual-1x",
+        ] {
+            assert!(!valid_name(name));
+        }
+    }
 }

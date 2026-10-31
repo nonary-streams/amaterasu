@@ -615,3 +615,52 @@ fn named_outputs_have_independent_capture_leases_and_cancel_does_not_close_a_pee
     controller.shutdown();
     assert!(controller.reader("amaterasu.video", second).is_err());
 }
+
+#[test]
+fn named_capture_reports_only_observed_live_output() {
+    let mut settings = crate::test_support::settings();
+    settings.allow_named_outputs = true;
+    let (mut controller, driver) = crate::test_support::setup(settings);
+    let open = || Operation::Open {
+        output: "kwin:Virtual-12".into(),
+        operation_id: Some("test-observation".into()),
+        constant_rate: None,
+    };
+    *driver.state.lock().unwrap() = SourceState::Ready {
+        node: 1,
+        width: 2,
+        height: 2,
+    };
+    let first = controller
+        .handle("amaterasu.video", open(), 0)
+        .unwrap()
+        .payload;
+    assert!(first.get("observed_capture").is_none());
+    *driver.observed.lock().unwrap() = Some(crate::backend::ObservedCapture {
+        version: 1,
+        protocol: "wayland-wl-output",
+        registry_global: 73,
+        output_name: "Virtual-12".into(),
+        width: 1920,
+        height: 1080,
+        refresh_millihz: 60000,
+    });
+    let second = controller
+        .handle("amaterasu.video", open(), 1)
+        .unwrap()
+        .payload;
+    assert_eq!(second["observed_capture"]["registry_global"], 73);
+    assert_eq!(second["observed_capture"]["width"], 1920);
+    driver.observed.lock().unwrap().as_mut().unwrap().width = 2560;
+    let refreshed = controller
+        .direct
+        .lookup("amaterasu.video", "test-observation")
+        .unwrap();
+    assert_eq!(refreshed["observed_capture"]["width"], 2560);
+    *driver.state.lock().unwrap() = SourceState::Revoked;
+    let lookup = controller
+        .direct
+        .lookup("amaterasu.video", "test-observation")
+        .unwrap();
+    assert!(lookup.get("observed_capture").is_none());
+}

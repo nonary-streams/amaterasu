@@ -4,7 +4,21 @@ use crate::{
 };
 use std::sync::Arc;
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct ObservedCapture {
+    pub version: u8,
+    pub protocol: &'static str,
+    pub registry_global: u32,
+    pub output_name: String,
+    pub width: u32,
+    pub height: u32,
+    pub refresh_millihz: u32,
+}
+
 pub trait SourceSession: Send {
+    fn observed_capture(&self) -> Option<ObservedCapture> {
+        None
+    }
     fn geometry(&self) -> Option<amaterasu_media::CaptureGeometry> {
         None
     }

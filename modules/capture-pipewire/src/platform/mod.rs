@@ -1,5 +1,5 @@
 mod token_store;
-use super::{Backend, SourceSession};
+use super::{Backend, ObservedCapture, SourceSession};
 use crate::{
     buffers::{Mailbox, Plane},
     model::{
@@ -23,7 +23,6 @@ struct Probe {
     source_types: u32,
     cursor_modes: u32,
 }
-#[derive(Default)]
 #[repr(C)]
 struct Snapshot {
     state: u32,
@@ -46,10 +45,24 @@ struct Snapshot {
     desktop_top: i32,
     desktop_width: u32,
     desktop_height: u32,
+    registry_global: u32,
+    mode_width: u32,
+    mode_height: u32,
+    refresh_millihz: u32,
+    output_name: [c_char; 128],
+}
+
+impl Default for Snapshot {
+    fn default() -> Self {
+        // SAFETY: every field has an all-zero valid representation.
+        unsafe { std::mem::zeroed() }
+    }
 }
 
 #[cfg(amaterasu_kwin)]
 unsafe extern "C" {
+    #[cfg(test)]
+    fn am_pw_valid_named_output(output: *const c_char) -> i32;
     fn am_pw_start_output(
         output: *const c_char,
         timeout: u32,
@@ -198,6 +211,37 @@ struct CallbackContext {
 unsafe impl Send for NativeSession {}
 
 impl SourceSession for NativeSession {
+    fn observed_capture(&self) -> Option<ObservedCapture> {
+        let mut snapshot = Snapshot::default();
+        // SAFETY: the session is live and the adapter writes a fixed-layout snapshot.
+        unsafe { am_pw_snapshot(self.native.as_ptr(), &mut snapshot) };
+        if snapshot.state != 2
+            || snapshot.registry_global == 0
+            || snapshot.mode_width == 0
+            || snapshot.mode_height == 0
+            || snapshot.refresh_millihz == 0
+        {
+            return None;
+        }
+        // SAFETY: the zero-initialized native buffer is copied from a bounded,
+        // NUL-terminated Wayland output name.
+        let output_name = unsafe { CStr::from_ptr(snapshot.output_name.as_ptr()) }
+            .to_str()
+            .ok()?
+            .to_owned();
+        if output_name.is_empty() {
+            return None;
+        }
+        Some(ObservedCapture {
+            version: 1,
+            protocol: "wayland-wl-output",
+            registry_global: snapshot.registry_global,
+            output_name,
+            width: snapshot.mode_width,
+            height: snapshot.mode_height,
+            refresh_millihz: snapshot.refresh_millihz,
+        })
+    }
     fn geometry(&self) -> Option<amaterasu_media::CaptureGeometry> {
         use amaterasu_media::{CaptureGeometry, DesktopRect};
         let mut snapshot = Snapshot::default();

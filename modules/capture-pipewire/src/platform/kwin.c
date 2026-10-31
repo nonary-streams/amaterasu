@@ -17,6 +17,10 @@ struct output {
     struct zxdg_output_v1 *xdg;
     char name[128];
     int32_t x,y,width,height;
+    uint32_t mode_width,mode_height,refresh_millihz;
+    int32_t pending_x,pending_y,pending_width,pending_height;
+    uint32_t pending_mode_width,pending_mode_height,pending_refresh_millihz;
+    bool geometry_pending,mode_pending;
     bool removed;
 };
 struct am_kwin {
@@ -34,8 +38,27 @@ struct am_kwin {
 static void output_geometry(void *data,struct wl_output *object,int32_t x,int32_t y,int32_t pw,int32_t ph,int32_t sub,const char *make,const char *model,int32_t transform) {
     (void)data;(void)object;(void)x;(void)y;(void)pw;(void)ph;(void)sub;(void)make;(void)model;(void)transform;
 }
-static void output_mode(void *data,struct wl_output *object,uint32_t flags,int32_t width,int32_t height,int32_t refresh) { (void)data;(void)object;(void)flags;(void)width;(void)height;(void)refresh; }
-static void output_done(void *data,struct wl_output *object) { (void)data;(void)object; }
+static void output_mode(void *data,struct wl_output *object,uint32_t flags,int32_t width,int32_t height,int32_t refresh) {
+    (void)object; struct output *output=data;
+    if (flags & WL_OUTPUT_MODE_CURRENT) {
+        output->pending_mode_width=width>0?(uint32_t)width:0; output->pending_mode_height=height>0?(uint32_t)height:0;
+        output->pending_refresh_millihz=refresh>0?(uint32_t)refresh:0; output->mode_pending=true;
+    }
+}
+static void commit_geometry(struct output *output) {
+    if (!output->geometry_pending) return;
+    output->x=output->pending_x; output->y=output->pending_y;
+    output->width=output->pending_width; output->height=output->pending_height;
+    output->geometry_pending=false;
+}
+static void output_done(void *data,struct wl_output *object) {
+    (void)object; struct output *output=data;
+    if (output->mode_pending) {
+        output->mode_width=output->pending_mode_width; output->mode_height=output->pending_mode_height;
+        output->refresh_millihz=output->pending_refresh_millihz; output->mode_pending=false;
+    }
+    if (output->xdg && zxdg_output_v1_get_version(output->xdg)>=3) commit_geometry(output);
+}
 static void output_scale(void *data,struct wl_output *object,int32_t scale) { (void)data;(void)object;(void)scale; }
 static void output_name(void *data,struct wl_output *object,const char *name) {
     (void)object; struct output *output=data;
@@ -43,9 +66,15 @@ static void output_name(void *data,struct wl_output *object,const char *name) {
 }
 static void output_description(void *data,struct wl_output *object,const char *description) { (void)data;(void)object;(void)description; }
 static const struct wl_output_listener output_listener={.geometry=output_geometry,.mode=output_mode,.done=output_done,.scale=output_scale,.name=output_name,.description=output_description};
-static void logical_position(void *data,struct zxdg_output_v1 *object,int32_t x,int32_t y) { (void)object;struct output *output=data;output->x=x;output->y=y; }
-static void logical_size(void *data,struct zxdg_output_v1 *object,int32_t width,int32_t height) { (void)object;struct output *output=data;output->width=width;output->height=height; }
-static void logical_done(void *data,struct zxdg_output_v1 *object) { (void)data;(void)object; }
+static void begin_geometry(struct output *output) {
+    if (output->geometry_pending) return;
+    output->pending_x=output->x; output->pending_y=output->y;
+    output->pending_width=output->width; output->pending_height=output->height;
+    output->geometry_pending=true;
+}
+static void logical_position(void *data,struct zxdg_output_v1 *object,int32_t x,int32_t y) { (void)object;struct output *output=data;begin_geometry(output);output->pending_x=x;output->pending_y=y; }
+static void logical_size(void *data,struct zxdg_output_v1 *object,int32_t width,int32_t height) { (void)object;struct output *output=data;begin_geometry(output);output->pending_width=width;output->pending_height=height; }
+static void logical_done(void *data,struct zxdg_output_v1 *object) { (void)object;commit_geometry(data); }
 static void logical_name(void *data,struct zxdg_output_v1 *object,const char *name) { (void)object;output_name(data,NULL,name); }
 static void logical_description(void *data,struct zxdg_output_v1 *object,const char *description) { (void)data;(void)object;(void)description; }
 static const struct zxdg_output_v1_listener logical_listener={.logical_position=logical_position,.logical_size=logical_size,.done=logical_done,.name=logical_name,.description=logical_description};
@@ -137,7 +166,10 @@ struct am_kwin *am_kwin_open(const char *output,const atomic_bool *stopped,int64
         zxdg_output_v1_add_listener(connection->outputs[i].xdg,&logical_listener,&connection->outputs[i]);
     }
     if (synchronize(connection,stopped,deadline)<0) goto failure;
-    for (size_t i=0;i<connection->count;i++) if (!connection->outputs[i].removed && strcmp(connection->outputs[i].name,output)==0) connection->selected=i;
+    for (size_t i=0;i<connection->count;i++) if (!connection->outputs[i].removed && strcmp(connection->outputs[i].name,output)==0) {
+        if (connection->selected!=SIZE_MAX) goto failure;
+        connection->selected=i;
+    }
     if (connection->selected==SIZE_MAX) goto failure;
     connection->stream=zkde_screencast_unstable_v1_stream_output(connection->manager,connection->outputs[connection->selected].object,ZKDE_SCREENCAST_UNSTABLE_V1_POINTER_EMBEDDED);
     zkde_screencast_stream_unstable_v1_add_listener(connection->stream,&stream_listener,connection);
@@ -156,6 +188,7 @@ int am_kwin_snapshot(struct am_kwin *connection,uint32_t *node,uint64_t *serial,
     for (size_t i=0;i<connection->count;i++) {
         const struct output *output=&connection->outputs[i];
         if (output->removed) continue;
+        if (output->geometry_pending || output->mode_pending) return -1;
         if (output->width<=0 || output->height<=0 || output->width>32768 || output->height>32768) return -1;
         if (output->x<left) left=output->x;
         if (output->y<top) top=output->y;
@@ -166,6 +199,9 @@ int am_kwin_snapshot(struct am_kwin *connection,uint32_t *node,uint64_t *serial,
     const struct output *selected=&connection->outputs[connection->selected];
     *geometry=(struct am_kwin_geometry){.left=selected->x,.top=selected->y,.width=(uint32_t)selected->width,.height=(uint32_t)selected->height,
         .desktop_left=(int32_t)left,.desktop_top=(int32_t)top,.desktop_width=(uint32_t)(right-left),.desktop_height=(uint32_t)(bottom-top)};
+    geometry->registry_global=selected->global; geometry->mode_width=selected->mode_width;
+    geometry->mode_height=selected->mode_height; geometry->refresh_millihz=selected->refresh_millihz;
+    memcpy(geometry->output_name,selected->name,sizeof(geometry->output_name));
     *node=connection->node;*serial=connection->serial;
     return 0;
 }

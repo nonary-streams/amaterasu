@@ -1,6 +1,6 @@
 //! Private synthetic driver for ownership/state tests. Does not qualify capture.
 use crate::{
-    backend::{Backend, SourceSession},
+    backend::{Backend, ObservedCapture, SourceSession},
     buffers::{Mailbox, Plane},
     controller::Controller,
     model::{Availability, CaptureResult, Settings, SourceDiagnostics, SourceState, SourceType},
@@ -12,6 +12,7 @@ use std::sync::{
 
 pub struct Driver {
     pub state: Mutex<SourceState>,
+    pub observed: Mutex<Option<ObservedCapture>>,
     pub diagnostics: Mutex<SourceDiagnostics>,
     pub mailbox: Arc<Mailbox>,
     pub selections: AtomicUsize,
@@ -71,6 +72,9 @@ impl Backend for FakeBackend {
     }
 }
 impl SourceSession for FakeSession {
+    fn observed_capture(&self) -> Option<ObservedCapture> {
+        self.0.observed.lock().unwrap().clone()
+    }
     fn state(&self) -> SourceState {
         let read = self.0.state_reads.fetch_add(1, Ordering::SeqCst) + 1;
         if read == self.0.revoke_at_read.load(Ordering::SeqCst) {
@@ -94,6 +98,7 @@ impl Drop for FakeSession {
 pub fn setup(settings: Settings) -> (Controller<FakeBackend>, Arc<Driver>) {
     let driver = Arc::new(Driver {
         state: Mutex::new(SourceState::Selecting),
+        observed: Mutex::new(None),
         diagnostics: Mutex::new(SourceDiagnostics::default()),
         mailbox: Arc::new(Mailbox::default()),
         selections: AtomicUsize::new(0),

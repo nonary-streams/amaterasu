@@ -149,7 +149,7 @@ The optional `linux-kwin-screencast` feature adds an independent Wayland client
 for KDE's ScreenCast protocol. It uses generated upstream protocol descriptions
 from `third-party/protocols`, plus `wayland-client` and `wayland-scanner` at build
 time. An explicitly enabled `allow_named_outputs` policy lets authorized capture
-callers open `kwin:Virtual-1` through `kwin:Virtual-8` without a portal selection.
+callers open `kwin:Virtual-N` (a positive, canonical 32-bit decimal index) without a portal selection.
 The exact host executable must have KDE's scoped ScreenCast declaration installed;
 missing permission fails this path instead of borrowing a remembered portal source.
 

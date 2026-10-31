@@ -26,6 +26,8 @@ struct am_pw_snapshot {
     uint32_t logical_width, logical_height;
     int32_t desktop_left, desktop_top;
     uint32_t desktop_width, desktop_height;
+    uint32_t registry_global, mode_width, mode_height, refresh_millihz;
+    char output_name[128];
 };
 struct am_pw_plane {
     const uint8_t *data;

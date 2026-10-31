@@ -523,6 +523,9 @@ static gpointer worker(gpointer data) {
                 struct am_kwin_geometry geometry = {0}; uint32_t node = 0; uint64_t serial = 0;
                 if (am_kwin_snapshot(session->kwin, &node, &serial, &geometry) == 0) {
                     g_mutex_lock(&session->geometry_lock); session->geometry = geometry; g_mutex_unlock(&session->geometry_lock);
+                } else {
+                    /* A partial topology update must not preserve an old observation. */
+                    g_mutex_lock(&session->geometry_lock); memset(&session->geometry, 0, sizeof(session->geometry)); g_mutex_unlock(&session->geometry_lock);
                 }
             }
 #endif
@@ -578,9 +581,20 @@ struct am_pw_session *am_pw_start(uint32_t source_type, uint32_t timeout_seconds
     return start(source_type, timeout_seconds, restore_token, persist, token_callback, callback, context, NULL);
 }
 #ifdef AMATERASU_KWIN
+int am_pw_valid_named_output(const char *output) {
+    if (!output || strncmp(output, "Virtual-", 8) != 0 || output[8] < '1' || output[8] > '9') return 0;
+    uint32_t number = 0;
+    for (const char *p = output + 8; *p; ++p) {
+        if (*p < '0' || *p > '9') return 0;
+        uint32_t digit = (uint32_t)(*p - '0');
+        if (number > (UINT32_MAX - digit) / 10) return 0;
+        number = number * 10 + digit;
+    }
+    return number != 0;
+}
 struct am_pw_session *am_pw_start_output(const char *output, uint32_t timeout_seconds,
     am_pw_frame_callback callback, void *context) {
-    if (!output || strlen(output) != 9 || strncmp(output, "Virtual-", 8) != 0 || output[8] < '1' || output[8] > '8') return NULL;
+    if (!am_pw_valid_named_output(output)) return NULL;
     return start(1, timeout_seconds, NULL, 0, NULL, callback, context, output);
 }
 #endif
@@ -601,6 +615,9 @@ void am_pw_snapshot(struct am_pw_session *session, struct am_pw_snapshot *output
     output->logical_width=session->geometry.width; output->logical_height=session->geometry.height;
     output->desktop_left=session->geometry.desktop_left; output->desktop_top=session->geometry.desktop_top;
     output->desktop_width=session->geometry.desktop_width; output->desktop_height=session->geometry.desktop_height;
+    output->registry_global=session->geometry.registry_global; output->mode_width=session->geometry.mode_width;
+    output->mode_height=session->geometry.mode_height; output->refresh_millihz=session->geometry.refresh_millihz;
+    memcpy(output->output_name,session->geometry.output_name,sizeof(output->output_name));
     g_mutex_unlock(&session->geometry_lock);
 }
 

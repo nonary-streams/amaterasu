@@ -247,3 +247,23 @@ fn adapter_callback_copies_pixels_into_the_stable_mailbox_allocation() {
     let delivery = mailbox.claim().unwrap().unwrap();
     assert_eq!(delivery.frame.bytes, [42u8; 16]);
 }
+#[cfg(amaterasu_kwin)]
+#[test]
+fn native_named_output_validation_matches_admission() {
+    for (name, valid) in [
+        ("Virtual-1", true),
+        ("Virtual-12", true),
+        ("Virtual-4294967295", true),
+        ("Virtual-0", false),
+        ("Virtual-01", false),
+        ("Virtual-4294967296", false),
+        ("Virtual-1x", false),
+    ] {
+        let name = std::ffi::CString::new(name).unwrap();
+        // SAFETY: the C string remains valid for this synchronous validation call.
+        assert_eq!(
+            unsafe { super::am_pw_valid_named_output(name.as_ptr()) } != 0,
+            valid
+        );
+    }
+}
