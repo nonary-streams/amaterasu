@@ -108,6 +108,84 @@ native readback. It does not independently prove operating-system state.
 Producer identity remains stable across consumer borrows; individual native
 borrow tokens remain separate lease evidence.
 
+## Composition protocol v2
+
+The public SDK defines a separately negotiated composition protocol for an
+owner that produces a resource and a dependent participant that configures it.
+For the split display implementation, `nonary.virtual-screen/2` owns the virtual
+resource and its native leases; `nonary.display-settings/2` supplies settings
+policy. The protocol is generic: it does not require a display-specific shell or
+expose an owner’s native lease credentials. Version 1 provider requests and
+responses retain their existing form; a version 2 participant and its methods
+must be explicitly selected and approved. Empty additive fields are omitted from
+version 1 serialization.
+
+The SDK contract and its structural validators are implemented. The composed
+runtime path is **not yet qualified**: a successful end-to-end broker harness and
+appropriate native adapter qualification are still required before claiming that
+this sequence works in a deployed session.
+
+The coordinator validates the selected participant dependency graph before
+starting effects and persists the graph and the admitted snapshots. A producer
+publishes a `ResourceOutput` identifying its service, capability, schema, origin
+target and generation, resource identity and incarnation, execution domain,
+revision, and complete mutation-domain observations. A dependent receives only
+outputs selected from its declared dependencies. A session output can be used by
+its child stream only after the coordinator verifies the exact persisted parent
+and generation; structural validation alone is not that proof. Output data and
+observations are evidence, not grants to control the resource.
+
+A typical stream transition proceeds in this order:
+
+1. The owner prepares or retains the session resource and publishes its staged
+   output. Stream preparation does not open capture or take a capture borrow yet.
+2. The dependent submits a read-only `ResourcePlan` with its
+   `ResourceControlProposal`. The coordinator checks the installed method and
+   schema approvals, exact output provenance, target, resource, domain state and
+   requested rights, then durably admits the plan and its cleanup obligations.
+3. The coordinator dispatches `resource_control` to the owner with a scoped,
+   independently verified permit. The owner retains native authority, performs
+   the admitted change, and returns its readback. An unknown effect stays fenced
+   for recovery; a status query never repeats the effect.
+4. An applied control result is provisional until settlement. The coordinator
+   persists the exact request, output, and settlement ID, and calls the selected
+   `resource_control_settle` method. The owner verifies that durable tuple with
+   the coordinator and durably acknowledges it. Only an `Applied` acknowledgement
+   of the same output, without a candidate, completes settlement. The dependent
+   callback receives the frozen original inputs and confirmed control results.
+5. The owner receives `resource_finalize_plan` through its registered
+   `resource_plan` method. This read-only v2 request contains the current owner
+   output and confirmed controls, but no admission. Its fresh plan accounts for
+   the current revisions, rights, borrow and cleanup needs. The coordinator admits
+   that plan before calling `resource_finalize`. The owner then takes the fresh
+   capture borrow and returns the final output and, when a capture consumer needs
+   one, its exact candidate binding. Capture opens only after finalization and the
+   consumer acknowledges that binding. The standalone owner follows the same
+   finalization stage even when no dependent control was selected.
+
+On disconnect the coordinator fences work and retires stream consumers before
+stream cleanup; the session resource remains retained for resume. Resume admits
+a new stream and obtains fresh finalized binding evidence. End waits for
+application retirement. Cleanup uses the persisted dependency graph, original
+inputs, plans, and obligations in reverse order: a dependent's restoration must
+settle before its owner releases or destroys the resource. An unknown or failed
+dependent cleanup blocks release of its prerequisites and remains recoverable;
+independent cleanup may continue. Timed retention requires an implementation and
+qualification before it can be offered.
+
+`SchemaCatalog` validates installed, digest-pinned document bytes against a
+bounded, offline subset of JSON Schema; it is not a full JSON Schema engine.
+Unsupported keywords and references are rejected. Numeric values in `const` or
+`enum`, including nested values, are rejected until mathematical numeric equality
+is supported. Schema equality and structural SDK checks do not substitute for
+coordinator authorization or fresh owner observations.
+
+The v2 action-target description is planning context. It can include a retained
+owner output even when no stream is active. For removal, the coordinator checks
+exact output provenance and a complete current borrower snapshot under the
+admitted domain lock; missing unrelated streams in a description do not grant
+permission to remove a resource.
+
 ## Settings and actions
 
 Descriptors use namespaced IDs and declarative schemas. Adding an option or action
