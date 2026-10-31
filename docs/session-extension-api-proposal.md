@@ -1,7 +1,8 @@
 # Session extension API proposal
 
-Status: revised design for review, 2026-10-30. No new runtime API or virtual-display
-module is implemented by this document.
+Status: design reference, 2026-10-30. The implemented contracts, supported paths,
+and validation boundaries are documented in [Session extension API](session-extension-api.md).
+Proposed behavior below is not, by itself, a claim of implementation or platform parity.
 
 The goal is an SDK through which independently built modules can prepare a
 session, react to streaming transitions, expose new settings, and offer actions
