@@ -182,7 +182,7 @@ impl SettlementDispatch {
         let mut next = self.state.clone();
         next.owner_ack = Some(ack);
         next.phase = SettlementPhase::Acknowledged;
-        next.dispatch = None;
+        // Retain the exact completed broker call as durable owner proof.
         self.persist(journal, next)?;
         self.dispatcher = None;
         Ok(())

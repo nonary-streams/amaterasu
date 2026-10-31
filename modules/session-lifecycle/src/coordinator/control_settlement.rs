@@ -1,6 +1,7 @@
 //! Immutable provisional and owner-acknowledged control settlement records.
 //! The coordinator journals this book atomically with authority and Work state.
 use crate::prepare_authority::{Admission, ControlPermit};
+use crate::provider_dispatch::{DispatchRecord, DispatchState};
 use amaterasu_extension_api::{
     ConfirmedControl, ResourceControlResponse, ResourceControlSettlementRequest,
     validate_resource_control_response, validate_resource_control_settlement_request,
@@ -18,6 +19,8 @@ pub(super) struct ControlSettlementRecord {
     pub applied: ResourceControlResponse,
     pub owner_receipt_id: Option<String>,
     pub owner_ack: Option<ResourceControlResponse>,
+    #[serde(default)]
+    pub owner_dispatch: Option<DispatchRecord>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -58,6 +61,7 @@ impl ControlSettlementBook {
         verify: &impl Fn(&ControlSettlementRecord) -> bool,
     ) -> Result<(), &'static str> {
         if item.owner_ack.is_some()
+            || item.owner_dispatch.is_some()
             || !permit.consumed
             || permit.settled
             || permit.request != item.settlement.request
@@ -99,7 +103,8 @@ impl ControlSettlementBook {
         &mut self,
         id: &str,
         ack: ResourceControlResponse,
-        verify: &impl Fn(&ControlSettlementRecord, &ResourceControlResponse) -> bool,
+        dispatch: DispatchRecord,
+        verify: &impl Fn(&ControlSettlementRecord, &ResourceControlResponse, &DispatchRecord) -> bool,
     ) -> Result<(), &'static str> {
         let item = self
             .records
@@ -107,18 +112,20 @@ impl ControlSettlementBook {
             .find(|item| item.settlement.settlement_id == id)
             .ok_or("unknown_control_settlement")?;
         if validate_resource_control_settlement_response(&item.settlement, &ack).is_err()
-            || !verify(item, &ack)
+            || !valid_dispatch(item, &ack, &dispatch)
+            || !verify(item, &ack, &dispatch)
         {
             return Err("invalid_control_settlement_ack");
         }
         if let Some(old) = &item.owner_ack {
-            return if old == &ack {
+            return if old == &ack && item.owner_dispatch.as_ref() == Some(&dispatch) {
                 Ok(())
             } else {
                 Err("control_settlement_ack_conflict")
             };
         }
         item.owner_ack = Some(ack);
+        item.owner_dispatch = Some(dispatch);
         Ok(())
     }
 }
@@ -132,9 +139,25 @@ fn valid_record(item: &ControlSettlementRecord) -> bool {
         && item.confirmed.proposal_id == item.settlement.request.proposal.proposal_id
         && item.confirmed.output == item.settlement.output
         && matches!(&item.applied,ResourceControlResponse::Applied { output,candidate } if **output==item.confirmed.output && candidate.as_deref()==item.confirmed.candidate.as_ref())
-        && item.owner_ack.as_ref().is_none_or(|ack| {
-            validate_resource_control_settlement_response(&item.settlement, ack).is_ok()
-        })
+        && match (&item.owner_ack, &item.owner_dispatch) {
+            (None, None) => true,
+            (Some(ack), Some(dispatch)) => {
+                validate_resource_control_settlement_response(&item.settlement, ack).is_ok()
+                    && valid_dispatch(item, ack, dispatch)
+            }
+            _ => false,
+        }
+}
+fn valid_dispatch(
+    item: &ControlSettlementRecord,
+    ack: &ResourceControlResponse,
+    dispatch: &DispatchRecord,
+) -> bool {
+    dispatch.call.operation_id == format!("{}.settle", item.settlement.request.operation_id)
+        && dispatch.call.approval["provider"].as_str()
+            == Some(item.settlement.request.proposal.owner_provider.as_str())
+        && serde_json::to_value(&item.settlement).ok().as_ref() == Some(&dispatch.call.arguments)
+        && matches!(&dispatch.state, DispatchState::Completed { payload } if serde_json::to_value(ack).ok().as_ref() == Some(payload))
 }
 
 #[cfg(test)]
@@ -160,16 +183,22 @@ mod tests {
             output: Box::new(item.confirmed.output.clone()),
             candidate: None,
         };
+        let dispatch: DispatchRecord = serde_json::from_value(json!({"call":{"service":"owner/2","method":"settle","interface_major":2,"interface_minor":0,"approval":{"provider":"owner"},"arguments":item.settlement,"timeout_ms":1000,"operation_id":"effect.settle"},"state":{"state":"completed","payload":ack}})).unwrap();
         assert!(
-            book.acknowledge("settlement", ack.clone(), &|_, _| false)
-                .is_err()
+            book.acknowledge("settlement", ack.clone(), dispatch.clone(), &|_, _, _| {
+                false
+            })
+            .is_err()
         );
         assert!(book.get("settlement").unwrap().owner_ack.is_none());
         assert!(
-            book.acknowledge("settlement", ack.clone(), &|_, _| true)
+            book.acknowledge("settlement", ack.clone(), dispatch.clone(), &|_, _, _| true)
                 .is_ok()
         );
-        assert!(book.acknowledge("settlement", ack, &|_, _| true).is_ok());
+        assert!(
+            book.acknowledge("settlement", ack, dispatch, &|_, _, _| true)
+                .is_ok()
+        );
         assert!(book.validate_structure());
         let mut changed = item;
         changed.confirmed.output.resource.incarnation = "foreign".into();

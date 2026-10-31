@@ -1,7 +1,8 @@
 //! Owner-authenticated finalization permit endpoint adapter. Finalization has a
 //! distinct authority and never reuses a control permit.
 use amaterasu_extension_api::{
-    LifecycleTarget, ResourceFinalizeRequest, ResourceOutput, validate_resource_finalize_request,
+    LifecycleTarget, ResourceFinalizeRequest, ResourceOutput, ResourcePlan,
+    validate_resource_finalize_request,
 };
 use amaterasu_module_sdk::ModuleResult;
 use serde::Deserialize;
@@ -33,6 +34,8 @@ pub(super) struct ResolvedFinalize {
     pub participant: ParticipantSettings,
     pub context: FinalizeContext,
     pub session_target: LifecycleTarget,
+    pub admitted_plan: ResourcePlan,
+    pub consumers_retired: bool,
 }
 
 /// Implementations must reconstruct trusted selected policy, authenticated
@@ -71,7 +74,7 @@ pub(super) fn finalize_endpoint(
 ) -> Value {
     match authorize(caller, payload, backend) {
         Ok((status, resolved)) => {
-            json!({"status":status, "session_target":resolved.session_target, "target":resolved.context.target, "output":resolved.context.output})
+            json!({"status":status, "session_target":resolved.session_target, "target":resolved.context.target, "output":resolved.context.output, "admitted_plan":resolved.admitted_plan, "plan_revision":resolved.admitted_plan.revision, "consumers_retired":resolved.consumers_retired})
         }
         Err(_) => json!({"status":"rejected","reason":"resource_finalize_not_authorized"}),
     }
@@ -149,6 +152,8 @@ mod tests {
                 participant: self.resolved.participant.clone(),
                 context: self.resolved.context.clone(),
                 session_target: self.resolved.session_target.clone(),
+                admitted_plan: self.resolved.admitted_plan.clone(),
+                consumers_retired: self.resolved.consumers_retired,
             })
         }
         fn validate_output(&mut self, _: &ResourceOutput) -> ModuleResult<()> {
@@ -212,6 +217,8 @@ mod tests {
                     participant,
                     context,
                     session_target: serde_json::from_value(json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1})).unwrap(),
+                    admitted_plan: serde_json::from_value(json!({"plan_id":"p","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]})).unwrap(),
+                    consumers_retired: false,
                 },
                 schema: true,
                 consumed: false,
