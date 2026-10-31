@@ -94,6 +94,12 @@ impl Drop for RunningModule {
 fn domain(revision: u64, borrowers: usize) -> Value {
     json!({"id":"provider_session:abc","revision":revision,"borrowers":borrowers,"pending_mutations":0,"scope":"provider_session"})
 }
+#[derive(Default, serde::Serialize)]
+struct Collection {
+    revision: u64,
+    entries: BTreeMap<String, Value>,
+    metadata: Value,
+}
 struct Fixture {
     broker: Rc<RefCell<Broker>>,
     lifecycle: RunningModule,
@@ -104,9 +110,7 @@ struct Fixture {
     next: u64,
     state_revision: u64,
     values: BTreeMap<String, Value>,
-    collection_revision: u64,
-    entries: BTreeMap<String, Value>,
-    metadata: Value,
+    collections: BTreeMap<String, Collection>,
     native_calls: Vec<Value>,
     references: BTreeMap<String, String>,
     borrows: BTreeMap<String, String>,
@@ -220,9 +224,7 @@ impl Fixture {
             next: 0,
             state_revision: 0,
             values: BTreeMap::new(),
-            collection_revision: 0,
-            entries: BTreeMap::new(),
-            metadata: Value::Null,
+            collections: BTreeMap::new(),
             native_calls: Vec::new(),
             references: BTreeMap::new(),
             borrows: BTreeMap::new(),
@@ -273,21 +275,29 @@ impl Fixture {
                 json!({"ok":true,"revision":self.state_revision})
             }
             "collection_get" => {
-                json!({"ok":true,"revision":self.collection_revision,"found":self.collection_revision!=0,"metadata":self.metadata,"count":self.entries.len(),"value":self.entries.get(p["key"].as_str().unwrap())})
+                let collection = self
+                    .collections
+                    .entry(p["collection"].as_str().unwrap().into())
+                    .or_default();
+                json!({"ok":true,"revision":collection.revision,"found":collection.revision!=0,"metadata":collection.metadata,"count":collection.entries.len(),"value":collection.entries.get(p["key"].as_str().unwrap())})
             }
             "collection_commit" => {
-                assert_eq!(p["expected_revision"], self.collection_revision);
+                let collection = self
+                    .collections
+                    .entry(p["collection"].as_str().unwrap().into())
+                    .or_default();
+                assert_eq!(p["expected_revision"], collection.revision);
                 for edit in p["edits"].as_array().unwrap() {
                     let key = edit["key"].as_str().unwrap().to_owned();
                     if edit["value"].is_null() {
-                        self.entries.remove(&key);
+                        collection.entries.remove(&key);
                     } else {
-                        self.entries.insert(key, edit["value"].clone());
+                        collection.entries.insert(key, edit["value"].clone());
                     }
                 }
-                self.metadata = p["metadata"].clone();
-                self.collection_revision += 1;
-                json!({"ok":true,"revision":self.collection_revision})
+                collection.metadata = p["metadata"].clone();
+                collection.revision += 1;
+                json!({"ok":true,"revision":collection.revision})
             }
             _ => panic!("unexpected state: {p}"),
         }
@@ -315,7 +325,8 @@ impl Fixture {
             }
             "create" => {
                 assert_eq!(
-                    self.metadata["pending"], 1,
+                    self.collections["display-settings/operation-receipts-v2"].metadata["pending"],
+                    1,
                     "effect must follow durable reservation"
                 );
                 assert!(
@@ -450,7 +461,7 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let evidence = json!({"values":self.values,"entries":self.entries,"metadata":self.metadata,"native_calls":self.native_calls});
+        let evidence = json!({"values":self.values,"collections":self.collections,"native_calls":self.native_calls});
         std::fs::write(
             self.root.join("simulated-backend.json"),
             serde_json::to_vec_pretty(&evidence).unwrap(),
