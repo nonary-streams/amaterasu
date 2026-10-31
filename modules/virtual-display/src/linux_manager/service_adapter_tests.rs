@@ -123,6 +123,37 @@ fn create(
     }
 }
 
+struct TransientInspection<'a> {
+    manager: &'a mut Manager,
+}
+impl Backend for TransientInspection<'_> {
+    type Admission = Admission;
+    fn admit(&mut self, caller: &str, operation: Operation) -> (Value, Option<Admission>) {
+        if matches!(
+            operation,
+            Operation::Status {
+                identity: Some(_),
+                ..
+            }
+        ) {
+            (json!({"ok":false,"code":"temporary_failure"}), None)
+        } else {
+            self.manager.admit(caller, operation)
+        }
+    }
+    fn completion_lost(&mut self, admission: Option<Admission>) {
+        self.manager.completion_lost(admission);
+    }
+    fn remove_owned(
+        &mut self,
+        caller: &str,
+        owner: &OwnerReference,
+    ) -> crate::service_adapter::RemovalOutcome {
+        self.manager
+            .admit_removal(caller, &owner.identity, &owner.reference_id)
+    }
+}
+
 struct CancelAfterCreate<'a> {
     manager: &'a mut Manager,
     client: &'a RuntimeClient,
@@ -142,6 +173,14 @@ impl Backend for CancelAfterCreate<'_> {
     }
     fn completion_lost(&mut self, admission: Option<Admission>) {
         self.manager.completion_lost(admission);
+    }
+    fn remove_owned(
+        &mut self,
+        caller: &str,
+        owner: &OwnerReference,
+    ) -> crate::service_adapter::RemovalOutcome {
+        self.manager
+            .admit_removal(caller, &owner.identity, &owner.reference_id)
     }
 }
 
@@ -263,6 +302,74 @@ fn production_linux_manager_routes_fenced_requests_to_fake_worker_via_broker() {
             ..
         }
     ));
+    let call = display::call(
+        &alice,
+        options("recover-transient"),
+        Request::Recover {
+            owner: first.clone(),
+            operation_id: "first".into(),
+        },
+    )
+    .unwrap();
+    let incoming = provider.poll_serialized().unwrap().unwrap();
+    crate::handle_display_api(
+        &provider,
+        &mut TransientInspection {
+            manager: &mut manager,
+        },
+        &mut adapter,
+        incoming,
+    )
+    .unwrap();
+    assert!(matches!(
+        call.poll().unwrap().unwrap().reply,
+        Reply::Effect {
+            state: EffectState::Unknown,
+            ..
+        }
+    ));
+    assert!(call.release().is_ok());
+    events
+        .send(Event::Created {
+            key: ("alice".into(), first.identity.clone()),
+            result: Err("fake failure".into()),
+        })
+        .unwrap();
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "recover-failed",
+            Request::Recover {
+                owner: first.clone(),
+                operation_id: "first".into()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Failed,
+            ..
+        }
+    ));
+    let original_domain = manager.domain_id.clone();
+    manager.domain_id = "different-provider-session".into();
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "recover-new-domain",
+            Request::Recover {
+                owner: first.clone(),
+                operation_id: "first".into()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Unknown,
+            ..
+        }
+    ));
+    manager.domain_id = original_domain;
     events
         .send(Event::Created {
             key: ("alice".into(), first.identity.clone()),
@@ -410,6 +517,73 @@ fn production_linux_manager_routes_fenced_requests_to_fake_worker_via_broker() {
         &mut adapter,
         &alice,
         "before-remove",
+        Request::Capabilities,
+    ) else {
+        panic!("missing capabilities")
+    };
+    let borrow_id = "held-borrow".to_string();
+    manager.borrows.insert(
+        borrow_id.clone(),
+        Borrow {
+            key: ("alice".into(), first.identity.clone()),
+            reference_id: first.reference_id.clone(),
+            observation: observer::Observation {
+                global: 1,
+                width: 1920,
+                height: 1080,
+                refresh: 60000,
+                generation: 1,
+                compositor_id: [1; 32],
+            },
+            valid: true,
+        },
+    );
+    let borrowed_request = Request::Remove {
+        owner: first.clone(),
+        operation_id: "remove-first".into(),
+        expected: capabilities.topology.clone().unwrap(),
+    };
+    assert_eq!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "borrowed-remove",
+            borrowed_request
+        ),
+        Reply::Unavailable
+    );
+    assert!(observed.try_recv().is_err());
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "recover-after-rejection",
+            Request::Recover {
+                owner: first.clone(),
+                operation_id: "first".into()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Applied,
+            ..
+        }
+    ));
+    let (release, _) = manager.admit(
+        "alice",
+        Operation::ReleaseBorrow {
+            identity: first.identity.clone(),
+            reference_id: first.reference_id.clone(),
+            borrow_id,
+        },
+    );
+    assert_eq!(release["ok"], true);
+    let Reply::Capabilities { capabilities } = exchange(
+        &mut manager,
+        &mut adapter,
+        &alice,
+        "after-borrow",
         Request::Capabilities,
     ) else {
         panic!("missing capabilities")

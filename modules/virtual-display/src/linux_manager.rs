@@ -681,30 +681,51 @@ impl Manager {
         true
     }
     fn remove(&mut self, caller: &str, identity: &str, reference_id: Option<&str>) -> Value {
+        self.remove_outcome(caller, identity, reference_id)
+            .into_response()
+    }
+
+    pub(crate) fn admit_removal(
+        &mut self,
+        caller: &str,
+        identity: &str,
+        reference_id: &str,
+    ) -> crate::service_adapter::RemovalOutcome {
+        self.tick();
+        self.remove_outcome(caller, identity, Some(reference_id))
+    }
+
+    fn remove_outcome(
+        &mut self,
+        caller: &str,
+        identity: &str,
+        reference_id: Option<&str>,
+    ) -> crate::service_adapter::RemovalOutcome {
+        use crate::service_adapter::RemovalOutcome::{Attempted, Rejected};
         if self
             .reconfigurations
             .values()
             .any(|change| change.state == "pending")
         {
-            return failure("reconfigure_pending");
+            return Rejected(failure("reconfigure_pending"));
         }
         if !valid_identity(identity)
             || reference_id.is_some_and(|reference| !valid_reference_id(reference))
         {
-            return failure("invalid_request");
+            return Rejected(failure("invalid_request"));
         }
         let key = (caller.to_owned(), identity.to_owned());
         if !self.ready && self.recovery_error.is_none() {
-            return failure("startup_reconciliation_pending");
+            return Rejected(failure("startup_reconciliation_pending"));
         }
         if self.borrows.values().any(|borrow| {
             borrow.key == key
                 && reference_id.is_none_or(|reference| borrow.reference_id == reference)
         }) {
-            return failure("display_borrowed");
+            return Rejected(failure("display_borrowed"));
         }
         if !self.monitors.contains_key(&key) {
-            return json!({"ok":true,"removed":true,"identity":identity});
+            return Attempted(json!({"ok":true,"removed":true,"identity":identity}));
         }
         let removes_output = reference_id.is_none_or(|reference| {
             self.monitors[&key]
@@ -713,39 +734,43 @@ impl Manager {
                 .is_none_or(|refs| refs.is_empty() || (refs.len() == 1 && refs.contains(reference)))
         });
         if removes_output && !self.borrows.is_empty() {
-            return failure("topology_borrowed");
+            return Rejected(failure("topology_borrowed"));
         }
         if removes_output && self.topology_revision == u64::MAX {
-            return failure("topology_revision_exhausted");
+            return Rejected(failure("topology_revision_exhausted"));
         }
         if let Some(reference) = reference_id {
             let Some(references) = self.monitors[&key].references.as_ref() else {
-                return failure("reference_conflict");
+                return Rejected(failure("reference_conflict"));
             };
             let mut references = references.clone();
             let released = references.remove(reference);
             let last = references.is_empty();
             if !self.persist_references(&key, references) {
-                return failure("journal_unavailable");
+                return Attempted(failure("journal_unavailable"));
             }
             if !last {
-                return json!({"ok":true,"removed":false,"identity":identity,"reference_released":released,"reference_owned":false});
+                return Attempted(
+                    json!({"ok":true,"removed":false,"identity":identity,"reference_released":released,"reference_owned":false}),
+                );
             }
         } else if self.monitors[&key].references.is_some()
             && !self.persist_references(&key, BTreeSet::new())
         {
-            return failure("journal_unavailable");
+            return Attempted(failure("journal_unavailable"));
         }
         if !self.cleanup_pending.contains(&key) {
             if !self.enqueue(Work::Remove { key: key.clone() }) {
-                return failure("busy");
+                return Attempted(failure("busy"));
             }
             self.topology_revision += 1;
             self.pending_mutations += 1;
             self.cleanup_pending.insert(key.clone());
             self.monitors.get_mut(&key).unwrap().state = "removing";
         }
-        json!({"ok":true,"removed":false,"monitor":self.monitors[&key].response(reference_id),"reference_owned":false})
+        Attempted(
+            json!({"ok":true,"removed":false,"monitor":self.monitors[&key].response(reference_id),"reference_owned":false}),
+        )
     }
     /// Lookup only: never enqueue work or admit an unknown operation. The
     /// observing phase may finish the already completed operation's borrow.

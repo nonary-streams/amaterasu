@@ -11,10 +11,34 @@ use std::collections::BTreeMap;
 
 const MAX_OPERATIONS: usize = 128;
 
+/// Manager-owned classification, independent of human-readable error codes.
+/// `Rejected` guarantees no ownership or display mutation was attempted;
+/// `Attempted` may have changed state even when its response is an error.
+pub enum RemovalOutcome {
+    Rejected(Value),
+    #[cfg_attr(
+        all(not(amaterasu_libvirtualdisplay), not(test)),
+        expect(
+            dead_code,
+            reason = "only the topology-capable Linux manager attempts typed removal"
+        )
+    )]
+    Attempted(Value),
+}
+impl RemovalOutcome {
+    #[cfg(amaterasu_libvirtualdisplay)]
+    pub fn into_response(self) -> Value {
+        match self {
+            Self::Rejected(value) | Self::Attempted(value) => value,
+        }
+    }
+}
+
 pub trait Backend {
     type Admission;
     fn admit(&mut self, caller: &str, operation: Operation) -> (Value, Option<Self::Admission>);
     fn completion_lost(&mut self, admission: Option<Self::Admission>);
+    fn remove_owned(&mut self, caller: &str, owner: &OwnerReference) -> RemovalOutcome;
 }
 
 #[cfg(any(not(amaterasu_libvirtualdisplay), test))]
@@ -26,6 +50,9 @@ impl<D: crate::backend::Driver> Backend for crate::manager::Manager<D> {
     fn completion_lost(&mut self, admission: Option<Self::Admission>) {
         self.completion_lost(admission);
     }
+    fn remove_owned(&mut self, _: &str, _: &OwnerReference) -> RemovalOutcome {
+        RemovalOutcome::Rejected(crate::model::failure("unsupported_topology_domain"))
+    }
 }
 #[cfg(amaterasu_libvirtualdisplay)]
 impl Backend for crate::linux_manager::Manager {
@@ -36,6 +63,9 @@ impl Backend for crate::linux_manager::Manager {
     fn completion_lost(&mut self, admission: Option<Self::Admission>) {
         self.completion_lost(admission);
     }
+    fn remove_owned(&mut self, caller: &str, owner: &OwnerReference) -> RemovalOutcome {
+        self.admit_removal(caller, &owner.identity, &owner.reference_id)
+    }
 }
 
 #[derive(Clone)]
@@ -43,6 +73,7 @@ struct OperationRecord {
     request: Request,
     reply: Reply,
     cleanup: bool,
+    creation_fenced: bool,
 }
 
 #[derive(Default)]
@@ -56,6 +87,65 @@ pub struct Invocation<'a, B: Backend> {
     admission: Option<B::Admission>,
 }
 impl Adapter {
+    /// Conservatively fence an older create when another owner-scoped request
+    /// could replace its reference. All legacy calls pass through this hook.
+    pub fn observe_mutation(
+        &mut self,
+        caller: &str,
+        identity: &str,
+        reference: Option<&str>,
+        except: Option<&str>,
+    ) {
+        for ((principal, operation_id), record) in &mut self.operations {
+            if principal != caller || except == Some(operation_id.as_str()) || record.cleanup {
+                continue;
+            }
+            if let Request::Create { owner, .. } = &record.request
+                && owner.identity == identity
+                && reference.is_none_or(|id| id == owner.reference_id)
+            {
+                record.creation_fenced = true;
+            }
+        }
+    }
+
+    fn settle_fenced_creations(&mut self, caller: &str, owner: &OwnerReference) {
+        for ((principal, _), record) in &mut self.operations {
+            if principal == caller
+                && record.creation_fenced
+                && !record.cleanup
+                && matches!(&record.request, Request::Create { owner: original, .. } if original == owner)
+            {
+                record.reply = Reply::Effect {
+                    state: EffectState::Absent,
+                    topology: None,
+                    observation: ModeObservation::NotObserved,
+                };
+                record.creation_fenced = false;
+            }
+        }
+    }
+
+    pub fn observe_legacy_mutation(&mut self, caller: &str, operation: &Operation) {
+        match operation {
+            Operation::Create {
+                identity,
+                reference_id,
+                ..
+            }
+            | Operation::Remove {
+                identity,
+                reference_id,
+            } => self.observe_mutation(caller, identity, reference_id.as_deref(), None),
+            // Reconfiguration can replace the output shared by all references.
+            Operation::Reconfigure { identity, .. }
+            | Operation::ReconfigureModeOnly { identity, .. } => {
+                self.observe_mutation(caller, identity, None, None)
+            }
+            _ => {}
+        }
+    }
+
     pub fn invocation<'a, B: Backend>(&'a mut self, backend: &'a mut B) -> Invocation<'a, B> {
         Invocation {
             adapter: self,
@@ -146,6 +236,62 @@ impl<B: Backend> Invocation<'_, B> {
         Self::effect(state, topology)
     }
 
+    fn creation_status(&mut self, caller: &str, request: &Request) -> Reply {
+        let Request::Create {
+            owner,
+            expected,
+            mode,
+            name,
+            layout,
+            scale,
+            ..
+        } = request
+        else {
+            return Self::effect(EffectState::Unknown, None);
+        };
+        let status = self.status(caller, Some(owner));
+        let topology = Self::topology(&status);
+        let valid_domain = topology.as_ref().is_some_and(|current| {
+            current.domain_id == expected.domain_id && current.revision >= expected.revision
+        });
+        let Some(monitors) = status["monitors"].as_array() else {
+            return Self::effect(EffectState::Unknown, topology);
+        };
+        if status["ok"] != true
+            || status["recovery_ready"] != true
+            || !valid_domain
+            || status["reference_owned"] != true
+            || monitors.len() != 1
+        {
+            return Self::effect(EffectState::Unknown, topology);
+        }
+        let monitor = &monitors[0];
+        let specification = &monitor["specification"];
+        let expected_layout = match layout {
+            Layout::Exclusive => "exclusive",
+            Layout::Extended => "extended",
+            _ => return Self::effect(EffectState::Unknown, topology),
+        };
+        if specification["identity"] != owner.identity
+            || specification["name"] != *name
+            || specification["width"] != mode.width
+            || specification["height"] != mode.height
+            || specification["refresh_millihz"] != mode.refresh_millihz
+            || specification["hdr_enabled"] != mode.hdr
+            || monitor["virtual_display_layout"] != expected_layout
+            || scale.is_some_and(|value| monitor["dd_virtual_display_scale"] != value)
+        {
+            return Self::effect(EffectState::Unknown, topology);
+        }
+        let state = match monitor["state"].as_str() {
+            Some("ready") => EffectState::Applied,
+            Some("creating") => EffectState::Pending,
+            Some("cleanup_failed") => EffectState::Failed,
+            _ => EffectState::Unknown,
+        };
+        Self::effect(state, topology)
+    }
+
     fn recover(&mut self, caller: &str, owner: &OwnerReference, operation_id: &str) -> Reply {
         let key = (caller.to_owned(), operation_id.to_owned());
         let Some(record) = self.adapter.operations.get(&key).cloned() else {
@@ -158,6 +304,9 @@ impl<B: Backend> Invocation<'_, B> {
         if original != owner {
             return Self::effect(EffectState::Unknown, None);
         }
+        if record.creation_fenced && !record.cleanup {
+            return Self::effect(EffectState::Unknown, None);
+        }
         let reply = match &record.reply {
             Reply::Effect {
                 state: EffectState::Completed | EffectState::Removed | EffectState::Absent,
@@ -165,19 +314,28 @@ impl<B: Backend> Invocation<'_, B> {
             } => record.reply.clone(),
             _ if record.cleanup => self.cleanup_status(caller, owner),
             Reply::Effect {
-                state: EffectState::Pending,
+                state:
+                    EffectState::Pending
+                    | EffectState::Unknown
+                    | EffectState::Failed
+                    | EffectState::Applied,
                 ..
-            } => match self.inspect(caller, owner) {
-                as_reply @ Reply::Effect {
-                    state: EffectState::Pending | EffectState::Applied,
-                    ..
-                } => as_reply,
-                _ => Self::effect(EffectState::Unknown, None),
-            },
+            } => self.creation_status(caller, &record.request),
             _ => record.reply.clone(),
         };
         if let Some(saved) = self.adapter.operations.get_mut(&key) {
             saved.reply = reply.clone();
+        }
+        if record.cleanup
+            && matches!(
+                reply,
+                Reply::Effect {
+                    state: EffectState::Completed,
+                    ..
+                }
+            )
+        {
+            self.adapter.settle_fenced_creations(caller, owner);
         }
         reply
     }
@@ -230,14 +388,16 @@ impl<B: Backend> Invocation<'_, B> {
         {
             return Self::effect(EffectState::Unknown, Some(current));
         }
-        let (result, admission) = self.backend.admit(
+        let result = match self.backend.remove_owned(caller, owner) {
+            RemovalOutcome::Rejected(result) => return failure(&result),
+            RemovalOutcome::Attempted(result) => result,
+        };
+        self.adapter.observe_mutation(
             caller,
-            Operation::Remove {
-                identity: owner.identity.clone(),
-                reference_id: Some(owner.reference_id.clone()),
-            },
+            &owner.identity,
+            Some(&owner.reference_id),
+            Some(operation_id),
         );
-        self.admission = admission;
         let state = if result["ok"] == true && Self::release_confirmed(&result) {
             EffectState::Completed
         } else if result["ok"] == true {
@@ -248,6 +408,9 @@ impl<B: Backend> Invocation<'_, B> {
         let reply = Self::effect(state, Self::topology(&self.status(caller, None)));
         if let Some(saved) = self.adapter.operations.get_mut(&key) {
             saved.reply = reply.clone();
+        }
+        if state == EffectState::Completed {
+            self.adapter.settle_fenced_creations(caller, owner);
         }
         reply
     }
@@ -324,9 +487,31 @@ impl<B: Backend> Invocation<'_, B> {
             }
             _ => return Reply::Unavailable,
         };
-        let (result, admission) = self.backend.admit(caller, operation);
-        self.admission = admission;
         let cleanup = matches!(request, Request::Remove { .. });
+        let result = if cleanup {
+            match self.backend.remove_owned(caller, owner) {
+                RemovalOutcome::Rejected(result) => return failure(&result),
+                RemovalOutcome::Attempted(result) => result,
+            }
+        } else {
+            self.adapter.observe_mutation(
+                caller,
+                &owner.identity,
+                Some(&owner.reference_id),
+                Some(operation_id),
+            );
+            let (result, admission) = self.backend.admit(caller, operation);
+            self.admission = admission;
+            result
+        };
+        if cleanup {
+            self.adapter.observe_mutation(
+                caller,
+                &owner.identity,
+                Some(&owner.reference_id),
+                Some(operation_id),
+            );
+        }
         if result["ok"] != true && !cleanup {
             return failure(&result);
         }
@@ -344,8 +529,12 @@ impl<B: Backend> Invocation<'_, B> {
                 request: request.clone(),
                 reply: reply.clone(),
                 cleanup,
+                creation_fenced: false,
             },
         );
+        if cleanup && state == EffectState::Completed {
+            self.adapter.settle_fenced_creations(caller, owner);
+        }
         reply
     }
 }
@@ -435,6 +624,20 @@ impl<B: Backend> Provider for Invocation<'_, B> {
     }
     fn completion_lost(&mut self, caller: &str, request: &Request, _: &Reply) {
         let had_admission = self.admission.is_some();
+        if had_admission
+            && let Request::Create {
+                owner,
+                operation_id,
+                ..
+            } = request
+        {
+            self.adapter.observe_mutation(
+                caller,
+                &owner.identity,
+                Some(&owner.reference_id),
+                Some(operation_id),
+            );
+        }
         self.backend.completion_lost(self.admission.take());
         if let Request::Create { operation_id, .. } = request
             && had_admission
@@ -484,7 +687,7 @@ mod tests {
                     json!({"ok":true, "enabled":true, "recovery_ready":true,
                     "mutation_domain":{"id":"test-domain", "revision":self.revision},
                     "reference_owned":self.reference_owned,
-                    "monitors":self.state.map(|state| vec![json!({"state":state})]).unwrap_or_default()}),
+                    "monitors":self.state.map(|state| vec![json!({"state":state,"specification":{"identity":"display","name":"Display","width":1920,"height":1080,"refresh_millihz":60000,"hdr_enabled":false},"virtual_display_layout":"extended","dd_virtual_display_scale":0})]).unwrap_or_default()}),
                     None,
                 ),
                 Operation::Remove { .. } => {
@@ -509,6 +712,16 @@ mod tests {
             }
         }
         fn completion_lost(&mut self, _: Option<()>) {}
+        fn remove_owned(&mut self, caller: &str, owner: &OwnerReference) -> RemovalOutcome {
+            let (result, _) = self.admit(
+                caller,
+                Operation::Remove {
+                    identity: owner.identity.clone(),
+                    reference_id: Some(owner.reference_id.clone()),
+                },
+            );
+            RemovalOutcome::Attempted(result)
+        }
     }
     fn owner() -> OwnerReference {
         OwnerReference {
@@ -546,6 +759,161 @@ mod tests {
     }
     fn has_state(reply: Reply, expected: EffectState) -> bool {
         matches!(reply, Reply::Effect { state, .. } if state == expected)
+    }
+
+    #[test]
+    fn reference_mutation_fences_old_create_even_if_status_looks_ready() {
+        let mut backend = FakeBackend::new();
+        let mut adapter = Adapter::default();
+        let request = Request::Create {
+            owner: owner(),
+            operation_id: "create".into(),
+            expected: topology(7),
+            mode: amaterasu_module_sdk::virtual_display_service::Mode {
+                width: 1920,
+                height: 1080,
+                refresh_millihz: 60000,
+                hdr: false,
+            },
+            acceptance: amaterasu_module_sdk::virtual_display_service::ModeAcceptance {
+                max_refresh_delta_ppm: 0,
+                require_hdr_match: true,
+            },
+            name: "Display".into(),
+            layout: Layout::Extended,
+            scale: Some(0),
+        };
+        adapter.operations.insert(
+            ("alice".into(), "create".into()),
+            OperationRecord {
+                request,
+                reply: Invocation::<FakeBackend>::effect(EffectState::Unknown, None),
+                cleanup: false,
+                creation_fenced: false,
+            },
+        );
+        let recover = Request::Recover {
+            owner: owner(),
+            operation_id: "create".into(),
+        };
+        adapter.observe_legacy_mutation(
+            "bob",
+            &Operation::Remove {
+                identity: "display".into(),
+                reference_id: Some("stream".into()),
+            },
+        );
+        assert!(has_state(
+            run(&mut adapter, &mut backend, &recover),
+            EffectState::Applied
+        ));
+        adapter.observe_legacy_mutation(
+            "alice",
+            &Operation::Remove {
+                identity: "display".into(),
+                reference_id: Some("stream".into()),
+            },
+        );
+        assert!(has_state(
+            run(&mut adapter, &mut backend, &recover),
+            EffectState::Unknown
+        ));
+        assert_eq!(
+            run(
+                &mut adapter,
+                &mut backend,
+                &Request::ReleaseOperation {
+                    owner: owner(),
+                    operation_id: "create".into()
+                }
+            ),
+            Reply::OperationNotSettled
+        );
+        assert!(has_state(
+            run(&mut adapter, &mut backend, &remove()),
+            EffectState::Pending
+        ));
+        backend.state = None;
+        assert!(has_state(
+            run(
+                &mut adapter,
+                &mut backend,
+                &Request::Recover {
+                    owner: owner(),
+                    operation_id: "operation".into()
+                }
+            ),
+            EffectState::Completed
+        ));
+        assert_eq!(
+            run(
+                &mut adapter,
+                &mut backend,
+                &Request::ReleaseOperation {
+                    owner: owner(),
+                    operation_id: "create".into()
+                }
+            ),
+            Reply::OperationReleased
+        );
+    }
+
+    #[test]
+    fn legacy_reconfiguration_fences_every_reference_to_the_output() {
+        let mut backend = FakeBackend::new();
+        let mut adapter = Adapter::default();
+        let request = Request::Create {
+            owner: owner(),
+            operation_id: "create".into(),
+            expected: topology(7),
+            mode: amaterasu_module_sdk::virtual_display_service::Mode {
+                width: 1920,
+                height: 1080,
+                refresh_millihz: 60000,
+                hdr: false,
+            },
+            acceptance: amaterasu_module_sdk::virtual_display_service::ModeAcceptance {
+                max_refresh_delta_ppm: 0,
+                require_hdr_match: true,
+            },
+            name: "Display".into(),
+            layout: Layout::Extended,
+            scale: Some(0),
+        };
+        adapter.operations.insert(
+            ("alice".into(), "create".into()),
+            OperationRecord {
+                request,
+                reply: Invocation::<FakeBackend>::effect(EffectState::Unknown, None),
+                cleanup: false,
+                creation_fenced: false,
+            },
+        );
+        adapter.observe_legacy_mutation(
+            "alice",
+            &Operation::Reconfigure {
+                operation_id: "reconfigure".into(),
+                identity: "display".into(),
+                reference_id: "another-reference".into(),
+                borrow_id: "borrow".into(),
+                width: 1920,
+                height: 1080,
+                refresh_millihz: 60000,
+                expected_topology_domain_id: "test-domain".into(),
+                expected_topology_revision: 7,
+            },
+        );
+        assert!(has_state(
+            run(
+                &mut adapter,
+                &mut backend,
+                &Request::Recover {
+                    owner: owner(),
+                    operation_id: "create".into()
+                }
+            ),
+            EffectState::Unknown
+        ));
     }
 
     #[test]
@@ -656,6 +1024,7 @@ mod tests {
                         Some(topology(7)),
                     ),
                     cleanup: true,
+                    creation_fenced: false,
                 },
             );
         }

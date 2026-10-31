@@ -114,6 +114,8 @@ impl ManagedModule for VirtualDisplayModule {
                             self.runtime.send(Command::CheckRequest { request: id })?,
                             Response::Ok
                         ) {
+                            self.display_adapter
+                                .observe_legacy_mutation(&caller, &operation);
                             self.manager.admit(&caller, operation)
                         } else {
                             (failure("request_ended"), None)
