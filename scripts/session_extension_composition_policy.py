@@ -91,7 +91,8 @@ def provider_entries(selected: list[dict], enable_action: bool = False) -> dict:
                          "approved_methods": [entry["method"] for entry in selected_approvals],
                          "grants": grants, "migrations": []})
         defaults = {option["id"]: option["definition"]["default"] for option in descriptor["options"]}
-        participant = {"provider": provider, "depends_on": [] if provider == check.OWNER else [check.OWNER],
+        participant = {"provider": provider, "contract_version": 2,
+                       "depends_on": [] if provider == check.OWNER else [check.OWNER],
                        "plan_method": method_ref(provider, "resource_plan"),
                        "callback_method": method_ref(provider, "lifecycle_callback"),
                        "status_method": method_ref(provider, "lifecycle_status"),
@@ -186,3 +187,46 @@ def build_bootstrap(base: dict, selected: list[dict], entries: dict, lifecycle_s
         raise ValueError("existing capture selection conflicts with PipeWire")
     capture["capture_provider"] = "pipewire"
     return bootstrap, calls
+
+
+def lifecycle_graph(owner_approvals: list[dict], target_document: bytes, control_document: bytes,
+                    method_names: dict[str, str]) -> dict:
+    """Build the pinned resource-scoped owner graph from approved method names.
+
+    Names are supplied only after the coordinator and owner's complete method
+    contracts have been reviewed and matched. This does not validate routes,
+    operation grants or runtime support and cannot by itself enable a profile.
+    """
+    import hashlib
+
+    roles = {"control", "control_status", "settlement", "settlement_status", "finalize", "finalize_status"}
+    if set(method_names) != roles or any(not isinstance(name, str) or not name for name in method_names.values()):
+        raise ValueError("complete owner method selections are required")
+    for document, digest in ((target_document, check.TARGET_DIGEST), (control_document, check.CONTROL_DIGEST)):
+        if hashlib.sha256(document).hexdigest() != digest:
+            raise ValueError("composition schema bytes do not match the selected digest")
+    names = {approval["method"]["method"] for approval in owner_approvals
+             if approval.get("provider") == check.OWNER
+             and approval.get("method", {}).get("service") == check.OWNER + "/2"
+             and approval["method"].get("interface_major") == 2
+             and approval["method"].get("interface_minor") == 0}
+    if not set(method_names.values()) <= names:
+        raise ValueError("owner method selection lacks an approval")
+    target_schema = {"id": "amaterasu.display-target/1", "major": 1, "minor": 0, "digest": check.TARGET_DIGEST}
+    control_schema = {"id": "amaterasu.display-control/1", "major": 1, "minor": 0, "digest": check.CONTROL_DIGEST}
+    common = {"owner_provider": check.OWNER, "owner_service": check.OWNER + "/2",
+              "output_capability": "amaterasu.display-target", "output_schema": target_schema,
+              "domain_scope": "resource", "mutation_domains": []}
+    control = {**copy.deepcopy(common), "dependent_provider": check.DISPLAY,
+               "owner_method": method_ref(check.OWNER, method_names["control"]),
+               "status_method": method_ref(check.OWNER, method_names["control_status"]),
+               "settlement_method": method_ref(check.OWNER, method_names["settlement"]),
+               "settlement_status_method": method_ref(check.OWNER, method_names["settlement_status"]),
+               "argument_schema": control_schema, "max_access": "exclusive"}
+    finalize = {**copy.deepcopy(common), "method": method_ref(check.OWNER, method_names["finalize"]),
+                "status_method": method_ref(check.OWNER, method_names["finalize_status"]),
+                "capture_provider": "amaterasu.capture-pipewire/1", "selector_schema": "amaterasu.kwin-wl-output/1",
+                "required_access": "exclusive"}
+    return {"control_policies": [control], "finalize_policies": [finalize],
+            "schema_documents": [{"reference": target_schema, "document": target_document.decode("utf-8")},
+                                 {"reference": control_schema, "document": control_document.decode("utf-8")} ]}

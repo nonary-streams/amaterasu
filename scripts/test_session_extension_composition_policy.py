@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Validate split participant and registry policy assembly."""
 import copy
+import hashlib
 import unittest
+from unittest import mock
 
 import check_session_extension_composition as check
 import session_extension_composition_policy as policy
@@ -36,6 +38,7 @@ class CompositionPolicyTest(unittest.TestCase):
         self.assertEqual(self.selected, before)
         self.assertEqual([entry["provider"] for entry in result["participants"]], [check.OWNER, check.DISPLAY])
         self.assertEqual(result["participants"][1]["depends_on"], [check.OWNER])
+        self.assertTrue(all(entry["contract_version"] == 2 for entry in result["participants"]))
         self.assertEqual(result["participants"][0]["binding_validate_method"], policy.method_ref(check.OWNER, "binding_validate"))
         self.assertEqual(result["input_actions"], [])
         self.assertEqual(result["action_grants"], [])
@@ -113,6 +116,29 @@ class CompositionPolicyTest(unittest.TestCase):
         base["policy"]["settings"][legacy.NVHTTP]["session_lifecycle_required"] = False
         with self.assertRaisesRegex(ValueError, "lifecycle configuration conflicts"):
             policy.build_bootstrap(base, self.selected, entries, {})
+
+    def test_resource_scoped_graph_pins_owner_methods_and_schema_bytes(self):
+        target, control = b'{"target":true}\n', b'{"control":true}\n'
+        names = {"control": "resource_control", "control_status": "resource_status",
+                 "settlement": "resource_control_settle", "settlement_status": "resource_settle_status",
+                 "finalize": "resource_finalize", "finalize_status": "resource_status"}
+        approvals = copy.deepcopy(self.owner["approvals"])
+        for name in set(names.values()) - check.OWNER_METHODS:
+            approval = copy.deepcopy(approvals[0])
+            approval["method"]["method"] = name
+            approvals.append(approval)
+        with mock.patch.object(check, "TARGET_DIGEST", hashlib.sha256(target).hexdigest()), \
+             mock.patch.object(check, "CONTROL_DIGEST", hashlib.sha256(control).hexdigest()):
+            graph = policy.lifecycle_graph(approvals, target, control, names)
+            self.assertEqual(graph["control_policies"][0]["domain_scope"], "resource")
+            self.assertEqual(graph["control_policies"][0]["mutation_domains"], [])
+            self.assertEqual(graph["finalize_policies"][0]["domain_scope"], "resource")
+            self.assertEqual(graph["schema_documents"][0]["document"].encode(), target)
+            with self.assertRaisesRegex(ValueError, "schema bytes"):
+                policy.lifecycle_graph(approvals, target + b' ', control, names)
+            names["control_status"] = "not_approved"
+            with self.assertRaisesRegex(ValueError, "lacks an approval"):
+                policy.lifecycle_graph(approvals, target, control, names)
 
 
 if __name__ == "__main__":
