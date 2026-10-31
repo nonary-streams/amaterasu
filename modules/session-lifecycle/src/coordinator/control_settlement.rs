@@ -8,8 +8,11 @@ use amaterasu_extension_api::{
     validate_resource_control_settlement_response,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 
 const MAX_SETTLEMENTS: usize = 128;
+const MAX_REPLAY_FENCES: usize = 8192;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -41,6 +44,9 @@ impl ControlSettlementRecord {
 #[serde(deny_unknown_fields)]
 pub(super) struct ControlSettlementBook {
     records: Vec<ControlSettlementRecord>,
+    /// Permanent digests of compacted identifiers. Exhaustion fails closed.
+    #[serde(default)]
+    replay_fences: BTreeSet<String>,
 }
 
 impl ControlSettlementBook {
@@ -56,6 +62,18 @@ impl ControlSettlementBook {
     /// schema provenance. Recheck all against the coordinator journal on load.
     pub fn validate_structure(&self) -> bool {
         self.records.len() <= MAX_SETTLEMENTS
+            && self.replay_fences.len() <= MAX_REPLAY_FENCES
+            && self.replay_fences.iter().all(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+            && self.records.iter().all(|item| {
+                replay_keys(item)
+                    .iter()
+                    .all(|key| !self.replay_fences.contains(key))
+            })
             && self.records.iter().enumerate().all(|(index, item)| {
                 valid_record(item)
                     && !self.records[..index].iter().any(|old| {
@@ -101,7 +119,8 @@ impl ControlSettlementBook {
                 Err("control_settlement_conflict")
             };
         }
-        if self.records.len() >= MAX_SETTLEMENTS
+        if self.is_fenced(&item)
+            || self.records.len() >= MAX_SETTLEMENTS
             || self
                 .records
                 .iter()
@@ -111,6 +130,43 @@ impl ControlSettlementBook {
         }
         self.records.push(item);
         Ok(())
+    }
+    fn is_fenced(&self, item: &ControlSettlementRecord) -> bool {
+        replay_keys(item)
+            .iter()
+            .any(|key| self.replay_fences.contains(key))
+    }
+    /// Check before effect dispatch; rejecting only while recording the outcome
+    /// would be too late to prevent replayed native effects.
+    #[allow(dead_code, reason = "awaits coordinator-owned lineage closure")]
+    pub fn operation_fenced(&self, owner: &str, operation_id: &str) -> bool {
+        self.replay_fences
+            .contains(&replay_digest(&["operation", owner, operation_id]))
+    }
+    /// Remove acknowledged records only after the coordinator independently
+    /// proves every dependent and owner obligation closed. Persist this book
+    /// atomically with that proof and the rest of the lineage retirement.
+    #[allow(dead_code, reason = "awaits coordinator-owned lineage closure")]
+    pub fn compact_confirmed(&mut self, closed: &impl Fn(&ControlSettlementRecord) -> bool) {
+        self.records.retain(|item| {
+            if item.owner_ack.is_none()
+                || item.owner_dispatch.is_none()
+                || !valid_record(item)
+                || !closed(item)
+            {
+                return true;
+            }
+            let keys = replay_keys(item);
+            let additional = keys
+                .iter()
+                .filter(|key| !self.replay_fences.contains(*key))
+                .count();
+            if self.replay_fences.len() + additional > MAX_REPLAY_FENCES {
+                return true;
+            }
+            self.replay_fences.extend(keys);
+            false
+        });
     }
     /// Caller authenticates selected owner and exact broker completion before
     /// calling. Atomically persist this update with the Work and authority state.
@@ -143,6 +199,22 @@ impl ControlSettlementBook {
         item.owner_dispatch = Some(dispatch);
         Ok(())
     }
+}
+fn replay_digest(parts: &[&str]) -> String {
+    let bytes = serde_json::to_vec(parts).expect("string tuple serializes");
+    format!("{:x}", Sha256::digest(bytes))
+}
+fn replay_keys(item: &ControlSettlementRecord) -> [String; 3] {
+    let request = &item.settlement.request;
+    [
+        replay_digest(&["settlement", &item.settlement.settlement_id]),
+        replay_digest(&["permit", &request.permit_id]),
+        replay_digest(&[
+            "operation",
+            &request.proposal.owner_provider,
+            &request.operation_id,
+        ]),
+    ]
 }
 fn valid_record(item: &ControlSettlementRecord) -> bool {
     validate_resource_control_settlement_request(&item.settlement).is_ok()
@@ -238,6 +310,7 @@ mod tests {
         assert!(valid_record(&item));
         let mut book = ControlSettlementBook {
             records: vec![item.clone()],
+            ..Default::default()
         };
         let ack = ResourceControlResponse::Applied {
             output: Box::new(item.confirmed.output.clone()),
@@ -271,10 +344,71 @@ mod tests {
         duplicate.settlement.settlement_id = "another".into();
         assert!(
             !ControlSettlementBook {
-                records: vec![item, duplicate]
+                records: vec![item, duplicate],
+                ..Default::default()
             }
             .validate_structure()
         );
+    }
+    fn acknowledged_fixture(index: usize) -> ControlSettlementRecord {
+        let mut item = fixture();
+        item.settlement.settlement_id = format!("settlement-{index}");
+        item.settlement.request.permit_id = format!("permit-{index}");
+        item.settlement.request.operation_id = format!("effect-{index}");
+        item.effect_dispatch.call.operation_id = item.settlement.request.operation_id.clone();
+        item.effect_dispatch.call.arguments =
+            serde_json::to_value(&item.settlement.request).unwrap();
+        let ack = item.applied.clone();
+        item.owner_dispatch = Some(serde_json::from_value(json!({"call":{"service":"owner/2","method":"settle","interface_major":2,"interface_minor":0,"approval":{"provider":"owner"},"arguments":item.settlement,"timeout_ms":1000,"operation_id":format!("effect-{index}.settle")},"state":{"state":"completed","payload":ack}})).unwrap());
+        item.owner_ack = Some(ack);
+        assert!(valid_record(&item));
+        item
+    }
+
+    #[test]
+    fn compacted_closure_preserves_replay_fences_and_unresolved_records() {
+        let mut book = ControlSettlementBook::default();
+        let pending = fixture();
+        book.records.push(pending.clone());
+        let held = acknowledged_fixture(1000);
+        book.records.push(held.clone());
+        let first = acknowledged_fixture(0);
+        for index in 0..200 {
+            book.records.push(acknowledged_fixture(index));
+            book.compact_confirmed(&|item| {
+                item.settlement.settlement_id != held.settlement.settlement_id
+            });
+            assert!(book.validate_structure());
+        }
+        assert_eq!(book.records.len(), 2);
+        assert_eq!(book.get(&pending.settlement.settlement_id), Some(&pending));
+        assert_eq!(book.get(&held.settlement.settlement_id), Some(&held));
+        let restored: ControlSettlementBook =
+            serde_json::from_slice(&serde_json::to_vec(&book).unwrap()).unwrap();
+        assert!(restored.validate_structure());
+        assert!(restored.is_fenced(&first));
+        assert!(restored.operation_fenced("owner", "effect-0"));
+        assert!(!restored.operation_fenced("other-owner", "effect-0"));
+        let mut replay = acknowledged_fixture(9999);
+        replay.settlement.request.operation_id = first.settlement.request.operation_id.clone();
+        assert!(restored.is_fenced(&replay));
+        replay = acknowledged_fixture(9999);
+        replay.settlement.request.permit_id = first.settlement.request.permit_id.clone();
+        assert!(restored.is_fenced(&replay));
+    }
+
+    #[test]
+    fn full_fence_budget_retains_the_full_proof() {
+        let item = acknowledged_fixture(0);
+        let mut book = ControlSettlementBook {
+            records: vec![item.clone()],
+            replay_fences: (0..MAX_REPLAY_FENCES)
+                .map(|i| format!("{i:064x}"))
+                .collect(),
+        };
+        book.compact_confirmed(&|_| true);
+        assert_eq!(book.records, vec![item]);
+        assert!(book.validate_structure());
     }
     #[test]
     fn retained_raw_owner_response_accepts_omitted_default_field() {
