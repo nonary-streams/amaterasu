@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 const STATE: &str = "amaterasu.state/1";
 const COLLECTION: &str = "extension-actions-v1";
 const MAX_EPOCHS: u64 = 64;
-const MAX_EPOCH_BYTES: usize = 8_000;
+const MAX_EPOCH_BYTES: usize = 14_000;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1505,7 +1505,7 @@ impl ActionsModule {
                 .dispatch
                 .proof
                 .as_ref()
-                .is_some_and(|proof| proof.last().result.is_some())
+                .is_some_and(|proof| proof.last().result_digest.is_some())
         {
             let Some(method) = active.dispatch.descriptor.status.as_ref() else {
                 return self.dispatch_unknown(key);
@@ -1550,17 +1550,28 @@ impl ActionsModule {
             active.dispatch.stage,
             DispatchStage::Running { .. } | DispatchStage::ProviderPending { .. }
         ) {
-            let Some(call) = active
+            let Some(proof) = active
                 .dispatch
                 .proof
                 .as_ref()
-                .filter(|proof| proof.last().result.is_none())
-                .map(|proof| proof.last().call.clone())
+                .filter(|proof| proof.last().result_digest.is_none())
             else {
                 return self.dispatch_unknown(key);
             };
-            command =
-                serde_json::from_value(call).map_err(|_| "invalid persisted dispatch call")?;
+            if matches!(active.dispatch.stage, DispatchStage::ProviderPending { .. }) {
+                let Command::CallApi { operation_id, .. } = &mut command else {
+                    return self.dispatch_unknown(key);
+                };
+                operation_id.push_str(&format!("-{}", proof.status.len()));
+            }
+            let Command::CallApi { payload, .. } = &command else {
+                return self.dispatch_unknown(key);
+            };
+            if crate::dispatch_proof::digest(payload).ok().as_deref()
+                != Some(proof.last().call_digest.as_str())
+            {
+                return self.dispatch_unknown(key);
+            }
         }
         if matches!(
             active.dispatch.stage,
@@ -1586,11 +1597,13 @@ impl ActionsModule {
                 };
                 method
             };
-            let expected = active
-                .dispatch
-                .proof
-                .as_ref()
-                .map(|proof| &proof.last().approval);
+            let expected = active.dispatch.approvals.as_ref().and_then(|frozen| {
+                if matches!(active.dispatch.stage, DispatchStage::Running { .. }) {
+                    Some(&frozen.execute)
+                } else {
+                    frozen.status.as_ref()
+                }
+            });
             let fresh = self.runtime.send(Command::QueryApiApproval {
                 service: method.service.clone(),
                 method: method.method.clone(),
@@ -1858,7 +1871,7 @@ fn terminal_receipt(record: &Record) -> bool {
         Some("rejected" | "succeeded" | "failed" | "cancelled")
     )
 }
-fn retire_one(epoch: &mut Epoch) -> Result<(), ()> {
+pub(crate) fn retire_one(epoch: &mut Epoch) -> Result<(), ()> {
     let next = epoch.retired.checked_add(1).ok_or(())?;
     if !epoch.receipts.get(&next).is_some_and(terminal_receipt) {
         return Err(());
@@ -1965,6 +1978,8 @@ mod tests {
         effects: usize,
         provider_pending: bool,
         status_complete: bool,
+        large_receipt: bool,
+        pending_statuses: usize,
         drift_execute: bool,
         drift_status: bool,
         execute_approvals: usize,
@@ -2083,15 +2098,15 @@ mod tests {
                                 let saved = &self.state[&format!("epoch/{epoch}")]["receipts"]
                                     [sequence]["dispatch"];
                                 assert_eq!(saved["proof"], payload["dispatch_proof"]);
-                                assert_eq!(payload["provider_completed"]["status"], "succeeded");
                                 assert_eq!(
-                                    payload["dispatch_proof"]["effect"]["approval"]["provider"],
+                                    payload["dispatch_proof"]["completed"]["status"],
+                                    "succeeded"
+                                );
+                                assert_eq!(
+                                    saved["approvals"]["execute"]["provider"],
                                     "example.provider"
                                 );
-                                assert_eq!(
-                                    payload["dispatch_proof"]["effect"]["call"]["payload"]["permit"],
-                                    payload["permit"]
-                                );
+                                assert_eq!(saved["stage"]["permit"], payload["permit"]);
                                 json!({"status":"succeeded","operation_id":payload["operation_id"]})
                             }
                             _ => json!({"status":"rejected"}),
@@ -2160,10 +2175,15 @@ mod tests {
                         json!({"status":"planned","operation_id":payload["operation_id"],"action_id":payload["action_id"],"target":payload["target"],"plan":{"plan_id":"p1","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]}})
                     } else if method == "action_status" {
                         self.status_calls += 1;
-                        if self.status_complete {
-                            json!({"status":"succeeded","receipt":{"effect":"confirmed"}})
+                        let receipt = if self.large_receipt {
+                            json!(format!("{}{}", self.status_calls, "x".repeat(1_997)))
                         } else {
-                            json!({"status":"pending","receipt":{"id":"pending"}})
+                            json!({"id":"pending"})
+                        };
+                        if self.status_complete && self.status_calls > self.pending_statuses {
+                            json!({"status":"succeeded","receipt":receipt})
+                        } else {
+                            json!({"status":"pending","receipt":receipt})
                         }
                     } else {
                         assert!(parent.is_none());
@@ -2175,18 +2195,23 @@ mod tests {
                         let record = &self.state[&format!("epoch/{epoch}")]["receipts"][sequence];
                         assert_eq!(record["dispatch"]["stage"]["phase"], "running");
                         assert_eq!(
-                            record["dispatch"]["proof"]["effect"]["approval"]["provider"],
+                            record["dispatch"]["approvals"]["execute"]["provider"],
                             "example.provider"
                         );
                         assert_eq!(
-                            record["dispatch"]["proof"]["effect"]["call"]["payload"],
-                            payload
+                            record["dispatch"]["proof"]["effect"]["call_digest"],
+                            crate::dispatch_proof::digest(&payload).unwrap()
                         );
-                        assert!(record["dispatch"]["proof"]["effect"]["result"].is_null());
+                        assert!(record["dispatch"]["proof"]["effect"]["result_digest"].is_null());
                         assert_eq!(record["receipt"]["status"], "running");
                         self.effects += 1;
                         if self.provider_pending {
-                            json!({"status":"pending","receipt":{"id":"pending"}})
+                            let receipt = if self.large_receipt {
+                                json!(format!("0{}", "x".repeat(1_997)))
+                            } else {
+                                json!({"id":"pending"})
+                            };
+                            json!({"status":"pending","receipt":receipt})
                         } else {
                             json!({"status":"succeeded","receipt":{"effect":"confirmed"}})
                         }
@@ -2405,12 +2430,39 @@ mod tests {
         host.run();
         assert_eq!(host.effects, 1);
         let proof = &host.state[&format!("epoch/{epoch}")]["receipts"]["1"]["dispatch"]["proof"];
-        assert_eq!(proof["effect"]["result"]["status"], "pending");
+        assert!(proof["effect"]["pending_receipt_digest"].is_string());
         assert_eq!(
-            proof["status"][0]["call"]["payload"]["provider_receipt"],
-            proof["effect"]["result"]["receipt"]
+            proof["status"][0]["input_receipt_digest"],
+            proof["effect"]["pending_receipt_digest"]
         );
-        assert_eq!(proof["status"][0]["result"]["status"], "succeeded");
+        assert_eq!(proof["completed"]["status"], "succeeded");
+    }
+    #[test]
+    fn maximum_receipts_and_eight_status_calls_fit_state_and_completion() {
+        let mut host = Host {
+            allow_permit: true,
+            provider_pending: true,
+            status_complete: true,
+            large_receipt: true,
+            pending_statuses: 7,
+            ..Host::default()
+        };
+        host.request(
+            1,
+            "alice",
+            json!({"operation":"open_epoch","operation_id":"open"}),
+        );
+        host.run();
+        let epoch = host.replies[0]["epoch"].as_str().unwrap().to_owned();
+        host.request(2, "alice", json!({"operation":"invoke","epoch":epoch,"sequence":1,"operation_id":format!("{epoch}:1"),"action_id":"example/action","target":{"kind":"session","host_epoch":"h","session_id":"s","expected_generation":1},"arguments":{},"expected_settings_revision":null}));
+        host.run();
+        assert_eq!(host.effects, 1);
+        assert_eq!(host.status_calls, 8);
+        let saved = &host.state[&format!("epoch/{epoch}")];
+        assert!(serde_json::to_vec(saved).unwrap().len() <= MAX_EPOCH_BYTES);
+        let proof = &saved["receipts"]["1"]["dispatch"]["proof"];
+        assert_eq!(proof["status"].as_array().unwrap().len(), 8);
+        assert_eq!(proof["completed"]["status"], "succeeded");
     }
     #[test]
     fn startup_persists_recovery_for_interrupted_effect_before_admission() {

@@ -14,7 +14,7 @@ use std::time::Instant;
 const COLLECTION: &str = "extension-actions-v1";
 const STATE: &str = "amaterasu.state/1";
 const MAX_QUEUED: usize = 32;
-const MAX_EPOCH_BYTES: usize = 8_000;
+const MAX_EPOCH_BYTES: usize = 14_000;
 const MAX_RETRIES: u8 = 8;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -332,6 +332,47 @@ fn merge(job: &Job, response: &Value) -> Result<(u64, Value, Value), Failure> {
     }
     record.dispatch = Some(job.replacement.clone());
     record.receipt = job.receipt.clone();
+    if let Some(worst) = job
+        .replacement
+        .worst_case_results()
+        .map_err(|_| failure_for(job, false))?
+    {
+        loop {
+            let mut fits = true;
+            for candidate in &worst {
+                let finished = matches!(candidate.stage, Stage::Finished { .. });
+                let record = epoch
+                    .receipts
+                    .get_mut(&job.expected.request.sequence)
+                    .ok_or(Failure::Conflict)?;
+                record.dispatch = Some(candidate.clone());
+                record.receipt = job.receipt.clone();
+                if finished {
+                    record.receipt["result"] = Value::String("x".repeat(1_998));
+                    record.receipt["status"] = Value::String("recovery_required".into());
+                }
+                let candidate = serde_json::to_value(&epoch).map_err(|_| Failure::Unavailable)?;
+                let payload = json!({"action":"collection_commit","collection":COLLECTION,"expected_revision":revision,"metadata":metadata,"edits":[{"key":format!("epoch/{}",job.epoch_id),"value":candidate}]});
+                if serde_json::to_vec(&candidate)
+                    .map_or(true, |bytes| bytes.len() > MAX_EPOCH_BYTES)
+                    || serde_json::to_vec(&payload).map_or(true, |bytes| bytes.len() > 15_800)
+                {
+                    fits = false;
+                    break;
+                }
+            }
+            let record = epoch
+                .receipts
+                .get_mut(&job.expected.request.sequence)
+                .ok_or(Failure::Conflict)?;
+            record.dispatch = Some(job.replacement.clone());
+            record.receipt = job.receipt.clone();
+            if fits {
+                break;
+            }
+            crate::service::retire_one(&mut epoch).map_err(|_| failure_for(job, false))?;
+        }
+    }
     let value = serde_json::to_value(epoch).map_err(|_| Failure::Unavailable)?;
     if serde_json::to_vec(&value).map_or(true, |bytes| bytes.len() > MAX_EPOCH_BYTES) {
         return Err(failure_for(job, false));
@@ -385,7 +426,7 @@ fn valid_transition(before: &Dispatch, after: &Dispatch) -> bool {
     if before
         .proof
         .as_ref()
-        .is_some_and(|proof| proof.last().result.is_none())
+        .is_some_and(|proof| proof.last().result_digest.is_none())
         && matches!(
             before.stage,
             Stage::Running { .. } | Stage::ProviderPending { .. }
@@ -393,16 +434,45 @@ fn valid_transition(before: &Dispatch, after: &Dispatch) -> bool {
         && after
             .proof
             .as_ref()
-            .is_some_and(|proof| proof.last().result.is_some())
+            .is_some_and(|proof| proof.last().result_digest.is_some())
         && after.proof.as_ref().map_or(0, |proof| proof.status.len())
             == before.proof.as_ref().map_or(0, |proof| proof.status.len())
     {
-        let reply = after
-            .proof
-            .as_ref()
-            .and_then(|proof| proof.last().result.clone())
-            .unwrap();
-        return computed.accept_reply(reply).is_ok() && computed == *after;
+        let Some(proof) = &after.proof else {
+            return false;
+        };
+        if let Some(reply) = &proof.completed {
+            return computed.accept_reply(reply.clone()).is_ok() && computed == *after;
+        }
+        let Stage::ProviderPending {
+            provider_receipt, ..
+        } = &after.stage
+        else {
+            return false;
+        };
+        let result_digest = proof.last().result_digest.as_deref().unwrap_or("");
+        if result_digest.len() != 64
+            || !result_digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || crate::dispatch_proof::digest(provider_receipt)
+                .ok()
+                .as_deref()
+                != proof.last().pending_receipt_digest.as_deref()
+            || computed.provider_pending(provider_receipt.clone()).is_err()
+        {
+            return false;
+        }
+        let Some(expected_proof) = computed.proof.as_mut() else {
+            return false;
+        };
+        let expected_last = expected_proof
+            .status
+            .last_mut()
+            .unwrap_or(&mut expected_proof.effect);
+        expected_last.result_digest = proof.last().result_digest.clone();
+        expected_last.pending_receipt_digest = proof.last().pending_receipt_digest.clone();
+        return computed == *after;
     }
     let result = match (&before.stage, &after.stage) {
         (Stage::Planning, Stage::AwaitingPermit { plan, .. }) => computed.accept_plan(plan.clone()),
@@ -443,8 +513,14 @@ fn valid_transition(before: &Dispatch, after: &Dispatch) -> bool {
             .confirm_transition(&before.request.operation_id, &before.request.target, digest),
         (Stage::ReadyToExecute { .. }, Stage::Running { .. }) => {
             computed.begin_effect().and_then(|_| {
-                if let Some(proof) = &after.proof {
-                    computed.arm_effect(proof.effect.approval.clone())?;
+                if after.proof.is_some() {
+                    let approval = computed
+                        .approvals
+                        .as_ref()
+                        .ok_or("approval_snapshot_missing")?
+                        .execute
+                        .clone();
+                    computed.arm_effect(approval)?;
                 }
                 Ok(())
             })
@@ -453,11 +529,10 @@ fn valid_transition(before: &Dispatch, after: &Dispatch) -> bool {
             if after.proof.as_ref().map_or(0, |proof| proof.status.len())
                 > before.proof.as_ref().map_or(0, |proof| proof.status.len()) =>
         {
-            let approval = after
-                .proof
+            let approval = computed
+                .approvals
                 .as_ref()
-                .and_then(|proof| proof.status.last())
-                .map(|call| call.approval.clone())
+                .and_then(|frozen| frozen.status.clone())
                 .ok_or("status_proof_missing");
             approval.and_then(|approval| computed.arm_status(approval))
         }

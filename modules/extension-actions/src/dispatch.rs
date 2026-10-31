@@ -334,6 +334,7 @@ impl Dispatch {
         self.proof = Some(crate::dispatch_proof::DispatchProof {
             effect,
             status: Vec::new(),
+            completed: None,
         });
         Ok(())
     }
@@ -371,6 +372,71 @@ impl Dispatch {
             .as_mut()
             .ok_or("effect_proof_missing")?
             .arm_status(call)
+    }
+
+    /// Upper bounds each durable post-call state before submitting an owner call.
+    pub(crate) fn worst_case_results(&self) -> Result<Option<[Self; 3]>, &'static str> {
+        let (plan, digest, permit) = match &self.stage {
+            Stage::Running {
+                plan,
+                digest,
+                permit,
+            }
+            | Stage::ProviderPending {
+                plan,
+                digest,
+                permit,
+                ..
+            } => (plan, digest, permit),
+            _ => return Ok(None),
+        };
+        let Some(proof) = &self.proof else {
+            return Ok(None);
+        };
+        if proof.last().result_digest.is_some() {
+            return Ok(None);
+        }
+        let receipt = Value::String("x".repeat(1_998));
+        let mut pending = self.clone();
+        pending
+            .proof
+            .as_mut()
+            .ok_or("effect_proof_missing")?
+            .complete(serde_json::json!({"status":"pending","receipt":receipt}))?;
+        pending.stage = Stage::ProviderPending {
+            plan: plan.clone(),
+            digest: digest.clone(),
+            permit: permit.clone(),
+            provider_receipt: receipt.clone(),
+        };
+        let mut completed = self.clone();
+        let mut reply = serde_json::json!({"status":"succeeded","receipt":receipt,"padding":""});
+        let used = serde_json::to_vec(&reply)
+            .map_err(|_| "invalid_result")?
+            .len();
+        reply["padding"] =
+            Value::String("x".repeat(4_000usize.checked_sub(used).ok_or("invalid_result")?));
+        completed
+            .proof
+            .as_mut()
+            .ok_or("effect_proof_missing")?
+            .complete(reply)?;
+        completed.stage = Stage::Completing {
+            digest: digest.clone(),
+            permit: permit.clone(),
+            outcome: Outcome::RecoveryRequired,
+            provider_receipt: receipt.clone(),
+        };
+        let command = completed.broker_call()?.ok_or("completion_call_missing")?;
+        if serde_json::to_vec(&command).map_or(true, |bytes| bytes.len() > 15_800) {
+            return Err("completion_envelope_capacity");
+        }
+        let mut finished = completed.clone();
+        finished.stage = Stage::Finished {
+            outcome: Outcome::RecoveryRequired,
+            provider_receipt: receipt,
+        };
+        Ok(Some([pending, completed, finished]))
     }
 
     /// Build the next broker operation from a durably persisted phase. The
@@ -415,7 +481,7 @@ impl Dispatch {
                 ))
             }
             Stage::AwaitingPermit { plan, digest } => {
-                let mut payload = json!({"operation":"authorize_action","operation_id":operation_id,"action_id":action_id,"target":target,"plan":plan,"plan_digest":digest,"provider":self.selected_provider,"execute_method":self.descriptor.execute,"descriptor":self.descriptor,"execute_approval":self.approvals.as_ref().map(|a| &a.execute),"status_approval":self.approvals.as_ref().and_then(|a| a.status.as_ref()),"source":source});
+                let mut payload = json!({"operation":"authorize_action","operation_id":operation_id,"action_id":action_id,"target":target,"plan":plan,"plan_digest":digest,"provider":self.selected_provider,"execute_method":self.descriptor.execute,"descriptor":self.descriptor,"invoke":self.request,"execute_approval":self.approvals.as_ref().map(|a| &a.execute),"status_approval":self.approvals.as_ref().and_then(|a| a.status.as_ref()),"source":source});
                 if let Some(reservation) = &self.request.input_reservation_id {
                     payload["input_reservation_id"] = json!(reservation);
                 }
@@ -479,9 +545,9 @@ impl Dispatch {
                 digest,
                 permit,
                 outcome,
-                provider_receipt,
+                provider_receipt: _,
             } => Some(request(
-                json!({"operation":"complete_action","operation_id":operation_id,"action_id":action_id,"target":target,"plan_digest":digest,"permit":permit,"outcome":outcome,"provider_receipt":provider_receipt,"dispatch_proof":self.proof,"provider_completed":self.proof.as_ref().and_then(|proof| proof.last().result.as_ref())}),
+                json!({"operation":"complete_action","operation_id":operation_id,"action_id":action_id,"target":target,"plan_digest":digest,"permit":permit,"outcome":outcome,"dispatch_proof":self.proof}),
                 "complete",
             )),
             Stage::ReadyToExecute { .. }
