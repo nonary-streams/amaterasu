@@ -33,6 +33,8 @@ mod plan_observation;
 mod provider_observations;
 mod providers;
 mod recovery;
+#[allow(dead_code)] // Generation lookup is gated on authenticated endpoints.
+mod resource_generation;
 mod retention;
 mod security;
 mod session_prepare_evidence;
