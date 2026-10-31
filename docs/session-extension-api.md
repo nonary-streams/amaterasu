@@ -1,9 +1,9 @@
 # Session extension API
 
 Amaterasu provides session lifecycle, extension settings, and action services as
-independently built managed libraries. Display behavior belongs to the separate
-`amaterasu-display-settings` repository. The shell loads approved components and
-routes their broker calls; it does not contain display policy.
+independently built managed libraries. Display behavior belongs to independently
+built display-settings and virtual-screen providers. The shell loads approved
+components and routes their broker calls; it does not contain display policy.
 
 ## Services and installation
 
@@ -53,7 +53,7 @@ rights until the callback settles, including across asynchronous status polling.
 Native capture evidence is provider-specific; the coordinator preserves it and
 checks the common negotiated mode and exact binding identity.
 
-### Planned dependent-provider composition
+### Dependent-provider composition
 
 The planned split uses separately approved `nonary.virtual-screen/2` and
 `nonary.display-settings/2` services, built independently in the
@@ -62,9 +62,19 @@ The planned split uses separately approved `nonary.virtual-screen/2` and
 repositories. Virtual-screen owns the session-retained producer and its native
 leases; display-settings consumes its selected output and applies configuration
 for the stream. A resumed stream receives a fresh configuration while the
-session's producer may be retained. The
-existing v1 provider contracts remain unchanged. This is a design target, not a
-claim that the current single-provider profile implements the split.
+session's producer may be retained. The existing v1 provider contracts remain
+unchanged. The split SDK and coordinator contracts exist in source; the current
+single-provider profile does not implement this composition, and the complete
+provider, cleanup, and action paths still require integration and qualification.
+
+The session-owned output has a resource generation distinct from the session
+and stream generations. Dependent requests bind to the selected producer output
+and its resource generation; a stale generation cannot authorize effects on a
+replacement. Disconnect retires the stream and its configuration while retaining
+the application and eligible session resource. Session end additionally requires
+application retirement and release of the root resource after its dependents.
+Cleanup and action wiring for this split must be qualified before relying on
+these semantics in a running host.
 
 The coordinator must validate the installed dependency graph, schemas, and
 method approvals before effects. It must persist the producer's selected output
@@ -76,11 +86,11 @@ is published only after the dependent result and producer are validated and the
 consumer acknowledges the exact binding.
 
 The selected capability is `amaterasu.display-target`. Its frozen schema
-references are `display-target/1` (SHA-256
+references are `amaterasu.display-target/1` (SHA-256
 `ededc620113268bcae3990d492deeef039c5e9c5ff28067a676dd992fe6324ce`)
-and `display-control/1` (SHA-256
+and `amaterasu.display-control/1` (SHA-256
 `c2c3ce866277cb29bbd9fbd947899917538d46b1020df3197fbd264159607d87`).
-The owner service `nonary.virtual-screen/2` exposes the planned
+The owner service `nonary.virtual-screen/2` is intended to expose
 `resource_control`, `resource_finalize`, and `resource_status` methods.
 
 Release and rollback proceed in reverse dependency order. Independent cleanup
@@ -211,6 +221,15 @@ claims one execution permit, then uses fresh nonce-bound `check_action_effect`
 queries before subsequent native effects. Completion releases rights and retains
 any outstanding cleanup obligations. The initial mutation implementation requires
 a single active stream; unsupported target or borrower combinations are rejected.
+
+The split SDK also defines a typed resource disposition for an action: a `release`
+intent identifies the exact output, origin, resource, and resource generation.
+The owner's result reports `released`, `retained`, or `unknown`. The coordinator
+must authenticate the owner and admission and resolve dependent cleanup; the
+typed result alone is not authorization or proof of retirement. A confirmed
+release followed by resume requires a new resource generation rather than reuse
+of the released generation. End-to-end action release and new-generation resume
+remain subject to wiring and qualification.
 
 When an invocation supplies `expected_settings_revision`, the action service
 compares that decimal revision with the provider's current registry document
