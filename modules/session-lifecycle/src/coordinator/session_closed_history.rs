@@ -68,6 +68,8 @@ pub(super) struct EndedSessionCertificate {
     pub version: u32,
     pub target: LifecycleTarget,
     pub owner: crate::action_authority::Principal,
+    #[serde(default)]
+    pub end_receipt: Option<TerminalEndReceipt>,
     pub graph: ProviderGraph,
     pub application_ref: Value,
     pub application: Option<application::ApplicationBinding>,
@@ -91,6 +93,41 @@ pub(super) struct EndedSessionCertificate {
     /// Legacy randomly generated operation IDs remain fenced by the retained
     /// authority set; newly allocated IDs use the monotonic Core counter.
     pub legacy_operation_ids: BTreeSet<String>,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TerminalEndReceipt {
+    key: String,
+    caller: String,
+    initiator: String,
+    request: Value,
+    response: Value,
+}
+
+impl TerminalEndReceipt {
+    fn valid_for(&self, target: &LifecycleTarget) -> bool {
+        let Some(id) = self.request["operation_id"]
+            .as_str()
+            .filter(|id| valid_id(id))
+        else {
+            return false;
+        };
+        valid_id(&self.caller)
+            && valid_id(&self.initiator)
+            && self.key == receipt_key(&self.caller, &self.initiator, id)
+            && self.request["operation"] == "end_session"
+            && serde_json::from_value::<LifecycleTarget>(self.request["target"].clone())
+                .ok()
+                .as_ref()
+                == Some(target)
+            && self.response["status"] == "succeeded"
+            && self.response["operation_id"] == id
+            && serde_json::from_value::<LifecycleTarget>(self.response["target"].clone())
+                .ok()
+                .as_ref()
+                == Some(target)
+    }
 }
 
 fn operation_covered(operation: &str, counter: u64, legacy: &BTreeSet<String>) -> bool {
@@ -291,6 +328,26 @@ impl EndedSessionCertificate {
             version: CERTIFICATE_VERSION,
             target: target.clone(),
             owner: session.owner.clone(),
+            end_receipt: {
+                let mut matches = journal.receipts.iter().filter_map(|(key, receipt)| {
+                    let candidate = TerminalEndReceipt {
+                        key: key.clone(),
+                        caller: receipt.caller.clone(),
+                        initiator: receipt.initiator.clone(),
+                        request: receipt.request.clone(),
+                        response: receipt.response.clone(),
+                    };
+                    (receipt.work.is_none()
+                        && receipt.wait_target.is_none()
+                        && candidate.valid_for(target))
+                    .then_some(candidate)
+                });
+                let first = matches.next();
+                if matches.next().is_some() {
+                    return Err("ambiguous_end_receipt".into());
+                }
+                first
+            },
             graph,
             application_ref: session.application_ref.clone(),
             application: session.application.clone(),
@@ -326,6 +383,10 @@ impl EndedSessionCertificate {
             return false;
         };
         if self.version != CERTIFICATE_VERSION
+            || self
+                .end_receipt
+                .as_ref()
+                .is_some_and(|receipt| !receipt.valid_for(&self.target))
             || !valid_id(epoch)
             || !valid_id(session_id)
             || generation == 0
@@ -583,6 +644,23 @@ pub(super) struct EndedSessionBook {
 }
 
 impl EndedSessionBook {
+    pub(super) fn end_response(
+        &self,
+        journal: &Journal,
+        key: &str,
+        request: &Value,
+    ) -> Option<Value> {
+        self.certificates.values().find_map(|cert| {
+            let end = cert.end_receipt.as_ref()?;
+            (end.key == key && Self::valid_entry(journal, cert)).then(|| {
+                if request["operation"] == "lookup" || end.request == *request {
+                    end.response.clone()
+                } else {
+                    rejection("operation_id_conflict")
+                }
+            })
+        })
+    }
     pub(super) fn matches_children(
         &self,
         journal: &Journal,
@@ -649,6 +727,9 @@ impl EndedSessionBook {
     fn valid_entry(journal: &Journal, cert: &EndedSessionCertificate) -> bool {
         cert.validate()
             && retention::session_expired(journal, &cert.target)
+            && cert.end_receipt.as_ref().is_none_or(|end| {
+                retention::expired(journal, &end.key) && !journal.receipts.contains_key(&end.key)
+            })
             && operations::target_parts(&cert.target)
                 .ok()
                 .is_some_and(|(_, id, _, _)| !journal.sessions.contains_key(id))
@@ -703,10 +784,15 @@ impl EndedSessionBook {
     /// monotonic authority counters; it never reopens the ended target.
     #[allow(dead_code, reason = "awaits atomic ended-session journal integration")]
     pub(super) fn validate(&self, journal: &Journal) -> bool {
+        let mut end_keys = BTreeSet::new();
         self.certificates.len() <= MAX_CERTIFICATES
             && self.certificates.iter().all(|(key, cert)| {
                 Self::key(&cert.target).as_ref() == Some(key)
                     && Self::valid_entry(journal, cert)
+                    && cert
+                        .end_receipt
+                        .as_ref()
+                        .is_none_or(|end| end_keys.insert(&end.key))
                     && journal
                         .closed_streams
                         .session_children_raw(&cert.target)

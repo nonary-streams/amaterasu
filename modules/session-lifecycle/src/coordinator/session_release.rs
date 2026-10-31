@@ -2126,6 +2126,7 @@ pub(in crate::coordinator) mod tests {
             version: 1,
             target: work.target.clone(),
             owner: session.owner.clone(),
+            end_receipt: None,
             graph: session.provider_graph.clone().unwrap(),
             application_ref: session.application_ref.clone(),
             application: session.application.clone(),
@@ -2154,8 +2155,66 @@ pub(in crate::coordinator) mod tests {
         )
         .unwrap();
         assert!(constructed == cert);
-        let mut retired = journal.clone();
+        let end_request =
+            json!({"operation":"end_session","operation_id":"end-operation","target":work.target});
+        let end_response =
+            json!({"status":"succeeded","operation_id":"end-operation","target":work.target});
+        let end_key = receipt_key("transport", "client", "end-operation");
+        let mut with_end = journal.clone();
+        with_end.receipts.insert(
+            end_key.clone(),
+            Receipt {
+                caller: "transport".into(),
+                initiator: "client".into(),
+                request: end_request.clone(),
+                response: end_response.clone(),
+                work: None,
+                wait_target: None,
+            },
+        );
+        let mut retired = with_end;
         super::session_closure::retire_ended_session(&mut retired, &work.target).unwrap();
+        assert_eq!(
+            retired
+                .ended_session_history
+                .end_response(&retired, &end_key, &end_request),
+            Some(end_response.clone())
+        );
+        assert_eq!(
+            retired.ended_session_history.end_response(
+                &retired,
+                &end_key,
+                &json!({"operation":"lookup"})
+            ),
+            Some(end_response.clone())
+        );
+        assert_eq!(
+            retired.ended_session_history.end_response(
+                &retired,
+                &end_key,
+                &json!({"operation":"end_session","operation_id":"end-operation","target":null})
+            ),
+            Some(rejection("operation_id_conflict"))
+        );
+        assert!(
+            retired
+                .ended_session_history
+                .end_response(
+                    &retired,
+                    &receipt_key("foreign", "client", "end-operation"),
+                    &end_request
+                )
+                .is_none()
+        );
+        let reloaded: Journal =
+            serde_json::from_value(serde_json::to_value(&retired).unwrap()).unwrap();
+        assert!(validate_journal(&reloaded).is_ok());
+        assert_eq!(
+            reloaded
+                .ended_session_history
+                .end_response(&reloaded, &end_key, &end_request),
+            Some(end_response)
+        );
         assert!(retired.sessions.is_empty());
         assert!(retention::session_expired(&retired, &work.target));
         assert!(retired.composition.records().next().is_none());
@@ -2493,6 +2552,7 @@ pub(in crate::coordinator) mod tests {
             version: 1,
             target: work.target.clone(),
             owner: session.owner.clone(),
+            end_receipt: None,
             graph: session.provider_graph.clone().unwrap(),
             application_ref: json!({"kind":"desktop"}),
             application: None,

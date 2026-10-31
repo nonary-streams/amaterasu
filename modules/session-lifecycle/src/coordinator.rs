@@ -1267,6 +1267,12 @@ impl Coordinator {
             return rejection("operation_id_conflict");
         }
         let journal = self.shared.borrow().value.clone();
+        if let Some(response) = journal
+            .ended_session_history
+            .end_response(&journal, &key, &payload)
+        {
+            return response;
+        }
         if retention::expired(&journal, &key) {
             return rejection("receipt_expired");
         }
