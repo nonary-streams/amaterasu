@@ -23,6 +23,7 @@ mod control_backend;
 #[allow(dead_code)] // Control dispatch remains gated until coordinator sequencing is wired.
 mod control_dispatch;
 mod control_endpoints;
+mod control_history;
 #[allow(dead_code)]
 mod control_settlement;
 mod finalize_backend;
@@ -873,7 +874,8 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                 || permit.context.target != request.target
                 || permit.context.transition_id != request.transition_id
                 || permit.context.policy != selection.control_policy
-                || permit.context.output != selection.input.output
+                || control_history::authenticated_input(journal, request, selection).as_ref()
+                    != Some(&permit.context.output)
                 || admission.provider != selection.control_policy.dependent_provider
                 || !admission.plan.control_proposals.contains(&request.proposal)
                 || permit.settled != item.owner_ack.is_some()
@@ -924,9 +926,21 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
             else {
                 return true;
             };
+            let mut settlements = journal.control_settlements.records().filter(|record| {
+                record.settlement.request == item.request
+                    && record.confirmed == item.confirmed
+                    && record.applied == item.owner_result
+                    && record.owner_receipt_id == item.owner_receipt_id
+            });
+            let Some(settlement) = settlements.next() else {
+                return true;
+            };
+            if settlements.next().is_some() {
+                return true;
+            }
             let Some(selection) = journal.composition.selection(
                 &item.request.target,
-                &item.request.transition_id,
+                &settlement.selection_transition_id,
                 &permit.context.policy.dependent_provider,
                 &item.request.proposal.owner_provider,
                 &item.request.proposal.output_id,
@@ -942,7 +956,8 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
             !permit.consumed
                 || permit.request != item.request
                 || permit.context.policy != selection.control_policy
-                || permit.context.output != selection.input.output
+                || control_history::authenticated_input(journal, &item.request, selection).as_ref()
+                    != Some(&permit.context.output)
                 || admission.provider != selection.control_policy.dependent_provider
                 || !admission.plan.obligations.contains(&item.original)
                 || !admission
