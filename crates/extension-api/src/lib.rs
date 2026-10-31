@@ -753,6 +753,7 @@ fn validate_composition_results(
                 input.output_id == proposal.output_id && input.producer == proposal.owner_provider
             })
             .ok_or("missing original input")?;
+        validate_output_refinement(original, &result.output)?;
         if result.output.output_id != original.output_id
             || result.output.producer != original.producer
             || result.output.producer_service != original.producer_service

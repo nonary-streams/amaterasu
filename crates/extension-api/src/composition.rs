@@ -284,6 +284,41 @@ pub fn validate_resource_output(output: &ResourceOutput) -> Result<(), String> {
     Ok(())
 }
 
+/// Check an owner-confirmed refinement against its frozen selected output.
+/// The coordinator must additionally authenticate the owner and compare these
+/// observations to its current authoritative state while rights are held.
+pub fn validate_output_refinement(
+    original: &ResourceOutput,
+    refined: &ResourceOutput,
+) -> Result<(), String> {
+    validate_resource_output(original)?;
+    validate_resource_output(refined)?;
+    if original.output_id != refined.output_id
+        || original.capability != refined.capability
+        || original.schema != refined.schema
+        || original.producer != refined.producer
+        || original.producer_service != refined.producer_service
+        || original.origin != refined.origin
+        || !same_resource(&original.resource, &refined.resource)
+        || refined.resource.revision < original.resource.revision
+    {
+        return Err("refinement changed selected resource".into());
+    }
+    for old in &original.domain_observations {
+        let new = refined
+            .domain_observations
+            .iter()
+            .find(|entry| entry.domain == old.domain)
+            .ok_or("refinement omitted domain")?;
+        if new.revision < old.revision
+            || (new.revision == old.revision && new.borrowers != old.borrowers)
+        {
+            return Err("refinement regressed domain observation".into());
+        }
+    }
+    Ok(())
+}
+
 /// Structural checks only; the selected owner, permissions, and effect still require validation.
 pub fn validate_resource_control_proposal(
     proposal: &ResourceControlProposal,
@@ -451,6 +486,7 @@ pub fn validate_resource_finalize_response(
         ResourceControlResponse::Applied { output, candidate } => {
             validate_resource_output(output)?;
             let selected = &request.output;
+            validate_output_refinement(selected, output)?;
             if output.output_id != selected.output_id
                 || output.capability != selected.capability
                 || output.schema != selected.schema
@@ -495,6 +531,21 @@ mod tests {
         let request: ResourceControlRequest = serde_json::from_value(json!({"version":2,"transition_id":"transition","operation_id":"operation","provider_sequence":1,"target":stream,"proposal":proposal,"admission_id":"admission","permit_id":"permit","remaining_ms":5000})).unwrap();
         let finalize: ResourceFinalizeRequest = serde_json::from_value(json!({"version":2,"transition_id":"transition","operation_id":"finalize","provider_sequence":2,"target":stream,"output":output,"control_results":[],"admission_id":"admission","permit_id":"permit","remaining_ms":5000})).unwrap();
         (output, request, finalize)
+    }
+
+    #[test]
+    fn refinement_rejects_stale_or_inconsistent_domain_observations() {
+        let (original, _, _) = fixture();
+        let mut updated = original.clone();
+        assert!(validate_output_refinement(&original, &updated).is_ok());
+        updated.domain_observations[0]
+            .borrowers
+            .insert("new".into(), 1);
+        assert!(validate_output_refinement(&original, &updated).is_err());
+        updated.domain_observations[0].revision += 1;
+        assert!(validate_output_refinement(&original, &updated).is_ok());
+        updated.domain_observations[0].revision = original.domain_observations[0].revision - 1;
+        assert!(validate_output_refinement(&original, &updated).is_err());
     }
 
     #[test]
