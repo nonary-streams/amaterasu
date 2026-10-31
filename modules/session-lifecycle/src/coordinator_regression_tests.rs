@@ -116,7 +116,9 @@ impl Harness {
                 "verify_provider_epoch",
                 "refresh_provider_observations",
                 "verify_resource_finalize",
+                "describe_resource_control",
                 "verify_resource_control",
+                "validate_resource_control",
                 "verify_control_settlement"
             ]);
             configuration["settings"][COORDINATOR]["operation_grants"]["settings"] =
@@ -862,6 +864,38 @@ fn check_settlement_history(harness: &mut Harness, tuples: &[Value]) {
     }
 }
 
+fn check_closed_effects_rejected(harness: &mut Harness, tuples: &[Value]) {
+    let effects_before = harness
+        .events
+        .iter()
+        .filter(|(provider, call)| provider == "display" && call["method"] == "control")
+        .count();
+    for tuple in tuples {
+        for operation in [
+            "describe_resource_control",
+            "verify_resource_control",
+            "validate_resource_control",
+        ] {
+            let result = harness.call(
+                "display",
+                json!({"operation": operation, "request": tuple["request"]}),
+            );
+            assert_eq!(
+                result["status"], "rejected",
+                "closed effect {operation}: {result}"
+            );
+        }
+    }
+    assert_eq!(
+        harness
+            .events
+            .iter()
+            .filter(|(provider, call)| { provider == "display" && call["method"] == "control" })
+            .count(),
+        effects_before
+    );
+}
+
 fn composed_restore_and_close(last_cycle: usize) {
     let mut harness = Harness::with_provider(true);
     harness.simulate_stage_refresh = true;
@@ -1024,6 +1058,17 @@ fn composed_restore_and_close(last_cycle: usize) {
     assert_eq!(ended["status"], "succeeded", "{ended}");
     assert!(!harness.native_live);
     assert!(harness.staged_output.is_none());
+    let journal: Value =
+        serde_json::from_slice(&std::fs::read(harness.root.join("journal.json")).unwrap()).unwrap();
+    assert_eq!(
+        journal["closed_streams"]["records"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    check_settlement_history(&mut harness, &historical_tuples);
+    check_closed_effects_rejected(&mut harness, &historical_tuples);
     let calls = harness.events.len();
     harness.coordinator.take();
     harness.start();
@@ -1032,11 +1077,8 @@ fn composed_restore_and_close(last_cycle: usize) {
         json!({"operation":"lookup","operation_id":"session.end"}),
     );
     assert_eq!(recovered["status"], "succeeded", "{recovered}");
-    for tuple in historical_tuples {
-        let mut query = tuple;
-        query["operation"] = json!("verify_control_settlement");
-        assert_eq!(harness.call("display", query)["status"], "rejected");
-    }
+    check_settlement_history(&mut harness, &historical_tuples);
+    check_closed_effects_rejected(&mut harness, &historical_tuples);
     assert_eq!(harness.events.len(), calls);
     assert!(!harness.native_live);
 }
