@@ -457,6 +457,10 @@ impl Coordinator {
     ) -> ModuleResult<()> {
         use crate::prepare_driver::{PrepareAuthority, PreparePhase};
         use amaterasu_extension_api::ResourceFinalizeRequest;
+        super::checkpoint_queries::ensure_effect_scope_open(
+            &self.shared.borrow().value,
+            &work.target,
+        )?;
         let finalize = work
             .composition_progress
             .as_ref()
@@ -656,6 +660,17 @@ impl Coordinator {
             self.reserve_standalone_finalize(key, work)?;
             return Ok(false);
         };
+        if matches!(state.phase, FinalizePhase::Effect)
+            && state
+                .dispatch
+                .as_ref()
+                .is_none_or(|record| record.state == crate::provider_dispatch::DispatchState::Ready)
+        {
+            super::checkpoint_queries::ensure_effect_scope_open(
+                &self.shared.borrow().value,
+                &state.request.target,
+            )?;
+        }
         match &state.phase {
             FinalizePhase::Confirmed { .. } => return Ok(true),
             FinalizePhase::Rejected { .. } | FinalizePhase::RecoveryRequired { .. } => {
@@ -985,4 +1000,84 @@ pub(super) fn standalone_stream_input(
     // The owner refreshes its native observation during the read-only plan.
     // Admission independently checks freshness before any callback effect.
     Ok(current)
+}
+
+#[cfg(test)]
+mod expired_effect_tests {
+    use super::*;
+    use crate::provider_dispatch::{DispatchRecord, DispatchState};
+
+    #[test]
+    fn retired_session_blocks_finalize_issue_and_recovered_ready_before_broker() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-finalize-expired-{}-{}",
+            std::process::id(),
+            identifier().unwrap()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = root.join("journal.json");
+        let coordinator = Coordinator::open(&path).unwrap();
+        let mut journal = coordinator.shared.borrow().value.clone();
+        let ended: LifecycleTarget = serde_json::from_value(json!({
+            "kind":"session", "host_epoch":"epoch", "session_id":"session", "generation":7
+        }))
+        .unwrap();
+        super::super::retention::fence_closed_session(&mut journal, &ended).unwrap();
+        save(&coordinator.shared, journal).unwrap();
+        drop(coordinator);
+
+        let (_, mut work, owner_plan) = super::super::session_release::tests::complete_fixture();
+        let mut dispatch = super::super::finalize_dispatch::tests::fixture();
+        dispatch.dispatch = Some(DispatchRecord {
+            call: dispatch.effect_call.clone(),
+            state: DispatchState::Ready,
+        });
+        work.target = dispatch.request.target.clone();
+        work.composition_progress = Some(super::super::composition_progress::CompositionProgress {
+            inputs: vec![],
+            selections: vec![],
+            controls: vec![],
+            finalize: Some(super::super::composition_progress::FinalizeProgress {
+                selection: super::super::finalize_selection::tests::fixture(),
+                owner_plan,
+                dispatch: None,
+            }),
+        });
+        let mut coordinator = Coordinator::open(&path).unwrap();
+        let before = serde_json::to_value(&coordinator.shared.borrow().value.authority).unwrap();
+        assert_eq!(
+            coordinator
+                .reserve_standalone_finalize("old", &work)
+                .unwrap_err(),
+            "session_expired"
+        );
+        work.composition_progress
+            .as_mut()
+            .unwrap()
+            .finalize
+            .as_mut()
+            .unwrap()
+            .dispatch = Some(dispatch);
+        let recovered: Work = serde_json::from_slice(&serde_json::to_vec(&work).unwrap()).unwrap();
+        let mut calls = 0;
+        let error = coordinator
+            .advance_standalone_finalize_effect("old", &recovered, &mut |_| {
+                calls += 1;
+                Err("unexpected broker call".into())
+            })
+            .unwrap_err();
+        assert_eq!(error, "session_expired");
+        assert_eq!(calls, 0);
+        assert_eq!(
+            serde_json::to_value(&coordinator.shared.borrow().value.authority).unwrap(),
+            before
+        );
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

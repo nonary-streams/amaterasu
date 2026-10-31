@@ -362,11 +362,11 @@ impl<J: FinalizeJournal> DispatchJournal for Bridge<'_, J> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::coordinator) mod tests {
     use super::*;
     use serde_json::json;
     use std::collections::VecDeque;
-    fn fixture() -> FinalizeDispatchState {
+    pub(in crate::coordinator) fn fixture() -> FinalizeDispatchState {
         let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1});
         let schema = json!({"id":"schema","major":1,"minor":0,"digest":"a".repeat(64)});
         let resource = json!({"provider":"owner","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":"domain","mutation_domains":["domain"]});
