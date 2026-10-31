@@ -1,6 +1,7 @@
 use super::*;
 mod display_plugin_smoke;
 mod library_provider_smoke;
+mod media_profile_smoke;
 use amaterasu_contracts::Grants;
 use amaterasu_module_sdk::RuntimeClient;
 use std::sync::atomic::{AtomicUsize, Ordering};

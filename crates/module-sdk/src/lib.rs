@@ -9,6 +9,7 @@ pub mod events;
 pub mod exports;
 pub mod input;
 pub mod media;
+pub mod media_profile;
 mod native;
 pub mod network;
 #[cfg(feature = "network-http")]

@@ -5,6 +5,7 @@ mod validation;
 
 use super::{Method, Request, serialize_response};
 use crate::sdp;
+use amaterasu_contracts::media_profile::VideoProfileSnapshot;
 
 pub struct TrustedLaunch {
     pub epoch: u64,
@@ -41,6 +42,8 @@ pub struct Capabilities {
 pub enum Action {
     /// Backend must compare this against its actual prepared wire/capture config.
     Announce(sdp::Announce),
+    /// An extension has its own identity; no legacy codec is substituted.
+    ExtensionAnnounce(sdp::Announce<sdp::NegotiatedVideoFormat>),
     Play,
     Teardown,
 }
@@ -109,6 +112,7 @@ pub struct Negotiation {
     state: State,
     last_cseq: Option<u32>,
     pending: Option<Pending>,
+    profile_offer: Option<VideoProfileSnapshot>,
 }
 
 impl Negotiation {
@@ -120,7 +124,24 @@ impl Negotiation {
             state: State::Options,
             last_cseq: None,
             pending: None,
+            profile_offer: None,
         })
+    }
+
+    /// Build an extension-aware negotiation from an immutable provider snapshot
+    /// and independently supplied trusted downstream support. Neither is peer input.
+    pub fn with_video_profiles(
+        launch: TrustedLaunch,
+        capabilities: Capabilities,
+        offered: VideoProfileSnapshot,
+        downstream: VideoProfileSnapshot,
+    ) -> Result<Self, Error> {
+        if !offered.supported_by(&downstream) {
+            return Err(Error::UnsupportedMedia);
+        }
+        let mut negotiation = Self::new(launch, capabilities)?;
+        negotiation.profile_offer = Some(offered);
+        Ok(negotiation)
     }
 
     pub fn state(&self) -> State {
@@ -221,7 +242,18 @@ impl Negotiation {
                 if request.header("accept") != Some("application/sdp") {
                     return Err(Error::InvalidHeaders);
                 }
-                let body = validation::description(&self.capabilities);
+                let mut body = validation::description(&self.capabilities);
+                if let Some(offer) = &self.profile_offer {
+                    let insertion = body.find("m=audio ").ok_or(Error::Serialization)?;
+                    let markers = offer
+                        .profiles
+                        .iter()
+                        .map(|p| {
+                            format!("a=rtpmap:{} {}/90000\r\n", p.payload_type, p.encoding_name)
+                        })
+                        .collect::<String>();
+                    body.insert_str(insertion, &markers);
+                }
                 let reply = self.response(
                     200,
                     request.cseq,
@@ -261,6 +293,20 @@ impl Negotiation {
                 validation::target(request, "streamid=control/13/0")?;
                 if request.header("content-type") != Some("application/sdp") {
                     return Err(Error::InvalidHeaders);
+                }
+                if let Some(offer) = &self.profile_offer {
+                    let selected = sdp::parse_profile_announce(&request.body, offer)
+                        .map_err(|_| Error::UnsupportedMedia)?;
+                    if matches!(
+                        selected.video.format,
+                        sdp::NegotiatedVideoFormat::Extension(_)
+                    ) {
+                        validation::media_extension(&selected, &self.capabilities)?;
+                        return Ok((
+                            action(request, Action::ExtensionAnnounce(selected)),
+                            State::Play,
+                        ));
+                    }
                 }
                 let announce = sdp::parse_announce(&request.body).map_err(|error| {
                     eprintln!("amaterasu rtsp announce parse rejection reason={error:?}");

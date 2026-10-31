@@ -1,5 +1,6 @@
 //! Version 1 control-plane messages. These types are independent of the bootstrap ABI.
 pub mod encoder;
+pub mod media_profile;
 pub mod virtual_display;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

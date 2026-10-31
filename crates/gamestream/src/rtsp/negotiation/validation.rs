@@ -131,6 +131,20 @@ pub(super) fn media(value: &sdp::Announce, capabilities: &Capabilities) -> Resul
             eprintln!("amaterasu rtsp announce capability rejection reason={error:?}");
             Error::UnsupportedMedia
         })?;
+    media_common(value, capabilities)
+}
+
+pub(super) fn media_extension(
+    value: &sdp::Announce<sdp::NegotiatedVideoFormat>,
+    capabilities: &Capabilities,
+) -> Result<(), Error> {
+    value
+        .check_common_support(&capabilities.transport)
+        .map_err(|_| Error::UnsupportedMedia)?;
+    media_common(value, capabilities)
+}
+
+fn media_common<T>(value: &sdp::Announce<T>, capabilities: &Capabilities) -> Result<(), Error> {
     if value.control != sdp::ControlProtocol::EncryptedEnet
         || !value.encryption.control_v2
         || !capabilities.supported_colors.contains(&value.video.color)

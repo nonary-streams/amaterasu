@@ -104,6 +104,19 @@ impl Controller {
             }
             Ok(NegotiationStep::Action {
                 ticket: action_ticket,
+                action: Action::ExtensionAnnounce(_),
+            }) => {
+                // This controller has no extension framing path yet.
+                self.finish_immediate_action(
+                    &mut record,
+                    connection,
+                    action_ticket,
+                    false,
+                    "unsupported_video_format",
+                );
+            }
+            Ok(NegotiationStep::Action {
+                ticket: action_ticket,
                 action: Action::Play,
             }) => {
                 let Some(session) = record.session else {

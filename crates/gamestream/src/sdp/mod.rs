@@ -5,7 +5,7 @@ mod attributes;
 mod negotiate;
 mod syntax;
 
-pub use negotiate::parse_announce;
+pub use negotiate::{NegotiatedVideoFormat, parse_announce, parse_profile_announce};
 
 pub const MAX_BYTES: usize = 16 * 1024;
 pub const MAX_LINES: usize = 192;
@@ -48,9 +48,9 @@ pub enum ControlProtocol {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Video {
+pub struct Video<T = VideoStreamFormat> {
     /// Codec, bit depth, and dynamic range selected by the client ANNOUNCE.
-    pub format: VideoStreamFormat,
+    pub format: T,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -89,8 +89,8 @@ pub struct Fec {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Announce {
-    pub video: Video,
+pub struct Announce<T = VideoStreamFormat> {
+    pub video: Video<T>,
     pub audio: Audio,
     /// NV header + video payload bytes; excludes the 16-byte RTP header.
     pub packet_size: u32,
@@ -125,7 +125,7 @@ impl Announce {
     /// Parsing is not acceptance. Call this against actual backend capabilities
     /// before committing ANNOUNCE; resource allocation and session checks follow.
     pub fn check_support(&self, support: &TransportSupport) -> Result<(), Error> {
-        let requirements = [
+        for (required, available, name) in [
             (
                 self.video.format.codec == VideoCodec::Hevc,
                 support.hevc,
@@ -136,6 +136,19 @@ impl Announce {
                 support.av1,
                 "AV1 video",
             ),
+        ] {
+            if required && !available {
+                return Err(Error::Unsupported(name));
+            }
+        }
+        self.check_common_support(support)
+    }
+}
+
+impl<T> Announce<T> {
+    /// Check transport capabilities independent of the selected codec identity.
+    pub fn check_common_support(&self, support: &TransportSupport) -> Result<(), Error> {
+        let requirements = [
             (true, support.stereo_audio, "stereo audio"),
             (true, support.enet_control, "ENet control"),
             (
