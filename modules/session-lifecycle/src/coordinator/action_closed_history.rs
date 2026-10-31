@@ -787,6 +787,12 @@ mod tests {
             reopened.historical_root_for_scope(&old_child, &replacement.output, 8),
             Some((&root.output, 7))
         );
+        let mut wrong_latest = snapshot.clone();
+        let input = wrong_latest.test_set_latest_release(&replacement, old_child.clone(), 8);
+        assert!(!wrong_latest.release_input_matches(&replacement, 8, &input));
+        let mut correct_latest = snapshot.clone();
+        let input = correct_latest.test_set_latest_release(&replacement, new_child.clone(), 8);
+        assert!(correct_latest.release_input_matches(&replacement, 8, &input));
         let mut forged = serde_json::to_value(&snapshot).unwrap();
         let roots = forged["historical_roots"].as_object_mut().unwrap();
         let old = roots

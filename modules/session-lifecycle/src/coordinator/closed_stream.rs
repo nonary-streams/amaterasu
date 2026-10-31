@@ -162,6 +162,8 @@ impl SessionChildrenSnapshot {
                 },
             )
             && self.contains_scope(&witness.target)
+            && self.historical_root_for_scope(&witness.target, &root.output, generation)
+                == Some((&root.output, generation))
             && valid_id(&witness.admission_id)
             && valid_digest(&witness.release_commitment)
             && witness.output == *input
