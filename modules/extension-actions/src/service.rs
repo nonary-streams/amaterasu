@@ -112,6 +112,16 @@ enum Stage {
         result: Value,
         start: Option<Box<Dispatch>>,
     },
+    ReservedCancelWrite {
+        parent: u64,
+        request: ActionInvoke,
+        receipt: Value,
+    },
+    ReservedCancelReply {
+        parent: u64,
+        request: ActionInvoke,
+        receipt: Value,
+    },
     DispatchReply {
         key: (String, u64),
     },
@@ -356,7 +366,9 @@ impl ActionsModule {
     fn submit(&mut self, payload: Value, stage: Stage) -> ModuleResult<()> {
         let parent = match &stage {
             Stage::Read(incoming) => incoming.id,
-            Stage::Write { parent, .. } => *parent,
+            Stage::Write { parent, .. }
+            | Stage::ReservedCancelWrite { parent, .. }
+            | Stage::ReservedCancelReply { parent, .. } => *parent,
             Stage::Descriptor { incoming, .. } => incoming.id,
             Stage::Plan(context) => context.incoming.id,
             Stage::InputReservation(context) => context.incoming.id,
@@ -369,11 +381,15 @@ impl ActionsModule {
             }
         };
         let descriptor = matches!(stage, Stage::Descriptor { .. });
-        let lifecycle = matches!(stage, Stage::InputReservation(_));
+        let lifecycle = matches!(
+            stage,
+            Stage::InputReservation(_) | Stage::ReservedCancelReply { .. }
+        );
         let input = matches!(stage, Stage::ConfirmInput(_));
         let phase = match &stage {
             Stage::Read(_) => "read",
-            Stage::Write { .. } => "write",
+            Stage::Write { .. } | Stage::ReservedCancelWrite { .. } => "write",
+            Stage::ReservedCancelReply { .. } => "cancel-input-reservation",
             Stage::Descriptor { .. } => "descriptor",
             Stage::Plan(_) => "plan",
             Stage::InputReservation(_) => "input-reservation",
@@ -454,6 +470,35 @@ impl ActionsModule {
                             self.complete(parent, failure("state_commit_failed"))
                         }
                     }
+                    Stage::ReservedCancelWrite {
+                        parent,
+                        request,
+                        receipt,
+                    } => {
+                        if payload.get("ok") == Some(&Value::Bool(true)) {
+                            self.cancel_reserved_input(parent, request, receipt)
+                        } else {
+                            self.complete(parent, failure("state_commit_failed"))
+                        }
+                    }
+                    Stage::ReservedCancelReply {
+                        parent,
+                        request,
+                        receipt,
+                    } => {
+                        if payload.get("status").and_then(Value::as_str) == Some("succeeded")
+                            && payload.get("operation_id").and_then(Value::as_str)
+                                == Some(request.operation_id.as_str())
+                            && payload.get("action_id").and_then(Value::as_str)
+                                == Some(request.action_id.as_str())
+                            && payload.get("reservation_id").and_then(Value::as_str)
+                                == request.input_reservation_id.as_deref()
+                        {
+                            self.complete(parent, receipt)
+                        } else {
+                            self.complete(parent, failure("reservation_cancellation_unconfirmed"))
+                        }
+                    }
                     Stage::DispatchReply { key } => self.dispatch_reply(key, payload),
                     Stage::CancelReply { key } => self.cancel_reply(key, payload),
                     Stage::RecoveryHead => self.recovery_head(payload),
@@ -463,7 +508,9 @@ impl ActionsModule {
             _ => {
                 let parent = match pending.stage {
                     Stage::Read(incoming) => incoming.id,
-                    Stage::Write { parent, .. } => parent,
+                    Stage::Write { parent, .. }
+                    | Stage::ReservedCancelWrite { parent, .. }
+                    | Stage::ReservedCancelReply { parent, .. } => parent,
                     Stage::Descriptor { incoming, .. } => incoming.id,
                     Stage::Plan(context) => context.incoming.id,
                     Stage::InputReservation(context) => context.incoming.id,
@@ -644,6 +691,38 @@ impl ActionsModule {
             let Some(record) = epoch.receipts.get(&sequence) else {
                 return self.complete(incoming.id, failure("unknown_receipt"));
             };
+            if record.request.input_reservation_id.is_some()
+                && matches!(
+                    record.receipt.get("status").and_then(Value::as_str),
+                    Some("reserved" | "cancelled")
+                )
+            {
+                let request = record.request.clone();
+                if record.receipt.get("status").and_then(Value::as_str) == Some("cancelled") {
+                    return self.cancel_reserved_input(
+                        incoming.id,
+                        request,
+                        record.receipt.clone(),
+                    );
+                }
+                let mut receipt = record.receipt.clone();
+                receipt["status"] = json!("cancelled");
+                epoch
+                    .receipts
+                    .get_mut(&sequence)
+                    .expect("record exists")
+                    .receipt = receipt.clone();
+                let value = serde_json::to_value(&epoch).map_err(|error| error.to_string())?;
+                let payload = json!({"action":"collection_commit","collection":COLLECTION,"expected_revision":revision,"metadata":metadata,"edits":[{"key":format!("epoch/{epoch_id}"),"value":value}]});
+                return self.submit(
+                    payload,
+                    Stage::ReservedCancelWrite {
+                        parent: incoming.id,
+                        request,
+                        receipt,
+                    },
+                );
+            }
             if !matches!(
                 record.receipt.get("status").and_then(Value::as_str),
                 Some("queued" | "running")
@@ -1027,6 +1106,22 @@ impl ActionsModule {
             &epoch,
             receipt,
             Some(dispatch),
+        )
+    }
+    fn cancel_reserved_input(
+        &mut self,
+        parent: u64,
+        request: ActionInvoke,
+        receipt: Value,
+    ) -> ModuleResult<()> {
+        let payload = json!({"operation":"cancel_input_reservation","operation_id":request.operation_id,"action_id":request.action_id,"reservation_id":request.input_reservation_id});
+        self.submit(
+            payload,
+            Stage::ReservedCancelReply {
+                parent,
+                request,
+                receipt,
+            },
         )
     }
     fn write(
@@ -1717,6 +1812,20 @@ mod tests {
                             Some("consume_input_reservation") if self.allow_permit => {
                                 json!({"status":"succeeded","operation_id":payload["operation_id"],"action_id":payload["action_id"],"target":payload["target"],"reservation_id":payload["reservation_id"],"source":{"caller":"stream-session","initiator":"paired-client"}})
                             }
+                            Some("cancel_input_reservation") if self.allow_permit => {
+                                self.cancellation_requests += 1;
+                                let (epoch, sequence) = payload["operation_id"]
+                                    .as_str()
+                                    .unwrap()
+                                    .split_once(':')
+                                    .unwrap();
+                                assert_eq!(
+                                    self.state[&format!("epoch/{epoch}")]["receipts"][sequence]["receipt"]
+                                        ["status"],
+                                    "cancelled"
+                                );
+                                json!({"status":"succeeded","operation_id":payload["operation_id"],"action_id":payload["action_id"],"reservation_id":payload["reservation_id"]})
+                            }
                             Some("authorize_action") if self.allow_permit => {
                                 self.last_source = payload["source"].clone();
                                 json!({"status":"succeeded","operation_id":payload["operation_id"],"target":payload["target"],"permit":"permit"})
@@ -2144,6 +2253,36 @@ mod tests {
         assert_eq!(host.replies[66]["code"], "receipt_expired");
         assert_eq!(host.replies[67]["code"], "receipt_expired");
         assert_eq!(host.effects, 65);
+    }
+    #[test]
+    fn cancelling_reserved_input_is_durable_before_revocation_and_blocks_commit() {
+        let mut host = Host {
+            allow_permit: true,
+            mutation_descriptor: true,
+            delivery_confirmed: true,
+            ..Host::default()
+        };
+        host.request_input(
+            1,
+            json!({"operation":"open_epoch","operation_id":"input-open"}),
+        );
+        host.run();
+        let epoch = host.replies[0]["epoch"].as_str().unwrap().to_owned();
+        let operation_id = format!("{epoch}:1");
+        host.request_input(2, json!({"operation":"reserve_input","epoch":epoch,"sequence":1,"operation_id":operation_id,"action_id":"example/action","target":{"kind":"session","host_epoch":"h","session_id":"s","expected_generation":1},"arguments":{},"expected_settings_revision":null,"input_reservation_id":"reservation"}));
+        host.run();
+        host.request_input(3, json!({"operation":"cancel","epoch":epoch,"sequence":1}));
+        host.run();
+        assert_eq!(host.replies[2]["status"], "cancelled");
+        assert_eq!(host.cancellation_requests, 1);
+        host.request_input(4, json!({"operation":"commit_input","epoch":epoch,"sequence":1,"operation_id":operation_id}));
+        host.run();
+        assert_eq!(host.replies[3]["status"], "cancelled");
+        assert_eq!(host.effects, 0);
+        host.request_input(5, json!({"operation":"cancel","epoch":epoch,"sequence":1}));
+        host.run();
+        assert_eq!(host.replies[4]["status"], "cancelled");
+        assert_eq!(host.cancellation_requests, 2);
     }
     #[test]
     fn input_reservation_waits_for_independent_delivery_proof() {
