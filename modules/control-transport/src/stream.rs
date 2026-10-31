@@ -6,11 +6,14 @@ use amaterasu_gamestream::{
     enet::peer::{Config, Delivery, Event, Peer, PeerError, State},
 };
 use amaterasu_media::*;
-use amaterasu_module_sdk::abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
+use amaterasu_module_sdk::{
+    abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status},
+    network::{Network, UdpSocket},
+};
 use serde_json::{Value, json};
 use std::{
     collections::VecDeque,
-    net::{IpAddr, SocketAddr, UdpSocket},
+    net::{IpAddr, SocketAddr},
 };
 
 const MAX_MESSAGES: usize = 256;
@@ -49,7 +52,18 @@ pub struct Stream {
 }
 
 impl Stream {
+    #[cfg(test)]
     pub fn open(owner: &str, request: &Open, key: &[u8; 16], now: u64) -> ControlResult<Self> {
+        Self::open_with_network(&Network::test_provider(), owner, request, key, now)
+    }
+
+    pub fn open_with_network(
+        network: &Network,
+        owner: &str,
+        request: &Open,
+        key: &[u8; 16],
+        now: u64,
+    ) -> ControlResult<Self> {
         let ping_timeout_ms = validate_ping_timeout_ms(request.ping_timeout_ms)?;
         let defaults = Config::default();
         let peer = Peer::new(
@@ -71,8 +85,9 @@ impl Stream {
             ControlOrdering::MultipleChannels,
         )
         .map_err(|_| "encryption_failed")?;
-        let socket =
-            amaterasu_network_policy::bind_udp(request.local()).map_err(|_| "udp_bind_failed")?;
+        let socket = network
+            .bind_udp(request.local())
+            .map_err(|_| "udp_bind_failed")?;
         let local = socket
             .local_addr()
             .map_err(|_| "udp_configuration_failed")?;

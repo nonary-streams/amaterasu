@@ -44,7 +44,13 @@ impl ManagedModule for CaptureModule {
         })?;
         // SAFETY: factory is boxed and retained through module destruction;
         // bindings own independent references to controller state.
-        unsafe { runtime.register_native(SERVICE, &factory.api) }?;
+        unsafe {
+            runtime.register_native_typed(
+                SERVICE,
+                amaterasu_module_sdk::media::native_contracts::CAPTURE,
+                &factory.api,
+            )
+        }?;
         Ok(Self {
             runtime,
             controller,

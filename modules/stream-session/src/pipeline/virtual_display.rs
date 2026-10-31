@@ -1,5 +1,6 @@
 use super::record::Record;
 use crate::model::DisplayRequest;
+use amaterasu_module_sdk::virtual_display::Operation;
 use serde_json::{Value, json};
 
 pub(super) enum ReferenceStatus {
@@ -15,17 +16,24 @@ pub(super) fn create(record: &Record) -> Value {
         .virtual_display_intent
         .as_ref()
         .expect("validated active virtual-display intent");
-    json!({
-        "action":"create",
-        "identity":intent.identity,
-        "reference_id":intent.reference_id,
-        "name":intent.name,
-        "width":intent.width,
-        "height":intent.height,
-        "refresh_millihz":intent.refresh_millihz,
-        "hdr_enabled":intent.display_policy.as_ref().and_then(|policy| policy.effective_client_hdr_request).unwrap_or(false),
-        "dd_virtual_display_scale":intent.dd_virtual_display_scale,
+    serde_json::to_value(Operation::Create {
+        identity: intent.identity.clone(),
+        reference_id: Some(intent.reference_id.clone()),
+        name: intent.name.clone(),
+        width: intent.width,
+        height: intent.height,
+        refresh_millihz: intent.refresh_millihz,
+        hdr_enabled: intent
+            .display_policy
+            .as_ref()
+            .and_then(|policy| policy.effective_client_hdr_request)
+            .unwrap_or(false),
+        dd_virtual_display_scale: Some(intent.dd_virtual_display_scale),
+        virtual_display_layout: None,
+        expected_topology_revision: None,
+        expected_topology_domain_id: None,
     })
+    .expect("virtual display operation serializes")
 }
 
 pub(super) fn status(record: &Record) -> Value {
@@ -34,11 +42,11 @@ pub(super) fn status(record: &Record) -> Value {
         .virtual_display_intent
         .as_ref()
         .expect("virtual-display status requires intent");
-    json!({
-        "action":"status",
-        "identity":intent.identity,
-        "reference_id":intent.reference_id,
+    serde_json::to_value(Operation::Status {
+        identity: Some(intent.identity.clone()),
+        reference_id: Some(intent.reference_id.clone()),
     })
+    .expect("virtual display operation serializes")
 }
 
 pub(super) fn remove(record: &Record) -> Value {
@@ -47,11 +55,11 @@ pub(super) fn remove(record: &Record) -> Value {
         .virtual_display_intent
         .as_ref()
         .expect("virtual-display removal requires intent");
-    json!({
-        "action":"remove",
-        "identity":intent.identity,
-        "reference_id":intent.reference_id,
+    serde_json::to_value(Operation::Remove {
+        identity: intent.identity.clone(),
+        reference_id: Some(intent.reference_id.clone()),
     })
+    .expect("virtual display operation serializes")
 }
 
 pub(super) fn accept_status(record: &mut Record, response: &Value) -> ReferenceStatus {

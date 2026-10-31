@@ -76,6 +76,10 @@ pub struct HookSpec {
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     pub principals: BTreeMap<String, Grants>,
+    /// Trusted composition approvals for legacy untyped native factories, keyed
+    /// by provider principal and exact service. This does not grant native access.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub legacy_native_contracts: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub api_methods: Vec<ApiMethodApproval>,
     #[serde(default)]
@@ -174,6 +178,20 @@ pub enum Command {
     NativeRegister {
         service: String,
         factory: usize,
+    },
+    /// Registers a native factory with an immutable interface-family identity.
+    /// Contract metadata is copied and checked before invoking a typed binding.
+    NativeRegisterTyped {
+        service: String,
+        factory: usize,
+        contract: String,
+    },
+    NativeBindTyped {
+        service: String,
+        interface_major: u32,
+        min_minor: u32,
+        min_size: u32,
+        contract: String,
     },
     NativeBind {
         service: String,

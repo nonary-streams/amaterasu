@@ -54,6 +54,7 @@ struct Harness {
     provider_calls: Vec<Value>,
     provider: bool,
     registry_settings: Option<(u64, Value)>,
+    input_principal: &'static str,
 }
 
 impl Harness {
@@ -62,6 +63,14 @@ impl Harness {
     }
 
     fn with_registry(provider: bool, registry_settings: Option<(u64, Value)>) -> Self {
+        Self::with_input_provider(provider, registry_settings, "amaterasu.input")
+    }
+
+    fn with_input_provider(
+        provider: bool,
+        registry_settings: Option<(u64, Value)>,
+        input_principal: &'static str,
+    ) -> Self {
         let root = std::env::temp_dir().join(format!(
             "amaterasu-lifecycle-broker-{}-{}",
             std::process::id(),
@@ -78,20 +87,21 @@ impl Harness {
                 COORDINATOR: {"provide": [SERVICE]},
                 "transport": {"call": [SERVICE]},
                 "capture": {"call": [SERVICE]},
-                "amaterasu.input": {"call": [SERVICE], "provide": ["amaterasu.input/1"]},
+                (input_principal): {"call": [SERVICE], "provide": ["amaterasu.input/1"]},
                 "launch": {"provide": ["amaterasu.launch/1"]}
             },
             "settings": {
                 COORDINATOR: {
                     "journal_path": root.join("journal.json"),
                     "consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["example/1"]},
-                    "trusted_callers": ["transport", "capture", "amaterasu.input"],
-                    "session_delegates": ["capture", "amaterasu.input"],
-                    "consumers": {"capture":["capture"], "input":["amaterasu.input"]},
+                    "trusted_callers": ["transport", "capture", input_principal],
+                    "session_delegates": ["capture", input_principal],
+                    "input_provider": input_principal,
+                    "consumers": {"capture":["capture"], "input":[input_principal, "transport"]},
                     "operation_grants": {
                         "transport": ["prepare", "lookup", "snapshot", "prepare_stream", "start_stream", "pause_stream", "resume_stream", "end_session", "bind_application", "application_retired", "issue_input_binding"],
                         "capture": ["ack_binding", "retire_stream", "lookup"],
-                        "amaterasu.input": ["ack_binding", "lookup", "validate_input_binding"]
+                        (input_principal): ["ack_binding", "lookup", "validate_input_binding"]
                     }
                 }
             }
@@ -106,7 +116,7 @@ impl Harness {
             configuration["principals"]["display"] =
                 json!({"provide":["example.display/1"],"call":[SERVICE]});
             configuration["settings"][COORDINATOR]["trusted_callers"] =
-                json!(["transport", "capture", "amaterasu.input", "display"]);
+                json!(["transport", "capture", input_principal, "display"]);
             configuration["settings"][COORDINATOR]["operation_grants"]["display"] =
                 json!(["verify_provider_epoch"]);
             let method_ref = |name: &str| json!({"service":"example.display/1","method":name,"interface_major":1,"interface_minor":0,"schema_revision":1});
@@ -145,7 +155,7 @@ impl Harness {
             assert!(matches!(response, Response::Ok));
         }
         for (principal, service) in [
-            ("amaterasu.input", "amaterasu.input/1"),
+            (input_principal, "amaterasu.input/1"),
             ("launch", "amaterasu.launch/1"),
         ] {
             assert!(matches!(
@@ -186,6 +196,7 @@ impl Harness {
             provider_calls: Vec::new(),
             provider,
             registry_settings,
+            input_principal,
         };
         harness.start();
         harness
@@ -326,7 +337,7 @@ impl Harness {
                 assert!(matches!(self.broker.borrow_mut().dispatch("registry", Command::Complete { request: id, payload: json!({"ok":true,"status":"ok","revision":revision,"effective":effective}) }), Response::Ok));
             }
         }
-        for principal in ["amaterasu.input", "launch"] {
+        for principal in [self.input_principal, "launch"] {
             let request = self
                 .broker
                 .borrow_mut()
@@ -437,17 +448,17 @@ impl Harness {
         assert_eq!(binding["status"], "succeeded", "{binding}");
         let token = binding["token"].clone();
         let validate = |boot: &str| json!({"operation":"validate_input_binding","token":token,"input_boot_epoch":boot});
-        let valid = self.call("amaterasu.input", validate("fake-input-boot"));
+        let valid = self.call(self.input_principal, validate("fake-input-boot"));
         assert_eq!(valid["status"], "succeeded", "{valid}");
-        let repeated = self.call("amaterasu.input", validate("fake-input-boot"));
+        let repeated = self.call(self.input_principal, validate("fake-input-boot"));
         assert_eq!(repeated["status"], "succeeded", "{repeated}");
-        let restarted = self.call("amaterasu.input", validate("different-input-boot"));
+        let restarted = self.call(self.input_principal, validate("different-input-boot"));
         assert_eq!(restarted["status"], "rejected", "{restarted}");
         assert_eq!(restarted["reason"], "input_provider_restarted");
         let input_id = format!("{operation}.input");
-        let ack = self.call("amaterasu.input", json!({"operation":"ack_binding","operation_id":input_id,"target":target,"consumer":"input","plan_revision":1,"candidate":candidate}));
+        let ack = self.call(self.input_principal, json!({"operation":"ack_binding","operation_id":input_id,"target":target,"consumer":"input","plan_revision":1,"candidate":candidate}));
         assert_eq!(ack["status"], "pending", "{ack}");
-        let ack = self.settled("amaterasu.input", &input_id);
+        let ack = self.settled(self.input_principal, &input_id);
         assert_eq!(ack["status"], "succeeded", "{ack}");
         let started = self.call("transport", json!({"operation":"start_stream","operation_id":format!("{operation}.start"),"target":target}));
         assert_eq!(started["status"], "succeeded", "{started}");
@@ -468,6 +479,19 @@ impl Harness {
         let result = self.settled("transport", &id);
         assert_eq!(result["status"], "succeeded", "{result}");
     }
+}
+
+#[test]
+fn replacement_input_provider_receives_lifecycle_authority() {
+    let mut harness = Harness::with_input_provider(true, None, "vendor.input");
+    let prepared = harness.call("transport", json!({"operation":"prepare","operation_id":"replacement.prepare","application_ref":{"kind":"application","app_id":"app"}}));
+    assert_eq!(prepared["status"], "pending", "{prepared}");
+    let ready = harness.settled("transport", "replacement.prepare");
+    assert_eq!(ready["status"], "succeeded", "{ready}");
+    let session = ready["target"].clone();
+    let bound = harness.call("transport", json!({"operation":"bind_application","operation_id":"replacement.bind","target":session,"launch_id":42,"application_operation_id":"replacement.launch"}));
+    assert_eq!(bound["status"], "succeeded", "{bound}");
+    harness.prepare_and_start_stream(&session, "replacement.stream", false);
 }
 
 #[test]

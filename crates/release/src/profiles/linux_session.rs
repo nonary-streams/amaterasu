@@ -18,9 +18,9 @@ mod tests;
 use super::{
     APPLICATION, AUDIO, AUDIO_ENCODE, AUTHENTICATION, CAPTURE_KMS, CAPTURE_PIPEWIRE, CAPTURE_VKMS,
     CATALOG, CONFIGURATION, CONTROL_TRANSPORT, ComponentDefinition, DISPLAY, ENCODE, FRAME_LIMITER,
-    HOST_METRICS, INPUT, LAUNCH, LIBRARY, LUTRIS, MANAGEMENT, MEDIA_TRANSPORT, NVHTTP, PAIRING,
-    RTSP, RUNTIME, RUNTIME_ID, SESSION, SESSION_HISTORY, STATE, STEAM, STREAM_SESSION, VIDEO,
-    VIRTUAL_DISPLAY, names,
+    HOST_METRICS, INPUT, LAUNCH, LIBRARY, LUTRIS, MANAGEMENT, MEDIA_TRANSPORT, NETWORK, NVHTTP,
+    PAIRING, RTSP, RUNTIME, RUNTIME_ID, SESSION, SESSION_HISTORY, STATE, STEAM, STREAM_SESSION,
+    VIDEO, VIRTUAL_DISPLAY, names,
 };
 use amaterasu_contracts::{Grants, RuntimeConfig};
 use amaterasu_package::{PackageResult, create_private_directory};
@@ -146,12 +146,14 @@ const LINUX_SESSION_VIDEO: ComponentDefinition = ComponentDefinition {
 const LINUX_SESSION_LIBRARY: ComponentDefinition = ComponentDefinition {
     calls: &[
         "amaterasu.catalog/1",
+        "amaterasu.state/1",
         "amaterasu.steam/1",
         "amaterasu.lutris/1",
     ],
     dependencies: &[
         RUNTIME_ID,
         "amaterasu.catalog",
+        "amaterasu.state",
         "amaterasu.steam",
         "amaterasu.lutris",
     ],
@@ -186,6 +188,7 @@ const LINUX_SESSION_NVHTTP: ComponentDefinition = ComponentDefinition {
         "amaterasu.encode/1",
     ],
     dependencies: &[
+        "amaterasu.network",
         RUNTIME_ID,
         "amaterasu.configuration",
         "amaterasu.pairing",
@@ -264,6 +267,7 @@ const LINUX_SESSION_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
 
 const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "amaterasu.library/1",
         "amaterasu.host-logs/1",
         "amaterasu.steam/1",
         "amaterasu.host-metrics/1",
@@ -302,6 +306,8 @@ const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.stream-session/1",
     ],
     dependencies: &[
+        "amaterasu.library",
+        "amaterasu.network",
         "amaterasu.steam",
         "amaterasu.host-metrics",
         "amaterasu.lutris",
@@ -331,6 +337,7 @@ const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
 
 pub const COMPONENTS: &[ComponentDefinition] = &[
     RUNTIME,
+    NETWORK,
     STATE,
     SESSION,
     CONFIGURATION,
@@ -397,6 +404,7 @@ const EXTENSION_ACTIONS: ComponentDefinition = ComponentDefinition {
 
 pub const EXTENSION_COMPONENTS: &[ComponentDefinition] = &[
     RUNTIME,
+    NETWORK,
     STATE,
     SESSION,
     CONFIGURATION,
@@ -447,6 +455,17 @@ pub fn linux_session_policy(
                 .insert(component.id.into(), component.grants());
         }
     }
+    // The standalone VKMS provider still pins an SDK released before typed
+    // registration. This explicit principal/service attestation lets it use
+    // the same capture contract until its independent SDK pin is updated.
+    policy
+        .legacy_native_contracts
+        .entry("amaterasu.capture-vkms".into())
+        .or_default()
+        .insert(
+            "amaterasu.capture-vkms/1".into(),
+            "amaterasu.video-capture.native/1".into(),
+        );
     policy.principals.insert(
         CONSOLE_ID.into(),
         Grants {
@@ -648,7 +667,7 @@ fn catalog_settings(options: &LinuxSessionOptions) -> Value {
         "seed_desktop_entry": false,
         "steam_id_export_principals": {"amaterasu.lutris": owner},
         "import_principals": {"amaterasu.steam": owner, "amaterasu.lutris": owner},
-        "export_principals": {"amaterasu.nvhttp": owner},
+        "export_principals": {"amaterasu.nvhttp": owner, "amaterasu.management": owner},
     })
 }
 

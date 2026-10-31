@@ -197,6 +197,7 @@ impl Pipeline {
             .as_ref()
             .map(|_| self.settings.enable_input);
         let mut record = Record::new(id, owner, config, self.settings.input_lease_ttl_ms);
+        record.providers = self.settings.providers.clone();
         record.lifecycle_input_required = lifecycle_input_required;
         self.records.insert(id, record);
         self.job = Some(Job::new(

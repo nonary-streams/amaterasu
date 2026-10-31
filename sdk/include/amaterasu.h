@@ -33,6 +33,9 @@ typedef struct {
     void (*write)(void *context, AmaterasuBorrowedBytes bytes);
 } AmaterasuReplySink;
 
+/* invoke/context support concurrent consumer-worker calls. The endpoint keeps
+ * the same runtime principal across OS threads. Native guards may release on
+ * their final owning worker; runtime destruction follows every guard/call. */
 typedef struct {
     AmaterasuAbiHeader header;
     void *context;

@@ -521,6 +521,7 @@ pub fn matches_query(entry: &Entry, query: &str) -> bool {
             crate::model::ArtworkReference::Steam { .. } => contains("steam"),
             crate::model::ArtworkReference::Lutris { .. } => contains("lutris"),
             crate::model::ArtworkReference::Playnite { .. } => contains("playnite"),
+            crate::model::ArtworkReference::External { source, .. } => contains(source),
         })
     {
         return true;

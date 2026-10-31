@@ -34,11 +34,11 @@ and counts it down, so that dynamic value is excluded from stable ownership
 comparisons. The crate exposes the interval but does not run a timer; its caller
 must schedule refreshes.
 
-`discover_gateway` applies the crate's two-second search timeout and returns
+`discover_gateway(&network)` applies the crate's two-second search timeout and returns
 discovery errors. Mapping, cleanup, and refresh errors are returned to the
 caller.
 
-`discover_ipv6_firewalls` separately searches `ff02::c` from each selected local
+`discover_ipv6_firewalls(&network)` separately searches `ff02::c` from each selected local
 IPv6 interface, retaining that interface scope for the gateway's link-local
 control endpoint. `PinholeManager` uses `WANIPv6FirewallControl`, asks for a
 3600-second lease, refreshes owned pinhole IDs on the caller's schedule, and
@@ -57,3 +57,16 @@ Mapping ownership is deliberately stricter than the pinned implementation:
 pre-existing or externally changed conflicts are preserved instead of deleted.
 The IGD protocol still has check-then-act races around create, refresh, and
 delete; the adapter documents those limits at each operation.
+
+All discovery, route selection, interface enumeration and SOAP connections use
+the caller's selected `Network` provider. Gateway objects retain that binding
+through mapping/pinhole cleanup. Missing TCP, UDP, multicast or interface
+enumeration support is returned as an explicit discovery error. There is no
+embedded `igd-next` transport or direct OS socket fallback in this crate.
+
+The IPv4 adapter recognizes WANPPPConnection:1 and WANIPConnection:1/2. It
+uses canonical IGD action arguments and pins description/control URLs to the
+advertising gateway address. Responses are bounded, and HTTP supports content
+length, chunked transfer and close-delimited bodies. Router-specific SCPD
+argument extensions are not inferred; physical router interoperability remains
+unqualified.

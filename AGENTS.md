@@ -37,3 +37,21 @@
   and Clippy before handoff. Fix validation failures in the owning worker.
 - Commit coherent validated increments and integrate ready work promptly; do not
   wait for a batch barrier or create status-only commits to imply progress.
+
+## Plugin substitutability
+
+- Built-in consumers must use the same versioned contracts and SDK adapters
+  offered to external plugin developers. Keep default implementations in
+  provider components; a consumer must not silently fall back to one.
+- Select providers through trusted startup composition, with explicit grants,
+  dependencies and capability checks. Keep provider-specific identities, OS
+  handles and allocation ownership out of consumer contracts.
+- A reusable operation needs an API contract, SDK support and a replacement
+  test that exercises an unchanged consumer against another implementation.
+  Native table size and version alone do not establish interface identity.
+- Production TCP/UDP/DNS socket operations belong to the network provider.
+  HTTP, streaming protocols and library policy consume the Network SDK.
+  Bootstrap repository retrieval before plugins can be loaded is an explicit
+  exception; preserve its injected RepositoryTransport verification boundary.
+- Preserve bounded storage, cancellation and worker retirement when replacing
+  providers. Local admission is not evidence of remote delivery.

@@ -33,6 +33,25 @@ pub(super) fn validate(configuration: &RuntimeConfig) -> Result<(), String> {
         return Err("host lifecycle endpoint identity is missing or untrusted".into());
     }
 
+    if configuration.legacy_native_contracts.len() > MAX_PRINCIPALS {
+        return Err("too many legacy native contract principals".into());
+    }
+    for (principal, services) in &configuration.legacy_native_contracts {
+        let grants = configuration
+            .principals
+            .get(principal)
+            .ok_or("legacy native contract references unknown principal")?;
+        if services.len() > MAX_GRANTS_PER_KIND
+            || services.iter().any(|(service, contract)| {
+                !valid_name(service)
+                    || !valid_name(contract)
+                    || !grants.native_provide.contains(service)
+            })
+        {
+            return Err("invalid or ungranted legacy native contract".into());
+        }
+    }
+
     for (principal, settings) in &configuration.settings {
         if !configuration.principals.contains_key(principal) {
             return Err(format!("settings refer to unknown principal: {principal}"));

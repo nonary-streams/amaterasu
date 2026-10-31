@@ -5,7 +5,9 @@ mod model;
 mod native;
 mod stream;
 
-use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
+use amaterasu_module_sdk::{
+    Command, ManagedModule, ModuleResult, Response, RuntimeClient, network::Network,
+};
 use controller::{ControlReply, Controller};
 use model::{Operation, Settings};
 use serde_json::json;
@@ -21,28 +23,7 @@ struct MediaTransportModule {
 
 impl ManagedModule for MediaTransportModule {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
-        let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
-            return Err("media transport settings unavailable".into());
-        };
-        let settings: Settings =
-            serde_json::from_value(payload).map_err(|_| "invalid media transport settings")?;
-        settings.validate()?;
-        let controller = Arc::new(Mutex::new(Controller::new(settings)));
-        let factory = native::Factory::new(controller.clone());
-        runtime.require_success(Command::Register {
-            service: SERVICE.into(),
-        })?;
-        // SAFETY: boxed factory and synchronized controller live until unload.
-        // Signed dependency ordering requires consumers to release all native
-        // bindings before provider unload; grants are not a native-code sandbox.
-        unsafe {
-            runtime.register_native(SERVICE, &factory.api)?;
-        }
-        Ok(Self {
-            runtime,
-            controller,
-            _factory: factory,
-        })
+        Self::start_configured(runtime, None)
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
@@ -100,6 +81,40 @@ impl ManagedModule for MediaTransportModule {
             }
             _ => Err("media transport poll failed".into()),
         }
+    }
+}
+
+impl MediaTransportModule {
+    fn start_configured(
+        runtime: RuntimeClient,
+        selected_network: Option<Network>,
+    ) -> ModuleResult<Self> {
+        let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
+            return Err("media transport settings unavailable".into());
+        };
+        let settings: Settings = serde_json::from_value(payload.clone())
+            .map_err(|_| "invalid media transport settings")?;
+        settings.validate()?;
+        let network = match selected_network {
+            Some(network) => network,
+            None => Network::from_settings(&runtime, &payload)?,
+        };
+        let controller = Arc::new(Mutex::new(Controller::with_network(settings, network)));
+        let factory = native::Factory::new(controller.clone());
+        runtime.require_success(Command::Register {
+            service: SERVICE.into(),
+        })?;
+        // SAFETY: boxed factory and synchronized controller live until unload.
+        // Signed dependency ordering requires consumers to release all native
+        // bindings before provider unload; grants are not a native-code sandbox.
+        unsafe {
+            amaterasu_module_sdk::transport::register_media(&runtime, SERVICE, &factory.api)?;
+        }
+        Ok(Self {
+            runtime,
+            controller,
+            _factory: factory,
+        })
     }
 }
 

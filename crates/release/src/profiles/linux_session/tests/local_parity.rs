@@ -343,6 +343,11 @@ fn delegated_paths() -> Vec<Vec<&'static str>> {
     ] {
         paths.push(vec!["amaterasu.library/1", service]);
     }
+    paths.push(vec![
+        "amaterasu.library/1",
+        "amaterasu.catalog/1",
+        "amaterasu.state/1",
+    ]);
     paths.push(vec!["amaterasu.pairing/1", "amaterasu.state/1"]);
     paths.push(vec!["amaterasu.catalog/1", "amaterasu.state/1"]);
     paths
@@ -699,7 +704,7 @@ fn nvhttp_chain_grants_match_the_agreed_services_exactly() {
     );
     assert_eq!(
         component(NVHTTP_ID).grants().native_use,
-        expected(&["amaterasu.identity/1"])
+        expected(&["amaterasu.identity/1", "amaterasu.network/1"])
     );
 }
 
@@ -795,7 +800,7 @@ fn stream_wiring_names_only_the_next_service_in_the_chain() {
     );
     assert_eq!(
         settings["amaterasu.catalog"]["export_principals"],
-        json!({"amaterasu.nvhttp": "amaterasu.management"})
+        json!({"amaterasu.nvhttp": "amaterasu.management", "amaterasu.management": "amaterasu.management"})
     );
     assert_eq!(
         settings["amaterasu.catalog"]["launch_principals"],
@@ -817,7 +822,7 @@ fn stream_wiring_names_only_the_next_service_in_the_chain() {
         .settings;
     assert_eq!(
         settings["amaterasu.catalog"]["export_principals"],
-        json!({"amaterasu.nvhttp": "amaterasu.console"})
+        json!({"amaterasu.nvhttp": "amaterasu.console", "amaterasu.management": "amaterasu.console"})
     );
 }
 

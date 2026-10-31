@@ -85,6 +85,29 @@ binding slot before calling the provider, preventing unbounded concurrent creati
 Metadata is bounded to 256 immutable factories and 1024 live or pending bindings;
 release recovers capacity. There is no automatic retry/replay of a failed bind.
 
+For binary transfer, video, and media/control transport, providers must use the typed
+`native_register_typed {service,factory,contract}` envelope and consumers use
+`native_bind_typed {service,contract,interface_major,min_minor,min_size}`.
+C plugins obtain the exact family strings from `AMATERASU_DATA_TRANSFER_CONTRACT`
+in `amaterasu_data_plane.h` and `AMATERASU_MEDIA_TRANSPORT_CONTRACT` or
+`AMATERASU_CONTROL_TRANSPORT_CONTRACT` or `AMATERASU_VIDEO_CONTRACT` in `amaterasu_media.h`. The runtime
+rejects untyped registrations and mismatched families before invoking the factory,
+including for custom aliases. Typed identities are trusted provider promises and
+do not isolate native code; grants and lifetime requirements still apply.
+
+A trusted startup policy may temporarily approve a legacy factory by setting
+`legacy_native_contracts` to a map of exact provider principal to exact service
+and contract identity. The provider must also retain an effective native-provide
+grant; package verification drops approvals for absent components and removed
+grants. Only legacy `native_register` uses this approval. Explicit typed
+registrations retain their own declared identity. This bridge is a trusted
+composition assertion, not a sandbox or proof of implementation behavior.
+The Linux session policy temporarily approves only principal
+`amaterasu.capture-vkms`, service `amaterasu.capture-vkms/1`, and contract
+`amaterasu.video-capture.native/1`, for the standalone VKMS provider pinned to
+an older SDK. Remove this approval when that provider updates to an SDK that
+registers its capture family explicitly.
+
 Internal control envelopes are `native_register {service,factory}`, `native_bind
 {service,interface_major,min_minor,min_size}`, and `native_release {binding}`;
 `native_bound {binding,address}` is the binding response. Addresses are process-local
@@ -108,3 +131,25 @@ release ownership/exactly-once behavior, callback lock freedom, short factory
 headers, incompatible table cleanup and control-message validation. Hardware
 buffer interoperability and product callback behavior require their own tests.
 
+
+### Video plane provider migration
+
+Capture, video encoder, source encoder, frame-resource consumer, CPU frame
+processor and GPU frame processor providers register with `native_register_typed`
+using the matching family identifier. Rust providers can use
+`amaterasu_module_sdk::media::native_contracts` with
+`RuntimeClient::register_native_typed`; consumers use the same identifier with
+`bind_native_typed`. C providers use the corresponding constants in
+`amaterasu_media.h`: `AMATERASU_VIDEO_CAPTURE_CONTRACT`,
+`AMATERASU_VIDEO_ENCODER_CONTRACT`, `AMATERASU_ENCODER_PROVIDER_CONTRACT`,
+`AMATERASU_FRAME_RESOURCE_CONSUMER_CONTRACT`,
+`AMATERASU_CPU_FRAME_PROCESSOR_CONTRACT`, and
+`AMATERASU_GPU_FRAME_PROCESSOR_CONTRACT`.
+
+For example, a C provider using the native control envelope supplies its existing
+service alias and factory address along with `AMATERASU_VIDEO_CAPTURE_CONTRACT`
+as the `contract` value in `native_register_typed`. A consumer passes that same
+contract in `native_bind_typed`, along with the required major, minor and table
+size. Existing untyped registrations must be updated before using the video
+plane; a matching service name and table size alone do not establish the family.
+Service grants, lifetime rules and the underlying table definitions are unchanged.

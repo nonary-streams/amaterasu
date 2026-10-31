@@ -1,6 +1,6 @@
 use crate::{model::*, stream::Stream};
 use amaterasu_media::{ControlMessage, ControlMessageSink, MEDIA_CLOSED};
-use amaterasu_module_sdk::abi::Status;
+use amaterasu_module_sdk::{abi::Status, network::Network};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
@@ -16,6 +16,7 @@ struct OperationRecord {
 }
 
 pub struct Controller {
+    network: Network,
     settings: Settings,
     streams: BTreeMap<u64, Stream>,
     operations: BTreeMap<(String, String), OperationRecord>,
@@ -25,8 +26,14 @@ pub struct Controller {
 }
 
 impl Controller {
+    #[cfg(test)]
     pub fn new(settings: Settings) -> Self {
+        Self::with_network(settings, Network::test_provider())
+    }
+
+    pub fn with_network(settings: Settings, network: Network) -> Self {
         Self {
+            network,
             settings,
             streams: BTreeMap::new(),
             operations: BTreeMap::new(),
@@ -88,7 +95,7 @@ impl Controller {
         }
         self.admit(owner, &key)?;
         let id = self.new_id()?;
-        let stream = Stream::open(owner, &request, &key, self.now())?;
+        let stream = Stream::open_with_network(&self.network, owner, &request, &key, self.now())?;
         let payload = stream.metadata(id);
         self.streams.insert(id, stream);
         self.issued_ids.insert(id);

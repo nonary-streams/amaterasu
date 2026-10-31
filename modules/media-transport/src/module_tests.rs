@@ -3,6 +3,7 @@ use amaterasu_module_sdk::abi::*;
 use std::{collections::VecDeque, ffi::c_void, net::UdpSocket};
 
 struct Host {
+    typed_network_binds: usize,
     replies: VecDeque<Response>,
     complete: Option<serde_json::Value>,
 }
@@ -15,6 +16,21 @@ unsafe extern "C" fn invoke(
     // SAFETY: the test endpoint context and message allocations outlive invocation.
     let host = unsafe { &mut *context.cast::<Host>() };
     let command: Command = serde_json::from_slice(unsafe { input.read().unwrap() }).unwrap();
+    match &command {
+        Command::NativeBindTyped {
+            service, contract, ..
+        } => {
+            assert_eq!(contract, "amaterasu.network-interface/1");
+            assert_eq!(service, "vendor.network/1");
+            host.typed_network_binds += 1;
+        }
+        Command::NativeBind { service, .. }
+            if service == "vendor.network/1" || service == "amaterasu.network/1" =>
+        {
+            panic!("network bindings must declare the typed network contract");
+        }
+        _ => {}
+    }
     if let Command::Complete { payload, .. } = command {
         host.complete = Some(payload);
     }
@@ -41,6 +57,7 @@ fn cancelled_open_releases_udp_ports_and_cannot_leave_a_hidden_sender() {
             payload: json!({"action":"open","peer_ip":"127.0.0.1","video_port":port,"audio_port":port,"audio":{"channels":2,"packet_ms":10,"wire_payload_bytes":4}}),
         };
         let mut host = Host {
+            typed_network_binds: 0,
             replies: VecDeque::from([
                 Response::Result {
                     payload: json!({"enabled":true,"allowed_principals":["consumer"]}),
@@ -61,8 +78,11 @@ fn cancelled_open_releases_udp_ports_and_cannot_leave_a_hidden_sender() {
             invoke,
         };
         // SAFETY: host state outlives module and all runtime endpoint calls.
-        let mut module =
-            MediaTransportModule::start(unsafe { RuntimeClient::from_endpoint(api) }).unwrap();
+        let mut module = MediaTransportModule::start_configured(
+            unsafe { RuntimeClient::from_endpoint(api) },
+            Some(Network::test_provider()),
+        )
+        .unwrap();
         module.tick().unwrap();
         assert!(host.replies.is_empty());
         let status = module
@@ -80,4 +100,31 @@ fn cancelled_open_releases_udp_ports_and_cannot_leave_a_hidden_sender() {
             assert!(before);
         }
     }
+}
+
+#[test]
+fn startup_rejects_an_unavailable_selected_network_provider() {
+    let mut host = Host {
+        typed_network_binds: 0,
+        replies: VecDeque::from([
+            Response::Result {
+                payload: json!({"enabled":true,"network_provider":"vendor.network/1","allowed_principals":["consumer"]}),
+            },
+            Response::Error {
+                code: "not_found".into(),
+                message: "provider unavailable".into(),
+            },
+        ]),
+        complete: None,
+    };
+    let api = HostApi {
+        header: AbiHeader::of::<HostApi>(),
+        context: (&mut host as *mut Host).cast(),
+        invoke,
+    };
+    // SAFETY: host remains live while startup attempts the selected binding.
+    let result = MediaTransportModule::start(unsafe { RuntimeClient::from_endpoint(api) });
+    assert!(result.is_err());
+    assert_eq!(host.typed_network_binds, 1);
+    assert!(host.replies.is_empty());
 }

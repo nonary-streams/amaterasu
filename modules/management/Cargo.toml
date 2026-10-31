@@ -20,6 +20,7 @@ url = "2"
 
 [dev-dependencies]
 ed25519-dalek.workspace = true
+amaterasu-module-sdk = { workspace = true, features = ["network-test-support"] }
 
 [lints]
 workspace = true

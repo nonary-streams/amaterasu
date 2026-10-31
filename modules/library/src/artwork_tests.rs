@@ -16,13 +16,22 @@ struct FakeHost {
     bad_release_echo: bool,
     deny_detached: bool,
     lose_take_once: bool,
+    external: bool,
+    unsupported_artwork: bool,
+    changed_mime: bool,
 }
 
 impl FakeHost {
     fn dispatch(&mut self, command: Command) -> Response {
         self.commands.push(command.clone());
         match command {
-            Command::GetSettings {} => Response::Result { payload: json!({}) },
+            Command::GetSettings {} => Response::Result {
+                payload: if self.external {
+                    json!({"artwork":{"providers":{"vendor":{"service":"vendor.artwork/1","allowed_initiators":["amaterasu.nvhttp"]}}}})
+                } else {
+                    json!({})
+                },
+            },
             Command::Register { .. } => Response::Ok,
             Command::Poll {} => self.incoming.pop_front().unwrap_or(Response::Pending),
             Command::Request {
@@ -43,10 +52,24 @@ impl FakeHost {
                         payload,
                         json!({"action":"resolve_exported_artwork","id":"app-0000000000000001"})
                     );
-                    if self.playnite {
+                    if self.external {
+                        json!({"ok":true,"artwork":{"provider":"external","source":"vendor","reference":{"id":"opaque/cover","revision":"revision:17"}}})
+                    } else if self.playnite {
                         json!({"ok":true,"artwork":{"provider":"playnite","game_id":"12345678-1234-1234-1234-123456789abc","revision":"a".repeat(64)}})
                     } else {
                         json!({"ok":true,"artwork":{"provider":"steam","app_id":42,"revision":self.artwork_revision}})
+                    }
+                } else if self.external {
+                    assert_eq!(service, "vendor.artwork/1");
+                    if payload["action"] == "describe" {
+                        json!({"ok":true,"capabilities":{"discovery":false,"artwork":!self.unsupported_artwork,"lifecycle":false}})
+                    } else {
+                        assert_eq!(payload["action"], "artwork");
+                        assert_eq!(
+                            payload["reference"],
+                            json!({"id":"opaque/cover","revision":"revision:17"})
+                        );
+                        json!({"ok":true,"reference":payload["reference"],"offset":0,"total_bytes":3,"mime":"image/png","data_base64":"YWJj"})
                     }
                 } else if self.playnite {
                     assert_eq!(service, "amaterasu.playnite/1");
@@ -81,7 +104,7 @@ impl FakeHost {
                     } else {
                         "YWJj".to_owned()
                     };
-                    json!({"ok":true,"app_id":42,"revision":"17","offset":offset,"next_offset":if offset == 0 { Some(8192) } else { None },"total_bytes":8195,"mime_type":"image/png","data":data})
+                    json!({"ok":true,"app_id":42,"revision":"17","offset":offset,"next_offset":if offset == 0 { Some(8192) } else { None },"total_bytes":8195,"mime_type":if self.changed_mime { "image/jpeg" } else { "image/png" },"data":data})
                 };
                 self.results.insert(self.next_child, result);
                 Response::Accepted {
@@ -465,6 +488,8 @@ fn transfer_fences_allow_thousands_and_enforce_bound() {
         library.transfers.insert(
             format!("{n:032x}"),
             Transfer {
+                described: false,
+                stream: None,
                 initiator: "amaterasu.nvhttp".into(),
                 id: "app-0000000000000001".into(),
                 artwork: None,
@@ -520,5 +545,86 @@ fn unknown_release_is_unverified_and_fences_late_read() {
             .commands
             .iter()
             .any(|c| matches!(c, Command::Request { .. }))
+    );
+}
+
+#[test]
+fn external_artwork_uses_sdk_route_and_negotiates_capability_once() {
+    for supported in [true, false] {
+        let mut host = FakeHost {
+            external: true,
+            unsupported_artwork: !supported,
+            ..Default::default()
+        };
+        let endpoint = HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: (&mut host as *mut FakeHost).cast(),
+            invoke,
+        };
+        // SAFETY: host allocation outlives its single-threaded library instance.
+        let mut library =
+            Library::start(unsafe { RuntimeClient::from_endpoint(endpoint) }).unwrap();
+        host.enqueue(10, None, 0);
+        for _ in 0..20 {
+            library.tick().unwrap();
+        }
+        if supported {
+            assert_eq!(
+                host.completions[&10],
+                json!({"ok":true,"revision":"revision:17","offset":0,"next_offset":null,"total_bytes":3,"mime_type":"image/png","data":"YWJj"})
+            );
+            host.enqueue(11, Some("revision:17"), 0);
+            for _ in 0..20 {
+                library.tick().unwrap();
+            }
+            assert_eq!(host.completions[&11]["ok"], true);
+            let descriptions = host
+                .commands
+                .iter()
+                .filter(|command| {
+                    matches!(command, Command::Request { service, payload, .. }
+                if service == "vendor.artwork/1" && payload["action"] == "describe")
+                })
+                .count();
+            assert_eq!(descriptions, 1);
+        } else {
+            assert_eq!(
+                host.completions[&10]["error"]["code"],
+                "artwork_unsupported"
+            );
+            assert!(!host.commands.iter().any(
+                |command| matches!(command, Command::Request { service, payload, .. }
+                if service == "vendor.artwork/1" && payload["action"] == "artwork")
+            ));
+        }
+    }
+}
+
+#[test]
+fn artwork_transfer_pins_mime_across_successive_chunks() {
+    let mut host = FakeHost {
+        artwork_revision: "17",
+        ..Default::default()
+    };
+    let endpoint = HostApi {
+        header: AbiHeader::of::<HostApi>(),
+        context: (&mut host as *mut FakeHost).cast(),
+        invoke,
+    };
+    // SAFETY: boxed endpoint context remains live on this test's single thread.
+    let mut library = Library::start(unsafe { RuntimeClient::from_endpoint(endpoint) }).unwrap();
+    host.enqueue(10, None, 0);
+    for _ in 0..12 {
+        library.tick().unwrap();
+    }
+    assert_eq!(host.completions[&10]["ok"], true);
+    host.changed_mime = true;
+    host.enqueue(11, Some("17"), 8192);
+    for _ in 0..12 {
+        library.tick().unwrap();
+    }
+    assert_eq!(
+        host.completions[&11]["error"]["code"],
+        "invalid_artwork_response"
     );
 }

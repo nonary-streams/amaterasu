@@ -4,12 +4,12 @@ mod connection;
 mod tickets;
 
 use amaterasu_gamestream::{crypto::MAX_RTSP_PLAINTEXT_BYTES, rtsp::Request};
+use amaterasu_module_sdk::network::{Network, TcpListener};
 use connection::{Connection, Step};
-use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::{
     collections::BTreeMap,
     io,
-    net::{IpAddr, SocketAddr, TcpListener},
+    net::{IpAddr, SocketAddr},
 };
 use tickets::Tickets;
 
@@ -32,6 +32,7 @@ pub enum Event {
 }
 
 pub struct Transport {
+    network: Network,
     listeners: Vec<TcpListener>,
     tickets: Tickets,
     connections: BTreeMap<u64, Connection>,
@@ -46,7 +47,16 @@ impl Transport {
         Self::bind_all(vec![address], allow_remote)
     }
 
+    #[cfg(test)]
     pub fn bind_all(addresses: Vec<SocketAddr>, allow_remote: bool) -> TransportResult<Self> {
+        Self::bind_all_with_network(Network::test_provider(), addresses, allow_remote)
+    }
+
+    pub fn bind_all_with_network(
+        network: Network,
+        addresses: Vec<SocketAddr>,
+        allow_remote: bool,
+    ) -> TransportResult<Self> {
         if addresses.is_empty() {
             return Err("invalid_listen_address");
         }
@@ -64,38 +74,18 @@ impl Transport {
             {
                 address.set_port(port);
             }
-            let socket = Socket::new(
-                Domain::for_address(address),
-                Type::STREAM,
-                Some(Protocol::TCP),
-            )
-            .map_err(|_| "tcp_bind_failed")?;
-            // Unix TIME_WAIT endpoints must not prevent host restart. This
-            // does not allow a second live listener to share the endpoint.
-            #[cfg(unix)]
-            socket
-                .set_reuse_address(true)
-                .map_err(|_| "tcp_configuration_failed")?;
-            if address.is_ipv6() {
-                socket
-                    .set_only_v6(true)
-                    .map_err(|_| "tcp_configuration_failed")?;
-            }
-            socket
-                .bind(&SockAddr::from(address))
-                .map_err(|_| "tcp_bind_failed")?;
-            socket
-                .listen(4096)
-                .map_err(|_| "tcp_configuration_failed")?;
-            socket
+            // Socket ownership and platform listener semantics belong to the
+            // selected provider; RTSP retains address admission and tickets.
+            let listener = network.bind_tcp(address).map_err(|_| "tcp_bind_failed")?;
+            listener
                 .set_nonblocking(true)
                 .map_err(|_| "tcp_configuration_failed")?;
-            let listener: TcpListener = socket.into();
             selected_port
                 .get_or_insert_with(|| listener.local_addr().expect("bound listener").port());
             listeners.push(listener);
         }
         Ok(Self {
+            network,
             listeners,
             tickets: Tickets::default(),
             connections: BTreeMap::new(),
@@ -131,7 +121,7 @@ impl Transport {
             return Err("tcp_listener_active");
         }
         let previous_addresses = self.local_addrs()?;
-        match Self::bind_all(addresses.clone(), allow_remote) {
+        match Self::bind_all_with_network(self.network.clone(), addresses.clone(), allow_remote) {
             Ok(replacement) => {
                 self.listeners = replacement.listeners;
                 self.allow_remote = allow_remote;
@@ -142,16 +132,20 @@ impl Transport {
                 // bind. Release all listeners together, retry, and restore the
                 // old set if any member of the new set still fails.
                 drop(std::mem::take(&mut self.listeners));
-                match Self::bind_all(addresses, allow_remote) {
+                match Self::bind_all_with_network(self.network.clone(), addresses, allow_remote) {
                     Ok(replacement) => {
                         self.listeners = replacement.listeners;
                         self.allow_remote = allow_remote;
                         Ok(())
                     }
                     Err(replacement_error) => {
-                        self.listeners = Self::bind_all(previous_addresses, self.allow_remote)
-                            .map_err(|_| "tcp_rebind_rollback_failed")?
-                            .listeners;
+                        self.listeners = Self::bind_all_with_network(
+                            self.network.clone(),
+                            previous_addresses,
+                            self.allow_remote,
+                        )
+                        .map_err(|_| "tcp_rebind_rollback_failed")?
+                        .listeners;
                         let _ = preflight_error;
                         Err(replacement_error)
                     }

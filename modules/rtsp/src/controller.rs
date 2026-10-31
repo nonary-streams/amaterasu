@@ -19,13 +19,13 @@ use amaterasu_gamestream::rtsp::{
     },
     serialize_response,
 };
-use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
+use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient, network::Network};
 use record::{Job, Phase, Record, State};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    net::{IpAddr, SocketAddr, UdpSocket},
+    net::{IpAddr, SocketAddr},
     thread,
     time::{Duration, Instant},
 };
@@ -146,6 +146,7 @@ impl StartupRecovery {
 }
 
 pub struct Controller {
+    network: Network,
     settings: Settings,
     bootstrap_settings: Settings,
     network_base_port: Option<u16>,
@@ -171,13 +172,22 @@ pub struct Controller {
 }
 
 impl Controller {
+    #[cfg(test)]
     pub fn new(settings: Settings) -> Result<Self, &'static str> {
+        Self::with_network(settings, Network::test_provider())
+    }
+
+    pub fn with_network(settings: Settings, network: Network) -> Result<Self, &'static str> {
         settings.validate()?;
         let mut recovery_nonce = [0; 8];
         getrandom::fill(&mut recovery_nonce).map_err(|_| "random_unavailable")?;
         let network_base_port = settings.default_base_port();
         let (transport, locals, local) = if settings.enabled {
-            let transport = Transport::bind_all(settings.resolved_binds()?, settings.allow_remote)?;
+            let transport = Transport::bind_all_with_network(
+                network.clone(),
+                settings.resolved_binds()?,
+                settings.allow_remote,
+            )?;
             let locals = transport.local_addrs()?;
             let local = locals.first().copied().ok_or("tcp_address_failed")?;
             (Some(transport), locals, Some(local))
@@ -192,6 +202,7 @@ impl Controller {
             STARTUP_RECONCILIATION_TIMEOUT_MS,
         );
         Ok(Self {
+            network,
             bootstrap_settings: settings.clone(),
             active_address_family: None,
             active_bind_address: None,
@@ -550,7 +561,9 @@ impl Controller {
         // UDP connect performs route selection without sending a datagram. The
         // resulting local endpoint is advertised and reused for this stream's
         // per-session UDP listeners instead of returning an unusable wildcard.
-        let route = UdpSocket::bind(SocketAddr::new(listener.ip(), 0))
+        let route = self
+            .network
+            .bind_udp(SocketAddr::new(listener.ip(), 0))
             .map_err(|_| "route_selection_failed")?;
         route
             .connect(SocketAddr::new(peer, 9))
@@ -608,7 +621,7 @@ impl Controller {
             return Ok(false);
         }
 
-        candidate.probe_media_binds(base_port)?;
+        candidate.probe_media_binds_with_network(&self.network, base_port)?;
         if self.locals == binds {
             self.listener_base_port = Some(base_port);
             self.active_network_base_port = Some(base_port);

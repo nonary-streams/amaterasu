@@ -8,7 +8,7 @@ use model::{FixtureError, Operation, Settings};
 use serde_json::{Value, json};
 use std::time::Instant;
 
-const INPUT_SERVICE: &str = "amaterasu.input/1";
+const INPUT_SERVICE: &str = amaterasu_module_sdk::input::INPUT_SERVICE;
 const METRICS_SERVICE: &str = "test.input-probe/1";
 
 struct InputProbe {

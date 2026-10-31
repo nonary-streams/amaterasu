@@ -243,20 +243,75 @@ namespace Amaterasu {
     }
   }
 
+  /** Catalog identity selects the provider on the host; the browser never supplies a service route. */
+  export async function readCatalogArtwork(
+    api: Pick<Api, "post">,
+    id: string,
+    revision: string,
+    active: () => boolean = () => true,
+    transferId = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join(""),
+  ): Promise<Blob> {
+    if (!/^app-[0-9a-f]{16}$/.test(id) || typeof revision !== "string" || !revision ||
+        revision.length > 128 || /[\u0000-\u001f\u007f-\u009f]/u.test(revision) ||
+        !/^[0-9a-f]{32}$/.test(transferId)) throw new Error("Invalid catalog artwork reference.");
+    const chunks: ArrayBuffer[] = [];
+    let offset = 0;
+    let totalBytes: number | null = null;
+    let mimeType: string | null = null;
+    try {
+      while (true) {
+        if (!active()) throw new Error("Artwork transfer cancelled.");
+        const reply = await api.post<Omit<SteamArtworkChunk, "app_id">>("library/artwork_read", {
+          id, revision, offset, transfer_id: transferId,
+        });
+        if (!active()) throw new Error("Artwork transfer cancelled.");
+        if (reply.ok !== true || reply.revision !== revision || reply.offset !== offset ||
+            !Number.isSafeInteger(reply.total_bytes) || reply.total_bytes < 1 || reply.total_bytes > 16 * 1024 * 1024 ||
+            !["image/png", "image/jpeg", "image/webp"].includes(reply.mime_type) ||
+            typeof reply.data !== "string" || reply.data.length > 10924 ||
+            (totalBytes !== null && totalBytes !== reply.total_bytes) ||
+            (mimeType !== null && mimeType !== reply.mime_type)) throw new Error("Catalog artwork changed during transfer.");
+        totalBytes = reply.total_bytes;
+        mimeType = reply.mime_type;
+        const decoded = atob(reply.data);
+        if (!decoded.length || decoded.length > 8192 || offset + decoded.length > totalBytes)
+          throw new Error("Invalid catalog artwork chunk.");
+        const bytes = new Uint8Array(decoded.length);
+        for (let index = 0; index < decoded.length; index++) bytes[index] = decoded.charCodeAt(index);
+        chunks.push(bytes.buffer);
+        const end = offset + decoded.length;
+        if (reply.next_offset === null) {
+          if (end !== totalBytes) throw new Error("Incomplete catalog artwork transfer.");
+          return new Blob(chunks, { type: mimeType });
+        }
+        if (reply.next_offset !== end || end >= totalBytes || end % 8192 !== 0)
+          throw new Error("Invalid catalog artwork cursor.");
+        offset = end;
+      }
+    } finally {
+      await api.post("library/artwork_release", { id, transfer_id: transferId }).catch(() => {});
+    }
+  }
+
   export function showCatalogArtwork(
     api: Pick<Api, "post" | "allows">,
     reference: Entry["artwork"],
     art: HTMLElement,
     content: HTMLElement,
     onLoad?: () => void,
+    catalogId?: string,
   ): void {
     if (!reference) return;
-    if (reference.provider === "steam" && !api.allows("steam.read")) return;
-    if (reference.provider === "lutris" && !api.allows("lutris.read")) return;
+    if (catalogId && !api.allows("catalog.read")) return;
+    if (!catalogId && reference.provider === "steam" && !api.allows("steam.read")) return;
+    if (!catalogId && reference.provider === "lutris" && !api.allows("lutris.read")) return;
+    if (!catalogId && reference.provider === "external") return;
     const active = () => content.isConnected && art.isConnected;
-    const imageRead = reference.provider === "steam"
-      ? readSteamArtwork(api, reference, active)
-      : readLutrisArtwork(api, reference, active);
+    const imageRead = catalogId
+      ? readCatalogArtwork(api, catalogId, reference.provider === "external" ? reference.reference.revision : reference.revision, active)
+      : reference.provider === "steam" ? readSteamArtwork(api, reference, active)
+      : reference.provider === "lutris" ? readLutrisArtwork(api, reference, active)
+      : Promise.reject(new Error("Catalog artwork identity is required."));
     void imageRead.then((blob) => {
       if (!content.isConnected || !art.isConnected) return;
       const url = URL.createObjectURL(blob);
@@ -1043,6 +1098,7 @@ namespace Amaterasu {
     if (entry.launch.kind === "playnite" || entry.launch.kind === "playnite_fullscreen") return "Playnite";
     if (entry.steam_id || entry.artwork?.provider === "steam") return "Steam";
     if (entry.artwork?.provider === "lutris") return "Lutris";
+    if (entry.artwork?.provider === "external") return entry.artwork.source;
     return "Other";
   }
 
@@ -1519,7 +1575,7 @@ namespace Amaterasu {
         el("span", "app-monogram", catalogTextLiteral(row.entry.name.slice(0, 2).toUpperCase())),
         badge(launchLabel),
       );
-      showCatalogArtwork(api, row.entry.artwork, art, content);
+      showCatalogArtwork(api, row.entry.artwork, art, content, undefined, row.id);
       const open = button("", () => {
         if (providerLaunch) showProviderOverrideEditor(row, capabilities);
         else showEditor(row, capabilities);
@@ -1830,7 +1886,7 @@ namespace Amaterasu {
           el("div", "catalog-editor-layout", cover.figure, form),
         ),
       );
-      showCatalogArtwork(api, row.entry.artwork, cover.art, content, () => { cover.fallback.hidden = true; });
+      showCatalogArtwork(api, row.entry.artwork, cover.art, content, () => { cover.fallback.hidden = true; }, row.id);
       editor.scrollIntoView({ behavior: "smooth", block: "start" });
       fec.focus();
     }
@@ -1911,7 +1967,7 @@ namespace Amaterasu {
           cover ? el("div", "catalog-editor-layout", cover.figure, form) : form,
         ),
       );
-      if (cover && row) showCatalogArtwork(api, row.entry.artwork, cover.art, content, () => { cover.fallback.hidden = true; });
+      if (cover && row) showCatalogArtwork(api, row.entry.artwork, cover.art, content, () => { cover.fallback.hidden = true; }, row.id);
       editor.scrollIntoView({ behavior: "smooth", block: "start" });
       form.querySelector("input")?.focus();
     }
@@ -1923,7 +1979,7 @@ namespace Amaterasu {
     const art = el("div", "catalog-editor-artwork", fallback);
     const provider = row.entry.artwork?.provider;
     const description = provider === "steam" ? "Steam artwork" :
-      provider === "lutris" ? "Lutris artwork" : "No provider cover";
+      provider === "lutris" ? "Lutris artwork" : provider === "external" ? "Provider artwork" : "No provider cover";
     const figure = el("figure", "catalog-editor-cover", art,
       el("figcaption", "muted", description));
     return { figure, art, fallback };

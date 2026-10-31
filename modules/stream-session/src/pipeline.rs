@@ -72,7 +72,8 @@ impl Drive for Plane {
     }
 }
 
-type Factory<'a> = dyn FnMut(Handles) -> Result<Box<dyn Drive>, &'static str> + 'a;
+type Factory<'a> = dyn FnMut(Handles, &crate::providers::ProviderServices) -> Result<Box<dyn Drive>, &'static str>
+    + 'a;
 
 pub struct Pipeline {
     settings: Settings,
@@ -271,8 +272,9 @@ impl Pipeline {
         self.tick_with(
             now,
             &mut |command| runtime.send_ephemeral(command),
-            &mut |handles| {
-                Plane::new(runtime, handles).map(|plane| Box::new(plane) as Box<dyn Drive>)
+            &mut |handles, providers| {
+                Plane::new(runtime, handles, providers)
+                    .map(|plane| Box::new(plane) as Box<dyn Drive>)
             },
         )
     }

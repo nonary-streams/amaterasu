@@ -60,3 +60,54 @@ with the real broker and synthetic provider. The launch test uses fake catalog
 and session services and verifies lost-start recovery, detached monitoring and
 stop, and a missing broker grant. These tests do not establish signed-host
 installation, real application effects, or end-to-end gameplay.
+
+The catalog-backed facade also accepts this provider for artwork without a
+provider-specific dispatch branch. Configure the facade with:
+
+```json
+{
+  "artwork": {
+    "providers": {
+      "vendor": {
+        "service": "example.library.provider/1",
+        "allowed_initiators": ["consumer"]
+      }
+    }
+  }
+}
+```
+
+The catalog's authenticated importer must be selected for the same `vendor`
+provider alias. Its imported entry can carry this opaque reference:
+
+```json
+{
+  "provider": "external",
+  "source": "vendor",
+  "reference": { "id": "fixture-cover", "revision": "fixture-v1" }
+}
+```
+
+Provider alias and service selection come from trusted startup settings. Normal
+broker grants must cover the facade, catalog, state and selected provider for
+the initiating principal. The facade requests the SDK `describe` capability
+before the first artwork chunk, preserves reference/revision/MIME/total length,
+and refuses unknown or unauthorized routes. The provider controls its resource
+identity and returns the same shared SDK artwork contract as other providers.
+This route uses the existing bounded chunk protocol; bulk binary migration is
+separate from provider substitutability.
+
+The independently compiled provider/facade check is opt-in:
+
+```sh
+cargo build --offline -p amaterasu-library
+cargo build --offline --manifest-path crates/module-sdk/examples/application-library-provider/Cargo.toml
+AMATERASU_LIBRARY_PLUGIN="$PWD/target/debug/libamaterasu_library.so" \
+AMATERASU_PROVIDER_PLUGIN="$PWD/crates/module-sdk/examples/application-library-provider/target/debug/libexample_application_library_provider.so" \
+cargo test --offline --manifest-path crates/module-sdk/examples/application-library-provider/Cargo.toml \
+  third_party_artwork_flows -- --ignored
+```
+
+Set the library paths for the platform and configured Cargo target directory.
+The check exercises both accepted and explicitly unsupported artwork capability
+responses through the same facade binary and a real broker.

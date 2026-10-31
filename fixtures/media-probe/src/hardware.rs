@@ -240,7 +240,7 @@ impl HardwareVideoProbe {
             return self.begin_diagnostics(runtime, "hardware_video_timeout");
         }
         let stream = self.stream.expect("video stream exists while collecting");
-        let binding = unsafe { runtime.bind_native(VIDEO, 1, 0, size_of::<VideoApi>() as u32) }?;
+        let binding = unsafe { amaterasu_module_sdk::video::bind(runtime, VIDEO) }?;
         let api = unsafe { binding.table::<VideoApi>() }?;
         let sink = PacketSink {
             context: (&mut self.collected as *mut Collected).cast(),

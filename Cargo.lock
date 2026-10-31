@@ -26,7 +26,7 @@ checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
 dependencies = [
  "cfg-if",
  "cipher",
- "cpufeatures 0.2.17",
+ "cpufeatures",
  "zeroize",
 ]
 
@@ -266,6 +266,23 @@ dependencies = [
  "amaterasu-module-sdk",
  "amaterasu-network-policy",
  "getrandom 0.3.4",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "amaterasu-data-plane"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-abi",
+ "serde",
+]
+
+[[package]]
+name = "amaterasu-data-plane-fixture"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-module-sdk",
  "serde",
  "serde_json",
 ]
@@ -564,11 +581,10 @@ dependencies = [
  "amaterasu-media",
  "amaterasu-module-sdk",
  "amaterasu-network-policy",
+ "amaterasu-network-sockets",
  "getrandom 0.3.4",
- "libc",
  "serde",
  "serde_json",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -577,11 +593,34 @@ version = "0.1.0"
 dependencies = [
  "amaterasu-abi",
  "amaterasu-contracts",
+ "amaterasu-data-plane",
  "amaterasu-extension-api",
  "amaterasu-media",
+ "amaterasu-network-api",
+ "amaterasu-network-sockets",
  "base64 0.22.1",
+ "getrandom 0.3.4",
  "serde",
  "serde_json",
+ "ureq",
+]
+
+[[package]]
+name = "amaterasu-network"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-module-sdk",
+ "amaterasu-network-api",
+ "amaterasu-network-sockets",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "amaterasu-network-api"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-abi",
 ]
 
 [[package]]
@@ -591,6 +630,17 @@ dependencies = [
  "serde",
  "serde_json",
  "socket2",
+]
+
+[[package]]
+name = "amaterasu-network-sockets"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-abi",
+ "amaterasu-network-api",
+ "libc",
+ "socket2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -613,7 +663,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "socket2",
  "x509-cert",
 ]
 
@@ -695,6 +744,7 @@ dependencies = [
  "amaterasu-input-policy",
  "amaterasu-media",
  "amaterasu-module-sdk",
+ "amaterasu-network-sockets",
  "getrandom 0.3.4",
  "serde",
  "serde_json",
@@ -762,6 +812,7 @@ name = "amaterasu-steam"
 version = "0.1.0"
 dependencies = [
  "amaterasu-module-sdk",
+ "amaterasu-network-sockets",
  "image",
  "serde",
  "serde_json",
@@ -787,6 +838,7 @@ dependencies = [
  "amaterasu-input-policy",
  "amaterasu-media",
  "amaterasu-module-sdk",
+ "amaterasu-runtime",
  "getrandom 0.3.4",
  "serde",
  "serde_json",
@@ -829,10 +881,7 @@ dependencies = [
 name = "amaterasu-upnp"
 version = "0.1.0"
 dependencies = [
- "igd-next",
- "libc",
- "socket2",
- "windows-sys 0.61.2",
+ "amaterasu-module-sdk",
  "xmltree",
 ]
 
@@ -914,7 +963,7 @@ checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
 dependencies = [
  "base64ct",
  "blake2",
- "cpufeatures 0.2.17",
+ "cpufeatures",
  "password-hash",
 ]
 
@@ -961,18 +1010,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "attohttpc"
-version = "0.30.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16e2cdb6d5ed835199484bb92bb8b3edd526effe995c61732580439c1a67e2e9"
-dependencies = [
- "base64 0.22.1",
- "http",
- "log",
- "url",
 ]
 
 [[package]]
@@ -1171,17 +1208,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
-name = "chacha20"
-version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.3.1",
- "rand_core 0.10.1",
-]
-
-[[package]]
 name = "cipher"
 version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1242,15 +1268,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cpufeatures"
-version = "0.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "crc"
 version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1306,7 +1323,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97fb8b7c4503de7d6ae7b42ab72a5a59857b4c937ec27a3d4539dba95b5ab2be"
 dependencies = [
  "cfg-if",
- "cpufeatures 0.2.17",
+ "cpufeatures",
  "curve25519-dalek-derive",
  "digest",
  "fiat-crypto",
@@ -1605,7 +1622,6 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi 6.0.0",
- "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -1750,19 +1766,6 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
-]
-
-[[package]]
-name = "igd-next"
-version = "0.17.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de7238d487a9aff61f81b5ab41c0a841532a115a398b5fa92a2fadd0885e2581"
-dependencies = [
- "attohttpc",
- "log",
- "rand 0.10.3",
- "url",
- "xmltree",
 ]
 
 [[package]]
@@ -2297,17 +2300,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rand"
-version = "0.10.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
-dependencies = [
- "chacha20",
- "getrandom 0.4.3",
- "rand_core 0.10.1",
-]
-
-[[package]]
 name = "rand_chacha"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2344,12 +2336,6 @@ checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 dependencies = [
  "getrandom 0.3.4",
 ]
-
-[[package]]
-name = "rand_core"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rcgen"
@@ -2687,7 +2673,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a978451301f4db1d02937a4ab3ccce137717b81826e79b7d49ffe3244a13c3b8"
 dependencies = [
  "cfg-if",
- "cpufeatures 0.2.17",
+ "cpufeatures",
  "digest",
 ]
 
@@ -2698,7 +2684,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
- "cpufeatures 0.2.17",
+ "cpufeatures",
  "digest",
 ]
 

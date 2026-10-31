@@ -782,8 +782,14 @@ impl ManagedModule for SteamModule {
             return Err("Steam settings unavailable".into());
         };
         let settings: StartupSettings =
-            serde_json::from_value(payload).map_err(|error| error.to_string())?;
+            serde_json::from_value(payload.clone()).map_err(|error| error.to_string())?;
         settings.validate().map_err(str::to_owned)?;
+        let network = amaterasu_module_sdk::network::Network::from_settings(&runtime, &payload)?;
+        if !network.supports(
+            amaterasu_module_sdk::network::abi::TCP | amaterasu_module_sdk::network::abi::DNS,
+        ) {
+            return Err("Steam artwork requires network TCP and DNS capabilities".into());
+        }
         let configuration = ProductConfiguration::new();
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
@@ -792,6 +798,7 @@ impl ManagedModule for SteamModule {
             runtime,
             provider: {
                 let mut provider = Provider::new(settings.roots);
+                provider.remote_artwork.set_network(network);
                 provider
                     .remote_artwork
                     .set_cache_root(settings.steam_artwork_cache_root);

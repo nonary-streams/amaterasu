@@ -59,8 +59,7 @@ impl CustomVideoProbe {
         if matches!(self.stage, Stage::Collecting) {
             // SAFETY: the binding is retained for this call, and the sink borrows
             // the live packet buffer only until the synchronous callback returns.
-            let binding =
-                unsafe { runtime.bind_native(VIDEO, 1, 0, size_of::<VideoApi>() as u32) }?;
+            let binding = unsafe { amaterasu_module_sdk::video::bind(runtime, VIDEO) }?;
             let api = unsafe { binding.table::<VideoApi>() }?;
             let sink = PacketSink {
                 context: (&mut self.packets as *mut Packets).cast(),

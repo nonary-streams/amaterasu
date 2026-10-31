@@ -96,9 +96,22 @@ pub struct RawPreparationCommand {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "provider", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ArtworkReference {
-    Steam { app_id: u32, revision: String },
-    Lutris { game_id: i64, revision: String },
-    Playnite { game_id: String, revision: String },
+    Steam {
+        app_id: u32,
+        revision: String,
+    },
+    Lutris {
+        game_id: i64,
+        revision: String,
+    },
+    Playnite {
+        game_id: String,
+        revision: String,
+    },
+    External {
+        source: String,
+        reference: amaterasu_module_sdk::application_library::provider::ArtworkReference,
+    },
 }
 
 impl ArtworkReference {
@@ -134,6 +147,15 @@ impl ArtworkReference {
                         .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
                 {
                     return Err("invalid Lutris artwork reference");
+                }
+            }
+            Self::External { source, reference } => {
+                if !amaterasu_module_sdk::application_library::artwork::valid_source(source)
+                    || !amaterasu_module_sdk::application_library::artwork::valid_reference(
+                        reference,
+                    )
+                {
+                    return Err("invalid external artwork reference");
                 }
             }
         }

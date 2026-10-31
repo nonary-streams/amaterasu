@@ -6,8 +6,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ureq::Agent;
@@ -329,6 +331,7 @@ pub struct RemoteArtworkWorker {
     stopped: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     cache_root: Option<PathBuf>,
+    agent: Option<Agent>,
 }
 
 /// Stable opaque revision for the fixed Steam CDN portrait URL. Including the
@@ -760,6 +763,10 @@ fn is_link_or_reparse(metadata: &fs::Metadata) -> bool {
 }
 
 impl RemoteArtworkWorker {
+    pub fn set_network(&mut self, network: amaterasu_module_sdk::network::Network) {
+        self.agent = Some(remote_agent(network));
+    }
+
     pub fn set_cache_root(&mut self, root: Option<PathBuf>) {
         self.cache_root = root;
     }
@@ -783,7 +790,11 @@ impl RemoteArtworkWorker {
     }
 
     fn start_if_needed(&mut self) -> Result<(), &'static str> {
-        self.start_with_fetcher(fetch_remote)
+        if self.requests.is_some() {
+            return Ok(());
+        }
+        let agent = self.agent.clone().ok_or("artwork_network_unavailable")?;
+        self.start_with_fetcher(move |app_id| fetch_remote(&agent, app_id))
     }
 
     pub(crate) fn start_with_fetcher(
@@ -1031,9 +1042,9 @@ fn jpeg_dimensions_from_prefix(bytes: &[u8]) -> Option<(u32, u32)> {
     None
 }
 
-fn fetch_remote(app_id: u32) -> Result<Vec<u8>, &'static str> {
+fn fetch_remote(agent: &Agent, app_id: u32) -> Result<Vec<u8>, &'static str> {
     let url = remote_portrait_url(app_id).ok_or("artwork_unavailable")?;
-    let response = remote_agent()
+    let response = agent
         .get(&url)
         .header("accept", "image/jpeg")
         .header("accept-encoding", "identity")
@@ -1074,23 +1085,20 @@ fn fetch_remote(app_id: u32) -> Result<Vec<u8>, &'static str> {
     Ok(body)
 }
 
-fn remote_agent() -> &'static Agent {
-    static AGENT: OnceLock<Agent> = OnceLock::new();
-    AGENT.get_or_init(|| {
-        let config = Agent::config_builder()
-            .https_only(true)
-            .max_redirects(0)
-            .timeout_global(Some(REMOTE_FETCH_TIMEOUT))
-            .max_response_header_size(8 * 1024)
-            .input_buffer_size(8 * 1024)
-            .tls_config(
-                TlsConfig::builder()
-                    .root_certs(RootCerts::PlatformVerifier)
-                    .build(),
-            )
-            .build();
-        Agent::new_with_config(config)
-    })
+fn remote_agent(network: amaterasu_module_sdk::network::Network) -> Agent {
+    let config = Agent::config_builder()
+        .https_only(true)
+        .max_redirects(0)
+        .timeout_global(Some(REMOTE_FETCH_TIMEOUT))
+        .max_response_header_size(8 * 1024)
+        .input_buffer_size(8 * 1024)
+        .tls_config(
+            TlsConfig::builder()
+                .root_certs(RootCerts::PlatformVerifier)
+                .build(),
+        )
+        .build();
+    amaterasu_module_sdk::network_http::agent(config, network)
 }
 
 /// Finds an existing local portrait first, then a header or icon. It reads only

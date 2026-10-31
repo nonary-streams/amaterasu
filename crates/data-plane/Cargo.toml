@@ -1,0 +1,12 @@
+[package]
+name = "amaterasu-data-plane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+amaterasu-abi.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

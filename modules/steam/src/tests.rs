@@ -843,6 +843,8 @@ fn product_settings_expose_bounded_tool_and_recent_game_policy() {
 
 #[derive(Default)]
 struct FakeHost {
+    network_bindings: BTreeMap<u64, usize>,
+    deny_network: bool,
     next_child: u64,
     startup_settings: Option<Value>,
     product_get_results: VecDeque<Response>,
@@ -884,6 +886,75 @@ impl FakeHost {
                     .unwrap_or_else(|| json!({"roots":[]})),
             },
             Command::Register { .. } => Response::Ok,
+            Command::NativeBindTyped {
+                service,
+                interface_major,
+                min_minor,
+                min_size,
+                contract,
+            } => {
+                if contract != "amaterasu.network-interface/1" {
+                    return Response::error("unsupported_contract", "unknown network contract");
+                }
+                self.dispatch(Command::NativeBind {
+                    service,
+                    interface_major,
+                    min_minor,
+                    min_size,
+                })
+            }
+            Command::NativeBind {
+                service,
+                interface_major,
+                min_minor,
+                min_size,
+            } => {
+                if self.deny_network || service != "amaterasu.network/1" {
+                    return Response::error(
+                        "permission_denied",
+                        "test network provider unavailable",
+                    );
+                }
+                let factory = amaterasu_network_sockets::Factory::new();
+                let query = amaterasu_module_sdk::abi::NativeInterfaceQuery {
+                    header: AbiHeader::of::<amaterasu_module_sdk::abi::NativeInterfaceQuery>(),
+                    interface_major,
+                    min_minor,
+                    min_size,
+                };
+                let mut output = std::ptr::null();
+                // SAFETY: explicitly injected test provider owns each returned
+                // binding until the fake runtime's NativeRelease handler.
+                let status = unsafe {
+                    (factory.api.bind.unwrap())(
+                        factory.api.context,
+                        BorrowedBytes::new(b"amaterasu.steam"),
+                        &query,
+                        &mut output,
+                    )
+                };
+                if status != STATUS_OK {
+                    return Response::error("provider_rejected", "test network binding rejected");
+                }
+                let binding = self.network_bindings.len() as u64 + 1;
+                self.network_bindings.insert(binding, output as usize);
+                Response::NativeBound {
+                    binding,
+                    address: output as usize,
+                }
+            }
+            Command::NativeRelease { binding } => {
+                let Some(address) = self.network_bindings.remove(&binding) else {
+                    return Response::error("not_found", "test network binding released");
+                };
+                // SAFETY: each factory output is live and uniquely owned until
+                // this release, after the module joined its artwork worker.
+                unsafe {
+                    let base = *(address as *const amaterasu_module_sdk::abi::NativeInterface);
+                    (base.release.unwrap())(base.context);
+                }
+                Response::Ok
+            }
             Command::Request {
                 service, payload, ..
             } => {
@@ -1966,4 +2037,21 @@ fn a_settings_change_stops_before_the_next_catalog_snapshot_step() {
 
     assert_eq!(host.catalog_requests.len(), 1);
     assert_eq!(module.catalog_sync.status()["syncing"], false);
+}
+
+#[test]
+fn steam_startup_rejects_a_missing_network_provider_instead_of_falling_back() {
+    let mut host = Box::new(FakeHost {
+        deny_network: true,
+        ..Default::default()
+    });
+    let endpoint = HostApi {
+        header: AbiHeader::of::<HostApi>(),
+        context: (&mut *host as *mut FakeHost).cast(),
+        invoke: invoke_fake_host,
+    };
+    // SAFETY: boxed host remains alive until the failed start returns.
+    let result = SteamModule::start(unsafe { RuntimeClient::from_endpoint(endpoint) });
+    assert!(result.is_err());
+    assert!(host.network_bindings.is_empty());
 }

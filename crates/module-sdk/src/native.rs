@@ -65,6 +65,50 @@ impl RuntimeClient {
         }
     }
 
+    /// Registers an interface-family identity independently of the service alias.
+    ///
+    /// # Safety
+    /// The factory must implement the exact contract's C layout, concurrency,
+    /// ownership and callbacks. All register_native lifetime rules also apply.
+    pub unsafe fn register_native_typed(
+        &self,
+        service: &str,
+        contract: &str,
+        factory: &abi::NativeServiceFactory,
+    ) -> ModuleResult<()> {
+        match self.send_native(Command::NativeRegisterTyped {
+            service: service.into(),
+            factory: factory as *const _ as usize,
+            contract: contract.into(),
+        })? {
+            Response::Ok => Ok(()),
+            response => Err(format!("typed native registration failed: {response:?}")),
+        }
+    }
+
+    /// Binds only a factory registered for this exact interface family. The
+    /// runtime rejects mismatches before calling the provider's factory.
+    ///
+    /// # Safety
+    /// All bind_native lifetime and native contract requirements apply. Contract
+    /// names identify trusted provider promises; they do not sandbox native code.
+    pub unsafe fn bind_native_typed(
+        &self,
+        service: &str,
+        contract: &str,
+        interface_major: u32,
+        min_minor: u32,
+        min_size: u32,
+    ) -> ModuleResult<NativeBinding> {
+        self.bind_native_command(Command::NativeBindTyped {
+            service: service.into(),
+            contract: contract.into(),
+            interface_major,
+            min_minor,
+            min_size,
+        })
+    }
+
     /// # Safety
     /// Runtime and provider DLL must outlive the returned binding and every callback.
     /// Consumer code must obey the product interface's C layout, ownership and thread
@@ -77,12 +121,16 @@ impl RuntimeClient {
         min_minor: u32,
         min_size: u32,
     ) -> ModuleResult<NativeBinding> {
-        match self.send_native(Command::NativeBind {
+        self.bind_native_command(Command::NativeBind {
             service: service.into(),
             interface_major,
             min_minor,
             min_size,
-        })? {
+        })
+    }
+
+    fn bind_native_command(&self, command: Command) -> ModuleResult<NativeBinding> {
+        match self.send_native(command)? {
             Response::NativeBound { binding, address } => {
                 if address == 0 || !address.is_multiple_of(align_of::<abi::NativeInterface>()) {
                     let _ = self.send_native(Command::NativeRelease { binding });

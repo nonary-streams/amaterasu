@@ -1,6 +1,4 @@
 use super::{PlaneResult, *};
-const MAX_ACCESS_UNIT: usize = 8 * 1024 * 1024;
-const MAX_FRAGMENTS: usize = 1024;
 
 pub(super) struct VideoPacket {
     metadata: EncodedPacket,
@@ -12,7 +10,7 @@ impl VideoPacket {
     /// The provider keeps its header and initialized bytes live through this copy.
     pub(super) unsafe fn copy(packet: &EncodedPacket) -> PlaneResult<Self> {
         let bytes = unsafe { packet.bytes() }.map_err(|_| "invalid_video_packet")?;
-        if bytes.len() > MAX_ACCESS_UNIT {
+        if bytes.len() > MAX_VIDEO_ACCESS_UNIT_BYTES {
             return Err("video_access_unit_limit");
         }
         let mut metadata = *packet;
@@ -62,8 +60,9 @@ impl VideoAssembly {
             {
                 return Err("video_access_unit_incomplete");
             }
-            if self.fragments >= MAX_FRAGMENTS
-                || current.bytes.len().saturating_add(packet.bytes.len()) > MAX_ACCESS_UNIT
+            if self.fragments >= MAX_VIDEO_ACCESS_UNIT_FRAGMENTS
+                || current.bytes.len().saturating_add(packet.bytes.len())
+                    > MAX_VIDEO_ACCESS_UNIT_BYTES
             {
                 return Err("video_access_unit_limit");
             }

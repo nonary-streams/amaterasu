@@ -8,6 +8,17 @@ WASAPI loopback. Linux uses monitor sources from the user's existing
 PulseAudio-compatible server, including PipeWire's Pulse server. Other operating
 systems return an empty endpoint list and `unsupported_platform` on open.
 
+The native service registers the `amaterasu.audio-capture.native/1` interface
+family through `amaterasu_module_sdk::audio::register_capture`. Alternative
+providers use the same SDK adapter and PCM contract. Consumers bind with
+`bind_capture`, which requires the runtime to verify that family before exposing
+the table. Trusted startup composition and signed grants still choose and
+authorize the service; native providers are trusted code. C providers use
+`AMATERASU_AUDIO_CAPTURE_CONTRACT` from `amaterasu_media.h` with the runtime's
+`native_register_typed` operation; C consumers use the same identity with
+`native_bind_typed`. A provider registered only with the legacy untyped operation
+cannot serve the typed stream consumer.
+
 Strict JSON controls:
 
 ```json

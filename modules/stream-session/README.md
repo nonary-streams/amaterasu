@@ -9,6 +9,58 @@ libraries are trusted code; broker grants do not sandbox their machine code.
 The caller must already have authorized the peer and supply fresh session keys.
 This library does not implement pairing, NVHTTP launch or a network RTSP server.
 
+## Provider contracts
+
+Trusted startup settings select the control/native service for each role:
+
+```json
+{
+  "providers": {
+    "session": "amaterasu.session/1",
+    "video": "amaterasu.video/1",
+    "audio_capture": "amaterasu.audio/1",
+    "audio_encoder": "amaterasu.audio-encode/1",
+    "media_transport": "vendor.media-delivery/1",
+    "control_transport": "vendor.control/1"
+  }
+}
+```
+
+Omitted roles retain their default service contracts. Each selected service must
+be a distinct bounded version-1 name. The signed composition must include its
+initialization dependency, control-call grant and, except for the session role,
+native-use grant. Parented calls also intersect the initiating caller's grants;
+that caller needs the selected control contracts in its approved composition.
+The role map grants no authority on its own. A replacement implements the same
+control semantics and exact native interface version; a service selector is not
+permission to reinterpret a different table. Missing providers, denied grants and incompatible tables fail
+the operation explicitly. Requests cannot supply or override this role map.
+
+For a custom native service, `open` includes `required_native_contract` containing
+the role's canonical contract ID (for example `amaterasu.media-transport/1`).
+The successful response must return the same ID as `native_contract` before
+native binding is attempted. An absent or different acknowledgment triggers
+owned cleanup, including any handle already allocated. Native table size and
+major checks cannot prove callback types: acknowledgment and exact implementation
+of the declared ABI remain trusted provider requirements. Default canonical
+services preserve their existing open request/reply shape.
+
+Every prepared record pins the selected services. Open, status, native binding,
+drain, close and uncertain-operation lookup all use that same selection. The
+cleanup journal preserves it across restart; changing startup selection does
+not redirect cleanup to a different implementation. Keep the old service and
+its cleanup authority available until its journaled work is reconciled. Old
+journal entries without this field retain the original built-in service names.
+
+These role contracts still describe the existing streaming profile. Its shared
+video codec enum, packet assembly bounds, media packet validation and wire
+configuration do not negotiate arbitrary codecs or opaque framing metadata.
+A new format needs a separate negotiated interface and end-to-end consumer
+route, rather than a new name for incompatible legacy bytes. Constant-rate
+capture likewise remains WGC-specific because the current start contract has no
+provider-neutral timing/pacing capability handshake. Capture table version alone
+does not prove that behavior.
+
 ## Lifecycle
 
 1. `prepare` allocates a session record, a stereo Opus encoder, media UDP sockets

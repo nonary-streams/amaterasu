@@ -233,7 +233,7 @@ fn receive(
     reject_eos: bool,
 ) -> ModuleResult<abi::Status> {
     // SAFETY: binding owns the interface for this synchronous call; callback borrows packets only during receive.
-    let binding = unsafe { runtime.bind_native(VIDEO, 1, 0, size_of::<VideoApi>() as u32) }?;
+    let binding = unsafe { amaterasu_module_sdk::video::bind(runtime, VIDEO) }?;
     let api = unsafe { binding.table::<VideoApi>() }?;
     let mut state = Sink {
         packets,

@@ -23,7 +23,7 @@ use journal::Journal;
 use manager::Manager;
 use model::{Operation, Settings, failure};
 
-const SERVICE: &str = "amaterasu.virtual-display/1";
+use amaterasu_module_sdk::virtual_display::SERVICE;
 
 struct VirtualDisplayModule {
     runtime: RuntimeClient,

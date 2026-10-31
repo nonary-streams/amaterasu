@@ -1,0 +1,21 @@
+[package]
+name = "amaterasu-network-sockets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+[dependencies]
+amaterasu-abi.workspace = true
+amaterasu-network-api.workspace = true
+socket2 = {version="0.6",features=["all"]}
+[target.'cfg(unix)'.dependencies]
+libc="0.2"
+[lints]
+workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+] }

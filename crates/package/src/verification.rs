@@ -217,6 +217,7 @@ fn resolve_runtime_grants(
 ) -> RuntimeConfig {
     let mut runtime = RuntimeConfig {
         principals: BTreeMap::new(),
+        legacy_native_contracts: BTreeMap::new(),
         api_methods: Vec::new(),
         hooks: bootstrap.policy.hooks.clone(),
         settings: BTreeMap::new(),
@@ -250,6 +251,20 @@ fn resolve_runtime_grants(
             .principals
             .insert("amaterasu.console".into(), console.clone());
     }
+    runtime.legacy_native_contracts = bootstrap
+        .policy
+        .legacy_native_contracts
+        .iter()
+        .filter_map(|(principal, services)| {
+            let grants = runtime.principals.get(principal)?;
+            let approved: BTreeMap<_, _> = services
+                .iter()
+                .filter(|(service, _)| grants.native_provide.contains(*service))
+                .map(|(service, contract)| (service.clone(), contract.clone()))
+                .collect();
+            (!approved.is_empty()).then(|| (principal.clone(), approved))
+        })
+        .collect();
     runtime.api_methods = bootstrap
         .policy
         .api_methods
@@ -297,6 +312,57 @@ mod tests {
             !runtime
                 .principals
                 .contains_key(HOST_LIFECYCLE_CONTROL_PRINCIPAL)
+        );
+    }
+    #[test]
+    fn legacy_contracts_follow_effective_provider_grants() {
+        use crate::ComponentManifest;
+        use amaterasu_contracts::Grants;
+        let service = "example.capture/1";
+        let principal = "example.capture";
+        let mut bootstrap = BootstrapConfig {
+            development: false,
+            allow_unsigned: false,
+            trusted_keys: BTreeMap::new(),
+            policy: RuntimeConfig::default(),
+        };
+        bootstrap.policy.principals.insert(
+            principal.into(),
+            Grants {
+                native_provide: [service.into()].into(),
+                ..Default::default()
+            },
+        );
+        bootstrap.policy.legacy_native_contracts.insert(
+            principal.into(),
+            [(service.into(), "example.capture.native/1".into())].into(),
+        );
+        assert!(
+            resolve_runtime_grants(&bootstrap, &[])
+                .legacy_native_contracts
+                .is_empty()
+        );
+        let mut component = ComponentManifest {
+            id: principal.into(),
+            version: "1".into(),
+            file: "x".into(),
+            sha256: "x".into(),
+            size: 0,
+            abi_major: 1,
+            runtime: false,
+            requires: BTreeMap::new(),
+            requested: Grants::default(),
+        };
+        assert!(
+            resolve_runtime_grants(&bootstrap, &[component.clone()])
+                .legacy_native_contracts
+                .is_empty()
+        );
+        component.requested.native_provide.insert(service.into());
+        let resolved = resolve_runtime_grants(&bootstrap, &[component]);
+        assert_eq!(
+            resolved.legacy_native_contracts[principal][service],
+            "example.capture.native/1"
         );
     }
 }

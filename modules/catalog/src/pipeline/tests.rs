@@ -7561,3 +7561,64 @@ fn real_state_generic_staging_rejects_artwork_spoof_and_preserves_concurrent_edi
     drop(store);
     std::fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn external_artwork_is_owned_by_its_selected_importer_and_preserves_opaque_identity() {
+    let entry = |source: &str| {
+        serde_json::from_value::<Entry>(json!({
+        "name":"Vendor game",
+        "launch":{"kind":"provider","provider":"vendor","application_id":"game/opaque:7"},
+        "artwork":{"provider":"external","source":source,"reference":{"id":"cover/opaque:?7","revision":"revision:17"}}
+    })).unwrap()
+    };
+    let valid = entry("vendor");
+    assert!(
+        validate_provider_entry(
+            "vendor.importer",
+            Some("vendor"),
+            "game/opaque:7",
+            &valid,
+            false
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        serde_json::to_value(&valid).unwrap()["artwork"]["reference"]["id"],
+        "cover/opaque:?7"
+    );
+    for (source, selected) in [
+        ("vendor", None),
+        ("other", Some("vendor")),
+        ("vendor", Some("other")),
+    ] {
+        assert_eq!(
+            validate_provider_entry(
+                "vendor.importer",
+                selected,
+                "game/opaque:7",
+                &entry(source),
+                false
+            )
+            .unwrap_err()["error"]["code"],
+            "provider_artwork_required"
+        );
+    }
+    assert_eq!(
+        validate_provider_entry(
+            "vendor.importer",
+            Some("vendor"),
+            "different",
+            &valid,
+            false
+        )
+        .unwrap_err()["error"]["code"],
+        "provider_artwork_required"
+    );
+    let invalid = json!({"provider":"external","source":"vendor/service","reference":{"id":"cover","revision":"1"}});
+    let parsed = serde_json::from_value::<ArtworkReference>(invalid).unwrap();
+    let mut document = Document::default();
+    let mut bad = valid.clone();
+    bad.artwork = Some(parsed);
+    document.entries.insert("app-0000000000000001".into(), bad);
+    assert!(document.validate().is_err());
+}

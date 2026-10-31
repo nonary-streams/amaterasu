@@ -566,6 +566,11 @@ impl Broker {
         }
         if service == "amaterasu.virtual-display/1" {
             if call.payload["reference_id"].is_string() {
+                // This replacement provider accepts the same SDK contract as the
+                // independently built native provider before handling a request.
+                let _: amaterasu_module_sdk::virtual_display::Operation =
+                    serde_json::from_value(call.payload.clone())
+                        .expect("replacement provider received an invalid request");
                 return self.virtual_display(action, &call.payload);
             }
             let identity = call.payload["identity"].as_str().unwrap().to_owned();
@@ -1368,7 +1373,7 @@ impl Harness {
             .tick_with(
                 self.now,
                 &mut |command| self.broker.send(command),
-                &mut |_| Ok(Box::new(FakePlane(state.clone()))),
+                &mut |_, _| Ok(Box::new(FakePlane(state.clone()))),
             )
             .unwrap();
     }

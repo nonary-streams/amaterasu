@@ -2076,3 +2076,29 @@ fn completed_hook_result_survives_a_poll_after_the_deadline() {
         matches!(&*outcomes[0].result, Response::Result { payload } if payload == &json!({"released":true}))
     );
 }
+
+#[test]
+fn legacy_native_contract_approval_requires_valid_names_and_provider_grant() {
+    let mut config = RuntimeConfig::default();
+    config.principals.insert(
+        "provider".into(),
+        Grants {
+            native_provide: ["capture/1".into()].into(),
+            ..Default::default()
+        },
+    );
+    let approvals = |principal: &str, service: &str, contract: &str| {
+        [(principal.into(), [(service.into(), contract.into())].into())].into()
+    };
+    config.legacy_native_contracts = approvals("provider", "capture/1", "capture.native/1");
+    assert!(Broker::new(config.clone()).is_ok());
+    for (principal, service, contract) in [
+        ("unknown", "capture/1", "capture.native/1"),
+        ("provider", "other/1", "capture.native/1"),
+        ("provider", "capture/1", "INVALID"),
+        ("provider", "invalid service", "capture.native/1"),
+    ] {
+        config.legacy_native_contracts = approvals(principal, service, contract);
+        assert!(Broker::new(config.clone()).is_err());
+    }
+}

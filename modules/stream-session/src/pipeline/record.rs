@@ -62,12 +62,25 @@ impl Resource {
         }
     }
 
+    #[cfg(test)]
     pub fn service(self) -> String {
         format!("amaterasu.{}/1", self.name())
+    }
+
+    fn native_contract(self) -> Option<&'static str> {
+        match self {
+            Self::Session => None,
+            Self::Video => Some("amaterasu.video/1"),
+            Self::AudioCapture => Some("amaterasu.audio/1"),
+            Self::AudioEncoder => Some("amaterasu.audio-encode/1"),
+            Self::Media => Some("amaterasu.media-transport/1"),
+            Self::Control => Some("amaterasu.control-transport/1"),
+        }
     }
 }
 
 pub(super) struct Record {
+    pub providers: crate::providers::ProviderServices,
     pub id: u64,
     pub history: super::history::SessionHistory,
     pub host_metrics: super::host_metrics_activity::HostMetricsActivity,
@@ -169,9 +182,41 @@ pub(super) struct Record {
 }
 
 impl Record {
+    pub fn required_native_contract(&self, resource: Resource) -> Option<&'static str> {
+        resource
+            .native_contract()
+            .filter(|contract| self.service(resource) != *contract)
+    }
+
+    pub fn validate_native_contract(
+        &self,
+        resource: Resource,
+        payload: &Value,
+    ) -> Result<(), &'static str> {
+        if let Some(contract) = self.required_native_contract(resource)
+            && payload["native_contract"].as_str() != Some(contract)
+        {
+            return Err("native_contract_unconfirmed");
+        }
+        Ok(())
+    }
+
+    pub fn service(&self, resource: Resource) -> String {
+        match resource {
+            Resource::Session => &self.providers.session,
+            Resource::Video => &self.providers.video,
+            Resource::AudioCapture => &self.providers.audio_capture,
+            Resource::AudioEncoder => &self.providers.audio_encoder,
+            Resource::Media => &self.providers.media_transport,
+            Resource::Control => &self.providers.control_transport,
+        }
+        .clone()
+    }
+
     pub fn new(id: u64, owner: String, config: PrepareConfig, input_ttl_ms: u64) -> Self {
         let virtual_display_state = "not_requested".to_owned();
         Self {
+            providers: Default::default(),
             id,
             history: super::history::SessionHistory::new(id, config.history_activity_id.clone()),
             host_metrics: super::host_metrics_activity::HostMetricsActivity::new(id),
@@ -515,6 +560,9 @@ impl Record {
             }
         };
         payload["operation_id"] = json!(self.operation(resource));
+        if let Some(contract) = self.required_native_contract(resource) {
+            payload["required_native_contract"] = json!(contract);
+        }
         payload
     }
 }

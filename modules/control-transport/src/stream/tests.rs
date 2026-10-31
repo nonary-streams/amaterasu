@@ -1,5 +1,6 @@
 use super::*;
 use std::ffi::c_void;
+use std::net::UdpSocket;
 
 fn stream() -> Stream {
     let request = Open {
@@ -108,7 +109,7 @@ fn oversized_or_unauthenticated_udp_does_not_extend_the_admission_deadline() {
     receiver
         .set_read_timeout(Some(std::time::Duration::from_secs(1)))
         .unwrap();
-    receiver.peek_from(&mut [0; 8000]).unwrap();
+    receiver.peek(&mut [0; 8000]).unwrap();
     receiver.set_nonblocking(true).unwrap();
     stream.tick(9999);
     assert_eq!(stream.failure, None);

@@ -64,7 +64,7 @@ unsafe extern "C" fn invoke(context: *mut c_void, input: BorrowedBytes, sink: Re
             runtime.registrations.push(service);
             Response::Ok
         }
-        Command::NativeRegister { service, .. } => {
+        Command::NativeRegisterTyped { service, .. } => {
             runtime.native_registrations.push(service);
             Response::Ok
         }

@@ -148,6 +148,11 @@ stops through the real broker and Launch module. This proves a library module
 boundary, not signed installation, actual game effects, Moonlight compatibility,
 hardware behavior or independent packaging of every subsystem.
 
+The [binary transfer API](binary-transfer-api.md) supplies the optional native
+bulk-data foundation for artwork. Its independent fixture is qualified; the
+Steam/Lutris, facade, HTTP and Moonlight consumers still need migration with the
+same provider/revision/authority checks. The legacy chunk contract remains active.
+
 Remaining ecosystem work stays tracked: generic artwork, revision-checked edits
 and source/user ownership, authenticated user/device/seat policy, optional source
 management and asynchronous actions, and durable execution recovery. This first

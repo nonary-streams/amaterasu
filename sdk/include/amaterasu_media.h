@@ -17,6 +17,21 @@ extern "C" {
 #define AMATERASU_MEDIA_CLOSED 12
 #define AMATERASU_MEDIA_UNSUPPORTED 13
 #define AMATERASU_MEDIA_BACKEND_ERROR 14
+/* Typed native interface-family identities, distinct from service aliases.
+ * Providers register their factory using native_register_typed with the matching
+ * contract. Consumers use native_bind_typed with that identity before calling
+ * the corresponding table; a matching size and version alone are insufficient.
+ * The signed composition must grant the selected service and order its provider
+ * before consumers. Native providers remain trusted code. */
+/* Interface family identities for typed native registration and binding. */
+#define AMATERASU_VIDEO_CAPTURE_CONTRACT "amaterasu.video-capture.native/1"
+#define AMATERASU_VIDEO_ENCODER_CONTRACT "amaterasu.video-encoder.native/1"
+#define AMATERASU_ENCODER_PROVIDER_CONTRACT "amaterasu.encoder-provider.native/1"
+#define AMATERASU_FRAME_RESOURCE_CONSUMER_CONTRACT "amaterasu.frame-resource-consumer.native/1"
+#define AMATERASU_CPU_FRAME_PROCESSOR_CONTRACT "amaterasu.cpu-frame-processor.native/1"
+#define AMATERASU_GPU_FRAME_PROCESSOR_CONTRACT "amaterasu.gpu-frame-processor.native/1"
+#define AMATERASU_AUDIO_CAPTURE_CONTRACT "amaterasu.audio-capture.native/1"
+#define AMATERASU_AUDIO_ENCODER_CONTRACT "amaterasu.audio-encoder.native/1"
 #define AMATERASU_PCM_F32 1
 #define AMATERASU_PCM_I16 2
 #define AMATERASU_AUDIO_DISCONTINUITY 1
@@ -522,6 +537,14 @@ typedef struct {
     /* OK initializes geometry; UNSUPPORTED means unavailable. */
     AmaterasuStatus (*geometry)(void *context, uint64_t stream, AmaterasuCaptureGeometry *geometry);
 } AmaterasuVideoApiV1_1;
+
+/* Register and bind each transport using its exact typed native family.
+ * Untyped factories and other families are rejected for every service alias. */
+#define AMATERASU_MEDIA_TRANSPORT_CONTRACT "amaterasu.media-transport.native/1"
+#define AMATERASU_CONTROL_TRANSPORT_CONTRACT "amaterasu.control-transport.native/1"
+
+/* Video providers register and consumers bind this typed family for every alias. */
+#define AMATERASU_VIDEO_CONTRACT "amaterasu.video.native/1"
 
 /* The trusted control caller must authorize the peer and negotiate the profile.
  * The provider enforces ownership; it does not authenticate peers. Submit one

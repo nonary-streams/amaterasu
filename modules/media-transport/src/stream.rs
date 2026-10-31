@@ -8,7 +8,10 @@ use amaterasu_gamestream::{
     video::{VideoCodec as WireVideoCodec, VideoConfig, VideoPacketizer},
 };
 use amaterasu_media::*;
-use amaterasu_module_sdk::abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
+use amaterasu_module_sdk::{
+    abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status},
+    network::Network,
+};
 use std::{
     net::{IpAddr, SocketAddr},
     time::Duration,
@@ -50,7 +53,16 @@ struct PendingVideo {
 }
 
 impl Stream {
+    #[cfg(test)]
     pub fn open(owner: &str, request: &Open) -> TransportResult<Self> {
+        Self::open_with_network(&Network::test_provider(), owner, request)
+    }
+
+    pub fn open_with_network(
+        network: &Network,
+        owner: &str,
+        request: &Open,
+    ) -> TransportResult<Self> {
         if let Some(format) = request.video_stream_format {
             validate_video_stream_format(format)?;
         }
@@ -59,7 +71,8 @@ impl Stream {
         let (video, audio) = packetizers(request)?;
         let (video_sealer, audio_sealer) = ciphers(request)?;
         let mut delivery = match (&request.discovery, request.video_port, request.audio_port) {
-            (Some(discovery), None, None) => Delivery::discover(
+            (Some(discovery), None, None) => Delivery::discover_with_network(
+                network,
                 request.local(true),
                 request.local(false),
                 request.peer_ip,
@@ -67,7 +80,8 @@ impl Stream {
                 Duration::from_millis(ping_timeout_ms),
             ),
             (None, Some(video_port), Some(audio_port)) if video_port != 0 && audio_port != 0 => {
-                Delivery::bind(
+                Delivery::bind_with_network(
+                    network,
                     request.local(true),
                     request.local(false),
                     SocketAddr::new(request.peer_ip, video_port),

@@ -1,5 +1,8 @@
 //! Validated artwork references and bounded provider chunks.
 use super::error;
+use amaterasu_module_sdk::application_library::{
+    artwork::ArtworkRoutes, provider::ArtworkReference,
+};
 use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -10,9 +13,22 @@ const MAX_ARTWORK: u64 = 16 * 1024 * 1024;
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(tag = "provider", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Artwork {
-    Steam { app_id: u32, revision: String },
-    Lutris { game_id: i64, revision: String },
-    Playnite { game_id: String, revision: String },
+    Steam {
+        app_id: u32,
+        revision: String,
+    },
+    Lutris {
+        game_id: i64,
+        revision: String,
+    },
+    Playnite {
+        game_id: String,
+        revision: String,
+    },
+    External {
+        source: String,
+        reference: ArtworkReference,
+    },
 }
 impl Artwork {
     pub(super) fn revision(&self) -> &str {
@@ -20,6 +36,7 @@ impl Artwork {
             Self::Steam { revision, .. }
             | Self::Lutris { revision, .. }
             | Self::Playnite { revision, .. } => revision,
+            Self::External { reference, .. } => &reference.revision,
         }
     }
     pub(super) fn request(
@@ -58,11 +75,34 @@ impl Artwork {
             _ => None,
         }
     }
+    /// Route external providers through the same SDK contract used by their
+    /// independently built adapters. Payload references never select services.
+    pub(super) fn route(
+        &self,
+        routes: &ArtworkRoutes,
+        initiator: &str,
+        expected: Option<&str>,
+        offset: u64,
+        transfer_id: &str,
+    ) -> Option<(String, Value)> {
+        if expected.is_some_and(|revision| revision != self.revision()) {
+            return None;
+        }
+        match self {
+            Self::External { source, reference } => {
+                routes.route(source, reference, initiator, offset).ok()
+            }
+            _ => self
+                .request(expected, offset, transfer_id)
+                .map(|(service, payload)| (service.to_owned(), payload)),
+        }
+    }
     fn matches_id(&self, payload: &Value) -> bool {
         match self {
             Self::Steam { app_id, .. } => payload["app_id"].as_u64() == Some(u64::from(*app_id)),
             Self::Lutris { game_id, .. } => payload["game_id"].as_i64() == Some(*game_id),
             Self::Playnite { game_id, .. } => payload["game_id"].as_str() == Some(game_id),
+            Self::External { .. } => false,
         }
     }
 }
@@ -71,7 +111,9 @@ pub(super) fn valid_artwork_cursor(revision: Option<&str>, offset: u64) -> bool 
         return false;
     }
     match revision {
-        Some(value) => !value.is_empty() && value.len() <= 64,
+        Some(value) => {
+            !value.trim().is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+        }
         None => offset == 0,
     }
 }
@@ -106,6 +148,12 @@ pub(super) fn artwork_chunk(
     revision: &str,
     offset: u64,
 ) -> Value {
+    if let Artwork::External { reference, .. } = artwork {
+        return amaterasu_module_sdk::application_library::artwork::project_chunk(
+            payload, reference, offset,
+        )
+        .unwrap_or_else(|code| error(code, "provider returned invalid artwork"));
+    }
     let valid = || -> Option<Value> {
         if payload["ok"] != true
             || !artwork.matches_id(&payload)

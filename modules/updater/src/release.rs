@@ -1,4 +1,5 @@
 use crate::model::Settings;
+use amaterasu_module_sdk::{network::Network, network_http};
 use semver::Version;
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -157,22 +158,20 @@ pub struct GitHubReleaseSource {
     agent: Agent,
 }
 
-impl Default for GitHubReleaseSource {
-    fn default() -> Self {
+impl GitHubReleaseSource {
+    pub fn new(network: Network) -> Self {
         let configuration = Agent::config_builder()
             .timeout_global(Some(HTTP_TIMEOUT))
             .build();
         Self {
-            agent: Agent::new_with_config(configuration),
+            agent: network_http::agent(configuration, network),
         }
     }
-}
 
-impl ReleaseSource for GitHubReleaseSource {
-    fn fetch(&mut self) -> Result<ReleaseSet, String> {
+    fn fetch_endpoint(&mut self, endpoint: &str) -> Result<ReleaseSet, String> {
         let mut response = self
             .agent
-            .get(RELEASES_ENDPOINT)
+            .get(endpoint)
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .header("User-Agent", "Amaterasu-Updater/1.0")
@@ -189,6 +188,12 @@ impl ReleaseSource for GitHubReleaseSource {
             return Err("release service response exceeds its size limit".into());
         }
         parse_release_feed(&bytes)
+    }
+}
+
+impl ReleaseSource for GitHubReleaseSource {
+    fn fetch(&mut self) -> Result<ReleaseSet, String> {
+        self.fetch_endpoint(RELEASES_ENDPOINT)
     }
 }
 
@@ -288,6 +293,64 @@ mod tests {
             url: format!("{RELEASE_URL_PREFIX}{tag}"),
             prerelease,
         }
+    }
+
+    #[test]
+    fn release_feed_http_uses_the_injected_network_provider() {
+        use std::io::{Read, Write};
+
+        let network = Network::test_provider();
+        let listener = network.bind_tcp("127.0.0.1:0".parse().unwrap()).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "HTTP client did not connect"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("HTTP test accept failed: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let mut bytes = [0u8; 1024];
+                let length = stream.read(&mut bytes).unwrap();
+                assert_ne!(length, 0, "HTTP client closed before headers");
+                request.extend_from_slice(&bytes[..length]);
+                assert!(request.len() <= 8192, "HTTP request exceeds header bound");
+            }
+            let request = std::str::from_utf8(&request).unwrap();
+            assert!(request.starts_with("GET /releases HTTP/1.1\r\n"));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("user-agent: amaterasu-updater/1.0")
+            );
+            let body = br#"[{"tag_name":"v2.0.0","html_url":"https://github.com/Nonary/amaterasu/releases/tag/v2.0.0","prerelease":false,"draft":false}]"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+        let mut source = GitHubReleaseSource::new(network);
+        let releases = source
+            .fetch_endpoint(&format!("http://{address}/releases"))
+            .unwrap();
+        assert_eq!(releases.stable.unwrap().tag, "v2.0.0");
+        server.join().unwrap();
     }
 
     #[test]

@@ -4,7 +4,9 @@ mod model;
 mod native;
 mod stream;
 
-use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
+use amaterasu_module_sdk::{
+    Command, ManagedModule, ModuleResult, Response, RuntimeClient, network::Network,
+};
 use controller::{Controller, Reply};
 use model::{Operation, Settings};
 use serde_json::json;
@@ -20,27 +22,7 @@ struct ControlTransport {
 
 impl ManagedModule for ControlTransport {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
-        let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
-            return Err("control transport settings unavailable".into());
-        };
-        let settings: Settings =
-            serde_json::from_value(payload).map_err(|_| "invalid control transport settings")?;
-        settings.validate()?;
-        let controller = Arc::new(Mutex::new(Controller::new(settings)));
-        let factory = native::Factory::new(controller.clone());
-        runtime.require_success(Command::Register {
-            service: SERVICE.into(),
-        })?;
-        // SAFETY: boxed factory lives through unload. Signed dependencies require
-        // consumers to release bindings before provider code unloads.
-        unsafe {
-            runtime.register_native(SERVICE, &factory.api)?;
-        }
-        Ok(Self {
-            runtime,
-            controller,
-            _factory: factory,
-        })
+        Self::start_configured(runtime, None)
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
@@ -109,6 +91,39 @@ impl ControlTransport {
             .lock()
             .map_err(|_| "control_state_unavailable")?
             .handle(owner, operation)
+    }
+}
+
+impl ControlTransport {
+    fn start_configured(
+        runtime: RuntimeClient,
+        selected_network: Option<Network>,
+    ) -> ModuleResult<Self> {
+        let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
+            return Err("control transport settings unavailable".into());
+        };
+        let settings: Settings = serde_json::from_value(payload.clone())
+            .map_err(|_| "invalid control transport settings")?;
+        settings.validate()?;
+        let network = match selected_network {
+            Some(network) => network,
+            None => Network::from_settings(&runtime, &payload)?,
+        };
+        let controller = Arc::new(Mutex::new(Controller::with_network(settings, network)));
+        let factory = native::Factory::new(controller.clone());
+        runtime.require_success(Command::Register {
+            service: SERVICE.into(),
+        })?;
+        // SAFETY: boxed factory lives through unload. Signed dependencies require
+        // consumers to release bindings before provider code unloads.
+        unsafe {
+            amaterasu_module_sdk::transport::register_control(&runtime, SERVICE, &factory.api)?;
+        }
+        Ok(Self {
+            runtime,
+            controller,
+            _factory: factory,
+        })
     }
 }
 

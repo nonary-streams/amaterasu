@@ -1,4 +1,5 @@
 //! UPnP listener selection and owned gateway-mapping lifecycle.
+use amaterasu_module_sdk::network::Network;
 use amaterasu_module_sdk::{Command, Response, RuntimeClient};
 use amaterasu_network_policy::GameStreamPorts;
 use amaterasu_upnp::{
@@ -176,12 +177,13 @@ pub(crate) struct UpnpLifecycle {
 }
 
 impl UpnpLifecycle {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(network: Option<Network>) -> Self {
         let (command_tx, command_rx) = mpsc::channel();
         let (status_tx, status_rx) = mpsc::channel();
+        let worker_network = network.clone();
         let worker = thread::Builder::new()
             .name("amaterasu-upnp".into())
-            .spawn(move || run_worker(command_rx, status_tx))
+            .spawn(move || run_worker(worker_network, command_rx, status_tx))
             .ok();
         let status = if worker.is_some() {
             UpnpRuntimeStatus::default()
@@ -191,7 +193,7 @@ impl UpnpLifecycle {
                 error: Some("UPnP lifecycle worker could not be started".into()),
             }
         };
-        let ipv6_lifecycle = crate::upnp_ipv6::Ipv6PinholeLifecycle::new();
+        let ipv6_lifecycle = crate::upnp_ipv6::Ipv6PinholeLifecycle::new(network);
         let ipv6_status = ipv6_lifecycle.status().clone();
         Self {
             commands: command_tx,
@@ -381,7 +383,11 @@ fn append_listener_endpoints(
     );
 }
 
-fn run_worker(commands: Receiver<LifecycleCommand>, statuses: Sender<UpnpRuntimeStatus>) {
+fn run_worker(
+    network: Option<Network>,
+    commands: Receiver<LifecycleCommand>,
+    statuses: Sender<UpnpRuntimeStatus>,
+) {
     let mut desired = DesiredMappings::default();
     let mut gateways: BTreeMap<String, GatewayOwner<IgdGateway>> = BTreeMap::new();
     let mut active_gateway: Option<String> = None;
@@ -440,7 +446,13 @@ fn run_worker(commands: Receiver<LifecycleCommand>, statuses: Sender<UpnpRuntime
                 let mut discovery_error = last_discovery_error.clone();
                 if rediscover {
                     configuration_changed = false;
-                    match discover_gateway() {
+                    match network
+                        .as_ref()
+                        .ok_or_else(|| {
+                            amaterasu_upnp::GatewayError::new("UPnP network provider unavailable")
+                        })
+                        .and_then(discover_gateway)
+                    {
                         Ok(gateway) => {
                             last_discovery_error = None;
                             discovery_error = None;

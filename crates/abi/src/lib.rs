@@ -73,6 +73,9 @@ impl ReplySink {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+/// Host endpoints are thread-safe: invoke/context support concurrent calls from
+/// consumer workers and retain the same runtime-attested principal on each call.
+/// The runtime remains alive until every client, worker and native guard ends.
 pub struct HostApi {
     pub header: AbiHeader,
     /// An endpoint identity created by the runtime, never supplied in message JSON.

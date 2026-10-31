@@ -1000,13 +1000,29 @@ impl Coordinator {
             }
             let binding = stream.candidate.as_ref().ok_or("candidate_missing")?;
             let plan_revision = binding.plan_revision;
+            // The installed policy selects the broker identity, never the request.
+            let input_consumer = match self.settings.input_provider.as_ref() {
+                Some(provider) if self.settings.consumers.input.contains(provider) => provider,
+                Some(_) => return Err("input_consumer_unavailable".into()),
+                None if self.settings.consumers.input.len() == 1 => self
+                    .settings
+                    .consumers
+                    .input
+                    .iter()
+                    .next()
+                    .expect("one consumer"),
+                None if self.settings.consumers.input.is_empty() => {
+                    return Err("input_consumer_unavailable".into());
+                }
+                None => return Err("input_consumer_ambiguous".into()),
+            };
             let active = ActiveBinding {
                 host_epoch: session.host_epoch.clone(),
                 session_id: session.id.clone(),
                 stream_id,
                 generation: stream.generation,
                 geometry_revision: binding.geometry_revision,
-                input_consumer: "amaterasu.input".into(),
+                input_consumer: input_consumer.clone(),
                 allowed_actions: self.settings.input_actions.clone(),
             };
             let token = next

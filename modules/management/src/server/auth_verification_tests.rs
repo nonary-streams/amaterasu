@@ -49,6 +49,20 @@ unsafe extern "C" fn invoke(
 }
 
 fn verify_cookie(result: Response, cookie: char) -> (Stage, Vec<Command>) {
+    verify_cookie_route(
+        result,
+        cookie,
+        "management_settings/get",
+        &AudioProviders::default(),
+    )
+}
+
+fn verify_cookie_route(
+    result: Response,
+    cookie: char,
+    path: &str,
+    providers: &AudioProviders,
+) -> (Stage, Vec<Command>) {
     let terminal = matches!(&result, Response::Result { .. });
     let recorder = VerificationRuntime {
         result,
@@ -61,12 +75,11 @@ fn verify_cookie(result: Response, cookie: char) -> (Stage, Vec<Command>) {
     };
     // SAFETY: recorder outlives all synchronous client calls below.
     let runtime = unsafe { RuntimeClient::from_endpoint(endpoint) };
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let authority = listener.local_addr().unwrap().to_string();
+    let (_peer, stream) = test_stream_pair();
+    let authority = stream.local_addr().unwrap().to_string();
     let access = format!("ama_{}", cookie.to_string().repeat(64));
     let bytes = format!(
-        "POST /v1/management_settings/get HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nOrigin: https://{authority}\r\nCookie: __Secure-amaterasu-access={access}\r\nX-Amaterasu-CSRF: 1\r\n\r\n{{}}"
+        "POST /v1/{path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nOrigin: https://{authority}\r\nCookie: __Secure-amaterasu-access={access}\r\nX-Amaterasu-CSRF: 1\r\n\r\n{{}}"
     );
     let request = http::parse_policy_transport(
         bytes.as_bytes(),
@@ -97,6 +110,7 @@ fn verify_cookie(result: Response, cookie: char) -> (Stage, Vec<Command>) {
             &mut operation,
             &mut None,
             &mut selection_owners,
+            providers,
         )
         .unwrap();
     let Stage::Verifying {
@@ -114,7 +128,10 @@ fn verify_cookie(result: Response, cookie: char) -> (Stage, Vec<Command>) {
             *request,
             &mut operation,
             &mut selection_owners,
-            None,
+            VerifiedDispatch {
+                extensions: None,
+                audio_providers: providers,
+            },
         )
         .unwrap();
     let commands = recorder.commands.into_inner().unwrap();
@@ -216,6 +233,50 @@ fn valid_cookie_with_exact_route_scope_dispatches_only_the_resolved_action() {
 }
 
 #[test]
+fn authorized_audio_discovery_uses_the_selected_provider() {
+    let providers = AudioProviders {
+        capture: "vendor.capture/1".into(),
+        encoder: "vendor.opus/1".into(),
+    };
+    for (path, service, action) in [
+        ("media/audio_endpoints", "vendor.capture/1", "enumerate"),
+        ("media/audio_driver_status", "vendor.capture/1", "status"),
+        ("media/audio_encoders", "vendor.opus/1", "enumerate"),
+    ] {
+        let (stage, commands) = verify_cookie_route(
+            Response::Result {
+                payload: json!({"ok":true,"kind":"administrator_session","role":"administrator","subject":"admin","scopes":["media.read"],"expires_at":1_800_000_000}),
+            },
+            'd',
+            path,
+            &providers,
+        );
+        assert!(matches!(stage, Stage::Dispatching { request_id: 42, .. }));
+        assert!(
+            matches!(&commands[3], Command::Request { service: selected, payload, .. } if selected == service && payload == &json!({"action":action}))
+        );
+    }
+}
+
+#[test]
+fn selected_audio_provider_is_not_called_without_media_scope() {
+    let providers = AudioProviders {
+        capture: "vendor.capture/1".into(),
+        encoder: "vendor.opus/1".into(),
+    };
+    let (stage, commands) = verify_cookie_route(
+        Response::Result {
+            payload: json!({"ok":true,"kind":"administrator_session","role":"administrator","subject":"admin","scopes":["catalog.read"],"expires_at":1_800_000_000}),
+        },
+        'd',
+        "media/audio_endpoints",
+        &providers,
+    );
+    assert!(matches!(stage, Stage::Writing { .. }));
+    assert_eq!(commands.len(), 3);
+}
+
+#[test]
 fn host_log_dispatch_uses_verified_session_context() {
     let owner = "a".repeat(64);
     let recorder = VerificationRuntime {
@@ -233,9 +294,8 @@ fn host_log_dispatch_uses_verified_session_context() {
     };
     // SAFETY: recorder outlives every synchronous runtime call.
     let runtime = unsafe { RuntimeClient::from_endpoint(endpoint) };
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let authority = listener.local_addr().unwrap().to_string();
+    let (_peer, stream) = test_stream_pair();
+    let authority = stream.local_addr().unwrap().to_string();
     let access = format!("ama_{}", "d".repeat(64));
     let bytes = format!(
         "POST /v1/host-logs/open HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nOrigin: https://{authority}\r\nCookie: __Secure-amaterasu-access={access}\r\nX-Amaterasu-CSRF: 1\r\n\r\n{{}}"
@@ -268,6 +328,7 @@ fn host_log_dispatch_uses_verified_session_context() {
             &mut operation,
             &mut None,
             &mut selection_owners,
+            &AudioProviders::default(),
         )
         .unwrap();
     let Stage::Verifying {
@@ -284,7 +345,10 @@ fn host_log_dispatch_uses_verified_session_context() {
             *request,
             &mut operation,
             &mut selection_owners,
-            None,
+            VerifiedDispatch {
+                extensions: None,
+                audio_providers: &AudioProviders::default(),
+            },
         )
         .unwrap();
     let commands = recorder.commands.into_inner().unwrap();
@@ -323,9 +387,8 @@ fn pipewire_selection_route_verifies_capture_scope_and_binds_the_handle_to_sessi
     };
     // SAFETY: recorder outlives all synchronous client calls below.
     let runtime = unsafe { RuntimeClient::from_endpoint(endpoint) };
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-    let authority = listener.local_addr().unwrap().to_string();
+    let (_peer, stream) = test_stream_pair();
+    let authority = stream.local_addr().unwrap().to_string();
     let access = format!("ama_{}", "d".repeat(64));
     let request_bytes = format!(
         "POST /v1/capture/pipewire_selection_begin HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: 79\r\nOrigin: https://{authority}\r\nCookie: __Secure-amaterasu-access={access}\r\nX-Amaterasu-CSRF: 1\r\n\r\n{{\"source_type\":\"monitor\",\"operation_id\":\"{OPERATION_ID}\"}}"
@@ -358,6 +421,7 @@ fn pipewire_selection_route_verifies_capture_scope_and_binds_the_handle_to_sessi
             &mut operation,
             &mut None,
             &mut selection_owners,
+            &AudioProviders::default(),
         )
         .unwrap();
     let Stage::Verifying {
@@ -374,7 +438,10 @@ fn pipewire_selection_route_verifies_capture_scope_and_binds_the_handle_to_sessi
             *request,
             &mut operation,
             &mut selection_owners,
-            None,
+            VerifiedDispatch {
+                extensions: None,
+                audio_providers: &AudioProviders::default(),
+            },
         )
         .unwrap();
     assert!(matches!(

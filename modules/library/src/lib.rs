@@ -5,6 +5,7 @@
 mod artwork;
 mod discovery;
 
+use amaterasu_module_sdk::application_library::artwork::{ArtworkRoutes, supports_artwork};
 use artwork::{Artwork, artwork_chunk, valid_artwork_cursor};
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
@@ -197,6 +198,14 @@ enum Stage {
         offset: u64,
         transfer_id: String,
     },
+    ArtworkDescribe {
+        artwork: Artwork,
+        revision: String,
+        offset: u64,
+        transfer_id: String,
+        service: String,
+        request: Value,
+    },
     ArtworkRelease {
         transfer_id: String,
     },
@@ -210,6 +219,8 @@ struct Transfer {
     closed: bool,
     proven: bool,
     touched: Instant,
+    described: bool,
+    stream: Option<(String, u64)>,
 }
 struct Pending {
     parent: u64,
@@ -242,6 +253,7 @@ struct Library {
     admissions: BTreeMap<u64, Admission>,
     pending: BTreeMap<u64, Pending>,
     discovery: discovery::Settings,
+    artwork_routes: ArtworkRoutes,
     transfers: BTreeMap<String, Transfer>,
     cleanup: BTreeMap<String, Cleanup>,
 }
@@ -358,6 +370,7 @@ impl ManagedModule for Library {
             return Err("library settings unavailable".into());
         };
         let discovery = discovery::Settings::from_module_settings(&payload)?;
+        let artwork_routes = ArtworkRoutes::from_module_settings(&payload)?;
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
@@ -366,6 +379,7 @@ impl ManagedModule for Library {
             admissions: BTreeMap::new(),
             pending: BTreeMap::new(),
             discovery,
+            artwork_routes,
             transfers: BTreeMap::new(),
             cleanup: BTreeMap::new(),
         })
@@ -447,6 +461,9 @@ impl ManagedModule for Library {
                         ref transfer_id, ..
                     }
                     | Stage::ArtworkProvider {
+                        ref transfer_id, ..
+                    }
+                    | Stage::ArtworkDescribe {
                         ref transfer_id, ..
                     } = pending.stage
                         && let Some(t) = self.transfers.get_mut(transfer_id)
@@ -550,7 +567,15 @@ impl ManagedModule for Library {
                                 .as_ref()
                                 .is_none_or(|existing| existing == *a)
                         })
-                        .and_then(|a| a.request(revision.as_deref(), offset, &transfer_id));
+                        .and_then(|a| {
+                            a.route(
+                                &self.artwork_routes,
+                                &transfer.initiator,
+                                revision.as_deref(),
+                                offset,
+                                &transfer_id,
+                            )
+                        });
                     if let (Some(artwork), Some((service, request))) = (artwork, provider) {
                         transfer.artwork = Some(artwork.clone());
                         let revision = artwork.revision().to_owned();
@@ -560,24 +585,49 @@ impl ManagedModule for Library {
                             .as_millis()
                             .min(30_000) as u64;
                         if timeout > 0 {
+                            let (request, stage) = if matches!(artwork, Artwork::External { .. })
+                                && !transfer.described
+                            {
+                                (
+                                    json!({"action":"describe"}),
+                                    Stage::ArtworkDescribe {
+                                        artwork,
+                                        revision,
+                                        offset,
+                                        transfer_id,
+                                        service: service.clone(),
+                                        request,
+                                    },
+                                )
+                            } else {
+                                (
+                                    request,
+                                    Stage::ArtworkProvider {
+                                        artwork,
+                                        revision,
+                                        offset,
+                                        transfer_id,
+                                    },
+                                )
+                            };
+                            let operation_id = if matches!(stage, Stage::ArtworkDescribe { .. }) {
+                                format!("library.artwork.describe.{}", pending.parent)
+                            } else {
+                                format!("library.artwork.{}", pending.parent)
+                            };
                             self.admissions.insert(
                                 pending.parent,
                                 Admission {
                                     command: Command::Request {
-                                        service: service.into(),
+                                        service,
                                         payload: request,
                                         timeout_ms: timeout,
-                                        operation_id: format!("library.artwork.{}", pending.parent),
+                                        operation_id,
                                         parent: Some(pending.parent),
                                     },
                                     pending: Pending {
                                         parent: pending.parent,
-                                        stage: Stage::ArtworkProvider {
-                                            artwork,
-                                            revision,
-                                            offset,
-                                            transfer_id,
-                                        },
+                                        stage,
                                         result: None,
                                         released: false,
                                         deadline: pending.deadline,
@@ -613,18 +663,86 @@ impl ManagedModule for Library {
                         t.active = false;
                         t.touched = Instant::now();
                     }
-                    pending.result = Some(
-                        if matches!(artwork, Artwork::Playnite { .. })
-                            && payload["transfer_id"].as_str() != Some(&transfer_id)
+                    let result = if matches!(artwork, Artwork::Playnite { .. })
+                        && payload["transfer_id"].as_str() != Some(&transfer_id)
+                    {
+                        error(
+                            "invalid_artwork_response",
+                            "provider returned invalid transfer",
+                        )
+                    } else {
+                        artwork_chunk(payload, &artwork, &revision, offset)
+                    };
+                    let result = if result["ok"] == true {
+                        let stream = (
+                            result["mime_type"].as_str().unwrap().to_owned(),
+                            result["total_bytes"].as_u64().unwrap(),
+                        );
+                        let transfer = self.transfers.get_mut(&transfer_id).unwrap();
+                        if transfer
+                            .stream
+                            .as_ref()
+                            .is_some_and(|pinned| pinned != &stream)
                         {
-                            error(
-                                "invalid_artwork_response",
-                                "provider returned invalid transfer",
-                            )
+                            error("invalid_artwork_response", "artwork stream changed")
                         } else {
-                            artwork_chunk(payload, &artwork, &revision, offset)
-                        },
-                    );
+                            transfer.stream = Some(stream);
+                            result
+                        }
+                    } else {
+                        result
+                    };
+                    pending.result = Some(result);
+                }
+                Stage::ArtworkDescribe {
+                    artwork,
+                    revision,
+                    offset,
+                    transfer_id,
+                    service,
+                    request,
+                } => {
+                    let timeout = pending
+                        .deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis()
+                        .min(30_000) as u64;
+                    if supports_artwork(payload) && timeout > 0 {
+                        self.transfers.get_mut(&transfer_id).unwrap().described = true;
+                        self.admissions.insert(
+                            pending.parent,
+                            Admission {
+                                command: Command::Request {
+                                    service,
+                                    payload: request,
+                                    timeout_ms: timeout,
+                                    operation_id: format!("library.artwork.{}", pending.parent),
+                                    parent: Some(pending.parent),
+                                },
+                                pending: Pending {
+                                    parent: pending.parent,
+                                    stage: Stage::ArtworkProvider {
+                                        artwork,
+                                        revision,
+                                        offset,
+                                        transfer_id,
+                                    },
+                                    result: None,
+                                    released: false,
+                                    deadline: pending.deadline,
+                                },
+                            },
+                        );
+                        continue;
+                    }
+                    if let Some(transfer) = self.transfers.get_mut(&transfer_id) {
+                        transfer.active = false;
+                        transfer.touched = Instant::now();
+                    }
+                    pending.result = Some(error(
+                        "artwork_unsupported",
+                        "selected provider does not support artwork",
+                    ));
                 }
                 Stage::ArtworkRelease { transfer_id } => {
                     if let Some(t) = self.transfers.get_mut(&transfer_id) {
@@ -728,6 +846,8 @@ impl ManagedModule for Library {
                         closed: false,
                         proven: false,
                         touched: Instant::now(),
+                        described: false,
+                        stream: None,
                     });
                 if transfer.initiator != initiator
                     || transfer.id != app_id
@@ -773,6 +893,8 @@ impl ManagedModule for Library {
                             closed: true,
                             proven: false,
                             touched: Instant::now(),
+                            described: false,
+                            stream: None,
                         },
                     );
                 }

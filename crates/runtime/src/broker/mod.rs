@@ -122,6 +122,8 @@ impl Broker {
         match command {
             Command::NativeRegister { .. }
             | Command::NativeBind { .. }
+            | Command::NativeRegisterTyped { .. }
+            | Command::NativeBindTyped { .. }
             | Command::NativeRelease { .. } => Response::error(
                 "native_transport_required",
                 "native interfaces require the authenticated ABI endpoint",

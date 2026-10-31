@@ -299,10 +299,7 @@ impl Probe {
     }
     fn collect(&mut self) -> ModuleResult<()> {
         // SAFETY: the binding owns the table during the synchronous callback; no borrowed pointers escape.
-        let binding = unsafe {
-            self.runtime
-                .bind_native(VIDEO, 1, 0, size_of::<VideoApi>() as u32)
-        }?;
+        let binding = unsafe { amaterasu_module_sdk::video::bind(&self.runtime, VIDEO) }?;
         let api = unsafe { binding.table::<VideoApi>() }?;
         let sink = PacketSink {
             context: (&mut self.packets as *mut Packets).cast(),

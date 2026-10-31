@@ -17,10 +17,11 @@ type BindCallback = unsafe extern "C" fn(
 
 /// Copy the small descriptor at registration. Only provider context/code need
 /// stable lifetimes; moving a Rust wrapper cannot invalidate the registry entry.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Factory {
     context: usize,
     bind: BindCallback,
+    contract: Option<String>,
 }
 
 struct Binding {
@@ -37,13 +38,18 @@ struct Registry {
 
 pub(crate) struct NativeServices {
     grants: BTreeMap<String, Grants>,
+    legacy_contracts: BTreeMap<String, BTreeMap<String, String>>,
     registry: Mutex<Registry>,
 }
 
 impl NativeServices {
-    pub fn new(grants: BTreeMap<String, Grants>) -> Self {
+    pub fn new(
+        grants: BTreeMap<String, Grants>,
+        legacy_contracts: BTreeMap<String, BTreeMap<String, String>>,
+    ) -> Self {
         Self {
             grants,
+            legacy_contracts,
             registry: Mutex::new(Registry::default()),
         }
     }
@@ -54,8 +60,36 @@ impl NativeServices {
     pub unsafe fn dispatch(&self, caller: &str, command: Command) -> Response {
         match command {
             Command::NativeRegister { service, factory } => unsafe {
-                self.register(caller, service, factory)
+                let contract = self
+                    .legacy_contracts
+                    .get(caller)
+                    .and_then(|services| services.get(&service))
+                    .cloned();
+                self.register(caller, service, factory, contract)
             },
+            Command::NativeRegisterTyped {
+                service,
+                factory,
+                contract,
+            } => unsafe { self.register(caller, service, factory, Some(contract)) },
+            Command::NativeBindTyped {
+                service,
+                interface_major,
+                min_minor,
+                min_size,
+                contract,
+            } => {
+                if !valid_name(&contract) {
+                    return invalid();
+                }
+                let query = NativeInterfaceQuery {
+                    header: AbiHeader::of::<NativeInterfaceQuery>(),
+                    interface_major,
+                    min_minor,
+                    min_size,
+                };
+                unsafe { self.bind(caller, &service, query, Some(&contract)) }
+            }
             Command::NativeBind {
                 service,
                 interface_major,
@@ -68,7 +102,7 @@ impl NativeServices {
                     min_minor,
                     min_size,
                 };
-                unsafe { self.bind(caller, &service, query) }
+                unsafe { self.bind(caller, &service, query, None) }
             }
             Command::NativeRelease { binding } => unsafe { self.release(caller, binding) },
             _ => Response::error("invalid_request", "not a native operation"),
@@ -86,10 +120,22 @@ impl NativeServices {
             })
     }
 
-    unsafe fn register(&self, caller: &str, service: String, address: usize) -> Response {
+    unsafe fn register(
+        &self,
+        caller: &str,
+        service: String,
+        address: usize,
+        contract: Option<String>,
+    ) -> Response {
         // Authorization precedes even the first pointer read.
         if !self.permitted(caller, &service, true) {
             return denied();
+        }
+        if contract
+            .as_deref()
+            .is_some_and(|contract| !valid_name(contract))
+        {
+            return invalid();
         }
         if !aligned::<NativeServiceFactory>(address) {
             return invalid();
@@ -107,6 +153,7 @@ impl NativeServices {
         let factory = Factory {
             context: descriptor.context as usize,
             bind,
+            contract,
         };
         let Ok(mut registry) = self.registry.lock() else {
             return unavailable();
@@ -124,15 +171,26 @@ impl NativeServices {
         Response::Ok
     }
 
-    fn reserve(&self, caller: &str, service: &str) -> Result<(u64, Factory), Response> {
+    fn reserve(
+        &self,
+        caller: &str,
+        service: &str,
+        contract: Option<&str>,
+    ) -> Result<(u64, Factory), Response> {
         if !self.permitted(caller, service, false) {
             return Err(denied());
         }
         let mut registry = self.registry.lock().map_err(|_| unavailable())?;
-        let factory = *registry
-            .factories
-            .get(service)
-            .ok_or_else(|| Response::error("not_found", "native interface is not registered"))?;
+        let factory =
+            registry.factories.get(service).cloned().ok_or_else(|| {
+                Response::error("not_found", "native interface is not registered")
+            })?;
+        if contract.is_some() && contract != factory.contract.as_deref() {
+            return Err(Response::error(
+                "native_contract_mismatch",
+                "native interface contract does not match the requested family",
+            ));
+        }
         if registry.bindings.len() >= MAX_BINDINGS {
             return Err(capacity());
         }
@@ -148,13 +206,19 @@ impl NativeServices {
         Ok((id, factory))
     }
 
-    unsafe fn bind(&self, caller: &str, service: &str, query: NativeInterfaceQuery) -> Response {
+    unsafe fn bind(
+        &self,
+        caller: &str,
+        service: &str,
+        query: NativeInterfaceQuery,
+        contract: Option<&str>,
+    ) -> Response {
         if query.min_size < size_of::<NativeInterface>() as u32
             || query.min_size > MAX_MESSAGE as u32
         {
             return invalid();
         }
-        let (binding, factory) = match self.reserve(caller, service) {
+        let (binding, factory) = match self.reserve(caller, service, contract) {
             Ok(reservation) => reservation,
             Err(error) => return error,
         };
@@ -277,3 +341,9 @@ mod tests;
 
 #[cfg(test)]
 mod encoder_sdk_tests;
+
+#[cfg(test)]
+mod data_plane_tests;
+
+#[cfg(test)]
+mod network_typed_tests;

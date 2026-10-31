@@ -3382,6 +3382,11 @@ fn validate_provider_entry(
         Some(ArtworkReference::Playnite { game_id, .. }) => {
             !valid_playnite_identity || game_id.as_str() != source_id
         }
+        Some(ArtworkReference::External { source, .. }) => {
+            provider_key != Some(source.as_str())
+                || !matches!(&entry.launch, Launch::Provider { provider, application_id, .. }
+                    if provider == source && application_id == source_id)
+        }
         None => false,
     } || (preserve_artwork
         && (!valid_playnite_identity || entry.artwork.is_some()));

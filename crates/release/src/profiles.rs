@@ -54,6 +54,19 @@ const RUNTIME: ComponentDefinition = ComponentDefinition {
     dependencies: &[],
 };
 
+// Default implementation of the public network contract. Consumers bind through
+// the SDK; replacement compositions may select another compatible provider.
+const NETWORK: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.network",
+    library: "amaterasu_network",
+    provides: &[],
+    calls: &[],
+    publishes: &[],
+    native_provides: &["amaterasu.network/1"],
+    native_uses: &[],
+    dependencies: &[RUNTIME_ID],
+};
+
 const EXAMPLE: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.example-echo",
     library: "amaterasu_echo_fixture",
@@ -144,8 +157,9 @@ const UPDATER: ComponentDefinition = ComponentDefinition {
     ],
     publishes: &[],
     native_provides: &[],
-    native_uses: &[],
+    native_uses: &["amaterasu.network/1"],
     dependencies: &[
+        "amaterasu.network",
         RUNTIME_ID,
         "amaterasu.configuration",
         "amaterasu.system-tray",
@@ -191,6 +205,7 @@ const LIBRARY: ComponentDefinition = ComponentDefinition {
     provides: &["amaterasu.library/1"],
     calls: &[
         "amaterasu.catalog/1",
+        "amaterasu.state/1",
         "amaterasu.steam/1",
         "amaterasu.lutris/1",
         "amaterasu.playnite/1",
@@ -201,6 +216,7 @@ const LIBRARY: ComponentDefinition = ComponentDefinition {
     dependencies: &[
         RUNTIME_ID,
         "amaterasu.catalog",
+        "amaterasu.state",
         "amaterasu.steam",
         "amaterasu.lutris",
         "amaterasu.playnite",
@@ -252,8 +268,9 @@ const STEAM: ComponentDefinition = ComponentDefinition {
     ],
     publishes: &[],
     native_provides: &[],
-    native_uses: &[],
+    native_uses: &["amaterasu.network/1"],
     dependencies: &[
+        "amaterasu.network",
         RUNTIME_ID,
         "amaterasu.catalog",
         "amaterasu.configuration",
@@ -372,8 +389,9 @@ const NVHTTP: ComponentDefinition = ComponentDefinition {
     ],
     publishes: &[],
     native_provides: &[],
-    native_uses: &["amaterasu.identity/1"],
+    native_uses: &["amaterasu.network/1", "amaterasu.identity/1"],
     dependencies: &[
+        "amaterasu.network",
         RUNTIME_ID,
         "amaterasu.configuration",
         "amaterasu.pairing",
@@ -605,8 +623,8 @@ const MEDIA_TRANSPORT: ComponentDefinition = ComponentDefinition {
     calls: &[],
     publishes: &[],
     native_provides: &["amaterasu.media-transport/1"],
-    native_uses: &[],
-    dependencies: &[RUNTIME_ID],
+    native_uses: &["amaterasu.network/1"],
+    dependencies: &["amaterasu.network", RUNTIME_ID],
 };
 const CONTROL_TRANSPORT: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.control-transport",
@@ -615,8 +633,8 @@ const CONTROL_TRANSPORT: ComponentDefinition = ComponentDefinition {
     calls: &[],
     publishes: &[],
     native_provides: &["amaterasu.control-transport/1"],
-    native_uses: &[],
-    dependencies: &[RUNTIME_ID],
+    native_uses: &["amaterasu.network/1"],
+    dependencies: &["amaterasu.network", RUNTIME_ID],
 };
 const FRAME_LIMITER: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.frame-limiter",
@@ -753,8 +771,9 @@ const RTSP: ComponentDefinition = ComponentDefinition {
     ],
     publishes: &[],
     native_provides: &[],
-    native_uses: &[],
+    native_uses: &["amaterasu.network/1"],
     dependencies: &[
+        "amaterasu.network",
         RUNTIME_ID,
         "amaterasu.stream-session",
         "amaterasu.display",
@@ -796,6 +815,7 @@ const NVHTTP_DESKTOP_SMOKE: ComponentDefinition = ComponentDefinition {
         "amaterasu.encode/1",
     ],
     dependencies: &[
+        "amaterasu.network",
         RUNTIME_ID,
         "amaterasu.configuration",
         "amaterasu.input",
@@ -874,6 +894,7 @@ const RTSP_DESKTOP_SMOKE: ComponentDefinition = ComponentDefinition {
         "amaterasu.encode/1",
     ],
     dependencies: &[
+        "amaterasu.network",
         RUNTIME_ID,
         "amaterasu.input",
         "amaterasu.stream-session",
@@ -1059,6 +1080,7 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
     library: "amaterasu_management",
     provides: &["amaterasu.management/1"],
     calls: &[
+        "amaterasu.library/1",
         // Loopback `/healthz` asks this component's fixed, status-only
         // operation to drive bounded checks of its imported dependencies.
         "amaterasu.management/1",
@@ -1100,8 +1122,10 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
     ],
     publishes: &[],
     native_provides: &[],
-    native_uses: &[],
+    native_uses: &["amaterasu.network/1"],
     dependencies: &[
+        "amaterasu.library",
+        "amaterasu.network",
         RUNTIME_ID,
         "amaterasu.authentication",
         "amaterasu.state",
@@ -1136,6 +1160,7 @@ const MANAGEMENT: ComponentDefinition = ComponentDefinition {
 // Only the opt-in fixture package grants management access to the example API.
 const MANAGEMENT_EXTENSION_EXAMPLE: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "amaterasu.library/1",
         // Loopback `/healthz` asks this component's fixed, status-only
         // operation to drive bounded checks of its imported dependencies.
         "amaterasu.management/1",
@@ -1184,6 +1209,8 @@ const MANAGEMENT_EXTENSION_EXAMPLE: ComponentDefinition = ComponentDefinition {
 // same as the platform component's grants.
 const MANAGEMENT_PROBE: ComponentDefinition = ComponentDefinition {
     dependencies: &[
+        "amaterasu.library",
+        "amaterasu.network",
         RUNTIME_ID,
         "amaterasu.authentication",
         "amaterasu.state",
@@ -1216,6 +1243,8 @@ const MANAGEMENT_PROBE: ComponentDefinition = ComponentDefinition {
 
 const MANAGEMENT_SOFTWARE_PROBE: ComponentDefinition = ComponentDefinition {
     dependencies: &[
+        "amaterasu.library",
+        "amaterasu.network",
         RUNTIME_ID,
         "amaterasu.authentication",
         "amaterasu.state",
@@ -1357,6 +1386,7 @@ const LINUX_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
 
 const LINUX_MANAGEMENT: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "amaterasu.library/1",
         "amaterasu.management/1",
         "amaterasu.authentication/1",
         "amaterasu.state/1",
@@ -1397,6 +1427,8 @@ const LINUX_MANAGEMENT: ComponentDefinition = ComponentDefinition {
         "amaterasu.session-history",
     ],
     dependencies: &[
+        "amaterasu.library",
+        "amaterasu.network",
         RUNTIME_ID,
         "amaterasu.authentication",
         "amaterasu.state",
@@ -1439,6 +1471,7 @@ impl PackageProfile {
             Self::RegistryFixture => &[RUNTIME, STATE, EXTENSION_REGISTRY_FIXTURE],
             Self::MediaProbe => &[
                 RUNTIME,
+                NETWORK,
                 CAPTURE_PIPEWIRE,
                 CAPTURE_DXGI,
                 CAPTURE_WGC,
@@ -1453,6 +1486,7 @@ impl PackageProfile {
             ],
             Self::StreamProbe => &[
                 RUNTIME,
+                NETWORK,
                 STATE,
                 CONFIGURATION,
                 CATALOG,
@@ -1485,6 +1519,7 @@ impl PackageProfile {
             ],
             Self::SoftwareProbe => &[
                 RUNTIME,
+                NETWORK,
                 STATE,
                 CONFIGURATION,
                 CATALOG,
@@ -1521,6 +1556,7 @@ impl PackageProfile {
             ],
             Self::LinuxProbe => &[
                 RUNTIME,
+                NETWORK,
                 STATE,
                 CONFIGURATION,
                 CATALOG,
@@ -1558,6 +1594,7 @@ impl PackageProfile {
             ],
             Self::DesktopStreamSmoke => &[
                 RUNTIME,
+                NETWORK,
                 STATE,
                 SESSION,
                 SESSION_HISTORY,
@@ -1583,6 +1620,7 @@ impl PackageProfile {
             Self::LinuxSessionExtensions => linux_session::EXTENSION_COMPONENTS,
             Self::Platform => &[
                 RUNTIME,
+                NETWORK,
                 STATE,
                 SESSION,
                 SESSION_HISTORY,
@@ -1621,6 +1659,7 @@ impl PackageProfile {
             ],
             Self::ExtensionExample => &[
                 RUNTIME,
+                NETWORK,
                 EXTENSION_EXAMPLE,
                 STATE,
                 SESSION,
@@ -1771,7 +1810,7 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
             "amaterasu.catalog".into(),
             json!({
                 "launch_principals": ["amaterasu.launch"],
-                "export_principals": {"amaterasu.nvhttp": "amaterasu.management"},
+                "export_principals": {"amaterasu.nvhttp": "amaterasu.management", "amaterasu.management": "amaterasu.management"},
                 "steam_id_export_principals": {"amaterasu.lutris": "amaterasu.management"},
                 "import_principals": {
                     "amaterasu.steam": "amaterasu.management",
@@ -1954,7 +1993,7 @@ pub fn installer_policy(
             "amaterasu.catalog".into(),
             json!({
                 "launch_principals": ["amaterasu.launch"],
-                "export_principals": {"amaterasu.nvhttp": "amaterasu.management"},
+                "export_principals": {"amaterasu.nvhttp": "amaterasu.management", "amaterasu.management": "amaterasu.management"},
                 "steam_id_export_principals": {"amaterasu.lutris": "amaterasu.management"},
                 "import_principals": {
                     "amaterasu.steam": "amaterasu.management",

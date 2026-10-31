@@ -4,7 +4,6 @@ use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const AUDIO_SERVICE: &str = "amaterasu.audio/1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_DELAY: Duration = Duration::from_secs(5);
 
@@ -45,12 +44,13 @@ impl AudioDriverInstallSync {
     pub(crate) fn tick(
         &mut self,
         runtime: &RuntimeClient,
+        service: &str,
         loaded: bool,
         revision: Option<u64>,
         enabled: bool,
     ) -> ModuleResult<()> {
         if let Some(pending) = self.pending.take() {
-            self.advance(pending, runtime)?;
+            self.advance(pending, runtime, service)?;
             return Ok(());
         }
         let Some(revision) = revision.filter(|_| loaded) else {
@@ -71,13 +71,18 @@ impl AudioDriverInstallSync {
             state: CallState::Submitting,
         });
         let pending = self.pending.take().expect("just created audio update");
-        self.advance(pending, runtime)
+        self.advance(pending, runtime, service)
     }
 
-    fn advance(&mut self, mut pending: PendingCall, runtime: &RuntimeClient) -> ModuleResult<()> {
+    fn advance(
+        &mut self,
+        mut pending: PendingCall,
+        runtime: &RuntimeClient,
+        service: &str,
+    ) -> ModuleResult<()> {
         match &mut pending.state {
             CallState::Submitting => match runtime.send(Command::Request {
-                service: AUDIO_SERVICE.into(),
+                service: service.into(),
                 payload: json!({
                     "action":"configure_steam_driver_install",
                     "enabled":pending.enabled,
@@ -254,7 +259,8 @@ mod tests {
         let runtime = runtime(state.clone());
         let mut sync = AudioDriverInstallSync::default();
 
-        sync.tick(&runtime, false, None, true).unwrap();
+        sync.tick(&runtime, "vendor.capture/1", false, None, true)
+            .unwrap();
 
         assert!(state.lock().unwrap().commands.is_empty());
     }
@@ -265,14 +271,17 @@ mod tests {
         let runtime = runtime(state.clone());
         let mut sync = AudioDriverInstallSync::default();
 
-        sync.tick(&runtime, true, Some(4), true).unwrap();
-        sync.tick(&runtime, true, Some(4), true).unwrap();
-        sync.tick(&runtime, true, Some(4), true).unwrap();
+        sync.tick(&runtime, "vendor.capture/1", true, Some(4), true)
+            .unwrap();
+        sync.tick(&runtime, "vendor.capture/1", true, Some(4), true)
+            .unwrap();
+        sync.tick(&runtime, "vendor.capture/1", true, Some(4), true)
+            .unwrap();
 
         let state = state.lock().unwrap();
         assert!(state.commands.iter().any(|command| matches!(command,
             Command::Request { service, payload, .. }
-                if service == AUDIO_SERVICE
+                if service == "vendor.capture/1"
                     && payload["action"] == "configure_steam_driver_install"
                     && payload["enabled"] == true
                     && payload["revision"] == 4)));
@@ -294,8 +303,14 @@ mod tests {
         let runtime = runtime(state.clone());
         let mut sync = AudioDriverInstallSync::default();
 
-        sync.tick(&runtime, true, Some(4), true).unwrap();
+        sync.tick(&runtime, "vendor.capture/1", true, Some(4), true)
+            .unwrap();
 
         assert_eq!(sync.last_error(), Some("unavailable: provider starting"));
+        let state = state.lock().unwrap();
+        assert_eq!(state.commands.len(), 1);
+        assert!(
+            matches!(&state.commands[0], Command::Request { service, .. } if service == "vendor.capture/1")
+        );
     }
 }

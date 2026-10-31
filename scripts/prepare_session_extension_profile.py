@@ -139,6 +139,7 @@ def prepare(bootstrap: dict, root: Path, descriptor: dict, descriptor_digest: st
         "input_actions": [action_id] if enable_display_actions else [], "action_service": ACTIONS, "settings_registry_caller": REGISTRY,
         "settings_registry_service": REGISTRY_SERVICE,
         "operation_grants": OPERATIONS,
+        "input_provider": INPUT,
         "consumers": {"capture": [STREAM], "input": [STREAM, INPUT]},
         "consumer_requirements": {"execution_domain": "desktop", "capture_providers": ["amaterasu.capture-pipewire/1"],
                                   "selector_schemas": ["amaterasu.kwin-wl-output/1"]},

@@ -75,7 +75,8 @@ namespace Amaterasu {
     launch: Launch;
     artwork?:
       | { provider: "steam"; app_id: number; revision: string }
-      | { provider: "lutris"; game_id: number; revision: string };
+      | { provider: "lutris"; game_id: number; revision: string }
+      | { provider: "external"; source: string; reference: { id: string; revision: string } };
     steam_id?: string;
     steam_install_dir?: string;
     output?: string | null;

@@ -2,10 +2,11 @@ use crate::model::{
     DISCOVERY_TOKEN_BYTES, DiscoveryTokens, MAX_DATAGRAMS, MAX_QUEUE_BYTES, SENDS_PER_STREAM,
 };
 mod udp_batch;
+use amaterasu_module_sdk::network::{Network, UdpSocket};
 use std::{
     collections::VecDeque,
     io,
-    net::{IpAddr, SocketAddr, UdpSocket},
+    net::{IpAddr, SocketAddr},
     time::{Duration, Instant},
 };
 use udp_batch::{BatchError, BatchSender};
@@ -44,11 +45,11 @@ struct Lane {
 }
 
 impl Lane {
-    fn fixed(local: SocketAddr, peer: SocketAddr) -> io::Result<Self> {
-        let socket = bound_socket(local)?;
+    fn fixed(network: &Network, local: SocketAddr, peer: SocketAddr) -> io::Result<Self> {
+        let socket = network.bind_udp(local)?;
         socket.connect(peer)?;
         Ok(Self {
-            batch_sender: BatchSender::new(&socket),
+            batch_sender: BatchSender::new(network),
             socket,
             peer: Some(peer),
             ping_payload: None,
@@ -57,12 +58,13 @@ impl Lane {
     }
 
     fn discovering(
+        network: &Network,
         local: SocketAddr,
         ping_payload: [u8; DISCOVERY_TOKEN_BYTES],
     ) -> io::Result<Self> {
-        let socket = bound_socket(local)?;
+        let socket = network.bind_udp(local)?;
         Ok(Self {
-            batch_sender: BatchSender::new(&socket),
+            batch_sender: BatchSender::new(network),
             socket,
             peer: None,
             ping_payload: Some(ping_payload),
@@ -132,20 +134,38 @@ pub struct Delivery {
 }
 
 impl Delivery {
+    #[cfg(test)]
     pub fn bind(
         video_local: SocketAddr,
         audio_local: SocketAddr,
         video_peer: SocketAddr,
         audio_peer: SocketAddr,
     ) -> io::Result<Self> {
+        Self::bind_with_network(
+            &Network::test_provider(),
+            video_local,
+            audio_local,
+            video_peer,
+            audio_peer,
+        )
+    }
+
+    pub fn bind_with_network(
+        network: &Network,
+        video_local: SocketAddr,
+        audio_local: SocketAddr,
+        video_peer: SocketAddr,
+        audio_peer: SocketAddr,
+    ) -> io::Result<Self> {
         Ok(Self::new(
-            Lane::fixed(video_local, video_peer)?,
-            Lane::fixed(audio_local, audio_peer)?,
+            Lane::fixed(network, video_local, video_peer)?,
+            Lane::fixed(network, audio_local, audio_peer)?,
             None,
             None,
         ))
     }
 
+    #[cfg(test)]
     pub fn discover(
         video_local: SocketAddr,
         audio_local: SocketAddr,
@@ -153,9 +173,27 @@ impl Delivery {
         tokens: DiscoveryTokens,
         timeout: Duration,
     ) -> io::Result<Self> {
+        Self::discover_with_network(
+            &Network::test_provider(),
+            video_local,
+            audio_local,
+            peer_ip,
+            tokens,
+            timeout,
+        )
+    }
+
+    pub fn discover_with_network(
+        network: &Network,
+        video_local: SocketAddr,
+        audio_local: SocketAddr,
+        peer_ip: IpAddr,
+        tokens: DiscoveryTokens,
+        timeout: Duration,
+    ) -> io::Result<Self> {
         Ok(Self::new(
-            Lane::discovering(video_local, tokens.video)?,
-            Lane::discovering(audio_local, tokens.audio)?,
+            Lane::discovering(network, video_local, tokens.video)?,
+            Lane::discovering(network, audio_local, tokens.audio)?,
             Some(peer_ip),
             Some(timeout),
         ))
@@ -324,13 +362,27 @@ impl Delivery {
                         let payload = self.video_group_payload(group_count, packet_bytes);
                         match send_batch(&self.video, &payload, packet_bytes) {
                             Ok(bytes) => {
-                                if !self.record_batch_send(group_count, payload.len(), Ok(bytes)) {
+                                // The provider reports an accepted datagram prefix.
+                                // Retire only that prefix; a later tick retries the
+                                // untouched suffix without duplicating wire packets.
+                                if bytes == 0
+                                    || bytes > payload.len()
+                                    || !bytes.is_multiple_of(packet_bytes)
+                                {
+                                    self.fail("udp_send_failed");
+                                    break;
+                                }
+                                let accepted = bytes / packet_bytes;
+                                if !self.record_batch_send(accepted, bytes, Ok(bytes)) {
                                     break;
                                 }
                                 self.video_batch_support = VideoBatchSupport::Available;
-                                sent += group_count;
+                                sent += accepted;
                                 if let Some((_, _, batch_sent)) = &mut active_video_batch {
-                                    *batch_sent += group_count;
+                                    *batch_sent += accepted;
+                                }
+                                if accepted < group_count {
+                                    break;
                                 }
                                 continue;
                             }
@@ -338,14 +390,6 @@ impl Delivery {
                                 self.video_batch_support = VideoBatchSupport::Unavailable;
                             }
                             Err(BatchError::Retry) => break,
-                            #[cfg(windows)]
-                            Err(BatchError::SentThenFailed(bytes)) => {
-                                if self.record_batch_send(group_count, payload.len(), Ok(bytes)) {
-                                    sent += group_count;
-                                    self.fail("udp_send_failed");
-                                }
-                                break;
-                            }
                             Err(BatchError::Failed(_error)) => {
                                 self.fail("udp_send_failed");
                                 break;
@@ -495,10 +539,6 @@ impl Delivery {
         self.queue.clear();
         self.bytes = 0;
     }
-}
-
-fn bound_socket(local: SocketAddr) -> io::Result<UdpSocket> {
-    amaterasu_network_policy::bind_udp(local)
 }
 
 #[cfg(test)]

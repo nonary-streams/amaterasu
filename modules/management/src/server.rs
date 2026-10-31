@@ -5,18 +5,44 @@ use crate::csrf_policy::CsrfOrigins;
 use crate::http::{BrowserAuth, RequestTarget};
 use crate::peer_policy::{self, PeerTier};
 use crate::{AUTH_SERVICE, http};
+use amaterasu_module_sdk::network::{Network, TcpListener, TcpStream};
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
 use rustls::{ServerConfig, ServerConnection};
 use serde_json::{Value, json};
 use std::io::{ErrorKind, Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const MAX_CONNECTIONS: usize = 16;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
+pub(crate) struct AudioProviders {
+    pub capture: String,
+    pub encoder: String,
+}
+
+impl Default for AudioProviders {
+    fn default() -> Self {
+        Self {
+            capture: "amaterasu.audio/1".into(),
+            encoder: "amaterasu.audio-encode/1".into(),
+        }
+    }
+}
+
+impl AudioProviders {
+    fn service<'a>(&'a self, service: &'a str) -> &'a str {
+        match service {
+            "amaterasu.audio/1" => &self.capture,
+            "amaterasu.audio-encode/1" => &self.encoder,
+            _ => service,
+        }
+    }
+}
+
 pub struct Server {
+    audio_providers: AudioProviders,
     listener: TcpListener,
     tls_listener: Option<TcpListener>,
     tls_configuration: Option<Arc<ServerConfig>>,
@@ -33,6 +59,7 @@ pub struct Server {
 }
 
 impl Server {
+    #[cfg(test)]
     pub fn bind(
         address: SocketAddr,
         origins: Vec<String>,
@@ -40,7 +67,27 @@ impl Server {
         tls_bind: Option<SocketAddr>,
         tls_configuration: Option<Arc<ServerConfig>>,
     ) -> ModuleResult<Self> {
-        let listener = TcpListener::bind(address).map_err(|_| "management bind failed")?;
+        Self::bind_with_network(
+            Network::test_provider(),
+            address,
+            origins,
+            assets,
+            tls_bind,
+            tls_configuration,
+        )
+    }
+
+    pub fn bind_with_network(
+        network: Network,
+        address: SocketAddr,
+        origins: Vec<String>,
+        assets: Option<Assets>,
+        tls_bind: Option<SocketAddr>,
+        tls_configuration: Option<Arc<ServerConfig>>,
+    ) -> ModuleResult<Self> {
+        let listener = network
+            .bind_tcp(address)
+            .map_err(|_| "management bind failed")?;
         listener
             .set_nonblocking(true)
             .map_err(|_| "management nonblocking listener unavailable")?;
@@ -49,7 +96,9 @@ impl Server {
             .map_err(|_| "management local address unavailable")?
             .to_string();
         let tls_listener = if let Some(bind) = tls_bind {
-            let listener = TcpListener::bind(bind).map_err(|_| "management TLS bind failed")?;
+            let listener = network
+                .bind_tcp(bind)
+                .map_err(|_| "management TLS bind failed")?;
             listener
                 .set_nonblocking(true)
                 .map_err(|_| "management TLS listener unavailable")?;
@@ -58,6 +107,7 @@ impl Server {
             None
         };
         Ok(Self {
+            audio_providers: AudioProviders::default(),
             listener,
             tls_listener,
             tls_configuration,
@@ -86,6 +136,7 @@ impl Server {
         self.accept()?;
         let mut tick = ConnectionTick {
             runtime,
+            audio_providers: &self.audio_providers,
             authority: &self.address,
             origins: &self.origins,
             csrf_origins: &self.csrf_origins,
@@ -110,6 +161,10 @@ impl Server {
         self.connections
             .retain(|connection| !matches!(connection.stage, Stage::Closed));
         Ok(())
+    }
+
+    pub(crate) fn set_audio_providers(&mut self, providers: AudioProviders) {
+        self.audio_providers = providers;
     }
 
     pub(crate) fn set_peer_policy(&mut self, maximum: Option<PeerTier>) {
@@ -194,8 +249,14 @@ struct Connection {
     peer: IpAddr,
 }
 
+struct VerifiedDispatch<'a> {
+    extensions: Option<&'a crate::extensions::Extensions>,
+    audio_providers: &'a AudioProviders,
+}
+
 struct ConnectionTick<'a> {
     runtime: &'a RuntimeClient,
+    audio_providers: &'a AudioProviders,
     authority: &'a str,
     origins: &'a [String],
     csrf_origins: &'a CsrfOrigins,
@@ -329,7 +390,10 @@ impl Connection {
                 *request,
                 context.operation,
                 context.selection_owners,
-                context.extensions,
+                VerifiedDispatch {
+                    extensions: context.extensions,
+                    audio_providers: context.audio_providers,
+                },
             )?,
             Stage::Dispatching {
                 request_id,
@@ -504,6 +568,7 @@ impl Connection {
                         context.operation,
                         context.assets,
                         context.selection_owners,
+                        context.audio_providers,
                     )?
                 } else {
                     self.fail(429, "rate_limited");
@@ -522,7 +587,7 @@ impl Connection {
         mut request: http::Request,
         operation: &mut u64,
         selection_owners: &mut SelectionOwners,
-        extensions: Option<&crate::extensions::Extensions>,
+        providers: VerifiedDispatch<'_>,
     ) -> ModuleResult<()> {
         match runtime.send_ephemeral(Command::TakeResult {
             request: request_id,
@@ -539,7 +604,13 @@ impl Connection {
             {
                 if matches!(request.target, RequestTarget::Api(route) if route.service == crate::SERVICE && matches!(route.action, "extension_list" | "extension_call"))
                 {
-                    self.dispatch_extension(runtime, request, &payload, operation, extensions)?;
+                    self.dispatch_extension(
+                        runtime,
+                        request,
+                        &payload,
+                        operation,
+                        providers.extensions,
+                    )?;
                     return Ok(());
                 }
                 if matches!(request.target, RequestTarget::Api(route) if route.service == "amaterasu.capture-pipewire/1" || route.service == amaterasu_contracts::HOST_LOG_SERVICE)
@@ -563,7 +634,13 @@ impl Connection {
                         return Ok(());
                     }
                 }
-                self.dispatch(runtime, request, operation, selection_owners)?
+                self.dispatch(
+                    runtime,
+                    request,
+                    operation,
+                    selection_owners,
+                    providers.audio_providers,
+                )?
             }
             Response::Result { payload } => {
                 match (
@@ -674,6 +751,7 @@ impl Connection {
         operation: &mut u64,
         assets: &mut Option<Assets>,
         selection_owners: &mut SelectionOwners,
+        audio_providers: &AudioProviders,
     ) -> ModuleResult<()> {
         self.origin.clone_from(&request.origin);
         self.csrf_exception = request
@@ -724,7 +802,13 @@ impl Connection {
                 };
             }
         } else {
-            self.dispatch(runtime, request, operation, selection_owners)?;
+            self.dispatch(
+                runtime,
+                request,
+                operation,
+                selection_owners,
+                audio_providers,
+            )?;
         }
         Ok(())
     }
@@ -735,6 +819,7 @@ impl Connection {
         mut request: http::Request,
         operation: &mut u64,
         selection_owners: &mut SelectionOwners,
+        audio_providers: &AudioProviders,
     ) -> ModuleResult<()> {
         let RequestTarget::Api(route) = &request.target else {
             if let RequestTarget::BrowserAuth(action) = request.target {
@@ -821,7 +906,12 @@ impl Connection {
             }
             return Ok(());
         }
-        if let Some(request_id) = self.submit(runtime, route.service, request.payload, operation)? {
+        if let Some(request_id) = self.submit(
+            runtime,
+            audio_providers.service(route.service),
+            request.payload,
+            operation,
+        )? {
             self.stage = Stage::Dispatching {
                 request_id,
                 login: route.scope.is_none(),
@@ -1341,14 +1431,27 @@ fn service_status(payload: &Value, login: bool, operational_health: bool) -> u16
 }
 
 #[cfg(test)]
+fn test_stream_pair() -> (std::net::TcpStream, TcpStream) {
+    let network = Network::test_provider();
+    let listener = network.bind_tcp("127.0.0.1:0".parse().unwrap()).unwrap();
+    let peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (stream, _) = listener.accept().unwrap();
+    (peer, stream)
+}
+
+#[cfg(test)]
 mod csrf_revocation_tests;
 
 #[cfg(test)]
 mod auth_verification_tests;
 
 #[cfg(test)]
+mod provider_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpStream;
 
     #[test]
     fn real_loopback_ingress_stays_closed_until_policy_load_and_uses_transport_rules() {
@@ -1397,8 +1500,7 @@ mod tests {
     }
 
     fn browser_reply(action: BrowserAuth, payload: Value) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, client) = test_stream_pair();
         let mut connection = Connection {
             stream: client,
             tls: None,
@@ -1467,8 +1569,7 @@ mod tests {
 
     #[test]
     fn saturated_tls_plaintext_buffer_retains_unsent_response() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, client) = test_stream_pair();
         let configuration =
             ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_safe_default_protocol_versions()

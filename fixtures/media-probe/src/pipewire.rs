@@ -163,8 +163,9 @@ fn safe_availability_reason(reason: &str) -> bool {
 
 fn verify_native_interface(runtime: &RuntimeClient) -> ModuleResult<()> {
     let binding = unsafe {
-        runtime.bind_native(
+        runtime.bind_native_typed(
             CAPTURE,
+            amaterasu_module_sdk::media::native_contracts::CAPTURE,
             1,
             CAPTURE_INTERFACE_MINOR,
             size_of::<CaptureApi>() as u32,
@@ -378,8 +379,9 @@ impl CaptureProbe {
         };
         self.stream = Some(stream);
         let binding = unsafe {
-            runtime.bind_native(
+            runtime.bind_native_typed(
                 CAPTURE,
+                amaterasu_module_sdk::media::native_contracts::CAPTURE,
                 1,
                 CAPTURE_INTERFACE_MINOR,
                 size_of::<CaptureApi>() as u32,

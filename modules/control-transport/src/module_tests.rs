@@ -3,6 +3,7 @@ use amaterasu_module_sdk::abi::*;
 use std::{collections::VecDeque, ffi::c_void, net::UdpSocket};
 
 struct Host {
+    typed_network_binds: usize,
     responses: VecDeque<Response>,
     completed: Vec<serde_json::Value>,
 }
@@ -15,6 +16,21 @@ unsafe extern "C" fn invoke(
     // SAFETY: test host and borrowed arguments remain live through invocation.
     let host = unsafe { &mut *context.cast::<Host>() };
     let command: Command = serde_json::from_slice(unsafe { input.read().unwrap() }).unwrap();
+    match &command {
+        Command::NativeBindTyped {
+            service, contract, ..
+        } => {
+            assert_eq!(contract, "amaterasu.network-interface/1");
+            assert_eq!(service, "vendor.network/1");
+            host.typed_network_binds += 1;
+        }
+        Command::NativeBind { service, .. }
+            if service == "vendor.network/1" || service == "amaterasu.network/1" =>
+        {
+            panic!("network bindings must declare the typed network contract");
+        }
+        _ => {}
+    }
     if let Command::Complete { payload, .. } = command {
         host.completed.push(payload);
     }
@@ -37,7 +53,11 @@ fn start(host: &mut Host) -> ControlTransport {
         invoke,
     };
     // SAFETY: each test keeps its host alive until the module is dropped.
-    ControlTransport::start(unsafe { RuntimeClient::from_endpoint(api) }).unwrap()
+    ControlTransport::start_configured(
+        unsafe { RuntimeClient::from_endpoint(api) },
+        Some(Network::test_provider()),
+    )
+    .unwrap()
 }
 
 fn open_request() -> Response {
@@ -68,6 +88,7 @@ fn ended() -> Response {
 fn cancellation_before_open_or_after_allocation_leaves_no_hidden_port() {
     for before in [true, false] {
         let mut host = Host {
+            typed_network_binds: 0,
             responses: VecDeque::new(),
             completed: Vec::new(),
         };
@@ -94,6 +115,7 @@ fn cancellation_before_open_or_after_allocation_leaves_no_hidden_port() {
 #[test]
 fn lost_replay_completion_preserves_the_original_owned_stream() {
     let mut host = Host {
+        typed_network_binds: 0,
         responses: VecDeque::new(),
         completed: Vec::new(),
     };
@@ -117,6 +139,7 @@ fn lost_replay_completion_preserves_the_original_owned_stream() {
 #[test]
 fn poisoned_controller_teardown_closes_sockets_even_with_retained_binding_state() {
     let mut host = Host {
+        typed_network_binds: 0,
         responses: VecDeque::new(),
         completed: Vec::new(),
     };
@@ -145,4 +168,31 @@ fn poisoned_controller_teardown_closes_sockets_even_with_retained_binding_state(
             .payload["streams"],
         json!([])
     );
+}
+
+#[test]
+fn startup_rejects_an_unavailable_selected_network_provider() {
+    let mut host = Host {
+        typed_network_binds: 0,
+        responses: VecDeque::from([
+            Response::Result {
+                payload: json!({"enabled":true,"network_provider":"vendor.network/1","allowed_principals":["alice"]}),
+            },
+            Response::Error {
+                code: "not_found".into(),
+                message: "provider unavailable".into(),
+            },
+        ]),
+        completed: Vec::new(),
+    };
+    let api = HostApi {
+        header: AbiHeader::of::<HostApi>(),
+        context: (&mut host as *mut Host).cast(),
+        invoke,
+    };
+    // SAFETY: host remains live while startup attempts the selected binding.
+    let result = ControlTransport::start(unsafe { RuntimeClient::from_endpoint(api) });
+    assert!(result.is_err());
+    assert_eq!(host.typed_network_binds, 1);
+    assert!(host.responses.is_empty());
 }

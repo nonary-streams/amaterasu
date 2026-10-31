@@ -265,8 +265,9 @@ impl Probe {
         // SAFETY: the signed capture dependency supplies the v1.1 table. The
         // binding keeps it alive, and this synchronous call retains no pointers.
         let binding = unsafe {
-            self.runtime.bind_native(
+            self.runtime.bind_native_typed(
                 service,
+                amaterasu_module_sdk::media::native_contracts::CAPTURE,
                 1,
                 CAPTURE_INTERFACE_MINOR,
                 size_of::<CaptureApi>() as u32,
@@ -291,8 +292,35 @@ impl Probe {
     ) -> ModuleResult<abi::Status> {
         // SAFETY: exact layout, dependency and borrowing guarantees come from caller.
         let binding = unsafe {
-            self.runtime
-                .bind_native(service, 1, 0, size_of::<T>() as u32)
+            if service == "amaterasu.video/1" {
+                amaterasu_module_sdk::video::bind(&self.runtime, service)
+            } else {
+                let contract = match service {
+                    "amaterasu.capture-dxgi/1" | "amaterasu.capture-wgc/1" => {
+                        Some(amaterasu_module_sdk::media::native_contracts::CAPTURE)
+                    }
+                    "amaterasu.encode/1" => {
+                        Some(amaterasu_module_sdk::media::native_contracts::ENCODER)
+                    }
+                    "amaterasu.audio/1" => Some(amaterasu_module_sdk::audio::CAPTURE_CONTRACT),
+                    "amaterasu.audio-encode/1" => {
+                        Some(amaterasu_module_sdk::audio::ENCODER_CONTRACT)
+                    }
+                    _ => None,
+                };
+                match contract {
+                    Some(contract) => self.runtime.bind_native_typed(
+                        service,
+                        contract,
+                        1,
+                        0,
+                        size_of::<T>() as u32,
+                    ),
+                    None => self
+                        .runtime
+                        .bind_native(service, 1, 0, size_of::<T>() as u32),
+                }
+            }
         }?;
         let table = unsafe { binding.table::<T>() }?;
         Ok(inspect(table))

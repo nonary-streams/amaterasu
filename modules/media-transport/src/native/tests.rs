@@ -9,6 +9,7 @@ use amaterasu_media::MEDIA_CLOSED;
 fn bound_native_tables_isolate_owners_and_remain_closed_after_shutdown() {
     let (video, audio) = receivers();
     let shared = Arc::new(Mutex::new(Controller::new(Settings {
+        network_provider: None,
         enabled: true,
         allow_remote: false,
         allowed_principals: vec!["owner".into()],

@@ -47,7 +47,13 @@ impl ManagedModule for CaptureSource {
         })?;
         // SAFETY: the stable boxed factory lives through module destruction;
         // consumers own independent shared references through their bindings.
-        unsafe { runtime.register_native(capture_service, &factory.api) }?;
+        unsafe {
+            runtime.register_native_typed(
+                capture_service,
+                amaterasu_module_sdk::media::native_contracts::CAPTURE,
+                &factory.api,
+            )
+        }?;
         runtime.require_success(Command::Register {
             service: METRICS_SERVICE.into(),
         })?;

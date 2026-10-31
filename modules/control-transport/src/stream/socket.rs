@@ -83,8 +83,11 @@ impl Stream {
 }
 
 fn ignorable_datagram_error(error: &io::Error) -> bool {
-    // Windows can surface delayed UDP ICMP errors on recv_from. They are not
-    // authenticated peer messages; authenticated idle/handshake deadlines still
-    // bound resource lifetime. Also tolerate oversized IPv6/jumbo datagrams.
-    cfg!(windows) && matches!(error.raw_os_error(), Some(10040 | 10054))
+    // Providers normalize oversized datagrams and delayed UDP ICMP resets into
+    // portable conditions. They are not authenticated peer messages; the
+    // authenticated idle/handshake deadlines still bound resource lifetime.
+    matches!(
+        error.kind(),
+        io::ErrorKind::InvalidData | io::ErrorKind::ConnectionReset
+    )
 }

@@ -1084,7 +1084,7 @@ fn stream_probe_replaces_platform_sources_without_widening_native_interfaces() {
         assert!(STREAM_SESSION.calls.contains(&"amaterasu.host-metrics/1"));
         assert!(!rtsp.calls.contains(&"amaterasu.session-history/1"));
         assert!(!rtsp.calls.contains(&"amaterasu.host-metrics/1"));
-        assert!(rtsp.native_uses.is_empty());
+        assert_eq!(rtsp.native_uses, &["amaterasu.network/1"]);
     }
 }
 
@@ -1254,7 +1254,7 @@ fn installer_policy_enables_only_the_loopback_control_plane() {
     );
     assert_eq!(
         policy.settings["amaterasu.catalog"]["export_principals"],
-        json!({"amaterasu.nvhttp": "amaterasu.management"})
+        json!({"amaterasu.nvhttp": "amaterasu.management", "amaterasu.management": "amaterasu.management"})
     );
     for component in [
         "amaterasu.capture-dxgi",
@@ -1294,7 +1294,7 @@ fn catalog_profiles_scope_lutris_steam_id_export_authorization() {
         );
         assert_eq!(
             catalog["export_principals"],
-            json!({"amaterasu.nvhttp": "amaterasu.management"})
+            json!({"amaterasu.nvhttp": "amaterasu.management", "amaterasu.management": "amaterasu.management"})
         );
         assert!(
             policy.settings[AUTHENTICATION.id]["allowed_scopes"]
@@ -1653,7 +1653,10 @@ fn public_launch_packages_preserve_transitive_delegation_and_identity_only_nativ
                     .all(|service| adapter.calls.contains(service))
             );
         }
-        assert_eq!(adapter.native_uses, &["amaterasu.identity/1"]);
+        assert_eq!(
+            names(adapter.native_uses),
+            names(&["amaterasu.identity/1", "amaterasu.network/1"])
+        );
     }
 }
 
@@ -1798,12 +1801,14 @@ fn catalog_profiles_package_library_with_scoped_calls() {
         ) {
             &[
                 "amaterasu.catalog/1",
+                "amaterasu.state/1",
                 "amaterasu.steam/1",
                 "amaterasu.lutris/1",
             ][..]
         } else {
             &[
                 "amaterasu.catalog/1",
+                "amaterasu.state/1",
                 "amaterasu.steam/1",
                 "amaterasu.lutris/1",
                 "amaterasu.playnite/1",
@@ -1833,4 +1838,49 @@ fn catalog_profiles_package_library_with_scoped_calls() {
             .iter()
             .any(|component| component.id == LIBRARY.id)
     );
+}
+
+#[test]
+fn network_consumers_have_an_explicit_provider_dependency_and_native_grant() {
+    for profile in [
+        PackageProfile::Platform,
+        PackageProfile::MediaProbe,
+        PackageProfile::StreamProbe,
+        PackageProfile::SoftwareProbe,
+        PackageProfile::LinuxProbe,
+        PackageProfile::DesktopStreamSmoke,
+        PackageProfile::LinuxSession,
+        PackageProfile::LinuxSessionExtensions,
+        PackageProfile::ExtensionExample,
+    ] {
+        let components = profile.components();
+        let provider = components
+            .iter()
+            .find(|component| component.id == NETWORK.id)
+            .expect("network provider in composition");
+        assert_eq!(provider.native_provides, &["amaterasu.network/1"]);
+        for consumer in components.iter().filter(|component| {
+            [
+                "amaterasu.management",
+                "amaterasu.nvhttp",
+                "amaterasu.rtsp",
+                "amaterasu.steam",
+                "amaterasu.updater",
+                "amaterasu.media-transport",
+                "amaterasu.control-transport",
+            ]
+            .contains(&component.id)
+        }) {
+            assert!(
+                consumer.native_uses.contains(&"amaterasu.network/1"),
+                "{} missing native contract",
+                consumer.id
+            );
+            assert!(
+                consumer.dependencies.contains(&NETWORK.id),
+                "{} may outlive provider code",
+                consumer.id
+            );
+        }
+    }
 }

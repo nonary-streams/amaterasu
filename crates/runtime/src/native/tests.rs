@@ -79,7 +79,7 @@ fn services() -> NativeServices {
             ..Default::default()
         },
     );
-    NativeServices::new(grants)
+    NativeServices::new(grants, BTreeMap::new())
 }
 fn query() -> Command {
     Command::NativeBind {
@@ -228,4 +228,182 @@ fn factory_descriptor_can_move_after_registration() {
     ));
     assert_eq!(context.binds.load(Ordering::SeqCst), 1);
     assert_eq!(context.releases.load(Ordering::SeqCst), 1);
+}
+
+fn typed_query(contract: &str) -> Command {
+    Command::NativeBindTyped {
+        service: "frames/1".into(),
+        contract: contract.into(),
+        interface_major: 1,
+        min_minor: 0,
+        min_size: size_of::<Table>() as u32,
+    }
+}
+
+#[test]
+fn typed_native_binding_rejects_wrong_family_before_any_factory_callback() {
+    let services = services();
+    let context = context(&services, false);
+    let factory = factory(&context);
+    // SAFETY: factory/context outlive every synchronous call and resulting table.
+    assert!(matches!(
+        unsafe {
+            services.dispatch(
+                "provider",
+                Command::NativeRegisterTyped {
+                    service: "frames/1".into(),
+                    factory: &factory as *const _ as usize,
+                    contract: "example.frames-interface/1".into(),
+                },
+            )
+        },
+        Response::Ok
+    ));
+    // Both families advertise the same major and minimum size. Their semantic
+    // table identity must still be checked before invoking either factory.
+    assert!(
+        matches!(unsafe { services.dispatch("consumer", typed_query("example.other-interface/1")) },
+        Response::Error { code, .. } if code == "native_contract_mismatch")
+    );
+    assert_eq!(context.binds.load(Ordering::SeqCst), 0);
+    assert!(services.registry.lock().unwrap().bindings.is_empty());
+    let Response::NativeBound { binding, .. } =
+        (unsafe { services.dispatch("consumer", typed_query("example.frames-interface/1")) })
+    else {
+        panic!("matching contract rejected");
+    };
+    assert_eq!(context.binds.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        unsafe { services.dispatch("consumer", Command::NativeRelease { binding }) },
+        Response::Ok
+    ));
+    assert_eq!(context.releases.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn typed_binding_never_infers_contract_from_an_untyped_legacy_factory() {
+    let services = services();
+    let context = context(&services, false);
+    let factory = factory(&context);
+    // SAFETY: test keeps factory/context live until the runtime calls finish.
+    assert!(matches!(
+        unsafe {
+            services.dispatch(
+                "provider",
+                Command::NativeRegister {
+                    service: "frames/1".into(),
+                    factory: &factory as *const _ as usize,
+                },
+            )
+        },
+        Response::Ok
+    ));
+    assert!(
+        matches!(unsafe { services.dispatch("consumer", typed_query("example.frames-interface/1")) },
+        Response::Error { code, .. } if code == "native_contract_mismatch")
+    );
+    assert_eq!(context.binds.load(Ordering::SeqCst), 0);
+    // Legacy explicitly unsafe consumers keep their original compatibility path.
+    let Response::NativeBound { binding, .. } = (unsafe { services.dispatch("consumer", query()) })
+    else {
+        panic!("legacy bind rejected");
+    };
+    unsafe {
+        services.dispatch("consumer", Command::NativeRelease { binding });
+    }
+}
+
+#[test]
+fn legacy_contract_approval_is_scoped_and_does_not_override_typed_registration() {
+    for (principal, service, explicit, accepted) in [
+        ("provider", "frames/1", false, true),
+        ("other", "frames/1", false, false),
+        ("provider", "other/1", false, false),
+        ("provider", "frames/1", true, false),
+    ] {
+        let grants = BTreeMap::from([
+            (
+                "provider".into(),
+                Grants {
+                    native_provide: ["frames/1".into(), "other/1".into()].into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "other".into(),
+                Grants {
+                    native_provide: ["frames/1".into()].into(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "consumer".into(),
+                Grants {
+                    native_use: ["frames/1".into(), "other/1".into()].into(),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let approvals = BTreeMap::from([(
+            "provider".into(),
+            BTreeMap::from([("frames/1".into(), "example.frames/1".into())]),
+        )]);
+        let services = NativeServices::new(grants, approvals);
+        let context = context(&services, false);
+        let descriptor = factory(&context);
+        let address = &descriptor as *const _ as usize;
+        let command = if explicit {
+            Command::NativeRegisterTyped {
+                service: service.into(),
+                factory: address,
+                contract: "example.other/1".into(),
+            }
+        } else {
+            Command::NativeRegister {
+                service: service.into(),
+                factory: address,
+            }
+        };
+        assert!(matches!(
+            unsafe { services.dispatch(principal, command) },
+            Response::Ok
+        ));
+        let query = |contract: &str| Command::NativeBindTyped {
+            service: service.into(),
+            contract: contract.into(),
+            interface_major: 1,
+            min_minor: 0,
+            min_size: size_of::<Table>() as u32,
+        };
+        assert!(
+            matches!(unsafe { services.dispatch("consumer", query("example.wrong/1")) }, Response::Error { code, .. } if code == "native_contract_mismatch")
+        );
+        assert_eq!(context.binds.load(Ordering::SeqCst), 0);
+        let response = unsafe { services.dispatch("consumer", query("example.frames/1")) };
+        if accepted {
+            let Response::NativeBound { binding, .. } = response else {
+                panic!("approved binding failed")
+            };
+            assert!(matches!(
+                unsafe { services.dispatch("consumer", Command::NativeRelease { binding }) },
+                Response::Ok
+            ));
+        } else {
+            assert!(
+                matches!(response, Response::Error { code, .. } if code == "native_contract_mismatch")
+            );
+            assert_eq!(context.binds.load(Ordering::SeqCst), 0);
+        }
+        if explicit {
+            let Response::NativeBound { binding, .. } =
+                (unsafe { services.dispatch("consumer", query("example.other/1")) })
+            else {
+                panic!("explicit family was overridden")
+            };
+            assert!(matches!(
+                unsafe { services.dispatch("consumer", Command::NativeRelease { binding }) },
+                Response::Ok
+            ));
+        }
+    }
 }

@@ -5,10 +5,13 @@ use amaterasu_gamestream::{
 };
 #[cfg(test)]
 use amaterasu_module_sdk::EncoderBackend;
-use amaterasu_module_sdk::EncoderSelection;
+use amaterasu_module_sdk::{EncoderSelection, network::Network};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+#[cfg(test)]
+use std::net::UdpSocket;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 const DEFAULT_BASE_PORT: u16 = 47_989;
 const MIN_BASE_PORT: u16 = 1_029;
@@ -30,6 +33,7 @@ pub enum AddressFamily {
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub enabled: bool,
+    pub network_provider: Option<String>,
     pub allow_remote: bool,
     pub bind: SocketAddr,
     pub address_family: Option<AddressFamily>,
@@ -40,6 +44,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: false,
+            network_provider: None,
             allow_remote: false,
             bind: SocketAddr::from(([127, 0, 0, 1], DEFAULT_BASE_PORT + RTSP_SETUP_OFFSET)),
             address_family: None,
@@ -50,7 +55,11 @@ impl Default for Settings {
 }
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.allowed_principals.len() > 16
+        if self
+            .network_provider
+            .as_deref()
+            .is_some_and(|service| !amaterasu_contracts::valid_name(service))
+            || self.allowed_principals.len() > 16
             || self.allowed_principals.iter().any(|name| !valid_name(name))
         {
             return Err("invalid_settings");
@@ -195,25 +204,25 @@ impl Settings {
         })
     }
 
+    #[cfg(test)]
     pub fn probe_media_binds(&self, base_port: u16) -> Result<(), &'static str> {
+        self.probe_media_binds_with_network(&Network::test_provider(), base_port)
+    }
+
+    pub fn probe_media_binds_with_network(
+        &self,
+        network: &Network,
+        base_port: u16,
+    ) -> Result<(), &'static str> {
         let binds = self.media_binds_by_family(base_port)?;
-        // Hold every UDP socket until the complete set has been checked. The
-        // stream-session service later binds its per-session sockets from the
-        // same addresses; this preflight cannot reserve sockets across services.
+        // Hold every provider-owned UDP handle until the complete set has been
+        // checked. Per-session transport admission performs its own later bind.
         let mut sockets = Vec::with_capacity(binds.len() * 3);
         for bind in binds
             .iter()
             .flat_map(|family| [family.video, family.control, family.audio])
         {
-            let socket = Socket::new(Domain::for_address(bind), Type::DGRAM, Some(Protocol::UDP))
-                .map_err(|_| "udp_bind_failed")?;
-            if bind.is_ipv6() {
-                socket.set_only_v6(true).map_err(|_| "udp_bind_failed")?;
-            }
-            socket
-                .bind(&SockAddr::from(bind))
-                .map_err(|_| "udp_bind_failed")?;
-            sockets.push(UdpSocket::from(socket));
+            sockets.push(network.bind_udp(bind).map_err(|_| "udp_bind_failed")?);
         }
         Ok(())
     }
@@ -2684,6 +2693,44 @@ mod tests {
             Err("udp_bind_failed"),
             "a conflict on only the IPv6 video bind must defer network activation"
         );
+    }
+
+    #[test]
+    fn udp_preflight_uses_the_injected_provider_instead_of_binding_os_sockets() {
+        use amaterasu_module_sdk::{abi::Status, network::abi};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static BIND_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn reject_udp_bind(
+            _: *mut std::ffi::c_void,
+            _: abi::Address,
+            _: *mut u64,
+        ) -> Status {
+            BIND_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+            abi::UNSUPPORTED
+        }
+
+        let factory = amaterasu_network_sockets::Factory::new();
+        // SAFETY: the factory outlives the owned binding. The copied table keeps
+        // the original context/release pair and changes only UDP admission.
+        // Exactly one SDK owner releases that context before the factory drops.
+        let provider = unsafe {
+            amaterasu_network_sockets::bind_standalone(&factory, "rtsp-preflight-test")
+                .expect("explicit standalone provider")
+        };
+        let mut table = unsafe { provider.read() };
+        table.udp_bind = reject_udp_bind;
+        // SAFETY: the table and factory remain live until network is dropped;
+        // its replacement callback is thread-safe and returns a defined error.
+        let network =
+            unsafe { Network::from_native_table(&table) }.expect("alternate network provider");
+        let settings = Settings::default();
+        assert_eq!(
+            settings.probe_media_binds_with_network(&network, 25_000),
+            Err("udp_bind_failed")
+        );
+        assert_eq!(BIND_ATTEMPTS.load(Ordering::SeqCst), 1);
+        drop(network);
     }
 
     #[test]

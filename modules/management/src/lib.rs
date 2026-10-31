@@ -15,6 +15,7 @@ mod tray_events;
 #[cfg(test)]
 mod csrf_adversarial_tests;
 
+use amaterasu_module_sdk::network::Network;
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use amaterasu_package::repository::RepositoryStore;
 use peer_policy::PeerTier;
@@ -33,6 +34,9 @@ const AUTH_SERVICE: &str = "amaterasu.authentication/1";
 struct Settings {
     #[serde(default)]
     enabled: bool,
+    network_provider: Option<String>,
+    audio_capture_provider: Option<String>,
+    audio_encoder_provider: Option<String>,
     bind: Option<SocketAddr>,
     tls_bind: Option<SocketAddr>,
     tls_certificate_path: Option<String>,
@@ -74,7 +78,7 @@ impl ManagedModule for ManagementModule {
             return Err("management settings unavailable".into());
         };
         let settings: Settings =
-            serde_json::from_value(payload).map_err(|error| error.to_string())?;
+            serde_json::from_value(payload.clone()).map_err(|error| error.to_string())?;
         validate_settings(&settings)?;
         let repositories = settings
             .web
@@ -95,7 +99,9 @@ impl ManagedModule for ManagementModule {
             .map(extensions::Extensions::new)
             .transpose()?;
         let server = if settings.enabled {
-            let mut server = Server::bind(
+            let network = Network::from_settings(&runtime, &payload)?;
+            let mut server = Server::bind_with_network(
+                network,
                 settings
                     .bind
                     .ok_or("enabled management requires an explicit loopback bind")?,
@@ -104,6 +110,14 @@ impl ManagedModule for ManagementModule {
                 settings.tls_bind,
                 tls_configuration,
             )?;
+            server.set_audio_providers(server::AudioProviders {
+                capture: settings
+                    .audio_capture_provider
+                    .unwrap_or_else(|| "amaterasu.audio/1".into()),
+                encoder: settings
+                    .audio_encoder_provider
+                    .unwrap_or_else(|| "amaterasu.audio-encode/1".into()),
+            });
             server.set_extensions(extensions);
             Some(server)
         } else {
@@ -510,6 +524,24 @@ fn complete(runtime: &RuntimeClient, request: u64, payload: serde_json::Value) -
 
 fn validate_settings(settings: &Settings) -> ModuleResult<()> {
     if settings
+        .network_provider
+        .as_deref()
+        .is_some_and(str::is_empty)
+    {
+        return Err("management network provider cannot be empty".into());
+    }
+    for service in [
+        &settings.audio_capture_provider,
+        &settings.audio_encoder_provider,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !amaterasu_module_sdk::network::valid_provider(service) {
+            return Err("invalid management audio provider".into());
+        }
+    }
+    if settings
         .bind
         .is_some_and(|address| !address.ip().is_loopback())
     {
@@ -538,6 +570,17 @@ amaterasu_module_sdk::export_module!(ManagementModule);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_provider_settings_are_versioned_and_validated_at_startup() {
+        let settings: Settings = serde_json::from_value(json!({"audio_capture_provider":"vendor.capture/1", "audio_encoder_provider":"vendor.encoder/1"})).unwrap();
+        assert!(validate_settings(&settings).is_ok());
+        for bad in ["", "vendor.capture/2", "Vendor/1", "vendor service/1"] {
+            let settings: Settings =
+                serde_json::from_value(json!({"audio_capture_provider":bad})).unwrap();
+            assert!(validate_settings(&settings).is_err());
+        }
+    }
 
     fn temporary_package_root() -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
@@ -593,6 +636,96 @@ mod tests {
         ] {
             let settings = serde_json::from_value(json!({"tls_bind":bind,"tls_certificate_path":"/cert.pem","tls_private_key_path":"/key.pem"})).unwrap();
             validate_settings(&settings).unwrap();
+        }
+    }
+
+    #[test]
+    fn enabled_server_requires_the_selected_network_provider() {
+        use amaterasu_module_sdk::abi::{
+            AbiHeader, BorrowedBytes, HostApi, ReplySink, STATUS_INVALID_ARGUMENT, STATUS_OK,
+            Status,
+        };
+        use std::ffi::c_void;
+        use std::sync::Mutex;
+
+        struct Host {
+            settings: serde_json::Value,
+            commands: Mutex<Vec<Command>>,
+        }
+        unsafe extern "C" fn invoke(
+            context: *mut c_void,
+            input: BorrowedBytes,
+            reply: ReplySink,
+        ) -> Status {
+            // SAFETY: the test retains the host and all input/reply borrows for
+            // each synchronous runtime call.
+            let host = unsafe { &*context.cast::<Host>() };
+            let Ok(bytes) = (unsafe { input.read() }) else {
+                return STATUS_INVALID_ARGUMENT;
+            };
+            let Ok(command) = serde_json::from_slice::<Command>(bytes) else {
+                return STATUS_INVALID_ARGUMENT;
+            };
+            let response = match &command {
+                Command::GetSettings {} => Response::Result {
+                    payload: host.settings.clone(),
+                },
+                Command::NativeBindTyped { .. } | Command::NativeBind { .. } => Response::error(
+                    "permission_denied",
+                    "test provider is deliberately unavailable",
+                ),
+                Command::Register { .. } => Response::Ok,
+                _ => return STATUS_INVALID_ARGUMENT,
+            };
+            host.commands.lock().unwrap().push(command);
+            let bytes = serde_json::to_vec(&response).unwrap();
+            // SAFETY: the sink copies the reply during this call.
+            unsafe { reply.send(&bytes) };
+            STATUS_OK
+        }
+        for enabled in [false, true] {
+            let host = Host {
+                settings: json!({
+                    "enabled": enabled,
+                    "bind": "127.0.0.1:0",
+                    "network_provider": "alternative.network/1"
+                }),
+                commands: Mutex::new(Vec::new()),
+            };
+            let endpoint = HostApi {
+                header: AbiHeader::of::<HostApi>(),
+                context: std::ptr::from_ref(&host).cast_mut().cast(),
+                invoke,
+            };
+            // SAFETY: host outlives the client and any returned disabled module.
+            let runtime = unsafe { RuntimeClient::from_endpoint(endpoint) };
+            let module = ManagementModule::start(runtime);
+            assert_eq!(module.is_ok(), !enabled);
+            drop(module);
+            let commands = host.commands.lock().unwrap();
+            assert!(
+                !commands
+                    .iter()
+                    .any(|command| matches!(command, Command::NativeBind { .. })),
+                "network startup must bind the declared interface contract"
+            );
+            let selected: Vec<_> = commands
+                .iter()
+                .filter_map(|command| match command {
+                    Command::NativeBindTyped {
+                        service, contract, ..
+                    } => Some((service.as_str(), contract.as_str())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                selected,
+                if enabled {
+                    vec![("alternative.network/1", "amaterasu.network-interface/1")]
+                } else {
+                    Vec::new()
+                }
+            );
         }
     }
 

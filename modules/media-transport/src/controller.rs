@@ -1,6 +1,6 @@
 use crate::{model::*, stream::Stream};
 use amaterasu_media::{EncodedAudioPacket, EncodedPacket, MEDIA_CLOSED};
-use amaterasu_module_sdk::abi::Status;
+use amaterasu_module_sdk::{abi::Status, network::Network};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -14,6 +14,7 @@ struct Record {
 }
 
 pub struct Controller {
+    network: Network,
     settings: Settings,
     streams: BTreeMap<u64, Stream>,
     operations: BTreeMap<(String, String), Record>,
@@ -24,8 +25,14 @@ pub struct Controller {
 }
 
 impl Controller {
+    #[cfg(test)]
     pub fn new(settings: Settings) -> Self {
+        Self::with_network(settings, Network::test_provider())
+    }
+
+    pub fn with_network(settings: Settings, network: Network) -> Self {
         Self {
+            network,
             settings,
             streams: BTreeMap::new(),
             operations: BTreeMap::new(),
@@ -132,7 +139,7 @@ impl Controller {
             }
         }
         let id = self.random_id()?;
-        let stream = Stream::open(owner, &request)?;
+        let stream = Stream::open_with_network(&self.network, owner, &request)?;
         let reply = metadata(id, &stream);
         if let Some(key) = key {
             self.used_keys.push(key);

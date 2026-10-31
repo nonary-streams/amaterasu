@@ -58,19 +58,31 @@ impl NativeBackend {
         Ok(())
     }
 
-    pub(super) fn new(runtime: &RuntimeClient, handles: Handles) -> PlaneResult<Self> {
-        let video = bind::<VideoApi>(runtime, "amaterasu.video/1")?;
+    pub(super) fn new(
+        runtime: &RuntimeClient,
+        handles: Handles,
+        providers: &crate::providers::ProviderServices,
+    ) -> PlaneResult<Self> {
+        let video = unsafe { amaterasu_module_sdk::video::bind(runtime, &providers.video) }
+            .map_err(|_| "native_binding_failed")?;
         let (capture, encoder) = match (
             handles.stream_audio,
             handles.audio_capture,
             handles.audio_encoder,
         ) {
             (true, Some(_), Some(_)) => (
-                Some(bind::<AudioCaptureApi>(runtime, "amaterasu.audio/1")?),
-                Some(bind::<AudioEncoderApi>(
-                    runtime,
-                    "amaterasu.audio-encode/1",
-                )?),
+                Some(
+                    unsafe {
+                        amaterasu_module_sdk::audio::bind_capture(runtime, &providers.audio_capture)
+                    }
+                    .map_err(|_| "native_binding_failed")?,
+                ),
+                Some(
+                    unsafe {
+                        amaterasu_module_sdk::audio::bind_encoder(runtime, &providers.audio_encoder)
+                    }
+                    .map_err(|_| "native_binding_failed")?,
+                ),
             ),
             (false, None, None) => (None, None),
             _ => return Err("invalid_audio_handles"),
@@ -79,21 +91,18 @@ impl NativeBackend {
             video,
             capture,
             encoder,
-            media: bind::<MediaTransportApi>(runtime, "amaterasu.media-transport/1")?,
-            control: bind::<ControlTransportApi>(runtime, "amaterasu.control-transport/1")?,
+            media: unsafe {
+                amaterasu_module_sdk::transport::bind_media(runtime, &providers.media_transport)
+            }
+            .map_err(|_| "native_binding_failed")?,
+            control: unsafe {
+                amaterasu_module_sdk::transport::bind_control(runtime, &providers.control_transport)
+            }
+            .map_err(|_| "native_binding_failed")?,
             handles,
             last_hdr: None,
         })
     }
-}
-
-fn bind<T>(runtime: &RuntimeClient, service: &str) -> PlaneResult<NativeBinding> {
-    // SAFETY: signed dependencies retain these exact C interfaces until plane drop.
-    let binding = unsafe { runtime.bind_native(service, 1, 0, size_of::<T>() as u32) }
-        .map_err(|_| "native_binding_failed")?;
-    // SAFETY: each private call site supplies the documented service's exact table.
-    unsafe { binding.table::<T>() }.map_err(|_| "native_layout_mismatch")?;
-    Ok(binding)
 }
 
 impl Backend for NativeBackend {

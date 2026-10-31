@@ -16,5 +16,10 @@ serde.workspace = true
 serde_json.workspace = true
 getrandom.workspace = true
 
+[dev-dependencies]
+amaterasu-network-policy = { path = "../../crates/network-policy", features = ["test-support"] }
+
+amaterasu-module-sdk = { workspace = true, features = ["network-test-support"] }
+
 [lints]
 workspace = true

@@ -18,7 +18,11 @@ serde.workspace = true
 serde_json.workspace = true
 getrandom.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
+amaterasu-network-sockets = { path = "../../crates/network-sockets" }
 socket2 = "0.6.5"
+amaterasu-module-sdk = { workspace = true, features = ["network-test-support"] }
 
 [lints]
 workspace = true

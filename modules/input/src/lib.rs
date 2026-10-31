@@ -34,7 +34,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const SERVICE: &str = "amaterasu.input/1";
+const SERVICE: &str = amaterasu_module_sdk::input::INPUT_SERVICE;
 const CONFIGURATION_SERVICE: &str = "amaterasu.configuration/1";
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

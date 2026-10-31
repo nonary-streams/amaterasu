@@ -3,9 +3,10 @@ use amaterasu_gamestream::{
     crypto::RtspEnvelopeDecoder,
     rtsp::{Decoder, Request},
 };
+use amaterasu_module_sdk::network::TcpStream;
 use std::{
     io::{self, Read, Write},
-    net::{IpAddr, TcpStream},
+    net::IpAddr,
 };
 
 const IO_BUDGET: usize = 16 * 1024;

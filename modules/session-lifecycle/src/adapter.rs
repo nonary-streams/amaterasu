@@ -35,6 +35,8 @@ pub struct LifecycleSettings {
     /// Broker identities granted delegation by installed operator policy.
     pub session_delegates: BTreeSet<String>,
     pub input_actions: BTreeSet<String>,
+    /// Selected broker principal for new input bindings, when several are authorized.
+    pub input_provider: Option<String>,
     pub action_service: String,
     /// Broker identity allowed to attest settings-scope request sources.
     pub settings_registry_caller: String,
@@ -59,6 +61,7 @@ impl Default for LifecycleSettings {
             trusted_callers: BTreeSet::new(),
             session_delegates: BTreeSet::new(),
             input_actions: BTreeSet::new(),
+            input_provider: None,
             action_service: "amaterasu.extension-actions".into(),
             settings_registry_caller: String::new(),
             settings_registry_service: None,
@@ -432,6 +435,13 @@ impl LifecycleSettings {
                 return Err("invalid lifecycle consumers".into());
             }
         }
+        if self
+            .input_provider
+            .as_ref()
+            .is_some_and(|provider| !self.consumers.input.contains(provider))
+        {
+            return Err("invalid lifecycle input provider".into());
+        }
         let mut providers = BTreeSet::new();
         if self.participants.len() > 32 {
             return Err("too many lifecycle participants".into());
@@ -803,6 +813,11 @@ mod tests {
                 .validate()
         };
         assert!(parse(policy.clone()).is_ok());
+        let mut selected_input = policy.clone();
+        selected_input["input_provider"] = json!("input");
+        assert!(parse(selected_input.clone()).is_ok());
+        selected_input["input_provider"] = json!("foreign");
+        assert!(parse(selected_input).is_err());
         let mut invalid_dependency = policy.clone();
         invalid_dependency["participants"][0]["depends_on"] = json!(["absent"]);
         assert!(parse(invalid_dependency).is_err());

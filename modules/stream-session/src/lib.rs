@@ -3,6 +3,7 @@
 mod model;
 mod pipeline;
 mod plane;
+mod providers;
 
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use model::Settings;

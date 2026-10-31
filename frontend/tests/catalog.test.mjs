@@ -814,3 +814,36 @@ test("Lutris card refresh ignores stale A and revokes B on load or removal", asy
   assert.equal(steamArt.children.length, 0);
   assert.deepEqual(revoked, ["blob:1", "blob:2", "blob:3"]);
 });
+
+test("catalog artwork uses an opaque catalog identity and releases its transfer", async () => {
+  const calls = [];
+  const token = "c".repeat(32);
+  const api = { async post(route, request) {
+    calls.push({ route, request: { ...request } });
+    if (route === "library/artwork_release") return { ok: true };
+    return { ok: true, revision: "vendor revision", offset: 0, next_offset: null,
+      total_bytes: 3, mime_type: "image/png", data: "YWJj" };
+  } };
+  const image = await context.Amaterasu.readCatalogArtwork(api, "app-0000000000000001", "vendor revision", () => true, token);
+  assert.equal(await image.text(), "abc");
+  assert.deepEqual(calls, [
+    { route: "library/artwork_read", request: { id: "app-0000000000000001", revision: "vendor revision", offset: 0, transfer_id: token } },
+    { route: "library/artwork_release", request: { id: "app-0000000000000001", transfer_id: token } },
+  ]);
+});
+
+test("catalog artwork rejects changed revisions and releases on cancellation", async () => {
+  const id = "app-0000000000000001";
+  const token = "d".repeat(32);
+  const calls = [];
+  const api = { async post(route) {
+    calls.push(route);
+    return { ok: true, revision: "different", offset: 0, next_offset: null,
+      total_bytes: 3, mime_type: "image/png", data: "YWJj" };
+  } };
+  await assert.rejects(context.Amaterasu.readCatalogArtwork(api, id, "expected", () => true, token), /changed during transfer/);
+  assert.equal(calls.at(-1), "library/artwork_release");
+  calls.length = 0;
+  await assert.rejects(context.Amaterasu.readCatalogArtwork(api, id, "expected", () => false, token), /cancelled/);
+  assert.deepEqual(calls, ["library/artwork_release"]);
+});

@@ -22,6 +22,11 @@ pub(super) type Send<'a> = dyn FnMut(amaterasu_module_sdk::Command) -> ModuleRes
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Entry {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::providers::ProviderServices::is_default"
+    )]
+    pub providers: crate::providers::ProviderServices,
     pub record_id: u64,
     pub owner: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -112,6 +117,7 @@ impl Default for Document {
 impl Entry {
     pub fn from_record(record: &Record) -> Self {
         Self {
+            providers: record.providers.clone(),
             record_id: record.id,
             owner: record.owner.clone(),
             lifecycle_recovery: record.config.lifecycle_session_target.clone().map(
@@ -158,7 +164,8 @@ impl Entry {
     }
 
     pub fn validate(&self) -> bool {
-        self.record_id != 0
+        self.providers.validate().is_ok()
+            && self.record_id != 0
             && !self.owner.is_empty()
             && self.owner.len() <= 128
             && !self.owner.chars().any(char::is_control)
@@ -207,6 +214,7 @@ impl Entry {
         }))
         .map_err(|_| "invalid_lifecycle_journal_entry")?;
         let mut record = Record::new(self.record_id, self.owner.clone(), config, 30_000);
+        record.providers = self.providers.clone();
         record.attempted = self
             .attempted_resources
             .iter()
@@ -586,6 +594,36 @@ mod tests {
         assert_eq!(
             journal.commit(next, &json!({"revision":3})),
             Err("lifecycle_journal_revision_unconfirmed")
+        );
+    }
+}
+
+#[cfg(test)]
+mod provider_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn provider_roles_survive_restart_instead_of_following_new_startup_selection() {
+        let config = serde_json::from_value(json!({"peer_ip":"127.0.0.1","key_hex":"00000000000000000000000000000000","key_id":0,"connect_data":0,"operation_id":"recovery"})).unwrap();
+        let mut record = Record::new(7, "owner".into(), config, 30_000);
+        record.providers.media_transport = "original.media/1".into();
+        record.providers.control_transport = "original.control/1".into();
+        record
+            .attempted
+            .insert(super::super::record::Resource::Media);
+        let entry = Entry::from_record(&record);
+        let value = serde_json::to_value(&entry).unwrap();
+        let recovered = serde_json::from_value::<Entry>(value)
+            .unwrap()
+            .recovery_record()
+            .unwrap();
+        assert_eq!(
+            recovered.service(super::super::record::Resource::Media),
+            "original.media/1"
+        );
+        assert_eq!(
+            recovered.service(super::super::record::Resource::Control),
+            "original.control/1"
         );
     }
 }

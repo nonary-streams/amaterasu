@@ -46,7 +46,7 @@ from test_nvhttp import (
 # `pack-linux-session` names the first missing library if this list falls behind
 # the profile in crates/release/src/profiles/linux_session.rs.
 LIBRARY_PACKAGES = [
-    "amaterasu-runtime", "amaterasu-state", "amaterasu-session", "amaterasu-configuration",
+    "amaterasu-runtime", "amaterasu-network", "amaterasu-state", "amaterasu-session", "amaterasu-configuration",
     "amaterasu-session-history", "amaterasu-host-metrics", "amaterasu-catalog",
     "amaterasu-application", "amaterasu-steam", "amaterasu-lutris", "amaterasu-authentication",
     "amaterasu-management", "amaterasu-pairing", "amaterasu-nvhttp", "amaterasu-display",
@@ -131,7 +131,20 @@ class LinuxSessionHarness:
         run(self.publisher, "stage", self.root, package)
 
     def console(self) -> Console:
-        return Console(self, environment=self.environment)
+        console = Console(self, environment=self.environment)
+        # Signed debug artifacts can take longer than a console request's reply
+        # budget to verify. Wait for the actual startup handshake; the host's
+        # per-phase watchdog still independently rejects stalled workers.
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            if any(line.startswith("Development worker ready: pid=") for line in console.errors):
+                return console
+            if console.process.poll() is not None:
+                console.close()
+                raise AssertionError("signed host exited before readiness:\n" + "".join(console.errors))
+            time.sleep(0.05)
+        console.close()
+        raise AssertionError("signed host did not report readiness:\n" + "".join(console.errors))
 
 
 def rejected(*arguments: str | Path) -> str:

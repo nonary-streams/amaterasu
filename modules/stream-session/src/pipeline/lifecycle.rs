@@ -817,7 +817,7 @@ impl Pipeline {
             Step::Open(resource) => {
                 let result = self.opened(record, job, resource, &payload, now, send);
                 if result.is_ok() && resource == Resource::Video && !record.config.stream_audio {
-                    record.plane = Some(factory(record.handles()?)?);
+                    record.plane = Some(factory(record.handles()?, &record.providers)?);
                 }
                 result
             }
@@ -907,7 +907,7 @@ impl Pipeline {
             }
             Step::AcquireAudio => {
                 require_lease(record, &payload, true)?;
-                record.plane = Some(factory(record.handles()?)?);
+                record.plane = Some(factory(record.handles()?, &record.providers)?);
                 job.step = Step::Activate;
                 Ok(true)
             }
@@ -1099,7 +1099,7 @@ impl Pipeline {
         }
     }
 
-    fn opened(
+    pub(super) fn opened(
         &mut self,
         record: &mut Record,
         job: &mut Job,
@@ -1110,6 +1110,10 @@ impl Pipeline {
     ) -> Result<bool, &'static str> {
         let id = allocation_id(record, resource, payload).ok_or("invalid_component_response")?;
         record.resources.insert(resource, id);
+        // An external provider must confirm its native role before the plane
+        // can interpret a function table. Retain any allocated handle first so
+        // a rejected acknowledgment still follows ordinary owned cleanup.
+        record.validate_native_contract(resource, payload)?;
         match resource {
             Resource::Session => {
                 if session_response(record, payload)

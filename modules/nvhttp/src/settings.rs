@@ -21,6 +21,8 @@ pub enum AddressFamily {
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub enabled: bool,
+    pub network_provider: String,
+    pub audio_capture_provider: String,
     pub http_bind: SocketAddr,
     pub https_bind: SocketAddr,
     pub address_family: Option<AddressFamily>,
@@ -35,6 +37,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: false,
+            network_provider: "amaterasu.network/1".into(),
+            audio_capture_provider: "amaterasu.audio/1".into(),
             http_bind: SocketAddr::from(([127, 0, 0, 1], 47989)),
             https_bind: SocketAddr::from(([127, 0, 0, 1], 47984)),
             address_family: None,
@@ -49,6 +53,12 @@ impl Default for Settings {
 
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if !amaterasu_module_sdk::network::valid_provider(&self.network_provider) {
+            return Err("invalid_network_provider");
+        }
+        if !amaterasu_module_sdk::network::valid_provider(&self.audio_capture_provider) {
+            return Err("invalid_audio_capture_provider");
+        }
         let http_binds = self.resolved_http_binds()?;
         let https_binds = self.resolved_https_binds()?;
         validate_configured_hostname(&self.hostname)?;
@@ -512,6 +522,40 @@ mod tests {
                     vec![expected_ip]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn audio_capture_provider_is_an_explicit_versioned_startup_contract() {
+        let settings: Settings = serde_json::from_value(
+            serde_json::json!({"audio_capture_provider":"vendor.capture/1"}),
+        )
+        .unwrap();
+        assert_eq!(settings.audio_capture_provider, "vendor.capture/1");
+        assert!(settings.validate().is_ok());
+        for service in ["", "vendor.capture/2", "Vendor/1", "vendor service/1"] {
+            let settings = Settings {
+                audio_capture_provider: service.into(),
+                ..Settings::default()
+            };
+            assert_eq!(settings.validate(), Err("invalid_audio_capture_provider"));
+        }
+    }
+
+    #[test]
+    fn network_provider_is_an_explicit_versioned_startup_contract() {
+        let replacement: Settings = serde_json::from_value(serde_json::json!({
+            "network_provider": "third-party.network/1"
+        }))
+        .unwrap();
+        replacement.validate().unwrap();
+        assert_eq!(replacement.network_provider, "third-party.network/1");
+        for service in ["third-party.network/2", "", "Invalid/1"] {
+            let settings = Settings {
+                network_provider: service.into(),
+                ..Settings::default()
+            };
+            assert_eq!(settings.validate(), Err("invalid_network_provider"));
         }
     }
 

@@ -73,7 +73,18 @@ impl ManagedModule for StreamSource {
             // SAFETY: stable boxed factories live until module unload, after all
             // dependent consumers release their native bindings.
             unsafe {
-                runtime.register_native(kind.service(), &factory.api)?;
+                match kind {
+                    Kind::Video => amaterasu_module_sdk::video::register(
+                        &runtime,
+                        kind.service(),
+                        &factory.api,
+                    )?,
+                    Kind::Audio => amaterasu_module_sdk::audio::register_capture(
+                        &runtime,
+                        kind.service(),
+                        &factory.api,
+                    )?,
+                }
             }
         }
         runtime.require_success(Command::Register {

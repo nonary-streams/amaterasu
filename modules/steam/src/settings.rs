@@ -199,6 +199,8 @@ impl ProductSettings {
 #[serde(deny_unknown_fields)]
 pub struct StartupSettings {
     #[serde(default)]
+    pub network_provider: Option<String>,
+    #[serde(default)]
     pub roots: Vec<std::path::PathBuf>,
     #[serde(default)]
     pub steam_artwork_cache_root: Option<std::path::PathBuf>,
@@ -212,6 +214,13 @@ fn default_library_principal() -> String {
 
 impl StartupSettings {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self
+            .network_provider
+            .as_ref()
+            .is_some_and(|provider| !amaterasu_module_sdk::network::valid_provider(provider))
+        {
+            return Err("invalid Steam network provider");
+        }
         if self.library_principal.is_empty()
             || self.library_principal.len() > 128
             || !self
@@ -282,6 +291,7 @@ mod tests {
     #[test]
     fn startup_artwork_cache_root_requires_a_bounded_absolute_path() {
         let mut settings = StartupSettings {
+            network_provider: None,
             roots: Vec::new(),
             steam_artwork_cache_root: Some(std::env::temp_dir()),
             library_principal: default_library_principal(),

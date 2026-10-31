@@ -85,8 +85,7 @@ fn submit_control(
 fn exercise_encoder(runtime: &RuntimeClient, stream: u64) -> ModuleResult<Value> {
     // SAFETY: the signed dependency supplies this exact media-v1 table. The
     // runtime/provider outlive the binding; all PCM and callbacks are synchronous.
-    let binding =
-        unsafe { runtime.bind_native(SERVICE, 1, 0, size_of::<AudioEncoderApi>() as u32) }?;
+    let binding = unsafe { amaterasu_module_sdk::audio::bind_encoder(runtime, SERVICE) }?;
     let api = unsafe { binding.table::<AudioEncoderApi>() }?;
     let first = verify_partial_input_and_retry(api, stream)?;
     let tail = verify_drain(api, stream)?;
@@ -319,8 +318,7 @@ pub(super) fn encode_transport_packets(
 ) -> ModuleResult<Vec<Packet>> {
     // SAFETY: the signed dependency supplies this exact table and outlives its
     // binding; all PCM input and packet callbacks remain synchronous.
-    let binding =
-        unsafe { runtime.bind_native(SERVICE, 1, 0, size_of::<AudioEncoderApi>() as u32) }?;
+    let binding = unsafe { amaterasu_module_sdk::audio::bind_encoder(runtime, SERVICE) }?;
     let api = unsafe { binding.table::<AudioEncoderApi>() }?;
     let mut packets = Vec::with_capacity(4);
     for index in 0..4 {

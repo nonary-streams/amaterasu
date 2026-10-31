@@ -885,3 +885,13 @@ Steam Streaming Speakers endpoint is absent. Installer and conditional default
 role restoration status is available through `POST /v1/media/audio_driver_status`
 with an empty object and `media.read`. Machine installation and Windows default
 route behavior still require native Windows qualification.
+
+### Audio capture provider selection
+
+The trusted startup setting `audio_capture_provider` selects the recipient of
+`configure_steam_driver_install` and defaults to `amaterasu.audio/1`. A
+replacement must support the same revisioned configuration operation, including
+its caller authorization and idempotency. Grant NVHTTP access to that service
+and order its component before NVHTTP. Use the same capture selection for
+stream-session and management when replacing the default provider. Product
+settings and client requests cannot change this startup selection.

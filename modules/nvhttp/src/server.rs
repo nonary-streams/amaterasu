@@ -3,14 +3,16 @@ use crate::{
     settings::Settings,
     wire::{Reply, Request},
 };
+use amaterasu_module_sdk::network::{
+    Network, TcpListenOptions, TcpListener as NetworkTcpListener, TcpStream as NetworkTcpStream,
+};
 use rustls::{ServerConfig, ServerConnection};
-use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 #[cfg(test)]
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::{
     collections::BTreeMap,
     io::{self, Read, Write},
-    net::{IpAddr, SocketAddr, TcpListener, TcpStream},
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -43,8 +45,9 @@ pub struct Closed {
 }
 
 pub struct Server {
-    http: Vec<TcpListener>,
-    https: Vec<TcpListener>,
+    network: Network,
+    http: Vec<NetworkTcpListener>,
+    https: Vec<NetworkTcpListener>,
     connections: BTreeMap<u64, Connection>,
     next_id: u64,
     configuration: Option<Arc<ServerConfig>>,
@@ -52,16 +55,24 @@ pub struct Server {
 }
 
 impl Server {
+    #[cfg(test)]
     pub fn bind(settings: &Settings) -> Result<Self, String> {
+        Self::bind_with_network(Network::test_provider(), settings)
+    }
+
+    pub fn bind_with_network(network: Network, settings: &Settings) -> Result<Self, String> {
         let http = bind_listeners(
+            &network,
             settings.resolved_http_binds().map_err(str::to_owned)?,
             "HTTP",
         )?;
         let https = bind_listeners(
+            &network,
             settings.resolved_https_binds().map_err(str::to_owned)?,
             "HTTPS",
         )?;
         Ok(Self {
+            network,
             http,
             https,
             connections: BTreeMap::new(),
@@ -118,8 +129,20 @@ impl Server {
             .iter()
             .map(|address| SocketAddr::new(address.ip(), https_port))
             .collect::<Vec<_>>();
-        let http = replacement_listeners(&http_addresses, &self.http, &self.https, "HTTP")?;
-        let https = replacement_listeners(&https_addresses, &self.http, &self.https, "HTTPS")?;
+        let http = replacement_listeners(
+            &self.network,
+            &http_addresses,
+            &self.http,
+            &self.https,
+            "HTTP",
+        )?;
+        let https = replacement_listeners(
+            &self.network,
+            &https_addresses,
+            &self.http,
+            &self.https,
+            "HTTPS",
+        )?;
 
         self.http = http;
         self.https = https;
@@ -139,8 +162,20 @@ impl Server {
         }
 
         let preflight = (|| {
-            let http = replacement_listeners(&http_addresses, &self.http, &self.https, "HTTP")?;
-            let https = replacement_listeners(&https_addresses, &self.http, &self.https, "HTTPS")?;
+            let http = replacement_listeners(
+                &self.network,
+                &http_addresses,
+                &self.http,
+                &self.https,
+                "HTTP",
+            )?;
+            let https = replacement_listeners(
+                &self.network,
+                &https_addresses,
+                &self.http,
+                &self.https,
+                "HTTPS",
+            )?;
             Ok::<_, String>((http, https))
         })();
         match preflight {
@@ -163,8 +198,8 @@ impl Server {
                     drop(std::mem::take(&mut self.http));
                     drop(std::mem::take(&mut self.https));
                     let replacement = (|| {
-                        let http = bind_listeners(http_addresses, "HTTP")?;
-                        let https = bind_listeners(https_addresses, "HTTPS")?;
+                        let http = bind_listeners(&self.network, http_addresses, "HTTP")?;
+                        let https = bind_listeners(&self.network, https_addresses, "HTTPS")?;
                         Ok::<_, String>((http, https))
                     })();
                     match replacement {
@@ -175,8 +210,16 @@ impl Server {
                         }
                         Err(replacement_error) => {
                             let restored = (|| {
-                                let http = bind_listeners(old_http_addresses, "HTTP rollback")?;
-                                let https = bind_listeners(old_https_addresses, "HTTPS rollback")?;
+                                let http = bind_listeners(
+                                    &self.network,
+                                    old_http_addresses,
+                                    "HTTP rollback",
+                                )?;
+                                let https = bind_listeners(
+                                    &self.network,
+                                    old_https_addresses,
+                                    "HTTPS rollback",
+                                )?;
                                 Ok::<_, String>((http, https))
                             })();
                             match restored {
@@ -384,35 +427,32 @@ impl Server {
     }
 }
 
-fn bind_listener(address: SocketAddr, name: &str) -> Result<TcpListener, String> {
-    let domain = Domain::for_address(address);
-    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
-        .map_err(|_| format!("{name} socket unavailable"))?;
-    // Unix keeps actively closed connections in TIME_WAIT after host shutdown.
-    // Address reuse permits restart after that listener closes; an existing
-    // live listener still owns its endpoint. Windows has different semantics.
-    #[cfg(unix)]
-    socket
-        .set_reuse_address(true)
-        .map_err(|_| format!("{name} address reuse configuration failed"))?;
-    if address.is_ipv6() {
-        socket
-            .set_only_v6(true)
-            .map_err(|_| format!("{name} IPv6 configuration failed"))?;
-    }
-    socket
-        .bind(&SockAddr::from(address))
-        .map_err(|_| format!("{name} listener unavailable"))?;
-    socket
-        .listen(128)
-        .map_err(|_| format!("{name} listen failed"))?;
-    socket
-        .set_nonblocking(true)
-        .map_err(|_| format!("{name} nonblocking setup failed"))?;
-    Ok(socket.into())
+fn bind_network_listener(
+    network: &Network,
+    address: SocketAddr,
+    name: &str,
+) -> Result<NetworkTcpListener, String> {
+    network
+        .bind_tcp_with_options(
+            address,
+            TcpListenOptions {
+                backlog: 128,
+                ..TcpListenOptions::default()
+            },
+        )
+        .map_err(|_| format!("{name} listener unavailable"))
 }
 
-fn bind_listeners(addresses: Vec<SocketAddr>, name: &str) -> Result<Vec<TcpListener>, String> {
+#[cfg(test)]
+fn bind_listener(address: SocketAddr, name: &str) -> Result<NetworkTcpListener, String> {
+    bind_network_listener(&Network::test_provider(), address, name)
+}
+
+fn bind_listeners(
+    network: &Network,
+    addresses: Vec<SocketAddr>,
+    name: &str,
+) -> Result<Vec<NetworkTcpListener>, String> {
     let mut listeners = Vec::with_capacity(addresses.len());
     let mut selected_port = None;
     for mut address in addresses {
@@ -421,7 +461,7 @@ fn bind_listeners(addresses: Vec<SocketAddr>, name: &str) -> Result<Vec<TcpListe
         {
             address.set_port(port);
         }
-        let listener = bind_listener(address, name)?;
+        let listener = bind_network_listener(network, address, name)?;
         selected_port.get_or_insert_with(|| listener.local_addr().expect("bound listener").port());
         listeners.push(listener);
     }
@@ -429,11 +469,12 @@ fn bind_listeners(addresses: Vec<SocketAddr>, name: &str) -> Result<Vec<TcpListe
 }
 
 fn replacement_listeners(
+    network: &Network,
     addresses: &[SocketAddr],
-    old_http: &[TcpListener],
-    old_https: &[TcpListener],
+    old_http: &[NetworkTcpListener],
+    old_https: &[NetworkTcpListener],
     name: &str,
-) -> Result<Vec<TcpListener>, String> {
+) -> Result<Vec<NetworkTcpListener>, String> {
     let mut replacements = Vec::with_capacity(addresses.len());
     for address in addresses {
         // A TCP listener is protocol-neutral; TLS/plain handling is chosen by
@@ -447,7 +488,7 @@ fn replacement_listeners(
             Some(listener) => listener
                 .try_clone()
                 .map_err(|_| format!("{name} listener clone failed"))?,
-            None => bind_listener(*address, name)?,
+            None => bind_network_listener(network, *address, name)?,
         };
         replacements.push(listener);
     }
@@ -494,7 +535,7 @@ struct Output {
     offset: usize,
 }
 struct Connection {
-    socket: TcpStream,
+    socket: NetworkTcpStream,
     remote: IpAddr,
     tls: Option<ServerConnection>,
     input: Vec<u8>,
@@ -684,7 +725,7 @@ impl Connection {
 }
 
 struct BoundedWriter<'a> {
-    socket: &'a mut TcpStream,
+    socket: &'a mut NetworkTcpStream,
     remaining: usize,
 }
 impl Write for BoundedWriter<'_> {
@@ -799,6 +840,7 @@ mod tests {
     }
 
     use super::*;
+    use std::net::{TcpListener, TcpStream};
     use std::sync::Mutex;
 
     static FIXED_PORT_LOCK: Mutex<()> = Mutex::new(());
@@ -1490,7 +1532,9 @@ mod tests {
 
     #[test]
     fn saturated_rustls_plaintext_buffer_retains_the_response_for_retry() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = Network::test_provider()
+            .bind_tcp("127.0.0.1:0".parse().unwrap())
+            .unwrap();
         let _peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (socket, remote) = listener.accept().unwrap();
         let configuration =
@@ -1524,3 +1568,6 @@ mod tests {
         assert!(!connection.finished);
     }
 }
+
+#[cfg(test)]
+mod provider_selection_tests;

@@ -416,6 +416,8 @@ mod provider_tests {
     }
 }
 
+/// Startup-selected opaque artwork routing and shared wire validation.
+pub mod artwork;
 /// Adapter for a broker-registered provider service. Host-side routing and
 /// lifecycle ownership remain separate responsibilities.
 pub mod provider_adapter;

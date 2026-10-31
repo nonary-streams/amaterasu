@@ -40,10 +40,22 @@ The unsafe runtime boundary lives in `ffi.rs`. Rust feature modules implement
 `ManagedModule` and use `RuntimeClient`; shared SDK adapters provide panic
 containment and allocation ownership at the native boundary.
 
+Large binary payloads have an optional versioned native
+[transfer API](binary-transfer-api.md), with negotiated limits, retained input,
+bounded queues and cancellation barriers. The runtime authorizes bindings;
+providers own resources and domain policy. Existing artwork and media consumers
+still require the migrations and qualification listed in that document.
+
 A component release can contain a library, helper executables, and private
 native dependencies. The development package format currently admits one runtime
 and native feature libraries. Packaging helpers, defining production dependency
 closures, and media interfaces remain future work.
+
+## Provider substitution
+
+Built-in consumers use the public SDK and selected provider contracts. See
+[plugin substitution](plugin-substitution.md) for migrated consumers, composition
+requirements, replacement tests and remaining codec/artwork migrations.
 
 ## Trust and permissions
 

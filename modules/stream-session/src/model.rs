@@ -9,6 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
+    pub providers: crate::providers::ProviderServices,
     pub enabled: bool,
     pub allow_remote: bool,
     pub allowed_principals: Vec<String>,
@@ -20,6 +21,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            providers: Default::default(),
             enabled: false,
             allow_remote: false,
             allowed_principals: Vec::new(),
@@ -32,6 +34,7 @@ impl Default for Settings {
 }
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
+        self.providers.validate()?;
         if self.allowed_principals.len() > 16
             || self
                 .allowed_principals

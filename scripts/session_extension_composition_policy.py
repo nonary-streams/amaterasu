@@ -298,6 +298,7 @@ def lifecycle_configuration(journal_path: str, graph: dict, additional_grants: d
             "session_delegates": [legacy.RTSP, legacy.STREAM],
             "action_service": legacy.ACTIONS, "settings_registry_caller": legacy.REGISTRY,
             "settings_registry_service": legacy.REGISTRY_SERVICE, "operation_grants": operations,
+            "input_provider": legacy.INPUT,
             "consumers": {"capture": [legacy.STREAM], "input": [legacy.STREAM, legacy.INPUT]},
             "consumer_requirements": {"execution_domain": "desktop",
                                       "capture_providers": ["amaterasu.capture-pipewire/1"],

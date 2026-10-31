@@ -301,8 +301,7 @@ fn active_request(runtime: &RuntimeClient, request: u64) -> ModuleResult<()> {
 fn submit_native(runtime: &RuntimeClient, stream: u64, audio: &[Packet]) -> ModuleResult<Value> {
     // SAFETY: the signed provider supplies the exact media-v1 table. Binding,
     // input buffers, and metadata remain live throughout these synchronous calls.
-    let binding =
-        unsafe { runtime.bind_native(TRANSPORT, 1, 0, size_of::<MediaTransportApi>() as u32) }?;
+    let binding = unsafe { amaterasu_module_sdk::transport::bind_media(runtime, TRANSPORT) }?;
     let api = unsafe { binding.table::<MediaTransportApi>() }?;
     let mut video = vec![0x55; 1700];
     video[..5].copy_from_slice(&[0, 0, 0, 1, 0x65]);

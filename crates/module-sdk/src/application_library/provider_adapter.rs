@@ -18,6 +18,7 @@ const MAX_RESPONSE_BYTES: usize = 12_000;
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum Request {
+    Describe {},
     Discover {
         cursor: Option<String>,
         limit: usize,
@@ -65,6 +66,14 @@ pub struct Identity<'a> {
 /// An error or lost reply after dispatch can follow a side effect and must be
 /// reconciled by stable operation ID; it does not prove that no effect occurred.
 pub trait Provider {
+    /// Actual implemented capabilities, independently restricted by caller policy.
+    fn capabilities(&self) -> super::provider::Capabilities {
+        super::provider::Capabilities {
+            discovery: true,
+            artwork: true,
+            lifecycle: true,
+        }
+    }
     fn discover(
         &mut self,
         identity: &Identity<'_>,
@@ -184,14 +193,16 @@ impl<P: Provider> ProviderAdapter<P> {
             return failure("invalid_request");
         };
         let policy = &self.callers[&incoming.caller];
+        let capabilities = self.provider.capabilities();
         let authorized = match &request {
-            Request::Discover { .. } => policy.discovery,
-            Request::Artwork { .. } => policy.artwork,
+            Request::Describe {} => true,
+            Request::Discover { .. } => policy.discovery && capabilities.discovery,
+            Request::Artwork { .. } => policy.artwork && capabilities.artwork,
             Request::Identity { .. }
             | Request::Launch { .. }
             | Request::Lookup { .. }
             | Request::RecoverStop { .. }
-            | Request::Stop { .. } => policy.lifecycle,
+            | Request::Stop { .. } => policy.lifecycle && capabilities.lifecycle,
         };
         if !authorized {
             return failure("unauthorized");
@@ -201,6 +212,14 @@ impl<P: Provider> ProviderAdapter<P> {
             initiator: &incoming.initiator,
         };
         let result = match request {
+            Request::Describe {} => {
+                let capabilities = self.provider.capabilities();
+                Ok(json!({"capabilities":super::provider::Capabilities {
+                    discovery: capabilities.discovery && policy.discovery,
+                    artwork: capabilities.artwork && policy.artwork,
+                    lifecycle: capabilities.lifecycle && policy.lifecycle,
+                }}))
+            }
             Request::Discover { cursor, limit } => {
                 if !(1..=super::provider::MAX_PAGE_ENTRIES).contains(&limit)
                     || cursor

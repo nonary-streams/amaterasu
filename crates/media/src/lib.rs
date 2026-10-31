@@ -71,6 +71,10 @@ pub const MEDIA_UNSUPPORTED: Status = 13;
 pub const MEDIA_BACKEND_ERROR: Status = 14;
 pub const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_PACKET_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum assembled access unit and fragment count accepted by the legacy
+/// video forwarding plane. Providers must stay within both limits.
+pub const MAX_VIDEO_ACCESS_UNIT_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_VIDEO_ACCESS_UNIT_FRAGMENTS: usize = 1024;
 
 /// Optional synchronous CPU processing interface, version 1.0.
 pub const CPU_PROCESSOR_INTERFACE_MAJOR: u32 = 1;

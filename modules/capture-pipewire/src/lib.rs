@@ -51,7 +51,13 @@ impl ManagedModule for CaptureModule {
         })?;
         // SAFETY: boxed factory remains stable until destruction; every independent
         // binding retains its own shared controller after factory release.
-        unsafe { runtime.register_native(SERVICE, &factory.api) }?;
+        unsafe {
+            runtime.register_native_typed(
+                SERVICE,
+                amaterasu_module_sdk::media::native_contracts::CAPTURE,
+                &factory.api,
+            )
+        }?;
         Ok(Self {
             runtime,
             controller,

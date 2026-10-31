@@ -23,6 +23,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "amaterasu-data-plane"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-abi",
+ "serde",
+]
+
+[[package]]
 name = "amaterasu-extension-api"
 version = "0.1.0"
 dependencies = [
@@ -68,11 +76,21 @@ version = "0.1.0"
 dependencies = [
  "amaterasu-abi",
  "amaterasu-contracts",
+ "amaterasu-data-plane",
  "amaterasu-extension-api",
  "amaterasu-media",
+ "amaterasu-network-api",
  "base64",
+ "getrandom",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "amaterasu-network-api"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-abi",
 ]
 
 [[package]]
@@ -142,6 +160,7 @@ dependencies = [
  "amaterasu-launch",
  "amaterasu-module-sdk",
  "amaterasu-runtime",
+ "base64",
  "example-application-library-v2",
  "getrandom",
  "libloading",

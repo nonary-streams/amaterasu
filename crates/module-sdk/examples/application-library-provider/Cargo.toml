@@ -16,6 +16,7 @@ serde_json = "1"
 getrandom = "0.3"
 
 [dev-dependencies]
+base64 = "0.22"
 amaterasu-runtime = { path = "../../../runtime" }
 amaterasu-contracts = { path = "../../../contracts" }
 amaterasu-launch = { path = "../../../../modules/launch" }

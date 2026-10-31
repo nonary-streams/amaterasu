@@ -39,9 +39,21 @@ impl ManagedModule for EncoderSource {
         }
         // SAFETY: registration and its factory context remain alive for the module lifetime.
         unsafe {
-            runtime.register_native(SERVICE, &registration.factory)?;
-            runtime.register_native(PROVIDER_SERVICE, &source_registration.factory)?;
-            runtime.register_native(CONSUMER_SERVICE, &consumer_registration.factory)?;
+            runtime.register_native_typed(
+                SERVICE,
+                amaterasu_module_sdk::media::native_contracts::ENCODER,
+                &registration.factory,
+            )?;
+            runtime.register_native_typed(
+                PROVIDER_SERVICE,
+                amaterasu_module_sdk::media::native_contracts::ENCODER_PROVIDER,
+                &source_registration.factory,
+            )?;
+            runtime.register_native_typed(
+                CONSUMER_SERVICE,
+                amaterasu_module_sdk::media::native_contracts::FRAME_RESOURCE_CONSUMER,
+                &consumer_registration.factory,
+            )?;
         }
         Ok(Self {
             runtime,

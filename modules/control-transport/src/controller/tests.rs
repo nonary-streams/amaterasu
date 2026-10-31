@@ -3,6 +3,7 @@ use std::net::UdpSocket;
 
 pub(crate) fn configured() -> Controller {
     Controller::new(Settings {
+        network_provider: None,
         enabled: true,
         allow_remote: false,
         allowed_principals: vec!["alice".into(), "bob".into()],

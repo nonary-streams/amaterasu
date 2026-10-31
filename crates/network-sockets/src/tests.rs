@@ -1,0 +1,307 @@
+use super::*;
+struct Bound {
+    pointer: *const net::NetworkApi,
+}
+impl Bound {
+    fn new(factory: &Factory) -> Self {
+        // SAFETY: tests retain factory until bindings end.
+        Self {
+            pointer: unsafe { bind_standalone(factory, "test.client").unwrap() },
+        }
+    }
+    fn api(&self) -> &net::NetworkApi {
+        // SAFETY: live unique binding until Drop.
+        unsafe { &*self.pointer }
+    }
+    fn context(&self) -> *mut c_void {
+        self.api().base.context
+    }
+    fn udp(&self) -> u64 {
+        let mut id = 0; // SAFETY: valid local address, binding and writable output.
+        assert_eq!(
+            unsafe {
+                (self.api().udp_bind)(
+                    self.context(),
+                    to_address("127.0.0.1:0".parse().unwrap()),
+                    &mut id,
+                )
+            },
+            STATUS_OK
+        );
+        id
+    }
+    fn local(&self, id: u64) -> SocketAddr {
+        let mut address = net::Address::default(); // SAFETY: binding and output live during callback.
+        assert_eq!(
+            unsafe { (self.api().local_addr)(self.context(), id, &mut address) },
+            STATUS_OK
+        );
+        from_address(address).unwrap()
+    }
+}
+impl Drop for Bound {
+    fn drop(&mut self) {
+        // SAFETY: no active calls and exactly one release.
+        unsafe { (self.api().base.release.unwrap())(self.context()) };
+    }
+}
+#[test]
+fn opaque_binding_handles_and_aggregate_capacity_are_enforced() {
+    let factory = Factory::with_limits(2);
+    let first = Bound::new(&factory);
+    let second = Bound::new(&factory);
+    let id = first.udp();
+    let mut address = net::Address::default();
+    assert_eq!(
+        unsafe { (second.api().local_addr)(second.context(), id, &mut address) },
+        net::NOT_FOUND
+    );
+    let second_id = second.udp();
+    let mut excessive = 0;
+    assert_eq!(
+        unsafe {
+            (first.api().udp_bind)(
+                first.context(),
+                to_address("127.0.0.1:0".parse().unwrap()),
+                &mut excessive,
+            )
+        },
+        net::RESOURCE_EXHAUSTED
+    );
+    assert_eq!(
+        unsafe { (first.api().close)(first.context(), id) },
+        STATUS_OK
+    );
+    let third = first.udp();
+    assert_ne!(third, id);
+    assert_eq!(
+        unsafe { (first.api().close)(first.context(), id) },
+        net::NOT_FOUND
+    );
+    assert_eq!(
+        unsafe { (second.api().close)(second.context(), second_id) },
+        STATUS_OK
+    );
+}
+#[test]
+fn udp_connected_batch_preserves_whole_datagrams_and_rejects_oversized_buffers() {
+    let factory = Factory::new();
+    let provider = Bound::new(&factory);
+    let id = provider.udp();
+    let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    assert_eq!(
+        unsafe {
+            (provider.api().connect_udp)(
+                provider.context(),
+                id,
+                to_address(receiver.local_addr().unwrap()),
+            )
+        },
+        STATUS_OK
+    );
+    let first = b"one";
+    let second = b"two";
+    let input = [
+        net::Datagram {
+            data: first.as_ptr(),
+            len: first.len(),
+        },
+        net::Datagram {
+            data: second.as_ptr(),
+            len: second.len(),
+        },
+    ];
+    let mut count = 0;
+    assert_eq!(
+        unsafe {
+            (provider.api().send_batch)(
+                provider.context(),
+                id,
+                input.as_ptr(),
+                input.len(),
+                &mut count,
+            )
+        },
+        STATUS_OK
+    );
+    assert_eq!(count, 2);
+    let mut bytes = [0; 64];
+    let (len, _) = receiver.recv_from(&mut bytes).unwrap();
+    assert_eq!(&bytes[..len], b"one");
+    let (len, _) = receiver.recv_from(&mut bytes).unwrap();
+    assert_eq!(&bytes[..len], b"two");
+    assert_eq!(
+        unsafe {
+            (provider.api().write)(
+                provider.context(),
+                id,
+                first.as_ptr(),
+                net::MAX_IO_BYTES + 1,
+                &mut count,
+            )
+        },
+        STATUS_INVALID_ARGUMENT
+    );
+}
+#[test]
+fn tcp_listener_connection_peek_and_shutdown_use_the_same_contract() {
+    let factory = Factory::new();
+    let provider = Bound::new(&factory);
+    let mut listener = 0;
+    let options = net::ListenOptions {
+        size: size_of::<net::ListenOptions>() as u32,
+        flags: net::LISTEN_NONBLOCKING | net::LISTEN_IPV6_ONLY,
+        backlog: 16,
+        reserved: 0,
+    };
+    assert_eq!(
+        unsafe {
+            (provider.api().tcp_listen)(
+                provider.context(),
+                to_address("127.0.0.1:0".parse().unwrap()),
+                options,
+                &mut listener,
+            )
+        },
+        STATUS_OK
+    );
+    let mut client = 0;
+    assert_eq!(
+        unsafe {
+            (provider.api().tcp_connect)(
+                provider.context(),
+                to_address(provider.local(listener)),
+                1000,
+                &mut client,
+            )
+        },
+        STATUS_OK
+    );
+    let mut server = 0;
+    let mut peer = net::Address::default();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let status = unsafe {
+            (provider.api().accept)(provider.context(), listener, &mut server, &mut peer)
+        };
+        if status == STATUS_OK {
+            break;
+        }
+        assert_eq!(status, net::WOULD_BLOCK);
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now()
+    }
+    assert!(from_address(peer).unwrap().ip().is_loopback());
+    let mut count = 0;
+    let bytes = b"hello";
+    assert_eq!(
+        unsafe {
+            (provider.api().write)(
+                provider.context(),
+                client,
+                bytes.as_ptr(),
+                bytes.len(),
+                &mut count,
+            )
+        },
+        STATUS_OK
+    );
+    assert_eq!(count, 5);
+    let mut output = [0; 5];
+    loop {
+        let status = unsafe {
+            (provider.api().peek)(
+                provider.context(),
+                server,
+                output.as_mut_ptr(),
+                output.len(),
+                &mut count,
+            )
+        };
+        if status == STATUS_OK {
+            break;
+        }
+        assert_eq!(status, net::WOULD_BLOCK);
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now()
+    }
+    assert_eq!(&output, b"hello");
+    assert_eq!(
+        unsafe {
+            (provider.api().read)(
+                provider.context(),
+                server,
+                output.as_mut_ptr(),
+                output.len(),
+                &mut count,
+            )
+        },
+        STATUS_OK
+    );
+    assert_eq!(&output, b"hello");
+    assert_eq!(
+        unsafe { (provider.api().shutdown)(provider.context(), client, net::SHUTDOWN_BOTH) },
+        STATUS_OK
+    );
+}
+#[test]
+fn address_value_conversion_preserves_ipv6_scope_and_rejects_noncanonical_ipv4() {
+    let scoped = SocketAddr::V6(SocketAddrV6::new("fe80::1".parse().unwrap(), 42, 7, 19));
+    assert_eq!(from_address(to_address(scoped)).unwrap(), scoped);
+    let mut bad = to_address("127.0.0.1:1".parse().unwrap());
+    bad.bytes[4] = 1;
+    assert!(from_address(bad).is_err());
+}
+#[test]
+fn releasing_binding_closes_owned_sockets_and_returns_budget() {
+    let factory = Factory::with_limits(1);
+    let bound = Bound::new(&factory);
+    let id = bound.udp();
+    let address = bound.local(id);
+    assert!(UdpSocket::bind(address).is_err());
+    drop(bound);
+    let socket = UdpSocket::bind(address).unwrap();
+    drop(socket);
+    let replacement = Bound::new(&factory);
+    replacement.udp();
+}
+
+#[test]
+fn dns_numeric_address_and_unsupported_options_are_explicit() {
+    let factory = Factory::new();
+    let provider = Bound::new(&factory);
+    let mut addresses = [net::Address::default(); 4];
+    let mut count = 0;
+    // SAFETY: all output storage and borrowed input survive the callback.
+    assert_eq!(
+        unsafe {
+            (provider.api().resolve)(
+                provider.context(),
+                BorrowedBytes::new(b"127.0.0.1"),
+                42,
+                1000,
+                addresses.as_mut_ptr(),
+                addresses.len(),
+                &mut count,
+            )
+        },
+        STATUS_OK
+    );
+    assert_eq!(count, 1);
+    assert_eq!(
+        from_address(addresses[0]).unwrap(),
+        "127.0.0.1:42".parse().unwrap()
+    );
+    let id = provider.udp();
+    assert_eq!(
+        unsafe { (provider.api().set_option)(provider.context(), id, u32::MAX, 0) },
+        net::UNSUPPORTED
+    );
+    assert_eq!(
+        unsafe { (provider.api().set_option)(provider.context(), id, net::NONBLOCKING, 2) },
+        STATUS_INVALID_ARGUMENT
+    );
+}

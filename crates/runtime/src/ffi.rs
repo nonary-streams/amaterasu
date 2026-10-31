@@ -33,6 +33,7 @@ unsafe extern "C" fn create_runtime(config: BorrowedBytes, output: *mut *mut c_v
             .map_err(|_| STATUS_INVALID_ARGUMENT)?;
         let native = Arc::new(crate::native::NativeServices::new(
             config.principals.clone(),
+            config.legacy_native_contracts.clone(),
         ));
         let principals: Vec<_> = config.principals.keys().cloned().collect();
         let broker = Arc::new(Mutex::new(
@@ -101,6 +102,8 @@ unsafe extern "C" fn invoke_command(
             Ok(
                 command @ (Command::NativeRegister { .. }
                 | Command::NativeBind { .. }
+                | Command::NativeRegisterTyped { .. }
+                | Command::NativeBindTyped { .. }
                 | Command::NativeRelease { .. }),
             ) => {
                 // SAFETY: only explicitly native-granted endpoints may supply pointers;

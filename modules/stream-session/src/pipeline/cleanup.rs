@@ -223,7 +223,7 @@ impl Pipeline {
                     record.attempted.remove(&resource);
                     if resource == Resource::Video && record.lifecycle_fenced {
                         record.lifecycle_retirement_receipt = Some(
-                            json!({"service":Resource::Video.service(),"operation_id":record.operation(resource),"response":{"code":payload["code"]}}),
+                            json!({"service":record.service(Resource::Video),"operation_id":record.operation(resource),"response":{"code":payload["code"]}}),
                         );
                     }
                 } else {
@@ -250,7 +250,7 @@ impl Pipeline {
                     job.confirming = None;
                     if resource == Resource::Video && record.lifecycle_fenced {
                         record.lifecycle_retirement_receipt = Some(
-                            json!({"service":Resource::Video.service(),"operation_id":record.operation(resource),"response":{"code":payload["code"]}}),
+                            json!({"service":record.service(Resource::Video),"operation_id":record.operation(resource),"response":{"code":payload["code"]}}),
                         );
                     }
                 } else if allocation_id(record, resource, &payload).is_none()

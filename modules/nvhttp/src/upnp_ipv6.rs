@@ -1,5 +1,6 @@
 //! IPv6 UPnP firewall pinholes for the live listener endpoints.
 
+use amaterasu_module_sdk::network::Network;
 use amaterasu_upnp::{
     IgdIpv6Firewall, Ipv6FirewallControl, PinholeEndpoint, PinholeManager,
     RECOMMENDED_REFRESH_INTERVAL, discover_ipv6_firewalls,
@@ -36,12 +37,12 @@ pub(crate) struct Ipv6PinholeLifecycle {
 }
 
 impl Ipv6PinholeLifecycle {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(network: Option<Network>) -> Self {
         let (command_tx, command_rx) = mpsc::channel();
         let (status_tx, status_rx) = mpsc::channel();
         let worker = thread::Builder::new()
             .name("amaterasu-upnp-ipv6".into())
-            .spawn(move || run_worker(command_rx, status_tx))
+            .spawn(move || run_worker(network, command_rx, status_tx))
             .ok();
         let status = if worker.is_some() {
             UpnpRuntimeStatus {
@@ -116,7 +117,11 @@ impl Drop for Ipv6PinholeLifecycle {
     }
 }
 
-fn run_worker(commands: Receiver<LifecycleCommand>, statuses: Sender<UpnpRuntimeStatus>) {
+fn run_worker(
+    network: Option<Network>,
+    commands: Receiver<LifecycleCommand>,
+    statuses: Sender<UpnpRuntimeStatus>,
+) {
     let mut desired = DesiredPinholes::default();
     let mut gateways: BTreeMap<String, Ipv6GatewayOwner<IgdIpv6Firewall>> = BTreeMap::new();
     let mut active_gateways = BTreeSet::new();
@@ -177,7 +182,15 @@ fn run_worker(commands: Receiver<LifecycleCommand>, statuses: Sender<UpnpRuntime
                 let mut error = last_discovery_error.clone();
                 if rediscover {
                     configuration_changed = false;
-                    match discover_ipv6_firewalls() {
+                    match network
+                        .as_ref()
+                        .ok_or_else(|| {
+                            amaterasu_upnp::GatewayError::new(
+                                "IPv6 UPnP network provider unavailable",
+                            )
+                        })
+                        .and_then(discover_ipv6_firewalls)
+                    {
                         Ok(discovered) => {
                             if !discovered.is_empty() {
                                 last_discovery_error = None;

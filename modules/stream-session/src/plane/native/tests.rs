@@ -22,9 +22,12 @@ struct Provider {
     sent_control: Vec<(u64, u32, u32, u32, Vec<u8>)>,
     control_failed: bool,
     pcm_failed: bool,
+    alternate_audio: bool,
+    submitted_pcm: bool,
 }
 
 struct Host {
+    services: crate::providers::ProviderServices,
     provider: Box<Provider>,
     video: VideoApi,
     capture: AudioCaptureApi,
@@ -34,6 +37,7 @@ struct Host {
     released: Vec<u64>,
     bindings: Vec<String>,
     reject_capture: bool,
+    typed_contracts: Vec<(String, String)>,
 }
 
 impl Host {
@@ -41,6 +45,7 @@ impl Host {
         let mut provider = Box::<Provider>::default();
         let context = (&mut *provider as *mut Provider).cast();
         Self {
+            services: Default::default(),
             provider,
             video: VideoApi {
                 base: prefix::<VideoApi>(context),
@@ -70,6 +75,7 @@ impl Host {
             released: Vec::new(),
             bindings: Vec::new(),
             reject_capture: false,
+            typed_contracts: Vec::new(),
         }
     }
 
@@ -99,24 +105,25 @@ unsafe extern "C" fn invoke(context: *mut c_void, input: BorrowedBytes, sink: Re
     let host = unsafe { &mut *context.cast::<Host>() };
     let command: Command = serde_json::from_slice(unsafe { input.read().unwrap() }).unwrap();
     let response = match command {
-        Command::NativeBind { service, .. } => {
-            host.bindings.push(service.clone());
-            if host.reject_capture && service == "amaterasu.audio/1" {
-                Response::Error {
-                    code: "denied".into(),
-                    message: "denied".into(),
-                }
+        Command::NativeBindTyped {
+            service, contract, ..
+        } => {
+            let expected = if service == host.services.video {
+                amaterasu_module_sdk::video::CONTRACT
+            } else if service == host.services.audio_capture {
+                amaterasu_module_sdk::audio::CAPTURE_CONTRACT
+            } else if service == host.services.audio_encoder {
+                amaterasu_module_sdk::audio::ENCODER_CONTRACT
+            } else if service == host.services.media_transport {
+                amaterasu_module_sdk::transport::MEDIA_CONTRACT
+            } else if service == host.services.control_transport {
+                amaterasu_module_sdk::transport::CONTROL_CONTRACT
             } else {
-                let (binding, address) = match service.as_str() {
-                    "amaterasu.video/1" => (1, &host.video.base as *const _ as usize),
-                    "amaterasu.audio/1" => (2, &host.capture.base as *const _ as usize),
-                    "amaterasu.audio-encode/1" => (3, &host.encoder.base as *const _ as usize),
-                    "amaterasu.media-transport/1" => (4, &host.media.base as *const _ as usize),
-                    "amaterasu.control-transport/1" => (5, &host.control.base as *const _ as usize),
-                    _ => panic!("unexpected service"),
-                };
-                Response::NativeBound { binding, address }
-            }
+                panic!("unexpected typed service {service}");
+            };
+            assert_eq!(contract, expected);
+            host.typed_contracts.push((service.clone(), contract));
+            bind_service(host, service)
         }
         Command::NativeRelease { binding } => {
             host.released.push(binding);
@@ -126,6 +133,31 @@ unsafe extern "C" fn invoke(context: *mut c_void, input: BorrowedBytes, sink: Re
     };
     unsafe { sink.send(&serde_json::to_vec(&response).unwrap()) };
     STATUS_OK
+}
+
+fn bind_service(host: &mut Host, service: String) -> Response {
+    host.bindings.push(service.clone());
+    if host.reject_capture && service == host.services.audio_capture {
+        Response::Error {
+            code: "denied".into(),
+            message: "denied".into(),
+        }
+    } else {
+        let (binding, address) = if service == host.services.video {
+            (1, &host.video.base as *const _ as usize)
+        } else if service == host.services.audio_capture {
+            (2, &host.capture.base as *const _ as usize)
+        } else if service == host.services.audio_encoder {
+            (3, &host.encoder.base as *const _ as usize)
+        } else if service == host.services.media_transport {
+            (4, &host.media.base as *const _ as usize)
+        } else if service == host.services.control_transport {
+            (5, &host.control.base as *const _ as usize)
+        } else {
+            panic!("unexpected service {service}");
+        };
+        Response::NativeBound { binding, address }
+    }
 }
 
 unsafe extern "C" fn video(context: *mut c_void, stream: u64, sink: PacketSink) -> Status {
@@ -154,20 +186,51 @@ unsafe extern "C" fn video(context: *mut c_void, stream: u64, sink: PacketSink) 
     }
 }
 
-unsafe extern "C" fn pcm(context: *mut c_void, _: u64, _: AudioSink) -> Status {
-    if unsafe { &*context.cast::<Provider>() }.pcm_failed {
-        MEDIA_BACKEND_ERROR
-    } else {
-        MEDIA_PENDING
+unsafe extern "C" fn pcm(context: *mut c_void, _: u64, sink: AudioSink) -> Status {
+    // SAFETY: the fake provider and callback are live for this synchronous call.
+    let provider = unsafe { &*context.cast::<Provider>() };
+    if provider.pcm_failed {
+        return MEDIA_BACKEND_ERROR;
     }
+    if !provider.alternate_audio {
+        return MEDIA_PENDING;
+    }
+    let samples = [7u8; 960];
+    let frame = AudioFrame {
+        sample_rate: 48_000,
+        channels: 2,
+        format: PCM_I16,
+        frames: 240,
+        flags: 0,
+        data: samples.as_ptr(),
+        len: samples.len(),
+        timestamp_us: 10,
+        sequence: 1,
+    };
+    unsafe { sink.send(&frame) }
 }
-unsafe extern "C" fn audio(context: *mut c_void, _: u64, _: AudioPacketSink) -> Status {
-    // SAFETY: the test keeps the boxed provider live for the binding lifetime.
-    if unsafe { &*context.cast::<Provider>() }.audio_failed {
-        MEDIA_BACKEND_ERROR
-    } else {
-        MEDIA_PENDING
+unsafe extern "C" fn audio(context: *mut c_void, _: u64, sink: AudioPacketSink) -> Status {
+    // SAFETY: the fake provider and callback are live for this synchronous call.
+    let provider = unsafe { &*context.cast::<Provider>() };
+    if provider.audio_failed {
+        return MEDIA_BACKEND_ERROR;
     }
+    if !provider.submitted_pcm {
+        return MEDIA_PENDING;
+    }
+    let bytes = [1u8, 2, 3];
+    let packet = EncodedAudioPacket {
+        codec: CODEC_OPUS,
+        flags: 0,
+        sample_rate: 48_000,
+        channels: 2,
+        frames: 240,
+        data: bytes.as_ptr(),
+        len: bytes.len(),
+        timestamp_us: 10,
+        sequence: 1,
+    };
+    unsafe { sink.send(&packet) }
 }
 unsafe extern "C" fn control(context: *mut c_void, _: u64, _: ControlMessageSink) -> Status {
     if unsafe { &*context.cast::<Provider>() }.control_failed {
@@ -176,8 +239,15 @@ unsafe extern "C" fn control(context: *mut c_void, _: u64, _: ControlMessageSink
         MEDIA_PENDING
     }
 }
-unsafe extern "C" fn submit_pcm(_: *mut c_void, _: u64, _: *const AudioFrame) -> Status {
-    MEDIA_BUSY
+unsafe extern "C" fn submit_pcm(context: *mut c_void, _: u64, frame: *const AudioFrame) -> Status {
+    // SAFETY: the test host supplies a live provider and a synchronous frame borrow.
+    let provider = unsafe { &mut *context.cast::<Provider>() };
+    if !provider.alternate_audio {
+        return MEDIA_BUSY;
+    }
+    assert_eq!(unsafe { (&*frame).bytes().unwrap() }, &[7u8; 960]);
+    provider.submitted_pcm = true;
+    STATUS_OK
 }
 unsafe extern "C" fn submit_video(_: *mut c_void, _: u64, _: *const EncodedPacket) -> Status {
     MEDIA_BUSY
@@ -248,7 +318,12 @@ fn disabled_audio_handles() -> Handles {
 #[test]
 fn actual_native_tables_copy_borrowed_bytes_and_release_all_bindings() {
     let mut host = Host::new();
-    let mut backend = NativeBackend::new(&host.runtime(), handles()).unwrap();
+    let mut backend = NativeBackend::new(
+        &host.runtime(),
+        handles(),
+        &crate::providers::ProviderServices::default(),
+    )
+    .unwrap();
     let packet = backend.video().unwrap().unwrap();
     let mut assembly = VideoAssembly::new(CODEC_H264);
     assembly.push(packet).unwrap();
@@ -256,6 +331,7 @@ fn actual_native_tables_copy_borrowed_bytes_and_release_all_bindings() {
     // SAFETY: assembly owns the copied bytes despite provider overwriting its source.
     assert_eq!(unsafe { header.bytes().unwrap() }, [0, 0, 1, 0x65, 9]);
     assert!(!backend.submit_video(&header).unwrap());
+    assert_eq!(host.typed_contracts.len(), 5);
     drop(backend);
     assert_eq!(host.released, [1, 2, 3, 4, 5]);
 }
@@ -263,7 +339,12 @@ fn actual_native_tables_copy_borrowed_bytes_and_release_all_bindings() {
 #[test]
 fn feedback_uses_the_bound_authenticated_stream_and_keeps_enet_routing_metadata() {
     let mut host = Host::new();
-    let mut backend = NativeBackend::new(&host.runtime(), handles()).unwrap();
+    let mut backend = NativeBackend::new(
+        &host.runtime(),
+        handles(),
+        &crate::providers::ProviderServices::default(),
+    )
+    .unwrap();
     let event = HostFeedback::Rumble {
         controller: 7,
         low_frequency: 0x1234,
@@ -303,7 +384,12 @@ fn partial_native_bind_failure_releases_previously_acquired_table() {
     let mut host = Host::new();
     host.reject_capture = true;
     assert_eq!(
-        NativeBackend::new(&host.runtime(), handles()).err(),
+        NativeBackend::new(
+            &host.runtime(),
+            handles(),
+            &crate::providers::ProviderServices::default()
+        )
+        .err(),
         Some("native_binding_failed")
     );
     assert_eq!(host.released, [1]);
@@ -313,7 +399,12 @@ fn partial_native_bind_failure_releases_previously_acquired_table() {
 fn disabled_audio_binds_no_capture_or_encoder_tables() {
     let mut host = Host::new();
     host.reject_capture = true;
-    let backend = NativeBackend::new(&host.runtime(), disabled_audio_handles()).unwrap();
+    let backend = NativeBackend::new(
+        &host.runtime(),
+        disabled_audio_handles(),
+        &crate::providers::ProviderServices::default(),
+    )
+    .unwrap();
     assert_eq!(
         host.bindings,
         [
@@ -330,7 +421,12 @@ fn disabled_audio_binds_no_capture_or_encoder_tables() {
 fn repeated_callbacks_and_output_with_pending_status_are_protocol_errors() {
     let mut host = Host::new();
     host.provider.duplicate = true;
-    let mut backend = NativeBackend::new(&host.runtime(), handles()).unwrap();
+    let mut backend = NativeBackend::new(
+        &host.runtime(),
+        handles(),
+        &crate::providers::ProviderServices::default(),
+    )
+    .unwrap();
     assert_eq!(backend.video().err(), Some("native_multiple_callbacks"));
     host.provider.duplicate = false;
     host.provider.invalid_status = true;
@@ -341,7 +437,12 @@ fn repeated_callbacks_and_output_with_pending_status_are_protocol_errors() {
 #[test]
 fn native_delivery_failures_identify_the_control_and_pcm_lane() {
     let mut host = Host::new();
-    let mut backend = NativeBackend::new(&host.runtime(), handles()).unwrap();
+    let mut backend = NativeBackend::new(
+        &host.runtime(),
+        handles(),
+        &crate::providers::ProviderServices::default(),
+    )
+    .unwrap();
     host.provider.control_failed = true;
     assert_eq!(
         backend.control().err(),
@@ -356,7 +457,12 @@ fn native_delivery_failures_identify_the_control_and_pcm_lane() {
 fn encoder_backend_status_is_distinct_from_other_native_failures() {
     let mut host = Host::new();
     host.provider.audio_failed = true;
-    let mut backend = NativeBackend::new(&host.runtime(), handles()).unwrap();
+    let mut backend = NativeBackend::new(
+        &host.runtime(),
+        handles(),
+        &crate::providers::ProviderServices::default(),
+    )
+    .unwrap();
     assert_eq!(backend.audio().err(), Some("audio_encoder_failed"));
     assert_eq!(
         encoder_accepted(MEDIA_BACKEND_ERROR),
@@ -366,4 +472,38 @@ fn encoder_backend_status_is_distinct_from_other_native_failures() {
         accepted(MEDIA_BACKEND_ERROR, "native_video_submit_failed"),
         Err("native_video_submit_failed")
     );
+}
+
+#[test]
+fn alternative_provider_roles_bind_and_release_the_exact_selected_interfaces() {
+    let mut host = Host::new();
+    let services = crate::providers::ProviderServices {
+        video: "acme.frames/1".into(),
+        audio_capture: "acme.microphone/1".into(),
+        audio_encoder: "acme.opus/1".into(),
+        media_transport: "acme.delivery/1".into(),
+        control_transport: "acme.control/1".into(),
+        ..Default::default()
+    };
+    host.services = services.clone();
+    host.provider.alternate_audio = true;
+    let mut backend = NativeBackend::new(&host.runtime(), handles(), &services).unwrap();
+    assert!(backend.video().unwrap().is_some());
+    let pcm = backend.pcm().unwrap().unwrap();
+    assert!(backend.submit_pcm(&pcm.header()).unwrap());
+    let encoded = backend.audio().unwrap().unwrap();
+    let encoded_header = encoded.header();
+    assert_eq!(unsafe { encoded_header.bytes().unwrap() }, &[1, 2, 3]);
+    assert_eq!(
+        host.bindings,
+        [
+            services.video,
+            services.audio_capture,
+            services.audio_encoder,
+            services.media_transport,
+            services.control_transport,
+        ]
+    );
+    drop(backend);
+    assert_eq!(host.released, [1, 2, 3, 4, 5]);
 }

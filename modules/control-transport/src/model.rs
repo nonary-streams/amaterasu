@@ -13,6 +13,7 @@ fn default_ping_timeout_ms() -> i64 {
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
+    pub network_provider: Option<String>,
     pub enabled: bool,
     pub allow_remote: bool,
     pub allowed_principals: Vec<String>,
@@ -20,7 +21,11 @@ pub struct Settings {
 
 impl Settings {
     pub fn validate(&self) -> ControlResult<()> {
-        if self.allowed_principals.len() > 16
+        if self
+            .network_provider
+            .as_deref()
+            .is_some_and(|service| !amaterasu_module_sdk::network::valid_provider(service))
+            || self.allowed_principals.len() > 16
             || self
                 .allowed_principals
                 .iter()

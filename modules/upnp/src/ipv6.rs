@@ -1,8 +1,8 @@
+use amaterasu_module_sdk::network::{Network, TcpStream, UdpSocket};
 use std::io::{self, Read, Write};
-use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6, TcpStream, UdpSocket};
+use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::time::{Duration, Instant};
 
-use socket2::{Domain, Protocol as SocketProtocol, SockAddr, Socket, Type};
 use xmltree::{Element, XMLNode};
 
 use crate::{
@@ -32,6 +32,7 @@ pub struct Ipv6InterfaceAddress {
 
 /// A discovered WANIPv6FirewallControl service on one LAN interface.
 pub struct IgdIpv6Firewall {
+    network: Network,
     control_address: SocketAddrV6,
     control_path: String,
     internal_addresses: Vec<Ipv6Addr>,
@@ -56,13 +57,37 @@ impl IgdIpv6Firewall {
 }
 
 /// Enumerates routable IPv6 unicast addresses and their interface scopes.
-pub fn ipv6_interface_addresses() -> Result<Vec<Ipv6InterfaceAddress>, GatewayError> {
-    platform::ipv6_interface_addresses()
+pub fn ipv6_interface_addresses(
+    network: &Network,
+) -> Result<Vec<Ipv6InterfaceAddress>, GatewayError> {
+    let addresses = network.interface_addresses().map_err(|error| {
+        GatewayError::new(format!("IPv6 interface enumeration failed: {error}"))
+    })?;
+    let mut addresses: Vec<_> = addresses
+        .into_iter()
+        .filter_map(|(address, interface_index)| match address {
+            std::net::IpAddr::V6(address)
+                if interface_index != 0
+                    && !address.is_unspecified()
+                    && !address.is_loopback()
+                    && !address.is_multicast() =>
+            {
+                Some(Ipv6InterfaceAddress {
+                    address,
+                    interface_index,
+                })
+            }
+            _ => None,
+        })
+        .collect();
+    addresses.sort();
+    addresses.dedup();
+    Ok(addresses)
 }
 
 /// Discovers IPv6 IGDs separately with scoped `ff02::c` SSDP searches.
-pub fn discover_ipv6_firewalls() -> Result<Vec<IgdIpv6Firewall>, GatewayError> {
-    let addresses = ipv6_interface_addresses()?;
+pub fn discover_ipv6_firewalls(network: &Network) -> Result<Vec<IgdIpv6Firewall>, GatewayError> {
+    let addresses = ipv6_interface_addresses(network)?;
     let mut interface_addresses = std::collections::BTreeMap::<u32, Vec<Ipv6Addr>>::new();
     for entry in addresses {
         if entry.address.is_unspecified()
@@ -87,7 +112,12 @@ pub fn discover_ipv6_firewalls() -> Result<Vec<IgdIpv6Firewall>, GatewayError> {
         let Some(internal_address) = internal_addresses.first().copied() else {
             continue;
         };
-        match discover_on_interface(interface_index, internal_address, &internal_addresses) {
+        match discover_on_interface(
+            network,
+            interface_index,
+            internal_address,
+            &internal_addresses,
+        ) {
             Ok(Some(firewall))
                 if !discovered
                     .iter()
@@ -110,11 +140,12 @@ pub fn discover_ipv6_firewalls() -> Result<Vec<IgdIpv6Firewall>, GatewayError> {
 }
 
 fn discover_on_interface(
+    network: &Network,
     interface_index: u32,
     internal_address: Ipv6Addr,
     internal_addresses: &[Ipv6Addr],
 ) -> Result<Option<IgdIpv6Firewall>, GatewayError> {
-    let socket = create_ssdp_socket(interface_index, internal_address)?;
+    let socket = create_ssdp_socket(network, interface_index, internal_address)?;
     let request = format!(
         "M-SEARCH * HTTP/1.1\r\nHOST: [FF02::C]:{SSDP_PORT}\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: {IGD_DEVICE_TYPE}\r\n\r\n"
     );
@@ -147,11 +178,13 @@ fn discover_on_interface(
         };
         let response = &response_buffer[..read];
         if let Some(firewall) = parse_ssdp_response(
+            network,
             response,
             source,
             interface_index,
             internal_address,
             internal_addresses,
+            deadline,
         )? {
             return Ok(Some(firewall));
         }
@@ -160,22 +193,12 @@ fn discover_on_interface(
 }
 
 fn create_ssdp_socket(
+    network: &Network,
     interface_index: u32,
     internal_address: Ipv6Addr,
 ) -> Result<UdpSocket, GatewayError> {
-    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(SocketProtocol::UDP))
-        .map_err(|error| GatewayError::new(format!("IPv6 IGD socket failed: {error}")))?;
-    socket
-        .set_only_v6(true)
-        .map_err(|error| GatewayError::new(format!("IPv6 IGD socket failed: {error}")))?;
-    socket
-        .set_multicast_if_v6(interface_index)
-        .map_err(|error| GatewayError::new(format!("IPv6 interface selection failed: {error}")))?;
-    socket
-        .set_multicast_hops_v6(2)
-        .map_err(|error| GatewayError::new(format!("IPv6 IGD socket failed: {error}")))?;
-    socket
-        .bind(&SockAddr::from(SocketAddrV6::new(
+    let socket = network
+        .bind_udp(SocketAddr::V6(SocketAddrV6::new(
             internal_address,
             0,
             0,
@@ -183,18 +206,22 @@ fn create_ssdp_socket(
         )))
         .map_err(|error| GatewayError::new(format!("IPv6 IGD socket bind failed: {error}")))?;
     socket
-        .join_multicast_v6(&SSDP_GROUP, interface_index)
-        .map_err(|error| GatewayError::new(format!("IPv6 IGD multicast join failed: {error}")))?;
-    let socket: UdpSocket = socket.into();
+        .set_nonblocking(false)
+        .and_then(|()| socket.set_multicast_if_v6(interface_index))
+        .and_then(|()| socket.set_multicast_hops_v6(2))
+        .and_then(|()| socket.join_multicast_v6(&SSDP_GROUP, interface_index))
+        .map_err(|error| GatewayError::new(format!("IPv6 IGD multicast setup failed: {error}")))?;
     Ok(socket)
 }
 
 fn parse_ssdp_response(
+    network: &Network,
     response: &[u8],
     source: SocketAddr,
     interface_index: u32,
     internal_address: Ipv6Addr,
     internal_addresses: &[Ipv6Addr],
+    deadline: Instant,
 ) -> Result<Option<IgdIpv6Firewall>, GatewayError> {
     let Some((target, location)) = parse_ssdp_advertisement(response) else {
         return Ok(None);
@@ -209,13 +236,12 @@ fn parse_ssdp_response(
     if !source_matches_location(source, *device_address.ip()) {
         return Ok(None);
     }
-    let description = http_request(
-        device_address,
+    let description = http_get_until(
+        network,
+        SocketAddr::V6(device_address),
         &device_path,
-        "GET",
-        &[],
-        None,
         MAX_DESCRIPTION_BYTES,
+        deadline,
     )?;
     if description.status != 200 {
         return Ok(None);
@@ -236,6 +262,7 @@ fn parse_ssdp_response(
     };
     let identity = format!("{control_address}|{control_path}|{internal_address}");
     Ok(Some(IgdIpv6Firewall {
+        network: network.clone(),
         control_address,
         control_path,
         internal_addresses: internal_addresses.to_vec(),
@@ -372,44 +399,137 @@ fn resolve_control_path(root_path: &str, control_url: &str) -> Option<String> {
     valid_http_path(&resolved).then_some(resolved)
 }
 
-fn valid_http_path(path: &str) -> bool {
+pub(crate) fn valid_http_path(path: &str) -> bool {
     path.starts_with('/')
         && !path.starts_with("//")
         && !path.contains(['\r', '\n', ' '])
         && !path.contains('#')
 }
 
-struct HttpResponse {
-    status: u16,
-    body: Vec<u8>,
+pub(crate) struct HttpResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
 }
 
-fn http_request(
-    address: SocketAddrV6,
+pub(crate) fn http_request(
+    network: &Network,
+    address: SocketAddr,
     path: &str,
     method: &str,
     headers: &[(&str, &str)],
     body: Option<&[u8]>,
     max_body_bytes: usize,
 ) -> Result<HttpResponse, GatewayError> {
-    if !valid_http_path(path) {
-        return Err(GatewayError::new("invalid IPv6 IGD HTTP path"));
-    }
-    let stream = TcpStream::connect_timeout(&SocketAddr::V6(address), HTTP_TIMEOUT)
-        .map_err(|error| GatewayError::new(format!("IPv6 IGD HTTP connection failed: {error}")))?;
-    stream
-        .set_read_timeout(Some(HTTP_TIMEOUT))
-        .and_then(|()| stream.set_write_timeout(Some(HTTP_TIMEOUT)))
-        .map_err(|error| GatewayError::new(format!("IPv6 IGD HTTP setup failed: {error}")))?;
+    perform_http(
+        network,
+        HttpOperation {
+            address,
+            path,
+            method,
+            headers,
+            body,
+            max_body_bytes,
+        },
+        Instant::now() + HTTP_TIMEOUT,
+    )
+}
 
-    let mut request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: [{}]:{}\r\nConnection: close\r\n",
-        address.ip(),
-        address.port()
-    );
+pub(crate) fn http_get_until(
+    network: &Network,
+    address: SocketAddr,
+    path: &str,
+    max_body_bytes: usize,
+    deadline: Instant,
+) -> Result<HttpResponse, GatewayError> {
+    perform_http(
+        network,
+        HttpOperation {
+            address,
+            path,
+            method: "GET",
+            headers: &[],
+            body: None,
+            max_body_bytes,
+        },
+        deadline,
+    )
+}
+
+struct HttpOperation<'a> {
+    address: SocketAddr,
+    path: &'a str,
+    method: &'a str,
+    headers: &'a [(&'a str, &'a str)],
+    body: Option<&'a [u8]>,
+    max_body_bytes: usize,
+}
+
+fn remaining(deadline: Instant) -> io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "IGD HTTP operation deadline exceeded",
+            )
+        })
+}
+
+trait TimedStream: Read + Write {
+    fn read_timeout(&self, timeout: Duration) -> io::Result<()>;
+    fn write_timeout(&self, timeout: Duration) -> io::Result<()>;
+}
+impl TimedStream for TcpStream {
+    fn read_timeout(&self, timeout: Duration) -> io::Result<()> {
+        self.set_read_timeout(Some(timeout))
+    }
+    fn write_timeout(&self, timeout: Duration) -> io::Result<()> {
+        self.set_write_timeout(Some(timeout))
+    }
+}
+struct DeadlineIo<S> {
+    stream: S,
+    deadline: Instant,
+}
+impl<S: TimedStream> Read for DeadlineIo<S> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.stream.read_timeout(remaining(self.deadline)?)?;
+        self.stream.read(bytes)
+    }
+}
+impl<S: TimedStream> Write for DeadlineIo<S> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.stream.write_timeout(remaining(self.deadline)?)?;
+        self.stream.write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.write_timeout(remaining(self.deadline)?)?;
+        self.stream.flush()
+    }
+}
+
+fn perform_http(
+    network: &Network,
+    operation: HttpOperation<'_>,
+    deadline: Instant,
+) -> Result<HttpResponse, GatewayError> {
+    let HttpOperation {
+        address,
+        path,
+        method,
+        headers,
+        body,
+        max_body_bytes,
+    } = operation;
+    if !valid_http_path(path) {
+        return Err(GatewayError::new("invalid IGD HTTP path"));
+    }
+    let mut request =
+        format!("{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n");
     for (name, value) in headers {
         if name.contains(['\r', '\n', ':']) || value.contains(['\r', '\n']) {
-            return Err(GatewayError::new("invalid IPv6 IGD HTTP header"));
+            return Err(GatewayError::new("invalid IGD HTTP header"));
         }
         request.push_str(name);
         request.push_str(": ");
@@ -418,77 +538,162 @@ fn http_request(
     }
     if let Some(body) = body {
         request.push_str(&format!("Content-Length: {}\r\n", body.len()));
-        request.push_str("\r\n");
-        let mut stream = stream;
-        stream
-            .write_all(request.as_bytes())
-            .and_then(|()| stream.write_all(body))
-            .map_err(|error| GatewayError::new(format!("IPv6 IGD HTTP write failed: {error}")))?;
-        read_http_response(stream, max_body_bytes)
-    } else {
-        request.push_str("\r\n");
-        let mut stream = stream;
-        stream
-            .write_all(request.as_bytes())
-            .map_err(|error| GatewayError::new(format!("IPv6 IGD HTTP write failed: {error}")))?;
-        read_http_response(stream, max_body_bytes)
     }
+    request.push_str("\r\n");
+    let timeout = remaining(deadline).map_err(|error| GatewayError::new(error.to_string()))?;
+    let stream = network
+        .connect_tcp(address, timeout)
+        .map_err(|error| GatewayError::new(format!("IGD HTTP connection failed: {error}")))?;
+    let mut stream = DeadlineIo { stream, deadline };
+    stream
+        .write_all(request.as_bytes())
+        .and_then(|()| {
+            if let Some(body) = body {
+                stream.write_all(body)
+            } else {
+                Ok(())
+            }
+        })
+        .map_err(|error| GatewayError::new(format!("IGD HTTP write failed: {error}")))?;
+    read_http_response(stream, max_body_bytes)
 }
 
 fn read_http_response(
-    mut stream: TcpStream,
+    mut stream: impl Read,
     max_body_bytes: usize,
 ) -> Result<HttpResponse, GatewayError> {
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 4096];
-    let mut header_end = None;
-    let mut expected_body_length = None;
     loop {
         let read = stream
             .read(&mut chunk)
-            .map_err(|error| GatewayError::new(format!("IPv6 IGD HTTP read failed: {error}")))?;
-        if read == 0 {
-            break;
-        }
+            .map_err(|error| GatewayError::new(format!("IGD HTTP read failed: {error}")))?;
         bytes.extend_from_slice(&chunk[..read]);
-        if bytes.len() > max_body_bytes + MAX_HTTP_HEADER_BYTES {
+        if bytes.len() > max_body_bytes.saturating_add(2 * MAX_HTTP_HEADER_BYTES) {
             return Err(GatewayError::new(
-                "IPv6 IGD HTTP response exceeded its size bound",
+                "IGD HTTP response exceeded its size bound",
             ));
         }
-        if header_end.is_none()
-            && let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
-        {
-            let end = position + 4;
-            header_end = Some(end);
-            expected_body_length = parse_content_length(&bytes[..end]);
-            if expected_body_length.is_some_and(|length| length > max_body_bytes) {
-                return Err(GatewayError::new(
-                    "IPv6 IGD HTTP response exceeded its size bound",
-                ));
+        let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") else {
+            if bytes.len() > MAX_HTTP_HEADER_BYTES || read == 0 {
+                return Err(GatewayError::new("invalid IGD HTTP headers"));
+            }
+            continue;
+        };
+        let header_end = position + 4;
+        if header_end > MAX_HTTP_HEADER_BYTES {
+            return Err(GatewayError::new(
+                "IGD HTTP headers exceeded their size bound",
+            ));
+        }
+        let headers = std::str::from_utf8(&bytes[..header_end])
+            .map_err(|_| GatewayError::new("invalid IGD HTTP headers"))?;
+        let status = headers
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|status| status.parse::<u16>().ok())
+            .filter(|status| (100..=599).contains(status))
+            .ok_or_else(|| GatewayError::new("invalid IGD HTTP status"))?;
+        let mut length = None;
+        let mut chunked = false;
+        for line in headers.lines().skip(1).filter(|line| !line.is_empty()) {
+            let (name, value) = line
+                .split_once(':')
+                .ok_or_else(|| GatewayError::new("invalid IGD HTTP header"))?;
+            if name.eq_ignore_ascii_case("content-length") {
+                let value = value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| GatewayError::new("invalid IGD HTTP content length"))?;
+                if length.replace(value).is_some() {
+                    return Err(GatewayError::new("duplicate IGD HTTP content length"));
+                }
+            } else if name.eq_ignore_ascii_case("transfer-encoding") {
+                if chunked || !value.trim().eq_ignore_ascii_case("chunked") {
+                    return Err(GatewayError::new("unsupported IGD HTTP transfer encoding"));
+                }
+                chunked = true;
             }
         }
-        if let (Some(header_end), Some(body_length)) = (header_end, expected_body_length)
-            && bytes.len() >= header_end + body_length
-        {
-            bytes.truncate(header_end + body_length);
-            break;
+        if length.is_some() && chunked {
+            return Err(GatewayError::new("ambiguous IGD HTTP body framing"));
+        }
+        let payload = &bytes[header_end..];
+        if chunked {
+            if let Some(body) = decode_chunked(payload, max_body_bytes)? {
+                return Ok(HttpResponse { status, body });
+            }
+        } else if let Some(length) = length {
+            if length > max_body_bytes {
+                return Err(GatewayError::new(
+                    "IGD HTTP response exceeded its size bound",
+                ));
+            }
+            if payload.len() >= length {
+                return Ok(HttpResponse {
+                    status,
+                    body: payload[..length].to_vec(),
+                });
+            }
+        } else if read == 0 {
+            if payload.len() > max_body_bytes {
+                return Err(GatewayError::new(
+                    "IGD HTTP response exceeded its size bound",
+                ));
+            }
+            return Ok(HttpResponse {
+                status,
+                body: payload.to_vec(),
+            });
+        }
+        if read == 0 {
+            return Err(GatewayError::new("truncated IGD HTTP body"));
         }
     }
-    let header_end =
-        header_end.ok_or_else(|| GatewayError::new("invalid IPv6 IGD HTTP response"))?;
-    let headers = std::str::from_utf8(&bytes[..header_end])
-        .map_err(|_| GatewayError::new("invalid IPv6 IGD HTTP headers"))?;
-    let status = headers
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|status| status.parse::<u16>().ok())
-        .ok_or_else(|| GatewayError::new("invalid IPv6 IGD HTTP status"))?;
-    let body = bytes[header_end..].to_vec();
-    Ok(HttpResponse { status, body })
 }
 
+fn decode_chunked(mut bytes: &[u8], maximum: usize) -> Result<Option<Vec<u8>>, GatewayError> {
+    let mut body = Vec::new();
+    loop {
+        let Some(line_end) = bytes.windows(2).position(|window| window == b"\r\n") else {
+            return Ok(None);
+        };
+        let line = std::str::from_utf8(&bytes[..line_end])
+            .map_err(|_| GatewayError::new("invalid IGD HTTP chunk size"))?;
+        let number = line.split(';').next().unwrap_or_default();
+        if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(GatewayError::new("invalid IGD HTTP chunk size"));
+        }
+        let length = usize::from_str_radix(number, 16)
+            .map_err(|_| GatewayError::new("invalid IGD HTTP chunk size"))?;
+        bytes = &bytes[line_end + 2..];
+        if length == 0 {
+            if bytes.starts_with(b"\r\n") || bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                return Ok(Some(body));
+            }
+            return Ok(None);
+        }
+        if length > maximum.saturating_sub(body.len()) {
+            return Err(GatewayError::new(
+                "IGD HTTP response exceeded its size bound",
+            ));
+        }
+        let Some(end) = length.checked_add(2) else {
+            return Err(GatewayError::new("invalid IGD HTTP chunk size"));
+        };
+        if bytes.len() < end {
+            return Ok(None);
+        }
+        if &bytes[length..end] != b"\r\n" {
+            return Err(GatewayError::new("invalid IGD HTTP chunk terminator"));
+        }
+        body.extend_from_slice(&bytes[..length]);
+        bytes = &bytes[end..];
+    }
+}
+
+#[cfg(test)]
 fn parse_content_length(headers: &[u8]) -> Option<usize> {
     std::str::from_utf8(headers)
         .ok()?
@@ -572,7 +777,8 @@ impl IgdIpv6Firewall {
         let body = soap_envelope(action, parameters);
         let action_header = format!("\"{IPV6_FIREWALL_SERVICE}#{action}\"");
         let response = http_request(
-            self.control_address,
+            &self.network,
+            SocketAddr::V6(self.control_address),
             &self.control_path,
             "POST",
             &[
@@ -584,10 +790,15 @@ impl IgdIpv6Firewall {
         )?;
         let root = Element::parse(response.body.as_slice())
             .map_err(|error| GatewayError::new(format!("invalid IPv6 SOAP response: {error}")))?;
-        if response.status != 200 {
+        if response.status != 200 || find_child_recursive(&root, "Fault").is_some() {
             let (code, description) = soap_fault(&root);
             return Err(GatewayError::new(format!(
                 "IPv6 gateway rejected {action} with fault {code}: {description}"
+            )));
+        }
+        if find_child_recursive(&root, &format!("{action}Response")).is_none() {
+            return Err(GatewayError::new(format!(
+                "IPv6 SOAP response omitted {action}Response"
             )));
         }
         Ok(root)
@@ -605,7 +816,7 @@ fn soap_envelope(action: &str, parameters: &[(&str, String)]) -> String {
     body
 }
 
-fn xml_escape(value: &str) -> String {
+pub(crate) fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -644,13 +855,13 @@ fn soap_fault(root: &Element) -> (String, String) {
     (code, description)
 }
 
-fn soap_error_code(error: &GatewayError) -> Option<u16> {
+pub(crate) fn soap_error_code(error: &GatewayError) -> Option<u16> {
     let message = error.to_string();
     let rest = message.split_once("fault ")?.1;
     rest.split(':').next()?.parse().ok()
 }
 
-fn find_child_recursive<'a>(element: &'a Element, name: &str) -> Option<&'a Element> {
+pub(crate) fn find_child_recursive<'a>(element: &'a Element, name: &str) -> Option<&'a Element> {
     if element.name == name {
         return Some(element);
     }
@@ -674,172 +885,6 @@ fn valid_pinhole_endpoint(endpoint: PinholeEndpoint) -> bool {
         && !endpoint.internal_client.is_loopback()
         && !endpoint.internal_client.is_multicast()
         && !endpoint.internal_client.is_unicast_link_local()
-}
-
-#[cfg(unix)]
-mod platform {
-    use super::{GatewayError, Ipv6Addr, Ipv6InterfaceAddress};
-    use std::{io, ptr};
-
-    pub(super) fn ipv6_interface_addresses() -> Result<Vec<Ipv6InterfaceAddress>, GatewayError> {
-        let mut first_address = ptr::null_mut();
-        // SAFETY: `getifaddrs` initializes the out pointer on success. The linked list is
-        // traversed while alive and released exactly once by `freeifaddrs` below.
-        if unsafe { libc::getifaddrs(&mut first_address) } != 0 {
-            return Err(GatewayError::new(format!(
-                "IPv6 interface enumeration failed: {}",
-                io::Error::last_os_error()
-            )));
-        }
-
-        let mut addresses = Vec::new();
-        let mut current = first_address;
-        while !current.is_null() {
-            // SAFETY: `current` points into the valid list returned by getifaddrs.
-            let interface = unsafe { &*current };
-            if !interface.ifa_addr.is_null()
-                // SAFETY: the first field of sockaddr is its address family.
-                && unsafe { (*interface.ifa_addr).sa_family as i32 } == libc::AF_INET6
-                && !interface.ifa_name.is_null()
-            {
-                // SAFETY: AF_INET6 above guarantees the pointed structure is sockaddr_in6.
-                let address = unsafe {
-                    let socket_address = &*interface.ifa_addr.cast::<libc::sockaddr_in6>();
-                    Ipv6Addr::from(socket_address.sin6_addr.s6_addr)
-                };
-                // SAFETY: ifa_name is a NUL-terminated interface name owned by this list.
-                let interface_index = unsafe { libc::if_nametoindex(interface.ifa_name) };
-                if interface_index != 0
-                    && !address.is_unspecified()
-                    && !address.is_loopback()
-                    && !address.is_multicast()
-                {
-                    addresses.push(Ipv6InterfaceAddress {
-                        address,
-                        interface_index,
-                    });
-                }
-            }
-            // SAFETY: current is a valid ifaddrs node; ifa_next links within the same list.
-            current = unsafe { (*current).ifa_next };
-        }
-        // SAFETY: this is the original successful getifaddrs allocation.
-        unsafe { libc::freeifaddrs(first_address) };
-        addresses.sort();
-        addresses.dedup();
-        Ok(addresses)
-    }
-}
-
-#[cfg(windows)]
-mod platform {
-    use super::{GatewayError, Ipv6Addr, Ipv6InterfaceAddress};
-    use std::{io, ptr};
-    use windows_sys::Win32::NetworkManagement::IpHelper::{
-        GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST,
-        GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
-    };
-    use windows_sys::Win32::Networking::WinSock::AF_INET6;
-
-    const ERROR_BUFFER_OVERFLOW: u32 = 111;
-    const SOCKADDR_IN6_LENGTH: usize = 28;
-
-    pub(super) fn ipv6_interface_addresses() -> Result<Vec<Ipv6InterfaceAddress>, GatewayError> {
-        let mut buffer = vec![0u64; 2048];
-        let mut buffer_bytes = (buffer.len() * std::mem::size_of::<u64>()) as u32;
-        let flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
-        // SAFETY: the `u64`-aligned buffer is passed with its exact byte capacity. Windows
-        // initializes an adapter-address linked list in that storage when the return code is 0.
-        let mut result = unsafe {
-            GetAdaptersAddresses(
-                AF_INET6 as u32,
-                flags,
-                ptr::null_mut(),
-                buffer.as_mut_ptr().cast(),
-                &mut buffer_bytes,
-            )
-        };
-        if result == ERROR_BUFFER_OVERFLOW {
-            let required_words = (buffer_bytes as usize).div_ceil(std::mem::size_of::<u64>());
-            buffer.resize(required_words, 0);
-            // SAFETY: the resized, aligned buffer advertises the exact capacity to the API.
-            result = unsafe {
-                GetAdaptersAddresses(
-                    AF_INET6 as u32,
-                    flags,
-                    ptr::null_mut(),
-                    buffer.as_mut_ptr().cast(),
-                    &mut buffer_bytes,
-                )
-            };
-        }
-        if result != 0 {
-            return Err(GatewayError::new(format!(
-                "IPv6 interface enumeration failed: {}",
-                io::Error::from_raw_os_error(result as i32)
-            )));
-        }
-
-        let mut addresses = Vec::new();
-        // SAFETY: the successful GetAdaptersAddresses call populated a list in buffer.
-        let mut adapter = buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
-        while !adapter.is_null() {
-            // SAFETY: adapter points to an initialized node in the API-owned buffer.
-            let adapter_record = unsafe { &*adapter };
-            let interface_index = adapter_record.Ipv6IfIndex;
-            // SAFETY: FirstUnicastAddress links initialized nodes owned by the same buffer.
-            let mut unicast = adapter_record.FirstUnicastAddress;
-            while !unicast.is_null() {
-                // SAFETY: unicast points to an initialized node in the API-owned buffer.
-                let unicast_record = unsafe { &*unicast };
-                let socket_address = unicast_record.Address;
-                if interface_index != 0
-                    && !socket_address.lpSockaddr.is_null()
-                    && socket_address.iSockaddrLength as usize >= SOCKADDR_IN6_LENGTH
-                {
-                    // SAFETY: the API-reported length is at least sockaddr_in6, so its family
-                    // and address fields are readable from the returned adapter buffer.
-                    let sockaddr = unsafe {
-                        std::slice::from_raw_parts(
-                            socket_address.lpSockaddr.cast::<u8>(),
-                            socket_address.iSockaddrLength as usize,
-                        )
-                    };
-                    if u16::from_ne_bytes([sockaddr[0], sockaddr[1]]) == AF_INET6 as u16 {
-                        let octets: [u8; 16] = sockaddr[8..24]
-                            .try_into()
-                            .expect("the IPv6 socket address field is exactly 16 bytes");
-                        let address = Ipv6Addr::from(octets);
-                        if !address.is_unspecified()
-                            && !address.is_loopback()
-                            && !address.is_multicast()
-                        {
-                            addresses.push(Ipv6InterfaceAddress {
-                                address,
-                                interface_index,
-                            });
-                        }
-                    }
-                }
-                unicast = unicast_record.Next;
-            }
-            adapter = adapter_record.Next;
-        }
-        addresses.sort();
-        addresses.dedup();
-        Ok(addresses)
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-mod platform {
-    use super::{GatewayError, Ipv6InterfaceAddress};
-
-    pub(super) fn ipv6_interface_addresses() -> Result<Vec<Ipv6InterfaceAddress>, GatewayError> {
-        Err(GatewayError::new(
-            "IPv6 UPnP interface discovery is unsupported on this platform",
-        ))
-    }
 }
 
 #[cfg(test)]

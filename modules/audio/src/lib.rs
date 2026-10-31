@@ -53,7 +53,7 @@ impl ManagedModule for AudioModule {
         // synchronizes callbacks. Signed dependency order requires consumers to
         // release their bindings before provider unload.
         unsafe {
-            runtime.register_native(SERVICE, &factory.api)?;
+            amaterasu_module_sdk::audio::register_capture(&runtime, SERVICE, &factory.api)?;
         }
         #[cfg(target_os = "linux")]
         {

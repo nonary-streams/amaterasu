@@ -3,6 +3,7 @@ use super::{
     record::{Record, Resource, State},
     rpc,
 };
+use amaterasu_module_sdk::input::{INPUT_SERVICE, InputRequest};
 use serde_json::{Value, json};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -291,7 +292,7 @@ impl Job {
         let session = || record.resources[&Resource::Session];
         match self.step {
             Step::ObserveLifecycleCapture | Step::ObserveActiveBinding => (
-                Resource::Video.service(),
+                record.service(Resource::Video),
                 json!({"action":"observe_capture", "stream":record.resources[&Resource::Video]}),
             ),
             Step::ValidateLifecycleCandidate
@@ -378,17 +379,17 @@ impl Job {
                     .clone()
                     .expect("journal write step owns a payload"),
             ),
-            Step::Open(resource) => (resource.service(), record.open(resource)),
+            Step::Open(resource) => (record.service(resource), record.open(resource)),
             Step::Authenticate => (
-                Resource::Control.service(),
+                record.service(Resource::Control),
                 json!({"action":"status","stream":record.resources[&Resource::Control]}),
             ),
             Step::ConfirmControlDisconnect => (
-                Resource::Control.service(),
+                record.service(Resource::Control),
                 json!({"action":"status","stream":record.resources[&Resource::Control]}),
             ),
             Step::MediaReady => (
-                Resource::Media.service(),
+                record.service(Resource::Media),
                 json!({"action":"status","stream":record.resources[&Resource::Media]}),
             ),
             Step::ConfigureMediaVideoFormat => {
@@ -397,7 +398,7 @@ impl Job {
                     .as_ref()
                     .expect("validated start configuration");
                 (
-                    Resource::Media.service(),
+                    record.service(Resource::Media),
                     json!({"action":"configure_video_format",
                         "stream":record.resources[&Resource::Media],
                         "video_stream_format":start.configuration.video_stream_format}),
@@ -449,11 +450,11 @@ impl Job {
                 json!({"action":if self.step == Step::RecoverDisplay {"recover"} else {"restore"},"lease":record.display_lease}),
             ),
             Step::AcquireOutput | Step::AcquireAudio => (
-                Resource::Session.service(),
+                record.service(Resource::Session),
                 json!({"action":"acquire","session_id":session(),"resource":record.lease(self.step == Step::AcquireAudio),"mode":"shared"}),
             ),
             Step::Activate => (
-                Resource::Session.service(),
+                record.service(Resource::Session),
                 json!({"action":"activate","session_id":session()}),
             ),
             Step::AcquireInput => {
@@ -489,83 +490,114 @@ impl Job {
                 if let Some(ds5_inputtino_randomize_mac) = start.ds5_inputtino_randomize_mac {
                     payload["ds5_inputtino_randomize_mac"] = json!(ds5_inputtino_randomize_mac);
                 }
-                ("amaterasu.input/1".into(), payload)
+                (INPUT_SERVICE.into(), payload)
             }
             Step::FindInput => (
-                "amaterasu.input/1".into(),
-                json!({"action":"lookup","operation_id":record.input_operation()}),
+                INPUT_SERVICE.into(),
+                InputRequest::Lookup {
+                    operation_id: &record.input_operation(),
+                }
+                .payload(),
             ),
             Step::ReleaseInput => (
-                "amaterasu.input/1".into(),
-                json!({"action":"release","lease":record.input_lease}),
+                INPUT_SERVICE.into(),
+                InputRequest::Release {
+                    lease: record.input_lease.as_deref(),
+                }
+                .payload(),
             ),
             Step::RenewInput => (
-                "amaterasu.input/1".into(),
-                json!({"action":"renew","lease":record.input_lease,"ttl_ms":record.input_ttl_ms}),
+                INPUT_SERVICE.into(),
+                InputRequest::Renew {
+                    lease: record.input_lease.as_deref(),
+                    ttl_ms: record.input_ttl_ms,
+                }
+                .payload(),
             ),
             Step::InputBatch => {
-                let mut payload = json!({"action":"batch","lease":record.input_lease,"events":record.input_events.iter().take(record.input_inflight).collect::<Vec<_>>() });
-                if let (Some(token), Some(epoch)) =
-                    (&record.lifecycle_input_token, &record.lifecycle_input_epoch)
-                {
-                    payload["input_binding"] = json!(token);
-                    payload["operation_id"] =
-                        json!(format!("{epoch}:{}", record.lifecycle_input_sequence));
-                }
-                ("amaterasu.input/1".into(), payload)
+                let binding = record
+                    .lifecycle_input_token
+                    .as_deref()
+                    .zip(record.lifecycle_input_epoch.as_deref());
+                (
+                    INPUT_SERVICE.into(),
+                    InputRequest::Batch {
+                        lease: record.input_lease.as_deref(),
+                        events: record
+                            .input_events
+                            .iter()
+                            .take(record.input_inflight)
+                            .collect(),
+                        input_binding: binding.map(|(token, _)| token),
+                        operation_id: binding.map(|(_, epoch)| {
+                            format!("{epoch}:{}", record.lifecycle_input_sequence)
+                        }),
+                    }
+                    .payload(),
+                )
             }
             Step::FeedbackPeek => (
-                "amaterasu.input/1".into(),
-                json!({"action":"feedback_peek","lease":record.input_lease,"limit":16}),
+                INPUT_SERVICE.into(),
+                InputRequest::FeedbackPeek {
+                    lease: record.input_lease.as_deref(),
+                    limit: 16,
+                }
+                .payload(),
             ),
             Step::FeedbackAck => (
-                "amaterasu.input/1".into(),
-                json!({"action":"feedback_ack","lease":record.input_lease,
-                    "through_sequence":record.feedback_ack_through}),
+                INPUT_SERVICE.into(),
+                InputRequest::FeedbackAck {
+                    lease: record.input_lease.as_deref(),
+                    through_sequence: record.feedback_ack_through,
+                }
+                .payload(),
             ),
             Step::PollGamepadFeedback => (
-                "amaterasu.input/1".into(),
-                json!({"action":"poll_gamepad_feedback","lease":record.input_lease}),
+                INPUT_SERVICE.into(),
+                InputRequest::PollGamepadFeedback {
+                    lease: record.input_lease.as_deref(),
+                }
+                .payload(),
             ),
             Step::RumbleDrain => (String::new(), Value::Null),
             Step::DrainVideo => (
-                Resource::Video.service(),
+                record.service(Resource::Video),
                 json!({"action":"drain","stream":record.resources[&Resource::Video]}),
             ),
             Step::RecoverAudio => (
-                Resource::AudioEncoder.service(),
+                record.service(Resource::AudioEncoder),
                 json!({"action":"recover","stream":record.resources[&Resource::AudioEncoder]}),
             ),
             Step::CloseCapture => (
-                Resource::AudioCapture.service(),
+                record.service(Resource::AudioCapture),
                 json!({"action":"close","stream":record.resources[&Resource::AudioCapture]}),
             ),
             Step::TransportStatus => (
-                Resource::Media.service(),
+                record.service(Resource::Media),
                 json!({"action":"status","stream":record.resources[&Resource::Media]}),
             ),
             Step::Find(Resource::Session) => (
-                Resource::Session.service(),
+                record.service(Resource::Session),
                 json!({"action":"lookup","key":record.operation(Resource::Session)}),
             ),
             Step::Find(resource) | Step::AwaitClosed(resource) => (
-                resource.service(),
+                record.service(resource),
                 json!({"action":"lookup","operation_id":record.operation(resource)}),
             ),
             Step::Close(resource) => (
-                resource.service(),
+                record.service(resource),
                 json!({"action":"close","stream":record.resources[&resource]}),
             ),
             Step::StopSession => (
-                Resource::Session.service(),
+                record.service(Resource::Session),
                 json!({"action":"stop","session_id":session()}),
             ),
             Step::FinishSession => (
-                Resource::Session.service(),
+                record.service(Resource::Session),
                 json!({"action":"finish_stop","session_id":session()}),
             ),
             Step::ForceIdr => (
-                Resource::Video.service(),
+                record.service(Resource::Video),
                 json!({"action":"force_idr","stream":record.resources[&Resource::Video]}),
             ),
             Step::WaitDrain => unreachable!("native drain has no JSON command"),

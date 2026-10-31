@@ -2,7 +2,9 @@
 mod model;
 mod product_settings;
 mod release;
+mod worker;
 
+use amaterasu_module_sdk::network::{Network, abi as network_abi};
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use model::Settings;
 use product_settings::{Completion, ProductSettings};
@@ -14,9 +16,8 @@ use semver::Version;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, VecDeque};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use worker::ReleaseWorker;
 
 const SERVICE: &str = "amaterasu.updater/1";
 const MANAGEMENT: &str = "amaterasu.management";
@@ -78,8 +79,8 @@ struct UpdaterModule {
     product_settings: ProductSettings,
     deferred_requests: VecDeque<(u64, Operation)>,
     installed_version: Version,
-    release_sender: Sender<Result<ReleaseSet, String>>,
-    release_receiver: Receiver<Result<ReleaseSet, String>>,
+    network: Network,
+    release_worker: Option<ReleaseWorker>,
     check_in_progress: bool,
     next_check_at: Option<Instant>,
     configured_interval: Option<u32>,
@@ -99,10 +100,16 @@ struct UpdaterModule {
 
 impl ManagedModule for UpdaterModule {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
+        let Response::Result { payload: settings } = runtime.send(Command::GetSettings {})? else {
+            return Err("updater settings unavailable".into());
+        };
+        let network = Network::from_settings(&runtime, &settings)?;
+        if !network.supports(network_abi::TCP | network_abi::DNS) {
+            return Err("updater requires network TCP and DNS capabilities".into());
+        }
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
-        let (release_sender, release_receiver) = mpsc::channel();
         let startup_id = format!(
             "{}-{}",
             std::process::id(),
@@ -115,8 +122,8 @@ impl ManagedModule for UpdaterModule {
             product_settings: ProductSettings::new(&startup_id),
             deferred_requests: VecDeque::new(),
             installed_version,
-            release_sender,
-            release_receiver,
+            network,
+            release_worker: None,
             check_in_progress: false,
             next_check_at: None,
             configured_interval: None,
@@ -175,6 +182,14 @@ impl ManagedModule for UpdaterModule {
         self.start_stream_check_if_due(Instant::now());
         self.advance_tray_call()?;
         Ok(())
+    }
+}
+
+impl Drop for UpdaterModule {
+    fn drop(&mut self) {
+        // Retire worker code and its provider handles before dropping this
+        // module's runtime client or the network binding it shares.
+        drop(self.release_worker.take());
     }
 }
 
@@ -342,25 +357,26 @@ impl UpdaterModule {
         }
         self.check_in_progress = true;
         self.last_check_started = Some(now);
-        let sender = self.release_sender.clone();
-        let result = thread::Builder::new()
-            .name("amaterasu-updater-check".into())
-            .spawn(move || {
-                let result = GitHubReleaseSource::default().fetch();
-                let _ = sender.send(result);
-            });
-        if result.is_err() {
-            self.check_in_progress = false;
-            self.last_error = Some("worker_unavailable");
-            self.finish_check_time(now);
-            return false;
+        let network = self.network.clone();
+        match ReleaseWorker::spawn(move || GitHubReleaseSource::new(network).fetch()) {
+            Ok(worker) => self.release_worker = Some(worker),
+            Err(_) => {
+                self.check_in_progress = false;
+                self.last_error = Some("worker_unavailable");
+                self.finish_check_time(now);
+                return false;
+            }
         }
         true
     }
 
     fn collect_release_result(&mut self, now: Instant) {
-        match self.release_receiver.try_recv() {
-            Ok(Ok(releases)) => {
+        let Some(result) = self.release_worker.as_mut().and_then(ReleaseWorker::poll) else {
+            return;
+        };
+        self.release_worker = None;
+        match result {
+            Ok(releases) => {
                 self.releases = releases;
                 self.last_error = None;
                 self.available_update = select_available_update(
@@ -386,14 +402,8 @@ impl UpdaterModule {
                 self.check_in_progress = false;
                 self.finish_check_time(now);
             }
-            Ok(Err(_)) => {
+            Err(_) => {
                 self.last_error = Some("release_service_unavailable");
-                self.check_in_progress = false;
-                self.finish_check_time(now);
-            }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                self.last_error = Some("release_worker_stopped");
                 self.check_in_progress = false;
                 self.finish_check_time(now);
             }
@@ -617,6 +627,78 @@ amaterasu_module_sdk::export_module!(UpdaterModule);
 mod tests {
     use super::*;
     use crate::model::{DEFAULT_UPDATE_CHECK_INTERVAL_SECONDS, MAX_UPDATE_CHECK_INTERVAL_SECONDS};
+
+    #[test]
+    fn missing_selected_network_provider_fails_before_registering_updater() {
+        use amaterasu_module_sdk::abi::{
+            AbiHeader, BorrowedBytes, HostApi, ReplySink, STATUS_OK, Status,
+        };
+        use std::ffi::c_void;
+
+        struct Host {
+            settings: Value,
+            commands: Vec<Command>,
+        }
+        unsafe extern "C" fn invoke(
+            context: *mut c_void,
+            input: BorrowedBytes,
+            reply: ReplySink,
+        ) -> Status {
+            // SAFETY: the boxed test host and synchronous request/reply borrows
+            // remain alive until startup has returned.
+            let host = unsafe { &mut *context.cast::<Host>() };
+            let command: Command =
+                serde_json::from_slice(unsafe { input.read().unwrap() }).unwrap();
+            let response = match &command {
+                Command::GetSettings {} => Response::Result {
+                    payload: host.settings.clone(),
+                },
+                Command::NativeBindTyped { contract, .. } => {
+                    assert_eq!(contract, network_abi::CONTRACT);
+                    Response::error("permission_denied", "test provider absent")
+                }
+                Command::NativeBind { .. } => {
+                    Response::error("permission_denied", "test provider absent")
+                }
+                _ => Response::Ok,
+            };
+            host.commands.push(command);
+            let bytes = serde_json::to_vec(&response).unwrap();
+            unsafe { reply.send(&bytes) };
+            STATUS_OK
+        }
+
+        for (settings, expected) in [
+            (json!({}), "amaterasu.network/1"),
+            (
+                json!({"network_provider":"example.network/1"}),
+                "example.network/1",
+            ),
+        ] {
+            let mut host = Box::new(Host {
+                settings,
+                commands: Vec::new(),
+            });
+            let endpoint = HostApi {
+                header: AbiHeader::of::<HostApi>(),
+                context: (&mut *host as *mut Host).cast(),
+                invoke,
+            };
+            // SAFETY: host outlives the rejected startup and no client escapes.
+            let runtime = unsafe { RuntimeClient::from_endpoint(endpoint) };
+            assert!(UpdaterModule::start(runtime).is_err());
+            assert!(host.commands.iter().any(|command| matches!(command,
+                Command::NativeBind { service, .. } | Command::NativeBindTyped { service, .. }
+                if service == expected
+            )));
+            assert!(
+                !host
+                    .commands
+                    .iter()
+                    .any(|command| matches!(command, Command::Register { .. }))
+            );
+        }
+    }
 
     #[test]
     fn updater_defaults_keep_the_24_hour_seconds_interval_and_zero_disables_checks() {

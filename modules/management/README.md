@@ -436,3 +436,14 @@ routes pin their provider/action and reject additional fields. They
 expose no native pointers, arbitrary service forwarding, or capture/open controls.
 Device enumeration can report an unsupported platform; default-disabled audio and
 encoding return empty capability lists without starting capture or encoding.
+
+### Audio discovery provider selection
+
+Trusted startup settings `audio_capture_provider` and `audio_encoder_provider`
+select the services used by audio endpoint/driver status and encoder discovery.
+They default to `amaterasu.audio/1` and `amaterasu.audio-encode/1`. The
+selected providers must implement the same `enumerate` and `status` control
+semantics and have matching signed call grants and startup dependencies. The
+existing `media.read` authorization and bodyless discovery policy still apply;
+HTTP requests cannot choose a provider. Configure these alongside the stream
+session provider selections when replacing audio services.

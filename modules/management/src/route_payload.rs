@@ -42,6 +42,7 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         "amaterasu.management/1" => management_settings(route.action, object),
         "amaterasu.host-configuration/1" => host_configuration(route.action, object),
         "amaterasu.catalog/1" => catalog(route.action, object),
+        "amaterasu.library/1" => library_artwork(route.action, object),
         "amaterasu.pairing/1" => pairing(route.action, object),
         "amaterasu.display/1" => display(route.action, object),
         "amaterasu.video/1" => video(route.action, object),
@@ -105,6 +106,37 @@ pub fn validate(route: Route, object: &Object) -> Result<(), &'static str> {
         }
         _ => Ok(()),
     }
+}
+
+fn library_artwork(action: &str, object: &Object) -> Result<(), &'static str> {
+    match action {
+        "artwork_read" => fields(object, &["id", "offset", "transfer_id"], &["revision"]),
+        "artwork_release" => fields(object, &["id", "transfer_id"], &[]),
+        _ => Err(INVALID),
+    }?;
+    let id = text(object, "id")?;
+    let transfer = text(object, "transfer_id")?;
+    if id.len() != 20
+        || !id.starts_with("app-")
+        || !id[4..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || transfer.len() != 32
+        || !transfer
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || object
+            .get("offset")
+            .is_some_and(|value| value.as_u64().is_none())
+        || object.get("revision").is_some_and(|value| {
+            value.as_str().is_none_or(|value| {
+                value.is_empty() || value.len() > 128 || value.chars().any(char::is_control)
+            })
+        })
+    {
+        return Err(INVALID);
+    }
+    Ok(())
 }
 
 fn host_logs(action: &str, object: &Object) -> Result<(), &'static str> {

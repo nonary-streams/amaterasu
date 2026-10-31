@@ -5,6 +5,7 @@ use amaterasu_module_sdk::abi::{
     STATUS_OK, Status,
 };
 use std::ffi::c_void;
+use std::net::TcpStream;
 use std::sync::Mutex;
 
 const TRUSTED: &str = "https://trusted.example:47990";

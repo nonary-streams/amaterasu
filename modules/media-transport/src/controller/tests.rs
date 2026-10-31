@@ -4,6 +4,7 @@ use amaterasu_module_sdk::abi::{STATUS_INVALID_ARGUMENT, STATUS_OK};
 
 fn controller() -> Controller {
     Controller::new(Settings {
+        network_provider: None,
         enabled: true,
         allow_remote: false,
         allowed_principals: vec!["owner".into(), "other".into()],

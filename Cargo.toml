@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/abi",
+    "crates/data-plane",
     "crates/configuration-schema",
     "crates/extension-api",
     "crates/media",
@@ -10,6 +11,9 @@ members = [
     "crates/gamestream",
     "crates/input-policy",
     "crates/network-policy",
+    "crates/network-api",
+    "crates/network-sockets",
+    "modules/network",
     "crates/webrtc-transport",
     "crates/logging",
     "crates/contracts",
@@ -23,6 +27,7 @@ members = [
     "crates/release",
     "crates/vkms-frame-helper",
     "fixtures/echo",
+    "fixtures/data-plane",
     "fixtures/extension-example",
     "fixtures/media-probe",
     "fixtures/autonomous-video-probe",
@@ -79,6 +84,9 @@ rust-version = "1.89"
 version = "0.1.0"
 
 [workspace.dependencies]
+amaterasu-network-api = { path = "crates/network-api" }
+amaterasu-network-sockets = { path = "crates/network-sockets" }
+amaterasu-data-plane = { path = "crates/data-plane" }
 amaterasu-configuration-schema = { path = "crates/configuration-schema" }
 amaterasu-extension-api = { path = "crates/extension-api" }
 amaterasu-abi = { path = "crates/abi" }

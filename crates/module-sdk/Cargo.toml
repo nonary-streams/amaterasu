@@ -4,14 +4,23 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+network-test-support = ["dep:amaterasu-network-sockets"]
+network-http = ["dep:ureq"]
+
 [dependencies]
 base64 = "0.22"
 amaterasu-abi.workspace = true
+amaterasu-network-api.workspace = true
+amaterasu-network-sockets = {workspace = true, optional = true}
+amaterasu-data-plane.workspace = true
+getrandom.workspace = true
 amaterasu-contracts.workspace = true
 amaterasu-extension-api = { path = "../extension-api" }
 amaterasu-media.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+ureq = { version = "=3.4.2", default-features = false, features = ["rustls", "platform-verifier"], optional = true }
 
 [lints]
 workspace = true

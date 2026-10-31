@@ -207,6 +207,9 @@ mod launch_composition;
 mod library_composition;
 
 #[cfg(test)]
+mod artwork_composition;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use amaterasu_module_sdk::requests::IncomingRequest;

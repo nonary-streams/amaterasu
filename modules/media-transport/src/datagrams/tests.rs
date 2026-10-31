@@ -1,4 +1,5 @@
 use super::*;
+use std::net::UdpSocket;
 
 const VIDEO_TOKEN: [u8; 16] = *b"video_token-1234";
 const AUDIO_TOKEN: [u8; 16] = *b"audio_token-1234";
@@ -178,30 +179,6 @@ fn partial_batch_send_result_fails_without_counting_any_datagrams_as_sent() {
 }
 
 #[test]
-#[cfg(windows)]
-fn accepted_batch_with_failed_option_reset_is_counted_once_then_fails_stream() {
-    let mut delivery = delivery();
-    delivery.push_video(1, vec![vec![1; 4], vec![2; 4], vec![3; 4], vec![4; 4]]);
-    let mut batch_attempts = 0;
-
-    let sent = delivery.tick_with_batch_sender(3, |_, payload, _| {
-        batch_attempts += 1;
-        if batch_attempts == 1 {
-            Err(BatchError::SentThenFailed(payload.len()))
-        } else {
-            Ok(payload.len())
-        }
-    });
-
-    assert_eq!(sent, 3);
-    assert_eq!(batch_attempts, 1);
-    assert_eq!(delivery.sent_datagrams, 3);
-    assert_eq!(delivery.discarded_datagrams, 1);
-    assert_eq!(delivery.failure, Some("udp_send_failed"));
-    assert_eq!(delivery.queued(), 0);
-}
-
-#[test]
 fn video_batch_allowance_resets_at_frame_boundaries() {
     let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
     let local = "127.0.0.1:0".parse().unwrap();
@@ -378,4 +355,82 @@ fn receive_work_per_tick_is_bounded() {
         delivery.peer_port(Medium::Video),
         Some(video.local_addr().unwrap().port())
     );
+}
+
+#[test]
+fn provider_partial_batch_acceptance_retries_only_unsent_suffix() {
+    let mut delivery = delivery();
+    delivery.push_video(1, vec![vec![1; 4], vec![2; 4], vec![3; 4]]);
+    let sent = delivery.tick_with_batch_sender(64, |_, payload, segment_size| {
+        assert_eq!(payload, [vec![1; 4], vec![2; 4], vec![3; 4]].concat());
+        Ok(segment_size)
+    });
+    assert_eq!(sent, 1);
+    assert_eq!(delivery.sent_datagrams, 1);
+    assert_eq!(delivery.queued(), 2);
+    assert_eq!(delivery.queued_bytes(), 8);
+    assert_eq!(delivery.failure, None);
+    let sent = delivery.tick_with_batch_sender(64, |_, payload, _| {
+        assert_eq!(payload, [vec![2; 4], vec![3; 4]].concat());
+        Ok(payload.len())
+    });
+    assert_eq!(sent, 2);
+    assert_eq!(delivery.sent_datagrams, 3);
+    assert_eq!(delivery.queued(), 0);
+}
+
+#[test]
+fn provider_with_one_datagram_batch_limit_preserves_ordered_delivery() {
+    use amaterasu_module_sdk::abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
+    use amaterasu_module_sdk::network::abi;
+    use std::ffi::c_void;
+    unsafe extern "C" fn capabilities(_: *mut c_void, output: *mut abi::Capabilities) -> Status {
+        if output.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: SDK supplies writable capability storage. This adapter offers
+        // a valid provider contract with a smaller optional batch limit.
+        unsafe {
+            *output = abi::Capabilities {
+                size: size_of::<abi::Capabilities>() as u32,
+                version: 1,
+                features: abi::UDP | abi::BATCH,
+                max_io_bytes: 65_535,
+                max_handles: 1024,
+                max_batch: 1,
+            }
+        };
+        STATUS_OK
+    }
+    let factory = amaterasu_network_sockets::Factory::new();
+    // SAFETY: factory and provider code outlive all native calls and the owned
+    // binding. The adapter copies only C function pointers/context, never Rust
+    // allocator objects. Its table remains boxed until after Network release.
+    let original = unsafe {
+        amaterasu_network_sockets::bind_standalone(&factory, "media.batch-test").unwrap()
+    };
+    let mut adapter = Box::new(unsafe { std::ptr::read(original) });
+    adapter.capabilities = capabilities;
+    let network = unsafe { Network::from_native_table(&*adapter).unwrap() };
+    let peer = sender();
+    let address = peer.local_addr().unwrap();
+    let local = "127.0.0.1:0".parse().unwrap();
+    let mut delivery =
+        Delivery::bind_with_network(&network, local, local, address, address).unwrap();
+    delivery.push_video(1, vec![vec![1; 4], vec![2; 4], vec![3; 4]]);
+    let mut buffer = [0; 16];
+    for expected in [1, 2, 3] {
+        assert_eq!(delivery.tick_with_limit(64), 1);
+        let length = peer.recv(&mut buffer).unwrap();
+        assert_eq!(&buffer[..length], &[expected; 4]);
+        assert_eq!(delivery.failure, None);
+    }
+    assert_eq!(delivery.sent_datagrams, 3);
+    assert_eq!(delivery.queued(), 0);
+    drop(delivery);
+    // Final Network release calls the original provider's release callback;
+    // it owns the original binding. The adapter's separate table box then drops.
+    drop(network);
+    drop(adapter);
+    drop(factory);
 }

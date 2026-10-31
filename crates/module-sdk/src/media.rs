@@ -1,4 +1,16 @@
 //! Helpers for borrowed CPU frames and explicitly retained GPU presentations.
+/// Native interface families used for typed registration and binding. These
+/// identities are independent of service aliases and imply the complete ABI
+/// and ownership contract for each family.
+pub mod native_contracts {
+    pub const CAPTURE: &str = "amaterasu.video-capture.native/1";
+    pub const ENCODER: &str = "amaterasu.video-encoder.native/1";
+    pub const ENCODER_PROVIDER: &str = "amaterasu.encoder-provider.native/1";
+    pub const FRAME_RESOURCE_CONSUMER: &str = "amaterasu.frame-resource-consumer.native/1";
+    pub const CPU_PROCESSOR: &str = "amaterasu.cpu-frame-processor.native/1";
+    pub const GPU_PROCESSOR: &str = "amaterasu.gpu-frame-processor.native/1";
+}
+
 mod generic;
 mod lease;
 use amaterasu_abi::{STATUS_INVALID_ARGUMENT, Status};

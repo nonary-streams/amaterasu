@@ -89,10 +89,14 @@ pub struct Plane {
 }
 
 impl Plane {
-    pub fn new(runtime: &RuntimeClient, handles: Handles) -> PlaneResult<Self> {
+    pub fn new(
+        runtime: &RuntimeClient,
+        handles: Handles,
+        providers: &crate::providers::ProviderServices,
+    ) -> PlaneResult<Self> {
         Ok(Self {
             pump: Pump::with_media(
-                native::NativeBackend::new(runtime, handles)?,
+                native::NativeBackend::new(runtime, handles, providers)?,
                 handles.stream_audio,
                 handles.audio_channels,
                 handles.video_codec,

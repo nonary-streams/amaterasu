@@ -128,8 +128,7 @@ pub fn echo(runtime: &RuntimeClient, stream: u64) -> ModuleResult<Value> {
     // SAFETY: signed dependency retains provider code until this local binding
     // is released; every packet allocation is borrowed synchronously below.
     unsafe {
-        let binding =
-            runtime.bind_native(SERVICE, 1, 0, size_of::<ControlTransportApi>() as u32)?;
+        let binding = amaterasu_module_sdk::transport::bind_control(runtime, SERVICE)?;
         let api = binding.table::<ControlTransportApi>()?;
         let mut first = Capture {
             reject: true,

@@ -264,14 +264,24 @@ impl ManagedModule for NvhttpModule {
             return Err("nvhttp settings unavailable".into());
         };
         let settings: Settings =
-            serde_json::from_value(payload).map_err(|_| "invalid nvhttp settings")?;
+            serde_json::from_value(payload.clone()).map_err(|_| "invalid nvhttp settings")?;
         settings.validate()?;
         let hostname = settings::effective_hostname(&settings.hostname);
         let mut product_settings =
             ProductSettings::with_bootstrap_settings(hostname.clone(), &settings);
+        let network = settings
+            .enabled
+            .then(|| amaterasu_module_sdk::network::Network::from_settings(&runtime, &payload))
+            .transpose()?;
         let (server, router, identity) = if settings.enabled {
             let identity = tls::Identity::bind(&runtime)?;
-            let server = server::Server::bind(&settings)?;
+            let server = server::Server::bind_with_network(
+                network
+                    .as_ref()
+                    .ok_or("enabled nvhttp requires a network provider")?
+                    .clone(),
+                &settings,
+            )?;
             let mut launches = launch::Controller::new(settings.streaming.clone())?;
             launches.set_session_lifecycle_required(settings.session_lifecycle_required);
             let router = wire::Router::new(
@@ -328,7 +338,7 @@ impl ManagedModule for NvhttpModule {
             warm: WarmIdentity::new(),
             product_settings,
             network_settings: NetworkSettings::default(),
-            upnp_lifecycle: upnp::UpnpLifecycle::new(),
+            upnp_lifecycle: upnp::UpnpLifecycle::new(network),
             management_exposure: upnp::ManagementExposure::default(),
             encoder_refresh: encoder_refresh::EncoderRefresh::default(),
             next_listener_rebind: Instant::now(),
@@ -355,6 +365,7 @@ impl ManagedModule for NvhttpModule {
         }
         self.audio_driver_install.tick(
             &self.runtime,
+            &self.startup_settings.audio_capture_provider,
             self.product_settings.loaded(),
             self.product_settings.revision(),
             self.product_settings.install_steam_audio_drivers(),

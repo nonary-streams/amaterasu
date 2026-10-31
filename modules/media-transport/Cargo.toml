@@ -16,11 +16,11 @@ serde.workspace = true
 serde_json.workspace = true
 getrandom = "0.3"
 
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
+[dev-dependencies]
+amaterasu-network-policy = { path = "../../crates/network-policy", features = ["test-support"] }
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Networking_WinSock"] }
+amaterasu-network-sockets.workspace = true
+amaterasu-module-sdk = { workspace = true, features = ["network-test-support"] }
 
 [lints]
 workspace = true

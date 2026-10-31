@@ -1,11 +1,20 @@
 //! Safe module-facing API. ABI ownership and panic containment live in `exports`.
 pub mod application_library;
+pub mod audio;
 pub mod capture;
+pub mod data_plane;
 pub mod encode;
 pub mod exports;
+pub mod input;
 pub mod media;
 mod native;
+pub mod network;
+#[cfg(feature = "network-http")]
+pub mod network_http;
 pub mod requests;
+pub mod transport;
+pub mod video;
+pub mod virtual_display;
 pub use native::NativeBinding;
 
 pub use amaterasu_abi as abi;
@@ -49,6 +58,10 @@ pub struct RuntimeClient {
 impl RuntimeClient {
     /// # Safety
     /// The endpoint's runtime must outlive this client and all its calls.
+    /// Its invoke callback and context must support concurrent calls from any
+    /// consumer worker thread. Native interface guards may release a binding on
+    /// the last owning worker; endpoint identity and authorization remain bound
+    /// to this table, never to the calling OS thread.
     pub unsafe fn from_endpoint(endpoint: abi::HostApi) -> Self {
         Self { endpoint }
     }
@@ -58,6 +71,8 @@ impl RuntimeClient {
             command,
             Command::NativeRegister { .. }
                 | Command::NativeBind { .. }
+                | Command::NativeRegisterTyped { .. }
+                | Command::NativeBindTyped { .. }
                 | Command::NativeRelease { .. }
         ) {
             return Err("native control operations require the unsafe native SDK API".into());

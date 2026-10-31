@@ -124,6 +124,15 @@ pub fn resolve(path: &str) -> Option<Route> {
             "package_selection_status",
             Some("configuration.read"),
         ),
+        ("library", "artwork_read" | "artwork_release") => (
+            "amaterasu.library/1",
+            if action == "artwork_read" {
+                "artwork_read"
+            } else {
+                "artwork_release"
+            },
+            Some("catalog.read"),
+        ),
         ("catalog", action) => (
             "amaterasu.catalog/1",
             catalog_action(action)?,
@@ -2094,5 +2103,24 @@ mod tests {
         assert!(payload(stop, br#"{"reference":"bad","revision":"bad"}"#).is_err());
         assert!(payload(status, br#"{"reference":null}"#).is_err());
         assert!(payload(status, br#"{"unexpected":1}"#).is_err());
+    }
+
+    #[test]
+    fn catalog_artwork_routes_cannot_select_a_provider_or_identity() {
+        let read = resolve("/v1/library/artwork_read").unwrap();
+        let release = resolve("/v1/library/artwork_release").unwrap();
+        assert_eq!(read.service, "amaterasu.library/1");
+        assert_eq!(read.scope, Some("catalog.read"));
+        let valid = serde_json::json!({"id":"app-0000000000000001", "revision":"opaque revision", "offset":0, "transfer_id":"a".repeat(32)});
+        assert!(payload(read, &serde_json::to_vec(&valid).unwrap()).is_ok());
+        for key in ["provider", "service", "owner", "initiator", "path"] {
+            let mut injected = valid.clone();
+            injected[key] = serde_json::json!("another-provider");
+            assert!(payload(read, &serde_json::to_vec(&injected).unwrap()).is_err());
+        }
+        let valid_release =
+            serde_json::json!({"id":"app-0000000000000001", "transfer_id":"a".repeat(32)});
+        assert!(payload(release, &serde_json::to_vec(&valid_release).unwrap()).is_ok());
+        assert!(payload(release, &serde_json::to_vec(&valid).unwrap()).is_err());
     }
 }
