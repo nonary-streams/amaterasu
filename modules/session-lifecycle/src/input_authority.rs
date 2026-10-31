@@ -391,7 +391,11 @@ impl InputAuthority {
             return Err(Error::Unauthorized);
         }
         if r.outcome == Outcome::RecoveryRequired {
-            return Err(Error::UnknownOutcome);
+            return if outcome == Outcome::RecoveryRequired {
+                Ok(r.clone())
+            } else {
+                Err(Error::UnknownOutcome)
+            };
         }
         if r.outcome != Outcome::Running && r.outcome != outcome {
             return Err(Error::Conflict);
@@ -848,14 +852,47 @@ mod tests {
         else {
             panic!()
         };
-        book.finish_input_action(
-            "input",
-            "client",
-            "op",
-            &reservation.reservation_id,
-            Outcome::RecoveryRequired,
-        )
-        .unwrap();
+        let uncertain = book
+            .finish_input_action(
+                "input",
+                "client",
+                "op",
+                &reservation.reservation_id,
+                Outcome::RecoveryRequired,
+            )
+            .unwrap();
+        assert_eq!(
+            book.finish_input_action(
+                "input",
+                "client",
+                "op",
+                &reservation.reservation_id,
+                Outcome::RecoveryRequired
+            ),
+            Ok(uncertain.clone())
+        );
+        let mut book: InputAuthority =
+            serde_json::from_slice(&serde_json::to_vec(&book).unwrap()).unwrap();
+        assert_eq!(
+            book.finish_input_action(
+                "input",
+                "client",
+                "op",
+                &reservation.reservation_id,
+                Outcome::RecoveryRequired
+            ),
+            Ok(uncertain)
+        );
+        assert_eq!(
+            book.finish_input_action(
+                "input",
+                "client",
+                "op",
+                &reservation.reservation_id,
+                Outcome::Cancelled
+            ),
+            Err(Error::UnknownOutcome)
+        );
         book.fence(&active);
         assert!(book.has_any_session_reference("session"));
         assert!(book.terminal_receipts.is_empty());
