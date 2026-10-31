@@ -24,6 +24,8 @@ struct Provider {
     pcm_failed: bool,
     alternate_audio: bool,
     submitted_pcm: bool,
+    /// Test-only pause inside the synchronous native transport send.
+    blocked_send: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
 }
 
 struct Host {
@@ -270,6 +272,14 @@ unsafe extern "C" fn send_control(
     let Ok(bytes) = (unsafe { message.bytes() }) else {
         return STATUS_INVALID_ARGUMENT;
     };
+    if let Some((entered, resume)) = provider.blocked_send.take()
+        && (entered.send(()).is_err()
+            || resume
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_err())
+    {
+        return MEDIA_BACKEND_ERROR;
+    }
     provider.sent_control.push((
         stream,
         message.message_type,
@@ -506,4 +516,64 @@ fn alternative_provider_roles_bind_and_release_the_exact_selected_interfaces() {
     );
     drop(backend);
     assert_eq!(host.released, [1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn test_ticket_harness_holds_drain_until_native_feedback_send_returns() {
+    use std::sync::{Arc, RwLock, mpsc};
+    use std::time::Duration;
+    // This lock only models the future protocol-owned gate. It does not install
+    // a source route or authorize production feedback.
+    let gate = Arc::new(RwLock::new(true));
+    let worker_gate = Arc::clone(&gate);
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut host = Host::new();
+        host.provider.blocked_send = Some((entered_tx, resume_rx));
+        let mut backend = NativeBackend::new(
+            &host.runtime(),
+            handles(),
+            &crate::providers::ProviderServices::default(),
+        )
+        .unwrap();
+        let message = encode_host_feedback(HostFeedback::Rumble {
+            controller: 7,
+            low_frequency: 1,
+            high_frequency: 2,
+        })
+        .unwrap();
+        let ticket = worker_gate.read().unwrap();
+        assert!(*ticket);
+        let accepted = backend.send_feedback(&message).unwrap();
+        drop(ticket);
+        drop(backend);
+        (accepted, host.provider.sent_control.len())
+    });
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(
+        gate.try_write().is_err(),
+        "drain must not complete inside native send"
+    );
+    let revoke_gate = Arc::clone(&gate);
+    let (started_tx, started_rx) = mpsc::channel();
+    let (drained_tx, drained_rx) = mpsc::channel();
+    let revoke = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let mut state = revoke_gate.write().unwrap();
+        *state = false;
+        drained_tx.send(()).unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(drained_rx.try_recv().is_err());
+    resume_tx.send(()).unwrap();
+    let (accepted, deliveries) = worker.join().unwrap();
+    drained_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    revoke.join().unwrap();
+    assert!(accepted);
+    assert_eq!(deliveries, 1);
+    assert!(
+        !*gate.read().unwrap(),
+        "future admission must fail after drain"
+    );
 }

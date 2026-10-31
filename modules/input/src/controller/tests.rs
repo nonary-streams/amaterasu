@@ -46,6 +46,8 @@ struct FakeBackend {
     active_controller_slots: BTreeSet<u16>,
     full_advances: usize,
     pen_touch_advances: usize,
+    /// Test-only hook to hold the actual backend effect call in flight.
+    blocked_inject: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
 }
 impl Backend for FakeBackend {
     fn poll_gamepad_feedback(
@@ -119,6 +121,12 @@ impl Backend for FakeBackend {
         Ok(())
     }
     fn inject(&mut self, event: &Event) -> InputResult<()> {
+        if let Some((entered, resume)) = self.blocked_inject.take() {
+            entered.send(()).expect("test observer remains live");
+            resume
+                .recv_timeout(Duration::from_secs(5))
+                .expect("test releases backend effect");
+        }
         self.trace.borrow_mut().push(event.clone());
         if let Event::PenTouch {
             pointer_id, phase, ..
@@ -4981,4 +4989,66 @@ fn lifecycle_revoke_only_cancels_exact_lease_and_retains_failed_cleanup() {
     controller.expire(now + Duration::from_millis(101));
     assert!(!controller.cleanup_required());
     assert!(!controller.bound_lease_active("owner", &token));
+}
+
+#[test]
+fn test_ticket_harness_holds_drain_until_actual_input_backend_returns() {
+    use std::sync::{Arc, RwLock, mpsc};
+    // This lock is a test double for the pending protocol gate, not a production
+    // authorization implementation. The test drives the real controller path.
+    let gate = Arc::new(RwLock::new(true));
+    let worker_gate = Arc::clone(&gate);
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut controller = Controller::new(
+            FakeBackend {
+                blocked_inject: Some((entered_tx, resume_rx)),
+                ..Default::default()
+            },
+            true,
+        );
+        let now = Instant::now();
+        let lease = acquire(&mut controller, now);
+        let ticket = worker_gate.read().unwrap();
+        assert!(*ticket);
+        let result = controller.handle(
+            "owner",
+            Operation::Batch {
+                lease,
+                events: vec![key(30, KeyState::Down)],
+            },
+            now,
+            &mut || Ok(()),
+        );
+        let count = controller.backend.trace.borrow().len();
+        drop(ticket);
+        (result, count)
+    });
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(
+        gate.try_write().is_err(),
+        "drain must not complete inside backend call"
+    );
+    let revoke_gate = Arc::clone(&gate);
+    let (started_tx, started_rx) = mpsc::channel();
+    let (drained_tx, drained_rx) = mpsc::channel();
+    let revoke = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let mut state = revoke_gate.write().unwrap();
+        *state = false;
+        drained_tx.send(()).unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(drained_rx.try_recv().is_err());
+    resume_tx.send(()).unwrap();
+    let (result, delivered) = worker.join().unwrap();
+    drained_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    revoke.join().unwrap();
+    assert_eq!(result["ok"], true);
+    assert_eq!(delivered, 1);
+    assert!(
+        !*gate.read().unwrap(),
+        "future admission must fail after drain"
+    );
 }

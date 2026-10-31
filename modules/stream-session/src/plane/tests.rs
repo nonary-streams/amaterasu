@@ -376,6 +376,26 @@ fn stop_cancels_pending_feedback_and_rejects_new_events() {
 }
 
 #[test]
+fn stop_discards_busy_feedback_before_transport_retry() {
+    let mut pump = Pump::new(Fake {
+        feedback_busy: true,
+        ..Fake::default()
+    });
+    assert_eq!(
+        pump.enqueue_feedback(rumble(1, 10, 20)),
+        Ok(FeedbackEnqueueOutcome::Queued)
+    );
+    pump.tick(false).unwrap();
+    assert_eq!(pump.pending_feedback.len(), 1);
+    pump.stopping = true;
+    pump.cancel_feedback();
+    pump.backend.feedback_busy = false;
+    pump.tick(false).unwrap();
+    assert!(pump.backend.feedback_sent.is_empty());
+    assert_eq!(pump.pending_feedback_bytes, 0);
+}
+
+#[test]
 fn accepted_media_counters_count_complete_units_once_and_ignore_busy_retries_and_eos() {
     let mut backend = Fake::default();
     backend.videos.extend([
