@@ -410,7 +410,7 @@ fn proven_stream_obligation_with(
     }
     let mut matches = 0;
     for (stream_id, stream) in &session.streams {
-        if stream.phase != StreamPhase::Retired || stream.binding_owner != obligation.provider {
+        if stream.phase != StreamPhase::Retired {
             continue;
         }
         let target = LifecycleTarget::Stream {
@@ -428,13 +428,17 @@ fn proven_stream_obligation_with(
                 })
         });
         let released = verified_release(&target).is_some_and(|id| {
-            session.admission_ids.contains(&id)
+            (stream.binding_owner == obligation.provider
+                && session.admission_ids.contains(&id)
                 && session.admission_targets.get(&id) == Some(&target)
                 && session.admission_phases.get(&id) == Some(&LifecyclePhase::StreamRelease)
                 && journal.authority.settled.get(&id).is_some_and(|admission| {
                     admission.provider == obligation.provider
                         && admission.plan.obligations.contains(obligation)
-                })
+                }))
+                || journal
+                    .composed_releases
+                    .has_valid_released_obligation(journal, &target, obligation)
         });
         if original && released {
             matches += 1;

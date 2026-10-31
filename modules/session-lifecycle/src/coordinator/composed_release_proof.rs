@@ -97,6 +97,61 @@ impl ComposedReleaseBook {
             released_output: &proof.released_output,
         })
     }
+    /// A graph-wide proof discharges only the exact provider obligation it
+    /// retained in that provider's source and completed cleanup admission.
+    pub fn has_valid_released_obligation(
+        &self,
+        journal: &Journal,
+        target: &LifecycleTarget,
+        obligation: &amaterasu_extension_api::ResourceObligation,
+    ) -> bool {
+        let mut candidates = self
+            .proofs
+            .iter()
+            .filter(|proof| &proof.work.target == target);
+        let Some(proof) = candidates.next() else {
+            return false;
+        };
+        if candidates.next().is_some() || verify(journal, proof).is_err() {
+            return false;
+        }
+        let Some(release) = proof.work.states.get(&obligation.provider) else {
+            return false;
+        };
+        let Some(release_id) = release.admission_id.as_deref() else {
+            return false;
+        };
+        let Some(release_admission) = journal.authority.settled.get(release_id) else {
+            return false;
+        };
+        let Some(finalized) = journal.finalize_results.records().find(|item| {
+            item.request.permit_id == proof.finalize_permit_id && item.request.target == *target
+        }) else {
+            return false;
+        };
+        let Some(source) = finalized
+            .chain_work
+            .as_ref()
+            .and_then(|work| work.states.get(&obligation.provider))
+        else {
+            return false;
+        };
+        let Some(source_id) = source.admission_id.as_deref() else {
+            return false;
+        };
+        let Some(source_admission) = journal.authority.settled.get(source_id) else {
+            return false;
+        };
+        source_admission.provider == obligation.provider
+            && release_admission.provider == obligation.provider
+            && obligation_released_by(
+                &source_admission.plan,
+                &release_admission.plan,
+                release.response.as_ref(),
+                obligation,
+            )
+    }
+
     pub fn released_output_for_target(
         &self,
         target: &LifecycleTarget,
@@ -106,6 +161,17 @@ impl ComposedReleaseBook {
         let admission = proof.work.states.get(owner)?.admission_id.as_deref()?;
         Some((admission, &proof.released_output))
     }
+}
+
+fn obligation_released_by(
+    original: &amaterasu_extension_api::ResourcePlan,
+    cleanup: &amaterasu_extension_api::ResourcePlan,
+    response: Option<&ProviderResponse>,
+    obligation: &amaterasu_extension_api::ResourceObligation,
+) -> bool {
+    original.obligations.contains(obligation)
+        && cleanup.obligations.contains(obligation)
+        && matches!(response, Some(ProviderResponse::Cleanup { outcomes, .. }) if outcomes.iter().filter(|outcome| outcome.obligation_id == obligation.obligation_id && outcome.state == CleanupState::Released).count() == 1)
 }
 
 fn verify(journal: &Journal, proof: &Proof) -> ModuleResult<()> {
@@ -634,6 +700,48 @@ pub(super) fn record_composed_release_proof(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn dependent_obligation_requires_exact_source_cleanup_and_terminal_result() {
+        let plan: amaterasu_extension_api::ResourcePlan = serde_json::from_value(json!({"plan_id":"plan","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[{"obligation_id":"restore","provider":"settings","resource_id":"display","mutation_domain":null,"cleanup_method":{"service":"settings/2","method":"cleanup","interface_major":2,"interface_minor":0,"schema_revision":1},"payload":{"revision":1},"depends_on":[]}],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]})).unwrap();
+        let obligation = plan.obligations[0].clone();
+        let released: ProviderResponse = serde_json::from_value(json!({"status":"cleanup","outcomes":[{"obligation_id":"restore","state":"released","reason":null}],"outputs":[]})).unwrap();
+        assert!(obligation_released_by(
+            &plan,
+            &plan,
+            Some(&released),
+            &obligation
+        ));
+        let mut foreign = obligation.clone();
+        foreign.payload = json!({"revision":2});
+        assert!(!obligation_released_by(
+            &plan,
+            &plan,
+            Some(&released),
+            &foreign
+        ));
+        let mut empty = plan.clone();
+        empty.obligations.clear();
+        assert!(!obligation_released_by(
+            &empty,
+            &plan,
+            Some(&released),
+            &obligation
+        ));
+        assert!(!obligation_released_by(
+            &plan,
+            &empty,
+            Some(&released),
+            &obligation
+        ));
+        let pending: ProviderResponse = serde_json::from_value(json!({"status":"cleanup","outcomes":[{"obligation_id":"restore","state":"deferred_restoration","reason":null}],"outputs":[]})).unwrap();
+        assert!(!obligation_released_by(
+            &plan,
+            &plan,
+            Some(&pending),
+            &obligation
+        ));
+    }
 
     #[test]
     fn missing_graph_evidence_cannot_retire_stream() {
