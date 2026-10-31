@@ -89,6 +89,9 @@ pub struct SchemaDocument {
 #[serde(deny_unknown_fields)]
 pub struct ParticipantSettings {
     pub provider: String,
+    /// Wire contract version. Version 2 remains disabled until scheduling is ready.
+    #[serde(default = "default_contract_version")]
+    pub contract_version: u32,
     /// Required participants that must prepare before this provider.
     #[serde(default)]
     pub depends_on: Vec<String>,
@@ -118,6 +121,10 @@ pub struct MethodSettings {
 pub struct ConsumerSettings {
     pub capture: BTreeSet<String>,
     pub input: BTreeSet<String>,
+}
+
+fn default_contract_version() -> u32 {
+    1
 }
 
 fn valid_identifier(name: &str) -> bool {
@@ -396,6 +403,7 @@ impl LifecycleSettings {
         }
         for participant in &self.participants {
             if !valid_identifier(&participant.provider)
+                || participant.contract_version != 1
                 || !providers.insert(&participant.provider)
                 || participant.capabilities.len() > 32
                 || participant
@@ -855,7 +863,12 @@ mod tests {
         invalid_major["participants"][0]["plan_method"]["interface_major"] = json!(0);
         assert!(parse(invalid_major.clone()).is_err());
         invalid_major["participants"][0]["plan_method"]["interface_major"] = json!(2);
+        assert!(parse(invalid_major.clone()).is_err());
+        invalid_major["participants"][0]["contract_version"] = json!(2);
         assert!(parse(invalid_major).is_err());
+        let mut unsupported_contract = policy.clone();
+        unsupported_contract["participants"][0]["contract_version"] = json!(2);
+        assert!(parse(unsupported_contract).is_err());
         let mut invalid_settings = policy.clone();
         invalid_settings["participants"][0]["settings"] = json!([]);
         assert!(parse(invalid_settings).is_err());
