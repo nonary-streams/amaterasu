@@ -52,6 +52,20 @@ pub struct ProducerCallbackProof {
     pub pending_receipt: Option<String>,
 }
 
+/// A stream-stage observation extends immutable session output provenance.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StagedOutputRefinement {
+    pub target: LifecycleTarget,
+    pub parent_generation: u64,
+    pub admission_id: String,
+    pub transition_id: String,
+    pub plan: ResourcePlan,
+    pub before: ResourceOutput,
+    pub after: ResourceOutput,
+    pub callback_proof: ProducerCallbackProof,
+}
+
 /// Authenticated control confirmation retained alongside its original
 /// pre-effect obligation; no field of that obligation is replaced.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -186,6 +200,8 @@ pub struct CompositionBook {
     finalize_selections: Vec<FinalizeSelectionSnapshot>,
     #[serde(default)]
     refinements: Vec<ObligationRefinement>,
+    #[serde(default)]
+    staged_outputs: Vec<StagedOutputRefinement>,
 }
 
 /// A policy-selected direct dependency. Schema is immutable and pinned by digest.
@@ -202,7 +218,12 @@ impl CompositionBook {
     /// policy before relying on it after recovery. Stored observations are not
     /// evidence that a native resource remains present after restart.
     pub fn validate(&self, verify_schema: &impl Fn(&ResourceOutput) -> bool) -> bool {
-        self.validate_structure() && self.outputs.iter().all(|item| verify_schema(&item.output))
+        self.validate_structure()
+            && self.outputs.iter().all(|item| verify_schema(&item.output))
+            && self
+                .staged_outputs
+                .iter()
+                .all(|stage| verify_schema(&stage.after))
     }
 
     /// Structural checks do not authorize outputs or validate schema semantics.
@@ -211,6 +232,12 @@ impl CompositionBook {
             && self.selections.len() <= MAX_OUTPUTS
             && self.finalize_selections.len() <= MAX_OUTPUTS
             && self.refinements.len() <= MAX_OUTPUTS
+            && self.staged_outputs.len() <= MAX_OUTPUTS
+            && self
+                .staged_outputs
+                .iter()
+                .enumerate()
+                .all(|(index, stage)| self.validate_stage_at(index, stage))
             && self.outputs.iter().enumerate().all(|(index, item)| {
                 valid_stored(item)
                     && !self.outputs[..index]
@@ -251,9 +278,13 @@ impl CompositionBook {
     }
 
     pub fn references_admission(&self, admission_id: &str) -> bool {
-        self.outputs
+        self.staged_outputs
             .iter()
-            .any(|item| item.admission_id == admission_id)
+            .any(|stage| stage.admission_id == admission_id)
+            || self
+                .outputs
+                .iter()
+                .any(|item| item.admission_id == admission_id)
             || self
                 .selections
                 .iter()
@@ -266,6 +297,127 @@ impl CompositionBook {
                 .refinements
                 .iter()
                 .any(|item| item.request.admission_id == admission_id)
+    }
+
+    pub fn staged_outputs(&self) -> impl DoubleEndedIterator<Item = &StagedOutputRefinement> {
+        self.staged_outputs.iter()
+    }
+
+    /// A target may use only its one exact staged result, and only while the
+    /// producing session output remains retained. Ambiguity is fenced.
+    pub fn staged_for(
+        &self,
+        target: &LifecycleTarget,
+        producer: &str,
+        output_id: &str,
+    ) -> Result<&StagedOutputRefinement, &'static str> {
+        let mut matches = self.staged_outputs.iter().filter(|stage| {
+            &stage.target == target
+                && stage.after.producer == producer
+                && stage.after.output_id == output_id
+        });
+        let stage = matches.next().ok_or("staged_output_missing")?;
+        if matches.next().is_some() || self.get(producer, output_id, &stage.after.origin).is_none()
+        {
+            return Err("staged_output_ambiguous_or_fenced");
+        }
+        Ok(stage)
+    }
+
+    fn validate_stage_at(&self, index: usize, stage: &StagedOutputRefinement) -> bool {
+        let LifecycleTarget::Session {
+            host_epoch,
+            session_id,
+            generation,
+        } = &stage.before.origin
+        else {
+            return false;
+        };
+        let LifecycleTarget::Stream {
+            host_epoch: epoch,
+            session_id: session,
+            ..
+        } = &stage.target
+        else {
+            return false;
+        };
+        let Some(root) = self
+            .outputs
+            .iter()
+            .find(|record| same_key(&record.output, &stage.before))
+        else {
+            return false;
+        };
+        let prior = self.staged_outputs[..index]
+            .iter()
+            .rev()
+            .find(|old| same_key(&old.after, &stage.before))
+            .map_or(&root.output, |old| &old.after);
+        let proof = &stage.callback_proof;
+        let Ok(response) = serde_json::from_value::<amaterasu_extension_api::ProviderResponse>(
+            match &proof.terminal.state {
+                crate::provider_dispatch::DispatchState::Completed { payload } => payload.clone(),
+                _ => return false,
+            },
+        ) else {
+            return false;
+        };
+        host_epoch == epoch
+            && session_id == session
+            && *generation == stage.parent_generation
+            && prior == &stage.before
+            && amaterasu_extension_api::validate_output_refinement(&stage.before, &stage.after)
+                .is_ok()
+            && (stage.before.data == stage.after.data
+                || stage.after.resource.revision > stage.before.resource.revision)
+            && valid_text(&stage.admission_id)
+            && valid_text(&stage.transition_id)
+            && proof.request.version == amaterasu_extension_api::COMPOSITION_VERSION
+            && proof.request.operation
+                == amaterasu_extension_api::ProviderOperation::LifecycleCallback
+            && proof.request.target == stage.target
+            && proof.request.phase == amaterasu_extension_api::LifecyclePhase::StreamPrepare
+            && proof.request.transition_id == stage.transition_id
+            && proof.request.admission_id.as_deref() == Some(stage.admission_id.as_str())
+            && proof.request.approved_plan.as_ref() == Some(&stage.plan)
+            && matches!(&response, amaterasu_extension_api::ProviderResponse::Prepared { outputs, .. } if outputs.contains(&stage.after))
+            && valid_callback_proof(proof, &response)
+            && !self.staged_outputs[..index]
+                .iter()
+                .any(|old| old.admission_id == stage.admission_id)
+    }
+
+    pub fn record_stage(
+        &mut self,
+        stage: StagedOutputRefinement,
+        verify: &impl Fn(&ResourceOutput) -> bool,
+    ) -> Result<(), &'static str> {
+        if let Some(old) = self
+            .staged_outputs
+            .iter()
+            .find(|old| old.admission_id == stage.admission_id)
+        {
+            return if old == &stage {
+                Ok(())
+            } else {
+                Err("staged_output_conflict")
+            };
+        }
+        if self
+            .get(
+                &stage.before.producer,
+                &stage.before.output_id,
+                &stage.before.origin,
+            )
+            .is_none()
+            || self.staged_outputs.len() >= MAX_OUTPUTS
+            || !self.validate_stage_at(self.staged_outputs.len(), &stage)
+            || !verify(&stage.after)
+        {
+            return Err("invalid_staged_output");
+        }
+        self.staged_outputs.push(stage);
+        Ok(())
     }
 
     pub fn refinements(&self) -> impl Iterator<Item = &ObligationRefinement> {
@@ -811,6 +963,44 @@ pub(super) fn collect_verified_outputs(
             capability: output.capability.clone(),
             schema: output.schema.clone(),
         };
+        if matches!(
+            (&output.origin, &work.target),
+            (
+                LifecycleTarget::Session { .. },
+                LifecycleTarget::Stream { .. }
+            )
+        ) {
+            let root = next
+                .get(provider, &output.output_id, &output.origin)
+                .ok_or("stage_root_missing")?;
+            let before = next
+                .staged_outputs()
+                .rev()
+                .find(|old| same_key(&old.after, output))
+                .map_or_else(|| root.output.clone(), |old| old.after.clone());
+            let LifecycleTarget::Session {
+                generation: parent_generation,
+                ..
+            } = &output.origin
+            else {
+                unreachable!()
+            };
+            let stage = StagedOutputRefinement {
+                target: work.target.clone(),
+                parent_generation: *parent_generation,
+                admission_id: admission_id.into(),
+                transition_id: work.transition_id.clone(),
+                plan: plan.clone(),
+                before,
+                after: output.clone(),
+                callback_proof: proof.clone(),
+            };
+            next.record_stage(stage, &|value| {
+                catalog.validate(&value.schema, &value.data).is_ok()
+            })
+            .map_err(str::to_owned)?;
+            continue;
+        }
         let record = StoredOutput {
             output: output.clone(),
             admission_id: admission_id.into(),
@@ -1081,6 +1271,72 @@ mod tests {
             capability: output.capability,
             schema: output.schema,
         }
+    }
+
+    #[test]
+    fn staged_output_keeps_root_and_requires_exact_callback_lineage() {
+        let mut book = CompositionBook::default();
+        let root = record();
+        book.record(root.clone(), &selection(), &target(), &|_| true)
+            .unwrap();
+        let stream = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1});
+        let mut plan = root.plan.clone();
+        plan.resources[0].expected_revision = Some(root.output.resource.revision);
+        let method = json!({"service":"screen/2","method":"callback","interface_major":2,"interface_minor":0,"schema_revision":1});
+        let participant = serde_json::from_value(json!({"provider":"screen","plan_method":method,"callback_method":method,"status_method":method,"capabilities":[],"cleanup_methods":[],"settings_revision":"revision","settings":{}})).unwrap();
+        let request: amaterasu_extension_api::ProviderRequest = serde_json::from_value(json!({"provider_sequence":2,"operation":"lifecycle_callback","version":2,"transition_id":"stage-transition","operation_id":"stage-call","target":stream,"phase":"stream.prepare","settings_revision":"revision","settings":{},"intent":"initial","reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector/1"]},"remaining_ms":1000,"plan_revision":plan.revision,"admission_id":"stage-admission","approved_plan":plan})).unwrap();
+        let response: amaterasu_extension_api::ProviderResponse = serde_json::from_value(
+            json!({"status":"prepared","candidate":null,"obligations":[],"outputs":[root.output]}),
+        )
+        .unwrap();
+        let terminal = crate::provider_dispatch::DispatchRecord {
+            call: crate::provider_dispatch::ProviderCall {
+                service: "screen/2".into(),
+                method: "callback".into(),
+                interface_major: 2,
+                interface_minor: 0,
+                approval: json!({"provider":"screen"}),
+                arguments: serde_json::to_value(&request).unwrap(),
+                timeout_ms: 1000,
+                operation_id: "stage-call".into(),
+            },
+            state: crate::provider_dispatch::DispatchState::Completed {
+                payload: serde_json::to_value(response).unwrap(),
+            },
+        };
+        let stage = StagedOutputRefinement {
+            target: serde_json::from_value(stream).unwrap(),
+            parent_generation: 1,
+            admission_id: "stage-admission".into(),
+            transition_id: "stage-transition".into(),
+            plan,
+            before: root.output.clone(),
+            after: root.output.clone(),
+            callback_proof: ProducerCallbackProof {
+                participant,
+                request,
+                terminal,
+                pending_receipt: None,
+            },
+        };
+        let mut wrong_parent = stage.clone();
+        wrong_parent.parent_generation += 1;
+        assert!(book.record_stage(wrong_parent, &|_| true).is_err());
+        let mut wrong_call = stage.clone();
+        wrong_call.callback_proof.terminal.call.arguments["operation_id"] = json!("different");
+        assert!(book.record_stage(wrong_call, &|_| true).is_err());
+        book.record_stage(stage.clone(), &|_| true).unwrap();
+        assert_eq!(book.records().next().unwrap(), &root);
+        assert_eq!(
+            book.staged_for(&stage.target, "screen", "output").unwrap(),
+            &stage
+        );
+        let mut changed = stage.clone();
+        changed.after.resource.revision += 1;
+        assert!(book.record_stage(changed, &|_| true).is_err());
+        let restored: CompositionBook =
+            serde_json::from_value(serde_json::to_value(book).unwrap()).unwrap();
+        assert!(restored.validate_structure());
     }
 
     #[test]

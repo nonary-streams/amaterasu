@@ -79,6 +79,10 @@ fn has_composition_output(journal: &Journal, session_id: &str, stream_id: Option
         .records()
         .any(|record| matches_target(&record.output.origin, session_id, stream_id))
         || journal
+            .composition
+            .staged_outputs()
+            .any(|stage| matches_target(&stage.target, session_id, stream_id))
+        || journal
             .finalize_results
             .records()
             .any(|record| matches_target(&record.request.target, session_id, stream_id))

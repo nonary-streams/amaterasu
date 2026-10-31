@@ -462,6 +462,46 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                         == Some(&selection.target))
             })
         })
+        || journal.composition.staged_outputs().any(|stage| {
+            let Ok((epoch, session_id, Some(stream_id), generation)) =
+                operations::target_parts(&stage.target)
+            else {
+                return true;
+            };
+            let Some(session) = journal.sessions.get(session_id) else {
+                return true;
+            };
+            let Some(stream) = session.streams.get(stream_id) else {
+                return true;
+            };
+            let Some(admission) = journal
+                .authority
+                .admissions
+                .get(&stage.admission_id)
+                .or_else(|| journal.authority.settled.get(&stage.admission_id))
+            else {
+                return true;
+            };
+            session.host_epoch != epoch
+                || session.generation != stage.parent_generation
+                || stream.generation != generation
+                || !session.admission_ids.contains(&stage.admission_id)
+                || session.admission_targets.get(&stage.admission_id) != Some(&stage.target)
+                || session.admission_phases.get(&stage.admission_id)
+                    != Some(&LifecyclePhase::StreamPrepare)
+                || journal.admission_transitions.get(&stage.admission_id)
+                    != Some(&stage.transition_id)
+                || admission.provider != stage.after.producer
+                || admission.plan != stage.plan
+                || admission.selection.participant != stage.callback_proof.participant
+                || !admission.selection.approvals.iter().any(|approval| {
+                    approval.broker_approval == stage.callback_proof.terminal.call.approval
+                        && composition::approval_matches_call(
+                            approval,
+                            &stage.callback_proof.terminal.call,
+                        )
+                })
+        })
         || !journal.finalize_results.validate_structure()
         || journal.finalize_results.records().any(|item| {
             let request = &item.request;
