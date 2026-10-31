@@ -2142,6 +2142,7 @@ mod tests {
             },
             dependents: vec![],
             closed_children: 0,
+            children: None,
             provider_sequences: BTreeMap::from([("owner".into(), 2)]),
             operation_counter: 1,
             legacy_operation_ids: BTreeSet::from(["root-call".into(), "release-call".into()]),
@@ -2204,6 +2205,69 @@ mod tests {
             .stage_verified(&journal, &work.target)
             .unwrap();
         assert!(validate_journal(&checkpoint).is_ok());
+        let stream = LifecycleTarget::Stream {
+            host_epoch: "epoch".into(),
+            session_id: "session".into(),
+            stream_id: "historical-stream".into(),
+            generation: 1,
+        };
+        let root_digest = super::closed_stream::test_root_commitment(&cert.root);
+        let (child_book, child_snapshot) = super::closed_stream::test_archive_snapshot(
+            &journal,
+            &work.target,
+            stream.clone(),
+            &cert.root,
+        )
+        .unwrap();
+        let mut with_child = checkpoint.clone();
+        let mut child_cert = cert.clone();
+        child_cert.closed_children = 1;
+        child_cert.children = Some(child_snapshot);
+        let mut source_with_child = journal.clone();
+        source_with_child.closed_streams = child_book.clone();
+        let actual_child_cert =
+            super::session_closed_history::EndedSessionCertificate::from_verified(
+                &source_with_child,
+                &work.target,
+            )
+            .unwrap();
+        assert!(actual_child_cert == child_cert);
+        let key = serde_json::to_string(&("epoch", "session")).unwrap();
+        let mut encoded_book = json!({"certificates":{}});
+        encoded_book["certificates"][&key] = serde_json::to_value(&child_cert).unwrap();
+        with_child.ended_session_history = serde_json::from_value(encoded_book).unwrap();
+        with_child.closed_streams = child_book;
+        assert!(validate_journal(&with_child).is_err());
+        with_child.closed_streams = Default::default();
+        assert!(validate_journal(&with_child).is_ok());
+        assert!(super::closed_stream::test_archived_root(
+            &journal,
+            stream.clone(),
+            &cert.root,
+            1,
+            &root_digest
+        ));
+        assert!(super::closed_stream::test_archived_root(
+            &checkpoint,
+            stream.clone(),
+            &cert.root,
+            1,
+            &root_digest
+        ));
+        assert!(!super::closed_stream::test_archived_root(
+            &checkpoint,
+            stream.clone(),
+            &cert.root,
+            2,
+            &root_digest
+        ));
+        assert!(!super::closed_stream::test_archived_root(
+            &checkpoint,
+            stream,
+            &cert.root,
+            1,
+            &"0".repeat(64)
+        ));
         let resolve = |snapshot: &Journal,
                        target: &LifecycleTarget,
                        admission: &str,
@@ -2404,6 +2468,7 @@ mod tests {
                 release: callback("settings-release", &dependent),
             }],
             closed_children: 0,
+            children: None,
             provider_sequences: BTreeMap::from([("owner".into(), 2), ("settings".into(), 2)]),
             operation_counter: 1,
             legacy_operation_ids: BTreeSet::from([

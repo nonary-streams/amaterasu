@@ -26,6 +26,28 @@ impl Coordinator {
         }
         let shared = self.shared.borrow();
         let journal = &shared.value;
+        if let Some((history, cert)) = journal.ended_session_history.historical_children(
+            journal,
+            &query.request.target,
+            caller,
+        ) {
+            let ResourceControlResponse::Applied { output, .. } = &query.response else {
+                return Err("ended_finalize_unavailable".into());
+            };
+            if !history.installed(&self.settings)
+                || !history.contains_finalize(caller, &query.request, &query.response)
+                || super::checkpoint_queries::has_original_result(journal, &query.request.target)
+                || self
+                    .settings
+                    .schema_catalog()
+                    .ok()
+                    .is_none_or(|catalog| catalog.validate(&output.schema, &output.data).is_err())
+            {
+                return Err("ended_finalize_unavailable".into());
+            }
+            return Ok(json!({"status":"valid", "target":query.request.target,
+                "result_id":query.request.permit_id, "resource_generation":cert.resource_generation}));
+        }
         if !journal.finalize_results.validate_structure() {
             return Err("invalid_finalize_result_book".into());
         }

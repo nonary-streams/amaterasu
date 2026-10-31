@@ -84,6 +84,94 @@ pub(super) fn fence_closed_session(
     Ok(())
 }
 
+/// Replace exact terminal session receipt keys with durable replay fences on a
+/// private transaction clone. Unknown outcomes and recovery aliases stay pinned.
+#[allow(dead_code, reason = "awaits atomic ended-session closure")]
+pub(super) fn fence_session_receipts(
+    journal: &mut Journal,
+    session_target: &LifecycleTarget,
+) -> ModuleResult<()> {
+    let (epoch, session_id, None, _) = operations::target_parts(session_target)? else {
+        return Err("session_target_required".into());
+    };
+    let mut keys = Vec::new();
+    for (key, receipt) in &journal.receipts {
+        let targets = [target(&receipt.request), target(&receipt.response)];
+        let matches = targets.iter().flatten().any(|target| {
+            operations::target_parts(target)
+                .is_ok_and(|(host, id, _, _)| host == epoch && id == session_id)
+        }) || (receipt.request["operation"] == "prepare"
+            && receipt.response["session_id"].as_str() == Some(session_id));
+        if !matches {
+            continue;
+        }
+        if targets.iter().flatten().any(|target| {
+            !operations::target_parts(target)
+                .is_ok_and(|(host, id, _, _)| host == epoch && id == session_id)
+        }) || receipt.work.is_some()
+            || receipt.wait_target.is_some()
+            || !matches!(
+                receipt.response["status"].as_str(),
+                Some("succeeded" | "rejected" | "cancelled")
+            )
+            || journal
+                .recovery_sources
+                .iter()
+                .any(|(alias, original)| alias == key || original == key)
+        {
+            return Err("session_receipt_not_retirable".into());
+        }
+        keys.push(key.clone());
+    }
+    fence_exact_receipts(journal, &keys.into_iter().collect())
+}
+
+/// Fence exactly the receipt keys authenticated by the terminal root gate.
+/// The gate owns source-reference discovery; this helper only transfers the
+/// retained keys after checking terminality and recovery-alias exclusion.
+#[allow(dead_code, reason = "awaits atomic ended-session closure")]
+pub(super) fn fence_exact_receipts(
+    journal: &mut Journal,
+    keys: &BTreeSet<String>,
+) -> ModuleResult<()> {
+    for key in keys {
+        let receipt = journal.receipts.get(key).ok_or("session_receipt_changed")?;
+        if receipt.work.is_some()
+            || receipt.wait_target.is_some()
+            || !matches!(
+                receipt.response["status"].as_str(),
+                Some("succeeded" | "rejected" | "cancelled")
+            )
+            || journal
+                .recovery_sources
+                .iter()
+                .any(|(alias, original)| alias == key || original == key)
+        {
+            return Err("session_receipt_not_retirable".into());
+        }
+    }
+    let fences: BTreeSet<_> = keys
+        .iter()
+        .map(|key| digest(key))
+        .filter(|fence| !journal.retention.tombstones.contains(fence))
+        .collect();
+    if journal
+        .retention
+        .tombstones
+        .len()
+        .saturating_add(fences.len())
+        > MAX_TOMBSTONES
+    {
+        return Err("retention_capacity_exhausted".into());
+    }
+    journal.retention.tombstones.extend(fences);
+    for key in keys {
+        journal.receipts.remove(key);
+    }
+    journal.retention.order.retain(|key| !keys.contains(key));
+    Ok(())
+}
+
 pub(super) fn at_capacity(journal: &Journal) -> bool {
     journal.retention.tombstones.len() >= MAX_TOMBSTONES
 }
@@ -447,6 +535,64 @@ mod tests {
             json!({"version":3,"host_epoch":"epoch","receipts":{},"sessions":{}}),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn session_receipts_are_fenced_atomically_and_aliases_block_retirement() {
+        let mut journal = journal();
+        let session = LifecycleTarget::Session {
+            host_epoch: "epoch".into(),
+            session_id: "one".into(),
+            generation: 1,
+        };
+        let create_key = receipt_key("caller", "caller", "create");
+        let end_key = receipt_key("caller", "caller", "end");
+        let receipt = |request, response| Receipt {
+            caller: "caller".into(),
+            initiator: "caller".into(),
+            request,
+            response,
+            work: None,
+            wait_target: None,
+        };
+        journal.receipts.insert(
+            create_key.clone(),
+            receipt(
+                json!({"operation":"prepare"}),
+                json!({"status":"succeeded","session_id":"one"}),
+            ),
+        );
+        journal.receipts.insert(
+            end_key.clone(),
+            receipt(
+                json!({"operation":"end_session","target":session}),
+                json!({"status":"succeeded","target":session}),
+            ),
+        );
+        journal
+            .retention
+            .order
+            .extend([create_key.clone(), end_key.clone()]);
+        journal
+            .recovery_sources
+            .insert("alias".into(), end_key.clone());
+        assert!(fence_session_receipts(&mut journal, &session).is_err());
+        assert_eq!(journal.receipts.len(), 2);
+        assert!(journal.retention.tombstones.is_empty());
+        journal.recovery_sources.clear();
+        let mut full = journal.clone();
+        full.retention.tombstones = (0..MAX_TOMBSTONES)
+            .map(|id| digest(&format!("old-{id}")))
+            .collect();
+        assert!(fence_session_receipts(&mut full, &session).is_err());
+        assert_eq!(full.receipts.len(), 2);
+        fence_session_receipts(&mut journal, &session).unwrap();
+        assert!(journal.receipts.is_empty());
+        assert!(journal.retention.order.is_empty());
+        let restored: Journal =
+            serde_json::from_slice(&serde_json::to_vec(&journal).unwrap()).unwrap();
+        assert!(expired(&restored, &create_key));
+        assert!(expired(&restored, &end_key));
     }
 
     #[test]

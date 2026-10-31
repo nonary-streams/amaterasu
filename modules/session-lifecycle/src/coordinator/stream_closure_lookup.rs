@@ -58,6 +58,31 @@ impl Coordinator {
             }
             let checkpoint = journal.closed_streams.contains_target(&query.target);
             let live = journal.composed_releases.contains_target(&query.target);
+            if let Some((history, _)) =
+                journal
+                    .ended_session_history
+                    .historical_children(journal, &query.target, caller)
+            {
+                if checkpoint
+                    || live
+                    || !history.installed(&self.settings)
+                    || !history.contains_closure_query(
+                        caller,
+                        &query.target,
+                        query.resource_generation,
+                        (&query.resource_id, &query.incarnation),
+                        &query.operation_id,
+                        &query.request_digest,
+                    )
+                {
+                    return Err("ended_session_closure_unavailable".into());
+                }
+                return Ok(
+                    json!({"status":"closed","target":query.target,"resource_generation":query.resource_generation,
+                    "resource_id":query.resource_id,"incarnation":query.incarnation,"operation_id":query.operation_id,
+                    "request_digest":query.request_digest}),
+                );
+            }
             if checkpoint && live {
                 return Err("ambiguous_closure_source".into());
             }

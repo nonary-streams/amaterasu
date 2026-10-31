@@ -812,6 +812,31 @@ impl Coordinator {
             if !preflight {
                 let shared = self.shared.borrow();
                 let journal = &shared.value;
+                if let Some((history, cert)) = journal.ended_session_history.historical_children(
+                    journal,
+                    &tuple.request.target,
+                    caller,
+                ) {
+                    if !history.installed(&self.settings)
+                        || !history.contains_settlement(caller, &tuple)
+                        || super::checkpoint_queries::has_original_result(
+                            journal,
+                            &tuple.request.target,
+                        )
+                        || self.settings.schema_catalog().ok().is_none_or(|catalog| {
+                            catalog
+                                .validate(&tuple.output.schema, &tuple.output.data)
+                                .is_err()
+                        })
+                    {
+                        return Err("ended_session_settlement_unavailable".into());
+                    }
+                    return Ok(
+                        json!({"status":"valid", "session_target":cert.target, "target":tuple.request.target,
+                        "output":tuple.output, "root_output":cert.root.output, "resource_generation":cert.resource_generation,
+                        "consumers_retired":false}),
+                    );
+                }
                 if journal
                     .closed_streams
                     .contains_target(&tuple.request.target)

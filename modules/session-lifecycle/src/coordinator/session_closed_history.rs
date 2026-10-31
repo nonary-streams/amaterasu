@@ -82,6 +82,10 @@ pub(super) struct EndedSessionCertificate {
     /// No child streams are accepted until their independent checkpoint API
     /// and all cross-book retirement gates are available.
     pub closed_children: u32,
+    /// Compact owner-query commitments transferred from validated child books.
+    /// These are historical evidence and never grant a new resource effect.
+    #[serde(default)]
+    pub children: Option<closed_stream::SessionChildrenSnapshot>,
     pub provider_sequences: BTreeMap<String, u64>,
     pub operation_counter: u64,
     /// Legacy randomly generated operation IDs remain fenced by the retained
@@ -133,8 +137,8 @@ fn empty_plan(plan: &amaterasu_extension_api::ResourcePlan) -> bool {
 
 impl EndedSessionCertificate {
     /// Freeze a candidate from authenticated source books. This does not
-    /// authorize deletion or a native effect. Stream histories remain fenced
-    /// until their independent checkpoint and no-live-reference gate exists.
+    /// authorize deletion or a native effect. The caller must separately prove
+    /// complete source coverage and no inbound references before retirement.
     #[allow(
         dead_code,
         reason = "awaits the atomic ended-session closure transaction"
@@ -143,9 +147,7 @@ impl EndedSessionCertificate {
         let source = session_closure::preflight(journal, target)?;
         let (_, session_id, _, _) = operations::target_parts(target)?;
         let session = journal.sessions.get(session_id).ok_or("unknown_session")?;
-        if !session.streams.is_empty()
-            || journal.composition.staged_outputs().any(|stage| matches!(&stage.target, LifecycleTarget::Stream { session_id: id, .. } if id == session_id))
-        {
+        if journal.composition.staged_outputs().any(|stage| matches!(&stage.target, LifecycleTarget::Stream { session_id: id, .. } if id == session_id)) {
             return Err("stream_checkpoint_retirement_unavailable".into());
         }
         let root = journal
@@ -156,6 +158,10 @@ impl EndedSessionCertificate {
             })
             .ok_or("session_root_missing")?
             .clone();
+        let children = journal
+            .closed_streams
+            .session_children_snapshot(journal, target, &root, source.release.resource_generation)
+            .ok_or("stream_checkpoint_snapshot_invalid")?;
         let root_admission = journal
             .authority
             .settled
@@ -299,7 +305,9 @@ impl EndedSessionCertificate {
             root_admission,
             owner_release,
             dependents,
-            closed_children: 0,
+            closed_children: u32::try_from(children.len())
+                .map_err(|_| "too_many_closed_children")?,
+            children: (children.len() != 0).then_some(children),
             provider_sequences,
             operation_counter: journal.authority.operation_counter,
             legacy_operation_ids,
@@ -325,7 +333,13 @@ impl EndedSessionCertificate {
             || !valid_id(&self.owner.initiator)
             || !valid_id(&self.producer)
             || self.resource_generation == 0
-            || self.closed_children != 0
+            || match &self.children {
+                Some(children) => {
+                    children.len() != self.closed_children as usize
+                        || !children.valid_for(&self.target)
+                }
+                None => self.closed_children != 0,
+            }
             || self.operation_counter == 0
             || self.legacy_operation_ids.len() > 8
             || self
@@ -569,6 +583,29 @@ pub(super) struct EndedSessionBook {
 }
 
 impl EndedSessionBook {
+    /// Resolve compact historical evidence only; this does not grant control.
+    pub(super) fn historical_children<'a>(
+        &'a self,
+        journal: &Journal,
+        target: &LifecycleTarget,
+        owner: &str,
+    ) -> Option<(
+        &'a closed_stream::SessionChildrenSnapshot,
+        &'a EndedSessionCertificate,
+    )> {
+        let (epoch, id, Some(_), _) = operations::target_parts(target).ok()? else {
+            return None;
+        };
+        let key = serde_json::to_string(&(epoch, id)).ok()?;
+        let cert = self.certificates.get(&key)?;
+        let children = cert.children.as_ref()?;
+        (cert.producer == owner
+            && Self::valid_entry(journal, cert)
+            && children.contains_scope(target)
+            && !journal.closed_streams.contains_target(target))
+        .then_some((children, cert))
+    }
+
     /// Resolve immutable root provenance for historical checkpoint validation.
     /// This is not authority to control the resource or re-enter the session.
     /// The caller must also compare its pinned output commitment to the result.
@@ -649,7 +686,12 @@ impl EndedSessionBook {
     pub(super) fn validate(&self, journal: &Journal) -> bool {
         self.certificates.len() <= MAX_CERTIFICATES
             && self.certificates.iter().all(|(key, cert)| {
-                Self::key(&cert.target).as_ref() == Some(key) && Self::valid_entry(journal, cert)
+                Self::key(&cert.target).as_ref() == Some(key)
+                    && Self::valid_entry(journal, cert)
+                    && journal
+                        .closed_streams
+                        .session_children_raw(&cert.target)
+                        .is_some_and(|snapshot| snapshot.len() == 0)
             })
     }
 }

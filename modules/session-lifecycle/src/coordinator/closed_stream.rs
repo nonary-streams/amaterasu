@@ -20,6 +20,108 @@ pub(super) struct ClosedStreamBook {
     archived: Vec<ArchivedStream>,
 }
 
+/// Compact owner-query commitments extracted from authenticated child history.
+/// This snapshot alone does not prove that other books have no inbound pins.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SessionChildrenSnapshot {
+    scopes: BTreeSet<String>,
+    closure_queries: BTreeSet<String>,
+    settlement_queries: BTreeSet<String>,
+    finalize_queries: BTreeSet<String>,
+    owner_acknowledgements: BTreeSet<String>,
+    control_policies: BTreeSet<String>,
+    finalize_policies: BTreeSet<String>,
+    schema_documents: BTreeSet<String>,
+}
+
+impl SessionChildrenSnapshot {
+    pub(super) fn len(&self) -> usize {
+        self.scopes.len()
+    }
+    pub(super) fn valid_for(&self, target: &LifecycleTarget) -> bool {
+        let Ok((_, _, None, generation)) = operations::target_parts(target) else {
+            return false;
+        };
+        generation > 0
+            && self.scopes.len() <= MAX_SCOPE_FENCES
+            && [
+                &self.scopes,
+                &self.closure_queries,
+                &self.settlement_queries,
+                &self.finalize_queries,
+                &self.owner_acknowledgements,
+                &self.control_policies,
+                &self.finalize_policies,
+                &self.schema_documents,
+            ]
+            .iter()
+            .all(|items| items.iter().all(|item| valid_digest(item)))
+    }
+
+    pub(super) fn contains_scope(&self, target: &LifecycleTarget) -> bool {
+        scope_digest(target).is_some_and(|scope| self.scopes.contains(&scope))
+    }
+
+    pub(super) fn installed(&self, settings: &LifecycleSettings) -> bool {
+        self.finalize_policies.iter().all(|hash| {
+            settings
+                .finalize_policies
+                .iter()
+                .any(|policy| commitment(policy).as_ref() == Some(hash))
+        }) && self.control_policies.iter().all(|hash| {
+            settings
+                .control_policies
+                .iter()
+                .any(|policy| commitment(policy).as_ref() == Some(hash))
+        }) && self.schema_documents.iter().all(|hash| {
+            settings
+                .schema_documents
+                .iter()
+                .any(|doc| commitment(doc).as_ref() == Some(hash))
+        })
+    }
+
+    pub(super) fn contains_closure_query(
+        &self,
+        owner: &str,
+        target: &LifecycleTarget,
+        generation: u64,
+        resource: (&str, &str),
+        operation: &str,
+        request_digest: &str,
+    ) -> bool {
+        commitment(&(
+            owner,
+            target,
+            generation,
+            resource.0,
+            resource.1,
+            operation,
+            request_digest,
+        ))
+        .is_some_and(|hash| self.closure_queries.contains(&hash))
+    }
+
+    pub(super) fn contains_settlement(
+        &self,
+        owner: &str,
+        request: &amaterasu_extension_api::ResourceControlSettlementRequest,
+    ) -> bool {
+        commitment(&(owner, request)).is_some_and(|hash| self.settlement_queries.contains(&hash))
+    }
+
+    pub(super) fn contains_finalize(
+        &self,
+        owner: &str,
+        request: &amaterasu_extension_api::ResourceFinalizeRequest,
+        response: &amaterasu_extension_api::ResourceControlResponse,
+    ) -> bool {
+        commitment(&(owner, request, response))
+            .is_some_and(|hash| self.finalize_queries.contains(&hash))
+    }
+}
+
 /// Compact, read-only query commitments after a successor takes over the
 /// predecessor baseline. This record never grants an effect or a new stage.
 #[derive(Clone, Serialize, Deserialize)]
@@ -42,6 +144,114 @@ struct ArchivedStream {
     closed_obligations: Vec<String>,
 }
 
+#[cfg(test)]
+pub(super) fn test_archived_root(
+    journal: &Journal,
+    target: LifecycleTarget,
+    root: &composition::StoredOutput,
+    resource_generation: u64,
+    expected_digest: &str,
+) -> bool {
+    let archive = ArchivedStream {
+        target,
+        parent_generation: 1,
+        resource_generation,
+        root_admission: root.admission_id.clone(),
+        root_output: expected_digest.into(),
+        owner: root.output.producer.clone(),
+        graph_commitment: "a".repeat(64),
+        release_commitment: "a".repeat(64),
+        finalize_commitment: "a".repeat(64),
+        finalize_tuple: "a".repeat(64),
+        finalize_policy: "a".repeat(64),
+        finalize_schemas: vec![],
+        settlement_tuples: vec![],
+        settlement_commitments: vec![],
+        closed_obligations: vec![],
+    };
+    archive.root(journal).is_some_and(|actual| actual == root)
+}
+
+#[cfg(test)]
+pub(super) fn test_root_commitment(root: &composition::StoredOutput) -> String {
+    commitment(&root.output).unwrap()
+}
+
+#[cfg(test)]
+pub(super) fn test_archive_snapshot(
+    journal: &Journal,
+    session_target: &LifecycleTarget,
+    stream_target: LifecycleTarget,
+    root: &composition::StoredOutput,
+) -> Option<(ClosedStreamBook, SessionChildrenSnapshot)> {
+    let archive = ArchivedStream {
+        target: stream_target.clone(),
+        parent_generation: 1,
+        resource_generation: 1,
+        root_admission: root.admission_id.clone(),
+        root_output: commitment(&root.output).unwrap(),
+        owner: root.output.producer.clone(),
+        graph_commitment: "a".repeat(64),
+        release_commitment: "a".repeat(64),
+        finalize_commitment: "a".repeat(64),
+        finalize_tuple: "a".repeat(64),
+        finalize_policy: "a".repeat(64),
+        finalize_schemas: vec![],
+        settlement_tuples: vec![SettlementTuple {
+            operation_id: "control".into(),
+            request_digest: "b".repeat(64),
+            resource_id: "display".into(),
+            incarnation: "incarnation".into(),
+            tuple: "c".repeat(64),
+            policy: "d".repeat(64),
+            schemas: vec![],
+        }],
+        settlement_commitments: vec!["e".repeat(64)],
+        closed_obligations: vec![],
+    };
+    let mut book = ClosedStreamBook::default();
+    book.expired_scopes
+        .insert(scope_digest(&stream_target).unwrap());
+    book.archived.push(archive);
+    let snapshot = book.session_children_snapshot(journal, session_target, root, 1)?;
+    if snapshot.scopes.len() != 1 {
+        return None;
+    }
+    if !snapshot.contains_closure_query(
+        &root.output.producer,
+        &stream_target,
+        1,
+        ("display", "incarnation"),
+        "control",
+        &"b".repeat(64),
+    ) || snapshot.contains_closure_query(
+        "foreign",
+        &stream_target,
+        1,
+        ("display", "incarnation"),
+        "control",
+        &"b".repeat(64),
+    ) || snapshot.contains_closure_query(
+        &root.output.producer,
+        &stream_target,
+        2,
+        ("display", "incarnation"),
+        "control",
+        &"b".repeat(64),
+    ) {
+        return None;
+    }
+    let mut missing_fence = book.clone();
+    missing_fence.expired_scopes.clear();
+    if missing_fence
+        .session_children_snapshot(journal, session_target, root, 1)
+        .is_some()
+    {
+        return None;
+    }
+    Some((book, snapshot))
+}
+
 impl ArchivedStream {
     fn historical_proof<'a>(&self, journal: &'a Journal) -> Option<HistoricalProof<'a>> {
         let root = self.root(journal)?;
@@ -60,6 +270,22 @@ impl ArchivedStream {
         };
         if generation == 0 || !valid_id(epoch) || !valid_id(session_id) || !valid_id(stream_id) {
             return None;
+        }
+        if !journal.sessions.contains_key(session_id) {
+            let parent = LifecycleTarget::Session {
+                host_epoch: epoch.into(),
+                session_id: session_id.into(),
+                generation: self.parent_generation,
+            };
+            let root = journal.ended_session_history.historical_root(
+                journal,
+                &parent,
+                &self.root_admission,
+                &self.owner,
+                self.resource_generation,
+            )?;
+            return (commitment(&root.output).as_deref() == Some(self.root_output.as_str()))
+                .then_some(root);
         }
         let session = journal.sessions.get(session_id)?;
         if session.host_epoch != epoch || session.generation != self.parent_generation {
@@ -422,6 +648,223 @@ pub(super) fn retire_closed_stream(
 }
 
 impl ClosedStreamBook {
+    pub(super) fn has_any_session_reference(&self, session_id: &str) -> bool {
+        self.records
+            .iter()
+            .map(|record| &record.target)
+            .chain(self.archived.iter().map(|record| &record.target))
+            .any(|target| {
+                operations::target_parts(target).map_or(true, |(_, id, stream, _)| {
+                    stream.is_none() || id == session_id
+                })
+            })
+    }
+
+    /// Remove child sources only on a private transaction clone, after their
+    /// exact query commitments and the encompassing session fence are staged.
+    #[allow(dead_code, reason = "awaits atomic ended-session closure")]
+    pub(super) fn retire_session_children_exact(
+        &mut self,
+        source: &Journal,
+        target: &LifecycleTarget,
+        root: &composition::StoredOutput,
+        resource_generation: u64,
+        expected: &SessionChildrenSnapshot,
+    ) -> ModuleResult<()> {
+        if self
+            .session_children_snapshot(source, target, root, resource_generation)
+            .as_ref()
+            != Some(expected)
+        {
+            return Err("session_child_snapshot_changed".into());
+        }
+        let (epoch, session_id, None, _) = operations::target_parts(target)? else {
+            return Err("session_target_required".into());
+        };
+        let matches = |child: &LifecycleTarget| {
+            operations::target_parts(child).is_ok_and(|(host, id, stream, _)| {
+                host == epoch && id == session_id && stream.is_some()
+            })
+        };
+        let archived_scopes: Vec<_> = self
+            .archived
+            .iter()
+            .filter(|item| matches(&item.target))
+            .filter_map(|item| scope_digest(&item.target))
+            .collect();
+        self.records.retain(|item| !matches(&item.target));
+        self.archived.retain(|item| !matches(&item.target));
+        for scope in archived_scopes {
+            self.expired_scopes.remove(&scope);
+        }
+        Ok(())
+    }
+
+    /// Freeze both full checkpoints and archive entries after authenticating
+    /// the book against the live session. Callers must separately establish
+    /// complete source-book coverage and the absence of inbound references.
+    #[allow(dead_code, reason = "awaits atomic ended-session closure")]
+    pub(super) fn session_children_snapshot(
+        &self,
+        journal: &Journal,
+        target: &LifecycleTarget,
+        root: &composition::StoredOutput,
+        resource_generation: u64,
+    ) -> Option<SessionChildrenSnapshot> {
+        let (epoch, session_id, None, generation) = operations::target_parts(target).ok()? else {
+            return None;
+        };
+        let session = journal.sessions.get(session_id)?;
+        if session.host_epoch != epoch
+            || session.generation != generation
+            || !self.validate(journal)
+            || root.output.origin != *target
+        {
+            return None;
+        }
+        let root_digest = commitment(&root.output)?;
+        if self
+            .records
+            .iter()
+            .filter(|record| {
+                operations::target_parts(&record.target).is_ok_and(|(_, id, _, _)| id == session_id)
+            })
+            .any(|record| {
+                record.root_admission != root.admission_id
+                    || record.root_output != root_digest
+                    || record.owner != root.output.producer
+                    || record.resource_generation != resource_generation
+            })
+            || self
+                .archived
+                .iter()
+                .filter(|record| {
+                    operations::target_parts(&record.target)
+                        .is_ok_and(|(_, id, _, _)| id == session_id)
+                })
+                .any(|record| {
+                    record.root_admission != root.admission_id
+                        || record.root_output != root_digest
+                        || record.owner != root.output.producer
+                        || record.resource_generation != resource_generation
+                })
+        {
+            return None;
+        }
+        let snapshot = self.session_children_raw(target)?;
+        if session.streams.iter().any(|(stream_id, stream)| {
+            let child = LifecycleTarget::Stream {
+                host_epoch: epoch.into(),
+                session_id: session_id.into(),
+                stream_id: stream_id.clone(),
+                generation: stream.generation,
+            };
+            stream.phase != StreamPhase::Retired
+                || scope_digest(&child).is_none_or(|key| !snapshot.scopes.contains(&key))
+        }) {
+            return None;
+        }
+        Some(snapshot)
+    }
+
+    /// Compare a retained snapshot after the session record has been removed.
+    /// The enclosing journal validator separately authenticates the book.
+    pub(super) fn session_children_raw(
+        &self,
+        target: &LifecycleTarget,
+    ) -> Option<SessionChildrenSnapshot> {
+        let (epoch, session_id, None, generation) = operations::target_parts(target).ok()? else {
+            return None;
+        };
+        let mut snapshot = SessionChildrenSnapshot {
+            scopes: BTreeSet::new(),
+            closure_queries: BTreeSet::new(),
+            settlement_queries: BTreeSet::new(),
+            finalize_queries: BTreeSet::new(),
+            owner_acknowledgements: BTreeSet::new(),
+            control_policies: BTreeSet::new(),
+            finalize_policies: BTreeSet::new(),
+            schema_documents: BTreeSet::new(),
+        };
+        let mut capture = |child: &LifecycleTarget,
+                           parent_generation: u64,
+                           owner: &str,
+                           resource_generation: u64,
+                           tuples: &[SettlementTuple],
+                           acknowledgements: &[String],
+                           finalize_tuple: &str,
+                           finalize_policy: &str,
+                           finalize_schemas: &[String]|
+         -> Option<()> {
+            let (record_epoch, record_session, Some(_), _) =
+                operations::target_parts(child).ok()?
+            else {
+                return None;
+            };
+            if record_session != session_id {
+                return Some(());
+            }
+            if record_epoch != epoch
+                || parent_generation != generation
+                || !snapshot.scopes.insert(scope_digest(child)?)
+            {
+                return None;
+            }
+            snapshot
+                .owner_acknowledgements
+                .extend(acknowledgements.iter().cloned());
+            snapshot.finalize_queries.insert(finalize_tuple.into());
+            snapshot.finalize_policies.insert(finalize_policy.into());
+            snapshot
+                .schema_documents
+                .extend(finalize_schemas.iter().cloned());
+            for tuple in tuples {
+                snapshot.closure_queries.insert(commitment(&(
+                    owner,
+                    child,
+                    resource_generation,
+                    &tuple.resource_id,
+                    &tuple.incarnation,
+                    &tuple.operation_id,
+                    &tuple.request_digest,
+                ))?);
+                snapshot.settlement_queries.insert(tuple.tuple.clone());
+                snapshot.control_policies.insert(tuple.policy.clone());
+                snapshot
+                    .schema_documents
+                    .extend(tuple.schemas.iter().cloned());
+            }
+            Some(())
+        };
+        for record in &self.records {
+            capture(
+                &record.target,
+                record.parent_generation,
+                &record.owner,
+                record.resource_generation,
+                &record.settlement_tuples,
+                &record.settlement_commitments,
+                &record.finalize_tuple,
+                &record.finalize_policy,
+                &record.finalize_schemas,
+            )?;
+        }
+        for record in &self.archived {
+            capture(
+                &record.target,
+                record.parent_generation,
+                &record.owner,
+                record.resource_generation,
+                &record.settlement_tuples,
+                &record.settlement_commitments,
+                &record.finalize_tuple,
+                &record.finalize_policy,
+                &record.finalize_schemas,
+            )?;
+        }
+        Some(snapshot)
+    }
+
     /// Raw presence only; callers must reject ambiguous mixed source records.
     pub(super) fn contains_target(&self, target: &LifecycleTarget) -> bool {
         self.records.iter().any(|record| &record.target == target)
@@ -867,14 +1310,7 @@ fn closed_source_generation(journal: &Journal, source: &composition::StoredOutpu
 
 impl ClosedStream {
     fn historical_proof<'a>(&self, journal: &'a Journal) -> Option<HistoricalProof<'a>> {
-        let mut roots = journal.composition.records().filter(|item| {
-            item.admission_id == self.root_admission
-                && commitment(&item.output).as_deref() == Some(self.root_output.as_str())
-        });
-        let root = roots.next()?;
-        if roots.next().is_some() {
-            return None;
-        }
+        let root = self.root(journal)?;
         Some(HistoricalProof {
             session_target: root.output.origin.clone(),
             resource_generation: self.resource_generation,
@@ -1062,43 +1498,73 @@ impl ClosedStream {
             })
     }
 
+    fn root<'a>(&self, journal: &'a Journal) -> Option<&'a composition::StoredOutput> {
+        let (epoch, session_id, Some(_), _) = operations::target_parts(&self.target).ok()? else {
+            return None;
+        };
+        let root = if journal.sessions.contains_key(session_id) {
+            let mut roots = journal.composition.records().filter(|item| {
+                item.admission_id == self.root_admission
+                    && commitment(&item.output).as_deref() == Some(self.root_output.as_str())
+            });
+            let root = roots.next()?;
+            if roots.next().is_some()
+                || resource_generation::historical_generation(journal, root)
+                    != Ok(self.resource_generation)
+            {
+                return None;
+            }
+            root
+        } else {
+            let parent = LifecycleTarget::Session {
+                host_epoch: epoch.into(),
+                session_id: session_id.into(),
+                generation: self.parent_generation,
+            };
+            let root = journal.ended_session_history.historical_root(
+                journal,
+                &parent,
+                &self.root_admission,
+                &self.owner,
+                self.resource_generation,
+            )?;
+            if commitment(&root.output).as_deref() != Some(self.root_output.as_str()) {
+                return None;
+            }
+            root
+        };
+        Some(root)
+    }
+
     fn valid(&self, journal: &Journal) -> bool {
         let Ok((epoch, session_id, Some(stream_id), generation)) =
             operations::target_parts(&self.target)
         else {
             return false;
         };
-        let Some(session) = journal.sessions.get(session_id) else {
+        let session = journal.sessions.get(session_id);
+        let Some(root) = self.root(journal) else {
             return false;
         };
-        let mut roots = journal.composition.records().filter(|item| {
-            item.admission_id == self.root_admission
-                && commitment(&item.output).as_deref() == Some(self.root_output.as_str())
-        });
-        let Some(root) = roots.next() else {
-            return false;
-        };
-        if roots.next().is_some() {
-            return false;
-        }
         let root_output = &root.output;
         generation > 0
             && valid_id(epoch)
             && valid_id(session_id)
             && valid_id(stream_id)
-            && session.host_epoch == epoch
-            && session.generation == self.parent_generation
+            && session.is_none_or(|session| {
+                session.host_epoch == epoch && session.generation == self.parent_generation
+            })
             && matches!(&root_output.origin, LifecycleTarget::Session {
                 host_epoch, session_id: root_session, generation: root_generation
             } if host_epoch == epoch && root_session == session_id && *root_generation == self.parent_generation)
             && valid_graph(&self.graph, &self.owner)
             && root_output.producer == self.owner
-            && session.streams.get(stream_id).is_none_or(|stream| {
-                stream.generation == generation
-                    && stream.provider_graph.as_ref() == Some(&self.graph)
-            })
-            && resource_generation::historical_generation(journal, root)
-                == Ok(self.resource_generation)
+            && session
+                .and_then(|session| session.streams.get(stream_id))
+                .is_none_or(|stream| {
+                    stream.generation == generation
+                        && stream.provider_graph.as_ref() == Some(&self.graph)
+                })
             && valid_digest(&self.root_output)
             && valid_id(&self.transition_id)
             && valid_id(&self.release_admission)
