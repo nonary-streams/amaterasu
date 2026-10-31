@@ -96,7 +96,8 @@ impl Worker {
         if self.queue.len() + usize::from(self.current.is_some()) >= MAX_QUEUED {
             return Err(Failure::Capacity);
         }
-        if !valid_transition(&expected, &replacement)
+        if !(valid_transition(&expected, &replacement)
+            || valid_cancellation(&expected, &replacement, &expected_receipt, &receipt))
             || expected.request.epoch != epoch_id
             || !valid_epoch(&epoch_id)
             || !expected_receipt.is_object()
@@ -336,6 +337,30 @@ fn merge(job: &Job, response: &Value) -> Result<(u64, Value, Value), Failure> {
         return Err(failure_for(job, false));
     }
     Ok((revision, metadata, value))
+}
+
+fn valid_cancellation(
+    before: &Dispatch,
+    after: &Dispatch,
+    expected: &Value,
+    receipt: &Value,
+) -> bool {
+    if before != after
+        || !matches!(
+            before.stage,
+            Stage::Running { .. } | Stage::ProviderPending { .. } | Stage::Completing { .. }
+        )
+    {
+        return false;
+    }
+    let Some(mut expected) = expected.as_object().cloned() else {
+        return false;
+    };
+    if expected.get("cancellation_requested") == Some(&Value::Bool(true)) {
+        return false;
+    }
+    expected.insert("cancellation_requested".into(), Value::Bool(true));
+    receipt.as_object() == Some(&expected)
 }
 
 fn valid_epoch(value: &str) -> bool {
@@ -679,5 +704,38 @@ mod tests {
         let result = drive(&mut worker, &mut host);
         assert_eq!(result.result, Err(Failure::RecoveryRequired));
         assert_eq!(host.commits, 0);
+    }
+    #[test]
+    fn pending_provider_receipts_and_restart_fence_preserve_identity() {
+        let (_, mut running, _) = fixture();
+        let mut pending = running.clone();
+        pending.provider_pending(json!({"id":"r"})).unwrap();
+        assert!(valid_transition(&running, &pending));
+        let mut changed = pending.clone();
+        changed
+            .provider_pending(json!({"id":"r","poll":2}))
+            .unwrap();
+        assert!(valid_transition(&pending, &changed));
+        let mut recovery = changed.clone();
+        recovery.fence_after_restart();
+        assert!(valid_transition(&changed, &recovery));
+        running.request.operation_id = "different".into();
+        assert!(!valid_transition(&running, &pending));
+    }
+    #[test]
+    fn cooperative_cancellation_only_sets_the_cancellation_flag() {
+        let (_, running, _) = fixture();
+        let old = json!({"status":"running","receipt_id":"id"});
+        let requested = json!({"status":"running","receipt_id":"id","cancellation_requested":true});
+        assert!(valid_cancellation(&running, &running, &old, &requested));
+        assert!(!valid_cancellation(
+            &running,
+            &running,
+            &old,
+            &json!({"status":"cancelled","receipt_id":"id","cancellation_requested":true})
+        ));
+        assert!(!valid_cancellation(
+            &running, &running, &requested, &requested
+        ));
     }
 }
