@@ -95,7 +95,7 @@ class CompositionPreflightTest(unittest.TestCase):
             return {"service": self.provider + "/2", "method": name, "interface_major": 2,
                     "interface_minor": 0, "schema_revision": 1}
         self.descriptor["actions"] = [{"id": self.provider + "/remove-owned", "execution": "session_mutation",
-                                       "allowed_targets": ["session", "stream"], "arguments": {}, "required_capabilities": [],
+                                       "allowed_targets": ["stream"], "arguments": {}, "required_capabilities": [],
                                        "plan": action_ref("action_plan"), "execute": action_ref("action_execute"),
                                        "status": action_ref("action_status")}]
         with self.assertRaisesRegex(ValueError, "incomplete"):

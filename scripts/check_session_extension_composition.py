@@ -95,7 +95,7 @@ def check_provider(descriptor: dict, component: dict, approvals: list, provider:
                     "interface_minor": 0, "schema_revision": 1}
         if (not isinstance(action, dict) or action.get("id") != OWNER + "/remove-owned"
                 or action.get("execution") != "session_mutation"
-                or set(action.get("allowed_targets", [])) != {"session", "stream"}
+                or action.get("allowed_targets") != ["stream"]
                 or action.get("arguments") != {} or action.get("required_capabilities") != []
                 or action.get("plan") != action_ref("action_plan")
                 or action.get("execute") != action_ref("action_execute")

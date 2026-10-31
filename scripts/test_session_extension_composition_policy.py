@@ -48,7 +48,7 @@ class CompositionPolicyTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "does not advertise"):
             policy.provider_entries(self.selected, True)
         self.owner["descriptor"]["actions"] = [{"id": check.OWNER + "/remove-owned", "execution": "session_mutation",
-            "allowed_targets": ["session", "stream"], "arguments": {}, "required_capabilities": [],
+            "allowed_targets": ["stream"], "arguments": {}, "required_capabilities": [],
             "plan": policy.method_ref(check.OWNER, "action_plan"),
             "execute": policy.method_ref(check.OWNER, "action_execute"),
             "status": policy.method_ref(check.OWNER, "action_status")}]
@@ -59,10 +59,14 @@ class CompositionPolicyTest(unittest.TestCase):
         result = policy.provider_entries(self.selected, True)
         self.assertEqual(result["input_actions"], [check.OWNER + "/remove-owned"])
         self.assertEqual(len(result["action_grants"]), 3)
+        self.assertTrue(all(grant["target_kinds"] == ["stream"] for grant in result["action_grants"]))
         self.owner["descriptor"]["actions"][0]["required_capabilities"] = ["unexpected"]
         with self.assertRaisesRegex(ValueError, "unsupported owner action"):
             policy.provider_entries(self.selected, True)
         self.owner["descriptor"]["actions"][0]["required_capabilities"] = []
+        self.owner["descriptor"]["actions"][0]["allowed_targets"] = ["session", "stream"]
+        with self.assertRaisesRegex(ValueError, "unsupported owner action"):
+            policy.provider_entries(self.selected, True)
         self.owner["descriptor"]["actions"][0]["allowed_targets"] = ["host"]
         with self.assertRaisesRegex(ValueError, "unsupported owner action"):
             policy.provider_entries(self.selected, True)
@@ -80,7 +84,7 @@ class CompositionPolicyTest(unittest.TestCase):
 
     def test_action_profile_requires_owner_grants_and_full_call_chain(self):
         self.owner["descriptor"]["actions"] = [{"id": check.OWNER + "/remove-owned", "execution": "session_mutation",
-            "allowed_targets": ["session", "stream"], "arguments": {}, "required_capabilities": [],
+            "allowed_targets": ["stream"], "arguments": {}, "required_capabilities": [],
             "plan": policy.method_ref(check.OWNER, "action_plan"),
             "execute": policy.method_ref(check.OWNER, "action_execute"),
             "status": policy.method_ref(check.OWNER, "action_status")}]

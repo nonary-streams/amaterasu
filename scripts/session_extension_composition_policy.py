@@ -35,7 +35,7 @@ def approved_action(descriptor: dict, enabled: bool) -> str:
     action = actions[0]
     if (not isinstance(action, dict) or action.get("id") != action_id
             or action.get("execution") != "session_mutation"
-            or set(action.get("allowed_targets", [])) != {"session", "stream"}
+            or action.get("allowed_targets") != ["stream"]
             or action.get("arguments") != {}
             or action.get("required_capabilities") != []
             or action.get("plan") != method_ref(check.OWNER, "action_plan")
@@ -111,7 +111,7 @@ def provider_entries(selected: list[dict], enable_action: bool = False) -> dict:
         raise ValueError("display settings actions are unsupported")
     action_id = approved_action(by_id[check.OWNER]["descriptor"], enable_action)
     action_grants = [{"principal": identity, "action_ids": [action_id],
-                      "target_kinds": ["session", "stream"], "execution_classes": ["session_mutation"]}
+                      "target_kinds": ["stream"], "execution_classes": ["session_mutation"]}
                      for identity in (legacy.MANAGEMENT, legacy.INPUT, legacy.STREAM)] if enable_action else []
     return {"registry_descriptors": registry, "api_methods": approvals,
             "participants": participants, "input_actions": [action_id] if enable_action else [],
