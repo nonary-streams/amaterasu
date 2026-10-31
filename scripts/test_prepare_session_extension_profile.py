@@ -67,6 +67,10 @@ class ProfileActionPolicyTest(unittest.TestCase):
         validate = next(item for item in bootstrap["policy"]["api_methods"]
                         if item["method"]["method"] == "settings_validate")
         self.assertIn(profile.ACTIONS, validate["callers"])
+        plan = next(item for item in bootstrap["policy"]["api_methods"]
+                    if item["method"]["method"] == "action_plan")
+        self.assertIn(profile.REGISTRY, plan["callers"])
+        self.assertIn(profile.ACTIONS, plan["callers"])
         self.assertEqual({grant["principal"] for grant in settings[profile.ACTIONS]["grants"]},
                          {profile.MANAGEMENT, profile.INPUT, profile.STREAM})
         self.assertTrue(all(grant["target_kinds"] == ["session", "stream"] and

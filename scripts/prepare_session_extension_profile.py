@@ -114,7 +114,7 @@ def prepare(bootstrap: dict, root: Path, descriptor: dict, descriptor_digest: st
         if approval["method"]["method"] == "settings_validate":
             approval["callers"] = validation_callers
         elif approval["method"]["method"] in {"action_plan", "action_execute", "action_status"}:
-            approval["callers"] = [ACTIONS, MANAGEMENT, INPUT, STREAM]
+            approval["callers"] = [REGISTRY, ACTIONS, MANAGEMENT, INPUT, STREAM]
     installed = policy.get("api_methods", [])
     def method_identity(approval: dict) -> tuple:
         method = approval["method"]
