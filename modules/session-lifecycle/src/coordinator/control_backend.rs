@@ -3,8 +3,260 @@ use super::control_endpoints::{ControlEndpointBackend, ResolvedControl, control_
 use super::*;
 use crate::prepare_authority::{ControlContext, ControlPermitUse, CoordinatorPrepareAuthority};
 use amaterasu_extension_api::{
-    ResourceControlRequest, ResourceControlSettlementRequest, SchemaRef,
+    ResourceControlRequest, ResourceControlResponse, ResourceControlSettlementRequest,
+    ResourceOutput, SchemaRef,
 };
+
+/// Resolve only a durable owner result and the exact acknowledged prefix. A
+/// provider's proposed input is never used to construct this chain.
+fn control_input(
+    coordinator: &Coordinator,
+    journal: &Journal,
+    work: &Work,
+    selection: &super::composition::CompositionSelectionSnapshot,
+    request: &ResourceControlRequest,
+    staged: &ResourceOutput,
+) -> ModuleResult<(ResourceOutput, ResourceOutput)> {
+    let mut current = if work.phase == LifecyclePhase::StreamRelease {
+        let mut matches = journal.finalize_results.records().filter(|record| {
+            record.request.target == work.target
+                && record.selection.policy.owner_provider == request.proposal.owner_provider
+                && record.selection.input == selection.input
+                && record.request.output.output_id == request.proposal.output_id
+        });
+        let record = matches.next().ok_or("control_finalize_missing")?;
+        if matches.next().is_some()
+            || !record.validate_structure()
+            || !record.validate_control_chain(journal)
+            || record.selection.policy != selection.finalize_policy
+            || record.selection.finalize_approval != selection.finalize_approval
+            || record.selection.finalize_status_approval != selection.finalize_status_approval
+            || super::finalize_backend::authenticated_current_output(&journal.composition, &record.selection).ok() != Some(staged)
+            || coordinator.verify_finalize_result(&request.proposal.owner_provider, json!({
+                "operation":"verify_finalize_result", "request":record.request, "response":record.applied
+            }))["status"] != "valid"
+        {
+            return Err("control_finalize_unproven".into());
+        }
+        let ResourceControlResponse::Applied {
+            output,
+            candidate: Some(candidate),
+        } = &record.applied
+        else {
+            return Err("control_finalize_unproven".into());
+        };
+        let (_, session_id, stream_id, _) = super::operations::target_parts(&work.target)?;
+        let stream = stream_id
+            .and_then(|id| journal.sessions.get(session_id)?.streams.get(id))
+            .ok_or("unknown_stream")?;
+        if stream.candidate.as_ref() != Some(candidate.as_ref()) {
+            return Err("control_finalize_candidate_mismatch".into());
+        }
+        (**output).clone()
+    } else {
+        staged.clone()
+    };
+    let progress = work
+        .composition_progress
+        .as_ref()
+        .ok_or("control_stage_unavailable")?;
+    let (_, session_id, _, _) = super::operations::target_parts(&work.target)?;
+    let session = journal.sessions.get(session_id).ok_or("unknown_session")?;
+    let current_admission = journal
+        .authority
+        .admissions
+        .get(&request.admission_id)
+        .or_else(|| journal.authority.settled.get(&request.admission_id))
+        .ok_or("control_admission_unavailable")?;
+    let current_position = work
+        .providers
+        .iter()
+        .position(|provider| provider == &current_admission.provider)
+        .ok_or("control_provider_not_ordered")?;
+    let current_proposal = current_admission
+        .plan
+        .control_proposals
+        .iter()
+        .position(|proposal| proposal == &request.proposal)
+        .ok_or("control_proposal_not_ordered")?;
+    let current_order = (current_position, current_proposal);
+    let mut previous_order = None;
+    let mut dependent_input = None;
+    let mut found = false;
+    for control in &progress.controls {
+        let previous = &control.dispatch.request;
+        if previous.proposal.owner_provider != request.proposal.owner_provider
+            || previous.proposal.output_id != request.proposal.output_id
+        {
+            continue;
+        }
+        if previous.admission_id == request.admission_id && dependent_input.is_none() {
+            dependent_input = Some(current.clone());
+        }
+        if previous == request {
+            if found {
+                return Err("ambiguous_control_stage".into());
+            }
+            found = true;
+            break;
+        }
+        if control.dispatch.dependency != current
+            || previous.target != work.target
+            || previous.transition_id != work.transition_id
+        {
+            return Err("control_chain_order_mismatch".into());
+        }
+        let super::control_dispatch::ControlPhase::Applied { result } = &control.dispatch.phase
+        else {
+            return Err("control_chain_not_applied".into());
+        };
+        let settlement = control
+            .settlement
+            .as_ref()
+            .ok_or("control_chain_not_settled")?;
+        if !matches!(
+            settlement.phase,
+            super::settlement_dispatch::SettlementPhase::Acknowledged
+        ) || settlement.request.request != *previous
+            || settlement.request.output != result.output
+        {
+            return Err("control_chain_ack_mismatch".into());
+        }
+        let record = journal
+            .control_settlements
+            .get(&settlement.request.settlement_id)
+            .ok_or("control_chain_record_missing")?;
+        let permit = journal
+            .authority
+            .control_permits
+            .get(&previous.permit_id)
+            .ok_or("control_chain_permit_missing")?;
+        let admission = journal
+            .authority
+            .admissions
+            .get(&previous.admission_id)
+            .or_else(|| journal.authority.settled.get(&previous.admission_id))
+            .ok_or("control_chain_admission_missing")?;
+        let position = work
+            .providers
+            .iter()
+            .position(|provider| provider == &admission.provider)
+            .ok_or("control_chain_provider_not_ordered")?;
+        let proposal_position = admission
+            .plan
+            .control_proposals
+            .iter()
+            .position(|proposal| proposal == &previous.proposal)
+            .ok_or("control_chain_proposal_not_ordered")?;
+        let order = (position, proposal_position);
+        let prior_state = work
+            .states
+            .get(&admission.provider)
+            .ok_or("control_chain_state_missing")?;
+        let frozen = progress
+            .selections
+            .iter()
+            .find(|entry| {
+                entry.control_policy.dependent_provider == admission.provider
+                    && entry.control_policy.owner_provider == previous.proposal.owner_provider
+                    && entry.input == selection.input
+            })
+            .ok_or("control_chain_selection_missing")?;
+        if previous_order.is_some_and(|prior| order <= prior)
+            || order >= current_order
+            || prior_state.admission_id.as_deref() != Some(previous.admission_id.as_str())
+            || prior_state.plan.as_ref() != Some(&admission.plan)
+            || !session.admission_ids.contains(&previous.admission_id)
+            || session.admission_targets.get(&previous.admission_id) != Some(&work.target)
+            || session.admission_phases.get(&previous.admission_id) != Some(&work.phase)
+            || journal.admission_transitions.get(&previous.admission_id)
+                != Some(&work.transition_id)
+            || journal.composition.selection(
+                &frozen.target,
+                &frozen.transition_id,
+                &admission.provider,
+                &previous.proposal.owner_provider,
+                &previous.proposal.output_id,
+            ) != Some(frozen)
+            || !coordinator
+                .settings
+                .control_policies
+                .contains(&frozen.control_policy)
+            || !coordinator
+                .settings
+                .finalize_policies
+                .contains(&frozen.finalize_policy)
+            || coordinator
+                .selections
+                .get(&previous.proposal.owner_provider)
+                .is_none_or(|selected| {
+                    [
+                        &frozen.control_approval,
+                        &frozen.control_status_approval,
+                        &frozen.settlement_approval,
+                    ]
+                    .iter()
+                    .any(|approval| !selected.approvals.contains(approval))
+                })
+            || !permit.consumed
+            || !permit.settled
+            || permit.request != *previous
+            || permit.context.output != current
+            || permit.context.policy != frozen.control_policy
+            || permit.context.target != work.target
+            || permit.context.transition_id != work.transition_id
+            || admission.provider != frozen.control_policy.dependent_provider
+            || !admission
+                .plan
+                .control_proposals
+                .contains(&previous.proposal)
+            || record.settlement != settlement.request
+            || record.confirmed != **result
+            || record.owner_ack != settlement.owner_ack
+            || record.owner_dispatch != settlement.dispatch
+            || record.selection_transition_id != frozen.transition_id
+            || !record.valid_under_permit(permit)
+            || record.owner_ack.is_none()
+            || record.owner_dispatch.as_ref().is_none_or(|dispatch| {
+                dispatch.call.approval != frozen.settlement_approval.broker_approval
+                    || !super::composition::approval_matches_call(
+                        &frozen.settlement_approval,
+                        &dispatch.call,
+                    )
+            })
+            || ![&frozen.control_approval, &frozen.control_status_approval]
+                .iter()
+                .any(|approval| {
+                    approval.broker_approval == record.effect_dispatch.call.approval
+                        && super::composition::approval_matches_call(
+                            approval,
+                            &record.effect_dispatch.call,
+                        )
+                })
+            || record.effect_pending_proof.as_ref().is_some_and(|proof| {
+                proof.call.approval != frozen.control_approval.broker_approval
+                    || !super::composition::approval_matches_call(
+                        &frozen.control_approval,
+                        &proof.call,
+                    )
+            })
+            || amaterasu_extension_api::validate_output_refinement(&current, &result.output)
+                .is_err()
+        {
+            return Err("control_chain_proof_mismatch".into());
+        }
+        previous_order = Some(order);
+        coordinator
+            .settings
+            .schema_catalog()?
+            .validate(&result.output.schema, &result.output.data)?;
+        current = result.output.clone();
+    }
+    if !found {
+        return Err("control_stage_missing".into());
+    }
+    Ok((current.clone(), dependent_input.unwrap_or(current)))
+}
 
 struct Backend<'a> {
     coordinator: &'a mut Coordinator,
@@ -172,10 +424,12 @@ impl Backend<'_> {
         } else {
             None
         };
-        let output = stage.map_or(&input.output, |stage| &stage.after);
+        let staged = stage.map_or(&input.output, |stage| &stage.after);
+        let (output, dependent_input) =
+            control_input(self.coordinator, journal, work, selection, request, staged)?;
         let mut controls = progress.controls.iter().filter(|control| {
             control.dispatch.request == *request
-                && control.dispatch.dependency == *output
+                && control.dispatch.dependency == output
                 && match (&control.dispatch.phase, settlement) {
                     (super::control_dispatch::ControlPhase::Effect, None) => true,
                     (super::control_dispatch::ControlPhase::Applied { result }, Some(tuple)) => {
@@ -204,7 +458,7 @@ impl Backend<'_> {
         {
             return Err("control_stage_mismatch".into());
         }
-        if !state.request.dependency_inputs.contains(output)
+        if !state.request.dependency_inputs.contains(&dependent_input)
             || journal
                 .composition
                 .get(owner, &input.output.output_id, &input.output.origin)
@@ -328,8 +582,8 @@ impl Backend<'_> {
         }
         if let LifecycleTarget::Session {
             generation: parent, ..
-        } = output.origin
-            && parent != session.generation
+        } = &output.origin
+            && *parent != session.generation
         {
             return Err("control_parent_stale".into());
         }
@@ -338,7 +592,7 @@ impl Backend<'_> {
             .schema_catalog()?
             .validate(&output.schema, &output.data)?;
         let resource_generation =
-            super::resource_generation::active_generation(journal, work, output)?;
+            super::resource_generation::active_generation(journal, work, &output)?;
         if stage.is_some_and(|stage| {
             stage.callback_proof.request.resource_generation != Some(resource_generation)
         }) {
@@ -605,7 +859,6 @@ impl Coordinator {
             let stage_session = journal.sessions.get(session_id).ok_or("unknown_session")?;
             if !journal.composition.validate_structure()
                 || stage.before != selection.input.output
-                || stage.after != permit.context.output
                 || stage.transition_id != record.selection_transition_id
                 || stage.parent_generation != stage_session.generation
                 || !stage_session.admission_ids.contains(&stage.admission_id)
@@ -624,6 +877,28 @@ impl Coordinator {
                 )
             {
                 return Err("settlement_stage_provenance_mismatch".into());
+            }
+            if stage.after != permit.context.output {
+                let mut works = journal.receipts.values().filter_map(|receipt| {
+                    let work = receipt.work.as_ref()?;
+                    (work.target == tuple.request.target
+                        && work.transition_id == tuple.request.transition_id
+                        && work.composition_progress.as_ref().is_some_and(|progress| {
+                            progress
+                                .controls
+                                .iter()
+                                .any(|control| control.dispatch.request == tuple.request)
+                        }))
+                    .then_some(work)
+                });
+                let work = works.next().ok_or("settlement_control_work_missing")?;
+                if works.next().is_some()
+                    || control_input(self, journal, work, selection, &tuple.request, &stage.after)?
+                        .0
+                        != permit.context.output
+                {
+                    return Err("settlement_control_chain_mismatch".into());
+                }
             }
         }
         let source = journal
@@ -712,6 +987,46 @@ mod tests {
         dispatch.state = DispatchState::OutcomeUnknown;
         assert!(!settlement_dispatch_eligible(Some(&dispatch), true));
         assert!(settlement_dispatch_eligible(Some(&dispatch), false));
+    }
+    #[test]
+    fn release_control_cannot_fall_back_to_unfinalized_stage() {
+        let path = std::env::temp_dir().join(format!(
+            "amaterasu-control-finalize-{}",
+            identifier().unwrap()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let coordinator = Coordinator::open(&path.join("journal.json")).unwrap();
+        let selected = super::super::finalize_selection::tests::fixture();
+        let method = json!({"service":"owner/2","method":"control","interface_major":2,"interface_minor":0,"schema_revision":1});
+        let control_policy = serde_json::from_value(json!({"dependent_provider":"dependent","owner_provider":"owner","owner_service":"owner/2","owner_method":method,"status_method":method,"settlement_method":method,"argument_schema":selected.input.output.schema,"output_capability":selected.input.output.capability,"output_schema":selected.input.output.schema,"max_access":"exclusive","domain_scope":"resource","mutation_domains":[]})).unwrap();
+        let selection = super::super::composition::CompositionSelectionSnapshot {
+            target: selected.target.clone(),
+            transition_id: selected.transition_id.clone(),
+            input: selected.input.clone(),
+            control_policy,
+            finalize_policy: selected.policy.clone(),
+            control_approval: selected.finalize_approval.clone(),
+            control_status_approval: selected.finalize_status_approval.clone(),
+            settlement_approval: selected.finalize_approval.clone(),
+            finalize_approval: selected.finalize_approval.clone(),
+            finalize_status_approval: selected.finalize_status_approval.clone(),
+            schema_documents: selected.schema_documents.clone(),
+        };
+        let target = &selection.target;
+        let output = &selection.input.output;
+        let request: ResourceControlRequest = serde_json::from_value(json!({"version":2,"transition_id":"release","operation_id":"effect","provider_sequence":1,"target":target,"proposal":{"proposal_id":"proposal","output_id":output.output_id,"owner_provider":"owner","owner_service":"owner/2","target":target,"resource":output.resource,"method":method,"argument_schema":output.schema,"arguments":{},"access":"exclusive","mutation_domains":output.resource.mutation_domains},"admission_id":"admission","permit_id":"permit","remaining_ms":1000})).unwrap();
+        let work: Work = serde_json::from_value(json!({"phase":"stream.release","target":target,"intent":null,"reason":null,"video":null,"transition_id":"release","providers":[],"index":0,"states":{},"candidate":null,"waiting_retirement":false})).unwrap();
+        let journal = coordinator.shared.borrow().value.clone();
+        assert!(
+            matches!(control_input(&coordinator, &journal, &work, &selection, &request, output), Err(error) if error == "control_finalize_missing")
+        );
+        drop(coordinator);
+        std::fs::remove_dir_all(path).unwrap();
     }
     #[test]
     fn restore_requires_exact_quiescence_and_consumer_retirement() {
