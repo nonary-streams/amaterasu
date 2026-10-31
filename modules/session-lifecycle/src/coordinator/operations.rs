@@ -218,6 +218,10 @@ impl Coordinator {
             response = json!({"status":"succeeded","target":target,"plan_revision":payload.get("plan_revision")});
             match operation {
                 "prepare_stream" | "resume_stream" => {
+                    if super::resource_generation::released_root_requires_reprepare(&next, session)
+                    {
+                        return Err("owner_resource_reprepare_required".into());
+                    }
                     if stream_id.is_some()
                         || !matches!(session.phase, SessionPhase::Ready | SessionPhase::Paused)
                     {

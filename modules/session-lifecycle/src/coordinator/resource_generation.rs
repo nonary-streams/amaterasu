@@ -82,6 +82,46 @@ pub(super) fn current_root_generation(journal: &Journal, root: &StoredOutput) ->
     Ok(generation)
 }
 
+/// Block stream admission until each released session root has been replaced by
+/// one authenticated newer incarnation at the current owner cursor.
+pub(super) fn released_root_requires_reprepare(journal: &Journal, session: &SessionRecord) -> bool {
+    let origin = LifecycleTarget::Session {
+        host_epoch: session.host_epoch.clone(),
+        session_id: session.id.clone(),
+        generation: session.generation,
+    };
+    for released in journal
+        .composition
+        .records()
+        .filter(|record| record.output.origin == origin && record.state == OutputState::Released)
+    {
+        let Some(cursor) = session.resource_generations.get(&released.output.producer) else {
+            return true;
+        };
+        let Ok(old_generation) = historical_generation(journal, released) else {
+            return true;
+        };
+        if old_generation >= *cursor {
+            return true;
+        }
+        let mut replacements = journal.composition.records().filter(|record| {
+            record.output.origin == origin
+                && record.output.producer == released.output.producer
+                && record.state == OutputState::Retained
+                && current_root_generation(journal, record).ok() == Some(*cursor)
+        });
+        let Some(replacement) = replacements.next() else {
+            return true;
+        };
+        if replacements.next().is_some()
+            || replacement.output.resource.incarnation == released.output.resource.incarnation
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Active endpoint metadata comes from the immutable root callback, never the
 /// incoming owner request. The caller still checks rights and frozen graph.
 pub(super) fn active_generation(
@@ -229,6 +269,97 @@ mod tests {
         journal.receipts.insert("work".into(), receipt);
         (journal, work, root)
     }
+    #[test]
+    fn released_root_blocks_stream_until_authenticated_replacement() {
+        let (mut journal, _, root) = fixture();
+        assert!(!released_root_requires_reprepare(
+            &journal,
+            &journal.sessions["session"]
+        ));
+        journal
+            .composition
+            .set_state(
+                "owner",
+                &root.output.output_id,
+                &root.output.origin,
+                OutputState::Released,
+            )
+            .unwrap();
+        assert!(released_root_requires_reprepare(
+            &journal,
+            &journal.sessions["session"]
+        ));
+        journal
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .resource_generations
+            .insert("owner".into(), 8);
+        assert!(released_root_requires_reprepare(
+            &journal,
+            &journal.sessions["session"]
+        ));
+        let mut replacement = root.clone();
+        replacement.output.output_id = "new-output".into();
+        replacement.output.resource.incarnation = "new-native".into();
+        replacement.admission_id = "new-root".into();
+        replacement.transition_id = "new-prepare".into();
+        let proof = replacement.callback_proof.as_mut().unwrap();
+        proof.request.resource_generation = Some(8);
+        proof.request.admission_id = Some("new-root".into());
+        proof.request.transition_id = "new-prepare".into();
+        proof.request.operation_id = "new-call".into();
+        proof.terminal.call.operation_id = "new-call".into();
+        proof.terminal.call.arguments = serde_json::to_value(&proof.request).unwrap();
+        proof.terminal.state = DispatchState::Completed {
+            payload: json!({"status":"prepared","candidate":null,"obligations":[],"outputs":[replacement.output]}),
+        };
+        let selection = composition::OutputSelection {
+            producer: "owner".into(),
+            service: "owner/2".into(),
+            capability: "screen".into(),
+            schema: replacement.output.schema.clone(),
+        };
+        journal
+            .composition
+            .record(
+                replacement.clone(),
+                &selection,
+                &replacement.output.origin,
+                &|_| true,
+            )
+            .unwrap();
+        journal
+            .authority
+            .settled
+            .insert("new-root".into(), journal.authority.settled["root"].clone());
+        let session = journal.sessions.get_mut("session").unwrap();
+        session.admission_ids.insert("new-root".into());
+        session
+            .admission_targets
+            .insert("new-root".into(), replacement.output.origin.clone());
+        session
+            .admission_phases
+            .insert("new-root".into(), LifecyclePhase::SessionPrepare);
+        journal
+            .admission_transitions
+            .insert("new-root".into(), "new-prepare".into());
+        assert!(!released_root_requires_reprepare(
+            &journal,
+            &journal.sessions["session"]
+        ));
+        journal
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .resource_generations
+            .clear();
+        assert!(released_root_requires_reprepare(
+            &journal,
+            &journal.sessions["session"]
+        ));
+    }
+
     #[test]
     fn current_generation_requires_exact_callback_cursor_and_live_work() {
         let (mut journal, work, root) = fixture();
