@@ -7,14 +7,11 @@ use super::composition_progress::CompositionProgress;
 use super::*;
 use amaterasu_extension_api::{MethodRef, ResourceOutput};
 
-fn ensure_control_scope_unfenced(
-    book: &super::closed_stream::ClosedStreamBook,
-    target: &LifecycleTarget,
-) -> ModuleResult<()> {
-    if book.scope_fenced(target) {
+fn ensure_control_scope_unfenced(journal: &Journal, target: &LifecycleTarget) -> ModuleResult<()> {
+    if journal.closed_streams.scope_fenced(target) {
         return Err("control_scope_retired".into());
     }
-    Ok(())
+    super::checkpoint_queries::ensure_effect_scope_open(journal, target)
 }
 
 fn ensure_control_operation_unfenced(
@@ -250,6 +247,7 @@ impl Coordinator {
     ) -> ModuleResult<bool> {
         use crate::prepare_driver::PrepareAuthority;
         use amaterasu_extension_api::ResourceControlRequest;
+        ensure_control_scope_unfenced(&self.shared.borrow().value, &work.target)?;
         let state = work.states.get(dependent).ok_or("dependent_plan_missing")?;
         let plan = state.plan.as_ref().ok_or("dependent_plan_missing")?;
         let admission = state
@@ -341,7 +339,6 @@ impl Coordinator {
             transition_id: work.transition_id.clone(),
             parent_generation: Some(parent_generation),
         };
-        ensure_control_scope_unfenced(&self.shared.borrow().value.closed_streams, &work.target)?;
         let mut authority = self.authority_for_work(work)?;
         let selected_providers = self.work_selections(work)?;
         let owner = selected_providers
@@ -538,7 +535,7 @@ impl Coordinator {
                 .is_none_or(|record| record.state == crate::provider_dispatch::DispatchState::Ready)
         {
             ensure_control_scope_unfenced(
-                &self.shared.borrow().value.closed_streams,
+                &self.shared.borrow().value,
                 &control.dispatch.request.target,
             )?;
             ensure_control_operation_unfenced(
@@ -1090,6 +1087,100 @@ mod tests {
     }
 
     #[test]
+    fn ended_parent_fences_control_allocation_and_recovered_ready_dispatch() {
+        use crate::provider_dispatch::{DispatchRecord, DispatchState};
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-parent-retired-{}-{}",
+            std::process::id(),
+            identifier().unwrap()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let path = root.join("journal.json");
+        let coordinator = Coordinator::open(&path).unwrap();
+        let mut dispatch = super::super::control_dispatch::tests::fixture();
+        let target = dispatch.request.target.clone();
+        dispatch.dispatch = Some(DispatchRecord {
+            call: dispatch.effect_call.clone(),
+            state: DispatchState::Ready,
+        });
+        let mut journal = coordinator.shared.borrow().value.clone();
+        let (epoch, session_id, _, _) = super::super::operations::target_parts(&target).unwrap();
+        let session = LifecycleTarget::Session {
+            host_epoch: epoch.into(),
+            session_id: session_id.into(),
+            generation: 7,
+        };
+        super::super::retention::fence_closed_session(&mut journal, &session).unwrap();
+        assert!(!journal.closed_streams.scope_fenced(&target));
+        save(&coordinator.shared, journal).unwrap();
+        drop(coordinator);
+
+        let (_, mut work, mut state) = super::super::session_release::tests::complete_fixture();
+        let mut plan = state.plan.clone().unwrap();
+        plan.control_proposals = vec![dispatch.request.proposal.clone()];
+        state.plan = Some(plan);
+        state.admission_id = Some(dispatch.request.admission_id.clone());
+        work.target = target;
+        work.states.insert("dependent".into(), state);
+        work.composition_progress = Some(super::super::composition_progress::CompositionProgress {
+            inputs: vec![],
+            selections: vec![],
+            controls: vec![super::super::composition_progress::ControlProgress {
+                dispatch,
+                settlement: None,
+            }],
+            finalize: None,
+        });
+        let recovered: Work = serde_json::from_slice(&serde_json::to_vec(&work).unwrap()).unwrap();
+        let mut coordinator = Coordinator::open(&path).unwrap();
+        let mut other_session = recovered.target.clone();
+        let mut other_epoch = recovered.target.clone();
+        if let LifecycleTarget::Stream { session_id, .. } = &mut other_session {
+            *session_id = "another-session".into();
+        }
+        if let LifecycleTarget::Stream { host_epoch, .. } = &mut other_epoch {
+            *host_epoch = "another-epoch".into();
+        }
+        assert!(
+            ensure_control_scope_unfenced(&coordinator.shared.borrow().value, &other_session)
+                .is_ok()
+        );
+        assert!(
+            ensure_control_scope_unfenced(&coordinator.shared.borrow().value, &other_epoch).is_ok()
+        );
+        let before = serde_json::to_value(&coordinator.shared.borrow().value.authority).unwrap();
+        assert_eq!(
+            coordinator
+                .reserve_next_dependent_control("old-receipt", &recovered, "dependent")
+                .unwrap_err(),
+            "session_expired"
+        );
+        assert_eq!(
+            before,
+            serde_json::to_value(&coordinator.shared.borrow().value.authority).unwrap()
+        );
+        let mut calls = 0;
+        let result = coordinator.advance_dependent_control_effect(
+            "old-receipt",
+            &recovered,
+            "dependent",
+            &mut |_| {
+                calls += 1;
+                Err("unexpected broker call".into())
+            },
+        );
+        assert_eq!(result.unwrap_err(), "session_expired");
+        assert_eq!(calls, 0);
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn closed_stream_scope_cannot_issue_or_replay_control() {
         use sha2::{Digest, Sha256};
         let target: LifecycleTarget = serde_json::from_value(json!({
@@ -1101,14 +1192,18 @@ mod tests {
             "{:x}",
             Sha256::digest(serde_json::to_vec(&json!(["closed-stream-scope-v1", target])).unwrap())
         );
-        let book: super::super::closed_stream::ClosedStreamBook =
+        let mut journal: Journal = serde_json::from_value(
+            json!({"version":3,"host_epoch":"epoch","receipts":{},"sessions":{}}),
+        )
+        .unwrap();
+        journal.closed_streams =
             serde_json::from_value(json!({"records":[],"expired_scopes":[digest]})).unwrap();
-        assert!(ensure_control_scope_unfenced(&book, &target).is_err());
+        assert!(ensure_control_scope_unfenced(&journal, &target).is_err());
         let mut other = target.clone();
         if let LifecycleTarget::Stream { generation, .. } = &mut other {
             *generation += 1;
         }
-        assert!(ensure_control_scope_unfenced(&book, &other).is_ok());
+        assert!(ensure_control_scope_unfenced(&journal, &other).is_ok());
     }
 
     #[test]
