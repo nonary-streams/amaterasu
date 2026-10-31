@@ -102,6 +102,8 @@ pub struct ActionInvoke {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionStatus {
+    /// Input is reserved; action execution has not yet been admitted.
+    Reserved,
     Queued,
     Running,
     Succeeded,
@@ -885,6 +887,16 @@ fn validate_method(method: &MethodRef) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn reserved_action_status_round_trips() {
+        let status = ActionStatus::Reserved;
+        assert_eq!(serde_json::to_value(&status).unwrap(), json!("reserved"));
+        assert_eq!(
+            serde_json::from_value::<ActionStatus>(json!("reserved")).unwrap(),
+            status
+        );
+    }
 
     #[test]
     fn descriptor_rejects_foreign_actions_and_unplanned_mutations() {
