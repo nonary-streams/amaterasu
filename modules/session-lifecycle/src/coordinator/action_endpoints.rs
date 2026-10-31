@@ -428,6 +428,37 @@ impl Coordinator {
                 {
                     return rejection("action_execution_invalid");
                 }
+                let snapshot_supplied = payload.get("descriptor").is_some()
+                    || payload.get("execute_approval").is_some()
+                    || payload.get("status_approval").is_some();
+                if snapshot_supplied || plan.resource_disposition.is_some() {
+                    let Ok(descriptor) = serde_json::from_value(payload["descriptor"].clone())
+                    else {
+                        return rejection("action_descriptor_required");
+                    };
+                    let Ok(execute_approval) =
+                        serde_json::from_value(payload["execute_approval"].clone())
+                    else {
+                        return rejection("action_approval_invalid");
+                    };
+                    let Ok(status_approval) =
+                        serde_json::from_value(payload["status_approval"].clone())
+                    else {
+                        return rejection("action_approval_invalid");
+                    };
+                    let snapshot = crate::action_authority::ActionApprovalSnapshot {
+                        descriptor,
+                        execute_approval,
+                        status_approval,
+                    };
+                    if journal
+                        .actions
+                        .bind_approval_snapshot(caller, &token, &binding, snapshot)
+                        .is_err()
+                    {
+                        return rejection("action_approval_invalid");
+                    }
+                }
                 if save(&self.shared, journal).is_err() {
                     return json!({"status":"recovery_required","reason":"journal_write_failed"});
                 }
@@ -634,6 +665,17 @@ impl Coordinator {
                         Some("failed" | "recovery_required") => ActionOutcome::RecoveryRequired,
                         _ => return rejection("invalid_outcome"),
                     };
+                    if outcome == ActionOutcome::Succeeded
+                        && journal
+                            .actions
+                            .execution_for_permit(caller, token)
+                            .is_ok_and(|(_, _, plan)| plan.resource_disposition.is_some())
+                    {
+                        // A typed disposition needs authenticated owner dispatch,
+                        // cleanup closure and an atomic output/cursor update.
+                        // Until that writer is installed, retain the transfer.
+                        return rejection("action_disposition_proof_unavailable");
+                    }
                     let receipt = payload["provider_receipt"].clone();
                     let succeeded = outcome == ActionOutcome::Succeeded;
                     if journal

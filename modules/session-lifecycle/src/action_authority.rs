@@ -118,9 +118,54 @@ struct ActionExecution {
     provider: String,
     method: amaterasu_extension_api::MethodRef,
     plan: amaterasu_extension_api::ResourcePlan,
+    #[serde(default)]
+    approval_snapshot: Option<ActionApprovalSnapshot>,
     claimed: bool,
     #[serde(default)]
     guard_nonces: std::collections::BTreeSet<String>,
+}
+
+/// Exact broker approvals attested by the configured action service before authorization.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActionApprovalSnapshot {
+    pub descriptor: amaterasu_extension_api::ActionDescriptor,
+    pub execute_approval: amaterasu_contracts::ApiMethodApproval,
+    pub status_approval: Option<amaterasu_contracts::ApiMethodApproval>,
+}
+
+fn approval_matches(
+    approval: &amaterasu_contracts::ApiMethodApproval,
+    provider: &str,
+    method: &amaterasu_extension_api::MethodRef,
+    action_service: &str,
+) -> bool {
+    approval.provider == provider
+        && approval.callers.contains(action_service)
+        && approval.method.service == method.service
+        && approval.method.method == method.method
+        && approval.method.interface_major == method.interface_major
+        && approval.method.interface_minor == method.interface_minor
+}
+
+fn valid_approval_snapshot(
+    snapshot: &ActionApprovalSnapshot,
+    provider: &str,
+    method: &amaterasu_extension_api::MethodRef,
+    action_id: &str,
+    action_service: &str,
+) -> bool {
+    snapshot.descriptor.id == action_id
+        && snapshot.descriptor.execute == *method
+        && approval_matches(&snapshot.execute_approval, provider, method, action_service)
+        && match (&snapshot.descriptor.status, &snapshot.status_approval) {
+            (Some(method), Some(approval)) => {
+                approval_matches(approval, provider, method, action_service)
+            }
+            (None, None) => true,
+            _ => false,
+        }
+        && serde_json::to_vec(snapshot).is_ok_and(|bytes| bytes.len() <= 32 * 1024)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -259,6 +304,18 @@ impl ActionAuthority {
                         || !valid_id(&execution.method.method)
                         || execution.method.interface_major == 0
                         || execution.method.schema_revision == 0
+                        || execution
+                            .approval_snapshot
+                            .as_ref()
+                            .is_some_and(|snapshot| {
+                                !valid_approval_snapshot(
+                                    snapshot,
+                                    &execution.provider,
+                                    &execution.method,
+                                    &reservation.binding.action_id,
+                                    &reservation.action_service,
+                                )
+                            })
                         || execution.guard_nonces.len() > 128
                         || execution.guard_nonces.iter().any(|nonce| !valid_id(nonce))
                         || (!execution.claimed && !execution.guard_nonces.is_empty())
@@ -526,6 +583,7 @@ impl ActionAuthority {
             provider: provider.into(),
             method: method.clone(),
             plan: plan.clone(),
+            approval_snapshot: None,
             claimed: false,
             guard_nonces: Default::default(),
         };
@@ -533,6 +591,50 @@ impl ActionAuthority {
             return Err(AuthorityError::Conflict);
         }
         item.execution = Some(selected);
+        Ok(())
+    }
+
+    /// Freeze the service-attested descriptor and complete broker approvals with the permit.
+    pub fn bind_approval_snapshot(
+        &mut self,
+        caller: &str,
+        token: &str,
+        binding: &ActionBinding,
+        snapshot: ActionApprovalSnapshot,
+    ) -> Result<(), AuthorityError> {
+        self.validate()?;
+        let item = self
+            .reservations
+            .get_mut(&key(binding))
+            .ok_or(AuthorityError::NotAuthorized)?;
+        if item.action_service != caller
+            || item.permit_token != token
+            || item.binding != *binding
+            || !matches!(item.state, ReservationState::Issued { .. })
+        {
+            return Err(AuthorityError::NotAuthorized);
+        }
+        let execution = item
+            .execution
+            .as_mut()
+            .ok_or(AuthorityError::NotAuthorized)?;
+        if !valid_approval_snapshot(
+            &snapshot,
+            &execution.provider,
+            &execution.method,
+            &binding.action_id,
+            caller,
+        ) {
+            return Err(AuthorityError::Invalid);
+        }
+        if execution
+            .approval_snapshot
+            .as_ref()
+            .is_some_and(|old| old != &snapshot)
+        {
+            return Err(AuthorityError::Conflict);
+        }
+        execution.approval_snapshot = Some(snapshot);
         Ok(())
     }
 
@@ -975,6 +1077,54 @@ impl ActionAuthority {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn approval_snapshot_requires_selected_owner_methods_and_service() {
+        let method = json!({"service":"display/1","method":"execute","interface_major":1,"interface_minor":0,"schema_revision":1});
+        let descriptor = json!({"id":"display/remove","label":"Remove","description":"Remove","execution":"session_mutation","arguments":{},"allowed_targets":["stream"],"required_capabilities":[],"plan":null,"execute":method,"status":null});
+        let approval = json!({"provider":"display","callers":["action-service"],"method":{"service":"display/1","method":"execute","interface_major":1,"interface_minor":0,"request":{"required":{}},"response":{"required":{}},"privilege":"user"}});
+        let snapshot: ActionApprovalSnapshot = serde_json::from_value(
+            json!({"descriptor":descriptor,"execute_approval":approval,"status_approval":null}),
+        )
+        .unwrap();
+        assert!(valid_approval_snapshot(
+            &snapshot,
+            "display",
+            &snapshot.descriptor.execute,
+            "display/remove",
+            "action-service"
+        ));
+        assert!(!valid_approval_snapshot(
+            &snapshot,
+            "foreign",
+            &snapshot.descriptor.execute,
+            "display/remove",
+            "action-service"
+        ));
+        assert!(!valid_approval_snapshot(
+            &snapshot,
+            "display",
+            &snapshot.descriptor.execute,
+            "display/remove",
+            "other-service"
+        ));
+        assert!(!valid_approval_snapshot(
+            &snapshot,
+            "display",
+            &snapshot.descriptor.execute,
+            "display/other",
+            "action-service"
+        ));
+        let mut changed = snapshot.clone();
+        changed.descriptor.execute.interface_minor += 1;
+        assert!(!valid_approval_snapshot(
+            &changed,
+            "display",
+            &snapshot.descriptor.execute,
+            "display/remove",
+            "action-service"
+        ));
+    }
 
     fn binding() -> ActionBinding {
         ActionBinding {
