@@ -26,6 +26,12 @@ pub enum Operation {
     #[serde(skip)]
     DescribeLibrary {},
     #[serde(skip)]
+    PreflightLibrary {
+        operation_id: String,
+        application: amaterasu_module_sdk::application_library::v2::ApplicationReference,
+        revision: String,
+    },
+    #[serde(skip)]
     LaunchLibrary {
         operation_id: String,
         application: amaterasu_module_sdk::application_library::v2::ApplicationReference,
@@ -2119,10 +2125,20 @@ pub struct Settings {
     pub retirement_observers: BTreeSet<String>,
     pub provider_routes: BTreeMap<String, ProviderRoute>,
     pub library_routes: BTreeMap<String, crate::library::Route>,
+    /// Experimental read-only library preflight; streaming admission remains unavailable.
+    pub enable_library_preflight: bool,
 }
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
         crate::library::validate_routes(&self.library_routes)?;
+        if self.enable_library_preflight
+            && !self
+                .library_routes
+                .values()
+                .any(|route| route.policy_service.is_some())
+        {
+            return Err("invalid_launch_settings");
+        }
         if self.retirement_observers.len() > 32
             || self
                 .retirement_observers

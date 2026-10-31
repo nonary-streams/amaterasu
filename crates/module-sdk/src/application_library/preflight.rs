@@ -6,6 +6,33 @@
 use super::v2::{ApplicationReference, token};
 use serde::{Deserialize, Serialize};
 
+/// Opt-in, read-only preview endpoint. It does not yet admit streaming.
+pub const SERVICE: &str = "amaterasu.launch/3";
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Request {
+    Prepare {
+        operation_id: String,
+        application: ApplicationReference,
+        entry_revision: String,
+    },
+}
+impl Request {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Prepare {
+                operation_id,
+                application,
+                entry_revision,
+            } if token(operation_id) && application.validate().is_ok() && token(entry_revision) => {
+                Ok(())
+            }
+            _ => Err("invalid_request"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PolicyIdentity {
@@ -48,6 +75,18 @@ impl PolicyIdentity {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn preview_request_rejects_payload_policy_or_provider_injection() {
+        let request = json!({"action":"prepare","operation_id":"op", "application":{"library":"games","id":"app"},"entry_revision":"opaque"});
+        let parsed: Request = serde_json::from_value(request.clone()).unwrap();
+        assert!(parsed.validate().is_ok());
+        for field in ["policy", "service", "command", "client_id"] {
+            let mut forged = request.clone();
+            forged[field] = json!("injected");
+            assert!(serde_json::from_value::<Request>(forged).is_err());
+        }
+    }
 
     #[test]
     fn opaque_library_revisions_remain_distinct_from_catalog_revisions() {

@@ -115,6 +115,24 @@ pub fn decode(
         operation.validate()?;
         return Ok(operation);
     }
+    if service == amaterasu_module_sdk::application_library::preflight::SERVICE {
+        if caller != initiator {
+            return Err("permission_denied");
+        }
+        let request: amaterasu_module_sdk::application_library::preflight::Request =
+            serde_json::from_value(payload).map_err(|_| "invalid_request")?;
+        request.validate()?;
+        let amaterasu_module_sdk::application_library::preflight::Request::Prepare {
+            operation_id,
+            application,
+            entry_revision,
+        } = request;
+        return Ok(Operation::PreflightLibrary {
+            operation_id,
+            application,
+            revision: entry_revision,
+        });
+    }
     if service != v2::LAUNCH_SERVICE {
         return Err("invalid_service");
     }

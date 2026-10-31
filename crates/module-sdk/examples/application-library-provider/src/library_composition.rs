@@ -384,6 +384,30 @@ impl Composition {
             ),
         );
         if resolver.is_some() {
+            config
+                .principals
+                .get_mut("alice")
+                .unwrap()
+                .call
+                .insert("amaterasu.launch/1".into());
+            config
+                .principals
+                .get_mut("alice")
+                .unwrap()
+                .call
+                .insert(amaterasu_module_sdk::application_library::preflight::SERVICE.into());
+            config
+                .principals
+                .get_mut("mallory")
+                .unwrap()
+                .call
+                .insert(amaterasu_module_sdk::application_library::preflight::SERVICE.into());
+            config
+                .principals
+                .get_mut(LAUNCH)
+                .unwrap()
+                .provide
+                .insert(amaterasu_module_sdk::application_library::preflight::SERVICE.into());
             for principal in ["alice", LAUNCH] {
                 if principal == "alice"
                     && resolver == Some(ResolverSelection::MissingInitiatorGrant)
@@ -441,7 +465,7 @@ impl Composition {
         };
         config.settings.insert(
             LAUNCH.into(),
-            json!({"library_routes":{"games":{
+            json!({"enable_library_preflight":resolver.is_some(),"library_routes":{"games":{
             "service":LIBRARY,"callers":["alice"],"executors":{"runner":SERVICE},
             "require_application_policy":use_preparation || resolver.is_some(),"application_policies":policy,
             "policy_service":resolver.map(|_| POLICY)}}}),
@@ -1194,4 +1218,55 @@ fn separately_built_library_artifact_browses_launches_and_stops() {
             .any(|(service, payload, _)| service == APPLICATION
                 && payload["action"] == "preparation_stop")
     );
+}
+
+#[test]
+#[ignore = "requires AMATERASU_POLICY_ARTIFACT pointing to the independently built policy cdylib"]
+fn independently_built_policy_replaces_resolver_during_readonly_preflight() {
+    assert!(std::env::var_os("AMATERASU_POLICY_ARTIFACT").is_some());
+    for (variant, expected_revision) in [(false, "first-policy"), (true, "artifact-policy-v1")] {
+        let mut composition = Composition::configure(
+            false,
+            None,
+            false,
+            false,
+            None,
+            false,
+            Some(if variant {
+                ResolverSelection::Second
+            } else {
+                ResolverSelection::First
+            }),
+        );
+        let epoch = composition.request(
+            "alice",
+            "amaterasu.launch/1",
+            json!({"action":"operation_epoch"}),
+        );
+        let epoch = epoch["operation_epoch"].as_str().unwrap();
+        let operation = format!("ale1:{epoch}:preview");
+        let preview = composition.request("alice", amaterasu_module_sdk::application_library::preflight::SERVICE,
+            json!({"action":"prepare","operation_id":operation,"application":{"library":"games","id":"opaque/library/game"},"entry_revision":"entry-v7"}));
+        assert_eq!(preview["ok"], true, "{preview}");
+        assert_eq!(preview["admission_capable"], false);
+        assert_eq!(preview["policy_identity"]["entry_revision"], "entry-v7");
+        let denied = composition.request("mallory", amaterasu_module_sdk::application_library::preflight::SERVICE,
+            json!({"action":"prepare","operation_id":operation,"application":{"library":"games","id":"opaque/library/game"},"entry_revision":"entry-v7"}));
+        assert_eq!(denied["code"], "permission_denied");
+        let direct = composition.request("alice", v2::LAUNCH_SERVICE,
+            json!({"action":"launch","operation_id":operation,"application":{"library":"games","id":"opaque/library/game"},"revision":"entry-v7"}));
+        assert_eq!(direct["code"], "operation_conflict");
+        assert_eq!(
+            preview["policy_identity"]["policy_revision"],
+            expected_revision
+        );
+        let state = composition.shared.borrow();
+        assert!(state.session.key.is_empty());
+        assert!(
+            !state
+                .requests
+                .iter()
+                .any(|(service, _, _)| service == APPLICATION || service == SERVICE)
+        );
+    }
 }
