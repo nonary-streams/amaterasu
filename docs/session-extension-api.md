@@ -231,6 +231,13 @@ release followed by resume requires a new resource generation rather than reuse
 of the released generation. End-to-end action release and new-generation resume
 remain subject to wiring and qualification.
 
+The planned `nonary.virtual-screen/remove-owned` action is restricted to an
+active stream target. A session target, including a paused session without an
+active stream, is unsupported. Its intended shortcut behavior is to retire the
+stream and remove the owned producer while retaining the application; a later
+resume must obtain a fresh resource generation. The target restriction and this
+end-to-end path require integration and validation before use.
+
 When an invocation supplies `expected_settings_revision`, the action service
 compares that decimal revision with the provider's current registry document
 before planning. This is a point-in-time check: a concurrent settings save can
