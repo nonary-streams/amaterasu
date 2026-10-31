@@ -1,7 +1,9 @@
 //! Serialized extension contracts. References select resources; they never confer authority.
+mod action_disposition;
 mod action_target;
 mod composition;
 pub mod schemas;
+pub use action_disposition::*;
 pub use action_target::*;
 pub use composition::*;
 
@@ -220,6 +222,8 @@ pub struct ResourcePlan {
     pub allowed_degradation: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub control_proposals: Vec<ResourceControlProposal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_disposition: Option<Box<ActionResourceDispositionPlan>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -671,6 +675,31 @@ pub fn validate_resource_plan(plan: &ResourcePlan) -> Result<(), String> {
                 .any(|domain| !domains.contains(domain))
         {
             return Err("invalid planned resource".into());
+        }
+    }
+    if let Some(disposition) = &plan.resource_disposition {
+        validate_action_disposition_plan(disposition)?;
+        let resource = &disposition.resource;
+        let expected_domains: BTreeSet<_> = resource
+            .mutation_domains
+            .iter()
+            .chain(resource.mutation_domain.iter())
+            .collect();
+        if expected_domains.iter().any(|domain| {
+            !plan.mutation_domains.iter().any(|declared| {
+                declared.domain.as_str() == domain.as_str()
+                    && declared.access == ResourceAccess::Exclusive
+            })
+        }) || !plan.resources.iter().any(|planned| {
+            planned.provider == resource.provider
+                && planned.resource_id == resource.resource_id
+                && planned.incarnation.as_deref() == Some(resource.incarnation.as_str())
+                && planned.expected_revision == Some(resource.revision)
+                && planned.execution_domain == resource.execution_domain
+                && planned.mutation_domains.iter().collect::<BTreeSet<_>>() == expected_domains
+                && planned.access == ResourceAccess::Exclusive
+        }) {
+            return Err("action disposition outside admitted resource".into());
         }
     }
     let mut obligations = BTreeSet::new();
@@ -1549,6 +1578,7 @@ mod tests {
             candidate_constraint: None,
             allowed_degradation: vec![],
             control_proposals: vec![],
+            resource_disposition: None,
         };
         assert!(validate_resource_plan(&plan).is_err());
         plan.obligations[1].depends_on.clear();
