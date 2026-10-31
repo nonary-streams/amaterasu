@@ -8,11 +8,25 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::planning::{self, Access, DomainEffect, DomainState, EffectPlan, PlanningSnapshot};
+use crate::prepare_authority::{ControlPolicy, DomainScope};
 use amaterasu_extension_api::{self as api, ResourceAccess};
+use serde::{Deserialize, Serialize};
+
+/// Selected by the coordinator from installed policy, authenticated producer
+/// evidence and broker approvals. Provider plans cannot authorize themselves.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedControlBinding {
+    pub policy: ControlPolicy,
+    pub output: api::ResourceOutput,
+    pub target: api::LifecycleTarget,
+}
 
 /// Caller-authorized policy and a complete current observation. The caller must
 /// obtain these from trusted authorities, not from the provider's plan.
 pub struct AdmissionContext<'a> {
+    pub provider: &'a str,
+    pub approved_control_bindings: &'a [ApprovedControlBinding],
     pub snapshot: &'a PlanningSnapshot,
     pub complete: bool,
     pub approved_capabilities: &'a BTreeSet<String>,
@@ -54,6 +68,14 @@ pub fn validate_effect_plan(
     api::validate_resource_plan(plan)?;
     if !context.complete {
         return Err("incomplete observation".into());
+    }
+    if plan.control_proposals.iter().any(|proposal| {
+        !plan
+            .resources
+            .iter()
+            .any(|resource| proposal_is_approved(plan, context, proposal, resource))
+    }) {
+        return Err("unapproved control proposal".into());
     }
     if !unique_valid(&plan.required_capabilities)
         || !unique_valid(&plan.affected_consumers)
@@ -102,8 +124,7 @@ pub fn validate_effect_plan(
         }
         if access(&resource.access) != Access::Read
             && !plan.obligations.iter().any(|obligation| {
-                obligation.provider == resource.provider
-                    && obligation.resource_id == resource.resource_id
+                obligation_matches_resource(plan, context, obligation, resource)
                     && obligation
                         .mutation_domain
                         .as_ref()
@@ -113,14 +134,17 @@ pub fn validate_effect_plan(
             return Err("mutation lacks cleanup obligation".into());
         }
     }
-    validate_obligations(plan, context.approved_cleanup_methods)?;
+    validate_obligations(plan, context)?;
     for domain in &plan.mutation_domains {
         if access(&domain.access) != Access::Read
             && !plan.obligations.iter().any(|obligation| {
                 plan.resources.iter().any(|resource| {
-                    resource.provider == obligation.provider
-                        && resource.resource_id == obligation.resource_id
+                    obligation_matches_resource(plan, context, obligation, resource)
                         && resource.mutation_domains.contains(&domain.domain)
+                        && obligation
+                            .mutation_domain
+                            .as_deref()
+                            .is_none_or(|id| id == domain.domain)
                 })
             })
         {
@@ -159,7 +183,7 @@ pub fn validate_effect_plan(
 
 fn validate_obligations(
     plan: &api::ResourcePlan,
-    approved: &[api::MethodRef],
+    context: &AdmissionContext<'_>,
 ) -> Result<(), String> {
     let by_id: BTreeMap<_, _> = plan
         .obligations
@@ -167,12 +191,14 @@ fn validate_obligations(
         .map(|obligation| (obligation.obligation_id.as_str(), obligation))
         .collect();
     for obligation in &plan.obligations {
-        if !approved.contains(&obligation.cleanup_method)
+        if !context
+            .approved_cleanup_methods
+            .contains(&obligation.cleanup_method)
             || !unique_valid(&obligation.depends_on)
-            || !plan.resources.iter().any(|resource| {
-                resource.provider == obligation.provider
-                    && resource.resource_id == obligation.resource_id
-            })
+            || !plan
+                .resources
+                .iter()
+                .any(|resource| obligation_matches_resource(plan, context, obligation, resource))
             || obligation.mutation_domain.as_ref().is_some_and(|domain| {
                 !plan
                     .mutation_domains
@@ -197,6 +223,111 @@ fn validate_obligations(
         }
     }
     Ok(())
+}
+
+fn obligation_matches_resource(
+    plan: &api::ResourcePlan,
+    context: &AdmissionContext<'_>,
+    obligation: &api::ResourceObligation,
+    resource: &api::PlannedResource,
+) -> bool {
+    if obligation.resource_id != resource.resource_id
+        || (!context.provider.is_empty() && obligation.provider != context.provider)
+        || obligation
+            .mutation_domain
+            .as_ref()
+            .is_some_and(|domain| !resource.mutation_domains.contains(domain))
+    {
+        return false;
+    }
+    if obligation.provider == resource.provider {
+        return true;
+    }
+    if obligation.provider != context.provider || resource.access == ResourceAccess::Read {
+        return false;
+    }
+    let mut matches = plan
+        .control_proposals
+        .iter()
+        .filter(|proposal| proposal_is_approved(plan, context, proposal, resource));
+    matches.next().is_some() && matches.next().is_none()
+}
+
+fn proposal_is_approved(
+    plan: &api::ResourcePlan,
+    context: &AdmissionContext<'_>,
+    proposal: &api::ResourceControlProposal,
+    resource: &api::PlannedResource,
+) -> bool {
+    context
+        .approved_control_bindings
+        .iter()
+        .filter(|binding| {
+            proposal_matches_binding(proposal, binding, context.provider, resource)
+                && binding
+                    .output
+                    .domain_observations
+                    .iter()
+                    .all(|observation| {
+                        observation.complete
+                            && plan.mutation_domains.iter().any(|domain| {
+                                domain.domain == observation.domain
+                                    && domain.expected_revision == observation.revision
+                                    && domain.borrowers == observation.borrowers
+                            })
+                    })
+        })
+        .count()
+        == 1
+}
+
+fn proposal_matches_binding(
+    proposal: &api::ResourceControlProposal,
+    binding: &ApprovedControlBinding,
+    dependent: &str,
+    planned: &api::PlannedResource,
+) -> bool {
+    let policy = &binding.policy;
+    let output = &binding.output;
+    let resource = &output.resource;
+    let domains: BTreeSet<_> = resource
+        .mutation_domains
+        .iter()
+        .cloned()
+        .chain(resource.mutation_domain.iter().cloned())
+        .collect();
+    let planned_domains: BTreeSet<_> = planned.mutation_domains.iter().cloned().collect();
+    let proposal_domains: BTreeSet<_> = proposal.mutation_domains.iter().cloned().collect();
+    api::validate_resource_control_proposal(proposal).is_ok()
+        && api::validate_resource_output(output).is_ok()
+        && api::output_in_scope(output, &binding.target)
+        && policy.dependent_provider == dependent
+        && policy.owner_provider == output.producer
+        && policy.owner_service == output.producer_service
+        && policy.output_capability == output.capability
+        && policy.output_schema == output.schema
+        && proposal.target == binding.target
+        && proposal.output_id == output.output_id
+        && proposal.owner_provider == output.producer
+        && proposal.owner_service == output.producer_service
+        && proposal.method == policy.owner_method
+        && proposal.argument_schema == policy.argument_schema
+        && proposal.resource == *resource
+        && proposal.access == planned.access
+        && level(access(&proposal.access)) <= level(access(&policy.max_access))
+        && planned.provider == resource.provider
+        && planned.resource_id == resource.resource_id
+        && planned.incarnation.as_deref() == Some(resource.incarnation.as_str())
+        && planned.expected_revision == Some(resource.revision)
+        && planned.execution_domain == resource.execution_domain
+        && !domains.is_empty()
+        && planned_domains == domains
+        && proposal_domains == domains
+        && proposal_domains.len() == proposal.mutation_domains.len()
+        && match policy.domain_scope {
+            DomainScope::Static => policy.mutation_domains == domains,
+            DomainScope::Resource => policy.mutation_domains.is_empty(),
+        }
 }
 
 /// Check a provider-ready candidate against the approved public constraint.
@@ -314,6 +445,8 @@ mod tests {
         macro_rules! context {
             () => {
                 AdmissionContext {
+                    provider: "display",
+                    approved_control_bindings: &[],
                     snapshot: &snapshot,
                     complete: true,
                     approved_capabilities: &capabilities,
@@ -336,6 +469,100 @@ mod tests {
         plan = fixture().0;
         plan.mutation_domains[0].access = ResourceAccess::Read;
         assert!(validate_effect_plan(&plan, &context!()).is_err());
+    }
+
+    #[test]
+    fn dependent_cleanup_requires_exact_approved_owner_binding() {
+        let (mut plan, snapshot, _) = fixture();
+        plan.obligations[0].provider = "settings".into();
+        plan.obligations[0].cleanup_method.service = "settings/2".into();
+        plan.obligations[0].cleanup_method.interface_major = 2;
+        let method: api::MethodRef = serde_json::from_value(json!({"service":"owner/2","method":"resource_control","interface_major":2,"interface_minor":0,"schema_revision":1})).unwrap();
+        let schema = json!({"id":"output/1","major":1,"minor":0,"digest":"a".repeat(64)});
+        let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1});
+        let resource = json!({"provider":"display","resource_id":"output","incarnation":"native","revision":4,"execution_domain":"seat","mutation_domain":"topology","mutation_domains":["topology"]});
+        let output: api::ResourceOutput = serde_json::from_value(json!({"output_id":"out","capability":"display/output","schema":schema,"producer":"display","producer_service":"owner/2","origin":target,"resource":resource,"domain_observations":[{"domain":"topology","revision":3,"borrowers":{"stream-a":1,"stream-b":2},"complete":true}],"data":{}})).unwrap();
+        let policy: ControlPolicy = serde_json::from_value(json!({"dependent_provider":"settings","owner_provider":"display","owner_service":"owner/2","owner_method":method,"status_method":method,"settlement_method":method,"argument_schema":schema,"output_capability":"display/output","output_schema":schema,"max_access":"exclusive","domain_scope":"resource","mutation_domains":[]})).unwrap();
+        let binding = ApprovedControlBinding {
+            policy,
+            output,
+            target: serde_json::from_value(target.clone()).unwrap(),
+        };
+        let proposal: api::ResourceControlProposal = serde_json::from_value(json!({"proposal_id":"proposal","output_id":"out","owner_provider":"display","owner_service":"owner/2","target":target,"resource":resource,"method":method,"argument_schema":schema,"arguments":{},"access":"exclusive","mutation_domains":["topology"]})).unwrap();
+        plan.control_proposals = vec![proposal];
+        let methods = vec![plan.obligations[0].cleanup_method.clone()];
+        let capabilities = ["display/change".into()].into();
+        let borrowers = ["stream-a".into(), "stream-b".into()].into();
+        let run = |candidate: &api::ResourcePlan, bindings: &[ApprovedControlBinding]| {
+            validate_effect_plan(
+                candidate,
+                &AdmissionContext {
+                    provider: "settings",
+                    approved_control_bindings: bindings,
+                    snapshot: &snapshot,
+                    complete: true,
+                    approved_capabilities: &capabilities,
+                    approved_cleanup_methods: &methods,
+                    authorized_borrowers: &borrowers,
+                },
+            )
+        };
+        assert!(run(&plan, std::slice::from_ref(&binding)).is_ok());
+        assert!(run(&plan, &[]).is_err());
+        let mut bad = plan.clone();
+        bad.obligations[0].provider = "display".into();
+        assert!(run(&bad, std::slice::from_ref(&binding)).is_err());
+        let mut bad = plan.clone();
+        bad.obligations[0].cleanup_method.method = "unapproved".into();
+        assert!(run(&bad, std::slice::from_ref(&binding)).is_err());
+        for field in [
+            "owner",
+            "output",
+            "incarnation",
+            "revision",
+            "domain",
+            "access",
+            "method",
+            "schema",
+            "target",
+        ] {
+            let mut bad = plan.clone();
+            let proposal = &mut bad.control_proposals[0];
+            match field {
+                "owner" => proposal.owner_provider = "other".into(),
+                "output" => proposal.output_id = "other".into(),
+                "incarnation" => proposal.resource.incarnation = "other".into(),
+                "revision" => proposal.resource.revision += 1,
+                "domain" => proposal.mutation_domains.clear(),
+                "access" => proposal.access = ResourceAccess::Shared,
+                "method" => proposal.method.method = "other".into(),
+                "schema" => proposal.argument_schema.digest = "b".repeat(64),
+                "target" => {
+                    if let api::LifecycleTarget::Stream { generation, .. } = &mut proposal.target {
+                        *generation += 1
+                    }
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                run(&bad, std::slice::from_ref(&binding)).is_err(),
+                "accepted changed {field}"
+            );
+        }
+        let mut duplicate = plan.clone();
+        let mut second = duplicate.control_proposals[0].clone();
+        second.proposal_id = "other-proposal".into();
+        duplicate.control_proposals.push(second);
+        assert!(run(&duplicate, std::slice::from_ref(&binding)).is_err());
+        let mut forged_extra = plan.clone();
+        let mut forged = forged_extra.control_proposals[0].clone();
+        forged.proposal_id = "forged".into();
+        forged.output_id = "other".into();
+        forged_extra.control_proposals.push(forged);
+        assert!(run(&forged_extra, std::slice::from_ref(&binding)).is_err());
+        let mut stale = binding.clone();
+        stale.output.domain_observations[0].revision += 1;
+        assert!(run(&plan, &[stale]).is_err());
     }
 
     #[test]

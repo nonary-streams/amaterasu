@@ -714,6 +714,8 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
             }
             validate_selection(&admission.selection)?;
             let context = AdmissionContext {
+                provider: &admission.provider,
+                approved_control_bindings: &[],
                 snapshot: &state.snapshot,
                 complete: true,
                 approved_capabilities: &admission.selection.capabilities,
@@ -1926,6 +1928,8 @@ impl<J: AuthorityJournal> PrepareAuthority for CoordinatorPrepareAuthority<J> {
             }
         }
         let context = AdmissionContext {
+            provider: &participant.provider,
+            approved_control_bindings: &[],
             snapshot: &next.snapshot,
             complete: true,
             approved_capabilities: &selection.capabilities,
@@ -1978,6 +1982,8 @@ impl<J: AuthorityJournal> PrepareAuthority for CoordinatorPrepareAuthority<J> {
             return Err("admission changed or rights lost".into());
         }
         let context = AdmissionContext {
+            provider: &participant.provider,
+            approved_control_bindings: &[],
             snapshot: &self.state.snapshot,
             complete: true,
             approved_capabilities: &selection.capabilities,

@@ -373,6 +373,10 @@ impl Coordinator {
                     BTreeSet::new()
                 };
                 let context = AdmissionContext {
+                    provider: selection
+                        .map(|selected| selected.participant.provider.as_str())
+                        .unwrap_or(""),
+                    approved_control_bindings: &[],
                     snapshot: &journal.authority.snapshot,
                     complete: true,
                     approved_capabilities: &approved,
