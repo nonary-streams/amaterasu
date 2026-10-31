@@ -129,7 +129,40 @@ impl Coordinator {
                     finalize.owner_plan.request.operation_id
                         == payload["operation_id"].as_str().unwrap_or("")
                 });
-            let state = if let Some(finalize) = nested {
+            let observation = work.owner_observations.values().find(|observation| {
+                observation.request.operation_id == payload["operation_id"].as_str().unwrap_or("")
+            });
+            let (request, participant, provider) = if let Some(observation) = observation {
+                let Some(dispatch) = observation.dispatch.as_ref() else {
+                    continue;
+                };
+                let selected = self.selections.get(caller);
+                if observation.participant.provider != caller
+                    || observation.phase != super::plan_observation::PlanObservationPhase::Ready
+                    || !matches!(
+                        dispatch.state,
+                        crate::provider_dispatch::DispatchState::OutcomeUnknown
+                    )
+                    || !super::observation_scheduler::validate_work_observations(journal, work)
+                    || selected.is_none_or(|selection| {
+                        !selection.approvals.iter().any(|approval| {
+                            approval.method == observation.participant.plan_method
+                                && approval.broker_approval == dispatch.call.approval
+                                && super::composition::approval_matches_call(
+                                    approval,
+                                    &dispatch.call,
+                                )
+                        })
+                    })
+                {
+                    continue;
+                }
+                (
+                    &observation.request,
+                    &observation.participant,
+                    observation.participant.provider.as_str(),
+                )
+            } else if let Some(finalize) = nested {
                 let state = &finalize.owner_plan;
                 let selection = &finalize.selection;
                 let selected = self.selections.get(caller);
@@ -185,15 +218,14 @@ impl Coordinator {
                 {
                     continue;
                 }
-                state
+                (&state.request, &state.participant, state.provider.as_str())
             } else {
                 let Some(state) = work.states.get(caller) else {
                     continue;
                 };
-                state
+                (&state.request, &state.participant, state.provider.as_str())
             };
-            let request = &state.request;
-            if state.provider != caller
+            if provider != caller
                 || request.target != work.target
                 || request.transition_id != work.transition_id
                 || request.phase != work.phase
@@ -258,7 +290,7 @@ impl Coordinator {
             // The cursor is coordinator-owned and frozen into the exact
             // persisted provider request. It exists before the first output;
             // subsequent work must match its current session value.
-            let resource_owner = state.participant.contract_version
+            let resource_owner = participant.contract_version
                 == amaterasu_extension_api::COMPOSITION_VERSION
                 && self
                     .settings

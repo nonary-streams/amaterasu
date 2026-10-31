@@ -256,8 +256,20 @@ impl Coordinator {
                             | crate::prepare_driver::PreparePhase::PlanStatus
                     )
                 {
-                    active_plans.push(state);
+                    active_plans.push((&state.request, &state.participant));
                 }
+            }
+            for observation in work.owner_observations.values().filter(|observation| {
+                observation.participant.provider == caller
+                    && observation.phase == super::plan_observation::PlanObservationPhase::Ready
+                    && observation.dispatch.as_ref().is_some_and(|dispatch| {
+                        matches!(
+                            dispatch.state,
+                            crate::provider_dispatch::DispatchState::OutcomeUnknown
+                        )
+                    })
+            }) {
+                active_plans.push((&observation.request, &observation.participant));
             }
         }
         if active_plans.len() > 1 {
@@ -265,11 +277,11 @@ impl Coordinator {
         }
         let nested = active_plans.first().copied();
         match (nested, payload.get("provider_request")) {
-            (Some(expected), Some(value)) => {
+            (Some((expected, participant)), Some(value)) => {
                 let supplied: amaterasu_extension_api::ProviderRequest =
                     serde_json::from_value(value.clone())
                         .map_err(|_| "invalid_finalize_refresh")?;
-                if supplied != expected.request
+                if &supplied != expected
                     || !matches!(
                         supplied.operation,
                         amaterasu_extension_api::ProviderOperation::ResourcePlan
@@ -278,7 +290,7 @@ impl Coordinator {
                     || supplied.version != amaterasu_extension_api::COMPOSITION_VERSION
                     || self.selections.get(caller).is_none_or(|selected| {
                         !selected.approvals.iter().any(|approval| {
-                            approval.method == expected.participant.plan_method
+                            approval.method == participant.plan_method
                                 && approval.broker_approval["provider"].as_str() == Some(caller)
                         })
                     })

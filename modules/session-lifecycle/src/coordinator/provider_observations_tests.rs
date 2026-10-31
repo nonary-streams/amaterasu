@@ -504,7 +504,7 @@ fn nested_finalize_plan_refresh_checks_exact_owner_and_request() {
     journal
         .admission_transitions
         .insert("fresh".into(), "transition".into());
-    journal.authority = serde_json::from_value(json!({"sequences":{"owner":3},"snapshot":{"resources":{"owner":{"output":{"provider":"owner","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domains":["domain"]}}},"domains":{"domain":{"revision":1,"borrowers":{}}}},"admissions":{"fresh":admission(final_plan)},"domain_locks":{"domain":"fresh"},"domain_owners":{"domain":"owner"},"refresh_required":[],"settled":{"source":admission(source_plan)},"finalize_permits":{"permit":{"context":context,"request":request,"consumed":false,"settled":false}}})).unwrap();
+    journal.authority = serde_json::from_value(json!({"sequences":{"owner":3},"snapshot":{"resources":{"owner":{"output":{"provider":"owner","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domains":["domain"]}}},"domains":{"domain":{"revision":1,"borrowers":{}}}},"admissions":{"fresh":admission(final_plan)},"domain_locks":{"domain":"fresh"},"domain_owners":{"domain":"owner"},"refresh_required":[],"settled":{"source":admission(source_plan.clone())},"finalize_permits":{"permit":{"context":context,"request":request,"consumed":false,"settled":false}}})).unwrap();
     coordinator
         .settings
         .finalize_policies
@@ -516,10 +516,11 @@ fn nested_finalize_plan_refresh_checks_exact_owner_and_request() {
     coordinator
         .settings
         .participants
-        .push(serde_json::from_value(participant).unwrap());
-    coordinator
-        .selections
-        .insert("owner".into(), serde_json::from_value(selection).unwrap());
+        .push(serde_json::from_value(participant.clone()).unwrap());
+    coordinator.selections.insert(
+        "owner".into(),
+        serde_json::from_value(selection.clone()).unwrap(),
+    );
     journal.authority.admissions.remove("fresh");
     journal.authority.finalize_permits.clear();
     journal.authority.domain_locks.clear();
@@ -535,6 +536,57 @@ fn nested_finalize_plan_refresh_checks_exact_owner_and_request() {
         "succeeded"
     );
     let original = coordinator.shared.borrow().value.clone();
+    // A post-stage owner re-observation is authorized only while the exact
+    // broker-dispatched request is persisted in the dependent's work.
+    let mut observation_journal = original.clone();
+    observation_journal.authority.settled.insert(
+        "stage-admission".into(),
+        serde_json::from_value(admission(source_plan.clone())).unwrap(),
+    );
+    let observed_request = json!({"version":2,"resource_generation":1,"provider_sequence":9,"operation":"resource_plan","transition_id":"transition","operation_id":"observe-op","target":stream,"phase":"stream.prepare","settings_revision":"one","settings":{},"intent":"initial","reason":null,"requested_video":null,"consumer_requirements":requirements,"remaining_ms":5000,"plan_revision":null,"admission_id":null,"approved_plan":null,"dependency_inputs":[staged_output],"control_results":[]});
+    let observed_request = serde_json::to_value(
+        serde_json::from_value::<amaterasu_extension_api::ProviderRequest>(observed_request)
+            .unwrap(),
+    )
+    .unwrap();
+    {
+        let work = observation_journal
+            .receipts
+            .get_mut("work")
+            .unwrap()
+            .work
+            .as_mut()
+            .unwrap();
+        work.composition_progress = None;
+        work.provider_graph = Some(serde_json::from_value(json!({"order":["owner","dependent"],"dependencies":{"owner":[],"dependent":["owner"]}})).unwrap());
+        work.states.insert("owner".into(), serde_json::from_value(json!({"provider":"owner","participant":participant,"request":stage_request,"phase":"prepared","plan":source_plan,"admission_id":"stage-admission","pending_receipt":null,"status_polls":0,"last_sequence":2,"dispatch":null,"terminal_dispatch":null,"response":stage_response})).unwrap());
+        work.owner_observations.insert(serde_json::to_string(&("dependent", "owner")).unwrap(), serde_json::from_value(json!({"participant":participant,"request":observed_request,"phase":"ready","dispatch":{"call":call("plan",observed_request.clone(),"observe-op"),"state":{"state":"outcome_unknown"}},"plan":null})).unwrap());
+    }
+    let observed_work = observation_journal.receipts["work"].work.as_ref().unwrap();
+    let observed_state = observed_work.owner_observations.values().next().unwrap();
+    super::super::plan_observation::PlanObservationDriver::new(observed_state.clone()).unwrap();
+    assert!(
+        super::super::observation_scheduler::validate_work_observations(
+            &observation_journal,
+            observed_work
+        )
+    );
+    save(&coordinator.shared, observation_journal).unwrap();
+    assert_eq!(
+        coordinator.verify_provider("owner", &verification(&observed_request))["status"],
+        "succeeded"
+    );
+    assert_eq!(
+        coordinator.verify_provider("foreign", &verification(&observed_request))["status"],
+        "rejected"
+    );
+    let mut forged_observation = observed_request.clone();
+    forged_observation["provider_sequence"] = json!(10);
+    assert_eq!(
+        coordinator.verify_provider("owner", &verification(&forged_observation))["status"],
+        "rejected"
+    );
+    save(&coordinator.shared, original.clone()).unwrap();
     let mut root_request = plan_request.clone();
     root_request["dependency_inputs"] = json!([output]);
     let mut tampered = original.clone();
