@@ -5,7 +5,7 @@ HDR10 on the owned Linux virtual-output path. Native modules are trusted code.
 The shell does not perform capture, colour conversion or HDR policy.
 
 The driver publishes colour state and a copied HDR metadata blob with the same
-completed presentation as the exported framebuffer. Helper protocol 3 requests
+completed presentation as the exported framebuffer. Helper protocol 4 requests
 `GET_FRAME_COLOR` with a read guard. Capture copies RGB10 into private GPU storage,
 waits for the copy, destroys the source import and releases the source guard.
 The encoder retains the private snapshot, so queued encoding does not hold the
@@ -43,3 +43,11 @@ driver identity, frame-lease diagnostics, full decode, metadata propagation and
 cleanup. Client display playback and content accuracy need a client test. This
 path does not implement scRGB/FP16 conversion, HDR-to-SDR tone mapping, other GPU
 encoder backends, or safety for arbitrarily retained direct scanout imports.
+
+The guarded helper keeps the driver read-guard descriptors separate from the
+original GPU-exported DMA-BUFs. NVIDIA must import its native allocation rather
+than a proxy DMA-BUF. The helper matches the native export to the guarded
+presentation; a changed sequence or layout is retried. Both descriptor sets
+remain owned until the GPU snapshot completes. Protocol 4 requires updating
+the helper and capture plugin together; the already installed HDR driver works
+with this path without another reboot.
