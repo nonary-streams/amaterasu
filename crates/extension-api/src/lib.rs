@@ -1063,7 +1063,7 @@ mod tests {
             json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1});
         let schema = json!({"id":"example.schema/1","major":1,"minor":0,"digest":"a".repeat(64)});
         let resource = json!({"provider":"example.owner","resource_id":"resource","incarnation":"instance","revision":4,"execution_domain":"seat","mutation_domain":"domain","mutation_domains":["domain"]});
-        let output = json!({"output_id":"selected","capability":"example.target","schema":schema,"producer":"example.owner","producer_service":"example.owner/2","origin":origin,"resource":resource,"data":{}});
+        let output = json!({"output_id":"selected","capability":"example.target","schema":schema,"producer":"example.owner","producer_service":"example.owner/2","origin":origin,"resource":resource,"domain_observations":[{"domain":"domain","revision":1,"borrowers":{},"complete":true}],"data":{}});
         let mut request: ProviderRequest = serde_json::from_value(json!({"version":1,"provider_sequence":1,"operation":"resource_plan","transition_id":"transition","operation_id":"operation","target":target,"phase":"stream.prepare","settings_revision":"settings","settings":{},"intent":"initial","reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector/1"]},"remaining_ms":5000,"plan_revision":null,"admission_id":null,"approved_plan":null})).unwrap();
         assert!(validate_provider_request(&request).is_ok());
         assert!(

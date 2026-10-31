@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 use crate::{CaptureBinding, LifecycleTarget, MethodRef, ResourceAccess, ResourceRef};
 
@@ -19,6 +20,17 @@ pub struct SchemaRef {
     pub digest: String,
 }
 
+/// Complete observation of one mutation domain at the reported revision.
+/// The coordinator independently verifies its provenance and freshness.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DomainObservation {
+    pub domain: String,
+    pub revision: u64,
+    pub borrowers: BTreeMap<String, u64>,
+    pub complete: bool,
+}
+
 /// A producer's serialized observation, bound to its lifecycle and resource.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +42,10 @@ pub struct ResourceOutput {
     pub producer_service: String,
     pub origin: LifecycleTarget,
     pub resource: ResourceRef,
+    /// Revisions can advance only under an owner-authenticated held permit;
+    /// independently verify each observation before admitting effects.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domain_observations: Vec<DomainObservation>,
     pub data: Value,
 }
 
@@ -227,6 +243,24 @@ pub fn output_in_scope(output: &ResourceOutput, target: &LifecycleTarget) -> boo
 /// Check an output's bounds and identity; it does not validate its schema contents.
 pub fn validate_resource_output(output: &ResourceOutput) -> Result<(), String> {
     validate_schema_ref(&output.schema)?;
+    let resource_domains = domains(&output.resource).ok_or("invalid resource domains")?;
+    let mut observed = std::collections::BTreeSet::new();
+    if output.domain_observations.len() > MAX_COMPOSITION_ITEMS
+        || output.domain_observations.iter().any(|observation| {
+            !crate::valid_opaque_id(&observation.domain)
+                || !observation.complete
+                || observation.revision == 0
+                || observation.borrowers.len() > 128
+                || observation
+                    .borrowers
+                    .iter()
+                    .any(|(id, generation)| !crate::valid_opaque_id(id) || *generation == 0)
+                || !observed.insert(observation.domain.as_str())
+        })
+        || observed != resource_domains
+    {
+        return Err("invalid domain observations".into());
+    }
     if !crate::valid_opaque_id(&output.output_id)
         || !crate::valid_identifier(&output.capability)
         || !crate::valid_identifier(&output.producer)
@@ -448,7 +482,7 @@ mod tests {
         let stream = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":5});
         let resource = json!({"provider":"example.display","resource_id":"output","incarnation":"native","revision":4,"execution_domain":"seat","mutation_domain":"topology","mutation_domains":["topology"]});
         let schema = json!({"id":"example.schema","major":2,"minor":0,"digest":"a".repeat(64)});
-        let output: ResourceOutput = serde_json::from_value(json!({"output_id":"output.1","capability":"example.display","schema":schema,"producer":"example.display","producer_service":"example.display/2","origin":session,"resource":resource,"data":{"width":1920}})).unwrap();
+        let output: ResourceOutput = serde_json::from_value(json!({"output_id":"output.1","capability":"example.display","schema":schema,"producer":"example.display","producer_service":"example.display/2","origin":session,"resource":resource,"domain_observations":[{"domain":"topology","revision":4,"borrowers":{"stream":5},"complete":true}],"data":{"width":1920}})).unwrap();
         let proposal = json!({"proposal_id":"proposal","output_id":"output.1","owner_provider":"example.display","owner_service":"example.display/2","target":stream,"resource":resource,"method":{"service":"example.display/2","method":"configure","interface_major":2,"interface_minor":0,"schema_revision":1},"argument_schema":schema,"arguments":{"width":1920},"access":"exclusive","mutation_domains":["topology"]});
         let request: ResourceControlRequest = serde_json::from_value(json!({"version":2,"transition_id":"transition","operation_id":"operation","provider_sequence":1,"target":stream,"proposal":proposal,"admission_id":"admission","permit_id":"permit","remaining_ms":5000})).unwrap();
         let finalize: ResourceFinalizeRequest = serde_json::from_value(json!({"version":2,"transition_id":"transition","operation_id":"finalize","provider_sequence":2,"target":stream,"output":output,"control_results":[],"admission_id":"admission","permit_id":"permit","remaining_ms":5000})).unwrap();
@@ -589,5 +623,29 @@ mod tests {
             )
             .is_ok()
         );
+    }
+    #[test]
+    fn output_requires_complete_unique_domain_observations() {
+        let (output, _, _) = fixture();
+        assert!(validate_resource_output(&output).is_ok());
+        let mut missing = output.clone();
+        missing.domain_observations.clear();
+        assert!(validate_resource_output(&missing).is_err());
+        let mut incomplete = output.clone();
+        incomplete.domain_observations[0].complete = false;
+        assert!(validate_resource_output(&incomplete).is_err());
+        let mut duplicate = output.clone();
+        duplicate
+            .domain_observations
+            .push(duplicate.domain_observations[0].clone());
+        assert!(validate_resource_output(&duplicate).is_err());
+        let mut stale = output.clone();
+        stale.domain_observations[0]
+            .borrowers
+            .insert("other".into(), 0);
+        assert!(validate_resource_output(&stale).is_err());
+        let mut foreign = output;
+        foreign.domain_observations[0].domain = "foreign".into();
+        assert!(validate_resource_output(&foreign).is_err());
     }
 }
