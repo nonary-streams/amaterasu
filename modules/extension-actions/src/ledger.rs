@@ -5,7 +5,8 @@ use std::collections::{BTreeMap, HashMap};
 
 const MAX_EPOCHS: usize = 64;
 const WINDOW: u64 = 64;
-const MAX_VALUE_BYTES: usize = 12_000;
+const MAX_VALUE_BYTES: usize = 6_000;
+const MAX_RECORD_BYTES: usize = 8_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Principal {
@@ -78,6 +79,9 @@ pub enum Error {
 
 impl Ledger {
     pub fn open(&mut self, principal: Principal) -> Result<String, Error> {
+        if principal.caller.len() > 256 || principal.initiator.len() > 256 {
+            return Err(Error::TooLarge);
+        }
         if self.epochs.len() >= MAX_EPOCHS {
             return Err(Error::Capacity);
         }
@@ -145,17 +149,23 @@ impl Ledger {
         }
         // Reclaim only the contiguous terminal prefix. Missing or live receipts
         // prevent advancing the watermark and therefore cannot be replayed.
-        while sequence > epoch.retired.saturating_add(WINDOW) {
-            let next = epoch.retired + 1;
-            if !epoch
-                .entries
-                .get(&next)
-                .is_some_and(|entry| entry.receipt.state.may_retire())
+        let required_retired = sequence.saturating_sub(WINDOW);
+        if required_retired > epoch.retired {
+            let count = required_retired - epoch.retired;
+            if count > epoch.entries.len() as u64
+                || (epoch.retired + 1..=required_retired).any(|next| {
+                    !epoch
+                        .entries
+                        .get(&next)
+                        .is_some_and(|entry| entry.receipt.state.may_retire())
+                })
             {
                 return Err(Error::SequenceWindow);
             }
-            epoch.entries.remove(&next);
-            epoch.retired = next;
+            for retired in epoch.retired + 1..=required_retired {
+                epoch.entries.remove(&retired);
+            }
+            epoch.retired = required_retired;
         }
         if epoch.entries.len() >= WINDOW as usize {
             return Err(Error::Capacity);
@@ -234,11 +244,6 @@ impl Ledger {
         state: State,
         result: Option<Value>,
     ) -> Result<Receipt, Error> {
-        if result.as_ref().is_some_and(|value| {
-            serde_json::to_vec(value).map_or(true, |bytes| bytes.len() > MAX_VALUE_BYTES)
-        }) {
-            return Err(Error::TooLarge);
-        }
         let entry = self.entry_mut(principal, id, sequence)?;
         let valid = matches!(
             (&entry.receipt.state, &state),
@@ -252,6 +257,28 @@ impl Ledger {
         );
         if !valid {
             return Err(Error::InvalidTransition);
+        }
+        if result.as_ref().is_some_and(|value| {
+            serde_json::to_vec(value).map_or(true, |bytes| bytes.len() > MAX_VALUE_BYTES)
+        }) {
+            if entry.receipt.state == State::Running {
+                entry.receipt.state = State::RecoveryRequired;
+                entry.receipt.result = Some(serde_json::json!({"reason": "result_too_large"}));
+                return Ok(entry.receipt.clone());
+            }
+            return Err(Error::TooLarge);
+        }
+        let combined = serde_json::json!({"request": entry.request, "receipt": {
+            "epoch": id, "sequence": sequence, "state": state,
+            "cancellation_requested": entry.receipt.cancellation_requested, "result": result
+        }});
+        if serde_json::to_vec(&combined).map_or(true, |bytes| bytes.len() > MAX_RECORD_BYTES) {
+            if entry.receipt.state == State::Running {
+                entry.receipt.state = State::RecoveryRequired;
+                entry.receipt.result = Some(serde_json::json!({"reason": "result_too_large"}));
+                return Ok(entry.receipt.clone());
+            }
+            return Err(Error::TooLarge);
         }
         entry.receipt.state = state;
         entry.receipt.result = result;
@@ -509,6 +536,47 @@ mod tests {
         assert_eq!(
             ledger.admit(&owner, &epoch, 1, request(&epoch, 1, json!({}))),
             Err(Error::UnknownEpoch)
+        );
+    }
+    #[test]
+    fn oversized_provider_result_fences_a_running_effect() {
+        let mut ledger = Ledger::default();
+        let owner = principal();
+        let epoch = ledger.open(owner.clone()).unwrap();
+        ledger
+            .admit(&owner, &epoch, 1, request(&epoch, 1, json!({})))
+            .unwrap();
+        ledger
+            .transition(&owner, &epoch, 1, State::Running, None)
+            .unwrap();
+        let receipt = ledger
+            .transition(
+                &owner,
+                &epoch,
+                1,
+                State::Succeeded,
+                Some(json!("x".repeat(7_000))),
+            )
+            .unwrap();
+        assert_eq!(receipt.state, State::RecoveryRequired);
+        assert_eq!(receipt.result, Some(json!({"reason":"result_too_large"})));
+    }
+    #[test]
+    fn rejected_sequence_jump_does_not_expire_receipts() {
+        let mut ledger = Ledger::default();
+        let owner = principal();
+        let epoch = ledger.open(owner.clone()).unwrap();
+        ledger
+            .admit(&owner, &epoch, 1, request(&epoch, 1, json!({})))
+            .unwrap();
+        ledger.cancel(&owner, &epoch, 1).unwrap();
+        assert_eq!(
+            ledger.admit(&owner, &epoch, 66, request(&epoch, 66, json!({}))),
+            Err(Error::SequenceWindow)
+        );
+        assert_eq!(
+            ledger.status(&owner, &epoch, 1).unwrap().state,
+            State::Cancelled
         );
     }
 }
