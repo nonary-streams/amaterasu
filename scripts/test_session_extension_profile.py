@@ -45,6 +45,8 @@ def available_base_port() -> int:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--enable-display-actions", action="store_true",
+                        help="also verify startup with explicit remove-owned action policy")
     parser.add_argument("publisher", type=Path)
     parser.add_argument("host", type=Path)
     parser.add_argument("artifacts", type=Path)
@@ -63,9 +65,19 @@ def main() -> None:
             environment.pop(name, None)
         environment.update(HOME=str(home), XDG_RUNTIME_DIR=str(runtime))
         root, package = directory / "root", directory / "package"
-        run("python3", WORKSPACE / "scripts/prepare_session_extension_profile.py", args.publisher,
-            root, args.artifacts, package, 1, args.provider_repo, args.provider_library,
-            "--", "--lan", f"127.0.0.1:{available_base_port()}", environment=environment)
+        prepare = ["python3", WORKSPACE / "scripts/prepare_session_extension_profile.py"]
+        if args.enable_display_actions:
+            prepare.append("--enable-display-actions")
+        prepare.extend([args.publisher, root, args.artifacts, package, 1, args.provider_repo,
+                        args.provider_library, "--", "--lan", f"127.0.0.1:{available_base_port()}"])
+        run(*prepare, environment=environment)
+        policy = json.loads((root / "bootstrap.json").read_text())["policy"]["settings"]
+        action_ids = policy["amaterasu.session-lifecycle"]["input_actions"]
+        action_grants = policy["amaterasu.extension-actions"]["grants"]
+        if args.enable_display_actions:
+            assert action_ids == ["nonary.display-settings/remove-owned"] and len(action_grants) == 3
+        else:
+            assert action_ids == [] and action_grants == []
         run(args.publisher, "stage", root, package, environment=environment)
 
         def request(payload: dict) -> dict:

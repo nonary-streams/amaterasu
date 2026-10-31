@@ -35,8 +35,8 @@ exact supported `nonary.display-settings/remove-owned` action, passing
 `--enable-display-actions` before the positional arguments authorizes that
 action for session and stream targets through management and input. The
 preparer rejects this flag if the matching descriptor and API methods are absent
-or incompatible. The provider's current published descriptor may still omit
-the action; source and hardware qualification remain separate.
+or incompatible. Provider revisions without that descriptor remain unavailable for this opt-in;
+source and hardware qualification remain separate.
 The command never stages,
 activates, installs, starts, or restarts the host, and it does not change desktop
 or network configuration. Both root and package paths must be new.
@@ -52,7 +52,26 @@ python3 scripts/test_session_extension_profile.py \
 
 This starts a temporary worker with loopback listeners and capture, input, and
 display effects disabled. It checks registry discovery and host settings
-persistence, then removes its temporary root.
+persistence, then removes its temporary root. Add `--enable-display-actions`
+before the positional arguments to test startup with the explicit action policy;
+the test does not invoke the action.
+
+To prepare a candidate that can request an owned virtual output and capture it,
+pass `-- --enable-capture --enable-virtual-display` after the provider library
+path. Add `--enable-input` only when input delivery is wanted. After reviewing
+and staging the signed set in a development root, explicitly set the display
+extension's `enabled` option to `true` through the extension settings UI or
+registry API before starting a session. The default `enabled: false` setting
+provides no virtual-display capture candidate. The current lifecycle binding
+requires a KDE/KWin PipeWire SDR output; these options do not establish that a
+particular desktop or GPU supports it.
+
+To authorize remove-owned actions as well, add `--enable-display-actions` before
+the preparer's positional arguments. Choose a keybinding in the extension UI
+if shortcut invocation is desired; no shortcut is installed by this profile.
+The action grant alone does not prove a live session can safely release its
+output. Qualification of the exact host, provider, client, and recovery path is
+still required before relying on it.
 
 The new Linux root starts with no explicit legacy display policy or virtual
 output list; those defaults resolve to disabled. If configuring product settings,
@@ -75,7 +94,7 @@ virtual-screen capture options are rejected by the preparer.
 This profile is an integration candidate. A verified signature and successful
 startup do not prove end-to-end session lifecycle, action execution, live capture,
 platform display changes, or recovery. The current display provider starts with
-effects disabled and its action list empty. This profile requests registry-backed
+effects disabled and action authorization disabled by default. This profile requests registry-backed
 settings snapshots for sessions; saved-settings propagation and host startup
 with the final integrated binaries still need end-to-end qualification. Run the
 signed integration fixture and validate the relevant operating-system and hardware scenario before relying
