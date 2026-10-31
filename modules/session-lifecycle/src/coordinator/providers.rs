@@ -2560,6 +2560,12 @@ impl Coordinator {
                 work.phase,
                 LifecyclePhase::SessionPrepare | LifecyclePhase::StreamPrepare
             )
+            // A reprepare is a new resource incarnation inside an existing
+            // retained session. Ordinary failed-start cleanup ends that session
+            // and can release its application. Until the new incarnation has
+            // generation-scoped cleanup proof, retain its exact Work and fence
+            // the session for recovery instead.
+            && work.reprepare.is_none()
         {
             let uncertain = work.states.values().any(|state| {
                 !matches!(state.phase, PreparePhase::Prepared | PreparePhase::Rejected)
@@ -2705,6 +2711,88 @@ impl Coordinator {
 #[cfg(test)]
 mod admission_target_tests {
     use super::*;
+
+    #[test]
+    fn failed_or_unknown_reprepare_preserves_session_and_generation_for_recovery() {
+        for phase in ["rejected", "recovery_required"] {
+            let dir =
+                std::env::temp_dir().join(format!("reprepare-failure-{}", identifier().unwrap()));
+            std::fs::create_dir(&dir).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let mut coordinator = Coordinator::open(&dir.join("journal.json")).unwrap();
+            let mut journal = coordinator.shared.borrow().value.clone();
+            let epoch = journal.host_epoch.clone();
+            let mut retained = session("session");
+            retained.host_epoch = epoch.clone();
+            retained.phase = SessionPhase::Preparing;
+            retained.application_ref = json!({"retained":"application"});
+            retained.resource_generations.insert("owner".into(), 2);
+            journal.sessions.insert("session".into(), retained);
+            let target = LifecycleTarget::Session {
+                host_epoch: epoch.clone(),
+                session_id: "session".into(),
+                generation: 1,
+            };
+            let child_target = LifecycleTarget::Stream {
+                host_epoch: epoch,
+                session_id: "session".into(),
+                stream_id: "new-stream".into(),
+                generation: 1,
+            };
+            let child: Work = serde_json::from_value(json!({"phase":"stream.prepare","target":child_target,"intent":null,"reason":null,"video":null,"transition_id":"child-transition","providers":["owner"],"index":0,"states":{},"candidate":null,"waiting_retirement":false})).unwrap();
+            let mut work: Work = serde_json::from_value(json!({"phase":"session.prepare","target":target,"intent":null,"reason":null,"video":null,"transition_id":"transition","providers":["owner"],"index":0,"states":{},"candidate":null,"waiting_retirement":false})).unwrap();
+            work.reprepare = Some(ReprepareContinuation {
+                owner: "owner".into(),
+                old_generation: 1,
+                old_incarnation: "old-native".into(),
+                next: Box::new(child),
+            });
+            let method = json!({"service":"owner/2","method":"callback","interface_major":2,"interface_minor":1,"schema_revision":1});
+            let participant = json!({"provider":"owner","depends_on":[],"plan_method":method,"callback_method":method,"status_method":method,"capabilities":[],"cleanup_methods":[],"settings_revision":"revision","settings":{}});
+            let request = json!({"provider_sequence":1,"operation":"lifecycle_callback","version":2,"transition_id":work.transition_id,"operation_id":"callback","target":work.target,"phase":"session.prepare","settings_revision":"revision","settings":{},"intent":null,"reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector/1"]},"remaining_ms":1000,"plan_revision":null,"admission_id":null,"approved_plan":null,"resource_generation":2});
+            let state: PrepareState = serde_json::from_value(json!({"provider":"owner","participant":participant,"request":request,"phase":phase,"plan":null,"admission_id":null,"pending_receipt":null,"status_polls":0,"last_sequence":1,"dispatch":null,"terminal_dispatch":null,"response":null})).unwrap();
+            work.states.insert("owner".into(), state);
+            let frozen_work = serde_json::to_value(&work).unwrap();
+            journal.receipts.insert(
+                "receipt".into(),
+                Receipt {
+                    caller: "caller".into(),
+                    initiator: "owner".into(),
+                    request: json!({}),
+                    response: json!({"status":"pending"}),
+                    work: Some(work),
+                    wait_target: None,
+                },
+            );
+            save(&coordinator.shared, journal).unwrap();
+            coordinator
+                .fail_work("receipt", "provider_outcome_unknown")
+                .unwrap();
+            let shared = coordinator.shared.borrow();
+            let saved = &shared.value;
+            let session = &saved.sessions["session"];
+            assert!(session.phase == SessionPhase::RecoveryRequired);
+            assert_eq!(session.application_ref, json!({"retained":"application"}));
+            assert!(!session.application_retired);
+            assert_eq!(session.resource_generations["owner"], 2);
+            let receipt = &saved.receipts["receipt"];
+            assert_eq!(receipt.response["status"], "recovery_required");
+            assert_eq!(
+                serde_json::to_value(receipt.work.as_ref().unwrap()).unwrap(),
+                frozen_work
+            );
+            drop(shared);
+            coordinator
+                .advance_work(&mut |_| panic!("reprepare recovery must not dispatch cleanup"))
+                .unwrap();
+            drop(coordinator);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
 
     #[test]
     fn action_cleanup_never_replans_while_retirement_or_callbacks_are_incomplete() {
