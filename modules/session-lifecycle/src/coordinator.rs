@@ -326,6 +326,7 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                         && !journal.authority.settled.contains_key(id))
             })
         || !journal.composition.validate_structure()
+        || !composition::validate_finalize_selections(journal)
         || journal.composition.records().any(|record| {
             let target = &record.output.origin;
             let session_id = match target {

@@ -4,6 +4,7 @@
 //! obligations before exposing outputs or dispatching dependent calls. Installed
 //! schema validation and active-resource reobservation are external prerequisites;
 //! this module never treats serialized provider data as authorization.
+use super::finalize_selection::FinalizeSelectionSnapshot;
 use crate::adapter::SchemaDocument;
 use crate::prepare_authority::{Admission, ControlPermit};
 use crate::prepare_authority::{ControlPolicy, FinalizePolicy, MethodApproval};
@@ -63,7 +64,6 @@ pub struct CompositionSelectionSnapshot {
     pub control_approval: MethodApproval,
     pub control_status_approval: MethodApproval,
     pub settlement_approval: MethodApproval,
-    pub settlement_status_approval: MethodApproval,
     pub finalize_approval: MethodApproval,
     pub finalize_status_approval: MethodApproval,
     pub schema_documents: Vec<SchemaDocument>,
@@ -107,11 +107,6 @@ impl CompositionSelectionSnapshot {
                 &self.settlement_approval,
                 &policy.owner_provider,
                 &policy.settlement_method,
-            )
-            || !approval_matches(
-                &self.settlement_status_approval,
-                &policy.owner_provider,
-                &policy.settlement_status_method,
             )
             || !approval_matches(
                 &self.finalize_status_approval,
@@ -175,6 +170,8 @@ pub struct CompositionBook {
     #[serde(default)]
     selections: Vec<CompositionSelectionSnapshot>,
     #[serde(default)]
+    finalize_selections: Vec<FinalizeSelectionSnapshot>,
+    #[serde(default)]
     refinements: Vec<ObligationRefinement>,
 }
 
@@ -199,6 +196,7 @@ impl CompositionBook {
     pub fn validate_structure(&self) -> bool {
         self.outputs.len() <= MAX_OUTPUTS
             && self.selections.len() <= MAX_OUTPUTS
+            && self.finalize_selections.len() <= MAX_OUTPUTS
             && self.refinements.len() <= MAX_OUTPUTS
             && self.outputs.iter().enumerate().all(|(index, item)| {
                 valid_stored(item)
@@ -215,6 +213,16 @@ impl CompositionBook {
                         && !self.selections[..index]
                             .iter()
                             .any(|old| same_selection(old, selection))
+                })
+            && self
+                .finalize_selections
+                .iter()
+                .enumerate()
+                .all(|(index, selection)| {
+                    selection.validate_structure()
+                        && !self.finalize_selections[..index]
+                            .iter()
+                            .any(|old| same_finalize_selection(old, selection))
                 })
             && self.refinements.iter().enumerate().all(|(index, item)| {
                 valid_refinement_shape(item)
@@ -235,6 +243,10 @@ impl CompositionBook {
             .any(|item| item.admission_id == admission_id)
             || self
                 .selections
+                .iter()
+                .any(|selection| selection.input.admission_id == admission_id)
+            || self
+                .finalize_selections
                 .iter()
                 .any(|selection| selection.input.admission_id == admission_id)
             || self
@@ -306,6 +318,60 @@ impl CompositionBook {
 
     pub fn selections(&self) -> impl Iterator<Item = &CompositionSelectionSnapshot> {
         self.selections.iter()
+    }
+
+    pub fn finalize_selections(&self) -> impl Iterator<Item = &FinalizeSelectionSnapshot> {
+        self.finalize_selections.iter()
+    }
+
+    /// The verifier must compare this snapshot to installed policy, exact broker
+    /// approvals, current resource observation and canonical parent generation.
+    pub fn record_finalize_selection(
+        &mut self,
+        selection: FinalizeSelectionSnapshot,
+        verify_installed: &impl Fn(&FinalizeSelectionSnapshot) -> bool,
+    ) -> Result<(), &'static str> {
+        if !selection.validate_structure()
+            || !verify_installed(&selection)
+            || self.get(
+                &selection.input.output.producer,
+                &selection.input.output.output_id,
+                &selection.input.output.origin,
+            ) != Some(&selection.input)
+        {
+            return Err("invalid_finalize_selection");
+        }
+        if let Some(old) = self
+            .finalize_selections
+            .iter()
+            .find(|old| same_finalize_selection(old, &selection))
+        {
+            return if old == &selection {
+                Ok(())
+            } else {
+                Err("finalize_selection_conflict")
+            };
+        }
+        if self.finalize_selections.len() >= MAX_OUTPUTS {
+            return Err("finalize_selection_capacity");
+        }
+        self.finalize_selections.push(selection);
+        Ok(())
+    }
+
+    pub fn finalize_selection(
+        &self,
+        target: &LifecycleTarget,
+        transition_id: &str,
+        owner: &str,
+        output_id: &str,
+    ) -> Option<&FinalizeSelectionSnapshot> {
+        self.finalize_selections.iter().find(|item| {
+            &item.target == target
+                && item.transition_id == transition_id
+                && item.input.output.producer == owner
+                && item.input.output.output_id == output_id
+        })
     }
 
     /// The verifier must resolve policy, graph edges, all method approvals and
@@ -526,6 +592,73 @@ fn same_selection(a: &CompositionSelectionSnapshot, b: &CompositionSelectionSnap
         && a.transition_id == b.transition_id
         && a.control_policy.dependent_provider == b.control_policy.dependent_provider
         && same_key(&a.input.output, &b.input.output)
+}
+fn same_finalize_selection(a: &FinalizeSelectionSnapshot, b: &FinalizeSelectionSnapshot) -> bool {
+    a.target == b.target
+        && a.transition_id == b.transition_id
+        && same_key(&a.input.output, &b.input.output)
+}
+
+/// On recovery, structural self-consistency is insufficient: reconnect every
+/// frozen finalization to the canonical target, transition and producer record.
+pub(super) fn validate_finalize_selections(journal: &super::Journal) -> bool {
+    journal.composition.finalize_selections().all(|selection| {
+        let Ok((epoch, session_id, stream_id, generation)) =
+            super::operations::target_parts(&selection.target)
+        else {
+            return false;
+        };
+        let Some(session) = journal.sessions.get(session_id) else {
+            return false;
+        };
+        if session.host_epoch != epoch {
+            return false;
+        }
+        match stream_id {
+            Some(id)
+                if session
+                    .streams
+                    .get(id)
+                    .is_some_and(|stream| stream.generation == generation)
+                    && selection.parent_generation == Some(session.generation) => {}
+            None if session.generation == generation && selection.parent_generation.is_none() => {}
+            _ => return false,
+        }
+        if let LifecycleTarget::Session {
+            generation: origin_generation,
+            ..
+        } = &selection.input.output.origin
+            && *origin_generation != session.generation
+        {
+            return false;
+        }
+        let output = &selection.input.output;
+        let Some(canonical) = journal
+            .composition
+            .records()
+            .find(|item| same_key(&item.output, output))
+        else {
+            return false;
+        };
+        if canonical.output != *output
+            || canonical.admission_id != selection.input.admission_id
+            || canonical.transition_id != selection.input.transition_id
+            || canonical.plan != selection.input.plan
+        {
+            return false;
+        }
+        journal.receipts.values().any(|receipt| {
+            receipt.work.as_ref().is_some_and(|work| {
+                work.target == selection.target && work.transition_id == selection.transition_id
+            }) || (receipt.response["transition_id"].as_str() == Some(&selection.transition_id)
+                && receipt
+                    .response
+                    .get("target")
+                    .and_then(|value| serde_json::from_value::<LifecycleTarget>(value.clone()).ok())
+                    .as_ref()
+                    == Some(&selection.target))
+        })
+    })
 }
 
 /// Collect only an authenticated driver's completed v2 callback. The caller
@@ -904,18 +1037,26 @@ mod tests {
         use sha2::{Digest, Sha256};
         let document = r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","$id":"screen/2","type":"object"}"#;
         let mut stored = record();
+        let mut materialized = serde_json::to_value(&stored).unwrap();
+        materialized["output"]["resource"]["mutation_domain"] = json!("topology");
+        materialized["output"]["resource"]["mutation_domains"] = json!(["topology"]);
+        materialized["output"]["domain_observations"] =
+            json!([{"domain":"topology","revision":1,"borrowers":{},"complete":true}]);
+        materialized["plan"]["resources"][0]["mutation_domains"] = json!(["topology"]);
+        materialized["plan"]["mutation_domains"] = json!([{"domain":"topology","expected_revision":1,"borrowers":{},"access":"exclusive"}]);
+        stored = serde_json::from_value(materialized).unwrap();
         stored.output.schema.digest = format!("{:x}", Sha256::digest(document.as_bytes()));
         let schema = stored.output.schema.clone();
-        let method = json!({"service":"screen/2","method":"control","interface_major":1,"interface_minor":0,"schema_revision":1});
-        let status = json!({"service":"screen/2","method":"status","interface_major":1,"interface_minor":0,"schema_revision":1});
+        let method = json!({"service":"screen/2","method":"control","interface_major":2,"interface_minor":0,"schema_revision":1});
+        let status = json!({"service":"screen/2","method":"status","interface_major":2,"interface_minor":0,"schema_revision":1});
         let approval = |m: &Value| {
             serde_json::from_value::<MethodApproval>(
                 json!({"method":m,"broker_approval":{"provider":"screen","method":m}}),
             )
             .unwrap()
         };
-        let policy: ControlPolicy = serde_json::from_value(json!({"dependent_provider":"settings","owner_provider":"screen","owner_service":"screen/2","owner_method":method,"status_method":status,"settlement_method":method,"settlement_status_method":status,"argument_schema":schema,"output_capability":"screen","output_schema":schema,"max_access":"exclusive","mutation_domains":[]})).unwrap();
-        let finalize: FinalizePolicy = serde_json::from_value(json!({"owner_provider":"screen","owner_service":"screen/2","method":method,"status_method":status,"output_capability":"screen","output_schema":schema,"capture_provider":"capture","selector_schema":"selector/1","required_access":"exclusive","mutation_domains":[]})).unwrap();
+        let policy: ControlPolicy = serde_json::from_value(json!({"dependent_provider":"settings","owner_provider":"screen","owner_service":"screen/2","owner_method":method,"status_method":status,"settlement_method":method,"argument_schema":schema,"output_capability":"screen","output_schema":schema,"max_access":"exclusive","mutation_domains":[]})).unwrap();
+        let finalize: FinalizePolicy = serde_json::from_value(json!({"owner_provider":"screen","owner_service":"screen/2","method":method,"status_method":status,"output_capability":"screen","output_schema":schema,"capture_provider":"capture","selector_schema":"selector/1","required_access":"exclusive","mutation_domains":["topology"]})).unwrap();
         let snapshot = CompositionSelectionSnapshot {
             target: target(),
             transition_id: "consumer-transition".into(),
@@ -925,7 +1066,6 @@ mod tests {
             control_approval: approval(&method),
             control_status_approval: approval(&status),
             settlement_approval: approval(&method),
-            settlement_status_approval: approval(&status),
             finalize_approval: approval(&method),
             finalize_status_approval: approval(&status),
             schema_documents: vec![SchemaDocument {
@@ -953,6 +1093,30 @@ mod tests {
         };
         book.record(stored, &selected, &target(), &|_| true)
             .unwrap();
+        let finalize = FinalizeSelectionSnapshot {
+            target: target(),
+            parent_generation: None,
+            transition_id: "finalize-transition".into(),
+            input: snapshot.input.clone(),
+            policy: snapshot.finalize_policy.clone(),
+            finalize_approval: snapshot.finalize_approval.clone(),
+            finalize_status_approval: snapshot.finalize_status_approval.clone(),
+            schema_documents: snapshot.schema_documents.clone(),
+        };
+        assert!(finalize.validate_structure());
+        assert!(
+            book.record_finalize_selection(finalize.clone(), &|_| false)
+                .is_err()
+        );
+        book.record_finalize_selection(finalize.clone(), &|_| true)
+            .unwrap();
+        assert_eq!(
+            book.finalize_selection(&target(), "finalize-transition", "screen", "output"),
+            Some(&finalize)
+        );
+        let mut tampered = finalize;
+        tampered.input.output.resource.incarnation = "foreign".into();
+        assert!(book.record_finalize_selection(tampered, &|_| true).is_err());
         assert!(book.record_selection(snapshot.clone(), &|_| false).is_err());
         book.record_selection(snapshot.clone(), &|_| true).unwrap();
         let mut forged = snapshot;
