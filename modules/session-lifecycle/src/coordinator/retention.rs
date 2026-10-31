@@ -818,6 +818,7 @@ mod tests {
         insert_ended(&mut journal, 1, "failed");
         insert_ended(&mut journal, 2, "deferred_restoration");
         let binding = ActiveBinding {
+            source_id: None,
             host_epoch: "epoch".into(),
             session_id: "session-0".into(),
             stream_id: "stream".into(),

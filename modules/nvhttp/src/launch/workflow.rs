@@ -326,18 +326,20 @@ impl Controller {
             Phase::ReadLaunchEpoch => (LAUNCH_SERVICE, json!({"action":"operation_epoch"}), 5_000),
             Phase::PrepareLifecycle => {
                 record.lifecycle_prepare_dispatched = true;
-                (
-                    SESSION_LIFECYCLE_SERVICE,
-                    json!({"operation":"prepare",
-                        "operation_id":format!("{}-lifecycle", record.application_operation),
-                        "application_ref":{"kind":if record.desktop {"desktop"} else {"application"},"app_id":app_id(record.request.app_id)},
-                        "application_operation_id":record.application_operation,
-                        "owner":{"kind":"paired_client","client_ref":record.peer.client_id},
-                        "settings_revision":record.global_display_revision.expect("validated revision").to_string(),
-                        "requested_video":{"width":record.request.width,"height":record.request.height,
-                            "refresh_millihz":record.request.fps * 1000,"hdr":record.request.hdr}}),
-                    5_000,
-                )
+                let mut payload = json!({"operation":"prepare",
+                    "operation_id":format!("{}-lifecycle", record.application_operation),
+                    "application_ref":{"kind":if record.desktop {"desktop"} else {"application"},"app_id":app_id(record.request.app_id)},
+                    "application_operation_id":record.application_operation,
+                    "owner":{"kind":"paired_client","client_ref":record.peer.client_id},
+                    "settings_revision":record.global_display_revision.expect("validated revision").to_string(),
+                    "requested_video":{"width":record.request.width,"height":record.request.height,
+                        "refresh_millihz":record.request.fps * 1000,"hdr":record.request.hdr}});
+                // `paired()` is established from the TLS certificate and the
+                // committed pairing lookup, never from the client query.
+                if record.peer.paired() {
+                    payload["source_attestation"] = json!({"version":1,"kind":"paired_tls"});
+                }
+                (SESSION_LIFECYCLE_SERVICE, payload, 5_000)
             }
             Phase::LookupLifecycle => (
                 SESSION_LIFECYCLE_SERVICE,

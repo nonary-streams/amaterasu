@@ -2851,6 +2851,7 @@ mod admission_target_tests {
 
     fn session(id: &str) -> SessionRecord {
         SessionRecord {
+            paired_source_attested: false,
             provider_graph: None,
             host_epoch: "epoch".into(),
             id: id.into(),

@@ -234,6 +234,20 @@ impl Coordinator {
         let mut wait_target = None;
         let mut response;
         if operation == "prepare" {
+            // Only the direct, trusted NVHTTP component may attest the paired
+            // TLS source that it already authenticated for this session. The
+            // request carries no client-selected identity or credential.
+            let paired_source_attested = match payload.get("source_attestation") {
+                None => false,
+                Some(value)
+                    if caller == "amaterasu.nvhttp"
+                        && initiator == caller
+                        && *value == json!({"version":1,"kind":"paired_tls"}) =>
+                {
+                    true
+                }
+                Some(_) => return Err("invalid_source_attestation".into()),
+            };
             let application_operation_id = payload
                 .get("application_operation_id")
                 .map(|value| {
@@ -262,6 +276,7 @@ impl Coordinator {
             next.sessions.insert(
                 id.clone(),
                 SessionRecord {
+                    paired_source_attested,
                     provider_graph: current.provider_graph.clone(),
                     host_epoch: next.host_epoch.clone(),
                     id,

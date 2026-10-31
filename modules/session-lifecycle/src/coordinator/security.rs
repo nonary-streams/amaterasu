@@ -1017,6 +1017,20 @@ impl Coordinator {
                 None => return Err("input_consumer_ambiguous".into()),
             };
             let active = ActiveBinding {
+                source_id: if session.paired_source_attested {
+                    let source_id = identifier()?;
+                    if next.input_bindings.contains_key(&source_id)
+                        || next
+                            .input_bindings
+                            .values()
+                            .any(|binding| binding.source_id.as_deref() == Some(source_id.as_str()))
+                    {
+                        return Err("source_identifier_collision".into());
+                    }
+                    Some(source_id)
+                } else {
+                    None
+                },
                 host_epoch: session.host_epoch.clone(),
                 session_id: session.id.clone(),
                 stream_id,
@@ -1070,10 +1084,32 @@ impl Coordinator {
             return Err("stale_input_binding".into());
         }
         if operation == "validate_input_binding" {
+            let include_source = match payload.get("source_version") {
+                None => false,
+                Some(version) if version.as_u64() == Some(1) => true,
+                Some(_) => return Err("unsupported_source_version".into()),
+            };
+            // A parented request must retain the session owner's initiator.
+            // The selected input service may also revalidate its own retained
+            // binding after the original request has ended.
+            if include_source && initiator != session.owner.initiator && initiator != caller {
+                return Err("source_initiator_denied".into());
+            }
             next.inputs
                 .validate_input_binding(caller, token, &binding)
                 .map_err(|_| "permission_denied")?;
-            let response = json!({"status":"succeeded","active":stream.phase==StreamPhase::Active,"target":target_for(&binding),"action_target":{"kind":"session","host_epoch":session.host_epoch,"session_id":session.id,"expected_generation":session.generation},"context":"active","application":session.application_ref["app_id"],"paired_client":null,"geometry_revision":binding.geometry_revision,"batch_epoch":format!("{}.{}.{}",binding.host_epoch,binding.stream_id,binding.generation),"allowed_actions":binding.allowed_actions});
+            let source = if session.paired_source_attested
+                && matches!(session.phase, SessionPhase::Ready | SessionPhase::Paused)
+                && stream.phase == StreamPhase::Active
+            {
+                binding
+                    .source_id
+                    .as_ref()
+                    .map(|id| json!({"version":1,"id":id,"generation":binding.generation}))
+            } else {
+                None
+            };
+            let mut response = json!({"status":"succeeded","active":stream.phase==StreamPhase::Active,"target":target_for(&binding),"action_target":{"kind":"session","host_epoch":session.host_epoch,"session_id":session.id,"expected_generation":session.generation},"context":"active","application":session.application_ref["app_id"],"paired_client":null,"geometry_revision":binding.geometry_revision,"batch_epoch":format!("{}.{}.{}",binding.host_epoch,binding.stream_id,binding.generation),"allowed_actions":binding.allowed_actions});
             let boot_epoch = payload["input_boot_epoch"]
                 .as_str()
                 .filter(|epoch| valid_id(epoch))
@@ -1087,6 +1123,9 @@ impl Coordinator {
                 next.input_boot_epochs
                     .insert(token.into(), boot_epoch.into());
                 save(&self.shared, next)?;
+            }
+            if include_source {
+                response["source"] = json!(source);
             }
             return Ok(response);
         }

@@ -23,6 +23,9 @@ const MAX_TEXT: usize = 128;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActiveBinding {
+    /// Random, non-bearer source handle bound to this exact input binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
     pub host_epoch: String,
     pub session_id: String,
     pub stream_id: String,
@@ -71,6 +74,7 @@ impl ActiveBinding {
         .all(|s| valid_text(s))
             && self.generation > 0
             && self.geometry_revision > 0
+            && self.source_id.as_deref().is_none_or(valid_token)
             && self.allowed_actions.len() <= MAX_ACTIONS
             && self.allowed_actions.iter().all(|s| valid_text(s))
     }
@@ -200,6 +204,11 @@ impl InputAuthority {
         }
         let token = unique_id(|id| {
             self.bindings.contains_key(id)
+                || active.source_id.as_deref() == Some(id)
+                || self
+                    .bindings
+                    .values()
+                    .any(|binding| binding.source_id.as_deref() == Some(id))
                 || self
                     .reservations
                     .values()
@@ -668,6 +677,7 @@ mod tests {
     use super::*;
     fn binding() -> ActiveBinding {
         ActiveBinding {
+            source_id: None,
             host_epoch: "host".into(),
             session_id: "session".into(),
             stream_id: "stream".into(),

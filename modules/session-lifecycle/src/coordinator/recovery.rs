@@ -198,6 +198,7 @@ mod tests {
             recovery_authorized_epoch: None,
         };
         let session = SessionRecord {
+            paired_source_attested: false,
             provider_graph: None,
             host_epoch: "old".into(),
             id: "session".into(),
