@@ -696,6 +696,7 @@ impl Coordinator {
                     | "begin_action_transition"
                     | "consume_input_reservation"
                     | "cancel_input_reservation"
+                    | "inspect_action_effect"
                     | "verify_action_effect"
                     | "check_action_effect"
             )

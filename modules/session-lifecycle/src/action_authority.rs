@@ -740,6 +740,37 @@ impl ActionAuthority {
         Ok(())
     }
 
+    /// Inspect the exact running execution before a provider advances its own
+    /// durable effect floor. The coordinator also rechecks current rights.
+    pub fn inspect_effect(
+        &self,
+        provider_caller: &str,
+        token: &str,
+        binding: &ActionBinding,
+        method: &amaterasu_extension_api::MethodRef,
+    ) -> Result<(), AuthorityError> {
+        self.validate()?;
+        let item = self
+            .reservations
+            .get(&key(binding))
+            .ok_or(AuthorityError::NotAuthorized)?;
+        let execution = item
+            .execution
+            .as_ref()
+            .ok_or(AuthorityError::NotAuthorized)?;
+        if item.permit_token != token
+            || item.binding != *binding
+            || !item.transition_ready
+            || !matches!(item.state, ReservationState::Running)
+            || execution.provider != provider_caller
+            || &execution.method != method
+            || execution.claimed
+        {
+            return Err(AuthorityError::NotAuthorized);
+        }
+        Ok(())
+    }
+
     /// A fresh, one-use gap guard for the already-claimed execute operation.
     /// Caller must also recheck the durable domain admission and quiescence.
     pub fn check_effect(
@@ -1250,6 +1281,11 @@ mod tests {
             .unwrap();
         assert!(
             authority
+                .inspect_effect("display", &token, &binding, &method)
+                .is_err()
+        );
+        assert!(
+            authority
                 .claim_effect("display", &token, &binding, &method)
                 .is_err()
         );
@@ -1259,6 +1295,28 @@ mod tests {
         authority
             .mark_transition_ready("action-service", &token, &binding, "transition")
             .unwrap();
+        assert!(
+            authority
+                .inspect_effect("display", &token, &binding, &method)
+                .is_ok()
+        );
+        assert!(
+            authority
+                .inspect_effect("display", &token, &binding, &method)
+                .is_ok()
+        );
+        assert!(
+            authority
+                .inspect_effect("other", &token, &binding, &method)
+                .is_err()
+        );
+        let mut wrong_method = method.clone();
+        wrong_method.method = "other".into();
+        assert!(
+            authority
+                .inspect_effect("display", &token, &binding, &wrong_method)
+                .is_err()
+        );
         assert!(
             authority
                 .claim_effect("other", &token, &binding, &method)
@@ -1272,6 +1330,11 @@ mod tests {
             authority
                 .claim_effect("display", &token, &binding, &method)
                 .is_ok()
+        );
+        assert!(
+            authority
+                .inspect_effect("display", &token, &binding, &method)
+                .is_err()
         );
         assert!(
             authority

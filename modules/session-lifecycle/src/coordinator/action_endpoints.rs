@@ -104,7 +104,10 @@ impl Coordinator {
         payload: &Value,
     ) -> Value {
         let operation = payload["operation"].as_str().unwrap_or("");
-        if operation == "verify_action_effect" || operation == "check_action_effect" {
+        if matches!(
+            operation,
+            "inspect_action_effect" | "verify_action_effect" | "check_action_effect"
+        ) {
             let mut journal = self.shared.borrow().value.clone();
             let Some(token) = payload["permit"].as_str() else {
                 return rejection("invalid_permit");
@@ -122,6 +125,16 @@ impl Coordinator {
             };
             if !effect_rights_current(&journal, &self.settings.action_service, token, &binding) {
                 return rejection("action_effect_not_authorized");
+            }
+            if operation == "inspect_action_effect" {
+                if journal
+                    .actions
+                    .inspect_effect(caller, token, &binding, &method)
+                    .is_err()
+                {
+                    return rejection("action_effect_not_authorized");
+                }
+                return json!({"status":"succeeded", "operation_id":binding.operation_id, "action_id":binding.action_id, "target":binding.target, "plan_digest":binding.plan_digest, "provider":caller, "execute_method":method});
             }
             let claim = if operation == "verify_action_effect" {
                 journal
