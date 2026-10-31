@@ -150,7 +150,7 @@ fn apply_participant(
     }
     if matches!(
         &state.response,
-        Some(ProviderResponse::Cleanup { outcomes }) if outcomes.iter().any(|outcome|
+        Some(ProviderResponse::Cleanup { outcomes, .. }) if outcomes.iter().any(|outcome|
             outcome.state == amaterasu_extension_api::CleanupState::DeferredRestoration)
     ) {
         // Runtime retirement is complete, but restoration still depends on
@@ -1032,7 +1032,7 @@ impl Coordinator {
                     continue;
                 }
                 let fully_released = match &state.response {
-                    Some(ProviderResponse::Cleanup { outcomes }) => outcomes
+                    Some(ProviderResponse::Cleanup { outcomes, .. }) => outcomes
                         .iter()
                         .all(|o| o.state == amaterasu_extension_api::CleanupState::Released),
                     _ => true,
@@ -1072,7 +1072,7 @@ impl Coordinator {
                     authority.finish_admission_with_resource(provider, admission, resource)?;
                 }
                 let mut composition_cleanup_blocked = false;
-                if let Some(ProviderResponse::Cleanup { outcomes }) = &state.response {
+                if let Some(ProviderResponse::Cleanup { outcomes, .. }) = &state.response {
                     let settled = self.shared.borrow().value.authority.settled.clone();
                     let owned = {
                         let (_, session_id, _, _) = super::operations::target_parts(&work.target)?;
@@ -1384,7 +1384,7 @@ impl Coordinator {
                     .map(|binding| binding.plan_revision)
             );
         }
-        let deferred=work.states.values().any(|state|matches!(&state.response,Some(ProviderResponse::Cleanup{outcomes}) if outcomes.iter().any(|o|o.state==amaterasu_extension_api::CleanupState::DeferredRestoration)));
+        let deferred=work.states.values().any(|state|matches!(&state.response,Some(ProviderResponse::Cleanup{outcomes,..}) if outcomes.iter().any(|o|o.state==amaterasu_extension_api::CleanupState::DeferredRestoration)));
         match work.phase {
             LifecyclePhase::SessionPrepare => {
                 if session.phase == SessionPhase::Preparing {

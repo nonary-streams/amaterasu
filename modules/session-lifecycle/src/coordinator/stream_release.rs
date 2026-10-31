@@ -118,7 +118,7 @@ fn validate_proof(journal: &Journal, proof: &StreamReleaseProof) -> bool {
     let Ok(response) = serde_json::from_value::<ProviderResponse>(payload.clone()) else {
         return false;
     };
-    let ProviderResponse::Cleanup { outcomes } = &response else {
+    let ProviderResponse::Cleanup { outcomes, .. } = &response else {
         return false;
     };
     let required_obligations = stage

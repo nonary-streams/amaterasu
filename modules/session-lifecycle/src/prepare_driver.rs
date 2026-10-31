@@ -516,7 +516,7 @@ impl PrepareDriver {
                 next.response = Some(response);
                 next.phase = PreparePhase::Prepared;
             }
-            ProviderResponse::Cleanup { outcomes }
+            ProviderResponse::Cleanup { outcomes, .. }
                 if matches!(
                     next.phase,
                     PreparePhase::Callback | PreparePhase::CallbackStatus
