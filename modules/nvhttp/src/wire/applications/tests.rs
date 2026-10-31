@@ -66,8 +66,8 @@ impl Catalog {
                 timeout_ms,
                 ..
             } => {
-                assert_eq!(service, CATALOG_SERVICE);
-                assert_eq!(payload["action"], "export_list");
+                assert_eq!(service, LIBRARY_SERVICE);
+                assert_eq!(payload["action"], "list");
                 assert_eq!(payload["limit"], PAGE_SIZE);
                 assert!(timeout_ms <= 5000);
                 self.requests.push(payload);

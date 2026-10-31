@@ -714,7 +714,7 @@ impl Router {
 impl Purpose {
     fn service(&self) -> &'static str {
         if matches!(self, Self::Applications { .. }) {
-            applications::CATALOG_SERVICE
+            applications::LIBRARY_SERVICE
         } else {
             PAIRING_SERVICE
         }

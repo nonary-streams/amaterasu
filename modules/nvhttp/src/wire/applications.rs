@@ -5,7 +5,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
-pub(super) const CATALOG_SERVICE: &str = "amaterasu.catalog/1";
+pub(super) const LIBRARY_SERVICE: &str = "amaterasu.library/1";
 const PAGE_SIZE: usize = 32;
 const MAX_ENTRIES: usize = 16_384;
 const MAX_PAGES: usize = 1_024;
@@ -245,7 +245,7 @@ impl Router {
                 desktop_enabled: self.launches.desktop_enabled(),
                 certificate: peer.peer_certificate.clone().expect("trusted certificate"),
             },
-            json!({"action":"export_list","limit":PAGE_SIZE}),
+            json!({"action":"list","limit":PAGE_SIZE}),
             now + LIST_TIMEOUT,
             now,
         )
@@ -291,7 +291,7 @@ impl Router {
             Ok(Some(cursor)) => {
                 job.applications = Some(applications);
                 job.call = Call::Ready {
-                    payload: json!({"action":"export_list","limit":PAGE_SIZE,"cursor":cursor}),
+                    payload: json!({"action":"list","limit":PAGE_SIZE,"cursor":cursor}),
                     not_before: now,
                 };
                 Some(job)
