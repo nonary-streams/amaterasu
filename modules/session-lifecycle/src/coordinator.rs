@@ -621,6 +621,9 @@ impl Coordinator {
         if operation == "describe_action_target" {
             return self.describe_action_target(caller, &payload);
         }
+        if operation == "verify_control_settlement" {
+            return self.verify_control_settlement(caller, payload);
+        }
         if matches!(
             operation,
             "describe_resource_control" | "verify_resource_control" | "validate_resource_control"

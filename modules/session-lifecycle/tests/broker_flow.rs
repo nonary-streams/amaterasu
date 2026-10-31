@@ -87,8 +87,8 @@ impl Harness {
                     "consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["example/1"]},
                     "trusted_callers": ["transport", "other-transport"],
                     "operation_grants": {
-                        "transport": ["prepare", "lookup", "snapshot", "describe_resource_control", "verify_resource_control", "validate_resource_control"],
-                        "other-transport": ["prepare", "lookup", "snapshot", "describe_resource_control", "verify_resource_control", "validate_resource_control"]
+                        "transport": ["prepare", "lookup", "snapshot", "describe_resource_control", "verify_resource_control", "validate_resource_control", "verify_control_settlement"],
+                        "other-transport": ["prepare", "lookup", "snapshot", "describe_resource_control", "verify_resource_control", "validate_resource_control", "verify_control_settlement"]
                     }
                 }
             }
@@ -264,6 +264,13 @@ fn control_routes_reject_unadmitted_and_foreign_callers_through_broker() {
             assert_eq!(response["status"], "rejected");
             assert_eq!(response["reason"], "resource_control_not_authorized");
         }
+    }
+    let output = json!({"output_id":"out","capability":"display","schema":schema,"producer":"transport","producer_service":"transport/2","origin":target,"resource":resource,"domain_observations":[],"data":{}});
+    let settlement = json!({"operation":"verify_control_settlement","request":request,"output":output,"settlement_id":"settlement"});
+    for caller in ["transport", "other-transport"] {
+        let response = harness.call(caller, settlement.clone());
+        assert_eq!(response["status"], "rejected");
+        assert_eq!(response["reason"], "resource_control_not_authorized");
     }
 }
 
