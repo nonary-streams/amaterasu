@@ -57,8 +57,8 @@ def main() -> None:
     if graph != {key: lifecycle[key] for key in ("control_policies", "finalize_policies", "schema_documents")}:
         raise ValueError("diagnostic graph does not match selected pinned composition")
     additional = {provider: lifecycle["operation_grants"][provider] for provider in (check.OWNER, check.DISPLAY)}
-    # The startup-only diagnostic never invokes the new baseline lookup; its
-    # presence in policy does not establish that the coordinator route works.
+    # The startup-only diagnostic never invokes either recovery lookup; their
+    # presence in policy does not establish that coordinator routes work.
     additional[check.OWNER] = sorted(set(additional[check.OWNER]) | composition.CORE_OWNER_OPERATIONS)
     if args.enable_display_actions:
         additional[legacy.ACTIONS] = sorted(composition.ACTION_COORDINATOR_OPERATIONS)

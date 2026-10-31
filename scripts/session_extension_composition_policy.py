@@ -14,7 +14,7 @@ import prepare_session_extension_profile as legacy
 ACTION_OWNER_OPERATIONS = {"describe_action_target", "inspect_action_effect",
                            "verify_action_effect", "check_action_effect"}
 ACTION_COORDINATOR_OPERATIONS = {"rebind_action_plan", "cancel_action"}
-CORE_OWNER_OPERATIONS = {"lookup_control_baseline"}
+CORE_OWNER_OPERATIONS = {"lookup_control_baseline", "lookup_stream_closure"}
 
 
 def method_ref(provider: str, name: str) -> dict:
@@ -192,7 +192,10 @@ def build_bootstrap(base: dict, selected: list[dict], entries: dict, lifecycle_s
         raise ValueError("action authorization does not match the profile selection")
     owner_operations = lifecycle.get("operation_grants", {}).get(check.OWNER, [])
     if not CORE_OWNER_OPERATIONS <= set(owner_operations):
-        raise ValueError("owner baseline lookup operation grant is missing")
+        raise ValueError("owner recovery operation grants are incomplete")
+    if any(CORE_OWNER_OPERATIONS & set(names) for identity, names in
+           lifecycle.get("operation_grants", {}).items() if identity != check.OWNER):
+        raise ValueError("owner recovery operations cannot be granted to other principals")
     if enable_action and not ACTION_OWNER_OPERATIONS <= set(owner_operations):
         raise ValueError("owner action operation grants are incomplete")
     action_operations = lifecycle.get("operation_grants", {}).get(legacy.ACTIONS, [])
@@ -280,6 +283,8 @@ def lifecycle_configuration(journal_path: str, graph: dict, additional_grants: d
     for provider, names in additional_grants.items():
         if not isinstance(names, list) or any(not isinstance(name, str) or not name or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789_" for c in name) for name in names) or len(names) != len(set(names)):
             raise ValueError("invalid provider operation grants")
+        if provider != check.OWNER and CORE_OWNER_OPERATIONS & set(names):
+            raise ValueError("owner recovery operations cannot be granted to other principals")
         operations[provider] = sorted(set(operations.get(provider, [])) | set(names))
     return {"journal_path": journal_path, "trusted_callers": sorted(operations),
             "session_delegates": [legacy.RTSP, legacy.STREAM],
