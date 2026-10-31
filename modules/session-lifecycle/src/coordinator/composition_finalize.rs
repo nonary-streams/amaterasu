@@ -2,7 +2,6 @@
 use super::finalize_selection::FinalizeSelectionSnapshot;
 use super::*;
 use crate::prepare_driver::PreparePhase;
-use crate::provider_dispatch::DispatchState;
 use amaterasu_extension_api::{ConfirmedControl, ProviderResponse, ResourceOutput};
 
 /// The caller must independently recheck installed grants, schema and fresh
@@ -180,8 +179,7 @@ fn resolve_chain(
         current = result.output.clone();
         results.push((**result).clone());
     }
-    // Each dependent callback must have consumed exactly its own acknowledged
-    // controls and completed through the pinned direct callback invocation.
+    // Each dependent callback must have consumed its own acknowledged controls.
     for provider in &graph.order {
         let state = &work.states[provider];
         let plan = state.plan.as_ref().ok_or("composition_plan_missing")?;
@@ -208,7 +206,13 @@ fn resolve_chain(
             .terminal_dispatch
             .as_ref()
             .ok_or("dependent_callback_unproven")?;
-        let method = &state.participant.callback_method;
+        let proof = super::composition::ProducerCallbackProof {
+            participant: state.participant.clone(),
+            request: state.request.clone(),
+            terminal: terminal.clone(),
+            pending_receipt: state.pending_receipt.clone(),
+            pending_dispatch: state.pending_dispatch.clone(),
+        };
         let admission_id = state
             .admission_id
             .as_ref()
@@ -228,24 +232,18 @@ fn resolve_chain(
             || state.request.admission_id.as_ref() != Some(admission_id)
             || state.request.approved_plan.as_ref() != Some(plan)
             || admission.selection.participant != state.participant
-            || !admission.selection.approvals.iter().any(|approval| {
-                approval.broker_approval == terminal.call.approval
-                    && super::composition::approval_matches_call(approval, &terminal.call)
-            })
+            || !super::composition::callback_approvals_valid(
+                &proof,
+                &admission.selection.approvals,
+                provider,
+            )
             || state.request.control_results != own
             || state.request.target != work.target
             || state.request.transition_id != work.transition_id
             || !matches!(response, ProviderResponse::Prepared { .. })
             || amaterasu_extension_api::validate_provider_response(&state.request, response)
                 .is_err()
-            || terminal.call.service != method.service
-            || terminal.call.method != method.method
-            || terminal.call.interface_major != method.interface_major
-            || terminal.call.interface_minor != method.interface_minor
-            || terminal.call.approval["provider"].as_str() != Some(provider.as_str())
-            || terminal.call.operation_id != state.request.operation_id
-            || serde_json::to_value(&state.request).ok().as_ref() != Some(&terminal.call.arguments)
-            || !matches!(&terminal.state, DispatchState::Completed { payload } if serde_json::from_value::<ProviderResponse>(payload.clone()).ok().as_ref() == Some(response))
+            || !super::composition::valid_callback_proof(&proof, response)
         {
             return Err("dependent_callback_unproven".into());
         }

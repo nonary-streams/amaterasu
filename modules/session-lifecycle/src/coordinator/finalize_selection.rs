@@ -282,6 +282,7 @@ pub(super) mod tests {
                 request,
                 terminal,
                 pending_receipt: None,
+                pending_dispatch: None,
             },
         };
         book.record_stage(stage.clone(), &|_| true).unwrap();

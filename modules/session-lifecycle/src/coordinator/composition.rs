@@ -50,6 +50,8 @@ pub struct ProducerCallbackProof {
     pub request: amaterasu_extension_api::ProviderRequest,
     pub terminal: crate::provider_dispatch::DispatchRecord,
     pub pending_receipt: Option<String>,
+    #[serde(default)]
+    pub pending_dispatch: Option<crate::provider_dispatch::DispatchRecord>,
 }
 
 /// A stream-stage observation extends immutable session output provenance.
@@ -944,13 +946,10 @@ pub(super) fn collect_verified_outputs(
             .clone()
             .ok_or("provider_terminal_proof_missing")?,
         pending_receipt: state.pending_receipt.clone(),
+        pending_dispatch: state.pending_dispatch.clone(),
     };
     if !valid_callback_proof(&proof, response)
-        || !selected.approvals.iter().any(|entry| {
-            entry.broker_approval == proof.terminal.call.approval
-                && approval_matches_call(entry, &proof.terminal.call)
-                && approval_is_valid(entry, provider)
-        })
+        || !callback_approvals_valid(&proof, &selected.approvals, provider)
     {
         return Err("provider_terminal_proof_invalid".into());
     }
@@ -1133,7 +1132,10 @@ pub(super) fn valid_callback_proof(
             && call.interface_major == method.interface_major
             && call.interface_minor == method.interface_minor
     };
-    if matches_method(callback) {
+    if matches_method(callback)
+        && proof.pending_receipt.is_none()
+        && proof.pending_dispatch.is_none()
+    {
         return call.operation_id == proof.request.operation_id
             && serde_json::to_value(&proof.request).ok().as_ref() == Some(&call.arguments);
     }
@@ -1145,10 +1147,50 @@ pub(super) fn valid_callback_proof(
     ) else {
         return false;
     };
-    request.operation_id == proof.request.operation_id
+    let Some(pending) = &proof.pending_dispatch else {
+        return false;
+    };
+    let DispatchState::Completed { payload } = &pending.state else {
+        return false;
+    };
+    let Ok(response @ amaterasu_extension_api::ProviderResponse::Pending { .. }) =
+        serde_json::from_value::<amaterasu_extension_api::ProviderResponse>(payload.clone())
+    else {
+        return false;
+    };
+    if amaterasu_extension_api::validate_provider_response(&proof.request, &response).is_err() {
+        return false;
+    }
+    let amaterasu_extension_api::ProviderResponse::Pending { receipt_id } = response else {
+        unreachable!()
+    };
+    pending.call.service == callback.service
+        && pending.call.method == callback.method
+        && pending.call.interface_major == callback.interface_major
+        && pending.call.interface_minor == callback.interface_minor
+        && pending.call.operation_id == proof.request.operation_id
+        && serde_json::to_value(&proof.request).ok().as_ref() == Some(&pending.call.arguments)
+        && Some(&receipt_id) == proof.pending_receipt.as_ref()
+        && call.operation_id != proof.request.operation_id
+        && request.operation_id == proof.request.operation_id
         && request.transition_id == proof.request.transition_id
         && Some(&request.receipt_id) == proof.pending_receipt.as_ref()
-        && request.provider_sequence > proof.request.provider_sequence
+        && request.provider_sequence == proof.request.provider_sequence
+}
+
+pub(super) fn callback_approvals_valid(
+    proof: &ProducerCallbackProof,
+    approvals: &[MethodApproval],
+    provider: &str,
+) -> bool {
+    let approved = |record: &crate::provider_dispatch::DispatchRecord| {
+        approvals.iter().any(|approval| {
+            approval.broker_approval == record.call.approval
+                && approval_matches_call(approval, &record.call)
+                && approval_is_valid(approval, provider)
+        })
+    };
+    approved(&proof.terminal) && proof.pending_dispatch.as_ref().is_none_or(approved)
 }
 
 pub(super) fn validate_callback_provenance(record: &StoredOutput, admission: &Admission) -> bool {
@@ -1176,11 +1218,7 @@ pub(super) fn validate_callback_provenance(record: &StoredOutput, admission: &Ad
         && proof.request.admission_id.as_deref() == Some(record.admission_id.as_str())
         && proof.request.transition_id == record.transition_id
         && proof.request.approved_plan.as_ref() == Some(&record.plan)
-        && admission.selection.approvals.iter().any(|approval| {
-            approval.broker_approval == proof.terminal.call.approval
-                && approval_matches_call(approval, &proof.terminal.call)
-                && approval_is_valid(approval, &admission.provider)
-        })
+        && callback_approvals_valid(proof, &admission.selection.approvals, &admission.provider)
         && matches!(&response, amaterasu_extension_api::ProviderResponse::Prepared { outputs, .. } if outputs.contains(&record.output))
         && valid_callback_proof(proof, &response)
 }
@@ -1358,7 +1396,8 @@ mod tests {
         let mut plan = root.plan.clone();
         plan.resources[0].expected_revision = Some(root.output.resource.revision);
         let method = json!({"service":"screen/2","method":"callback","interface_major":2,"interface_minor":0,"schema_revision":1});
-        let participant = serde_json::from_value(json!({"provider":"screen","plan_method":method,"callback_method":method,"status_method":method,"capabilities":[],"cleanup_methods":[],"settings_revision":"revision","settings":{}})).unwrap();
+        let status = json!({"service":"screen/2","method":"status","interface_major":2,"interface_minor":0,"schema_revision":1});
+        let participant = serde_json::from_value(json!({"provider":"screen","plan_method":method,"callback_method":method,"status_method":status,"capabilities":[],"cleanup_methods":[],"settings_revision":"revision","settings":{}})).unwrap();
         let request: amaterasu_extension_api::ProviderRequest = serde_json::from_value(json!({"provider_sequence":2,"operation":"lifecycle_callback","version":2,"transition_id":"stage-transition","operation_id":"stage-call","target":stream,"phase":"stream.prepare","settings_revision":"revision","settings":{},"intent":"initial","reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector/1"]},"remaining_ms":1000,"plan_revision":plan.revision,"admission_id":"stage-admission","approved_plan":plan,"dependency_inputs":[root.output]})).unwrap();
         let response: amaterasu_extension_api::ProviderResponse = serde_json::from_value(
             json!({"status":"prepared","candidate":null,"obligations":[],"outputs":[root.output]}),
@@ -1393,6 +1432,7 @@ mod tests {
                 request,
                 terminal,
                 pending_receipt: None,
+                pending_dispatch: None,
             },
         };
         let mut wrong_parent = stage.clone();
@@ -1401,6 +1441,42 @@ mod tests {
         let mut wrong_call = stage.clone();
         wrong_call.callback_proof.terminal.call.arguments["operation_id"] = json!("different");
         assert!(book.record_stage(wrong_call, &|_| true).is_err());
+        let mut polled = stage.clone();
+        let mut pending = polled.callback_proof.terminal.clone();
+        pending.state = crate::provider_dispatch::DispatchState::Completed {
+            payload: json!({"status":"pending","receipt_id":"receipt"}),
+        };
+        polled.callback_proof.pending_receipt = Some("receipt".into());
+        polled.callback_proof.pending_dispatch = Some(pending);
+        polled.callback_proof.terminal.call.method = "status".into();
+        polled.callback_proof.terminal.call.operation_id = "poll-call".into();
+        polled.callback_proof.terminal.call.arguments = json!({
+            "provider_sequence": polled.callback_proof.request.provider_sequence,
+            "operation_id": polled.callback_proof.request.operation_id,
+            "transition_id": polled.callback_proof.request.transition_id,
+            "receipt_id": "receipt"
+        });
+        assert!(book.record_stage(polled.clone(), &|_| true).is_ok());
+        let mut missing_pending = polled.clone();
+        missing_pending.callback_proof.pending_dispatch = None;
+        assert!(!valid_callback_proof(
+            &missing_pending.callback_proof,
+            &serde_json::from_value(json!({"status":"prepared","candidate":null,"obligations":[],"outputs":[root.output]})).unwrap(),
+        ));
+        let mut tampered = polled;
+        tampered
+            .callback_proof
+            .pending_dispatch
+            .as_mut()
+            .unwrap()
+            .state = crate::provider_dispatch::DispatchState::Completed {
+            payload: json!({"status":"pending","receipt_id":"different"}),
+        };
+        assert!(!valid_callback_proof(
+            &tampered.callback_proof,
+            &serde_json::from_value(json!({"status":"prepared","candidate":null,"obligations":[],"outputs":[root.output]})).unwrap(),
+        ));
+        book.staged_outputs.clear();
         let mut missing_input = stage.clone();
         missing_input
             .callback_proof

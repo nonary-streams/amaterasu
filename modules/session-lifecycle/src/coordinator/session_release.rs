@@ -175,11 +175,11 @@ fn validate_proof(journal: &Journal, proof: &SessionReleaseProof) -> bool {
         && session.admission_targets.get(release_id) == Some(&proof.target)
         && session.admission_phases.get(release_id) == Some(&LifecyclePhase::SessionRelease)
         && journal.admission_transitions.get(release_id) == Some(&proof.transition_id)
-        && admission.selection.approvals.iter().any(|approval| {
-            approval.broker_approval == proof.callback.terminal.call.approval
-                && composition::approval_matches_call(approval, &proof.callback.terminal.call)
-                && composition::approval_is_valid(approval, &admission.provider)
-        })
+        && composition::callback_approvals_valid(
+            &proof.callback,
+            &admission.selection.approvals,
+            &admission.provider,
+        )
         && composition::valid_callback_proof(&proof.callback, &response)
         && outcomes.len() == admission.plan.obligations.len()
         && outcomes
@@ -286,6 +286,7 @@ pub(super) fn record_session_release_proof(
                 .clone()
                 .ok_or("cleanup_terminal_proof_missing")?,
             pending_receipt: state.pending_receipt.clone(),
+            pending_dispatch: state.pending_dispatch.clone(),
         },
     };
     if journal.session_releases.proofs.len() >= MAX_RELEASES
@@ -387,6 +388,7 @@ mod tests {
                 request: root_request,
                 terminal: root_terminal,
                 pending_receipt: None,
+                pending_dispatch: None,
             }),
         };
         let output_selection = composition::OutputSelection {
@@ -442,6 +444,7 @@ mod tests {
             plan: Some(plan),
             admission_id: Some("release-admission".into()),
             pending_receipt: None,
+            pending_dispatch: None,
             status_polls: 0,
             last_sequence: 1,
             dispatch: None,

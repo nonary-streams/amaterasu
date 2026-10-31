@@ -54,9 +54,7 @@ fn valid_record(journal: &Journal, record: &Evidence) -> bool {
     let proof = &record.proof;
     let provider = &admission.provider;
     let request = &proof.request;
-    // Status responses require a separately authenticated Pending receipt proof.
-    proof.pending_receipt.is_none()
-        && session.host_epoch == epoch
+    session.host_epoch == epoch
         && session.generation == generation
         && session
             .provider_graph
@@ -76,11 +74,7 @@ fn valid_record(journal: &Journal, record: &Evidence) -> bool {
         && proof.participant == admission.selection.participant
         && matches!(&record.response, ProviderResponse::Prepared { .. })
         && composition::valid_callback_proof(proof, &record.response)
-        && admission.selection.approvals.iter().any(|approval| {
-            composition::approval_is_valid(approval, provider)
-                && approval.broker_approval == proof.terminal.call.approval
-                && composition::approval_matches_call(approval, &proof.terminal.call)
-        })
+        && composition::callback_approvals_valid(proof, &admission.selection.approvals, provider)
 }
 
 /// Record on the clone that atomically receives settled authority and progress.
@@ -123,6 +117,7 @@ pub(super) fn record(
                 .clone()
                 .ok_or("provider_terminal_proof_missing")?,
             pending_receipt: state.pending_receipt.clone(),
+            pending_dispatch: state.pending_dispatch.clone(),
         },
         response: state.response.clone().ok_or("provider_response_missing")?,
     };

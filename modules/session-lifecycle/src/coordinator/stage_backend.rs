@@ -98,9 +98,11 @@ impl Coordinator {
             || admission.provider != caller
             || admission.plan != stage.plan
             || admission.selection.participant != stage.callback_proof.participant
-            || !admission.selection.approvals.iter().any(|approval| {
-                approval.broker_approval == stage.callback_proof.terminal.call.approval
-            })
+            || !super::composition::callback_approvals_valid(
+                &stage.callback_proof,
+                &admission.selection.approvals,
+                &admission.provider,
+            )
             || !session.admission_ids.contains(&stage.admission_id)
             || session.admission_targets.get(&stage.admission_id) != Some(&stage.target)
             || session.admission_phases.get(&stage.admission_id)

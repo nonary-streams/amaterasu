@@ -49,6 +49,9 @@ pub struct PrepareState {
     pub plan: Option<ResourcePlan>,
     pub admission_id: Option<String>,
     pub pending_receipt: Option<String>,
+    /// Original broker-completed callback that returned the Pending receipt.
+    #[serde(default)]
+    pub pending_dispatch: Option<DispatchRecord>,
     pub status_polls: u32,
     pub last_sequence: u64,
     pub dispatch: Option<DispatchRecord>,
@@ -333,6 +336,35 @@ impl PrepareDriver {
                     .ok_or("missing admission")?,
             )?;
         }
+        if self.state.request.version == api::COMPOSITION_VERSION
+            && self.state.phase == PreparePhase::CallbackStatus
+        {
+            let pending = self
+                .state
+                .pending_dispatch
+                .as_ref()
+                .ok_or("pending_callback_proof_missing")?;
+            let DispatchState::Completed { payload } = &pending.state else {
+                return Err("pending_callback_proof_invalid".into());
+            };
+            let response: ProviderResponse = serde_json::from_value(payload.clone())
+                .map_err(|_| "pending_callback_proof_invalid")?;
+            api::validate_provider_response(&self.state.request, &response)?;
+            let ProviderResponse::Pending { receipt_id } = response else {
+                return Err("pending_callback_proof_invalid".into());
+            };
+            let arguments = serde_json::to_value(&self.state.request).map_err(|e| e.to_string())?;
+            let expected = authority.approved_call(
+                participant,
+                &participant.callback_method,
+                arguments,
+                self.state.request.operation_id.clone(),
+            )?;
+            if pending.call != expected || self.state.pending_receipt.as_ref() != Some(&receipt_id)
+            {
+                return Err("pending_callback_proof_invalid".into());
+            }
+        }
         if self.dispatcher.is_none() {
             let original = self.state.clone();
             let call = match self.make_call(participant, authority) {
@@ -524,10 +556,18 @@ impl PrepareDriver {
                 };
             }
             ProviderResponse::Pending { receipt_id } => {
-                // Version 2 status receipts need an authenticated pending-proof
-                // chain before they can authorize output or finalization.
                 if next.request.version == api::COMPOSITION_VERSION {
-                    return Err("composition_pending_requires_recovery".into());
+                    match next.phase {
+                        PreparePhase::Callback => {
+                            next.pending_dispatch = Some(self.state.dispatch.as_ref().filter(|record| {
+                                matches!(&record.state, DispatchState::Completed { payload: stored } if stored == &payload)
+                            }).cloned().ok_or("pending_callback_proof_missing")?);
+                        }
+                        PreparePhase::CallbackStatus
+                            if next.pending_receipt.as_ref() == Some(receipt_id)
+                                && next.pending_dispatch.is_some() => {}
+                        _ => return Err("composition_pending_requires_recovery".into()),
+                    }
                 }
                 next.pending_receipt = Some(receipt_id.clone());
                 next.phase = match next.phase {
@@ -650,6 +690,7 @@ mod tests {
             plan: None,
             admission_id: None,
             pending_receipt: None,
+            pending_dispatch: None,
             status_polls: 0,
             last_sequence: 1,
             dispatch: None,

@@ -64,6 +64,9 @@ struct Harness {
     finalize_verify_request: Option<(u64, u64, Value)>,
     finalize_pending: bool,
     pending_finalize_result: Option<Value>,
+    stage_pending: bool,
+    stage_pending_bad_receipt: bool,
+    pending_stage_result: Option<Value>,
     cleanup_deferred: bool,
     registry_settings: Option<(u64, Value)>,
 }
@@ -220,6 +223,9 @@ impl Harness {
             finalize_verify_request: None,
             finalize_pending: false,
             pending_finalize_result: None,
+            stage_pending: false,
+            stage_pending_bad_receipt: false,
+            pending_stage_result: None,
             cleanup_deferred: false,
             registry_settings,
         };
@@ -324,13 +330,38 @@ impl Harness {
                             .clone()
                     };
                     let output = json!({"output_id":"screen-output","capability":"display/output","schema":schema,"producer":"display","producer_service":"example.display/2","origin":origin,"resource":{"provider":"display","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":"topology","mutation_domains":["topology"]},"domain_observations":[{"domain":"topology","revision":1,"borrowers":{},"complete":true}],"data":if self.provider_invalid {json!("invalid")} else {json!({"ready":true})}});
-                    assert!(matches!(self.broker.borrow_mut().dispatch("display",Command::Complete {request:id,payload:json!({"status":"prepared","candidate":null,"obligations":[],"outputs":[output]})}),Response::Ok));
+                    let result = json!({"status":"prepared","candidate":null,"obligations":[],"outputs":[output]});
+                    let response = if self.stage_pending && args["phase"] == "stream.prepare" {
+                        self.pending_stage_result = Some(result);
+                        json!({"status":"pending","receipt_id":"stage-receipt"})
+                    } else {
+                        result
+                    };
+                    assert!(matches!(
+                        self.broker.borrow_mut().dispatch(
+                            "display",
+                            Command::Complete {
+                                request: id,
+                                payload: response
+                            }
+                        ),
+                        Response::Ok
+                    ));
                 } else if payload["method"] == "lifecycle_status" {
-                    assert_eq!(args["receipt_id"], "finalize-receipt");
-                    let result = self
-                        .pending_finalize_result
-                        .take()
-                        .expect("pending finalized result");
+                    let result = if args["receipt_id"] == "stage-receipt" {
+                        if self.stage_pending_bad_receipt {
+                            json!({"status":"pending","receipt_id":"changed-receipt"})
+                        } else {
+                            self.pending_stage_result
+                                .take()
+                                .expect("pending stage result")
+                        }
+                    } else {
+                        assert_eq!(args["receipt_id"], "finalize-receipt");
+                        self.pending_finalize_result
+                            .take()
+                            .expect("pending finalized result")
+                    };
                     assert!(matches!(
                         self.broker.borrow_mut().dispatch(
                             "display",
@@ -1067,4 +1098,84 @@ fn real_broker_deferred_cleanup_keeps_root_and_no_release_proof() {
             .unwrap()
             .is_empty()
     );
+}
+
+fn pending_stage_case(changed_receipt: bool) {
+    let mut harness = Harness::with_provider(true);
+    harness.simulate_stage_refresh = true;
+    harness.verify_finalize = true;
+    harness.stage_pending = true;
+    harness.stage_pending_bad_receipt = changed_receipt;
+    let started = harness.call("transport", json!({"operation":"prepare","operation_id":"session.prepare","application_ref":{"kind":"application","app_id":"app"}}));
+    assert_eq!(started["status"], "pending");
+    let mut ready = Value::Null;
+    for _ in 0..120 {
+        ready = harness.call(
+            "transport",
+            json!({"operation":"lookup","operation_id":"session.prepare"}),
+        );
+        if ready["status"] != "pending" {
+            break;
+        }
+    }
+    assert_eq!(ready["status"], "succeeded", "{ready}");
+    let session = ready["target"].clone();
+    let bound = harness.call("transport", json!({"operation":"bind_application","operation_id":"app.bind","target":session,"launch_id":42,"application_operation_id":"launch-42"}));
+    assert_eq!(bound["status"], "succeeded", "{bound}");
+    let started = harness.call("transport", json!({"operation":"prepare_stream","operation_id":"stream.prepare","target":session,"intent":"initial","requested_video":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false}}));
+    assert_eq!(started["status"], "pending", "{started}");
+    let mut result = Value::Null;
+    for _ in 0..200 {
+        result = harness.call(
+            "transport",
+            json!({"operation":"lookup","operation_id":"stream.prepare"}),
+        );
+        if result["status"] != "pending" {
+            break;
+        }
+    }
+    if changed_receipt {
+        assert_ne!(result["status"], "succeeded", "{result}");
+        let journal: Value =
+            serde_json::from_slice(&std::fs::read(harness.root.join("journal.json")).unwrap())
+                .unwrap();
+        assert!(
+            journal["composition"]["staged_outputs"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        return;
+    }
+    assert_eq!(result["status"], "succeeded", "{result}");
+    let journal: Value =
+        serde_json::from_slice(&std::fs::read(harness.root.join("journal.json")).unwrap()).unwrap();
+    let proof = &journal["composition"]["staged_outputs"][0]["callback_proof"];
+    assert_eq!(proof["pending_receipt"], "stage-receipt");
+    assert_eq!(
+        proof["pending_dispatch"]["state"]["payload"]["receipt_id"],
+        "stage-receipt"
+    );
+    assert_eq!(proof["terminal"]["call"]["method"], "lifecycle_status");
+    let calls = harness.provider_calls.len();
+    // SAFETY: this is the live instance and is destroyed once before replacement.
+    unsafe { (harness.api.destroy)(harness.instance) };
+    harness.instance = std::ptr::null_mut();
+    harness.start();
+    let recovered = harness.call(
+        "transport",
+        json!({"operation":"lookup","operation_id":"stream.prepare"}),
+    );
+    assert_eq!(recovered["status"], "succeeded", "{recovered}");
+    assert_eq!(harness.provider_calls.len(), calls);
+}
+
+#[test]
+fn real_broker_stage_pending_status_persists_proof_and_recovers() {
+    pending_stage_case(false);
+}
+
+#[test]
+fn real_broker_stage_pending_changed_receipt_is_fenced() {
+    pending_stage_case(true);
 }

@@ -612,13 +612,11 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                     || admission.provider != stage.after.producer
                     || admission.plan != stage.plan
                     || admission.selection.participant != stage.callback_proof.participant
-                    || !admission.selection.approvals.iter().any(|approval| {
-                        approval.broker_approval == stage.callback_proof.terminal.call.approval
-                            && composition::approval_matches_call(
-                                approval,
-                                &stage.callback_proof.terminal.call,
-                            )
-                    })
+                    || !composition::callback_approvals_valid(
+                        &stage.callback_proof,
+                        &admission.selection.approvals,
+                        &admission.provider,
+                    )
             })
         || !journal.session_prepare_evidence.validate(journal)
         || !journal.session_releases.validate(journal)

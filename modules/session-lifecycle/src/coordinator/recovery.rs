@@ -167,6 +167,7 @@ mod tests {
             plan: None,
             admission_id: None,
             pending_receipt: Some("provider-receipt".into()),
+            pending_dispatch: None,
             status_polls: 1,
             last_sequence: 4,
             dispatch: None,

@@ -205,10 +205,11 @@ fn validate_proof(journal: &Journal, proof: &StreamReleaseProof) -> bool {
         && session.admission_targets.get(admission_id) == Some(&proof.target)
         && session.admission_phases.get(admission_id) == Some(&LifecyclePhase::StreamRelease)
         && journal.admission_transitions.get(admission_id) == Some(&proof.transition_id)
-        && admission.selection.approvals.iter().any(|approval| {
-            approval.broker_approval == proof.callback.terminal.call.approval
-                && composition::approval_matches_call(approval, &proof.callback.terminal.call)
-        })
+        && composition::callback_approvals_valid(
+            &proof.callback,
+            &admission.selection.approvals,
+            &admission.provider,
+        )
         && composition::valid_callback_proof(&proof.callback, &response)
         && all_outcomes_released(&admission.plan, outcomes)
         && required_obligations
@@ -368,6 +369,7 @@ pub(super) fn record_release_proof(
                 .clone()
                 .ok_or("cleanup_terminal_proof_missing")?,
             pending_receipt: state.pending_receipt.clone(),
+            pending_dispatch: state.pending_dispatch.clone(),
         },
     };
     if !validate_proof(journal, &proof) {

@@ -1093,6 +1093,7 @@ impl Coordinator {
                     plan: None,
                     admission_id: None,
                     pending_receipt: None,
+                    pending_dispatch: None,
                     status_polls: 0,
                     last_sequence: sequence,
                     dispatch: None,
