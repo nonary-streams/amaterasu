@@ -72,6 +72,9 @@ impl Default for LifecycleSettings {
 #[serde(deny_unknown_fields)]
 pub struct ParticipantSettings {
     pub provider: String,
+    /// Required participants that must prepare before this provider.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
     pub plan_method: MethodSettings,
     pub callback_method: MethodSettings,
     pub status_method: MethodSettings,
@@ -109,6 +112,51 @@ fn valid_identifier(name: &str) -> bool {
 }
 
 impl LifecycleSettings {
+    /// Resolve required dependencies before admission. Among ready participants,
+    /// the earliest configured provider wins, preserving deterministic tie order.
+    pub(crate) fn resolved_participants(&self) -> ModuleResult<Vec<String>> {
+        if self.participants.len() > 32 {
+            return Err("too many lifecycle participants".into());
+        }
+        let mut names = BTreeSet::new();
+        for participant in &self.participants {
+            if !valid_identifier(&participant.provider)
+                || !names.insert(participant.provider.as_str())
+            {
+                return Err("invalid lifecycle participant".into());
+            }
+        }
+        for participant in &self.participants {
+            let mut seen = BTreeSet::new();
+            if participant.depends_on.len() > 32
+                || participant.depends_on.iter().any(|dependency| {
+                    !valid_identifier(dependency)
+                        || dependency == &participant.provider
+                        || !names.contains(dependency.as_str())
+                        || !seen.insert(dependency)
+                })
+            {
+                return Err("invalid lifecycle participant dependency".into());
+            }
+        }
+        let mut resolved = Vec::with_capacity(self.participants.len());
+        let mut visited = BTreeSet::new();
+        while resolved.len() < self.participants.len() {
+            let Some(participant) = self.participants.iter().find(|participant| {
+                !visited.contains(participant.provider.as_str())
+                    && participant
+                        .depends_on
+                        .iter()
+                        .all(|dependency| visited.contains(dependency.as_str()))
+            }) else {
+                return Err("cyclic lifecycle participant dependencies".into());
+            };
+            visited.insert(participant.provider.as_str());
+            resolved.push(participant.provider.clone());
+        }
+        Ok(resolved)
+    }
+
     pub(crate) fn validate(&self) -> ModuleResult<()> {
         if self.journal_path.is_empty() {
             return Err("lifecycle journal path is required".into());
@@ -243,6 +291,7 @@ impl LifecycleSettings {
                 }
             }
         }
+        self.resolved_participants()?;
         Ok(())
     }
 }
@@ -558,6 +607,9 @@ mod tests {
                 .validate()
         };
         assert!(parse(policy.clone()).is_ok());
+        let mut invalid_dependency = policy.clone();
+        invalid_dependency["participants"][0]["depends_on"] = json!(["absent"]);
+        assert!(parse(invalid_dependency).is_err());
         let mut registry_service = policy.clone();
         registry_service["settings_registry_service"] = json!("amaterasu.extension-registry/1");
         assert!(parse(registry_service.clone()).is_ok());
@@ -656,5 +708,27 @@ mod tests {
         let mut oversize = policy;
         oversize["participants"][0]["settings"] = json!({"data":"a".repeat(8192)});
         assert!(parse(oversize).is_err());
+    }
+    #[test]
+    fn participant_dependencies_resolve_stably_and_reject_invalid_graphs() {
+        let method = json!({"service":"provider/1","method":"prepare","interface_major":1,"interface_minor":0,"schema_revision":1});
+        let participant = |provider: &str, dependencies: Value| json!({"provider":provider,"depends_on":dependencies,"plan_method":method,"callback_method":method,"status_method":method,"capabilities":[],"cleanup_methods":[],"settings_revision":"initial","settings":{}});
+        let mut settings: LifecycleSettings = serde_json::from_value(json!({"participants":[participant("c",json!(["b"])),participant("independent",json!([])),participant("b",json!(["a"])),participant("a",json!([]))]})).unwrap();
+        assert_eq!(
+            settings.resolved_participants().unwrap(),
+            ["independent", "a", "b", "c"]
+        );
+        settings.participants[3].depends_on.push("c".into());
+        assert!(settings.resolved_participants().is_err());
+        settings.participants[3].depends_on = vec!["missing".into()];
+        assert!(settings.resolved_participants().is_err());
+        settings.participants[3].depends_on = vec!["a".into()];
+        assert!(settings.resolved_participants().is_err());
+        settings.participants[3].depends_on.clear();
+        settings.participants[2].depends_on = vec!["a".into(), "a".into()];
+        assert!(settings.resolved_participants().is_err());
+        settings.participants[2].depends_on = vec!["a".into()];
+        settings.participants[3].provider = "b".into();
+        assert!(settings.resolved_participants().is_err());
     }
 }
