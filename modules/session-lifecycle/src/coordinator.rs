@@ -17,6 +17,7 @@ mod finalize_dispatch;
 #[allow(dead_code)]
 mod finalize_result;
 mod finalize_endpoints;
+mod finalize_result_verify;
 #[allow(dead_code)] // Finalization selection remains gated until composition sequencing is wired.
 mod finalize_selection;
 mod operations;
@@ -815,6 +816,9 @@ impl Coordinator {
         }
         if operation == "verify_control_settlement" {
             return self.verify_control_settlement(caller, payload);
+        }
+        if operation == "verify_finalize_result" {
+            return self.verify_finalize_result(caller, payload);
         }
         if matches!(
             operation,

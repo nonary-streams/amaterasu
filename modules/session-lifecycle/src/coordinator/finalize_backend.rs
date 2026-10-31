@@ -394,7 +394,7 @@ mod tests {
         let source_plan = json!({"plan_id":"source","revision":1,"resources":[{"provider":"owner","resource_id":"output","incarnation":"native","expected_revision":1,"execution_domain":"seat","mutation_domains":["domain"],"access":"exclusive"}],"mutation_domains":[{"domain":"domain","expected_revision":1,"borrowers":{},"access":"exclusive"}],"required_capabilities":[],"constraints":{},"obligations":[obligation],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]});
         let mut final_plan = source_plan.clone();
         final_plan["plan_id"] = json!("final");
-        final_plan["candidate_constraint"] = json!({"capture_provider":"capture","selector_schema":"selector","resource_provider":"owner","resource_id":"output","incarnation":"native","execution_domain":"seat","mode":null,"plan_revision":1});
+        final_plan["candidate_constraint"] = json!({"capture_provider":"capture","selector_schema":"selector","resource_provider":"owner","resource_id":"output","incarnation":"native","execution_domain":"seat","mode":null,"plan_revision":1,"geometry_revision":2});
         let requirements = json!({"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector"]});
         let callback = json!({"version":2,"provider_sequence":1,"operation":"lifecycle_callback","transition_id":"source-transition","operation_id":"source-op","target":session,"phase":"session.prepare","settings_revision":"one","settings":{},"intent":null,"reason":null,"requested_video":null,"consumer_requirements":requirements,"remaining_ms":5000,"plan_revision":1,"admission_id":"source","approved_plan":source_plan});
         let prepared = json!({"status":"prepared","candidate":null,"obligations":[obligation],"outputs":[output]});
@@ -434,7 +434,7 @@ mod tests {
         journal
             .admission_transitions
             .insert("fresh".into(), "transition".into());
-        journal.authority = serde_json::from_value(json!({"sequences":{"owner":3},"snapshot":{"resources":{"owner":{"output":{"provider":"owner","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domains":["domain"]}}},"domains":{"domain":{"revision":1,"borrowers":{}}}},"admissions":{"fresh":admission(final_plan)},"domain_locks":{"domain":"fresh"},"domain_owners":{"domain":"owner"},"refresh_required":[],"settled":{"source":admission(source_plan)},"finalize_permits":{"permit":{"context":context,"request":request,"consumed":false,"settled":false}}})).unwrap();
+        journal.authority = serde_json::from_value(json!({"sequences":{"owner":3},"snapshot":{"resources":{"owner":{"output":{"provider":"owner","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domains":["domain"]}}},"domains":{"domain":{"revision":1,"borrowers":{}}}},"admissions":{"fresh":admission(final_plan.clone())},"domain_locks":{"domain":"fresh"},"domain_owners":{"domain":"owner"},"refresh_required":[],"settled":{"source":admission(source_plan)},"finalize_permits":{"permit":{"context":context,"request":request,"consumed":false,"settled":false}}})).unwrap();
         coordinator
             .settings
             .finalize_policies
@@ -477,6 +477,75 @@ mod tests {
         assert_eq!(
             coordinator.finalize_operation("owner", envelope)["status"],
             "reattach_only"
+        );
+        // Preserve an exact completed result after the original work disappears.
+        let candidate = json!({"capture_provider":"capture","selector_schema":"selector","selector":{},"resource":resource,"mode":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false},"plan_revision":1,"geometry_revision":2,"generation":1});
+        let applied = json!({"status":"applied","output":output,"candidate":candidate});
+        let record = json!({"selection":frozen,"plan_request":plan_request,"plan":final_plan,"plan_approval":approval("plan"),"plan_terminal":{"call":call("plan",serde_json::to_value(serde_json::from_value::<amaterasu_extension_api::ProviderRequest>(plan_request.clone()).unwrap()).unwrap(),"plan-op"),"state":{"state":"completed","payload":{"status":"planned","plan":final_plan}}},"request":request,"applied":applied,"terminal":{"call":effect_call,"state":{"state":"completed","payload":applied}},"pending_receipt":null});
+        let record: super::super::finalize_result::FinalizeResultRecord =
+            serde_json::from_value(record).unwrap();
+        assert!(
+            amaterasu_extension_api::validate_provider_response(
+                &record.plan_request,
+                &amaterasu_extension_api::ProviderResponse::Planned {
+                    plan: record.plan.clone()
+                }
+            )
+            .is_ok(),
+            "plan: {:?}",
+            amaterasu_extension_api::validate_provider_response(
+                &record.plan_request,
+                &amaterasu_extension_api::ProviderResponse::Planned {
+                    plan: record.plan.clone()
+                }
+            )
+        );
+        assert!(
+            amaterasu_extension_api::validate_resource_finalize_response(
+                &record.request,
+                &record.applied
+            )
+            .is_ok(),
+            "final response: {:?}",
+            amaterasu_extension_api::validate_resource_finalize_response(
+                &record.request,
+                &record.applied
+            )
+        );
+        assert_eq!(
+            record.plan_terminal.as_ref().unwrap().call.arguments,
+            serde_json::to_value(&record.plan_request).unwrap()
+        );
+        assert_eq!(
+            record.terminal.call.arguments,
+            serde_json::to_value(&record.request).unwrap()
+        );
+        assert!(record.validate_structure());
+        let mut journal = coordinator.shared.borrow().value.clone();
+        journal.finalize_results.record(record).unwrap();
+        journal
+            .authority
+            .finalize_permits
+            .get_mut("permit")
+            .unwrap()
+            .settled = true;
+        journal.authority.output_admissions.insert("fresh".into());
+        journal.receipts.clear();
+        save(&coordinator.shared, journal).unwrap();
+        let proof =
+            json!({"operation":"verify_finalize_result","request":request,"response":applied});
+        let result = coordinator.verify_finalize_result("owner", proof.clone());
+        assert_eq!(result["status"], "valid", "{result}");
+        assert_eq!(result["result_id"], "permit");
+        assert_eq!(
+            coordinator.verify_finalize_result("other", proof.clone())["status"],
+            "rejected"
+        );
+        let mut forged = proof;
+        forged["response"]["candidate"]["geometry_revision"] = json!(3);
+        assert_eq!(
+            coordinator.verify_finalize_result("owner", forged)["status"],
+            "rejected"
         );
         drop(coordinator);
         std::fs::remove_dir_all(path).unwrap();

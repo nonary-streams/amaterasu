@@ -87,8 +87,8 @@ impl Harness {
                     "consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["example/1"]},
                     "trusted_callers": ["transport", "other-transport"],
                     "operation_grants": {
-                        "transport": ["prepare", "lookup", "snapshot", "describe_resource_control", "verify_resource_control", "validate_resource_control", "verify_control_settlement", "describe_resource_finalize", "verify_resource_finalize", "validate_resource_finalize"],
-                        "other-transport": ["prepare", "lookup", "snapshot", "describe_resource_control", "verify_resource_control", "validate_resource_control", "verify_control_settlement", "describe_resource_finalize", "verify_resource_finalize", "validate_resource_finalize"]
+                        "transport": ["prepare", "lookup", "snapshot", "describe_resource_control", "verify_resource_control", "validate_resource_control", "verify_control_settlement", "describe_resource_finalize", "verify_resource_finalize", "validate_resource_finalize", "verify_finalize_result"],
+                        "other-transport": ["prepare", "lookup", "snapshot", "describe_resource_control", "verify_resource_control", "validate_resource_control", "verify_control_settlement", "describe_resource_finalize", "verify_resource_finalize", "validate_resource_finalize", "verify_finalize_result"]
                     }
                 }
             }
@@ -283,6 +283,12 @@ fn control_routes_reject_unadmitted_and_foreign_callers_through_broker() {
             assert_eq!(response["status"], "rejected");
             assert_eq!(response["reason"], "resource_finalize_not_authorized");
         }
+    }
+    let proof = json!({"operation":"verify_finalize_result","request":finalize,"response":{"status":"applied","output":output,"candidate":null}});
+    for caller in ["transport", "other-transport"] {
+        let response = harness.call(caller, proof.clone());
+        assert_eq!(response["status"], "rejected");
+        assert_eq!(response["reason"], "finalize_result_not_authorized");
     }
 }
 
