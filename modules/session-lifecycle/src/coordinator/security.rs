@@ -68,11 +68,70 @@ impl Coordinator {
             if work.waiting_retirement {
                 continue;
             }
-            let Some(state) = work.states.get(caller) else {
-                continue;
+            let nested = work
+                .composition_progress
+                .as_ref()
+                .and_then(|progress| progress.finalize.as_ref())
+                .filter(|finalize| {
+                    finalize.owner_plan.request.operation_id
+                        == payload["operation_id"].as_str().unwrap_or("")
+                });
+            let state = if let Some(finalize) = nested {
+                let state = &finalize.owner_plan;
+                let selection = &finalize.selection;
+                let selected = self.selections.get(caller);
+                if state.provider != caller
+                    || selection.policy.owner_provider != caller
+                    || state.request.operation
+                        != amaterasu_extension_api::ProviderOperation::ResourceFinalizePlan
+                    || !matches!(
+                        state.phase,
+                        crate::prepare_driver::PreparePhase::Plan
+                            | crate::prepare_driver::PreparePhase::PlanStatus
+                    )
+                    || state.request.target != work.target
+                    || state.request.transition_id != work.transition_id
+                    || selection.target != work.target
+                    || selection.transition_id != work.transition_id
+                    || state.request.dependency_inputs != vec![selection.input.output.clone()]
+                    || state.request.settings_revision != state.participant.settings_revision
+                    || serde_json::to_value(&state.request.settings).ok().as_ref()
+                        != Some(&state.participant.settings)
+                    || !selection.validate_structure()
+                    || journal.composition.finalize_selection(
+                        &selection.target,
+                        &selection.transition_id,
+                        caller,
+                        &selection.input.output.output_id,
+                    ) != Some(selection)
+                    || journal.composition.get(
+                        caller,
+                        &selection.input.output.output_id,
+                        &selection.input.output.origin,
+                    ) != Some(&selection.input)
+                    || !self.settings.finalize_policies.contains(&selection.policy)
+                    || selection
+                        .schema_documents
+                        .iter()
+                        .any(|doc| !self.settings.schema_documents.contains(doc))
+                    || selected.is_none_or(|selected| {
+                        !selected.approvals.contains(&selection.finalize_approval)
+                            || !selected
+                                .approvals
+                                .contains(&selection.finalize_status_approval)
+                    })
+                {
+                    continue;
+                }
+                state
+            } else {
+                let Some(state) = work.states.get(caller) else {
+                    continue;
+                };
+                state
             };
             let request = &state.request;
-            let Ok((target_epoch, session_id, stream_id, _)) =
+            let Ok((target_epoch, session_id, stream_id, generation)) =
                 super::operations::target_parts(&request.target)
             else {
                 continue;
@@ -83,6 +142,17 @@ impl Coordinator {
             let Some(session) = journal.sessions.get(session_id) else {
                 continue;
             };
+            if nested.is_some()
+                && (session.host_epoch != target_epoch
+                    || stream_id
+                        .and_then(|id| session.streams.get(id))
+                        .is_none_or(|stream| stream.generation != generation)
+                    || nested.is_some_and(|finalize| {
+                        finalize.selection.parent_generation != Some(session.generation)
+                    }))
+            {
+                continue;
+            }
             let phase_allowed = match request.phase {
                 LifecyclePhase::SessionPrepare => session.phase == SessionPhase::Preparing,
                 LifecyclePhase::StreamPrepare => stream_id

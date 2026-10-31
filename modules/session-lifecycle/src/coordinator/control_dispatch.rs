@@ -18,13 +18,21 @@ const MAX_STATUS_POLLS: u32 = 32;
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ControlPhase {
     Effect,
-    Status { receipt_id: String },
+    Status {
+        receipt_id: String,
+    },
     /// The owner reported Applied; this is provisional until settlement is
     /// durably recorded and the owner acknowledges its independent CAS.
     #[serde(alias = "confirmed")]
-    Applied { result: Box<ConfirmedControl> },
-    Rejected { reason: String },
-    RecoveryRequired { reason: String },
+    Applied {
+        result: Box<ConfirmedControl>,
+    },
+    Rejected {
+        reason: String,
+    },
+    RecoveryRequired {
+        reason: String,
+    },
 }
 
 /// Persist before constructing a dispatcher. The effect call and permit are
@@ -39,6 +47,9 @@ pub struct ControlDispatchState {
     pub phase: ControlPhase,
     pub status_polls: u32,
     pub dispatch: Option<DispatchRecord>,
+    /// Exact owner Pending response that established the status receipt.
+    #[serde(default)]
+    pub pending_proof: Option<DispatchRecord>,
 }
 
 impl ControlDispatchState {
@@ -91,6 +102,7 @@ impl ControlDispatchState {
             phase: ControlPhase::Effect,
             status_polls: 0,
             dispatch: None,
+            pending_proof: None,
         })
     }
 }
@@ -117,6 +129,11 @@ impl ControlDispatch {
         if state.status_polls > MAX_STATUS_POLLS {
             return Err("invalid_control_state".into());
         }
+        if let ControlPhase::Status { receipt_id } = &state.phase
+            && !valid_pending_proof(&state, receipt_id)
+        {
+            return Err("control_pending_receipt_unproven".into());
+        }
         if let Some(record) = &state.dispatch {
             let valid = match &state.phase {
                 ControlPhase::Effect => record.call == state.effect_call,
@@ -138,6 +155,34 @@ impl ControlDispatch {
                         && serde_json::to_value(expected).ok().as_ref() == Some(&call.arguments)
                 }
                 ControlPhase::RecoveryRequired { .. } => true,
+                ControlPhase::Applied { result } => {
+                    let exact_call = record.call == state.effect_call;
+                    let status: Option<ProviderStatusRequest> =
+                        serde_json::from_value(record.call.arguments.clone()).ok();
+                    let status_call = record.call.service == state.status_selection.service
+                        && record.call.method == state.status_selection.method
+                        && record.call.interface_major == state.status_selection.interface_major
+                        && record.call.interface_minor == state.status_selection.interface_minor
+                        && record.call.approval == state.status_selection.approval
+                        && status.as_ref().is_some_and(|status| {
+                            status.provider_sequence == state.request.provider_sequence
+                                && status.operation_id == state.request.operation_id
+                                && status.transition_id == state.request.transition_id
+                                && !status.receipt_id.is_empty()
+                        });
+                    let expected = ResourceControlResponse::Applied {
+                        output: Box::new(result.output.clone()),
+                        candidate: result.candidate.clone().map(Box::new),
+                    };
+                    // Status completion requires independently retained Pending
+                    // receipt proof, which older journals do not provide.
+                    (exact_call
+                        || (status_call
+                            && status.as_ref().is_some_and(|status| {
+                                valid_pending_proof(&state, &status.receipt_id)
+                            })))
+                        && matches!(&record.state, DispatchState::Completed { payload } if serde_json::to_value(expected).ok().as_ref() == Some(payload))
+                }
                 _ => false,
             };
             if !valid {
@@ -290,9 +335,19 @@ impl ControlDispatch {
                     && receipt_id.len() <= 128
                     && !receipt_id.chars().any(char::is_control) =>
             {
+                if matches!(next.phase, ControlPhase::Effect) {
+                    next.pending_proof = next.dispatch.clone();
+                } else if !valid_pending_proof(&next, &receipt_id) {
+                    return Err("control_pending_receipt_unproven".into());
+                }
                 ControlPhase::Status { receipt_id }
             }
             ResourceControlResponse::Applied { output, candidate } => {
+                if let ControlPhase::Status { receipt_id } = &next.phase
+                    && !valid_pending_proof(&next, receipt_id)
+                {
+                    return Err("control_pending_receipt_unproven".into());
+                }
                 let proposal = &next.request.proposal;
                 if output.producer != proposal.owner_provider
                     || output.producer_service != proposal.owner_service
@@ -340,7 +395,9 @@ impl ControlDispatch {
             }
             _ => return Err("invalid_control_response".into()),
         };
-        next.dispatch = None;
+        if !matches!(next.phase, ControlPhase::Applied { .. }) {
+            next.dispatch = None;
+        }
         self.persist(journal, next)?;
         self.dispatcher = None;
         Ok(())
@@ -358,6 +415,13 @@ impl ControlDispatch {
         self.state = next;
         Ok(())
     }
+}
+
+fn valid_pending_proof(state: &ControlDispatchState, receipt_id: &str) -> bool {
+    state.pending_proof.as_ref().is_some_and(|proof| {
+        proof.call == state.effect_call
+            && matches!(&proof.state, DispatchState::Completed { payload } if payload == &serde_json::json!({"status":"pending", "receipt_id":receipt_id}))
+    })
 }
 
 struct JournalBridge<'a, J> {
@@ -520,6 +584,12 @@ mod tests {
         let mut journal = Journal::default();
         let mut validate =
             |_: &ResourceControlRequest, _: &ResourceOutput, _: &ConfirmedControl| Ok(());
+        job.state.dispatch = Some(DispatchRecord {
+            call: job.state.effect_call.clone(),
+            state: DispatchState::Completed {
+                payload: json!({"status":"pending","receipt_id":"receipt"}),
+            },
+        });
         job.settle(
             json!({"status":"pending","receipt_id":"receipt"}),
             &mut journal,

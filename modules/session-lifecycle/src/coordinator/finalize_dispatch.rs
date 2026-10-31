@@ -43,6 +43,9 @@ pub(super) struct FinalizeDispatchState {
     pub phase: FinalizePhase,
     pub status_polls: u32,
     pub dispatch: Option<DispatchRecord>,
+    /// Exact owner Pending response that established the status receipt.
+    #[serde(default)]
+    pub pending_proof: Option<DispatchRecord>,
 }
 impl FinalizeDispatchState {
     pub fn new(
@@ -89,6 +92,7 @@ impl FinalizeDispatchState {
             phase: FinalizePhase::Effect,
             status_polls: 0,
             dispatch: None,
+            pending_proof: None,
         })
     }
 }
@@ -111,6 +115,11 @@ impl FinalizeDispatch {
         if state.status_polls > MAX_STATUS_POLLS {
             return Err("invalid_finalize_state".into());
         }
+        if let FinalizePhase::Status { receipt_id } = &state.phase
+            && !valid_pending_proof(&state, receipt_id)
+        {
+            return Err("finalize_pending_receipt_unproven".into());
+        }
         if let Some(record) = &state.dispatch {
             let valid = match &state.phase {
                 FinalizePhase::Effect => record.call == state.effect_call,
@@ -118,6 +127,17 @@ impl FinalizeDispatch {
                     status_matches(&state, &record.call, receipt_id)
                 }
                 FinalizePhase::RecoveryRequired { .. } => true,
+                FinalizePhase::Confirmed { result } => {
+                    let status: Option<ProviderStatusRequest> =
+                        serde_json::from_value(record.call.arguments.clone()).ok();
+                    let selected = record.call == state.effect_call
+                        || status.is_some_and(|status| {
+                            status_matches(&state, &record.call, &status.receipt_id)
+                                && valid_pending_proof(&state, &status.receipt_id)
+                        });
+                    selected
+                        && matches!(&record.state, DispatchState::Completed { payload } if serde_json::to_value(result.as_ref()).ok().as_ref() == Some(payload))
+                }
                 _ => false,
             };
             if !valid {
@@ -244,14 +264,26 @@ impl FinalizeDispatch {
         let mut next = self.state.clone();
         next.phase = match &response {
             ResourceControlResponse::Applied { .. } => {
+                if let FinalizePhase::Status { receipt_id } = &next.phase
+                    && !valid_pending_proof(&next, receipt_id)
+                {
+                    return Err("finalize_pending_receipt_unproven".into());
+                }
                 validate_applied(&next.request, &next.context, &response)?;
                 FinalizePhase::Confirmed {
                     result: Box::new(response),
                 }
             }
-            ResourceControlResponse::Pending { receipt_id } => FinalizePhase::Status {
-                receipt_id: receipt_id.clone(),
-            },
+            ResourceControlResponse::Pending { receipt_id } => {
+                if matches!(next.phase, FinalizePhase::Effect) {
+                    next.pending_proof = next.dispatch.clone();
+                } else if !valid_pending_proof(&next, receipt_id) {
+                    return Err("finalize_pending_receipt_unproven".into());
+                }
+                FinalizePhase::Status {
+                    receipt_id: receipt_id.clone(),
+                }
+            }
             ResourceControlResponse::Rejected { reason }
                 if matches!(next.phase, FinalizePhase::Status { .. }) =>
             {
@@ -268,7 +300,9 @@ impl FinalizeDispatch {
                 }
             }
         };
-        next.dispatch = None;
+        if !matches!(next.phase, FinalizePhase::Confirmed { .. }) {
+            next.dispatch = None;
+        }
         self.persist(journal, next)?;
         self.dispatcher = None;
         Ok(())
@@ -286,6 +320,13 @@ impl FinalizeDispatch {
         Ok(())
     }
 }
+fn valid_pending_proof(state: &FinalizeDispatchState, receipt_id: &str) -> bool {
+    state.pending_proof.as_ref().is_some_and(|proof| {
+        proof.call == state.effect_call
+            && matches!(&proof.state, DispatchState::Completed { payload } if payload == &serde_json::json!({"status":"pending", "receipt_id":receipt_id}))
+    })
+}
+
 fn status_matches(state: &FinalizeDispatchState, call: &ProviderCall, receipt_id: &str) -> bool {
     let pinned = &state.status_selection;
     let expected = ProviderStatusRequest {
@@ -453,5 +494,25 @@ mod tests {
             .is_err()
         );
         assert!(journal.0.is_empty());
+    }
+    #[test]
+    fn recovered_confirmation_requires_exact_completed_owner_response() {
+        let mut state = fixture();
+        let response = ResourceControlResponse::Applied {
+            output: Box::new(state.request.output.clone()),
+            candidate: None,
+        };
+        state.phase = FinalizePhase::Confirmed {
+            result: Box::new(response.clone()),
+        };
+        state.dispatch = Some(DispatchRecord {
+            call: state.effect_call.clone(),
+            state: DispatchState::Completed {
+                payload: serde_json::to_value(&response).unwrap(),
+            },
+        });
+        assert!(FinalizeDispatch::new(state.clone()).is_ok());
+        state.dispatch.as_mut().unwrap().call.approval["provider"] = json!("other");
+        assert!(FinalizeDispatch::new(state).is_err());
     }
 }

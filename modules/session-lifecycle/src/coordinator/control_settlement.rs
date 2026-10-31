@@ -15,12 +15,26 @@ const MAX_SETTLEMENTS: usize = 128;
 #[serde(deny_unknown_fields)]
 pub(super) struct ControlSettlementRecord {
     pub settlement: ResourceControlSettlementRequest,
+    /// Coordinator-selected original input selection, which may predate release.
+    pub selection_transition_id: String,
     pub confirmed: ConfirmedControl,
     pub applied: ResourceControlResponse,
+    /// Exact owner effect or status result that produced `applied`.
+    pub effect_dispatch: DispatchRecord,
+    /// Original owner Pending response when the effect settled via status.
+    #[serde(default)]
+    pub effect_pending_proof: Option<DispatchRecord>,
     pub owner_receipt_id: Option<String>,
     pub owner_ack: Option<ResourceControlResponse>,
     #[serde(default)]
     pub owner_dispatch: Option<DispatchRecord>,
+}
+impl ControlSettlementRecord {
+    /// Structural and exact permit-scoped dispatch checks; installed broker
+    /// approvals and live or retained provenance require separate verification.
+    pub fn valid_under_permit(&self, permit: &ControlPermit) -> bool {
+        valid_record(self) && effect_matches_policy(self, permit)
+    }
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -74,6 +88,7 @@ impl ControlSettlementBook {
             || permit.context.transition_id != item.settlement.request.transition_id
             || permit.context.output.schema != item.confirmed.output.schema
             || permit.context.output.origin != item.confirmed.output.origin
+            || !effect_matches_policy(&item, permit)
             || !valid_record(&item)
             || !verify(&item)
         {
@@ -131,6 +146,9 @@ impl ControlSettlementBook {
 }
 fn valid_record(item: &ControlSettlementRecord) -> bool {
     validate_resource_control_settlement_request(&item.settlement).is_ok()
+        && !item.selection_transition_id.is_empty()
+        && item.selection_transition_id.len() <= 128
+        && !item.selection_transition_id.chars().any(char::is_control)
         && validate_resource_control_response(&item.settlement.request, &item.applied).is_ok()
         && item
             .owner_receipt_id
@@ -139,6 +157,9 @@ fn valid_record(item: &ControlSettlementRecord) -> bool {
         && item.confirmed.proposal_id == item.settlement.request.proposal.proposal_id
         && item.confirmed.output == item.settlement.output
         && matches!(&item.applied,ResourceControlResponse::Applied { output,candidate } if **output==item.confirmed.output && candidate.as_deref()==item.confirmed.candidate.as_ref())
+        && item.effect_dispatch.call.approval["provider"].as_str()
+            == Some(item.settlement.request.proposal.owner_provider.as_str())
+        && matches!(&item.effect_dispatch.state, DispatchState::Completed { payload } if serde_json::to_value(&item.applied).ok().as_ref() == Some(payload))
         && match (&item.owner_ack, &item.owner_dispatch) {
             (None, None) => true,
             (Some(ack), Some(dispatch)) => {
@@ -147,6 +168,45 @@ fn valid_record(item: &ControlSettlementRecord) -> bool {
             }
             _ => false,
         }
+}
+fn effect_matches_policy(item: &ControlSettlementRecord, permit: &ControlPermit) -> bool {
+    let call = &item.effect_dispatch.call;
+    let policy = &permit.context.policy;
+    let matches_method = |method: &amaterasu_extension_api::MethodRef| {
+        call.service == method.service
+            && call.method == method.method
+            && call.interface_major == method.interface_major
+            && call.interface_minor == method.interface_minor
+    };
+    let direct = matches_method(&policy.owner_method)
+        && call.operation_id == item.settlement.request.operation_id
+        && serde_json::to_value(&item.settlement.request).ok().as_ref() == Some(&call.arguments);
+    let status: Option<amaterasu_extension_api::ProviderStatusRequest> =
+        serde_json::from_value(call.arguments.clone()).ok();
+    let polled = matches_method(&policy.status_method)
+        && call.operation_id != item.settlement.request.operation_id
+        && status.is_some_and(|status| {
+            status.provider_sequence == item.settlement.request.provider_sequence
+                && status.operation_id == item.settlement.request.operation_id
+                && status.transition_id == item.settlement.request.transition_id
+                && !status.receipt_id.is_empty()
+                && item.effect_pending_proof.as_ref().is_some_and(|proof| {
+                    matches_method_call(&proof.call, &policy.owner_method)
+                        && proof.call.operation_id == item.settlement.request.operation_id
+                        && serde_json::to_value(&item.settlement.request).ok().as_ref() == Some(&proof.call.arguments)
+                        && matches!(&proof.state, DispatchState::Completed { payload } if payload == &serde_json::json!({"status":"pending","receipt_id":status.receipt_id}))
+                })
+        });
+    direct || polled
+}
+fn matches_method_call(
+    call: &crate::provider_dispatch::ProviderCall,
+    method: &amaterasu_extension_api::MethodRef,
+) -> bool {
+    call.service == method.service
+        && call.method == method.method
+        && call.interface_major == method.interface_major
+        && call.interface_minor == method.interface_minor
 }
 fn valid_dispatch(
     item: &ControlSettlementRecord,
@@ -170,7 +230,7 @@ mod tests {
         let resource = json!({"provider":"owner","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":"domain","mutation_domains":["domain"]});
         let output = json!({"output_id":"out","capability":"display","schema":schema,"producer":"owner","producer_service":"owner/2","origin":target,"resource":resource,"data":{},"domain_observations":[{"domain":"domain","revision":1,"borrowers":{},"complete":true}]});
         let request = json!({"version":2,"transition_id":"transition","operation_id":"effect","provider_sequence":1,"target":target,"proposal":{"proposal_id":"proposal","output_id":"out","owner_provider":"owner","owner_service":"owner/2","target":target,"resource":resource,"method":{"service":"owner/2","method":"control","interface_major":2,"interface_minor":0,"schema_revision":1},"argument_schema":schema,"arguments":{},"access":"exclusive","mutation_domains":["domain"]},"admission_id":"admission","permit_id":"permit","remaining_ms":1000});
-        serde_json::from_value(json!({"settlement":{"request":request,"output":output,"settlement_id":"settlement"},"confirmed":{"proposal_id":"proposal","output":output,"candidate":null},"applied":{"status":"applied","output":output,"candidate":null},"owner_receipt_id":null,"owner_ack":null})).unwrap()
+        serde_json::from_value(json!({"settlement":{"request":request,"output":output,"settlement_id":"settlement"},"selection_transition_id":"transition","confirmed":{"proposal_id":"proposal","output":output,"candidate":null},"applied":{"status":"applied","output":output,"candidate":null},"effect_dispatch":{"call":{"service":"owner/2","method":"control","interface_major":2,"interface_minor":0,"approval":{"provider":"owner"},"arguments":request,"timeout_ms":1000,"operation_id":"effect"},"state":{"state":"completed","payload":{"status":"applied","output":output,"candidate":null}}},"owner_receipt_id":null,"owner_ack":null})).unwrap()
     }
     #[test]
     fn acknowledgement_requires_exact_output_and_trusted_owner_proof() {

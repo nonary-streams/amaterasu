@@ -360,21 +360,42 @@ impl Coordinator {
             if caller.is_empty() || caller != tuple.request.proposal.owner_provider {
                 return Err("settlement_owner_mismatch".into());
             }
+            if let Some(result) = self.verify_historical_settlement(caller, &tuple)? {
+                return Ok(result);
+            }
             let mut backend = Backend { coordinator: self };
             let resolved = backend.resolve_control(&tuple.request, Some(&tuple))?;
             {
                 let shared = backend.coordinator.shared.borrow();
-                let refinements: Vec<_> = shared
+                let record = shared
                     .value
-                    .composition
-                    .refinements()
-                    .filter(|item| item.request == tuple.request)
-                    .collect();
-                if refinements.is_empty() || refinements.iter().any(|item| {
-                item.confirmed.output != tuple.output
-                    || amaterasu_extension_api::validate_resource_control_response(&item.request, &item.owner_result).is_err()
-                    || !matches!(&item.owner_result, amaterasu_extension_api::ResourceControlResponse::Applied { output, candidate } if **output == item.confirmed.output && candidate.as_deref() == item.confirmed.candidate.as_ref())
-                }) { return Err("settlement_refinement_unavailable".into()); }
+                    .control_settlements
+                    .get(&tuple.settlement_id)
+                    .ok_or("settlement_record_unavailable")?;
+                if record.settlement != tuple
+                    || record.owner_ack.is_some()
+                    || record.owner_dispatch.is_some()
+                {
+                    return Err("settlement_record_mismatch".into());
+                }
+                let mut stages = shared.value.receipts.values().filter_map(|receipt| {
+                    if receipt.response["status"] != "pending" {
+                        return None;
+                    }
+                    let work = receipt.work.as_ref()?;
+                    let progress = work.composition_progress.as_ref()?;
+                    progress
+                        .controls
+                        .iter()
+                        .find(|control| control.dispatch.request == tuple.request)
+                });
+                let stage = stages.next().ok_or("settlement_control_unavailable")?;
+                if stages.next().is_some()
+                    || stage.dispatch.dispatch.as_ref() != Some(&record.effect_dispatch)
+                    || !matches!(&stage.dispatch.phase, super::control_dispatch::ControlPhase::Applied { result } if **result == record.confirmed)
+                {
+                    return Err("settlement_effect_proof_mismatch".into());
+                }
             }
             backend.validate(caller, &resolved, &tuple.request)?;
             backend
@@ -389,6 +410,145 @@ impl Coordinator {
         result.unwrap_or_else(
             |_| json!({"status":"rejected","reason":"resource_control_not_authorized"}),
         )
+    }
+
+    /// Read-only proof of an already acknowledged exact tuple. It grants no
+    /// mutation authority and does not require the original Work to be pending.
+    fn verify_historical_settlement(
+        &self,
+        caller: &str,
+        tuple: &ResourceControlSettlementRequest,
+    ) -> ModuleResult<Option<Value>> {
+        let shared = self.shared.borrow();
+        let journal = &shared.value;
+        let Some(record) = journal.control_settlements.get(&tuple.settlement_id) else {
+            return Ok(None);
+        };
+        if record.owner_ack.is_none() {
+            return Ok(None);
+        }
+        if record.settlement != *tuple || !journal.control_settlements.validate_structure() {
+            return Err("settlement_record_mismatch".into());
+        }
+        let permit = journal
+            .authority
+            .control_permits
+            .get(&tuple.request.permit_id)
+            .ok_or("settlement_permit_unavailable")?;
+        if !permit.consumed
+            || !permit.settled
+            || permit.request != tuple.request
+            || caller != permit.context.policy.owner_provider
+            || !record.valid_under_permit(permit)
+        {
+            return Err("settlement_permit_mismatch".into());
+        }
+        let admission = journal
+            .authority
+            .admissions
+            .get(&tuple.request.admission_id)
+            .or_else(|| journal.authority.settled.get(&tuple.request.admission_id))
+            .ok_or("settlement_admission_unavailable")?;
+        if admission.provider != permit.context.policy.dependent_provider
+            || !admission
+                .plan
+                .control_proposals
+                .contains(&tuple.request.proposal)
+        {
+            return Err("settlement_admission_mismatch".into());
+        }
+        let selection = journal
+            .composition
+            .selection(
+                &tuple.request.target,
+                &record.selection_transition_id,
+                &admission.provider,
+                caller,
+                &tuple.request.proposal.output_id,
+            )
+            .ok_or("settlement_selection_unavailable")?;
+        if !selection.validate_structure()
+            || selection.control_policy != permit.context.policy
+            || selection.input.output != permit.context.output
+            || journal.composition.get(
+                caller,
+                &selection.input.output.output_id,
+                &selection.input.output.origin,
+            ) != Some(&selection.input)
+            || !self
+                .settings
+                .control_policies
+                .contains(&selection.control_policy)
+            || selection
+                .schema_documents
+                .iter()
+                .any(|doc| !self.settings.schema_documents.contains(doc))
+        {
+            return Err("settlement_selection_mismatch".into());
+        }
+        let source = journal
+            .authority
+            .admissions
+            .get(&selection.input.admission_id)
+            .or_else(|| journal.authority.settled.get(&selection.input.admission_id))
+            .ok_or("settlement_source_unavailable")?;
+        if source.provider != caller
+            || source.plan != selection.input.plan
+            || journal
+                .admission_transitions
+                .get(&selection.input.admission_id)
+                != Some(&selection.input.transition_id)
+        {
+            return Err("settlement_source_mismatch".into());
+        }
+        let effect = &record.effect_dispatch.call;
+        let effect_approved = [
+            &selection.control_approval,
+            &selection.control_status_approval,
+        ]
+        .iter()
+        .any(|approval| super::composition::approval_matches_call(approval, effect));
+        if record.effect_pending_proof.as_ref().is_some_and(|proof| {
+            !super::composition::approval_matches_call(&selection.control_approval, &proof.call)
+        }) {
+            return Err("settlement_pending_approval_mismatch".into());
+        }
+        let settled = record
+            .owner_dispatch
+            .as_ref()
+            .ok_or("settlement_ack_missing")?;
+        if !effect_approved
+            || !super::composition::approval_matches_call(
+                &selection.settlement_approval,
+                &settled.call,
+            )
+        {
+            return Err("settlement_proof_approval_mismatch".into());
+        }
+        let (epoch, session_id, stream_id, generation) =
+            super::operations::target_parts(&tuple.request.target)?;
+        let session = journal.sessions.get(session_id).ok_or("unknown_session")?;
+        if epoch != journal.host_epoch
+            || session.host_epoch != epoch
+            || stream_id
+                .and_then(|id| session.streams.get(id))
+                .is_none_or(|stream| stream.generation != generation)
+        {
+            return Err("settlement_target_stale".into());
+        }
+        if let LifecycleTarget::Session {
+            generation: parent, ..
+        } = selection.input.output.origin
+            && parent != session.generation
+        {
+            return Err("settlement_parent_stale".into());
+        }
+        self.settings
+            .schema_catalog()?
+            .validate(&tuple.output.schema, &tuple.output.data)?;
+        Ok(Some(
+            json!({"status":"valid", "session_target":{"kind":"session","host_epoch":session.host_epoch,"session_id":session.id,"generation":session.generation}, "target":tuple.request.target,"output":tuple.output,"consumers_retired":false}),
+        ))
     }
 }
 
