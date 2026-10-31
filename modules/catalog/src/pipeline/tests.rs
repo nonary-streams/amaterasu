@@ -390,6 +390,135 @@ fn run_steam_artwork_snapshot(
     assert_eq!(finish["ok"], true, "{finish}");
 }
 
+#[test]
+fn provider_commit_invalidates_other_importers_cached_catalogs() {
+    let mut backend = Backend::default();
+    let mut pipeline = lutris_artwork_importer();
+    run_steam_artwork_snapshot(&mut backend, &mut pipeline, "steam-scan", 1, None);
+    let begin = backend.run_for(
+        &mut pipeline,
+        snapshot_begin("lutris-scan", 1),
+        "amaterasu.lutris",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    let generation = begin["generation"].as_u64().unwrap();
+    let batch = backend.run_for(
+        &mut pipeline,
+        snapshot_batch(
+            "lutris-scan",
+            generation,
+            1,
+            0,
+            1,
+            vec![("42", entry("Lutris game"))],
+        ),
+        "amaterasu.lutris",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(batch["revision"], 2);
+    let replay = backend.run_for(
+        &mut pipeline,
+        snapshot_finish("steam-scan", 1, 1, 1, 1, true),
+        "amaterasu.steam",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(replay["ok"], true, "{replay}");
+    assert_eq!(replay["revision"], 2);
+}
+
+#[test]
+fn lost_provider_commit_ack_invalidates_other_importer_caches() {
+    let mut backend = Backend::default();
+    let mut pipeline = lutris_artwork_importer();
+    run_steam_artwork_snapshot(&mut backend, &mut pipeline, "steam-scan", 1, None);
+    let begin = backend.run_for(
+        &mut pipeline,
+        snapshot_begin("lutris-scan", 1),
+        "amaterasu.lutris",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    let generation = begin["generation"].as_u64().unwrap();
+    let inventory = backend.run_for(
+        &mut pipeline,
+        snapshot_inventory(None, None, 32),
+        "amaterasu.steam",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(inventory["ok"], true);
+    assert!(pipeline.provider_sessions.contains_key("amaterasu.steam"));
+    backend.lose_commit_ack_once = true;
+    let lost = backend.run_for(
+        &mut pipeline,
+        snapshot_batch(
+            "lutris-scan",
+            generation,
+            1,
+            0,
+            1,
+            vec![("42", entry("Lutris game"))],
+        ),
+        "amaterasu.lutris",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(lost["error"]["code"], "deadline_exceeded");
+    let replay = backend.run_for(
+        &mut pipeline,
+        snapshot_finish("steam-scan", 1, 1, 1, 1, true),
+        "amaterasu.steam",
+        "amaterasu.management",
+        "amaterasu.management",
+    );
+    assert_eq!(replay["ok"], true, "{replay}");
+    assert_eq!(replay["revision"], 2);
+}
+
+#[test]
+fn interrupted_cleanup_discards_the_precommit_cache() {
+    let mut backend = Backend::default();
+    let mut pipeline = lutris_artwork_importer();
+    run_steam_artwork_snapshot(&mut backend, &mut pipeline, "steam-scan", 1, None);
+    let session = pipeline.provider_sessions["amaterasu.steam"].clone();
+    let marker = session.markers.values().next().unwrap().clone();
+    let context = Context {
+        request_id: 7,
+        key: session.key.clone(),
+        catalog_owner: None,
+        importer: Some(session.caller.clone()),
+        provider_count: 0,
+        deadline: Instant::now() - Duration::from_secs(1),
+    };
+    let save = ProviderSave {
+        session,
+        reply: json!({"ok":true}),
+        remaining_cleanup: vec![marker],
+        finish: true,
+    };
+    let mut completed = None;
+    pipeline
+        .consume(
+            context,
+            Stage::ProviderSaving(save),
+            backend.revision + 1,
+            json!({}),
+            &mut |command| {
+                match command {
+                    Command::Complete { payload, .. } => completed = Some(payload),
+                    _ => panic!("expired cleanup submitted another request"),
+                }
+                Ok(Response::Ok)
+            },
+        )
+        .unwrap();
+    assert_eq!(completed.unwrap()["error"]["code"], "deadline_exceeded");
+    assert!(!pipeline.provider_sessions.contains_key("amaterasu.steam"));
+}
+
 fn playnite_importer() -> Pipeline {
     Pipeline::new_with_steam_id_export_principals(
         BTreeSet::new(),
@@ -2067,6 +2196,95 @@ fn delegated_launch_lookup_uses_bound_initiator_and_requires_startup_authority()
             json!({"action":"resolve_launch","id":"app-0000000000000001","owner":"victim"})
         )
         .is_err()
+    );
+}
+
+#[test]
+fn library_exports_use_the_authenticated_configured_initiator() {
+    let pipeline = Pipeline::new_with_steam_id_export_principals(
+        BTreeSet::new(),
+        BTreeMap::from([("nvhttp".into(), "management".into())]),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let list = || Operation::ExportList {
+        cursor: None,
+        limit: None,
+    };
+    let resolve = || Operation::ResolveExported {
+        id: "app-0000000000000001".into(),
+    };
+    for operation in [list(), resolve()] {
+        let (key, _, _) = pipeline
+            .select_catalog("amaterasu.library", "nvhttp", operation)
+            .unwrap();
+        assert_eq!(key, "principal/management");
+    }
+    assert!(
+        pipeline
+            .select_catalog("amaterasu.library", "foreign", list())
+            .is_err()
+    );
+    assert!(
+        pipeline
+            .select_catalog("amaterasu.library", "foreign", resolve())
+            .is_err()
+    );
+    assert!(
+        pipeline
+            .select_catalog("stranger", "nvhttp", list())
+            .is_err()
+    );
+    assert!(
+        pipeline
+            .select_catalog("stranger", "nvhttp", resolve())
+            .is_err()
+    );
+    assert!(
+        pipeline
+            .select_catalog(
+                "amaterasu.library",
+                "nvhttp",
+                Operation::ResolveLaunch {
+                    id: "app-0000000000000001".into()
+                }
+            )
+            .is_err()
+    );
+    assert!(
+        pipeline
+            .select_catalog(
+                "amaterasu.library",
+                "nvhttp",
+                Operation::ResolveExportedLaunch {
+                    id: "app-0000000000000001".into()
+                }
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn library_resolve_returns_only_public_fields() {
+    let mut backend = Backend::default();
+    let mut pipeline = Pipeline::new_with_steam_id_export_principals(
+        BTreeSet::new(),
+        BTreeMap::from([("nvhttp".into(), "management".into())]),
+        BTreeMap::new(),
+        BTreeMap::new(),
+    );
+    let created = backend.run_for(&mut Pipeline::default(), json!({"action":"create","expected_revision":0,"entry":{"name":"Visible","launch":{"kind":"application","path":"/secret/path"}}}), "management", "management", "management");
+    assert_eq!(created["ok"], true);
+    let resolved = backend.run_for(
+        &mut pipeline,
+        json!({"action":"resolve_exported","id":"app-0000000000000001"}),
+        "amaterasu.library",
+        "nvhttp",
+        "management",
+    );
+    assert_eq!(
+        resolved,
+        json!({"ok":true,"revision":1,"id":"app-0000000000000001","name":"Visible"})
     );
 }
 

@@ -21,6 +21,10 @@ pub enum Operation {
     ResolveExportedLaunch {
         id: String,
     },
+    /// Resolve a client-visible entry without disclosing launch metadata.
+    ResolveExported {
+        id: String,
+    },
     Update {
         id: String,
         entry: Entry,
@@ -148,6 +152,12 @@ pub enum Change {
 pub fn apply(operation: Operation, existing: Option<Document>) -> Result<Change, Value> {
     let mut document = existing.unwrap_or_default();
     let reply = match operation {
+        Operation::ResolveExported { id } => {
+            let entry = find_entry(&document, &id)?;
+            return Ok(Change::Read(
+                json!({"ok":true,"revision":document.revision,"id":id,"name":entry.name}),
+            ));
+        }
         Operation::Get { id }
         | Operation::ResolveLaunch { id }
         | Operation::ResolveExportedLaunch { id } => {

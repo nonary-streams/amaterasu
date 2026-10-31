@@ -23,6 +23,7 @@ const MAX_SCAN: usize = 256;
 // reaching the Lutris prefix. It remains bounded by both catalog populations.
 const MAX_LAUNCH_MARKER_SCAN: usize = MAX_ENTRIES * 2;
 const MANAGEMENT_PRINCIPAL: &str = "amaterasu.management";
+const LIBRARY_PRINCIPAL: &str = "amaterasu.library";
 const PLAYNITE_IMPORTER: &str = "amaterasu.playnite";
 const STEAM_IMPORTER: &str = "amaterasu.steam";
 const LUTRIS_IMPORTER: &str = "amaterasu.lutris";
@@ -269,10 +270,30 @@ impl Pipeline {
                 Ok((format!("principal/{caller}"), None, operation))
             }
             operation @ Operation::ExportList { .. } => {
-                let owner = self.export_principals.get(caller).ok_or_else(|| {
+                let consumer = if caller == LIBRARY_PRINCIPAL {
+                    initiator
+                } else {
+                    caller
+                };
+                let owner = self.export_principals.get(consumer).ok_or_else(|| {
                     error(
                         "permission_denied",
                         "caller is not an authorized catalog consumer",
+                    )
+                })?;
+                Ok((format!("principal/{owner}"), None, operation))
+            }
+            operation @ Operation::ResolveExported { .. } => {
+                if caller != LIBRARY_PRINCIPAL {
+                    return Err(error(
+                        "permission_denied",
+                        "caller is not the library facade",
+                    ));
+                }
+                let owner = self.export_principals.get(initiator).ok_or_else(|| {
+                    error(
+                        "permission_denied",
+                        "request initiator is not an authorized catalog consumer",
                     )
                 })?;
                 Ok((format!("principal/{owner}"), None, operation))
@@ -430,6 +451,7 @@ impl Pipeline {
         let key = match &operation {
             Operation::Get { id }
             | Operation::ResolveLaunch { id }
+            | Operation::ResolveExported { id }
             | Operation::ResolveExportedLaunch { id }
             | Operation::Update { id, .. }
             | Operation::Delete { id, .. } => Some(id),
@@ -2143,6 +2165,12 @@ impl Pipeline {
         stage: Stage,
         send: &mut impl FnMut(Command) -> TransportResult,
     ) -> ModuleResult<()> {
+        if matches!(&stage, Stage::ProviderSaving(_)) {
+            // The outcome may be unknown even when the transport fails. Do
+            // not retain any view of a collection whose commit was attempted.
+            self.provider_sessions
+                .retain(|_, session| session.key != context.key);
+        }
         let remaining_ms = context
             .deadline
             .saturating_duration_since(Instant::now())
@@ -2186,17 +2214,16 @@ impl Pipeline {
                 Ok(())
             }
             Response::Result { payload } => {
+                if matches!(&pending.stage, Stage::ProviderSaving(_)) {
+                    self.provider_sessions
+                        .retain(|_, session| session.key != pending.context.key);
+                }
                 if payload["ok"] != true {
                     let failure = if payload["ok"] == false && payload["error"].is_object() {
                         payload
                     } else {
                         malformed()
                     };
-                    if matches!(&pending.stage, Stage::ProviderSaving(_))
-                        && let Some(caller) = &pending.context.importer
-                    {
-                        self.provider_sessions.remove(caller);
-                    }
                     return complete(send, pending.context.request_id, failure);
                 }
                 let Some(revision) = payload["revision"].as_u64() else {
@@ -2205,10 +2232,9 @@ impl Pipeline {
                 self.consume(pending.context, pending.stage, revision, payload, send)
             }
             failure => {
-                if matches!(&pending.stage, Stage::ProviderSaving(_))
-                    && let Some(caller) = &pending.context.importer
-                {
-                    self.provider_sessions.remove(caller);
+                if matches!(&pending.stage, Stage::ProviderSaving(_)) {
+                    self.provider_sessions
+                        .retain(|_, session| session.key != pending.context.key);
                 }
                 complete(send, pending.context.request_id, runtime_failure(failure))
             }
@@ -2233,6 +2259,11 @@ impl Pipeline {
             }
             Stage::ProviderSaving(mut save) => {
                 save.session.collection_revision = state_revision;
+                // A provider commit changes the collection shared by every
+                // importer for this owner. Discard all cached views, including
+                // this one before a cleanup continuation can fail to submit.
+                self.provider_sessions
+                    .retain(|_, session| session.key != context.key);
                 if save.finish && !save.remaining_cleanup.is_empty() {
                     return self.commit_provider_cleanup(
                         context,
@@ -2484,6 +2515,7 @@ impl Pipeline {
                 };
                 if let Operation::Get { id }
                 | Operation::ResolveLaunch { id }
+                | Operation::ResolveExported { id }
                 | Operation::ResolveExportedLaunch { id }
                 | Operation::Update { id, .. }
                 | Operation::Delete { id, .. } = &operation
@@ -2544,6 +2576,7 @@ impl Pipeline {
                 operation,
                 Operation::ExportList { .. }
                     | Operation::ExportSteamIds { .. }
+                    | Operation::ResolveExported { .. }
                     | Operation::ResolveExportedLaunch { .. }
             ) {
                 return complete_read(send, context, operation, Document::default());
@@ -2562,6 +2595,7 @@ impl Pipeline {
             operation,
             Operation::ExportList { .. }
                 | Operation::ExportSteamIds { .. }
+                | Operation::ResolveExported { .. }
                 | Operation::ResolveExportedLaunch { .. }
         ) {
             return complete_read(send, context, operation, document);
