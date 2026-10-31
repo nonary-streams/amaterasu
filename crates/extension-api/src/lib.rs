@@ -20,6 +20,8 @@ pub struct VideoMode {
 pub struct ResourceRef {
     pub provider: String,
     pub resource_id: String,
+    /// Native producer lifetime, shared by its consumer borrows. This is not a
+    /// consumer's native lease token; the selected provider retains those.
     pub incarnation: String,
     pub revision: u64,
     pub execution_domain: String,
@@ -35,7 +37,11 @@ pub struct CaptureBinding {
     pub selector: Value,
     pub resource: ResourceRef,
     pub mode: VideoMode,
+    /// The admitted plan revision, preserved across its native effect steps.
     pub plan_revision: u64,
+    /// The selected provider's verified geometry observation. It may become
+    /// known only after an admitted effect; the coordinator freezes the exact
+    /// published value together with this binding and stream generation.
     pub geometry_revision: u64,
     pub generation: u64,
     #[serde(default)]
