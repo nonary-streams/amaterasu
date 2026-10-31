@@ -283,10 +283,25 @@ pub fn build_package(
     sequence: u64,
     profile: PackageProfile,
 ) -> PackageResult<()> {
+    build_package_with_external(root, artifacts, output, sequence, profile, None)
+}
+
+/// Include an explicitly selected independently built component in a complete signed set.
+pub fn build_package_with_external(
+    root: &Path,
+    artifacts: &Path,
+    output: &Path,
+    sequence: u64,
+    profile: PackageProfile,
+    external: Option<(&Path, &Path)>,
+) -> PackageResult<()> {
     let bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json"))?;
     if !bootstrap.development {
         return Err("development publisher cannot use a production root".into());
     }
+    let external = external
+        .map(|(template, artifact)| read_external_component(template, artifact, &bootstrap))
+        .transpose()?;
     let secret: String = read_json(&root.join("development-key.json"))?;
     let signing_key = SigningKey::from_bytes(&decode_hex::<32>(&secret)?);
     let authority = if matches!(profile, PackageProfile::LinuxSession)
@@ -310,7 +325,20 @@ pub fn build_package(
         DEVELOPMENT_KEY_ID,
         x264_runtime_available,
         authority.as_ref(),
-    )
+        external.as_ref(),
+    )?;
+    if external.is_some() {
+        verify_package(
+            output,
+            &bootstrap,
+            VerificationPolicy {
+                minimum_sequence: 0,
+                allow_historical: true,
+                now: unix_timestamp(),
+            },
+        )?;
+    }
+    Ok(())
 }
 
 /// Make signed installer seed assets without writing a signing private key into
@@ -2451,6 +2479,7 @@ fn build_signed_package_with_runtime_probe(
         key_id,
         runtime_available,
         None,
+        None,
     )
 }
 
@@ -2464,6 +2493,7 @@ fn build_signed_package_with_runtime_probe_and_authority(
     key_id: &str,
     runtime_available: impl FnOnce(u32) -> bool,
     authority: Option<&crate::capture_authority_package::PackageSpec>,
+    external: Option<&ExternalComponent>,
 ) -> PackageResult<()> {
     if authority.is_some() && !matches!(profile, PackageProfile::LinuxSession) {
         return Err("capture authority is only supported by the Linux session package".into());
@@ -2493,6 +2523,19 @@ fn build_signed_package_with_runtime_probe_and_authority(
             copy_component(artifacts, output, definition, &version)?
         };
         components.push(component);
+    }
+
+    if let Some(external) = external {
+        if components.iter().any(|component| {
+            component.id == external.manifest.id || component.file == external.manifest.file
+        }) {
+            return Err(
+                "external component identity or artifact path duplicates the profile".into(),
+            );
+        }
+        fs::write(output.join(&external.manifest.file), &external.bytes)
+            .map_err(|error| error.to_string())?;
+        components.push(external.manifest.clone());
     }
 
     let privileged_requests = authority
@@ -2727,6 +2770,45 @@ pub(crate) fn x264_runtime_available(_: u32) -> bool {
     false
 }
 
+/// The template declares identity, dependencies and requested routing grants. The
+/// selected bytes, not template-supplied hash or size, determine integrity.
+struct ExternalComponent {
+    manifest: ComponentManifest,
+    bytes: Vec<u8>,
+}
+
+fn read_external_component(
+    template: &Path,
+    artifact: &Path,
+    bootstrap: &BootstrapConfig,
+) -> PackageResult<ExternalComponent> {
+    let mut manifest: ComponentManifest = read_json(template)?;
+    if manifest.runtime {
+        return Err("external component cannot replace the runtime".into());
+    }
+    if !amaterasu_contracts::valid_name(&manifest.file)
+        || manifest.file.starts_with('.')
+        || manifest.file.contains('/')
+    {
+        return Err("external artifact name must be a simple filename".into());
+    }
+    let approved = bootstrap
+        .policy
+        .principals
+        .get(&manifest.id)
+        .ok_or("external component has no installed grant approval")?;
+    let effective = manifest.requested.intersect(approved);
+    if serde_json::to_value(&effective).map_err(|error| error.to_string())?
+        != serde_json::to_value(&manifest.requested).map_err(|error| error.to_string())?
+    {
+        return Err("external component requests grants absent from bootstrap policy".into());
+    }
+    let bytes = read_bounded(artifact, 256 * 1024 * 1024)?;
+    manifest.size = bytes.len() as u64;
+    manifest.sha256 = sha256(&bytes);
+    Ok(ExternalComponent { manifest, bytes })
+}
+
 fn copy_component(
     artifacts: &Path,
     output: &Path,
@@ -2798,4 +2880,131 @@ fn library_filename(name: &str) -> String {
         std::env::consts::DLL_PREFIX,
         std::env::consts::DLL_SUFFIX
     )
+}
+
+#[cfg(test)]
+mod external_component_tests {
+    use super::*;
+
+    #[test]
+    fn selected_component_is_signed_and_tampering_fails_verification() {
+        let base = std::env::temp_dir().join(format!(
+            "amaterasu-external-package-{}",
+            random_identifier().unwrap()
+        ));
+        let root = base.join("root");
+        let artifacts = base.join("artifacts");
+        let output = base.join("package");
+        fs::create_dir_all(&artifacts).unwrap();
+        initialize(&root).unwrap();
+        for definition in PackageProfile::Example.components() {
+            fs::write(
+                artifacts.join(library_filename(definition.library)),
+                b"fixture",
+            )
+            .unwrap();
+        }
+        let artifact = base.join("external");
+        let template = base.join("component.json");
+        fs::write(&artifact, b"independently built").unwrap();
+        let manifest = ComponentManifest {
+            id: "example.display".into(),
+            version: "0.1.0".into(),
+            file: "example_display.so".into(),
+            sha256: String::new(),
+            size: 0,
+            abi_major: amaterasu_abi::ABI_MAJOR,
+            runtime: false,
+            requires: BTreeMap::from([("amaterasu.runtime".into(), "0.1.0".into())]),
+            requested: Grants {
+                provide: ["example.display/1".into()].into(),
+                ..Default::default()
+            },
+        };
+        fs::write(&template, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let mut bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json")).unwrap();
+        bootstrap
+            .policy
+            .principals
+            .insert(manifest.id.clone(), manifest.requested.clone());
+        write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
+        build_package_with_external(
+            &root,
+            &artifacts,
+            &output,
+            1,
+            PackageProfile::Example,
+            Some((&template, &artifact)),
+        )
+        .unwrap();
+        let policy = VerificationPolicy {
+            minimum_sequence: 0,
+            allow_historical: true,
+            now: unix_timestamp(),
+        };
+        let verified = verify_package(&output, &bootstrap, policy).unwrap();
+        assert!(verified.signed);
+        assert!(
+            verified
+                .manifest
+                .components
+                .iter()
+                .any(|entry| entry.id == manifest.id)
+        );
+        fs::write(output.join(&manifest.file), b"tampered").unwrap();
+        assert!(verify_package(&output, &bootstrap, policy).is_err());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn external_component_requires_approved_grants_and_hashes_selected_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-external-{}",
+            random_identifier().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        let template = root.join("component.json");
+        let artifact = root.join("independent-library");
+        let manifest = ComponentManifest {
+            id: "example.display".into(),
+            version: "0.1.0".into(),
+            file: "example_display.so".into(),
+            sha256: "incorrect".into(),
+            size: 0,
+            abi_major: amaterasu_abi::ABI_MAJOR,
+            runtime: false,
+            requires: BTreeMap::from([("amaterasu.runtime".into(), "0.1.0".into())]),
+            requested: Grants {
+                provide: ["example.display/1".into()].into(),
+                ..Default::default()
+            },
+        };
+        fs::write(&template, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        fs::write(&artifact, b"independent bytes").unwrap();
+        let mut bootstrap = BootstrapConfig {
+            development: true,
+            allow_unsigned: false,
+            trusted_keys: BTreeMap::new(),
+            policy: Default::default(),
+        };
+        assert!(read_external_component(&template, &artifact, &bootstrap).is_err());
+        bootstrap
+            .policy
+            .principals
+            .insert(manifest.id.clone(), Grants::default());
+        assert!(read_external_component(&template, &artifact, &bootstrap).is_err());
+        bootstrap
+            .policy
+            .principals
+            .insert(manifest.id.clone(), manifest.requested.clone());
+        let selected = read_external_component(&template, &artifact, &bootstrap).unwrap();
+        assert_eq!(selected.manifest.sha256, sha256(b"independent bytes"));
+        assert_eq!(selected.manifest.size, 17);
+        assert_eq!(selected.manifest.requires, manifest.requires);
+        let mut unsafe_manifest = manifest;
+        unsafe_manifest.file = "../escape".into();
+        fs::write(&template, serde_json::to_vec(&unsafe_manifest).unwrap()).unwrap();
+        assert!(read_external_component(&template, &artifact, &bootstrap).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 }

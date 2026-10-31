@@ -37,3 +37,28 @@ connected to an authenticated service/grant route.
 - The dropdown displays explicit commands; an authenticated browser install flow and compatibility diagnostics are future work. A stale catalog currently makes listing fail closed until refreshed.
 
 No real publisher key was enrolled, no downloaded third-party code was run, and no installed service permissions or persistent production trust were changed.
+
+## Including an independently built library in a local set
+
+The development `pack-linux-session` command accepts an explicit
+`--external-component TEMPLATE_JSON ARTIFACT` pair after its sequence number.
+The publisher builds the external library separately, then supplies its reviewed
+component manifest as `TEMPLATE_JSON` and the library bytes as `ARTIFACT`. The
+manifest uses the ordinary `ComponentManifest` fields, including the identity,
+version, output filename, ABI major, exact component dependencies, and requested
+routing grants. Its `sha256` and `size` fields are placeholders: packaging
+recomputes both from the selected artifact. The external component must not be
+a runtime, and its identity and output filename must differ from the profile's
+components.
+
+Before packaging, the development root's bootstrap policy must separately
+approve every requested grant for that exact component identity. Provider API
+methods, lifecycle hooks, descriptor hashes, caller scopes, and component
+settings also need their own explicit policy approvals where applicable; the
+artifact or template cannot authorize them. The publisher signs the *entire*
+component set with the local development key and verifies the resulting
+signature, target, artifact hashes, identities, and dependency graph. Package
+selection does not stage, activate, or load a library. The selected native code
+is trusted in-process code, and broker grants are not a native-code sandbox.
+This workflow does not mix independently signed sets or establish production
+publisher trust.
