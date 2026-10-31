@@ -380,6 +380,7 @@ fn valid_transition(before: &Dispatch, after: &Dispatch) -> bool {
     let result = match (&before.stage, &after.stage) {
         (Stage::Planning, Stage::AwaitingPermit { plan, .. }) => computed.accept_plan(plan.clone()),
         (Stage::Planning, Stage::Cancelled) => computed.cancel_before_effect(),
+        (Stage::Running { .. }, Stage::Cancelled) => computed.confirm_cancelled_before_effect(),
         (Stage::AwaitingPermit { .. }, Stage::AwaitingConsume { digest, permit, .. }) => computed
             .accept_permit(
                 &before.request.operation_id,
@@ -737,5 +738,36 @@ mod tests {
         assert!(!valid_cancellation(
             &running, &running, &requested, &requested
         ));
+    }
+    #[test]
+    fn confirmed_pre_effect_cancellation_persists_only_exact_dispatch() {
+        let (_, running, epoch) = fixture();
+        let mut stored = epoch;
+        stored["receipts"]["1"]["dispatch"] = serde_json::to_value(&running).unwrap();
+        stored["receipts"]["1"]["receipt"] =
+            json!({"status":"running","cancellation_requested":true});
+        let mut cancelled = running.clone();
+        cancelled.confirm_cancelled_before_effect().unwrap();
+        assert!(valid_transition(&running, &cancelled));
+        let mut forged = cancelled.clone();
+        forged.request.action_id = "other/action".into();
+        assert!(!valid_transition(&running, &forged));
+        let mut host = host(stored);
+        let mut worker = Worker::new().unwrap();
+        worker
+            .persist(
+                running.request.epoch.clone(),
+                running,
+                cancelled,
+                json!({"status":"running","cancellation_requested":true}),
+                json!({"status":"cancelled","cancellation_requested":true}),
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(drive(&mut worker, &mut host).result, Ok(()));
+        assert_eq!(
+            host.epoch["receipts"]["1"]["dispatch"]["stage"]["phase"],
+            "cancelled"
+        );
     }
 }

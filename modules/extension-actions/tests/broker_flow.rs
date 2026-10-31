@@ -56,6 +56,8 @@ struct Harness {
     observed_delegated_plan: bool,
     mutation_action: bool,
     expansive_plan: bool,
+    hold_running_commit: bool,
+    held_state: Option<(u64, Value)>,
 }
 impl Harness {
     fn new() -> Self {
@@ -134,6 +136,8 @@ impl Harness {
             observed_delegated_plan: false,
             mutation_action: false,
             expansive_plan: false,
+            hold_running_commit: false,
+            held_state: None,
         };
         let host = abi::HostApi {
             header: abi::AbiHeader::of::<abi::HostApi>(),
@@ -246,6 +250,9 @@ impl Harness {
                             self.consumptions += 1;
                             json!({"status":"succeeded","operation_id":payload["operation_id"],"target":payload["target"],"plan_digest":payload["plan_digest"]})
                         }
+                        "cancel_action" => {
+                            json!({"status":"cancelled","operation_id":payload["operation_id"]})
+                        }
                         "complete_action" => {
                             json!({"status":"succeeded","operation_id":payload["operation_id"]})
                         }
@@ -293,6 +300,19 @@ impl Harness {
                 }
                 _ => unreachable!(),
             };
+            if principal == "state"
+                && self.hold_running_commit
+                && payload["action"] == "collection_commit"
+                && payload["edits"].as_array().is_some_and(|edits| {
+                    edits.iter().any(|edit| {
+                        edit["value"]["receipts"]["1"]["dispatch"]["stage"]["phase"] == "running"
+                    })
+                })
+            {
+                self.held_state = Some((id, response));
+                self.hold_running_commit = false;
+                continue;
+            }
             self.complete(principal, id, response);
         }
     }
@@ -464,4 +484,59 @@ fn provider_cannot_expand_descriptor_capabilities() {
     assert!(harness.observed_delegated_plan);
     assert_eq!(harness.authorizations, 0);
     assert_eq!(harness.effects, 0);
+}
+
+#[test]
+fn cancelled_before_provider_invocation_never_starts_provider() {
+    let mut harness = Harness::new();
+    harness.hold_running_commit = true;
+    let epoch = harness.invoke_action();
+    for _ in 0..500 {
+        harness.pump();
+        if harness.held_state.is_some() {
+            break;
+        }
+    }
+    assert!(harness.held_state.is_some());
+    assert_eq!(harness.effects, 0);
+    let accepted = harness.broker.borrow_mut().dispatch(
+        "management",
+        Command::Request {
+            service: ACTION_SERVICE.into(),
+            payload: json!({"operation":"cancel","epoch":epoch,"sequence":1}),
+            timeout_ms: 5_000,
+            operation_id: "cancel.race".into(),
+            parent: None,
+        },
+    );
+    let Response::Accepted { id } = accepted else {
+        panic!("cancel rejected")
+    };
+    // Let the cancellation read and attach to the pending worker before the
+    // acknowledged Running commit releases the dispatch pipeline.
+    for _ in 0..20 {
+        harness.pump();
+    }
+    assert_eq!(harness.effects, 0);
+    let (state_request, response) = harness.held_state.take().unwrap();
+    harness.complete("state", state_request, response);
+    let mut reply = None;
+    for _ in 0..500 {
+        harness.pump();
+        if let Response::Result { payload } = harness
+            .broker
+            .borrow_mut()
+            .dispatch("management", Command::TakeResult { request: id })
+        {
+            reply = Some(payload);
+            break;
+        }
+    }
+    assert_eq!(reply.unwrap()["cancellation_requested"], true);
+    for _ in 0..150 {
+        harness.pump();
+    }
+    assert_eq!(harness.effects, 0);
+    let result = harness.call(json!({"operation":"status","epoch":epoch,"sequence":1}));
+    assert_eq!(result["status"], "cancelled");
 }
