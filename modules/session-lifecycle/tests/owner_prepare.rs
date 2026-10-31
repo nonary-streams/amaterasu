@@ -164,12 +164,13 @@ fn owner_configuration() -> Value {
         SCREEN:{"provide":["nonary.virtual-screen/2"],"call":[LIFECYCLE,"amaterasu.state/1","amaterasu.virtual-display/1"]},
         "transport":{"call":[LIFECYCLE]}, "capture":{"call":[LIFECYCLE]},
         "amaterasu.extension-registry":{"call":["nonary.virtual-screen/2"]},
+        "amaterasu.extension-actions":{"call":["nonary.virtual-screen/2"]},
         "amaterasu.management":{"call":["nonary.virtual-screen/2"]},
         "virtual":{"provide":["amaterasu.virtual-display/1"]}, "state":{"provide":["amaterasu.state/1"]}
     },"api_methods":approvals["api_methods"],"settings":{COORDINATOR:{
         "journal_path":"/replaced","trusted_callers":["transport","capture",SCREEN],
         "session_delegates":["capture"],"consumers":{"capture":["capture"]},
-        "operation_grants":{"transport":["prepare","prepare_stream","lookup","start_stream"],"capture":["ack_binding","lookup"],SCREEN:["verify_provider_epoch","describe_resource_finalize","verify_resource_finalize","validate_resource_finalize","verify_finalize_stage","verify_finalize_result","refresh_provider_observations"]},
+        "operation_grants":{"transport":["prepare","prepare_stream","lookup","start_stream","end_session","application_retired"],"capture":["ack_binding","lookup","retire_stream"],SCREEN:["verify_provider_epoch","describe_resource_finalize","verify_resource_finalize","validate_resource_finalize","verify_finalize_stage","verify_finalize_result","refresh_provider_observations"]},
         "consumer_requirements":{"execution_domain":"desktop","capture_providers":["amaterasu.capture-pipewire/1"],"selector_schemas":["amaterasu.kwin-wl-output/1"]},
         "participants":[{"provider":SCREEN,"contract_version":2,"plan_method":method("resource_plan"),"callback_method":method("lifecycle_callback"),"status_method":method("lifecycle_status"),"settings_revision":"one","settings":settings,"capabilities":[],"cleanup_methods":[method("lifecycle_callback")]}]
     }}});
@@ -420,6 +421,16 @@ impl Fixture {
                 self.domain_revision += 1;
                 json!({"ok":true,"released":true,"mutation_domain":domain(self.domain_revision,self.borrows.len())})
             }
+            "remove" => {
+                let reference = p["reference_id"].as_str().unwrap();
+                assert!(!self.borrows.contains_key(reference));
+                assert!(self.references.remove(reference).is_some());
+                let present = self
+                    .references
+                    .values()
+                    .any(|id| id == p["identity"].as_str().unwrap());
+                json!({"ok":true,"removed":!present,"identity":p["identity"],"reference_released":true,"reference_owned":false})
+            }
             action => panic!("unexpected virtual action {action}: {p}"),
         }
     }
@@ -593,4 +604,106 @@ fn real_owner_finalizes_stream_and_validates_capture_binding() {
     let started =
         f.call(json!({"operation":"start_stream","operation_id":"start","target":target}));
     assert_eq!(started["status"], "succeeded", "{started}");
+}
+
+#[test]
+#[ignore = "requires a cleanup-capable owner and lifecycle with stream/session release support"]
+fn real_owner_releases_stream_then_session_after_capture_retirement() {
+    let mut f = Fixture::new();
+    let video = json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false});
+    let pending = f.call(json!({"operation":"prepare","operation_id":"owner-session","requested_video":video,"application_ref":{"kind":"desktop"}}));
+    assert_eq!(pending["status"], "pending", "{pending}");
+    let session = f.settled("owner-session");
+    assert_eq!(session["status"], "succeeded", "{session}");
+    let requested = f.call(json!({"operation":"prepare_stream","operation_id":"owner-stream","target":session["target"],"intent":"initial","requested_video":video,"consumer_requirements":["capture"]}));
+    assert_eq!(requested["status"], "pending", "{requested}");
+    let stream = f.settled("owner-stream");
+    assert_eq!(
+        stream["status"],
+        "succeeded",
+        "{stream}; native={:?}; trace={:?}",
+        f.native_calls,
+        f.trace.borrow()
+    );
+    let target = stream["target"].clone();
+    let candidate = stream["candidate"].clone();
+    assert_eq!(candidate["resource"]["provider"], SCREEN);
+    assert_eq!(candidate["mode"], video);
+    let trace = f.trace.borrow();
+    assert!(
+        trace.iter().any(|event| event["principal"] == COORDINATOR
+            && event["command"]["method"] == "resource_finalize"),
+        "finalize not dispatched"
+    );
+    drop(trace);
+    let observed = json!({"version":1,"protocol":"wayland-wl-output","compositor_id":"b".repeat(64),"registry_global":4,"output_name":"Virtual-1","width":1920,"height":1080,"refresh_millihz":60000});
+    let ack = f.call_as("capture", json!({"operation":"ack_binding","operation_id":"capture-ack","target":target,"consumer":"capture","plan_revision":candidate["plan_revision"],"candidate":candidate,"observed_capture":observed}));
+    assert_eq!(ack["status"], "pending", "{ack}");
+    let mut outcome = Value::Null;
+    for _ in 0..500 {
+        outcome = f.call_as(
+            "capture",
+            json!({"operation":"lookup","operation_id":"capture-ack"}),
+        );
+        if outcome["status"] != "pending" {
+            break;
+        }
+    }
+    assert_eq!(
+        outcome["status"],
+        "succeeded",
+        "{outcome}; trace={:?}",
+        f.trace.borrow()
+    );
+    assert!(
+        f.trace
+            .borrow()
+            .iter()
+            .any(|event| event["principal"] == COORDINATOR
+                && event["command"]["method"] == "binding_validate"),
+        "binding validator not dispatched"
+    );
+    let started =
+        f.call(json!({"operation":"start_stream","operation_id":"start","target":target}));
+    assert_eq!(started["status"], "succeeded", "{started}");
+    let end =
+        f.call(json!({"operation":"end_session","operation_id":"end","target":session["target"]}));
+    assert_eq!(end["status"], "pending", "{end}");
+    let retired = f.call_as("capture", json!({"operation":"retire_stream","operation_id":"capture-retire","target":target,"consumer":"capture","retirement_receipt":{"response":{"status":"not_found"}}}));
+    assert_eq!(retired["status"], "pending", "{retired}");
+    let app = f.call(json!({"operation":"application_retired","operation_id":"app-retired","target":session["target"]}));
+    assert_eq!(app["status"], "succeeded", "{app}");
+    let ended = f.settled("end");
+    assert_eq!(
+        ended["status"],
+        "succeeded",
+        "{ended}; trace={:?}; native={:?}",
+        f.trace.borrow(),
+        f.native_calls
+    );
+    assert!(
+        f.references.is_empty(),
+        "owned references remain: {:?}",
+        f.references
+    );
+    assert!(
+        f.borrows.is_empty(),
+        "native borrows remain: {:?}",
+        f.borrows
+    );
+    let trace = f.trace.borrow();
+    let release = |event: &&Value, phase: &str| {
+        event["principal"] == COORDINATOR
+            && event["command"]["method"] == "lifecycle_callback"
+            && event["command"]["payload"]["phase"] == phase
+    };
+    let stream_release = trace
+        .iter()
+        .position(|event| release(&event, "stream.release"))
+        .expect("stream release");
+    let session_release = trace
+        .iter()
+        .position(|event| release(&event, "session.release"))
+        .expect("session release");
+    assert!(stream_release < session_release, "{trace:?}");
 }
