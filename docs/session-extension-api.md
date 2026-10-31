@@ -140,10 +140,9 @@ responses retain their existing form; a version 2 participant and its methods
 must be explicitly selected and approved. Empty additive fields are omitted from
 version 1 serialization.
 
-The SDK contract and its structural validators are implemented. The composed
-runtime path is **not yet qualified**: a successful end-to-end broker harness and
-appropriate native adapter qualification are still required before claiming that
-this sequence works in a deployed session.
+The SDK contract and its structural validators are implemented. Broker and
+fake-native tests exercise parts of the composed path; they do not establish
+deployed-session or native hardware behavior.
 
 The coordinator validates the selected participant dependency graph before
 starting effects and persists the graph and the admitted snapshots. A producer
@@ -234,7 +233,17 @@ must authenticate the owner and admission and resolve dependent cleanup; the
 typed result alone is not authorization or proof of retirement. A confirmed
 release followed by resume requires a new resource generation rather than reuse
 of the released generation. End-to-end action release and new-generation resume
-remain subject to wiring and qualification.
+remain subject to qualification.
+
+`ActionResourceDispositionPlan.cleanup_obligation_ids` may nominate up to 128
+sorted, unique IDs; an omitted or empty list claims no implicit cleanup. The
+result's `cleanup_outcomes` may refer only to nominated IDs. The coordinator
+matches full obligation tuples from the original root `session.prepare` plan
+against the exact authenticated owner plan and completed receipt. A released
+native resource alone does not discharge other cleanup obligations. Unclaimed,
+pending, or unknown cleanup retains the root, admission, and rights and fences
+unsafe conflicting reprepare. A compact work-proof reference points into private
+history and grants no effect authority.
 
 The `nonary.virtual-screen/remove-owned` action is restricted to an
 active stream target. A session target, including a paused session without an
@@ -336,3 +345,8 @@ or hardware behavior. Linux fake-native and real-broker tests are separate from
 hardware qualification. Windows virtual-screen owner startup is fenced while
 its DACL and process-lock security remain incomplete. Building the public plugin
 repositories currently requires a compatible private Amaterasu SDK checkout.
+
+The explicit test-gated Linux run using real state and fake native effects covered
+ten varying-mode cycles, active and paused session end, and a second session in
+the same mutation domain. It does not establish live hardware behavior. Two
+keyboard action cycles remain to be qualified.
