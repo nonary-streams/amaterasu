@@ -10,10 +10,48 @@ use amaterasu_extension_api::{ConsumerChange, ResourcePlan};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt::Write,
     time::{SystemTime, UNIX_EPOCH},
 };
+
+// An action transition currently retires consumers but does not run dependent
+// provider cleanup. Until it does, a persisted dependency graph must prove that
+// no provider depends on the provider whose resource the action will mutate.
+fn graph_proves_no_dependents(
+    order: &[String],
+    dependencies: &BTreeMap<String, Vec<String>>,
+    provider: &str,
+) -> bool {
+    let positions: BTreeMap<_, _> = order
+        .iter()
+        .enumerate()
+        .map(|(index, id)| (id.as_str(), index))
+        .collect();
+    if positions.len() != order.len()
+        || dependencies.len() != order.len()
+        || !positions.contains_key(provider)
+        || dependencies.iter().any(|(id, parents)| {
+            let Some(position) = positions.get(id.as_str()) else {
+                return true;
+            };
+            let unique: BTreeSet<_> = parents.iter().collect();
+            unique.len() != parents.len()
+                || parents.iter().any(|parent| {
+                    positions
+                        .get(parent.as_str())
+                        .is_none_or(|parent_position| parent_position >= position)
+                })
+        })
+    {
+        return false;
+    }
+    // Any transitive dependent implies an immediate dependent, so checking
+    // every edge is sufficient and also avoids trusting admission provenance.
+    !dependencies
+        .values()
+        .any(|parents| parents.iter().any(|parent| parent == provider))
+}
 
 struct ActionFinishWriter {
     shared: super::Shared,
@@ -299,6 +337,13 @@ impl Coordinator {
                     let Some(stream_target) = action_stream_target(&journal, &target) else {
                         return rejection("action_target_ambiguous");
                     };
+                    if !action_dependencies_clear(
+                        &journal,
+                        &stream_target,
+                        &selected.participant.provider,
+                    ) {
+                        return rejection("action_dependencies_unresolved");
+                    }
                     match action_borrower_scope(
                         &journal,
                         &stream_target,
@@ -386,7 +431,7 @@ impl Coordinator {
                         rejection("operation_id_conflict")
                     };
                 }
-                let Ok((_provider, _method, _plan)) =
+                let Ok((provider, _method, _plan)) =
                     journal.actions.execution_for_permit(caller, token)
                 else {
                     return rejection("action_execution_unavailable");
@@ -431,6 +476,9 @@ impl Coordinator {
                     stream_id: stream_id.clone(),
                     generation: stream.generation,
                 };
+                if !action_dependencies_clear(&journal, &target, &provider) {
+                    return rejection("action_dependencies_unresolved");
+                }
                 let input_id = payload["input_reservation_id"].as_str().map(str::to_owned);
                 if let Some(input_id) = &input_id {
                     let Ok(reservation) = journal.inputs.resolve_running_reservation(input_id)
@@ -794,6 +842,45 @@ pub(super) fn action_borrower_scope(
     Ok(result)
 }
 
+fn action_dependencies_clear(
+    journal: &super::Journal,
+    target: &amaterasu_extension_api::LifecycleTarget,
+    provider: &str,
+) -> bool {
+    let amaterasu_extension_api::LifecycleTarget::Stream {
+        host_epoch,
+        session_id,
+        stream_id,
+        generation,
+    } = target
+    else {
+        return false;
+    };
+    let Some(session) = journal.sessions.get(session_id) else {
+        return false;
+    };
+    if host_epoch != &journal.host_epoch
+        || host_epoch != &session.host_epoch
+        || session
+            .streams
+            .get(stream_id)
+            .is_none_or(|stream| stream.generation != *generation)
+    {
+        return false;
+    }
+    let independent = |graph: &Option<super::ProviderGraph>| {
+        graph.as_ref().is_some_and(|graph| {
+            graph_proves_no_dependents(&graph.order, &graph.dependencies, provider)
+        })
+    };
+    independent(&session.provider_graph)
+        && session
+            .streams
+            .values()
+            .filter(|stream| stream.phase != StreamPhase::Retired)
+            .all(|stream| independent(&stream.provider_graph))
+}
+
 fn active_provider_revision<'a>(
     journal: &'a super::Journal,
     target: &ActionTarget,
@@ -883,6 +970,9 @@ fn effect_rights_current(
     if host_epoch != &journal.host_epoch {
         return false;
     }
+    if !action_dependencies_clear(journal, &work.target, &provider) {
+        return false;
+    }
     journal
         .sessions
         .get(session_id)
@@ -964,6 +1054,24 @@ fn canonical_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn action_graph_requires_proven_independence() {
+        let order = vec!["display".into(), "control".into(), "other".into()];
+        let mut graph = BTreeMap::from([
+            ("display".into(), vec![]),
+            ("control".into(), vec!["display".into()]),
+            ("other".into(), vec!["control".into()]),
+        ]);
+        assert!(!graph_proves_no_dependents(&order, &graph, "display"));
+        assert!(!graph_proves_no_dependents(&order, &graph, "control"));
+        assert!(graph_proves_no_dependents(&order, &graph, "other"));
+        graph.insert("control".into(), vec![]);
+        assert!(graph_proves_no_dependents(&order, &graph, "display"));
+        graph.insert("display".into(), vec!["other".into()]);
+        assert!(!graph_proves_no_dependents(&order, &graph, "display"));
+        assert!(!graph_proves_no_dependents(&order, &graph, "missing"));
+    }
     use crate::coordinator::{SessionPhase, SessionRecord};
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -1158,6 +1266,13 @@ mod tests {
                 obligations: vec![],
             },
         );
+        let graph = super::super::ProviderGraph {
+            order: vec!["display".into()],
+            dependencies: [("display".into(), vec![])].into(),
+        };
+        let session = state.sessions.get_mut("session").unwrap();
+        session.provider_graph = Some(graph.clone());
+        session.streams.get_mut("stream").unwrap().provider_graph = Some(graph);
         save(&coordinator.shared, state).unwrap();
         let plan = json!({"plan_id":"plan","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{"selected_settings_revision":"rev"},"obligations":[],"affected_consumers":[],"consumer_change":"reconnect_required","candidate_constraint":null,"allowed_degradation":[]});
         let target = json!({"kind":"session","host_epoch":epoch,"session_id":"session","expected_generation":3});
@@ -1171,6 +1286,34 @@ mod tests {
             coordinator.action_operation(&service, "service", &stale_plan)["reason"],
             "provider_settings_revision_mismatch"
         );
+        let mut blocked = coordinator.shared.borrow().value.clone();
+        let graph = blocked
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .provider_graph
+            .as_mut()
+            .unwrap();
+        graph.order.push("control".into());
+        graph
+            .dependencies
+            .insert("control".into(), vec!["display".into()]);
+        save(&coordinator.shared, blocked).unwrap();
+        assert_eq!(
+            coordinator.action_operation(&service, "service", &auth)["reason"],
+            "action_dependencies_unresolved"
+        );
+        let mut restored = coordinator.shared.borrow().value.clone();
+        let graph = restored
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .provider_graph
+            .as_mut()
+            .unwrap();
+        graph.order.pop();
+        graph.dependencies.remove("control");
+        save(&coordinator.shared, restored).unwrap();
         let issued = coordinator.action_operation(&service, "service", &auth);
         assert_eq!(issued["status"], "succeeded");
         let mut request = json!({"operation":"consume_action_permit","operation_id":"op-transition","action_id":"display/remove","target":target,"plan_digest":auth["plan_digest"],"permit":issued["permit"]});
@@ -1212,6 +1355,27 @@ mod tests {
         verify["operation"] = json!("verify_action_effect");
         verify["provider"] = json!("display");
         verify["execute_method"] = execute;
+        let mut missing_graph = coordinator.shared.borrow().value.clone();
+        missing_graph
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .provider_graph = None;
+        save(&coordinator.shared, missing_graph).unwrap();
+        assert_eq!(
+            coordinator.action_operation("display", "display", &verify)["reason"],
+            "action_effect_not_authorized"
+        );
+        let mut restored_graph = coordinator.shared.borrow().value.clone();
+        restored_graph
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .provider_graph = Some(super::super::ProviderGraph {
+            order: vec!["display".into()],
+            dependencies: [("display".into(), vec![])].into(),
+        });
+        save(&coordinator.shared, restored_graph).unwrap();
         let mut changed = coordinator.shared.borrow().value.clone();
         changed
             .sessions
