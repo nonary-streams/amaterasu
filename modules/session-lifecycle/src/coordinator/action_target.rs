@@ -98,19 +98,32 @@ impl Coordinator {
             .filter(|admission| admission.provider == caller)
             .map(|admission| &admission.plan)
             .collect();
-        let mutation_domains: BTreeMap<_, _> = journal
-            .authority
-            .snapshot
-            .domains
+        let resource = selected
+            .and_then(|(_, stream)| stream.candidate.as_ref())
+            .map(|candidate| &candidate.resource);
+        let Some(resource) = resource else {
+            return rejection("candidate_missing");
+        };
+        let domains: BTreeSet<_> = resource
+            .mutation_domains
             .iter()
-            .filter(|(id, _)| {
-                journal
-                    .authority
-                    .domain_owners
-                    .get(*id)
-                    .is_some_and(|owner| owner == caller)
-            })
+            .chain(resource.mutation_domain.iter())
             .collect();
+        let mut mutation_domains = BTreeMap::new();
+        for domain in domains {
+            let Some(state) = journal.authority.snapshot.domains.get(domain) else {
+                return rejection("domain_observation_missing");
+            };
+            if journal
+                .authority
+                .domain_owners
+                .get(domain)
+                .is_none_or(|owner| owner != caller)
+            {
+                return rejection("domain_not_owned");
+            }
+            mutation_domains.insert(domain, state);
+        }
         let execution_domain = selected
             .and_then(|(_, stream)| stream.candidate.as_ref())
             .map(|candidate| candidate.resource.execution_domain.as_str());
