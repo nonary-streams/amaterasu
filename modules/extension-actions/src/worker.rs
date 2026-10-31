@@ -382,6 +382,28 @@ fn valid_transition(before: &Dispatch, after: &Dispatch) -> bool {
         return false;
     }
     let mut computed = before.clone();
+    if before
+        .proof
+        .as_ref()
+        .is_some_and(|proof| proof.last().result.is_none())
+        && matches!(
+            before.stage,
+            Stage::Running { .. } | Stage::ProviderPending { .. }
+        )
+        && after
+            .proof
+            .as_ref()
+            .is_some_and(|proof| proof.last().result.is_some())
+        && after.proof.as_ref().map_or(0, |proof| proof.status.len())
+            == before.proof.as_ref().map_or(0, |proof| proof.status.len())
+    {
+        let reply = after
+            .proof
+            .as_ref()
+            .and_then(|proof| proof.last().result.clone())
+            .unwrap();
+        return computed.accept_reply(reply).is_ok() && computed == *after;
+    }
     let result = match (&before.stage, &after.stage) {
         (Stage::Planning, Stage::AwaitingPermit { plan, .. }) => computed.accept_plan(plan.clone()),
         (Stage::Planning, Stage::Cancelled) => computed.cancel_before_effect(),
@@ -412,7 +434,24 @@ fn valid_transition(before: &Dispatch, after: &Dispatch) -> bool {
         (Stage::AwaitingTransition { .. }, Stage::ReadyToExecute { digest, .. }) => computed
             .confirm_transition(&before.request.operation_id, &before.request.target, digest),
         (Stage::ReadyToExecute { .. }, Stage::Running { .. }) => {
-            computed.begin_effect().map(|_| ())
+            computed.begin_effect().and_then(|_| {
+                if let Some(proof) = &after.proof {
+                    computed.arm_effect(proof.effect.approval.clone())?;
+                }
+                Ok(())
+            })
+        }
+        (Stage::ProviderPending { .. }, Stage::ProviderPending { .. })
+            if after.proof.as_ref().map_or(0, |proof| proof.status.len())
+                > before.proof.as_ref().map_or(0, |proof| proof.status.len()) =>
+        {
+            let approval = after
+                .proof
+                .as_ref()
+                .and_then(|proof| proof.status.last())
+                .map(|call| call.approval.clone())
+                .ok_or("status_proof_missing");
+            approval.and_then(|approval| computed.arm_status(approval))
         }
         (
             Stage::Running { .. } | Stage::ProviderPending { .. },

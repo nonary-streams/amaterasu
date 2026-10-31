@@ -16,6 +16,8 @@ pub struct Dispatch {
     #[serde(default)]
     pub source: Option<Source>,
     pub stage: Stage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) proof: Option<crate::dispatch_proof::DispatchProof>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -116,6 +118,7 @@ impl Dispatch {
             initiator,
             source: None,
             stage: Stage::Planning,
+            proof: None,
         })
     }
     pub fn accept_plan(&mut self, plan: Value) -> Result<(), &'static str> {
@@ -264,6 +267,51 @@ impl Dispatch {
         };
         Ok(plan)
     }
+    pub(crate) fn arm_effect(&mut self, approval: Value) -> Result<(), &'static str> {
+        if !matches!(self.stage, Stage::Running { .. }) || self.proof.is_some() {
+            return Err("invalid_phase");
+        }
+        let call = self.broker_call()?.ok_or("effect_call_missing")?;
+        let effect = crate::dispatch_proof::ApprovedCall::new(
+            approval,
+            &call,
+            &self.selected_provider,
+            &self.descriptor.execute,
+        )?;
+        self.proof = Some(crate::dispatch_proof::DispatchProof {
+            effect,
+            status: Vec::new(),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn arm_status(&mut self, approval: Value) -> Result<(), &'static str> {
+        if !matches!(self.stage, Stage::ProviderPending { .. }) {
+            return Err("invalid_phase");
+        }
+        let method = self
+            .descriptor
+            .status
+            .as_ref()
+            .ok_or("status_unavailable")?;
+        let mut call = self.broker_call()?.ok_or("status_call_missing")?;
+        let proof = self.proof.as_ref().ok_or("effect_proof_missing")?;
+        let amaterasu_module_sdk::Command::CallApi { operation_id, .. } = &mut call else {
+            return Err("status_call_missing");
+        };
+        operation_id.push_str(&format!("-{}", proof.status.len() + 1));
+        let call = crate::dispatch_proof::ApprovedCall::new(
+            approval,
+            &call,
+            &self.selected_provider,
+            method,
+        )?;
+        self.proof
+            .as_mut()
+            .ok_or("effect_proof_missing")?
+            .arm_status(call)
+    }
+
     /// Build the next broker operation from a durably persisted phase. The
     /// caller must never reissue a Running effect after an uncertain send.
     pub fn broker_call(&self) -> Result<Option<amaterasu_module_sdk::Command>, &'static str> {
@@ -372,7 +420,7 @@ impl Dispatch {
                 outcome,
                 provider_receipt,
             } => Some(request(
-                json!({"operation":"complete_action","operation_id":operation_id,"action_id":action_id,"target":target,"plan_digest":digest,"permit":permit,"outcome":outcome,"provider_receipt":provider_receipt}),
+                json!({"operation":"complete_action","operation_id":operation_id,"action_id":action_id,"target":target,"plan_digest":digest,"permit":permit,"outcome":outcome,"provider_receipt":provider_receipt,"dispatch_proof":self.proof,"provider_completed":self.proof.as_ref().and_then(|proof| proof.last().result.as_ref())}),
                 "complete",
             )),
             Stage::ReadyToExecute { .. }
@@ -385,6 +433,30 @@ impl Dispatch {
     /// Advance only on a matching, explicit result; transport failures and
     /// unknown native outcomes must be handled as recovery, never as replay.
     pub fn accept_reply(&mut self, reply: Value) -> Result<(), &'static str> {
+        if matches!(
+            self.stage,
+            Stage::Running { .. } | Stage::ProviderPending { .. }
+        ) {
+            if let Some(proof) = self.proof.as_mut() {
+                proof.complete(reply.clone())?;
+            }
+            if reply.get("status").and_then(Value::as_str) != Some("pending") {
+                let completed: amaterasu_extension_api::ActionProviderCompleted =
+                    serde_json::from_value(reply.clone())
+                        .map_err(|_| "invalid_provider_completion")?;
+                let plan = match &self.stage {
+                    Stage::Running { plan, .. } | Stage::ProviderPending { plan, .. } => plan,
+                    _ => unreachable!(),
+                };
+                let plan: amaterasu_extension_api::ResourcePlan =
+                    serde_json::from_value(plan.clone()).map_err(|_| "invalid_plan")?;
+                amaterasu_extension_api::validate_action_provider_completed(
+                    plan.resource_disposition.as_deref(),
+                    &completed,
+                )
+                .map_err(|_| "invalid_provider_completion")?;
+            }
+        }
         let status = reply
             .get("status")
             .and_then(Value::as_str)

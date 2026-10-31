@@ -2,6 +2,7 @@
 //! Execution requires the lifecycle coordinator's authority and is deliberately
 //! not inferred from payload identities.
 pub mod dispatch;
+mod dispatch_proof;
 pub mod ledger;
 
 pub mod validation;
