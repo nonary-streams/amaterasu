@@ -628,6 +628,222 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_plans_refreshes_and_releases_owner_resource() {
+        let (mut journal, mut work, mut state) = complete_fixture();
+        let directory = std::env::temp_dir().join(format!(
+            "amaterasu-session-release-{}",
+            amaterasu_storage::random_identifier().unwrap()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut coordinator = Coordinator::open(&directory.join("journal")).unwrap();
+        coordinator.configured = true;
+        coordinator
+            .settings
+            .participants
+            .push(state.participant.clone());
+        coordinator.settings.consumer_requirements = state.request.consumer_requirements.clone();
+        coordinator
+            .settings
+            .finalize_policies
+            .push(super::super::finalize_selection::tests::fixture().policy);
+        // Reconstruct an authenticated root with an observed shared domain.
+        let mut root = journal.composition.records().next().unwrap().clone();
+        root.output.resource.mutation_domains = vec!["topology".into()];
+        root.output.domain_observations = vec![
+            serde_json::from_value(
+                json!({"domain":"topology","revision":1,"borrowers":{},"complete":true}),
+            )
+            .unwrap(),
+        ];
+        root.plan.resources[0].mutation_domains = vec!["topology".into()];
+        root.plan.mutation_domains = vec![serde_json::from_value(json!({"domain":"topology","expected_revision":1,"borrowers":{},"access":"exclusive"})).unwrap()];
+        let proof = root.callback_proof.as_mut().unwrap();
+        proof.request.approved_plan = Some(root.plan.clone());
+        proof.terminal.call.arguments = serde_json::to_value(&proof.request).unwrap();
+        proof.terminal.state = crate::provider_dispatch::DispatchState::Completed {
+            payload: json!({"status":"prepared","candidate":null,"obligations":root.plan.obligations,"outputs":[root.output]}),
+        };
+        journal.authority.settled.get_mut("root").unwrap().plan = root.plan.clone();
+        journal.composition = composition::CompositionBook::default();
+        let selected = composition::OutputSelection {
+            producer: root.output.producer.clone(),
+            service: root.output.producer_service.clone(),
+            capability: root.output.capability.clone(),
+            schema: root.output.schema.clone(),
+        };
+        journal
+            .composition
+            .record(root.clone(), &selected, &work.target, &|_| true)
+            .unwrap();
+        let mut admission = journal
+            .authority
+            .settled
+            .remove("release-admission")
+            .unwrap();
+        admission.plan = root.plan.clone();
+        admission.plan.resources[0].incarnation = Some("native".into());
+        let cleanup = admission.plan.obligations[0].cleanup_method.clone();
+        admission.selection.cleanup_methods.push(cleanup);
+        state.request.approved_plan = Some(admission.plan.clone());
+        state.request.dependency_inputs =
+            vec![journal.composition.records().next().unwrap().output.clone()];
+        state.request.resource_generation = Some(1);
+        state.plan = Some(admission.plan.clone());
+        state.phase = PreparePhase::Callback;
+        state.response = None;
+        state.terminal_dispatch = None;
+        // Begin before plan allocation and admission.
+        work.states.clear();
+        journal
+            .authority
+            .snapshot
+            .resources
+            .entry("owner".into())
+            .or_default()
+            .insert(
+                "display".into(),
+                crate::planning::ResourceRef {
+                    provider: "owner".into(),
+                    resource_id: "display".into(),
+                    incarnation: "native".into(),
+                    revision: 2,
+                    execution_domain: "seat".into(),
+                    mutation_domains: ["topology".into()].into_iter().collect(),
+                },
+            );
+        coordinator
+            .selections
+            .insert("owner".into(), admission.selection.clone());
+        let release_plan = admission.plan.clone();
+        journal.authority.snapshot.domains.insert(
+            "topology".into(),
+            crate::planning::DomainState {
+                revision: 1,
+                borrowers: Default::default(),
+            },
+        );
+        journal
+            .authority
+            .domain_owners
+            .insert("topology".into(), "owner".into());
+        journal.authority.refresh_required.insert("topology".into());
+        journal.admission_transitions.remove("release-admission");
+        let session = journal.sessions.get_mut("session").unwrap();
+        session.admission_ids.remove("release-admission");
+        session.admission_targets.remove("release-admission");
+        session.admission_phases.remove("release-admission");
+        journal
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .resource_generations
+            .insert("owner".into(), 1);
+        journal
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .provider_settings
+            .insert(
+                "owner".into(),
+                settings_snapshot::FrozenSettings {
+                    settings: json!({}),
+                    revision: "revision".into(),
+                },
+            );
+        let key = receipt_key("transport", "client", "end");
+        journal.receipts.clear();
+        journal.receipts.insert(
+            key.clone(),
+            Receipt {
+                caller: "transport".into(),
+                initiator: "client".into(),
+                request: json!({"operation_id":"end"}),
+                response: json!({"status":"pending","operation_id":"end"}),
+                work: Some(work),
+                wait_target: None,
+            },
+        );
+        journal.authority.sequences.insert("owner".into(), 1);
+        coordinator.shared.borrow_mut().value = journal;
+        let mut submitted = 0;
+        let mut current_response = Value::Null;
+        let mut refreshed = false;
+        for _ in 0..40 {
+            let mut owner_plan = None;
+            {
+                let mut send = |command| -> ModuleResult<Response> {
+                    match command {
+                        Command::QueryApiApproval { .. } => Ok(Response::Result {
+                            payload: json!({"provider":"owner","method":{"service":"owner/2","method":"callback","interface_major":2,"interface_minor":0}}),
+                        }),
+                        Command::CallApi { payload, .. } => {
+                            assert_eq!(payload["phase"], "session.release");
+                            assert_eq!(payload["resource_generation"], 1);
+                            assert_eq!(payload["dependency_inputs"][0]["output_id"], "output");
+                            submitted += 1;
+                            if payload["operation"] == "resource_plan" {
+                                owner_plan = Some(payload);
+                                current_response = json!({"status":"planned","plan":release_plan});
+                            } else {
+                                current_response = json!({"status":"cleanup","outcomes":[{"obligation_id":"cleanup","state":"released","reason":null}],"outputs":[]});
+                            }
+                            Ok(Response::Accepted { id: 1 })
+                        }
+                        Command::TakeResult { .. } => Ok(Response::Result {
+                            payload: current_response.clone(),
+                        }),
+                        Command::ReleaseResult { .. } => Ok(Response::Ok),
+                        other => panic!("unexpected broker command: {other:?}"),
+                    }
+                };
+                coordinator.advance_work(&mut send).unwrap();
+            }
+            if let Some(request) = owner_plan {
+                let refresh = json!({"operation_id":"owner-refresh","target":request["target"],"provider_request":request,"domains":[{"domain":"topology","revision":1,"borrowers":{}}],"resources":[]});
+                let response = coordinator
+                    .refresh_provider_observations(
+                        "owner",
+                        "owner",
+                        refresh,
+                        receipt_key("owner", "owner", "owner-refresh"),
+                    )
+                    .unwrap();
+                assert_eq!(response["status"], "succeeded");
+                refreshed = true;
+            }
+        }
+        assert!(refreshed);
+        let shared = coordinator.shared.borrow();
+        assert_eq!(
+            submitted, 2,
+            "receipt: {}",
+            shared.value.receipts[&key].response
+        );
+        assert_eq!(shared.value.receipts[&key].response["status"], "succeeded");
+        assert!(shared.value.session_releases.validate(&shared.value));
+        assert_eq!(
+            shared.value.composition.records().next().unwrap().state,
+            composition::OutputState::Released
+        );
+        drop(shared);
+        drop(coordinator);
+        let restored: Journal =
+            serde_json::from_slice(&std::fs::read(directory.join("journal")).unwrap()).unwrap();
+        assert!(restored.session_releases.validate(&restored));
+        assert_eq!(
+            restored.composition.records().next().unwrap().state,
+            composition::OutputState::Released
+        );
+        validate_journal(&restored).unwrap();
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn exact_completed_cleanup_atomically_releases_root_and_retains_proof() {
         let (mut journal, work, state) = complete_fixture();
         assert!(validate_session_release_preflight(&journal, &work, "owner").is_ok());
