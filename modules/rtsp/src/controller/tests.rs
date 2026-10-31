@@ -409,6 +409,11 @@ fn record(state: State) -> Record {
         uncertain_phase: None,
         needs_lookup: false,
         stream_state: Some("stopping".into()),
+        lifecycle_target: None,
+        lifecycle_candidate: None,
+        lifecycle_prepare_outstanding: false,
+        lifecycle_input_required: None,
+        authenticated_disconnect_reason: None,
         display_applied: false,
         display_preflight_deadline: None,
         display_lease_ready_until: None,
@@ -1128,6 +1133,11 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         uncertain_phase: None,
         needs_lookup: true,
         stream_state: None,
+        lifecycle_target: None,
+        lifecycle_candidate: None,
+        lifecycle_prepare_outstanding: false,
+        lifecycle_input_required: None,
+        authenticated_disconnect_reason: None,
         display_applied: false,
         display_preflight_deadline: None,
         display_lease_ready_until: None,
@@ -2129,6 +2139,9 @@ fn play_verifies_the_frozen_launch_snapshot_before_starting_the_stream() {
         "wrong_snapshot",
         "wrong_path",
         "unavailable",
+        "lifecycle_exact",
+        "lifecycle_missing",
+        "lifecycle_wrong",
     ] {
         let mut controller = Controller::new(Settings::default()).unwrap();
         let mut record = record(State::Ready);
@@ -2159,6 +2172,12 @@ fn play_verifies_the_frozen_launch_snapshot_before_starting_the_stream() {
         record.config.application_operation_id = Some("launch-one".into());
         record.config.app_id = Some("app-0000000000000001".into());
         record.config.catalog_revision = Some(7);
+        if case.starts_with("lifecycle_") {
+            record.config.lifecycle_session_target = Some(serde_json::from_value(json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1})).unwrap());
+            record.config.lifecycle_settings_revision = Some("7".into());
+            record.config.lifecycle_intent = Some("resume".into());
+            record.lifecycle_input_required = Some(false);
+        }
         let (negotiation, action_ticket) = pending_play(&record);
         record.negotiation = Some(negotiation);
         let ticket = record.id;
@@ -2185,6 +2204,8 @@ fn play_verifies_the_frozen_launch_snapshot_before_starting_the_stream() {
             "wrong_revision" => reply["catalog_revision"] = json!(8),
             "wrong_snapshot" => reply["frame_limiter_settings"]["version"] = json!(2),
             "wrong_path" => reply["frame_limiter_executable_path"] = json!("C:\\Games\\Other.exe"),
+            "lifecycle_exact" => reply["rtsp_operation_id"] = json!("caller-operation"),
+            "lifecycle_wrong" => reply["rtsp_operation_id"] = json!("old-rtsp"),
             _ => {}
         }
         let mut endpoint = Endpoint {
@@ -2204,6 +2225,11 @@ fn play_verifies_the_frozen_launch_snapshot_before_starting_the_stream() {
         assert_eq!(launch_request["action"], "verify_frame_limiter_snapshot");
         assert_eq!(launch_request["app_id"], "app-0000000000000001");
         assert_eq!(launch_request["catalog_revision"], 7);
+        if case.starts_with("lifecycle_") {
+            assert_eq!(launch_request["rtsp_operation_id"], "caller-operation");
+        } else {
+            assert!(launch_request.get("rtsp_operation_id").is_none());
+        }
         assert!(!endpoint.commands.iter().any(|command| matches!(command,
             Command::Request { service, payload, .. }
                 if service == "amaterasu.stream-session/1"
@@ -2212,7 +2238,14 @@ fn play_verifies_the_frozen_launch_snapshot_before_starting_the_stream() {
         if case != "unavailable" {
             controller.advance_job(&runtime, 2);
         }
-        if case == "exact" {
+        if case == "lifecycle_exact" {
+            assert!(
+                controller
+                    .job
+                    .as_ref()
+                    .is_some_and(|job| job.phase == Phase::LifecyclePrepare)
+            );
+        } else if case == "exact" {
             assert!(
                 controller
                     .job
@@ -2276,4 +2309,266 @@ fn unavailable_play_response_never_marks_the_ticket_playing() {
 
     assert!(record.state == State::Closing);
     assert_eq!(record.failure, Some("start_rejected"));
+}
+
+#[test]
+fn lifecycle_gate_waits_for_authority_and_passes_matching_candidate_to_stream_session() {
+    let (mut record, announce) = announced_profile_record();
+    assert!(record.accept_announce(&announce));
+    record.config.lifecycle_session_target = Some(
+        serde_json::from_value(
+            json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1}),
+        )
+        .unwrap(),
+    );
+    record.config.lifecycle_settings_revision = Some("7".into());
+    record.config.lifecycle_intent = Some("initial".into());
+    record.lifecycle_input_required = Some(false);
+    let mut controller = Controller::new(Settings::default()).unwrap();
+    let start = record.authenticated_start_payload(23).unwrap();
+    controller.schedule_arm(&mut record, start, 8, 9, 0);
+    assert!(record.lifecycle_prepare_outstanding);
+    controller.records.insert(record.id, record);
+    let operation = "rtsp-0000000000000005-lifecycle-prepare";
+    let mut endpoint = Endpoint {
+        verifier_reply: Some(json!({"status":"pending","operation_id":operation})),
+        ..Endpoint::default()
+    };
+    let runtime = client(&mut endpoint);
+    controller.advance_job(&runtime, 1);
+    controller.advance_job(&runtime, 2);
+    assert!(
+        controller
+            .job
+            .as_ref()
+            .is_some_and(|job| job.phase == Phase::LifecycleLookup)
+    );
+    assert!(!endpoint.commands.iter().any(|command| matches!(command, Command::Request { service, payload, .. } if service == "amaterasu.stream-session/1" && payload["action"] == "start_when_authenticated")));
+    endpoint.verifier_reply = Some(
+        json!({"status":"succeeded","operation_id":operation,"transition_id":"transition",
+        "target":{"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1},
+        "candidate":{"capture_provider":"amaterasu.capture-pipewire/1","selector_schema":"amaterasu.kwin-wl-output/1","selector":{"output":"kwin:Virtual-12"},
+            "resource":{"provider":"test.provider","resource_id":"output","incarnation":"one","revision":1,"execution_domain":"desktop","mutation_domain":null,"mutation_domains":["desktop"]},
+            "mode":{"width":announce.video.width,"height":announce.video.height,"refresh_millihz":announce.video.fps * 1000,"hdr":false},"plan_revision":1,"geometry_revision":1,"generation":1,"fallback":"forbidden"}}),
+    );
+    controller.advance_job(&runtime, 3);
+    controller.advance_job(&runtime, 4);
+    assert!(
+        controller
+            .job
+            .as_ref()
+            .is_some_and(|job| job.phase == Phase::Arm)
+    );
+    controller.advance_job(&runtime, 5);
+    let start = endpoint
+        .commands
+        .iter()
+        .find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.stream-session/1"
+                && payload["action"] == "start_when_authenticated" =>
+            {
+                Some(payload)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        start["configuration"]["lifecycle_target"]["stream_id"],
+        "stream"
+    );
+    assert_eq!(
+        start["configuration"]["lifecycle_candidate"]["plan_revision"],
+        1
+    );
+    let record = &controller.records[&5];
+    assert!(!record.lifecycle_prepare_outstanding);
+    assert!(!clean_terminal(
+        record,
+        &json!({"ok":true,"session":23,"state":"stopped","cleanup_error":null})
+    ));
+    assert!(clean_terminal(
+        record,
+        &json!({"ok":true,"session":23,"state":"stopped","cleanup_error":null,
+        "lifecycle_retired":true,"lifecycle_target":record.lifecycle_target})
+    ));
+}
+
+#[test]
+fn unknown_lifecycle_prepare_cannot_be_reported_clean() {
+    let mut record = record(State::Closing);
+    record.lifecycle_prepare_outstanding = true;
+    assert!(!clean_terminal(
+        &record,
+        &json!({"ok":true,"session":23,"state":"stopped","cleanup_error":null})
+    ));
+}
+
+#[test]
+fn lifecycle_gate_rejects_foreign_stream_or_stale_binding_before_capture_start() {
+    for mismatch in ["epoch", "generation", "geometry", "plan"] {
+        let (mut record, announce) = announced_profile_record();
+        assert!(record.accept_announce(&announce));
+        record.config.lifecycle_session_target = Some(
+        serde_json::from_value(
+            json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1}),
+        )
+        .unwrap(),
+    );
+        record.config.lifecycle_settings_revision = Some("7".into());
+        record.config.lifecycle_intent = Some("initial".into());
+        record.lifecycle_input_required = Some(false);
+        let mut controller = Controller::new(Settings::default()).unwrap();
+        let start = record.authenticated_start_payload(23).unwrap();
+        controller.schedule_arm(&mut record, start, 8, 9, 0);
+        controller.records.insert(record.id, record);
+        let mut endpoint = Endpoint {
+            verifier_reply: Some(
+                json!({"status":"succeeded","operation_id":"rtsp-0000000000000005-lifecycle-prepare",
+        "target":{"kind":"stream","host_epoch":"foreign","session_id":"session","stream_id":"stream","generation":1},
+        "candidate":{"capture_provider":"amaterasu.capture-pipewire/1","selector_schema":"amaterasu.kwin-wl-output/1","selector":{"output":"kwin:Virtual-12"},
+            "resource":{"provider":"provider","resource_id":"output","incarnation":"one","revision":1,"execution_domain":"desktop","mutation_domain":null,"mutation_domains":["desktop"]},
+            "mode":{"width":announce.video.width,"height":announce.video.height,"refresh_millihz":announce.video.fps * 1000,"hdr":false},"plan_revision":1,"geometry_revision":1,"generation":1,"fallback":"forbidden"}}),
+            ),
+            ..Endpoint::default()
+        };
+        let reply = endpoint.verifier_reply.as_mut().unwrap();
+        if mismatch != "epoch" {
+            reply["target"]["host_epoch"] = json!("epoch");
+        }
+        match mismatch {
+            "generation" => reply["candidate"]["generation"] = json!(2),
+            "geometry" => reply["candidate"]["geometry_revision"] = json!(0),
+            "plan" => reply["candidate"]["plan_revision"] = json!(0),
+            _ => {}
+        }
+        let runtime = client(&mut endpoint);
+        controller.advance_job(&runtime, 1);
+        controller.advance_job(&runtime, 2);
+        assert!(controller.job.is_none());
+        assert_eq!(controller.records[&5].state, State::Closing);
+        assert!(controller.records[&5].lifecycle_prepare_outstanding);
+        assert!(!endpoint.commands.iter().any(|command| matches!(command, Command::Request {service,payload,..} if service == "amaterasu.stream-session/1" && payload["action"] == "start_when_authenticated")));
+    }
+}
+
+#[test]
+fn lifecycle_cleanup_status_distinguishes_unadmitted_unknown_and_retired_streams() {
+    let mut record = record(State::Ready);
+    assert!(record.response()["lifecycle_cleanup_state"].is_null());
+    record.config.lifecycle_session_target = Some(
+        serde_json::from_value(json!({
+            "kind":"session","host_epoch":"epoch","session_id":"session","generation":1
+        }))
+        .unwrap(),
+    );
+    assert_eq!(record.response()["lifecycle_cleanup_state"], "not_admitted");
+    record.lifecycle_prepare_outstanding = true;
+    assert_eq!(
+        record.response()["lifecycle_cleanup_state"],
+        "prepare_unresolved"
+    );
+    record.lifecycle_prepare_outstanding = false;
+    record.lifecycle_target = Some(
+        json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1}),
+    );
+    assert_eq!(
+        record.response()["lifecycle_cleanup_state"],
+        "retirement_pending"
+    );
+    assert_eq!(record.response()["lifecycle_retired"], false);
+    record.cleanup_confirmed = true;
+    assert_eq!(record.response()["lifecycle_cleanup_state"], "retired");
+    assert_eq!(record.response()["lifecycle_retired"], true);
+}
+
+#[test]
+fn lifecycle_consumer_requirements_follow_frozen_stream_session_input_policy() {
+    for policy in [Some(false), Some(true), None] {
+        let (mut record, announce) = announced_profile_record();
+        assert!(record.accept_announce(&announce));
+        record.config.lifecycle_session_target = Some(serde_json::from_value(json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1})).unwrap());
+        record.config.lifecycle_settings_revision = Some("7".into());
+        record.config.lifecycle_intent = Some("initial".into());
+        record.lifecycle_input_required = policy;
+        let mut controller = Controller::new(Settings::default()).unwrap();
+        let payload = record.authenticated_start_payload(23).unwrap();
+        controller.schedule_arm(&mut record, payload, 8, 9, 0);
+        if policy.is_none() {
+            assert!(controller.job.is_none());
+            assert_eq!(record.failure, Some("lifecycle_input_policy_unverified"));
+            continue;
+        }
+        controller.records.insert(record.id, record);
+        let mut endpoint = Endpoint::default();
+        let runtime = client(&mut endpoint);
+        controller.advance_job(&runtime, 1);
+        let request = endpoint
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == "amaterasu.session-lifecycle/1" => Some(payload),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            request["consumer_requirements"],
+            if policy == Some(true) {
+                json!(["capture", "input"])
+            } else {
+                json!(["capture"])
+            }
+        );
+    }
+}
+
+#[test]
+fn authenticated_disconnect_requires_exact_clean_lifecycle_retirement() {
+    let mut record = record(State::Playing);
+    let target = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1});
+    record.lifecycle_target = Some(target.clone());
+    let mut payload = json!({"ok":true,"session":23,"state":"failed","cleanup_error":null,
+        "lifecycle_target":target,"lifecycle_retired":true,"authenticated_disconnect_reason":"peer_disconnected"});
+    assert_eq!(
+        authenticated_disconnect_reason(&record, &payload),
+        Some("peer_disconnected")
+    );
+    payload["lifecycle_retired"] = json!(false);
+    assert_eq!(authenticated_disconnect_reason(&record, &payload), None);
+    payload["lifecycle_retired"] = json!(true);
+    payload["session"] = json!(24);
+    assert_eq!(authenticated_disconnect_reason(&record, &payload), None);
+    payload["session"] = json!(23);
+    payload["authenticated_disconnect_reason"] = json!("video_capture_failed");
+    assert_eq!(authenticated_disconnect_reason(&record, &payload), None);
+    payload["authenticated_disconnect_reason"] = json!("peer_disconnected");
+    payload["state"] = json!("stopped");
+    assert_eq!(authenticated_disconnect_reason(&record, &payload), None);
+}
+
+#[test]
+fn absent_stream_session_cannot_confirm_unresolved_lifecycle_retirement() {
+    for issued_target in [false, true] {
+        let mut controller = Controller::new(Settings::default()).unwrap();
+        let mut record = record(State::Closing);
+        record.session = None;
+        record.needs_lookup = false;
+        if issued_target {
+            record.lifecycle_target = Some(
+                json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1}),
+            );
+        } else {
+            record.lifecycle_prepare_outstanding = true;
+        }
+        controller.schedule_cleanup(&mut record, None, 0);
+        assert_eq!(record.state, State::CleanupFailed);
+        assert!(!record.cleanup_confirmed);
+        assert_eq!(
+            record.cleanup_error,
+            Some("lifecycle_retirement_unconfirmed")
+        );
+    }
 }

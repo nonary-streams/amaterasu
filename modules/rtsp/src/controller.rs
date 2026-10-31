@@ -313,7 +313,8 @@ impl Controller {
         }
 
         let Some(session) = record.session else {
-            record.cleanup_confirmed = true;
+            record.cleanup_confirmed =
+                record.lifecycle_target.is_none() && !record.lifecycle_prepare_outstanding;
             finish_record(record);
             return;
         };
@@ -786,13 +787,32 @@ fn local_port(payload: &Value, field: &str) -> Result<u16, &'static str> {
 }
 
 fn clean_terminal(record: &Record, payload: &Value) -> bool {
-    payload["ok"] == true
+    !record.lifecycle_prepare_outstanding
+        && record.lifecycle_target.as_ref().is_none_or(|target| {
+            payload["lifecycle_retired"] == true && payload["lifecycle_target"] == *target
+        })
+        && payload["ok"] == true
         && response_session(payload) == record.session
         && matches!(
             stream_state(payload),
             Some("stopped" | "failed" | "cancelled")
         )
         && payload["cleanup_error"].is_null()
+}
+
+fn authenticated_disconnect_reason(record: &Record, payload: &Value) -> Option<&'static str> {
+    if record.lifecycle_target.is_none()
+        || !clean_terminal(record, payload)
+        || payload["state"] != "failed"
+    {
+        return None;
+    }
+    match payload["authenticated_disconnect_reason"].as_str()? {
+        "peer_disconnected" => Some("peer_disconnected"),
+        "authenticated_peer_idle" => Some("authenticated_peer_idle"),
+        "peer_timeout" => Some("peer_timeout"),
+        _ => None,
+    }
 }
 
 fn shutdown_request(
@@ -865,6 +885,14 @@ fn missing(payload: &Value) -> bool {
 }
 
 fn finish_record(record: &mut Record) {
+    if record.lifecycle_prepare_outstanding
+        || (record.lifecycle_target.is_some() && !record.cleanup_confirmed)
+    {
+        record.cleanup_confirmed = false;
+        record.state = State::CleanupFailed;
+        record.cleanup_error = Some("lifecycle_retirement_unconfirmed");
+        return;
+    }
     record.display_applied = false;
     record.cleanup_retry_count = 0;
     record.cleanup_retry_at = None;

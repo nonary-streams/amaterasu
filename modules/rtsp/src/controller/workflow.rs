@@ -57,7 +57,10 @@ impl Controller {
                 record.close(Some("dependency_unavailable"));
                 self.schedule_lookup(record, job.caller, now);
             }
-            Phase::VerifyFrameLimiter | Phase::Arm => {
+            Phase::VerifyFrameLimiter
+            | Phase::LifecyclePrepare
+            | Phase::LifecycleLookup
+            | Phase::Arm => {
                 if let Some((connection, action_ticket)) = job.network {
                     self.fail_network_action(
                         record,
@@ -97,10 +100,117 @@ impl Controller {
             Phase::Prepare => self.prepared(record, job, &payload, now, runtime),
             Phase::Find => self.found(record, job, &payload, now, runtime),
             Phase::VerifyFrameLimiter => self.verified_frame_limiter(record, job, &payload, now),
+            Phase::LifecyclePrepare | Phase::LifecycleLookup => {
+                self.lifecycle_prepared(record, job, &payload, now)
+            }
             Phase::Arm => self.armed(record, job, &payload, now),
             Phase::Stop => self.stopped(record, job, &payload, runtime),
             Phase::Status => self.status_result(record, job, &payload, now, runtime),
         }
+    }
+
+    fn lifecycle_prepared(&mut self, record: &mut Record, job: Job, payload: &Value, now: u64) {
+        let Some((connection, action_ticket)) = job.network else {
+            record.close(Some("network_disconnected"));
+            self.schedule_stop(record, job.caller, now);
+            return;
+        };
+        if record.state != State::Arming {
+            self.schedule_stop(record, job.caller, now);
+            return;
+        }
+        let operation = format!("{}-lifecycle-prepare", record.operation());
+        if payload["operation_id"] != operation {
+            self.fail_network_action(
+                record,
+                connection,
+                action_ticket,
+                "lifecycle_prepare_rejected",
+            );
+            return;
+        }
+        if payload["status"] == "pending" {
+            let request = json!({"operation":"lookup","operation_id":operation});
+            let call = Call::for_service(
+                "amaterasu.session-lifecycle/1",
+                request,
+                self.operation_id(record, "lifecycle-lookup"),
+                None,
+            );
+            self.job = Some(Job {
+                ticket: record.id,
+                phase: Phase::LifecycleLookup,
+                call,
+                caller: job.caller,
+                network: Some((connection, action_ticket)),
+                deadline: job.deadline,
+            });
+            return;
+        }
+        if payload["status"] == "rejected" {
+            record.lifecycle_prepare_outstanding = false;
+        }
+        let target: Option<amaterasu_extension_api::LifecycleTarget> =
+            serde_json::from_value(payload["target"].clone()).ok();
+        let candidate: Option<amaterasu_extension_api::CaptureBinding> =
+            serde_json::from_value(payload["candidate"].clone()).ok();
+        let valid_target = match (&record.config.lifecycle_session_target, &target) {
+            (
+                Some(amaterasu_extension_api::LifecycleTarget::Session {
+                    host_epoch: expected_epoch,
+                    session_id: expected_session,
+                    ..
+                }),
+                Some(amaterasu_extension_api::LifecycleTarget::Stream {
+                    host_epoch,
+                    session_id,
+                    stream_id,
+                    generation,
+                }),
+            ) => {
+                host_epoch == expected_epoch
+                    && session_id == expected_session
+                    && !stream_id.is_empty()
+                    && *generation > 0
+            }
+            _ => false,
+        };
+        let valid_candidate = candidate
+            .as_ref()
+            .zip(record.negotiated_video)
+            .zip(record.negotiated_video_stream_format)
+            .is_some_and(|((binding, video), format)| {
+                matches!(&target, Some(amaterasu_extension_api::LifecycleTarget::Stream { generation, .. }) if binding.generation == *generation)
+                    && binding.geometry_revision > 0
+                    && binding.plan_revision > 0
+                    && binding.mode.width == video.width
+                    && binding.mode.height == video.height
+                    && binding.mode.refresh_millihz == video.fps * 1000
+                    && binding.mode.hdr
+                        == (format.dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr)
+            });
+        if payload["status"] != "succeeded" || !valid_target || !valid_candidate {
+            self.fail_network_action(
+                record,
+                connection,
+                action_ticket,
+                "lifecycle_prepare_rejected",
+            );
+            return;
+        }
+        let Some(mut start) = record
+            .session
+            .and_then(|session| record.authenticated_start_payload(session))
+        else {
+            self.fail_network_action(record, connection, action_ticket, "negotiation_failed");
+            return;
+        };
+        record.lifecycle_target = Some(payload["target"].clone());
+        record.lifecycle_candidate = Some(payload["candidate"].clone());
+        record.lifecycle_prepare_outstanding = false;
+        start["configuration"]["lifecycle_target"] = payload["target"].clone();
+        start["configuration"]["lifecycle_candidate"] = payload["candidate"].clone();
+        self.schedule_actual_arm(record, start, connection, action_ticket, job.deadline);
     }
 
     pub(super) fn verified_frame_limiter(
@@ -120,6 +230,9 @@ impl Controller {
                 == record.config.frame_limiter_settings.as_ref()
             && payload["frame_limiter_executable_path"].as_str()
                 == record.config.frame_limiter_executable_path.as_deref()
+            && (record.config.lifecycle_session_target.is_none()
+                || payload["rtsp_operation_id"].as_str()
+                    == Some(record.config.operation_id.as_str()))
             && record.state == State::Ready
             && now < record.expires;
         let Some((connection, action_ticket)) = job.network else {
@@ -206,6 +319,17 @@ impl Controller {
                     && payload["rtsp_operation_id"].is_null() => {}
                 _ => return Err("history_activity_unverified"),
             }
+            if payload["lifecycle_session_target"] != json!(record.config.lifecycle_session_target)
+            {
+                return Err("lifecycle_identity_unverified");
+            }
+            if record.config.lifecycle_session_target.is_some() {
+                record.lifecycle_input_required = Some(
+                    payload["lifecycle_input_required"]
+                        .as_bool()
+                        .ok_or("lifecycle_input_policy_unverified")?,
+                );
+            }
             if record.display_prepare_timeout_ms.is_some_and(|expected| {
                 payload["display_prepare_timeout_ms"].as_u64() != Some(u64::from(expected))
             }) {
@@ -285,7 +409,8 @@ impl Controller {
     ) {
         if missing(payload) {
             record.needs_lookup = false;
-            record.cleanup_confirmed = true;
+            record.cleanup_confirmed =
+                record.lifecycle_target.is_none() && !record.lifecycle_prepare_outstanding;
             finish_record(record);
             complete_caller(record, job.caller, runtime);
             return;
@@ -351,6 +476,8 @@ impl Controller {
         runtime: &RuntimeClient,
     ) {
         if clean_terminal(record, payload) {
+            record.authenticated_disconnect_reason =
+                authenticated_disconnect_reason(record, payload);
             record.stream_state = stream_state(payload).map(str::to_owned);
             record.cleanup_confirmed = true;
             record.cleanup_error = None;
@@ -386,6 +513,8 @@ impl Controller {
         }
         record.stream_state = state.map(str::to_owned);
         if clean_terminal(record, payload) {
+            record.authenticated_disconnect_reason =
+                authenticated_disconnect_reason(record, payload);
             if record.state != State::Closing {
                 record.close(Some("stream_failed"));
             }
@@ -549,7 +678,8 @@ impl Controller {
         } else if record.needs_lookup {
             self.schedule_lookup(record, caller, now);
         } else {
-            record.cleanup_confirmed = true;
+            record.cleanup_confirmed =
+                record.lifecycle_target.is_none() && !record.lifecycle_prepare_outstanding;
             finish_record(record);
         }
     }

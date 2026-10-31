@@ -120,6 +120,10 @@ impl Controller {
             rpc::complete(runtime, request, error(code));
             return;
         }
+        if config.lifecycle_session_target.is_some() && caller != "amaterasu.nvhttp" {
+            rpc::complete(runtime, request, error("permission_denied"));
+            return;
+        }
         if config.frame_limiter_settings.is_some() && caller != "amaterasu.nvhttp" {
             rpc::complete(runtime, request, error("frame_limiter_snapshot_denied"));
             return;
@@ -258,6 +262,11 @@ impl Controller {
             uncertain_phase: None,
             needs_lookup: true,
             stream_state: None,
+            lifecycle_target: None,
+            lifecycle_candidate: None,
+            lifecycle_prepare_outstanding: false,
+            lifecycle_input_required: None,
+            authenticated_disconnect_reason: None,
             display_applied: false,
             display_preflight_deadline,
             display_lease_ready_until: None,

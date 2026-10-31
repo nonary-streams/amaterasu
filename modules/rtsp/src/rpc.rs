@@ -14,6 +14,7 @@ pub struct Call {
     request: Option<u64>,
     cancelling: bool,
     failures: u8,
+    result: Option<Value>,
 }
 
 impl Call {
@@ -38,6 +39,7 @@ impl Call {
             request: None,
             cancelling: false,
             failures: 0,
+            result: None,
         }
     }
 
@@ -79,11 +81,23 @@ impl Call {
             self.failures += 1;
             return Outcome::Waiting;
         }
-        match runtime.send_ephemeral(Command::TakeResult { request }) {
-            Ok(Response::Pending) => Outcome::Waiting,
-            Ok(Response::Result { payload }) => Outcome::Result(payload),
+        if self.result.is_none() {
+            match runtime.send_ephemeral(Command::TakeResult { request }) {
+                Ok(Response::Pending) => return Outcome::Waiting,
+                Ok(Response::Result { payload }) => self.result = Some(payload),
+                _ => {
+                    self.cancelling = true;
+                    return Outcome::Waiting;
+                }
+            }
+        }
+        match runtime.send_ephemeral(Command::ReleaseResult { request }) {
+            Ok(Response::Ok) => Outcome::Result(self.result.take().expect("result retained")),
+            Ok(Response::Error { code, .. }) if code == "not_found" => {
+                Outcome::Result(self.result.take().expect("result retained"))
+            }
             _ => {
-                self.cancelling = true;
+                self.failures += 1;
                 Outcome::Waiting
             }
         }

@@ -177,7 +177,7 @@ impl Controller {
         action_ticket: u64,
         now: u64,
     ) {
-        let verification = json!({
+        let mut verification = json!({
             "action":"verify_frame_limiter_snapshot",
             "application_operation_id":record.config.application_operation_id,
             "app_id":record.config.app_id,
@@ -185,6 +185,9 @@ impl Controller {
             "frame_limiter_settings":record.config.frame_limiter_settings,
             "frame_limiter_executable_path":record.config.frame_limiter_executable_path,
         });
+        if record.config.lifecycle_session_target.is_some() {
+            verification["rtsp_operation_id"] = json!(record.config.operation_id);
+        }
         let call = Call::for_service(
             "amaterasu.launch/1",
             verification,
@@ -210,6 +213,60 @@ impl Controller {
         now: u64,
     ) {
         let deadline = record.begin_arm(now);
+        if let Some(target) = &record.config.lifecycle_session_target {
+            let Some(input_required) = record.lifecycle_input_required else {
+                self.fail_network_action(
+                    record,
+                    connection,
+                    action_ticket,
+                    "lifecycle_input_policy_unverified",
+                );
+                return;
+            };
+            let Some(video) = record.negotiated_video else {
+                self.fail_network_action(record, connection, action_ticket, "negotiation_failed");
+                return;
+            };
+            let Some(format) = record.negotiated_video_stream_format else {
+                self.fail_network_action(record, connection, action_ticket, "negotiation_failed");
+                return;
+            };
+            let operation = format!("{}-lifecycle-prepare", record.operation());
+            record.lifecycle_prepare_outstanding = true;
+            let request = json!({"operation":"prepare_stream", "operation_id":operation,
+                "target":target, "intent":record.config.lifecycle_intent,
+                "settings_revision":record.config.lifecycle_settings_revision,
+                "requested_video":{"width":video.width,"height":video.height,
+                    "refresh_millihz":video.fps * 1000,
+                    "hdr":format.dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr},
+                "consumer_requirements":if input_required { vec!["capture", "input"] } else { vec!["capture"] }});
+            let call = Call::for_service(
+                "amaterasu.session-lifecycle/1",
+                request,
+                self.operation_id(record, "lifecycle-prepare"),
+                None,
+            );
+            self.job = Some(Job {
+                ticket: record.id,
+                phase: Phase::LifecyclePrepare,
+                call,
+                caller: None,
+                network: Some((connection, action_ticket)),
+                deadline,
+            });
+            return;
+        }
+        self.schedule_actual_arm(record, payload, connection, action_ticket, deadline);
+    }
+
+    pub(super) fn schedule_actual_arm(
+        &mut self,
+        record: &mut Record,
+        payload: Value,
+        connection: u64,
+        action_ticket: u64,
+        deadline: u64,
+    ) {
         self.job = Some(Job {
             ticket: record.id,
             phase: Phase::Arm,

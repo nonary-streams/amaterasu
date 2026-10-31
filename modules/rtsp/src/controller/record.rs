@@ -46,6 +46,11 @@ pub(super) struct Record {
     pub uncertain_phase: Option<Phase>,
     pub needs_lookup: bool,
     pub stream_state: Option<String>,
+    pub lifecycle_target: Option<Value>,
+    pub lifecycle_candidate: Option<Value>,
+    pub lifecycle_prepare_outstanding: bool,
+    pub lifecycle_input_required: Option<bool>,
+    pub authenticated_disconnect_reason: Option<&'static str>,
     /// True only after stream-session reports an applied, owned display lease.
     pub display_applied: bool,
     pub display_preflight_deadline: Option<u64>,
@@ -141,8 +146,26 @@ impl Record {
     }
 
     pub fn response(&self) -> Value {
+        let lifecycle_cleanup_state = self.config.lifecycle_session_target.as_ref().map(|_| {
+            if self.lifecycle_prepare_outstanding {
+                "prepare_unresolved"
+            } else if self.lifecycle_target.is_none() {
+                "not_admitted"
+            } else if self.cleanup_confirmed {
+                "retired"
+            } else {
+                "retirement_pending"
+            }
+        });
         json!({"ok":true,"ticket":self.id,"state":self.state,"local":self.local,
             "rtsp_url":self.url,"session":self.session,"stream_state":self.stream_state,
+            "lifecycle_session_target":self.config.lifecycle_session_target,
+            "lifecycle_settings_revision":self.config.lifecycle_settings_revision,
+            "lifecycle_intent":self.config.lifecycle_intent,
+            "lifecycle_target":self.lifecycle_target,
+            "lifecycle_retired":self.lifecycle_target.is_some() && self.cleanup_confirmed,
+            "lifecycle_cleanup_state":lifecycle_cleanup_state,
+            "authenticated_disconnect_reason":self.authenticated_disconnect_reason,
             "frame_limiter_settings":self.config.frame_limiter_settings,
             "encoder":self.config.capture.encoder,"sw_preset":self.config.sw_preset,"sw_tune":self.config.sw_tune,"min_threads":self.config.min_threads,"qp":self.config.qp,
             "slices_per_frame":self.negotiated_slices_per_frame,
@@ -207,6 +230,8 @@ pub(super) enum Phase {
     Prepare,
     Find,
     VerifyFrameLimiter,
+    LifecyclePrepare,
+    LifecycleLookup,
     Arm,
     Stop,
     Status,

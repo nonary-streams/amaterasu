@@ -597,6 +597,13 @@ pub struct VideoEncryptionPolicySnapshot {
 #[serde(deny_unknown_fields)]
 pub struct Open {
     pub operation_id: String,
+    /// Coordinator-issued session selector; it grants no authority by itself.
+    #[serde(default)]
+    pub lifecycle_session_target: Option<amaterasu_extension_api::LifecycleTarget>,
+    #[serde(default)]
+    pub lifecycle_settings_revision: Option<String>,
+    #[serde(default)]
+    pub lifecycle_intent: Option<String>,
     /// NVHTTP's nonce-bound RTSP operation, reused as the History session ID.
     #[serde(default)]
     pub history_activity_id: Option<String>,
@@ -853,6 +860,29 @@ impl Open {
             return Err("continuous_audio_requires_stream_audio");
         }
         self.validate_operation_id()?;
+        match (
+            &self.lifecycle_session_target,
+            &self.lifecycle_settings_revision,
+            &self.lifecycle_intent,
+        ) {
+            (None, None, None) => {}
+            (
+                Some(amaterasu_extension_api::LifecycleTarget::Session {
+                    host_epoch,
+                    session_id,
+                    generation,
+                }),
+                Some(revision),
+                Some(intent),
+            ) if valid_lifecycle_id(host_epoch)
+                && valid_lifecycle_id(session_id)
+                && *generation > 0
+                && valid_lifecycle_id(revision)
+                && matches!(intent.as_str(), "initial" | "resume")
+                && self.display_request.is_none()
+                && self.virtual_display_intent.is_none() => {}
+            _ => return Err("invalid_lifecycle_identity"),
+        }
         self.validate_destination(allow_remote)?;
         self.validate_capture()?;
         self.validate_max_bitrate()?;
@@ -1137,6 +1167,9 @@ impl Open {
         if let Some(activity_id) = &self.history_activity_id {
             payload["history_activity_id"] = serde_json::json!(activity_id);
             payload["rtsp_operation_id"] = serde_json::json!(self.operation_id);
+        }
+        if let Some(session) = &self.lifecycle_session_target {
+            payload["lifecycle_session_target"] = serde_json::json!(session);
         }
         payload
     }
@@ -1708,6 +1741,13 @@ pub enum Operation {
 
 pub fn valid_name(value: &str) -> bool {
     valid_label(value, 128)
+}
+fn valid_lifecycle_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
 }
 fn valid_label(value: &str, limit: usize) -> bool {
     !value.is_empty() && value.len() <= limit && !value.chars().any(char::is_control)
