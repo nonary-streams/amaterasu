@@ -3,7 +3,7 @@ use crate::prepare_authority::{AuthorityJournal, CoordinatorPrepareAuthority, Me
 use crate::prepare_driver::{PrepareAuthority, PrepareJournal, PreparePhase};
 use amaterasu_extension_api::{ProviderOperation, ProviderRequest, ProviderResponse};
 
-struct AuthorityWriter(Shared);
+pub(super) struct AuthorityWriter(pub(super) Shared);
 impl AuthorityJournal for AuthorityWriter {
     fn persist(&mut self, state: &AuthorityState) -> ModuleResult<()> {
         let mut next = self.0.borrow().value.clone();
@@ -144,7 +144,7 @@ fn apply_participant(
 
 /// Atomically bind an admission to its exact target. Reusing an admission ID
 /// for a different session or generation is never an ownership transfer.
-fn record_admission(
+pub(super) fn record_admission(
     next: &mut Journal,
     session_id: &str,
     admission_id: &str,
@@ -360,7 +360,7 @@ fn frozen_settings_mut<'a>(
 }
 
 impl Coordinator {
-    fn effective_settings(&self, work: &Work) -> ModuleResult<LifecycleSettings> {
+    pub(super) fn effective_settings(&self, work: &Work) -> ModuleResult<LifecycleSettings> {
         let shared = self.shared.borrow();
         let snapshots = frozen_settings(&shared.value, &work.target)?;
         let mut settings = self.settings.clone();
@@ -488,7 +488,6 @@ impl Coordinator {
             add_policy_method(&policy.owner_provider, &policy.owner_method)?;
             add_policy_method(&policy.owner_provider, &policy.status_method)?;
             add_policy_method(&policy.owner_provider, &policy.settlement_method)?;
-            add_policy_method(&policy.owner_provider, &policy.settlement_status_method)?;
         }
         for policy in &self.settings.finalize_policies {
             add_policy_method(&policy.owner_provider, &policy.method)?;
@@ -534,7 +533,7 @@ impl Coordinator {
         Ok(())
     }
 
-    fn authority_for_work(
+    pub(super) fn authority_for_work(
         &self,
         work: &Work,
     ) -> ModuleResult<CoordinatorPrepareAuthority<AuthorityWriter>> {

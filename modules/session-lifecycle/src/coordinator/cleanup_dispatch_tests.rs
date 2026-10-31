@@ -314,7 +314,7 @@ fn owner_control_and_finalize_methods_each_require_exact_broker_approval() {
     let mut h = Harness::new("none");
     let method = |name: &str| json!({"service":"a/2","method":name,"interface_major":2,"interface_minor":0,"schema_revision":1});
     let schema = json!({"id":"schema/1","major":1,"minor":0,"digest":"a".repeat(64)});
-    h.coordinator.settings.control_policies.push(serde_json::from_value(json!({"dependent_provider":"b","owner_provider":"a","owner_service":"a/2","owner_method":method("control"),"status_method":method("control_status"),"argument_schema":schema,"output_capability":"output","output_schema":schema,"max_access":"exclusive","mutation_domains":[]})).unwrap());
+    h.coordinator.settings.control_policies.push(serde_json::from_value(json!({"dependent_provider":"b","owner_provider":"a","owner_service":"a/2","owner_method":method("control"),"status_method":method("control_status"),"settlement_method":method("settle"),"argument_schema":schema,"output_capability":"output","output_schema":schema,"max_access":"exclusive","mutation_domains":[]})).unwrap());
     h.coordinator.settings.finalize_policies.push(serde_json::from_value(json!({"owner_provider":"a","owner_service":"a/2","method":method("finalize"),"status_method":method("finalize_status"),"output_capability":"output","output_schema":schema,"capture_provider":"capture","selector_schema":"selector/1","required_access":"exclusive","mutation_domains":[]})).unwrap());
     let mut seen = Vec::new();
     let mut send = |command| match command {
@@ -332,10 +332,16 @@ fn owner_control_and_finalize_methods_each_require_exact_broker_approval() {
         }
         _ => unreachable!(),
     };
-    for _ in 0..13 {
+    for _ in 0..14 {
         h.coordinator.refresh_approvals(&mut send).unwrap();
     }
-    for name in ["control", "control_status", "finalize", "finalize_status"] {
+    for name in [
+        "control",
+        "control_status",
+        "settle",
+        "finalize",
+        "finalize_status",
+    ] {
         assert!(seen.contains(&("a/2".into(), name.into(), 2)));
         assert!(
             h.coordinator.selections["a"]
@@ -344,5 +350,18 @@ fn owner_control_and_finalize_methods_each_require_exact_broker_approval() {
                 .any(|approval| approval.method.service == "a/2" && approval.method.method == name)
         );
     }
-    assert_eq!(seen.len(), 13);
+    assert_eq!(seen.len(), 14);
+}
+
+#[test]
+fn substituted_broker_method_is_rejected_before_caching() {
+    let mut h = Harness::new("none");
+    let response = h.coordinator.refresh_approvals(&mut |command| match command {
+        Command::QueryApiApproval { service, method, interface_major, min_minor } => Ok(Response::Result {
+            payload: json!({"provider":"a","method":{"service":service,"method":format!("{method}-other"),"interface_major":interface_major,"interface_minor":min_minor}}),
+        }),
+        _ => unreachable!(),
+    });
+    assert!(response.is_err());
+    assert!(h.coordinator.selections.is_empty());
 }
