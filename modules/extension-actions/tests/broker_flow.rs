@@ -10,6 +10,7 @@ const STATE: &str = "amaterasu.state/1";
 const REGISTRY: &str = "amaterasu.extension-registry/1";
 const LIFECYCLE: &str = "amaterasu.session-lifecycle/1";
 const PROVIDER: &str = "example.provider/1";
+const INPUT: &str = "amaterasu.input/1";
 
 struct Endpoint {
     broker: Rc<RefCell<Broker>>,
@@ -58,6 +59,9 @@ struct Harness {
     expansive_plan: bool,
     hold_running_commit: bool,
     held_state: Option<(u64, Value)>,
+    transition_pending: bool,
+    transitions: usize,
+    delivery: &'static str,
 }
 impl Harness {
     fn new() -> Self {
@@ -66,21 +70,22 @@ impl Harness {
 
     fn with_lifecycle_grant(allowed: bool) -> Self {
         let calls = if allowed {
-            vec![STATE, REGISTRY, LIFECYCLE, PROVIDER]
+            vec![STATE, REGISTRY, LIFECYCLE, PROVIDER, INPUT]
         } else {
-            vec![STATE, REGISTRY, PROVIDER]
+            vec![STATE, REGISTRY, PROVIDER, INPUT]
         };
         let schema = json!({"required":{},"optional":{},"allow_extra":true});
         let plan = json!({"service":PROVIDER,"method":"action_plan","interface_major":1,"interface_minor":0,"request":schema,"response":schema,"privilege":"user"});
         let execute = json!({"service":PROVIDER,"method":"action_execute","interface_major":1,"interface_minor":0,"request":schema,"response":schema,"privilege":"user"});
-        let settings = json!({"grants":[{"principal":"management","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["read_only","session_mutation"]}]});
+        let settings = json!({"input_service":"input","grants":[{"principal":"management","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["read_only","session_mutation"]},{"principal":"input","action_ids":["example/action"],"target_kinds":["session"],"execution_classes":["read_only","session_mutation"]}]});
         let config = serde_json::from_value(json!({"principals":{
             ACTIONS:{"provide":[ACTION_SERVICE],"call":calls},
             "management":{"call":[ACTION_SERVICE,REGISTRY,PROVIDER]},
+            "input":{"provide":[INPUT],"call":[ACTION_SERVICE,REGISTRY,PROVIDER]},
             "state":{"provide":[STATE]}, "registry":{"provide":[REGISTRY]},
             "lifecycle":{"provide":[LIFECYCLE]}, "provider":{"provide":[PROVIDER]}
         },"settings":{ACTIONS:settings},"api_methods":[
-            {"provider":"provider","callers":[ACTIONS,"management"],"method":plan},
+            {"provider":"provider","callers":[ACTIONS,"management","input"],"method":plan},
             {"provider":"provider","callers":[ACTIONS],"method":execute}
         ]}))
         .unwrap();
@@ -89,6 +94,7 @@ impl Harness {
             ("state", STATE),
             ("registry", REGISTRY),
             ("lifecycle", LIFECYCLE),
+            ("input", INPUT),
         ] {
             assert!(matches!(
                 broker.dispatch(
@@ -138,6 +144,9 @@ impl Harness {
             expansive_plan: false,
             hold_running_commit: false,
             held_state: None,
+            transition_pending: false,
+            transitions: 0,
+            delivery: "delivered",
         };
         let host = abi::HostApi {
             header: abi::AbiHeader::of::<abi::HostApi>(),
@@ -166,7 +175,7 @@ impl Harness {
     fn pump(&mut self) {
         // SAFETY: instance is live and calls are serialized on the test thread.
         assert_eq!(unsafe { (self.api.tick)(self.instance) }, abi::STATUS_OK);
-        for principal in ["state", "registry", "lifecycle", "provider"] {
+        for principal in ["state", "registry", "lifecycle", "provider", "input"] {
             if principal == "lifecycle" && self.lifecycle_hangs {
                 continue;
             }
@@ -250,6 +259,13 @@ impl Harness {
                             self.consumptions += 1;
                             json!({"status":"succeeded","operation_id":payload["operation_id"],"target":payload["target"],"plan_digest":payload["plan_digest"]})
                         }
+                        "begin_action_transition" => {
+                            self.transitions += 1;
+                            json!({"status":if self.transition_pending {"pending"} else {"succeeded"},"operation_id":payload["operation_id"],"target":payload["target"],"plan_digest":payload["plan_digest"]})
+                        }
+                        "consume_input_reservation" => {
+                            json!({"status":"succeeded","operation_id":payload["operation_id"],"action_id":payload["action_id"],"target":payload["target"],"reservation_id":payload["reservation_id"],"source":{"caller":"management","initiator":"management"}})
+                        }
                         "cancel_action" => {
                             json!({"status":"cancelled","operation_id":payload["operation_id"]})
                         }
@@ -266,6 +282,10 @@ impl Harness {
                         }
                         _ => json!({"status":"rejected"}),
                     }
+                }
+                "input" => {
+                    assert_eq!(payload["action"], "confirm_delivery");
+                    json!({"ok":true,"status":if self.delivery == "forged" {"delivered"} else {self.delivery},"epoch":payload["epoch"],"sequence":payload["sequence"],"operation_id":payload["operation_id"],"reservation_id": if self.delivery == "forged" {json!("forged")} else {payload["reservation_id"].clone()},"action_id":"example/action","target":{"kind":"session","host_epoch":"h","session_id":"s","expected_generation":1},"batch_epoch":"batch","batch_sequence":1})
                 }
                 "provider" => {
                     let arguments = &payload["arguments"];
@@ -332,9 +352,12 @@ impl Harness {
         );
     }
     fn call(&mut self, payload: Value) -> Value {
+        self.call_as("management", payload)
+    }
+    fn call_as(&mut self, principal: &str, payload: Value) -> Value {
         self.sequence += 1;
         let response = self.broker.borrow_mut().dispatch(
-            "management",
+            principal,
             Command::Request {
                 service: ACTION_SERVICE.into(),
                 payload,
@@ -351,14 +374,14 @@ impl Harness {
             let result = self
                 .broker
                 .borrow_mut()
-                .dispatch("management", Command::TakeResult { request: id });
+                .dispatch(principal, Command::TakeResult { request: id });
             match result {
                 Response::Pending => (),
                 Response::Result { payload } => {
                     let _ = self
                         .broker
                         .borrow_mut()
-                        .dispatch("management", Command::ReleaseResult { request: id });
+                        .dispatch(principal, Command::ReleaseResult { request: id });
                     return payload;
                 }
                 other => panic!("unexpected result: {other:?}"),
@@ -466,14 +489,60 @@ fn restart_fences_admitted_action_without_replaying_effect() {
 }
 
 #[test]
-fn mutation_action_is_rejected_before_lifecycle_or_provider_invocation() {
+fn mutation_waits_for_transfer_before_provider_invocation() {
     let mut harness = Harness::new();
     harness.mutation_action = true;
-    let (_, receipt) = harness.submit_action();
-    assert_eq!(receipt["code"], "mutation_unavailable");
-    assert!(harness.observed_delegated_plan);
-    assert_eq!(harness.authorizations, 0);
+    harness.transition_pending = true;
+    let epoch = harness.invoke_action();
+    for _ in 0..500 {
+        harness.pump();
+        if harness.transitions >= 2 {
+            break;
+        }
+    }
+    assert!(harness.transitions >= 2);
     assert_eq!(harness.effects, 0);
+    assert_eq!(
+        harness.state[&format!("epoch/{epoch}")]["receipts"]["1"]["dispatch"]["stage"]["phase"],
+        "awaiting_transition"
+    );
+    harness.transition_pending = false;
+    for _ in 0..500 {
+        harness.pump();
+        if harness.effects != 0 {
+            break;
+        }
+    }
+    assert_eq!(harness.effects, 1);
+}
+
+#[test]
+fn input_delivery_must_be_confirmed_with_matching_reservation() {
+    for bad_delivery in ["pending", "forged"] {
+        let mut harness = Harness::new();
+        for _ in 0..12 {
+            harness.pump();
+        }
+        let open = harness.call_as(
+            "input",
+            json!({"operation":"open_epoch","operation_id":"open.input"}),
+        );
+        let epoch = open["epoch"].as_str().unwrap();
+        let operation_id = format!("{epoch}:1");
+        let reserved = harness.call_as("input", json!({"operation":"reserve_input","epoch":epoch,"sequence":1,"operation_id":operation_id,"action_id":"example/action","target":{"kind":"session","host_epoch":"h","session_id":"s","expected_generation":1},"arguments":{},"expected_settings_revision":null,"input_reservation_id":"reservation"}));
+        assert_eq!(reserved["status"], "reserved", "{reserved}");
+        harness.delivery = bad_delivery;
+        let denied = harness.call_as("input", json!({"operation":"commit_input","epoch":epoch,"sequence":1,"operation_id":operation_id}));
+        assert_eq!(denied["code"], "input_delivery_unconfirmed", "{denied}");
+        for _ in 0..100 {
+            harness.pump();
+        }
+        assert_eq!(harness.effects, 0);
+        assert_eq!(
+            harness.state[&format!("epoch/{epoch}")]["receipts"]["1"]["receipt"]["status"],
+            "reserved"
+        );
+    }
 }
 #[test]
 fn provider_cannot_expand_descriptor_capabilities() {
