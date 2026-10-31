@@ -98,9 +98,12 @@ pub enum Operation {
     Lookup {
         operation_id: String,
     },
+    #[serde(rename = "operation_epoch")]
+    EpochRead {},
     VerifyRetirement {
         owner: String,
-        launch_id: u64,
+        #[serde(default)]
+        launch_id: Option<u64>,
         operation_id: String,
     },
     Stop {
@@ -155,7 +158,7 @@ impl Operation {
                 launch_id,
                 operation_id,
             } if !valid_catalog_principal(owner)
-                || *launch_id == 0
+                || *launch_id == Some(0)
                 || !valid_operation_id(operation_id) =>
             {
                 return Err("invalid_request");

@@ -6,7 +6,10 @@ use amaterasu_contracts::virtual_display::VirtualDisplayIntent;
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, time::Instant};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Instant,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CatalogSelection {
@@ -137,16 +140,24 @@ impl Record {
 pub struct Records {
     pub values: BTreeMap<u64, Record>,
     nonce: String,
+    operation_epoch: String,
     next_id: u64,
+    admitted_operations: BTreeSet<(String, String)>,
+    retired_operations: BTreeSet<(String, String)>,
 }
 impl Records {
     pub fn new() -> Result<Self, &'static str> {
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).map_err(|_| "entropy_unavailable")?;
+        let mut operation_epoch = [0; 16];
+        getrandom::fill(&mut operation_epoch).map_err(|_| "entropy_unavailable")?;
         Ok(Self {
             values: BTreeMap::new(),
             nonce: hex(&nonce),
+            operation_epoch: hex(&operation_epoch),
             next_id: 0,
+            admitted_operations: BTreeSet::new(),
+            retired_operations: BTreeSet::new(),
         })
     }
     pub fn start(
@@ -167,6 +178,30 @@ impl Records {
                             .preflight_deadline
                             .is_some_and(|deadline| Instant::now() < deadline)))
         });
+        let tracked = operation_id.starts_with("ale1:");
+        if tracked {
+            if !self.current_epoch_operation(&operation_id) {
+                return Err("stale_operation_epoch");
+            }
+            let key = (caller.to_owned(), operation_id.clone());
+            if self.retired_operations.contains(&key) {
+                return Err("operation_retired");
+            }
+            if self.admitted_operations.contains(&key)
+                && !self
+                    .values
+                    .values()
+                    .any(|record| record.owner == caller && record.operation_id == operation_id)
+            {
+                return Err("operation_unconfirmed");
+            }
+            if !self.admitted_operations.contains(&key) {
+                if self.admitted_operations.len() + self.retired_operations.len() >= 4096 {
+                    return Err("operation_limit");
+                }
+                self.admitted_operations.insert(key);
+            }
+        }
         let GlobalPreparation {
             structured_steps: global_preparation,
             legacy_commands: legacy_global_preparation,
@@ -272,6 +307,95 @@ impl Records {
             .get(&id)
             .filter(|record| record.owner == caller)
             .ok_or("launch_not_found")
+    }
+    pub fn operation_epoch(&self) -> &str {
+        &self.operation_epoch
+    }
+
+    pub fn current_epoch_operation(&self, operation_id: &str) -> bool {
+        let Some(suffix) = operation_id.strip_prefix("ale1:") else {
+            return false;
+        };
+        let Some((epoch, nonce)) = suffix.split_once(':') else {
+            return false;
+        };
+        epoch == self.operation_epoch
+            && !nonce.is_empty()
+            && nonce.len() <= 80
+            && nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    }
+
+    pub fn tombstone_absent(
+        &mut self,
+        owner: &str,
+        operation_id: &str,
+    ) -> Result<(), &'static str> {
+        if !self.current_epoch_operation(operation_id) {
+            return Err("retirement_unconfirmed");
+        }
+        let key = (owner.to_owned(), operation_id.to_owned());
+        if self.admitted_operations.contains(&key) {
+            return Err("retirement_unconfirmed");
+        }
+        if !self.retired_operations.contains(&key)
+            && self.admitted_operations.len() + self.retired_operations.len() >= 4096
+        {
+            return Err("retirement_unconfirmed");
+        }
+        self.retired_operations.insert(key);
+        Ok(())
+    }
+
+    /// Fence a completed, read-only preflight before it can admit a launch.
+    pub fn tombstone_unstarted(
+        &mut self,
+        owner: &str,
+        operation_id: &str,
+    ) -> Result<(), &'static str> {
+        if !self.current_epoch_operation(operation_id) {
+            return Err("retirement_unconfirmed");
+        }
+        let key = (owner.to_owned(), operation_id.to_owned());
+        if self.retired_operations.contains(&key) {
+            return Ok(());
+        }
+        let record = self
+            .values
+            .values_mut()
+            .find(|record| record.owner == owner && record.operation_id == operation_id)
+            .ok_or("retirement_unconfirmed")?;
+        if record.state != State::Starting
+            || record.launch_started
+            || !record.preflight_ready
+            || record.preflight_token.is_none()
+            || record.cleanup_error.is_some()
+            || record.outstanding_request.is_some()
+            || record.session_requested
+            || record.process_requested
+            || record.preparation_requested
+            || record.provider_launch_requested
+            || record.session_id.is_some()
+            || record.process_id.is_some()
+            || record.provider_ticket.is_some()
+        {
+            return Err("retirement_unconfirmed");
+        }
+        if !self.admitted_operations.remove(&key) {
+            return Err("retirement_unconfirmed");
+        }
+        self.retired_operations.insert(key);
+        record.state = State::Cancelled;
+        record.preflight_ready = false;
+        record.display_admission = None;
+        record.target = None;
+        Ok(())
+    }
+
+    pub fn is_tombstoned(&self, owner: &str, operation_id: &str) -> bool {
+        self.retired_operations
+            .contains(&(owner.to_owned(), operation_id.to_owned()))
     }
     pub fn owned_operation(
         &self,

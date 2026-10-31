@@ -169,11 +169,22 @@ Startup settings are optional and default to an empty environment:
 ```
 
 An optional `retirement_observers` array grants named broker callers read-only
-retirement verification. `verify_retirement` requires the original owner, launch
-ID, and application operation ID. It returns a bounded identity-matched success
+retirement verification. `verify_retirement` requires the original owner and
+application operation ID; a known launch ID can additionally be supplied. It
+returns a bounded identity-matched success
 only for a clean terminal launch with no unsettled broker request. An unknown
-record, including after a service restart, is unconfirmed and cannot prove that a
-launch was never admitted. The array defaults to empty.
+record is unconfirmed unless the operation uses the current service epoch. A
+trusted caller can read that epoch with `operation_epoch` and form an operation ID
+as `ale1:<epoch>:<opaque>`, where `opaque` contains ASCII letters, digits, dots,
+underscores, or hyphens. A verification with no launch ID can fence an unknown
+current-epoch ID before confirming it was never admitted. Later admissions for
+that owner and ID are refused. A completed, read-only preflight can also be
+fenced this way if no launch effect or unsettled request exists; an in-flight
+preflight remains unconfirmed. Here `never_admitted` describes the application
+launch effect, not the preceding read-only preflight. Admission and retirement markers are bounded and
+not evicted during the process lifetime. Restart creates a fresh epoch and rejects
+all old epoch IDs, so old unknown operations remain unconfirmed. The observer
+array defaults to empty.
 
 The application environment is cleared, then populated with this trusted startup
 map. Host variables are not inherited implicitly. Supply OS/application-required

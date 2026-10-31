@@ -365,17 +365,42 @@ impl Pipeline {
     }
 
     fn verify_retirement(
-        &self,
+        &mut self,
         caller: &str,
         owner: &str,
-        launch_id: u64,
+        launch_id: Option<u64>,
         operation_id: &str,
     ) -> Value {
         if !self.retirement_observers.contains(caller) {
             return error("permission_denied");
         }
-        let Ok(record) = self.records.owned(owner, launch_id) else {
-            return error("retirement_unconfirmed");
+        if launch_id.is_none() && self.records.is_tombstoned(owner, operation_id) {
+            return serde_json::json!({"ok":true,"retired":true,"never_admitted":true,
+                "owner":owner,"launch_id":null,"operation_id":operation_id});
+        }
+        if launch_id.is_none()
+            && self
+                .records
+                .tombstone_unstarted(owner, operation_id)
+                .is_ok()
+        {
+            return serde_json::json!({"ok":true,"retired":true,"never_admitted":true,
+                "owner":owner,"launch_id":null,"operation_id":operation_id});
+        }
+        let record = match launch_id {
+            Some(id) => self.records.owned(owner, id),
+            None => self.records.owned_operation(owner, operation_id),
+        };
+        let record = match record {
+            Ok(record) => record,
+            Err(_) if launch_id.is_none() => {
+                return match self.records.tombstone_absent(owner, operation_id) {
+                    Ok(()) => serde_json::json!({"ok":true,"retired":true,"never_admitted":true,
+                        "owner":owner,"launch_id":null,"operation_id":operation_id}),
+                    Err(code) => error(code),
+                };
+            }
+            Err(_) => return error("retirement_unconfirmed"),
         };
         if record.operation_id != operation_id
             || !record.state.terminal()
@@ -385,7 +410,7 @@ impl Pipeline {
             return error("retirement_unconfirmed");
         }
         serde_json::json!({"ok":true,"retired":true,"owner":owner,
-            "launch_id":launch_id,"operation_id":operation_id})
+            "launch_id":record.launch_id,"operation_id":operation_id})
     }
     pub fn tick(&mut self, mut send: impl FnMut(Command) -> Transport) -> ModuleResult<()> {
         if let Some(mut job) = self.job.take() {
@@ -496,7 +521,7 @@ impl Pipeline {
     /// Cleanup advances independently of the initiating request. Keep bounded
     /// owner-authorized readback available while its native undo is still running.
     fn poll_cleanup_readback(
-        &self,
+        &mut self,
         active_launch: u64,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
@@ -520,6 +545,9 @@ impl Pipeline {
                 Ok(operation)
             });
         let response = match operation {
+            Ok(Operation::EpochRead {}) => {
+                serde_json::json!({"ok":true,"operation_epoch":self.records.operation_epoch()})
+            }
             Ok(Operation::VerifyRetirement {
                 owner,
                 launch_id,
@@ -577,6 +605,13 @@ impl Pipeline {
                 Ok(operation)
             });
         match operation {
+            Ok(Operation::EpochRead {}) => {
+                complete(
+                    send,
+                    id,
+                    serde_json::json!({"ok":true,"operation_epoch":self.records.operation_epoch()}),
+                )?;
+            }
             Ok(Operation::VerifyRetirement {
                 owner,
                 launch_id,
@@ -658,6 +693,11 @@ impl Pipeline {
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
         match operation {
+            Operation::EpochRead {} => complete(
+                send,
+                request,
+                serde_json::json!({"ok":true,"operation_epoch":self.records.operation_epoch()}),
+            ),
             Operation::VerifyRetirement {
                 owner,
                 launch_id,

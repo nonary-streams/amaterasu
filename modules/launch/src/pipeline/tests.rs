@@ -4679,6 +4679,10 @@ fn retirement_observer_requires_exact_owned_clean_terminal_launch() {
         ),
         json!({"ok":true,"retired":true,"owner":"alice","launch_id":1,"operation_id":"retirement-one"})
     );
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.session-lifecycle", json!({"action":"verify_retirement","owner":"alice","launch_id":null,"operation_id":"retirement-one"}))["launch_id"],
+        1
+    );
     pipeline
         .records
         .values
@@ -4723,4 +4727,119 @@ fn retirement_observer_configuration_and_requests_are_bounded() {
         let operation = serde_json::from_value::<Operation>(payload);
         assert!(operation.is_err() || operation.unwrap().validate().is_err());
     }
+}
+
+#[test]
+fn retirement_tombstone_fences_delayed_launch_across_restart() {
+    let mut harness = Harness::new();
+    let mut first = pipeline();
+    first.set_retirement_observers(["amaterasu.session-lifecycle".to_string()].into());
+    let epoch = harness.request(&mut first, "alice", json!({"action":"operation_epoch"}))["operation_epoch"].as_str().unwrap().to_owned();
+    let operation = format!("ale1:{epoch}:opaque-1");
+    let verify = json!({"action":"verify_retirement","owner":"alice","launch_id":null,"operation_id":operation});
+    assert_eq!(
+        harness.request(&mut first, "mallory", verify.clone())["code"],
+        "permission_denied"
+    );
+    let retired = harness.request(&mut first, "amaterasu.session-lifecycle", verify.clone());
+    assert_eq!(
+        retired,
+        json!({"ok":true,"retired":true,"never_admitted":true,"owner":"alice","launch_id":null,"operation_id":operation})
+    );
+    assert_eq!(
+        harness.request(&mut first, "amaterasu.session-lifecycle", verify.clone()),
+        retired
+    );
+    assert_eq!(
+        harness.request(&mut first, "alice", launch(&operation))["code"],
+        "operation_retired"
+    );
+    let mut restarted = pipeline();
+    restarted.set_retirement_observers(["amaterasu.session-lifecycle".to_string()].into());
+    assert_eq!(
+        harness.request(&mut restarted, "alice", launch(&operation))["code"],
+        "stale_operation_epoch"
+    );
+    assert_eq!(
+        harness.request(&mut restarted, "amaterasu.session-lifecycle", verify)["code"],
+        "retirement_unconfirmed"
+    );
+    assert_eq!(harness.request(&mut restarted, "amaterasu.session-lifecycle", json!({"action":"verify_retirement","owner":"alice","launch_id":null,"operation_id":"legacy"}))["code"], "retirement_unconfirmed");
+}
+
+#[test]
+fn retirement_unknown_id_for_live_or_previously_admitted_operation_fails_closed() {
+    let mut harness = Harness::new();
+    let mut pipeline = pipeline();
+    pipeline.set_retirement_observers(["amaterasu.session-lifecycle".to_string()].into());
+    let epoch = harness.request(&mut pipeline, "alice", json!({"action":"operation_epoch"}))["operation_epoch"].as_str().unwrap().to_owned();
+    let operation = format!("ale1:{epoch}:started");
+    let started = harness.request(&mut pipeline, "alice", launch(&operation));
+    assert_eq!(started["launch"]["state"], "active");
+    let verify = json!({"action":"verify_retirement","owner":"alice","launch_id":null,"operation_id":operation});
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.session-lifecycle", verify.clone())["code"],
+        "retirement_unconfirmed"
+    );
+    // Losing a record must not turn a previously admitted operation into proof of absence.
+    pipeline.records.values.remove(&1);
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.session-lifecycle", verify)["code"],
+        "retirement_unconfirmed"
+    );
+    assert_eq!(
+        harness.request(&mut pipeline, "alice", launch(&operation))["code"],
+        "operation_unconfirmed"
+    );
+}
+
+#[test]
+fn retirement_tombstones_completed_preflight_before_delayed_launch() {
+    let mut harness = Harness::new();
+    let mut pipeline = pipeline();
+    pipeline.set_retirement_observers(["amaterasu.session-lifecycle".to_string()].into());
+    let epoch = harness.request(
+        &mut pipeline,
+        "amaterasu.nvhttp",
+        json!({"action":"operation_epoch"}),
+    )["operation_epoch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let operation = format!("ale1:{epoch}:preflight");
+    let preflight_request = json!({"action":"preflight_export","operation_id":operation,"app_id":"app-0000000000000001"});
+    let preflight = harness.request(&mut pipeline, "amaterasu.nvhttp", preflight_request.clone());
+    assert_eq!(preflight["ok"], true);
+    assert!(harness.sessions.is_empty());
+    assert!(harness.processes.is_empty());
+    let verify = json!({"action":"verify_retirement","owner":"amaterasu.nvhttp","launch_id":null,"operation_id":operation});
+    let expected = json!({"ok":true,"retired":true,"never_admitted":true,"owner":"amaterasu.nvhttp","launch_id":null,"operation_id":operation});
+    pipeline.records.values.get_mut(&1).unwrap().preflight_ready = false;
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.session-lifecycle", verify.clone())["code"],
+        "retirement_unconfirmed"
+    );
+    pipeline.records.values.get_mut(&1).unwrap().preflight_ready = true;
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.session-lifecycle", verify.clone()),
+        expected
+    );
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.session-lifecycle", verify),
+        expected
+    );
+    let mut delayed = launch_export(&operation);
+    delayed["preflight_token"] = preflight["preflight_token"].clone();
+    delayed["frame_limiter_settings"] = frame_limiter_snapshot();
+    delayed["client_frame_limiter_overrides"] = json!({});
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.nvhttp", delayed)["code"],
+        "operation_retired"
+    );
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.nvhttp", preflight_request)["code"],
+        "operation_retired"
+    );
+    assert!(harness.sessions.is_empty());
+    assert!(harness.processes.is_empty());
 }
