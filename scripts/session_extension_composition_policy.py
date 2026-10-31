@@ -196,6 +196,12 @@ def build_bootstrap(base: dict, selected: list[dict], entries: dict, lifecycle_s
     if any(CORE_OWNER_OPERATIONS & set(names) for identity, names in
            lifecycle.get("operation_grants", {}).items() if identity != check.OWNER):
         raise ValueError("owner recovery operations cannot be granted to other principals")
+    operation_grants = lifecycle.get("operation_grants", {})
+    if "finish_input_action" not in operation_grants.get(legacy.INPUT, []):
+        raise ValueError("input finish operation grant is missing")
+    if any("finish_input_action" in names for identity, names in operation_grants.items()
+           if identity != legacy.INPUT):
+        raise ValueError("input finish operation cannot be granted to other principals")
     if enable_action and not ACTION_OWNER_OPERATIONS <= set(owner_operations):
         raise ValueError("owner action operation grants are incomplete")
     action_operations = lifecycle.get("operation_grants", {}).get(legacy.ACTIONS, [])
@@ -285,6 +291,8 @@ def lifecycle_configuration(journal_path: str, graph: dict, additional_grants: d
             raise ValueError("invalid provider operation grants")
         if provider != check.OWNER and CORE_OWNER_OPERATIONS & set(names):
             raise ValueError("owner recovery operations cannot be granted to other principals")
+        if provider != legacy.INPUT and "finish_input_action" in names:
+            raise ValueError("input finish operation cannot be granted to other principals")
         operations[provider] = sorted(set(operations.get(provider, [])) | set(names))
     return {"journal_path": journal_path, "trusted_callers": sorted(operations),
             "session_delegates": [legacy.RTSP, legacy.STREAM],

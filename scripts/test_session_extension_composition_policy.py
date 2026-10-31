@@ -122,7 +122,7 @@ class CompositionPolicyTest(unittest.TestCase):
         base = {"policy": {"principals": {identity: {"call": []} for identity in identities},
                            "settings": {legacy.NVHTTP: {"streaming": {"capture": {}}}},
                            "api_methods": []}}
-        lifecycle = {"operation_grants": {check.OWNER: sorted(policy.CORE_OWNER_OPERATIONS | {"verify_action_effect", "check_action_effect"})}}
+        lifecycle = {"operation_grants": {check.OWNER: sorted(policy.CORE_OWNER_OPERATIONS | {"verify_action_effect", "check_action_effect"}), legacy.INPUT: ["finish_input_action"]}}
         with self.assertRaisesRegex(ValueError, "owner action operation grants"):
             policy.build_bootstrap(base, self.selected, entries, lifecycle, True)
         lifecycle["operation_grants"][check.OWNER] = sorted(policy.ACTION_OWNER_OPERATIONS | policy.CORE_OWNER_OPERATIONS)
@@ -162,7 +162,7 @@ class CompositionPolicyTest(unittest.TestCase):
                            "api_methods": []}}
         before = copy.deepcopy(base)
         entries = policy.provider_entries(self.selected)
-        lifecycle = {"journal_path": "/new-root/data/journal.json", "operation_grants": {check.OWNER: sorted(policy.CORE_OWNER_OPERATIONS)}}
+        lifecycle = {"journal_path": "/new-root/data/journal.json", "operation_grants": {check.OWNER: sorted(policy.CORE_OWNER_OPERATIONS), legacy.INPUT: ["finish_input_action"]}}
         with self.assertRaisesRegex(ValueError, "owner recovery operation grants"):
             policy.build_bootstrap(base, self.selected, entries, {"operation_grants": {}})
         for operation in policy.CORE_OWNER_OPERATIONS:
@@ -174,6 +174,13 @@ class CompositionPolicyTest(unittest.TestCase):
                                                  check.DISPLAY: [operation]}}
             with self.assertRaisesRegex(ValueError, "cannot be granted to other principals"):
                 policy.build_bootstrap(base, self.selected, entries, wrong_caller)
+        missing_finish = {"operation_grants": {check.OWNER: sorted(policy.CORE_OWNER_OPERATIONS)}}
+        with self.assertRaisesRegex(ValueError, "input finish operation grant is missing"):
+            policy.build_bootstrap(base, self.selected, entries, missing_finish)
+        wrong_finish = copy.deepcopy(lifecycle)
+        wrong_finish["operation_grants"][check.OWNER].append("finish_input_action")
+        with self.assertRaisesRegex(ValueError, "input finish operation cannot be granted"):
+            policy.build_bootstrap(base, self.selected, entries, wrong_finish)
         assembled, calls = policy.build_bootstrap(base, self.selected, entries, lifecycle)
         self.assertEqual(base, before)
         settings = assembled["policy"]["settings"]
@@ -197,17 +204,17 @@ class CompositionPolicyTest(unittest.TestCase):
         entries = policy.provider_entries(self.selected)
         base["policy"]["api_methods"].append(copy.deepcopy(entries["api_methods"][0]))
         with self.assertRaisesRegex(ValueError, "approval conflicts"):
-            policy.build_bootstrap(base, self.selected, entries, {"operation_grants": {check.OWNER: sorted(policy.CORE_OWNER_OPERATIONS)}})
+            policy.build_bootstrap(base, self.selected, entries, {"operation_grants": {check.OWNER: sorted(policy.CORE_OWNER_OPERATIONS), legacy.INPUT: ["finish_input_action"]}})
         base["policy"]["api_methods"] = []
         with self.assertRaisesRegex(ValueError, "must not override"):
             policy.build_bootstrap(base, self.selected, entries, {"participants": []})
         base["policy"]["settings"][legacy.NVHTTP]["streaming"]["capture"]["capture_provider"] = "kms"
         with self.assertRaisesRegex(ValueError, "capture selection conflicts"):
-            policy.build_bootstrap(base, self.selected, entries, {"operation_grants": {check.OWNER: sorted(policy.CORE_OWNER_OPERATIONS)}})
+            policy.build_bootstrap(base, self.selected, entries, {"operation_grants": {check.OWNER: sorted(policy.CORE_OWNER_OPERATIONS), legacy.INPUT: ["finish_input_action"]}})
         base["policy"]["settings"][legacy.NVHTTP]["streaming"]["capture"]["capture_provider"] = "pipewire"
         base["policy"]["settings"][legacy.NVHTTP]["session_lifecycle_required"] = False
         with self.assertRaisesRegex(ValueError, "lifecycle configuration conflicts"):
-            policy.build_bootstrap(base, self.selected, entries, {"operation_grants": {check.OWNER: sorted(policy.CORE_OWNER_OPERATIONS)}})
+            policy.build_bootstrap(base, self.selected, entries, {"operation_grants": {check.OWNER: sorted(policy.CORE_OWNER_OPERATIONS), legacy.INPUT: ["finish_input_action"]}})
 
     def test_resource_scoped_graph_pins_owner_methods_and_schema_bytes(self):
         target, control = b'{"target":true}\n', b'{"control":true}\n'
@@ -237,6 +244,9 @@ class CompositionPolicyTest(unittest.TestCase):
         settings = policy.lifecycle_configuration("/private/journal.json", graph,
             {check.OWNER: ["verify_resource_control"], check.DISPLAY: [], legacy.ACTIONS: ["rebind_action_plan", "cancel_action"]})
         self.assertIn("prepare", settings["operation_grants"][legacy.NVHTTP])
+        self.assertIn("finish_input_action", settings["operation_grants"][legacy.INPUT])
+        self.assertTrue(all("finish_input_action" not in names for principal, names in
+                            settings["operation_grants"].items() if principal != legacy.INPUT))
         self.assertIn("verify_resource_control", settings["operation_grants"][check.OWNER])
         self.assertEqual(settings["operation_grants"][check.DISPLAY], [])
         self.assertIn("authorize_action", settings["operation_grants"][legacy.ACTIONS])
@@ -246,6 +256,9 @@ class CompositionPolicyTest(unittest.TestCase):
         self.assertEqual(settings["consumer_requirements"]["capture_providers"], ["amaterasu.capture-pipewire/1"])
         with self.assertRaisesRegex(ValueError, "both providers"):
             policy.lifecycle_configuration("/private/journal.json", graph, {check.OWNER: []})
+        with self.assertRaisesRegex(ValueError, "input finish operation cannot be granted"):
+            policy.lifecycle_configuration("/private/journal.json", graph,
+                {check.OWNER: ["finish_input_action"], check.DISPLAY: []})
 
 
 if __name__ == "__main__":
