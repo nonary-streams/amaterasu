@@ -485,6 +485,10 @@ impl Coordinator {
                 if !action_dependencies_clear(&journal, &target, &provider) {
                     return rejection("action_dependencies_unresolved");
                 }
+                let Some(provider_graph) = stream.provider_graph.clone() else {
+                    return rejection("action_provider_graph_missing");
+                };
+                let providers = provider_graph.order.iter().rev().cloned().collect();
                 let input_id = payload["input_reservation_id"].as_str().map(str::to_owned);
                 if let Some(input_id) = &input_id {
                     let Ok(reservation) = journal.inputs.resolve_running_reservation(input_id)
@@ -531,8 +535,8 @@ impl Coordinator {
                     reason: Some(amaterasu_extension_api::ReleaseReason::Reconfigure),
                     video: None,
                     transition_id,
-                    providers: vec![],
-                    provider_graph: None,
+                    providers,
+                    provider_graph: Some(provider_graph),
                     cleanup_blockers: BTreeSet::new(),
                     index: 0,
                     states: Default::default(),
@@ -1345,6 +1349,13 @@ mod tests {
             coordinator.action_operation(&service, "service", &request)["status"],
             "pending"
         );
+        {
+            let journal = &coordinator.shared.borrow().value;
+            let key = super::super::receipt_key(&service, "action-transition", "op-transition");
+            let work = journal.receipts[&key].work.as_ref().unwrap();
+            assert_eq!(work.providers, vec!["display"]);
+            assert_eq!(work.provider_graph.as_ref().unwrap().order, vec!["display"]);
+        }
         let mut competing = auth.clone();
         competing["operation_id"] = json!("competing");
         assert_eq!(
