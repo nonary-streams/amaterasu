@@ -1947,6 +1947,19 @@ mod tests {
         assert_eq!(described["resource_generation"], 7);
         assert_eq!(described["settings_revision"], "session-rev");
         assert_eq!(described["streams"], json!([]));
+        // A released historical root must not mask the one current root.
+        let mut with_tombstone = paused.clone();
+        let mut history = serde_json::to_value(&with_tombstone.composition).unwrap();
+        let mut old = history["outputs"][0].clone();
+        old["state"] = json!("released");
+        old["output"]["output_id"] = json!("older-owned");
+        history["outputs"].as_array_mut().unwrap().push(old);
+        with_tombstone.composition = serde_json::from_value(history).unwrap();
+        save(&coordinator.shared, with_tombstone).unwrap();
+        let current = coordinator.describe_action_target("display", &v2);
+        assert_eq!(current["status"], "succeeded", "{current}");
+        assert_eq!(current["owner_output"]["output_id"], "owned");
+        assert_eq!(current["resource_generation"], 7);
         let mut stale_cursor = paused.clone();
         stale_cursor
             .sessions

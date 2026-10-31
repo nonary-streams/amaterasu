@@ -206,14 +206,22 @@ impl Coordinator {
             session_id: id.clone(),
             generation: session.generation,
         };
-        let mut outputs = journal
+        if !journal
             .composition
             .records()
-            .filter(|record| record.output.producer == caller && record.output.origin == origin);
-        let Some(record) = outputs.next() else {
+            .any(|record| record.output.producer == caller && record.output.origin == origin)
+        {
             return rejection("owner_output_missing");
+        }
+        let mut active = journal.composition.records().filter(|record| {
+            record.output.producer == caller
+                && record.output.origin == origin
+                && record.state == super::composition::OutputState::Retained
+        });
+        let Some(record) = active.next() else {
+            return rejection("owner_output_ambiguous_or_unavailable");
         };
-        if outputs.next().is_some() || record.state != super::composition::OutputState::Retained {
+        if active.next().is_some() {
             return rejection("owner_output_ambiguous_or_unavailable");
         }
         if amaterasu_extension_api::validate_resource_output(&record.output).is_err() {
