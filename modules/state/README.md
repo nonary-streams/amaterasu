@@ -109,7 +109,11 @@ Drafts belong to the authenticated State caller and the named collection. IDs
 contain 1–64 ASCII letters, digits, hyphens or underscores and must be unique
 among that caller's active drafts. Begin pins the collection revision and returns
 `next_sequence`; repeating begin with the same ID, collection and revision resumes
-it. Append sequences begin at zero. Retrying the most recent append with exactly
+it. An optional `content_id` on begin binds retries to a caller-declared content
+identity: it must be 64 lowercase hexadecimal characters and must match exactly
+on resume, including whether it was omitted. State does not compute this digest
+or verify it against the edits; callers must derive it from their complete
+intended publication. Append sequences begin at zero. Retrying the most recent append with exactly
 the same edits is idempotent; different content or an out-of-order sequence is
 rejected. Keys must be unique across the entire draft.
 

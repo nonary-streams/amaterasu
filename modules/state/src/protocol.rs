@@ -24,6 +24,8 @@ pub enum Operation {
         collection: String,
         draft_id: String,
         expected_revision: u64,
+        #[serde(default)]
+        content_id: Option<String>,
     },
     CollectionDraftAppend {
         collection: String,

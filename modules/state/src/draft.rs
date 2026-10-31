@@ -21,6 +21,8 @@ const DRAFT_IDLE_LIMIT: Duration = Duration::from_secs(24 * 60 * 60);
 struct Draft {
     collection: String,
     expected_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_id: Option<String>,
     next_sequence: u64,
     edit_count: usize,
     total_bytes: usize,
@@ -76,6 +78,7 @@ fn reclaim_stale_drafts(base: &Path, keep: &Path) {
                     .and_then(|bytes| serde_json::from_slice::<Draft>(&bytes).ok())
                     .is_some_and(|draft| {
                         crate::store::validate_key(&draft.collection).is_ok()
+                            && draft.content_id.as_deref().is_none_or(valid_content_id)
                             && draft.next_sequence <= MAX_CHUNKS
                             && draft.edit_count <= MAX_EDITS
                             && draft.total_bytes <= MAX_BYTES
@@ -127,7 +130,11 @@ fn load(path: &Path, collection: &str) -> Result<Draft, StateError> {
             "draft belongs to another collection",
         ));
     }
-    if draft.next_sequence > MAX_CHUNKS
+    if draft
+        .content_id
+        .as_deref()
+        .is_some_and(|value| !valid_content_id(value))
+        || draft.next_sequence > MAX_CHUNKS
         || draft.edit_count > MAX_EDITS
         || draft.total_bytes > MAX_BYTES
     {
@@ -140,6 +147,12 @@ fn chunk(path: &Path, sequence: u64) -> PathBuf {
 }
 fn save(path: &Path, draft: &Draft) -> Result<(), StateError> {
     write_json_atomically(&path.join("draft.json"), draft).map_err(storage_error)
+}
+fn valid_content_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 fn exhausted() -> StateError {
     StateError::new(
@@ -154,7 +167,17 @@ pub(crate) fn begin(
     collection: &str,
     id: &str,
     expected: u64,
+    content_id: Option<String>,
 ) -> Result<Value, StateError> {
+    if content_id
+        .as_deref()
+        .is_some_and(|value| !valid_content_id(value))
+    {
+        return Err(StateError::new(
+            "invalid_request",
+            "content_id must be 64 lowercase hexadecimal characters",
+        ));
+    }
     let path = directory(namespace, id)?;
     let collection_view = Collection::open(root, namespace, collection)?;
     if let Some(receipt) = collection_view.draft_receipt()
@@ -173,10 +196,10 @@ pub(crate) fn begin(
     }
     if path.join("draft.json").exists() {
         let draft = load(&path, collection)?;
-        if draft.expected_revision != expected {
+        if draft.expected_revision != expected || draft.content_id != content_id {
             return Err(StateError::new(
                 "draft_conflict",
-                "draft base revision differs",
+                "draft base revision or content ID differs",
             ));
         }
         save(&path, &draft)?;
@@ -195,6 +218,7 @@ pub(crate) fn begin(
     let draft = Draft {
         collection: collection.into(),
         expected_revision: expected,
+        content_id,
         next_sequence: 0,
         edit_count: 0,
         total_bytes: 0,

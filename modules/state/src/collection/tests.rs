@@ -512,3 +512,35 @@ fn stale_reclamation_retains_malformed_and_symlinked_entries() {
     assert!(base.join("linked").is_symlink());
     assert!(outside.exists());
 }
+
+#[test]
+fn draft_content_identity_fences_resumes_across_restart() {
+    let directory = Directory::new();
+    let store = StateStore::open(directory.0.clone()).unwrap();
+    let begin = json!({"action":"collection_draft_begin","collection":"apps","draft_id":"bound","expected_revision":0,"content_id":"a".repeat(64)});
+    assert_eq!(store.handle("catalog", begin.clone())["next_sequence"], 0);
+    assert_eq!(store.handle("catalog", json!({"action":"collection_draft_append","collection":"apps","draft_id":"bound","sequence":0,"edits":[{"key":"one","value":1}]}))["next_sequence"], 1);
+    drop(store);
+    let store = StateStore::open(directory.0.clone()).unwrap();
+    let mut changed = begin.clone();
+    changed["content_id"] = json!("b".repeat(64));
+    assert_eq!(
+        store.handle("catalog", changed)["error"]["code"],
+        "draft_conflict"
+    );
+    let mut omitted = begin.clone();
+    omitted.as_object_mut().unwrap().remove("content_id");
+    assert_eq!(
+        store.handle("catalog", omitted)["error"]["code"],
+        "draft_conflict"
+    );
+    assert_eq!(store.handle("catalog", begin)["next_sequence"], 1);
+    let invalid = json!({"action":"collection_draft_begin","collection":"apps","draft_id":"invalid","expected_revision":0,"content_id":"X".repeat(64)});
+    assert_eq!(
+        store.handle("catalog", invalid)["error"]["code"],
+        "invalid_request"
+    );
+    let legacy = json!({"action":"collection_draft_begin","collection":"apps","draft_id":"legacy","expected_revision":0});
+    assert_eq!(store.handle("catalog", legacy.clone())["next_sequence"], 0);
+    assert_eq!(store.handle("catalog", legacy)["next_sequence"], 0);
+}

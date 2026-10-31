@@ -90,6 +90,7 @@ impl StateStore {
                 collection,
                 draft_id,
                 expected_revision,
+                content_id,
             } => {
                 return crate::draft::begin(
                     &self.directory,
@@ -97,6 +98,7 @@ impl StateStore {
                     &collection,
                     &draft_id,
                     expected_revision,
+                    content_id,
                 );
             }
             Operation::CollectionDraftAppend {
