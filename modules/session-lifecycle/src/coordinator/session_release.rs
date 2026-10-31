@@ -1256,6 +1256,28 @@ mod tests {
         journal.receipts.get_mut("receipt").unwrap().work = Some(owner_work.clone());
         record_session_release_proof(&mut journal, &owner_work, "owner", &root_state).unwrap();
         assert!(journal.session_releases.validate(&journal));
+        assert!(journal.session_releases.has_valid_owner_completion(
+            &journal,
+            &owner_work.target,
+            "owner"
+        ));
+        assert!(!journal.session_releases.has_valid_owner_completion(
+            &journal,
+            &owner_work.target,
+            "settings"
+        ));
+        let mut altered = journal.clone();
+        altered.session_releases.proofs[0]
+            .callback
+            .terminal
+            .call
+            .approval["provider"] = json!("foreign");
+        assert!(!altered.session_releases.has_valid_owner_completion(
+            &altered,
+            &owner_work.target,
+            "owner"
+        ));
+        assert!(!altered.session_releases.validate(&altered));
         let restored: Journal =
             serde_json::from_value(serde_json::to_value(journal).unwrap()).unwrap();
         assert!(restored.session_releases.validate(&restored));
