@@ -625,6 +625,7 @@ impl Coordinator {
                 let work = super::Work {
                     composition_progress: None,
                     owner_observations: Default::default(),
+                    reprepare: None,
                     phase: amaterasu_extension_api::LifecyclePhase::StreamRelease,
                     target,
                     intent: None,

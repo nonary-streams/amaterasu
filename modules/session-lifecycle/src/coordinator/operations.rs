@@ -53,6 +53,58 @@ pub(super) fn checked_target<'a>(
     Ok((session, stream.map(str::to_owned)))
 }
 
+/// Reprepare only when a durable action proof identifies the exact removed root.
+fn required_reprepare(
+    journal: &Journal,
+    settings: &LifecycleSettings,
+    session: &SessionRecord,
+) -> ModuleResult<Option<(String, u64, String)>> {
+    let mut required = None;
+    let mut owners = BTreeSet::new();
+    for policy in &settings.finalize_policies {
+        let owner = &policy.owner_provider;
+        if !owners.insert(owner) {
+            continue;
+        }
+        let Some(generation) = session.resource_generations.get(owner).copied() else {
+            continue;
+        };
+        let mut roots = journal.composition.records().filter(|root| {
+            root.state == composition::OutputState::Retained
+                && root.output.producer == *owner
+                && matches!(&root.output.origin, LifecycleTarget::Session { host_epoch, session_id, generation }
+                    if host_epoch == &session.host_epoch && session_id == &session.id && *generation == session.generation)
+        });
+        if let Some(root) = roots.next() {
+            if roots.next().is_some()
+                || resource_generation::current_root_generation(journal, root)? != generation
+            {
+                return Err("resource_root_ambiguous_or_stale".into());
+            }
+            continue;
+        }
+        let marker = action_disposition::verified_marker(journal, &session.id, owner)
+            .ok_or("resource_removal_proof_missing")?;
+        if marker.resource_generation != generation
+            || marker.owner != *owner
+            || session.application_retired
+            || session
+                .streams
+                .values()
+                .any(|stream| stream.phase != StreamPhase::Retired)
+            || required.is_some()
+        {
+            return Err("resource_reprepare_not_authorized".into());
+        }
+        required = Some((
+            owner.clone(),
+            generation,
+            marker.resource.incarnation.clone(),
+        ));
+    }
+    Ok(required)
+}
+
 impl Coordinator {
     pub(super) fn snapshot(&self, caller: &str, initiator: &str) -> Value {
         let journal = &self.shared.borrow().value;
@@ -90,6 +142,7 @@ impl Coordinator {
         Ok(Work {
             composition_progress: None,
             owner_observations: Default::default(),
+            reprepare: None,
             phase,
             target,
             intent: payload
@@ -233,6 +286,7 @@ impl Coordinator {
                     {
                         return Err("application_not_bound".into());
                     }
+                    let reprepare = required_reprepare(&next, &self.settings, session)?;
                     let mut current =
                         self.new_work(LifecyclePhase::StreamPrepare, target.clone(), &payload)?;
                     let mode = current.video.as_ref().ok_or("negotiated_video_required")?;
@@ -290,7 +344,35 @@ impl Coordinator {
                         },
                     );
                     response = json!({"status":"pending","target":current.target,"transition_id":current.transition_id});
-                    work = Some(current);
+                    if let Some((owner, old_generation, old_incarnation)) = reprepare {
+                        let generation = old_generation
+                            .checked_add(1)
+                            .ok_or("resource_generation_exhausted")?;
+                        let mut preparation = self.new_work(
+                            LifecyclePhase::SessionPrepare,
+                            target.clone(),
+                            &payload,
+                        )?;
+                        preparation.providers = vec![owner.clone()];
+                        preparation.intent = None;
+                        preparation.reason = None;
+                        preparation.video = None;
+                        preparation.reprepare = Some(ReprepareContinuation {
+                            owner: owner.clone(),
+                            old_generation,
+                            old_incarnation,
+                            next: Box::new(current),
+                        });
+                        let session = next
+                            .sessions
+                            .get_mut(&session_id)
+                            .ok_or("unknown_session")?;
+                        session.resource_generations.insert(owner, generation);
+                        session.phase = SessionPhase::Preparing;
+                        work = Some(preparation);
+                    } else {
+                        work = Some(current);
+                    }
                 }
                 "validate_candidate" => {
                     let stream = session
@@ -489,5 +571,90 @@ impl Coordinator {
         );
         save(&self.shared, next)?;
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod reprepare_tests {
+    use super::*;
+
+    #[test]
+    fn missing_removal_proof_fences_reprepare_without_changing_cursor() {
+        let path = std::env::temp_dir().join(format!("reprepare-proof-{}", identifier().unwrap()));
+        std::fs::create_dir(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let coordinator = Coordinator::open(&path.join("journal.json")).unwrap();
+        let epoch = coordinator.shared.borrow().value.host_epoch.clone();
+        let mut journal = coordinator.shared.borrow().value.clone();
+        let session: SessionRecord = serde_json::from_value(json!({
+            "host_epoch": epoch, "id":"session", "generation":1, "phase":"paused",
+            "owner":{"caller":"caller","initiator":"client"}, "delegates":[],
+            "application_ref":null, "settings_revision":"one", "application_retired":false,
+            "streams":{}, "resource_generations":{"owner":1}
+        }))
+        .unwrap();
+        journal.sessions.insert("session".into(), session);
+        let method = json!({"service":"owner/2","method":"finalize","interface_major":2,"interface_minor":0,"schema_revision":1});
+        let mut settings = LifecycleSettings::default();
+        settings.finalize_policies.push(
+            serde_json::from_value(json!({
+                "owner_provider":"owner", "owner_service":"owner/2", "method":method,
+                "status_method":method, "output_capability":"display",
+                "output_schema":{"id":"output/1","major":1,"minor":0,"digest":"a".repeat(64)},
+                "capture_provider":"capture", "selector_schema":"selector",
+                "required_access":"exclusive", "domain_scope":"resource", "mutation_domains":[]
+            }))
+            .unwrap(),
+        );
+        let before = journal.sessions["session"].resource_generations.clone();
+        assert_eq!(
+            required_reprepare(&journal, &settings, &journal.sessions["session"]).unwrap_err(),
+            "resource_removal_proof_missing"
+        );
+        assert_eq!(journal.sessions["session"].resource_generations, before);
+        let session_target = LifecycleTarget::Session {
+            host_epoch: epoch.clone(),
+            session_id: "session".into(),
+            generation: 1,
+        };
+        let stream_target = LifecycleTarget::Stream {
+            host_epoch: epoch,
+            session_id: "session".into(),
+            stream_id: "stream".into(),
+            generation: 1,
+        };
+        let graph = ProviderGraph {
+            order: vec!["owner".into()],
+            dependencies: [("owner".into(), vec![])].into(),
+        };
+        let mut child = coordinator
+            .new_work(LifecyclePhase::StreamPrepare, stream_target, &json!({}))
+            .unwrap();
+        child.provider_graph = Some(graph.clone());
+        let mut parent = coordinator
+            .new_work(LifecyclePhase::SessionPrepare, session_target, &json!({}))
+            .unwrap();
+        parent.provider_graph = Some(graph);
+        parent.providers = vec!["owner".into()];
+        parent.reprepare = Some(ReprepareContinuation {
+            owner: "owner".into(),
+            old_generation: 1,
+            old_incarnation: "native".into(),
+            next: Box::new(child),
+        });
+        assert!(parent.valid_reprepare_shape());
+        assert!(!parent.reprepare_authorized(&journal));
+        parent.reprepare.as_mut().unwrap().next.target = LifecycleTarget::Stream {
+            host_epoch: "foreign".into(),
+            session_id: "session".into(),
+            stream_id: "stream".into(),
+            generation: 1,
+        };
+        assert!(!parent.valid_reprepare_shape());
+        std::fs::remove_dir_all(path).unwrap();
     }
 }

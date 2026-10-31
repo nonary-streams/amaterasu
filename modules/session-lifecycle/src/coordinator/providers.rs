@@ -1039,6 +1039,14 @@ impl Coordinator {
                 }
                 continue;
             }
+            let reprepare_authorized = {
+                let shared = self.shared.borrow();
+                work.reprepare_authorized(&shared.value)
+            };
+            if !reprepare_authorized {
+                self.fail_work(&key, "resource_reprepare_authority_changed")?;
+                continue;
+            }
             let provider = &work.providers[work.index];
             if matches!(
                 work.phase,
@@ -1923,6 +1931,65 @@ impl Coordinator {
             return Err("capture_owner_ambiguous".into());
         }
         drop(finalize_owners);
+        if let Some(continuation) = &work.reprepare {
+            let marker = super::action_disposition::verified_marker_at(
+                &next,
+                id,
+                &continuation.owner,
+                continuation.old_generation,
+            )
+            .ok_or("resource_removal_proof_missing")?;
+            let expected_generation = continuation
+                .old_generation
+                .checked_add(1)
+                .ok_or("resource_generation_exhausted")?;
+            let session = next.sessions.get(id).ok_or("unknown_session")?;
+            let (_, next_session, next_stream, next_generation) =
+                super::operations::target_parts(&continuation.next.target)?;
+            let stream_id = next_stream.ok_or("stream_target_required")?;
+            let stream = session.streams.get(stream_id).ok_or("unknown_stream")?;
+            if !work.valid_reprepare_shape()
+                || marker.session_target != work.target
+                || marker.resource_generation != continuation.old_generation
+                || marker.resource.incarnation != continuation.old_incarnation
+                || session.resource_generations.get(&continuation.owner)
+                    != Some(&expected_generation)
+                || session.phase != SessionPhase::Preparing
+                || session.application_retired
+                || next_session != id
+                || stream.generation != next_generation
+                || stream.phase != StreamPhase::Preparing
+                || stream.preparation_transition != continuation.next.transition_id
+                || session.streams.iter().any(|(other_id, other)| {
+                    other_id != stream_id && other.phase != StreamPhase::Retired
+                })
+            {
+                return Err("resource_reprepare_context_changed".into());
+            }
+            let mut roots = next.composition.records().filter(|root| {
+                root.state == composition::OutputState::Retained
+                    && root.output.producer == continuation.owner
+                    && root.output.origin == work.target
+            });
+            let root = roots.next().ok_or("reprepared_root_missing")?;
+            if roots.next().is_some()
+                || root.transition_id != work.transition_id
+                || root.admission_id == marker.root_admission_id
+                || root.output.resource.incarnation == continuation.old_incarnation
+                || super::resource_generation::current_root_generation(&next, root)?
+                    != expected_generation
+            {
+                return Err("reprepared_root_invalid".into());
+            }
+            drop(roots);
+            next.sessions.get_mut(id).ok_or("unknown_session")?.phase = SessionPhase::Ready;
+            let receipt = next.receipts.get_mut(key).ok_or("unknown_transition")?;
+            receipt.response["status"] = json!("pending");
+            receipt.response["target"] = json!(continuation.next.target);
+            receipt.response["transition_id"] = json!(continuation.next.transition_id);
+            receipt.work = Some((*continuation.next).clone());
+            return save(&self.shared, next);
+        }
         let session_release_proven = work.phase == LifecyclePhase::SessionRelease
             && work.providers.len() == 1
             && next.session_releases.has_valid_released(&next, &work.target, &work.providers[0])
@@ -2187,6 +2254,7 @@ impl Coordinator {
                 receipt.work = Some(Work {
                     composition_progress: None,
                     owner_observations: Default::default(),
+                    reprepare: None,
                     phase,
                     target: work.target.clone(),
                     intent: None,
@@ -2450,6 +2518,7 @@ mod dependency_cleanup_tests {
         Work {
             composition_progress: None,
             owner_observations: Default::default(),
+            reprepare: None,
             phase: LifecyclePhase::SessionRelease,
             target: LifecycleTarget::Session {
                 host_epoch: "epoch".into(),

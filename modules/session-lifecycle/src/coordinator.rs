@@ -103,6 +103,8 @@ struct Work {
     composition_progress: Option<composition_progress::CompositionProgress>,
     #[serde(default)]
     owner_observations: BTreeMap<String, plan_observation::PlanObservationState>,
+    #[serde(default)]
+    reprepare: Option<ReprepareContinuation>,
     phase: LifecyclePhase,
     target: LifecycleTarget,
     intent: Option<StreamIntent>,
@@ -128,7 +130,101 @@ struct Work {
     recovery_authorized_epoch: Option<String>,
 }
 
+/// Frozen child work is resumed only after a new producer root is proved.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReprepareContinuation {
+    owner: String,
+    old_generation: u64,
+    old_incarnation: String,
+    next: Box<Work>,
+}
+
 impl Work {
+    fn valid_reprepare_shape(&self) -> bool {
+        let Some(continuation) = &self.reprepare else {
+            return true;
+        };
+        let Ok((epoch, session, None, _)) = operations::target_parts(&self.target) else {
+            return false;
+        };
+        let Ok((next_epoch, next_session, Some(_), _)) =
+            operations::target_parts(&continuation.next.target)
+        else {
+            return false;
+        };
+        self.phase == LifecyclePhase::SessionPrepare
+            && valid_id(&continuation.owner)
+            && valid_id(&continuation.old_incarnation)
+            && continuation.old_generation > 0
+            && self.providers == [continuation.owner.clone()]
+            && self
+                .provider_graph
+                .as_ref()
+                .is_some_and(|graph| graph.order.contains(&continuation.owner))
+            && serde_json::to_value(&self.provider_graph).ok()
+                == serde_json::to_value(&continuation.next.provider_graph).ok()
+            && self.action_transfer.is_none()
+            && continuation.next.phase == LifecyclePhase::StreamPrepare
+            && continuation.next.reprepare.is_none()
+            && continuation.next.action_transfer.is_none()
+            && continuation.next.states.is_empty()
+            && continuation.next.index == 0
+            && epoch == next_epoch
+            && session == next_session
+    }
+
+    fn reprepare_authorized(&self, journal: &Journal) -> bool {
+        let Some(continuation) = &self.reprepare else {
+            return true;
+        };
+        if !self.valid_reprepare_shape() {
+            return false;
+        }
+        let Ok((_, session_id, None, _)) = operations::target_parts(&self.target) else {
+            return false;
+        };
+        let Some(session) = journal.sessions.get(session_id) else {
+            return false;
+        };
+        let Some(expected_generation) = continuation.old_generation.checked_add(1) else {
+            return false;
+        };
+        let Some(marker) = action_disposition::verified_marker_at(
+            journal,
+            session_id,
+            &continuation.owner,
+            continuation.old_generation,
+        ) else {
+            return false;
+        };
+        let Ok((_, _, Some(stream_id), generation)) =
+            operations::target_parts(&continuation.next.target)
+        else {
+            return false;
+        };
+        marker.session_target == self.target
+            && marker.resource.incarnation == continuation.old_incarnation
+            && session.resource_generations.get(&continuation.owner) == Some(&expected_generation)
+            && !session.application_retired
+            && matches!(
+                session.phase,
+                SessionPhase::Preparing | SessionPhase::RecoveryRequired
+            )
+            && session.streams.get(stream_id).is_some_and(|stream| {
+                stream.generation == generation
+                    && matches!(
+                        stream.phase,
+                        StreamPhase::Preparing | StreamPhase::RecoveryRequired
+                    )
+                    && stream.preparation_transition == continuation.next.transition_id
+            })
+            && session
+                .streams
+                .iter()
+                .all(|(id, stream)| id == stream_id || stream.phase == StreamPhase::Retired)
+    }
+
     fn use_release_graph(&mut self, graph: Option<ProviderGraph>) {
         if let Some(graph) = &graph {
             self.providers = graph.order.iter().rev().cloned().collect();
@@ -426,7 +522,8 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
         || journal.sessions.len() > MAX_SESSIONS
         || journal.receipts.values().any(|receipt| {
             receipt.work.as_ref().is_some_and(|work| {
-                !observation_scheduler::validate_work_observations(journal, work)
+                !work.reprepare_authorized(journal)
+                    || !observation_scheduler::validate_work_observations(journal, work)
                     || work.action_transfer.as_ref().is_some_and(|transfer| {
                         transfer.snapshot.as_ref().is_some_and(|snapshot| {
                             !action_endpoints::action_snapshot_matches(
