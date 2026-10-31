@@ -1,4 +1,7 @@
 //! Serialized extension contracts. References select resources; they never confer authority.
+mod composition;
+pub use composition::*;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -6,6 +9,7 @@ pub const SESSION_LIFECYCLE_SERVICE: &str = "amaterasu.session-lifecycle/1";
 pub const EXTENSION_REGISTRY_SERVICE: &str = "amaterasu.extension-registry/1";
 pub const EXTENSION_ACTIONS_SERVICE: &str = "amaterasu.extension-actions/1";
 pub const CONTRACT_VERSION: u32 = 1;
+pub const COMPOSITION_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -211,6 +215,8 @@ pub struct ResourcePlan {
     pub consumer_change: ConsumerChange,
     pub candidate_constraint: Option<BindingConstraint>,
     pub allowed_degradation: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control_proposals: Vec<ResourceControlProposal>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,6 +298,10 @@ pub struct ProviderRequest {
     pub plan_revision: Option<u64>,
     pub admission_id: Option<String>,
     pub approved_plan: Option<ResourcePlan>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependency_inputs: Vec<ResourceOutput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control_results: Vec<ConfirmedControl>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -334,6 +344,8 @@ pub enum ProviderResponse {
     Prepared {
         candidate: Option<CaptureBinding>,
         obligations: Vec<ResourceObligation>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        outputs: Vec<ResourceOutput>,
     },
     Pending {
         receipt_id: String,
@@ -690,6 +702,7 @@ pub fn validate_provider_response(
         ProviderResponse::Prepared {
             candidate,
             obligations,
+            outputs: _,
         } if request.operation == ProviderOperation::LifecycleCallback => {
             let plan = request
                 .approved_plan
@@ -969,6 +982,7 @@ mod tests {
             consumer_change: ConsumerChange::Live,
             candidate_constraint: None,
             allowed_degradation: vec![],
+            control_proposals: vec![],
         };
         assert!(validate_resource_plan(&plan).is_err());
         plan.obligations[1].depends_on.clear();
@@ -999,6 +1013,8 @@ mod tests {
             plan_revision: Some(1),
             admission_id: None,
             approved_plan: Some(plan),
+            dependency_inputs: vec![],
+            control_results: vec![],
         };
         assert!(validate_provider_request(&request).is_err());
         request.admission_id = Some("admitted".into());
