@@ -619,6 +619,23 @@ impl Backend<'_> {
     }
 }
 
+/// A compacted, closed operation may still be replayed through a recovered
+/// permit. Check the durable fence on each effect-authorizing endpoint call.
+fn ensure_control_operation_unfenced(
+    journal: &Journal,
+    owner: &str,
+    operation_id: &str,
+) -> ModuleResult<()> {
+    if !journal.control_settlements.validate_structure()
+        || journal
+            .control_settlements
+            .operation_fenced(owner, operation_id)
+    {
+        return Err("control_operation_fenced".into());
+    }
+    Ok(())
+}
+
 impl ControlEndpointBackend for Backend<'_> {
     fn resolve(&mut self, request: &ResourceControlRequest) -> ModuleResult<ResolvedControl> {
         self.resolve_control(request, None, false)
@@ -650,6 +667,11 @@ impl ControlEndpointBackend for Backend<'_> {
         resolved: &ResolvedControl,
         request: &ResourceControlRequest,
     ) -> ModuleResult<ControlPermitUse> {
+        ensure_control_operation_unfenced(
+            &self.coordinator.shared.borrow().value,
+            owner,
+            &request.operation_id,
+        )?;
         let catalog = self.coordinator.settings.schema_catalog()?;
         self.authority(request)?.consume_control_permit(
             owner,
@@ -665,6 +687,11 @@ impl ControlEndpointBackend for Backend<'_> {
         resolved: &ResolvedControl,
         request: &ResourceControlRequest,
     ) -> ModuleResult<()> {
+        ensure_control_operation_unfenced(
+            &self.coordinator.shared.borrow().value,
+            owner,
+            &request.operation_id,
+        )?;
         let catalog = self.coordinator.settings.schema_catalog()?;
         self.authority(request)?.validate_control_permit(
             owner,
@@ -972,6 +999,35 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compacted_operation_fence_survives_recovery_and_is_owner_scoped() {
+        use sha2::{Digest, Sha256};
+
+        let path =
+            std::env::temp_dir().join(format!("amaterasu-control-fence-{}", identifier().unwrap()));
+        std::fs::create_dir(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let coordinator = Coordinator::open(&path.join("journal.json")).unwrap();
+        let mut journal = coordinator.shared.borrow().value.clone();
+        let key = serde_json::to_vec(&["operation", "owner", "effect"]).unwrap();
+        let digest = format!("{:x}", Sha256::digest(key));
+        journal.control_settlements = serde_json::from_value(json!({
+            "records": [], "replay_fences": [digest]
+        }))
+        .unwrap();
+        let restored: Journal =
+            serde_json::from_slice(&serde_json::to_vec(&journal).unwrap()).unwrap();
+        assert!(ensure_control_operation_unfenced(&restored, "owner", "effect").is_err());
+        assert!(ensure_control_operation_unfenced(&restored, "owner", "other-effect").is_ok());
+        assert!(ensure_control_operation_unfenced(&restored, "other-owner", "effect").is_ok());
+        drop(coordinator);
+        std::fs::remove_dir_all(path).unwrap();
+    }
 
     #[test]
     fn settlement_preflight_never_grants_unarmed_owner_verification() {
