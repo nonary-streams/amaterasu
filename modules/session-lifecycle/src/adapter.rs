@@ -37,6 +37,8 @@ pub struct LifecycleSettings {
     pub action_service: String,
     /// Broker identity allowed to attest settings-scope request sources.
     pub settings_registry_caller: String,
+    /// Optional registry service used to freeze provider settings at session start.
+    pub settings_registry_service: Option<String>,
     pub journal_path: String,
     pub operation_grants: BTreeMap<String, BTreeSet<String>>,
     pub participants: Vec<ParticipantSettings>,
@@ -52,6 +54,7 @@ impl Default for LifecycleSettings {
             input_actions: BTreeSet::new(),
             action_service: "amaterasu.extension-actions".into(),
             settings_registry_caller: String::new(),
+            settings_registry_service: None,
             journal_path: String::new(),
             operation_grants: BTreeMap::new(),
             participants: Vec::new(),
@@ -156,6 +159,13 @@ impl LifecycleSettings {
                 .any(|action| !valid_identifier(action))
         {
             return Err("invalid lifecycle input action policy".into());
+        }
+        if self
+            .settings_registry_service
+            .as_deref()
+            .is_some_and(|service| !valid_identifier(service))
+        {
+            return Err("invalid lifecycle settings registry service".into());
         }
         if !self.settings_registry_caller.is_empty()
             && (!valid_identifier(&self.settings_registry_caller)
@@ -548,6 +558,11 @@ mod tests {
                 .validate()
         };
         assert!(parse(policy.clone()).is_ok());
+        let mut registry_service = policy.clone();
+        registry_service["settings_registry_service"] = json!("amaterasu.extension-registry/1");
+        assert!(parse(registry_service.clone()).is_ok());
+        registry_service["settings_registry_service"] = json!("");
+        assert!(parse(registry_service).is_err());
         let mut registry = policy.clone();
         registry["settings_registry_caller"] = json!("input");
         assert!(parse(registry).is_ok());

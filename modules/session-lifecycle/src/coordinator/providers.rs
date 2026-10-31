@@ -37,6 +37,14 @@ impl AuthorityJournal for ActionAdmissionWriter {
             return Err("action_already_admitted".into());
         }
         transfer.admission_id = Some(fresh[0].clone());
+        let target = &next.receipts[&self.key].work.as_ref().unwrap().target;
+        let (_, session_id, _, _) = super::operations::target_parts(target)?;
+        let session_id = session_id.to_owned();
+        next.sessions
+            .get_mut(&session_id)
+            .ok_or("unknown_session")?
+            .admission_ids
+            .insert(fresh[0].clone());
         next.authority = state.clone();
         save(&self.shared, next)
     }
@@ -56,11 +64,127 @@ impl PrepareJournal for WorkWriter {
             .and_then(|r| r.work.as_mut())
             .ok_or("transition_no_longer_active")?;
         work.states.insert(self.provider.clone(), state.clone());
+        let (_, session_id, _, _) = super::operations::target_parts(&work.target)?;
+        let session_id = session_id.to_owned();
+        if let Some(id) = &state.admission_id {
+            next.sessions
+                .get_mut(&session_id)
+                .ok_or("unknown_session")?
+                .admission_ids
+                .insert(id.clone());
+        }
         save(&self.shared, next)
     }
 }
 
+fn frozen_settings<'a>(
+    journal: &'a Journal,
+    target: &LifecycleTarget,
+) -> ModuleResult<&'a BTreeMap<String, super::settings_snapshot::FrozenSettings>> {
+    let (_, session_id, stream_id, _) = super::operations::target_parts(target)?;
+    let session = journal.sessions.get(session_id).ok_or("unknown_session")?;
+    match stream_id {
+        Some(stream_id) => Ok(&session
+            .streams
+            .get(stream_id)
+            .ok_or("unknown_stream")?
+            .provider_settings),
+        None => Ok(&session.provider_settings),
+    }
+}
+
+fn frozen_settings_mut<'a>(
+    journal: &'a mut Journal,
+    target: &LifecycleTarget,
+) -> ModuleResult<&'a mut BTreeMap<String, super::settings_snapshot::FrozenSettings>> {
+    let (_, session_id, stream_id, _) = super::operations::target_parts(target)?;
+    let session = journal
+        .sessions
+        .get_mut(session_id)
+        .ok_or("unknown_session")?;
+    match stream_id {
+        Some(stream_id) => Ok(&mut session
+            .streams
+            .get_mut(stream_id)
+            .ok_or("unknown_stream")?
+            .provider_settings),
+        None => Ok(&mut session.provider_settings),
+    }
+}
+
 impl Coordinator {
+    fn effective_settings(&self, work: &Work) -> ModuleResult<LifecycleSettings> {
+        let shared = self.shared.borrow();
+        let snapshots = frozen_settings(&shared.value, &work.target)?;
+        let mut settings = self.settings.clone();
+        for participant in &mut settings.participants {
+            let snapshot = snapshots
+                .get(&participant.provider)
+                .ok_or("settings_snapshot_missing")?;
+            participant.settings = snapshot.settings.clone();
+            participant.settings_revision = snapshot.revision.clone();
+        }
+        Ok(settings)
+    }
+
+    fn ensure_settings(
+        &mut self,
+        work: &Work,
+        send: &mut dyn FnMut(Command) -> ModuleResult<Response>,
+    ) -> ModuleResult<bool> {
+        let job_key = serde_json::to_string(&work.target).map_err(|_| "invalid_target")?;
+        if frozen_settings(&self.shared.borrow().value, &work.target)?.len()
+            == self.settings.participants.len()
+        {
+            return Ok(true);
+        }
+        if work.recovery_authorized_epoch.is_some() {
+            let mut next = self.shared.borrow().value.clone();
+            let snapshots = frozen_settings_mut(&mut next, &work.target)?;
+            for (provider, state) in &work.states {
+                snapshots.insert(
+                    provider.clone(),
+                    super::settings_snapshot::FrozenSettings {
+                        settings: state.participant.settings.clone(),
+                        revision: state.participant.settings_revision.clone(),
+                    },
+                );
+            }
+            for participant in &self.settings.participants {
+                snapshots
+                    .entry(participant.provider.clone())
+                    .or_insert_with(|| super::settings_snapshot::FrozenSettings {
+                        settings: participant.settings.clone(),
+                        revision: participant.settings_revision.clone(),
+                    });
+            }
+            save(&self.shared, next)?;
+            return Ok(true);
+        }
+        if !self.settings_jobs.contains_key(&job_key) {
+            self.settings_jobs.insert(
+                job_key.clone(),
+                super::settings_snapshot::SettingsSnapshotJob::new(
+                    self.settings.settings_registry_service.as_deref(),
+                    &self.settings.participants,
+                )?,
+            );
+        }
+        let snapshots = self
+            .settings_jobs
+            .get_mut(&job_key)
+            .unwrap()
+            .advance(send)?;
+        let Some(snapshots) = snapshots else {
+            return Ok(false);
+        };
+        let mut next = self.shared.borrow().value.clone();
+        *frozen_settings_mut(&mut next, &work.target)? = snapshots;
+        save(&self.shared, next)?;
+        self.settings_jobs.remove(&job_key);
+        Ok(true)
+    }
+
     pub(super) fn refresh_approvals(
         &mut self,
         send: &mut dyn FnMut(Command) -> ModuleResult<Response>,
@@ -117,10 +241,47 @@ impl Coordinator {
         Ok(())
     }
 
-    fn authority(&self) -> ModuleResult<CoordinatorPrepareAuthority<AuthorityWriter>> {
+    fn authority_for_work(
+        &self,
+        work: &Work,
+    ) -> ModuleResult<CoordinatorPrepareAuthority<AuthorityWriter>> {
+        let journal = &self.shared.borrow().value;
+        let (_, session_id, _, _) = super::operations::target_parts(&work.target)?;
+        let session = journal.sessions.get(session_id).ok_or("unknown_session")?;
+        let mut selections: Vec<_> = self.selections.values().cloned().collect();
+        for selected in &mut selections {
+            if let Some(snapshot) =
+                frozen_settings(journal, &work.target)?.get(&selected.participant.provider)
+            {
+                selected.participant.settings = snapshot.settings.clone();
+                selected.participant.settings_revision = snapshot.revision.clone();
+            }
+            let provider = &selected.participant.provider;
+            let consumers_retired = session.streams.values().all(|stream| {
+                stream.binding_owner != *provider
+                    || stream.phase == StreamPhase::Retired
+                    || (stream.phase == StreamPhase::Quiescing
+                        && stream.retirements == stream.required)
+            });
+            if consumers_retired && session.obligations.iter().any(|o| o.provider == *provider) {
+                selected.authorized_borrowers.insert(session.id.clone());
+            }
+            selected.authorized_borrowers.extend(
+                session
+                    .streams
+                    .iter()
+                    .filter(|(_, stream)| {
+                        stream.binding_owner == *provider
+                            && (stream.phase == StreamPhase::Retired
+                                || (stream.phase == StreamPhase::Quiescing
+                                    && stream.retirements == stream.required))
+                    })
+                    .map(|(id, _)| id.clone()),
+            );
+        }
         CoordinatorPrepareAuthority::new(
-            self.shared.borrow().value.authority.clone(),
-            self.selections.values().cloned().collect(),
+            journal.authority.clone(),
+            selections,
             AuthorityWriter(self.shared.clone()),
         )
     }
@@ -200,8 +361,19 @@ impl Coordinator {
                 self.fail_work(&key, "restart_requires_cleanup")?;
                 continue;
             }
-            let Some(participant) = self
-                .settings
+            match self.ensure_settings(&work, send) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => {
+                    if let Ok(job_key) = serde_json::to_string(&work.target) {
+                        self.settings_jobs.remove(&job_key);
+                    }
+                    self.fail_work(&key, "settings_snapshot_unavailable")?;
+                    continue;
+                }
+            }
+            let effective_settings = self.effective_settings(&work)?;
+            let Some(participant) = effective_settings
                 .participants
                 .iter()
                 .find(|p| &p.provider == provider)
@@ -211,7 +383,7 @@ impl Coordinator {
                 continue;
             };
             let runtime_key = format!("{key}/{}", work.index);
-            let mut authority = match self.authority() {
+            let mut authority = match self.authority_for_work(&work) {
                 Ok(a) => a,
                 Err(_) => continue,
             };
@@ -261,7 +433,7 @@ impl Coordinator {
             if !self.drivers.contains_key(&runtime_key) {
                 self.drivers.insert(
                     runtime_key.clone(),
-                    PrepareDriver::new(work.states[provider].clone(), &self.settings)?,
+                    PrepareDriver::new(work.states[provider].clone(), &effective_settings)?,
                 );
             }
             let mut writer = WorkWriter {
@@ -270,7 +442,7 @@ impl Coordinator {
                 provider: provider.clone(),
             };
             let result = self.drivers.get_mut(&runtime_key).unwrap().advance(
-                &self.settings,
+                &effective_settings,
                 &mut authority,
                 &mut writer,
                 send,
@@ -305,8 +477,14 @@ impl Coordinator {
                 }
                 if let Some(ProviderResponse::Cleanup { outcomes }) = &state.response {
                     let settled = self.shared.borrow().value.authority.settled.clone();
+                    let owned = {
+                        let (_, session_id, _, _) = super::operations::target_parts(&work.target)?;
+                        self.shared.borrow().value.sessions[session_id]
+                            .admission_ids
+                            .clone()
+                    };
                     for (id, admission) in settled {
-                        if admission.provider != *provider {
+                        if admission.provider != *provider || !owned.contains(&id) {
                             continue;
                         }
                         let matched: Vec<_> = outcomes
@@ -562,6 +740,12 @@ impl Coordinator {
         }
         work.states.insert(provider.into(), state.clone());
         work.index += 1;
+        for session in next.sessions.values_mut() {
+            session.admission_ids.retain(|id| {
+                next.authority.admissions.contains_key(id)
+                    || next.authority.settled.contains_key(id)
+            });
+        }
         save(&self.shared, next)
     }
 

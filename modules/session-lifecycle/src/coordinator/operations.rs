@@ -177,6 +177,8 @@ impl Coordinator {
                     required_consumers: None,
                     application: None,
                     application_operation_id,
+                    admission_ids: BTreeSet::new(),
+                    provider_settings: BTreeMap::new(),
                 },
             );
             work = Some(current);
@@ -252,6 +254,7 @@ impl Coordinator {
                             retirements: BTreeSet::new(),
                             binding_owner: String::new(),
                             preparation_transition: current.transition_id.clone(),
+                            provider_settings: Default::default(),
                         },
                     );
                     response = json!({"status":"pending","target":current.target,"transition_id":current.transition_id});

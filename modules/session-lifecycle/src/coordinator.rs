@@ -1,11 +1,14 @@
 //! Durable lifecycle authority; native work advances outside request handlers.
 mod action_endpoints;
+mod action_target;
 mod application;
 mod operations;
 mod providers;
 mod recovery;
 mod retention;
 mod security;
+mod settings_scope;
+mod settings_snapshot;
 
 use crate::adapter::LifecycleSettings;
 use crate::prepare_authority::{AuthorityState, ProviderSelection};
@@ -121,6 +124,8 @@ struct StreamRecord {
     binding_owner: String,
     #[serde(default)]
     preparation_transition: String,
+    #[serde(default)]
+    provider_settings: BTreeMap<String, settings_snapshot::FrozenSettings>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -144,6 +149,10 @@ struct SessionRecord {
     application: Option<application::ApplicationBinding>,
     #[serde(default)]
     application_operation_id: Option<String>,
+    #[serde(default)]
+    admission_ids: BTreeSet<String>,
+    #[serde(default)]
+    provider_settings: BTreeMap<String, settings_snapshot::FrozenSettings>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -242,6 +251,7 @@ pub struct Coordinator {
     application_jobs: BTreeMap<String, application::ApplicationJob>,
     ephemeral: BTreeMap<String, (Receipt, Instant)>,
     work_cursor: usize,
+    settings_jobs: BTreeMap<String, settings_snapshot::SettingsSnapshotJob>,
 }
 
 impl Coordinator {
@@ -305,6 +315,7 @@ impl Coordinator {
             application_jobs: BTreeMap::new(),
             ephemeral: BTreeMap::new(),
             work_cursor: 0,
+            settings_jobs: BTreeMap::new(),
         })
     }
 
@@ -329,6 +340,12 @@ impl Coordinator {
         }
         if operation == "verify_provider_epoch" {
             return self.verify_provider(caller, &payload);
+        }
+        if operation == "resolve_settings_scope" {
+            return self.resolve_settings_scope(caller, payload);
+        }
+        if operation == "describe_action_target" {
+            return self.describe_action_target(caller, &payload);
         }
         if matches!(
             operation,

@@ -204,6 +204,8 @@ mod tests {
             application_retired: false,
             application: None,
             application_operation_id: None,
+            admission_ids: Default::default(),
+            provider_settings: Default::default(),
             streams: [(
                 "stream".into(),
                 StreamRecord {
@@ -215,6 +217,7 @@ mod tests {
                     retirements: BTreeSet::new(),
                     binding_owner: String::new(),
                     preparation_transition: "transition".into(),
+                    provider_settings: Default::default(),
                 },
             )]
             .into(),

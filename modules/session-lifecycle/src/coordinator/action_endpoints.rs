@@ -268,6 +268,19 @@ impl Coordinator {
                     else {
                         return rejection("execute_method_required");
                     };
+                    let Some(actual_revision) =
+                        active_provider_revision(&journal, &target, provider)
+                    else {
+                        return rejection("provider_settings_snapshot_missing");
+                    };
+                    if plan
+                        .constraints
+                        .get("selected_settings_revision")
+                        .and_then(Value::as_str)
+                        != Some(actual_revision)
+                    {
+                        return rejection("provider_settings_revision_mismatch");
+                    }
                     selection = Some(installed);
                     method = Some(selected_method);
                 }
@@ -642,6 +655,42 @@ impl Coordinator {
     }
 }
 
+fn active_provider_revision<'a>(
+    journal: &'a super::Journal,
+    target: &ActionTarget,
+    provider: &str,
+) -> Option<&'a str> {
+    let session_id = match target {
+        ActionTarget::Session { session_id, .. } | ActionTarget::Stream { session_id, .. } => {
+            session_id
+        }
+        ActionTarget::Host { .. } => return None,
+    };
+    let session = journal.sessions.get(session_id)?;
+    let stream = match target {
+        ActionTarget::Stream { stream_id, .. } => session.streams.get(stream_id)?,
+        ActionTarget::Session { .. } => {
+            let mut streams = session.streams.values().filter(|stream| {
+                stream.phase == StreamPhase::Active && stream.binding_owner == provider
+            });
+            let stream = streams.next()?;
+            if streams.next().is_some() {
+                return None;
+            }
+            stream
+        }
+        ActionTarget::Host { .. } => return None,
+    };
+    if stream.phase != StreamPhase::Active || stream.binding_owner != provider {
+        return None;
+    }
+    let revision = &stream.provider_settings.get(provider)?.revision;
+    if !super::valid_id(revision) {
+        return None;
+    }
+    Some(revision)
+}
+
 fn effect_rights_current(
     journal: &super::Journal,
     service: &str,
@@ -703,6 +752,16 @@ fn effect_rights_current(
             stream.generation == *generation
                 && stream.phase == StreamPhase::Quiescing
                 && stream.retirements == stream.required
+                && stream.binding_owner == provider
+                && stream
+                    .provider_settings
+                    .get(&provider)
+                    .is_some_and(|snapshot| {
+                        plan.constraints
+                            .get("selected_settings_revision")
+                            .and_then(Value::as_str)
+                            == Some(snapshot.revision.as_str())
+                    })
         })
 }
 
@@ -810,6 +869,8 @@ mod tests {
                 application_ref: json!({}),
                 application: None,
                 application_operation_id: None,
+                admission_ids: Default::default(),
+                provider_settings: Default::default(),
                 required_consumers: None,
                 settings_revision: "revision".into(),
                 application_retired: false,
@@ -914,8 +975,16 @@ mod tests {
                 required: ["capture".into()].into(),
                 acknowledgements: ["capture".into()].into(),
                 retirements: Default::default(),
-                binding_owner: String::new(),
+                binding_owner: "display".into(),
                 preparation_transition: String::new(),
+                provider_settings: [(
+                    "display".into(),
+                    super::super::settings_snapshot::FrozenSettings {
+                        settings: json!({}),
+                        revision: "rev".into(),
+                    },
+                )]
+                .into(),
             },
         );
         state.sessions.insert(
@@ -933,6 +1002,8 @@ mod tests {
                 application_ref: json!({}),
                 application: None,
                 application_operation_id: None,
+                admission_ids: Default::default(),
+                provider_settings: Default::default(),
                 required_consumers: None,
                 settings_revision: "revision".into(),
                 application_retired: false,
@@ -941,7 +1012,7 @@ mod tests {
             },
         );
         save(&coordinator.shared, state).unwrap();
-        let plan = json!({"plan_id":"plan","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"reconnect_required","candidate_constraint":null,"allowed_degradation":[]});
+        let plan = json!({"plan_id":"plan","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{"selected_settings_revision":"rev"},"obligations":[],"affected_consumers":[],"consumer_change":"reconnect_required","candidate_constraint":null,"allowed_degradation":[]});
         let target = json!({"kind":"session","host_epoch":epoch,"session_id":"session","expected_generation":3});
         let execute = json!({"service":"display/1","method":"execute","interface_major":1,"interface_minor":0,"schema_revision":1});
         let auth = json!({"operation":"authorize_action","operation_id":"op-transition","action_id":"display/remove","target":target,"plan_digest":digest(&plan).unwrap(),"plan":plan,"source":{"caller":"transport","initiator":"user"},"provider":"display","execute_method":execute});
@@ -1026,6 +1097,7 @@ mod tests {
                 retirements: Default::default(),
                 binding_owner: String::new(),
                 preparation_transition: String::new(),
+                provider_settings: Default::default(),
             },
         );
         save(&coordinator.shared, state).unwrap();

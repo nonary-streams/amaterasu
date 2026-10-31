@@ -21,6 +21,8 @@ struct ScopeRequest {
     source: Source,
     #[serde(default)]
     input_binding: Option<String>,
+    #[serde(default)]
+    input_boot_epoch: Option<String>,
 }
 
 impl Coordinator {
@@ -55,6 +57,12 @@ impl Coordinator {
         }
         let shared = self.shared.borrow();
         let journal = &shared.value;
+        match (&request.input_binding, &request.input_boot_epoch) {
+            (Some(token), Some(epoch))
+                if valid_id(epoch) && journal.input_boot_epochs.get(token) == Some(epoch) => {}
+            (None, None) => {}
+            _ => return rejection("permission_denied"),
+        }
         let owner_session = operations::checked_target(
             journal,
             &request.target,
@@ -176,6 +184,8 @@ mod tests {
                 required_consumers: None,
                 application: None,
                 application_operation_id: None,
+                admission_ids: Default::default(),
+                provider_settings: Default::default(),
             },
         );
         let request = json!({"operation":"resolve_settings_scope", "operation_id":"request", "target":{"kind":"session","host_epoch":epoch,"session_id":"session","generation":3},"scope":"application","scope_id":"app","access":"read","source":{"caller":"transport","initiator":"client"}});
@@ -249,13 +259,18 @@ mod tests {
                         retirements: BTreeSet::new(),
                         binding_owner: String::new(),
                         preparation_transition: String::new(),
+                        provider_settings: Default::default(),
                     },
                 );
             let token = shared.value.inputs.issue_input_binding(&binding).unwrap();
             shared.value.input_bindings.insert(token.clone(), binding);
+            shared
+                .value
+                .input_boot_epochs
+                .insert(token.clone(), "boot".into());
             token
         };
-        let input = json!({"operation":"resolve_settings_scope","operation_id":"input-request","target":{"kind":"stream","host_epoch":epoch,"session_id":"session","stream_id":"stream","generation":4},"scope":"application","scope_id":"app","access":"read","source":{"caller":"input","initiator":"stream-session"},"input_binding":token});
+        let input = json!({"operation":"resolve_settings_scope","operation_id":"input-request","target":{"kind":"stream","host_epoch":epoch,"session_id":"session","stream_id":"stream","generation":4},"scope":"application","scope_id":"app","access":"read","source":{"caller":"input","initiator":"stream-session"},"input_binding":token,"input_boot_epoch":"boot"});
         assert_eq!(
             coordinator.resolve_settings_scope("registry", input.clone())["status"],
             "succeeded"
@@ -264,6 +279,19 @@ mod tests {
         foreign["source"]["caller"] = json!("other");
         assert_eq!(
             coordinator.resolve_settings_scope("registry", foreign)["status"],
+            "rejected"
+        );
+        let mut stale_boot = input.clone();
+        stale_boot["input_boot_epoch"] = json!("stale");
+        stale_boot["source"] = json!({"caller":"transport", "initiator":"client"});
+        assert_eq!(
+            coordinator.resolve_settings_scope("registry", stale_boot)["status"],
+            "rejected"
+        );
+        let mut missing_boot = input.clone();
+        missing_boot["input_boot_epoch"] = Value::Null;
+        assert_eq!(
+            coordinator.resolve_settings_scope("registry", missing_boot)["status"],
             "rejected"
         );
         coordinator

@@ -298,6 +298,8 @@ mod tests {
                 application_retired: false,
                 application: None,
                 application_operation_id: None,
+                admission_ids: Default::default(),
+                provider_settings: Default::default(),
                 streams: BTreeMap::new(),
                 obligations: vec![],
                 required_consumers: None,
