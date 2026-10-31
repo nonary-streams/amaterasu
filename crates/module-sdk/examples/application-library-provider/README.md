@@ -39,5 +39,7 @@ provider must reject changed arguments for a reused ID, make retries idempotent,
 and return `unknown` when it cannot establish an effect. This adapter dispatches
 these actions, but the current launch coordinator has no generic provider
 integration or retirement proof protocol. Successful synthetic fixture states
-are not evidence of launch or cleanup. The tests use a simulated host ABI; they
-do not establish signed-host installation or end-to-end gameplay.
+are not evidence of launch or cleanup. Tests cover a simulated host ABI and
+parent-linked discovery through the real runtime broker with a simulated library
+forwarder. They do not establish actual library-module integration, signed-host
+installation, or end-to-end gameplay.

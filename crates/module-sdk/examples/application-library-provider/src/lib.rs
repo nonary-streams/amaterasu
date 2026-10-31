@@ -214,6 +214,123 @@ mod tests {
     }
 
     #[test]
+    fn broker_routes_delegated_discovery_with_attested_identity() {
+        use amaterasu_contracts::{Command, Grants, Response, RuntimeConfig};
+        use amaterasu_runtime::Broker;
+        let grants = |calls: &[&str], provides: &[&str]| Grants {
+            call: calls.iter().map(|name| (*name).to_owned()).collect(),
+            provide: provides.iter().map(|name| (*name).to_owned()).collect(),
+            ..Default::default()
+        };
+        let mut config = RuntimeConfig::default();
+        config.principals.insert(
+            "consumer".into(),
+            grants(&["amaterasu.library/1", SERVICE], &[]),
+        );
+        config.principals.insert(
+            "library".into(),
+            grants(&[SERVICE], &["amaterasu.library/1"]),
+        );
+        config
+            .principals
+            .insert("fixture".into(), grants(&[], &[SERVICE]));
+        let mut broker = Broker::new(config).unwrap();
+        assert!(matches!(
+            broker.dispatch(
+                "library",
+                Command::Register {
+                    service: "amaterasu.library/1".into()
+                }
+            ),
+            Response::Ok
+        ));
+        assert!(matches!(
+            broker.dispatch(
+                "fixture",
+                Command::Register {
+                    service: SERVICE.into()
+                }
+            ),
+            Response::Ok
+        ));
+        let payload = json!({"action":"discover","cursor":null,"limit":20});
+        let Response::Accepted { id: parent } = broker.dispatch(
+            "consumer",
+            Command::Request {
+                service: "amaterasu.library/1".into(),
+                payload: payload.clone(),
+                timeout_ms: 10_000,
+                operation_id: "parent".into(),
+                parent: None,
+            },
+        ) else {
+            panic!("parent admission failed")
+        };
+        assert!(
+            matches!(broker.dispatch("library", Command::Poll {}), Response::Request { id, .. } if id == parent)
+        );
+        let Response::Accepted { id: child } = broker.dispatch(
+            "library",
+            Command::Request {
+                service: SERVICE.into(),
+                payload,
+                timeout_ms: 5_000,
+                operation_id: "child".into(),
+                parent: Some(parent),
+            },
+        ) else {
+            panic!("child admission failed")
+        };
+        let Response::Request {
+            id,
+            caller,
+            initiator,
+            service,
+            payload,
+            remaining_ms,
+        } = broker.dispatch("fixture", Command::Poll {})
+        else {
+            panic!("provider request missing")
+        };
+        assert_eq!(
+            (&*caller, &*initiator, &*service),
+            ("library", "consumer", SERVICE)
+        );
+        let mut adapter = ProviderAdapter::new(
+            Fixture::default(),
+            SERVICE.into(),
+            "library".into(),
+            BTreeSet::from(["consumer".into()]),
+        )
+        .unwrap();
+        let reply = adapter.dispatch(&IncomingRequest {
+            id,
+            caller,
+            initiator,
+            service,
+            payload,
+            remaining_ms,
+        });
+        assert!(matches!(
+            broker.dispatch(
+                "fixture",
+                Command::Complete {
+                    request: child,
+                    payload: reply
+                }
+            ),
+            Response::Ok
+        ));
+        let Response::Result { payload } =
+            broker.dispatch("library", Command::TakeResult { request: child })
+        else {
+            panic!("provider result missing")
+        };
+        assert_eq!(payload["entries"][0]["id"], "fixture-game");
+        assert_eq!(payload["revision"], "fixture-v1");
+    }
+
+    #[test]
     fn provider_routes_discovery_artwork_and_synthetic_lifecycle() {
         let mut adapter = ProviderAdapter::new(
             Fixture::default(),

@@ -56,6 +56,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "amaterasu-runtime"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-abi",
+ "amaterasu-contracts",
+ "serde_json",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -109,7 +118,9 @@ dependencies = [
 name = "example-application-library-provider"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-contracts",
  "amaterasu-module-sdk",
+ "amaterasu-runtime",
  "serde",
  "serde_json",
 ]
