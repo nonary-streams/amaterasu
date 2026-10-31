@@ -332,52 +332,90 @@ fn merge(job: &Job, response: &Value) -> Result<(u64, Value, Value), Failure> {
     }
     record.dispatch = Some(job.replacement.clone());
     record.receipt = job.receipt.clone();
-    if let Some(worst) = job
-        .replacement
-        .worst_case_results()
-        .map_err(|_| failure_for(job, false))?
-    {
-        loop {
-            let mut fits = true;
-            for candidate in &worst {
-                let finished = matches!(candidate.stage, Stage::Finished { .. });
-                let record = epoch
-                    .receipts
-                    .get_mut(&job.expected.request.sequence)
-                    .ok_or(Failure::Conflict)?;
-                record.dispatch = Some(candidate.clone());
-                record.receipt = job.receipt.clone();
-                if finished {
-                    record.receipt["result"] = Value::String("x".repeat(1_998));
-                    record.receipt["status"] = Value::String("recovery_required".into());
-                }
-                let candidate = serde_json::to_value(&epoch).map_err(|_| Failure::Unavailable)?;
-                let payload = json!({"action":"collection_commit","collection":COLLECTION,"expected_revision":revision,"metadata":metadata,"edits":[{"key":format!("epoch/{}",job.epoch_id),"value":candidate}]});
-                if serde_json::to_vec(&candidate)
-                    .map_or(true, |bytes| bytes.len() > MAX_EPOCH_BYTES)
-                    || serde_json::to_vec(&payload).map_or(true, |bytes| bytes.len() > 15_800)
-                {
-                    fits = false;
-                    break;
-                }
-            }
-            let record = epoch
-                .receipts
-                .get_mut(&job.expected.request.sequence)
-                .ok_or(Failure::Conflict)?;
-            record.dispatch = Some(job.replacement.clone());
-            record.receipt = job.receipt.clone();
-            if fits {
-                break;
-            }
-            crate::service::retire_one(&mut epoch).map_err(|_| failure_for(job, false))?;
-        }
+    while !epoch_has_reserved_capacity(&epoch, &job.epoch_id, revision, &metadata) {
+        crate::service::retire_one(&mut epoch).map_err(|_| failure_for(job, false))?;
     }
     let value = serde_json::to_value(epoch).map_err(|_| Failure::Unavailable)?;
     if serde_json::to_vec(&value).map_or(true, |bytes| bytes.len() > MAX_EPOCH_BYTES) {
         return Err(failure_for(job, false));
     }
     Ok((revision, metadata, value))
+}
+
+/// Check every in-flight owner call after any epoch mutation, including a
+/// possible cancellation marker and the final client receipt. A single lane
+/// prevents independent worst cases from consuming each other's reservation.
+pub(super) fn epoch_has_reserved_capacity(
+    epoch: &Epoch,
+    epoch_id: &str,
+    revision: u64,
+    metadata: &Value,
+) -> bool {
+    let mut reserved = 0usize;
+    for (sequence, record) in &epoch.receipts {
+        let Some(dispatch) = &record.dispatch else {
+            continue;
+        };
+        let candidates = match dispatch.worst_case_results() {
+            Ok(Some(worst)) => worst.to_vec(),
+            Ok(None) => {
+                if let Stage::Completing {
+                    outcome,
+                    provider_receipt,
+                    ..
+                } = &dispatch.stage
+                {
+                    let mut finished = dispatch.clone();
+                    finished.stage = Stage::Finished {
+                        outcome: outcome.clone(),
+                        provider_receipt: provider_receipt.clone(),
+                    };
+                    vec![finished]
+                } else {
+                    continue;
+                }
+            }
+            Err(_) => return false,
+        };
+        reserved += 1;
+        if reserved > 1 {
+            return false;
+        }
+        for candidate in candidates {
+            let Ok(mut value) = serde_json::to_value(epoch) else {
+                return false;
+            };
+            let Some(entry) = value
+                .get_mut("receipts")
+                .and_then(|items| items.get_mut(sequence.to_string()))
+            else {
+                return false;
+            };
+            let finished = matches!(candidate.stage, Stage::Finished { .. });
+            let Ok(serialized) = serde_json::to_value(&candidate) else {
+                return false;
+            };
+            entry["dispatch"] = serialized;
+            entry["receipt"]["cancellation_requested"] = Value::Bool(true);
+            if let Stage::Finished {
+                provider_receipt, ..
+            } = &candidate.stage
+            {
+                entry["receipt"]["result"] = provider_receipt.clone();
+            }
+            if finished {
+                entry["receipt"]["status"] = Value::String("recovery_required".into());
+            }
+            if serde_json::to_vec(&value).map_or(true, |bytes| bytes.len() > MAX_EPOCH_BYTES) {
+                return false;
+            }
+            let payload = json!({"action":"collection_commit","collection":COLLECTION,"expected_revision":revision,"metadata":metadata,"edits":[{"key":format!("epoch/{epoch_id}"),"value":value}]});
+            if serde_json::to_vec(&payload).map_or(true, |bytes| bytes.len() > 15_800) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn valid_cancellation(
@@ -739,6 +777,55 @@ mod tests {
             }
         }
         panic!("worker failed to finish")
+    }
+    #[test]
+    fn concurrent_workers_cannot_consume_an_armed_calls_reservation() {
+        let (mut first, _, mut epoch) = fixture();
+        let approval = json!({"provider":"example","method":{"service":"example/1","method":"action_execute","interface_major":1,"interface_minor":0}});
+        first.approvals = Some(crate::dispatch::FrozenApprovals {
+            execute: approval.clone(),
+            status: None,
+        });
+        let mut second = first.clone();
+        second.request.sequence = 2;
+        second.request.operation_id = format!("{}:2", second.request.epoch);
+        epoch["receipts"]["1"]["dispatch"] = serde_json::to_value(&first).unwrap();
+        let mut second_record = epoch["receipts"]["1"].clone();
+        second_record["request"] = serde_json::to_value(&second.request).unwrap();
+        second_record["dispatch"] = serde_json::to_value(&second).unwrap();
+        epoch["receipts"]["2"] = second_record;
+        let mut first_armed = first.clone();
+        first_armed.begin_effect().unwrap();
+        first_armed.arm_effect(approval.clone()).unwrap();
+        let job = |expected: Dispatch, replacement: Dispatch| Job {
+            epoch_id: expected.request.epoch.clone(),
+            expected,
+            replacement,
+            expected_receipt: json!({"status":"queued"}),
+            receipt: json!({"status":"running"}),
+            deadline: Instant::now() + Duration::from_secs(1),
+            generation: 1,
+            retries: 0,
+            phase: Phase::Load,
+        };
+        let response = |value: Value| json!({"ok":true,"revision":1,"metadata":{},"value":value});
+        let (_, _, armed_epoch) =
+            merge(&job(first.clone(), first_armed.clone()), &response(epoch)).unwrap();
+        let mut second_armed = second.clone();
+        second_armed.begin_effect().unwrap();
+        second_armed.arm_effect(approval).unwrap();
+        assert!(merge(&job(second, second_armed), &response(armed_epoch.clone())).is_err());
+        let mut first_completed = first_armed.clone();
+        first_completed
+            .accept_reply(json!({"status":"succeeded","receipt":"x".repeat(1_998)}))
+            .unwrap();
+        let mut completion = job(first_armed, first_completed);
+        completion.expected_receipt = json!({"status":"running"});
+        let result = merge(&completion, &response(armed_epoch));
+        assert!(
+            result.is_ok(),
+            "first result must retain its reserved space"
+        );
     }
     #[test]
     fn conflict_reloads_and_running_must_be_persisted_before_success() {

@@ -746,7 +746,15 @@ impl ActionsModule {
                     .get_mut(&sequence)
                     .expect("record exists")
                     .receipt = receipt.clone();
+                if !crate::worker::epoch_has_reserved_capacity(
+                    &epoch, epoch_id, revision, &metadata,
+                ) {
+                    return self.complete(incoming.id, failure("capacity"));
+                }
                 let value = serde_json::to_value(&epoch).map_err(|error| error.to_string())?;
+                if serde_json::to_vec(&value).map_or(true, |bytes| bytes.len() > MAX_EPOCH_BYTES) {
+                    return self.complete(incoming.id, failure("capacity"));
+                }
                 let payload = json!({"action":"collection_commit","collection":COLLECTION,"expected_revision":revision,"metadata":metadata,"edits":[{"key":format!("epoch/{epoch_id}"),"value":value}]});
                 return self.submit(
                     payload,
@@ -1190,6 +1198,9 @@ impl ActionsModule {
         start: Option<Dispatch>,
     ) -> ModuleResult<()> {
         let (revision, metadata) = state;
+        if !crate::worker::epoch_has_reserved_capacity(record, epoch, revision, &metadata) {
+            return self.complete(parent, failure("capacity"));
+        }
         let value = serde_json::to_value(record).map_err(|error| error.to_string())?;
         if serde_json::to_vec(&value)
             .map_err(|error| error.to_string())?
