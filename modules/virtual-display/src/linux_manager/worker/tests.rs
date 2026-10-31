@@ -430,6 +430,8 @@ fn linux_shared_references_persist_and_release_only_the_last_connector_owner() {
         receiver: Some(receiver),
         worker: Some(worker),
         cleanup_pending: Default::default(),
+        observer: None,
+        borrows: Default::default(),
         stopped,
     };
     let create = |reference: Option<&str>| crate::model::Operation::Create {
@@ -498,6 +500,33 @@ fn linux_shared_references_persist_and_release_only_the_last_connector_owner() {
     assert_eq!(
         manager.status("session", None, Some("stream-a".into()))["ok"],
         false
+    );
+    // A borrow pins its owner reference and cannot be released by another caller.
+    manager.borrows.insert(
+        "borrow-token".into(),
+        super::super::Borrow {
+            key: ("session".into(), FIRST.into()),
+            reference_id: "stream-a".into(),
+            observation: super::super::observer::Observation {
+                global: 4,
+                width: 1920,
+                height: 1080,
+                refresh: 60000,
+                generation: 1,
+            },
+        },
+    );
+    assert_eq!(
+        manager.remove("session", FIRST, Some("stream-a"))["code"],
+        "display_borrowed"
+    );
+    assert_eq!(
+        manager.release_borrow("other", FIRST, "stream-a", "borrow-token")["code"],
+        "borrow_invalid"
+    );
+    assert_eq!(
+        manager.release_borrow("session", FIRST, "stream-a", "borrow-token")["released"],
+        true
     );
     let response = manager.remove("session", FIRST, Some("stream-a"));
     assert_eq!(response["reference_released"], true);

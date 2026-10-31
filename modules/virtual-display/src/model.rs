@@ -155,6 +155,20 @@ impl Default for Settings {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    Borrow {
+        identity: String,
+        reference_id: String,
+    },
+    ValidateBorrow {
+        identity: String,
+        reference_id: String,
+        borrow_id: String,
+    },
+    ReleaseBorrow {
+        identity: String,
+        reference_id: String,
+        borrow_id: String,
+    },
     Create {
         #[serde(default)]
         hdr_enabled: bool,

@@ -37,12 +37,40 @@ fn main() {
         Command::new("cmake")
             .arg("--build")
             .arg(&build)
-            .args(["--target", "libvirtualdisplay_driver", "-j10"])
+            .args(["--target", "libvirtualdisplay_driver", "-j2"])
             .status()
             .expect("could not build libvirtualdisplay")
             .success(),
         "libvirtualdisplay build failed"
     );
+    let wayland = Command::new("pkg-config")
+        .args(["--cflags", "--libs", "wayland-client"])
+        .output()
+        .expect("Wayland pkg-config required");
+    assert!(
+        wayland.status.success(),
+        "linux-libvirtualdisplay requires wayland-client development files"
+    );
+    let mut observer = cc::Build::new();
+    observer
+        .file("src/linux_manager/wayland_observer.c")
+        .flag("-std=c11");
+    for flag in String::from_utf8(wayland.stdout)
+        .unwrap()
+        .split_whitespace()
+    {
+        if let Some(path) = flag.strip_prefix("-I") {
+            observer.include(path);
+        } else if let Some(lib) = flag.strip_prefix("-l") {
+            println!("cargo:rustc-link-lib={lib}");
+        } else if let Some(path) = flag.strip_prefix("-L") {
+            println!("cargo:rustc-link-search=native={path}");
+        } else {
+            observer.flag(flag);
+        }
+    }
+    observer.compile("amaterasu_wayland_observer");
+    println!("cargo:rerun-if-changed=src/linux_manager/wayland_observer.c");
     cc::Build::new()
         .cpp(true)
         .std("c++20")

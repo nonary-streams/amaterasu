@@ -3,6 +3,7 @@ mod compositor;
 mod connectors;
 mod journal;
 mod layout;
+mod observer;
 mod worker;
 use crate::{
     model::{Operation, Settings, Specification, failure, valid_identity, valid_reference_id},
@@ -63,6 +64,12 @@ impl Monitor {
 pub struct Admission {
     key: (String, String),
     reference_id: Option<String>,
+    borrow_id: Option<String>,
+}
+struct Borrow {
+    key: (String, String),
+    reference_id: String,
+    observation: observer::Observation,
 }
 enum Work {
     Create {
@@ -104,6 +111,8 @@ pub struct Manager {
     receiver: Option<Receiver<Event>>,
     worker: Option<JoinHandle<()>>,
     cleanup_pending: std::collections::BTreeSet<(String, String)>,
+    observer: Option<observer::Observer>,
+    borrows: BTreeMap<String, Borrow>,
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl Manager {
@@ -117,6 +126,8 @@ impl Manager {
             receiver: None,
             worker: None,
             cleanup_pending: Default::default(),
+            observer: None,
+            borrows: BTreeMap::new(),
             stopped: Default::default(),
         };
         if manager.settings.enabled {
@@ -210,6 +221,26 @@ impl Manager {
     pub fn admit(&mut self, caller: &str, operation: Operation) -> (Value, Option<Admission>) {
         self.tick();
         match operation {
+            Operation::Borrow {
+                identity,
+                reference_id,
+            } => self.borrow(caller, &identity, &reference_id),
+            Operation::ValidateBorrow {
+                identity,
+                reference_id,
+                borrow_id,
+            } => (
+                self.validate_borrow(caller, &identity, &reference_id, &borrow_id),
+                None,
+            ),
+            Operation::ReleaseBorrow {
+                identity,
+                reference_id,
+                borrow_id,
+            } => (
+                self.release_borrow(caller, &identity, &reference_id, &borrow_id),
+                None,
+            ),
             Operation::Status {
                 identity,
                 reference_id,
@@ -299,7 +330,11 @@ impl Manager {
                     }
                     return (
                         json!({"ok":true,"monitor":self.monitors[&key].response(Some(reference)),"reference_owned":true}),
-                        Some(Admission { key, reference_id }),
+                        Some(Admission {
+                            key,
+                            reference_id,
+                            borrow_id: None,
+                        }),
                     );
                 }
                 if self.monitors.len() >= 8 {
@@ -325,12 +360,23 @@ impl Manager {
                 };
                 let response = json!({"ok":true,"monitor":monitor.response(reference_id.as_deref()),"reference_owned":reference_id.is_some()});
                 self.monitors.insert(key.clone(), monitor);
-                (response, Some(Admission { key, reference_id }))
+                (
+                    response,
+                    Some(Admission {
+                        key,
+                        reference_id,
+                        borrow_id: None,
+                    }),
+                )
             }
         }
     }
     pub fn completion_lost(&mut self, admission: Option<Admission>) {
         if let Some(admission) = admission {
+            if let Some(borrow_id) = admission.borrow_id {
+                self.borrows.remove(&borrow_id);
+                return;
+            }
             let _ = self.remove(
                 &admission.key.0,
                 &admission.key.1,
@@ -373,6 +419,12 @@ impl Manager {
         if !self.ready && self.recovery_error.is_none() {
             return failure("startup_reconciliation_pending");
         }
+        if self.borrows.values().any(|borrow| {
+            borrow.key == key
+                && reference_id.is_none_or(|reference| borrow.reference_id == reference)
+        }) {
+            return failure("display_borrowed");
+        }
         if !self.monitors.contains_key(&key) {
             return json!({"ok":true,"removed":true,"identity":identity});
         }
@@ -402,6 +454,140 @@ impl Manager {
             self.monitors.get_mut(&key).unwrap().state = "removing";
         }
         json!({"ok":true,"removed":false,"monitor":self.monitors[&key].response(reference_id),"reference_owned":false})
+    }
+    fn borrow(
+        &mut self,
+        caller: &str,
+        identity: &str,
+        reference_id: &str,
+    ) -> (Value, Option<Admission>) {
+        let key = (caller.to_owned(), identity.to_owned());
+        let Some(monitor) = self.monitors.get(&key) else {
+            return (failure("not_found"), None);
+        };
+        if monitor.state != "ready"
+            || !monitor
+                .references
+                .as_ref()
+                .is_some_and(|refs| refs.contains(reference_id))
+        {
+            return (failure("reference_not_owned"), None);
+        }
+        let Some(output) = monitor.output.clone() else {
+            return (failure("binding_unavailable"), None);
+        };
+        if self.borrows.len() >= 64 {
+            return (failure("resource_exhausted"), None);
+        }
+        if !matches!(
+            crate::linux_control::LinuxControlClient::default().query_connector(&output),
+            Ok(true)
+        ) {
+            return (failure("binding_unavailable"), None);
+        }
+        if self.observer.is_none() {
+            self.observer = observer::Observer::open();
+        }
+        let Some(observation) = self
+            .observer
+            .as_mut()
+            .and_then(|observer| observer.read(&output))
+        else {
+            self.observer = None;
+            self.borrows.clear();
+            return (failure("binding_unavailable"), None);
+        };
+        if observation.width != monitor.specification.width
+            || observation.height != monitor.specification.height
+            || observation.refresh != monitor.specification.refresh_millihz
+        {
+            return (failure("binding_mismatch"), None);
+        }
+        let mut random = [0u8; 32];
+        if getrandom::fill(&mut random).is_err() {
+            return (failure("random_unavailable"), None);
+        }
+        let borrow_id: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        self.borrows.insert(
+            borrow_id.clone(),
+            Borrow {
+                key: key.clone(),
+                reference_id: reference_id.into(),
+                observation,
+            },
+        );
+        let result = json!({"ok":true,"borrow_id":borrow_id,"observed_output":Self::observation(&output, observation)});
+        (
+            result,
+            Some(Admission {
+                key,
+                reference_id: Some(reference_id.into()),
+                borrow_id: Some(borrow_id),
+            }),
+        )
+    }
+    fn observation(output: &str, observation: observer::Observation) -> Value {
+        json!({"version":1,"protocol":"wayland-wl-output","registry_global":observation.global,"output_name":output,"width":observation.width,"height":observation.height,"refresh_millihz":observation.refresh})
+    }
+    fn validate_borrow(
+        &mut self,
+        caller: &str,
+        identity: &str,
+        reference_id: &str,
+        borrow_id: &str,
+    ) -> Value {
+        let key = (caller.to_owned(), identity.to_owned());
+        let Some(borrow) = self.borrows.get(borrow_id) else {
+            return failure("borrow_invalid");
+        };
+        if borrow.key != key || borrow.reference_id != reference_id {
+            return failure("borrow_invalid");
+        }
+        let expected = borrow.observation;
+        let Some(monitor) = self.monitors.get(&key) else {
+            return failure("borrow_invalid");
+        };
+        if monitor.state != "ready"
+            || !monitor
+                .references
+                .as_ref()
+                .is_some_and(|refs| refs.contains(reference_id))
+        {
+            return failure("borrow_invalid");
+        }
+        let Some(output) = monitor.output.clone() else {
+            return failure("borrow_invalid");
+        };
+        let connected = matches!(
+            crate::linux_control::LinuxControlClient::default().query_connector(&output),
+            Ok(true)
+        );
+        let observed = self
+            .observer
+            .as_mut()
+            .and_then(|observer| observer.read(&output));
+        if !connected || observed != Some(expected) {
+            self.borrows.remove(borrow_id);
+            return failure("borrow_invalid");
+        }
+        json!({"ok":true,"borrow_id":borrow_id,"observed_output":Self::observation(&output, expected)})
+    }
+    fn release_borrow(
+        &mut self,
+        caller: &str,
+        identity: &str,
+        reference_id: &str,
+        borrow_id: &str,
+    ) -> Value {
+        if self.borrows.get(borrow_id).is_some_and(|borrow| {
+            borrow.key == (caller.to_owned(), identity.to_owned())
+                && borrow.reference_id == reference_id
+        }) {
+            self.borrows.remove(borrow_id);
+            json!({"ok":true,"released":true})
+        } else {
+            failure("borrow_invalid")
+        }
     }
     fn status(
         &self,

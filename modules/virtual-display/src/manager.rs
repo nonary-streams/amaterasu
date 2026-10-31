@@ -321,6 +321,26 @@ impl<D: Driver> Manager<D> {
 
     pub fn handle(&mut self, caller: &str, operation: Operation) -> Value {
         match operation {
+            Operation::Borrow {
+                identity,
+                reference_id,
+            } => {
+                drop((identity, reference_id));
+                failure("unsupported_binding")
+            }
+            Operation::ValidateBorrow {
+                identity,
+                reference_id,
+                borrow_id,
+            }
+            | Operation::ReleaseBorrow {
+                identity,
+                reference_id,
+                borrow_id,
+            } => {
+                drop((identity, reference_id, borrow_id));
+                failure("unsupported_binding")
+            }
             Operation::Status {
                 identity,
                 reference_id,

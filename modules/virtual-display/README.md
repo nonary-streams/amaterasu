@@ -263,3 +263,27 @@ settings persistence and migration, and management edit authority remain pending
 Windows driver qualification for permanent monitors has not been run. Run `cargo test -p
 amaterasu-virtual-display` and cross-check with `cargo check -p
 amaterasu-virtual-display --target x86_64-pc-windows-msvc`.
+
+### Cooperative Linux capture binding
+
+The optional Linux backend exposes `borrow`, `validate_borrow`, and
+`release_borrow` on this service. Each takes `identity` and `reference_id`;
+validation and release also take the provider-generated `borrow_id`. Borrow
+requires an existing ready caller-owned reference and independently observes the
+current `wl_output` global, name and current mode through a persistent Wayland
+connection. It also checks broker connection state. The response includes
+`observed_output` with version 1, protocol `wayland-wl-output`, registry global,
+output name, width, height and refresh in millihertz. The consumer must compare
+this tuple with its own live observation and validate before and after opening
+capture and throughout its lifetime. Changed mode, removal, observer failure,
+provider restart, or an unavailable observation invalidates validation. A
+borrow blocks releasing its reference, and caller ownership is checked on every
+operation. Lost borrow completion releases the newly created borrow.
+
+This is a cooperative fence against this provider's own removal and reuse, not
+an OS-enforced connector lease. The broker's read-only query reports connected
+state, not owning UID or an allocation nonce. Wayland globals are scoped to the
+compositor, so producer and consumer must use the same compositor. External
+replacement may occur between validations; consumers must stop on invalidation.
+A native binding to a privileged or uncooperative actor is not established.
+Windows reports `unsupported_binding` for these operations.
