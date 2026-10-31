@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 pub const SERVICE: &str = "amaterasu.library/1";
 const CATALOG: &str = "amaterasu.catalog/1";
 const MAX_PENDING: usize = 64;
+const DEFAULT_LIST_LIMIT: usize = 20;
 // Keep a minute of release fences without exhausting capacity during library browsing.
 const MAX_TRANSFERS: usize = 4096;
 
@@ -54,8 +55,14 @@ struct Cursor {
     query: String,
 }
 
+#[derive(Clone, Copy)]
+enum CatalogProjection {
+    Resolve,
+    List { limit: usize },
+}
+
 impl Action {
-    fn catalog_request(self) -> Result<(Value, bool), &'static str> {
+    fn catalog_request(self) -> Result<(Value, CatalogProjection), &'static str> {
         match self {
             Self::List { cursor, limit } => {
                 if limit.is_some_and(|n| !(1..=32).contains(&n))
@@ -65,14 +72,16 @@ impl Action {
                 {
                     return Err("invalid pagination");
                 }
+                let limit = limit.unwrap_or(DEFAULT_LIST_LIMIT);
                 Ok((
                     json!({"action":"export_list","cursor":cursor,"limit":limit}),
-                    false,
+                    CatalogProjection::List { limit },
                 ))
             }
-            Self::Resolve { id } if valid_id(&id) => {
-                Ok((json!({"action":"resolve_exported","id":id}), true))
-            }
+            Self::Resolve { id } if valid_id(&id) => Ok((
+                json!({"action":"resolve_exported","id":id}),
+                CatalogProjection::Resolve,
+            )),
             Self::Resolve { .. } => Err("invalid catalog ID"),
             Self::ArtworkRead { .. } | Self::ArtworkRelease { .. } | Self::Discover { .. } => {
                 Err("invalid request")
@@ -101,7 +110,7 @@ fn error(code: &str, message: &str) -> Value {
 }
 
 /// Never forward launch details, paths, or unknown fields from the catalog.
-fn project(payload: Value, resolve: bool) -> Value {
+fn project(payload: Value, projection: CatalogProjection) -> Value {
     if payload["ok"] == false {
         let code = payload
             .pointer("/error/code")
@@ -124,14 +133,22 @@ fn project(payload: Value, resolve: bool) -> Value {
     } else if payload["ok"] == true
         && let Some(revision) = payload["revision"].as_u64()
     {
-        if resolve {
+        if matches!(projection, CatalogProjection::Resolve) {
             if let (Some(id), Some(name)) = (payload["id"].as_str(), payload["name"].as_str())
                 && valid_id(id)
                 && valid_name(name)
             {
                 return json!({"ok":true,"revision":revision,"id":id,"name":name});
             }
-        } else if let Some(entries) = payload["entries"].as_array() {
+        } else if let CatalogProjection::List { limit } = projection
+            && let Some(entries) = payload["entries"].as_array()
+        {
+            if entries.len() > limit {
+                return error(
+                    "invalid_catalog_response",
+                    "catalog returned an invalid response",
+                );
+            }
             let projected: Option<Vec<Value>> = entries
                 .iter()
                 .map(|entry| {
@@ -141,9 +158,7 @@ fn project(payload: Value, resolve: bool) -> Value {
                 })
                 .collect();
             let cursor = payload.get("next_cursor");
-            if entries.len() <= 32
-                && let (Some(entries), Some(cursor)) = (projected, cursor)
-            {
+            if let (Some(entries), Some(cursor)) = (projected, cursor) {
                 let valid_cursor = cursor.is_null()
                     || serde_json::from_value::<Cursor>(cursor.clone()).is_ok_and(|c| {
                         c.revision == revision && valid_id(&c.after) && c.query.is_empty()
@@ -169,7 +184,7 @@ enum Stage {
         limit: usize,
     },
     Catalog {
-        resolve: bool,
+        projection: CatalogProjection,
     },
     ArtworkResolve {
         revision: Option<String>,
@@ -634,7 +649,9 @@ impl ManagedModule for Library {
                         },
                     );
                 }
-                Stage::Catalog { resolve } => pending.result = Some(project(payload, resolve)),
+                Stage::Catalog { projection } => {
+                    pending.result = Some(project(payload, projection))
+                }
                 Stage::Discovery { limit } => {
                     pending.result = Some(discovery::project(payload, limit))
                 }
@@ -800,7 +817,9 @@ impl ManagedModule for Library {
                 .map_err(|code| (code, "discovery request rejected")),
             Ok(action) => action
                 .catalog_request()
-                .map(|(payload, resolve)| (CATALOG.to_owned(), payload, Stage::Catalog { resolve }))
+                .map(|(payload, projection)| {
+                    (CATALOG.to_owned(), payload, Stage::Catalog { projection })
+                })
                 .map_err(|message| ("invalid_request", message)),
             Err(_) => Err(("invalid_request", "invalid request")),
         };
@@ -908,7 +927,7 @@ mod tests {
     fn resolve_never_exposes_launch_or_configuration() {
         let result = project(
             json!({"ok":true,"revision":7,"id":"app-0000000000000001","name":"Game","entry":{"launch":{"program":"secret"},"prep_cmd":["secret"]}}),
-            true,
+            CatalogProjection::Resolve,
         );
         assert_eq!(
             result,
@@ -933,7 +952,7 @@ mod tests {
         );
         let result = project(
             json!({"ok":true,"revision":1,"entries":[{"id":"app-0000000000000001","name":"Game","launch":"secret"}],"next_cursor":null}),
-            false,
+            CatalogProjection::List { limit: 20 },
         );
         assert_eq!(
             result["entries"][0],
@@ -958,6 +977,8 @@ mod forwarding_tests {
         polled: bool,
         commands: Vec<Command>,
         completed: Option<Value>,
+        requested: Option<Value>,
+        catalog_result: Option<Value>,
     }
     unsafe extern "C" fn invoke(
         context: *mut c_void,
@@ -983,14 +1004,14 @@ mod forwarding_tests {
                     caller: "amaterasu.nvhttp".into(),
                     initiator: "amaterasu.nvhttp".into(),
                     service: SERVICE.into(),
-                    payload: json!({"action":"list","limit":20}),
+                    payload: host.requested.clone().unwrap_or_else(|| json!({"action":"list","limit":20})),
                     remaining_ms: 5000,
                 }
             }
             Command::Poll {} => Response::Pending,
             Command::Request { .. } => Response::Accepted { id: 12 },
             Command::TakeResult { request: 12 } => Response::Result {
-                payload: json!({"ok":true,"revision":4,"entries":[{"id":"app-0000000000000001","name":"Game","launch":"private"}],"next_cursor":null}),
+                payload: host.catalog_result.clone().unwrap_or_else(|| json!({"ok":true,"revision":4,"entries":[{"id":"app-0000000000000001","name":"Game","launch":"private"}],"next_cursor":null})),
             },
             Command::Complete {
                 request: 11,
@@ -1028,5 +1049,44 @@ mod forwarding_tests {
                 json!({"ok":true,"revision":4,"entries":[{"id":"app-0000000000000001","name":"Game"}],"next_cursor":null})
             )
         );
+    }
+    #[test]
+    fn list_response_respects_requested_and_default_page_limit_through_broker() {
+        for (requested, limit, count, accepted) in [
+            (Some(1), 1, 1, true),
+            (Some(1), 1, 2, false),
+            (Some(32), 32, 32, true),
+            (Some(32), 32, 33, false),
+            (None, 20, 20, true),
+            (None, 20, 21, false),
+        ] {
+            let entries: Vec<_> = (1..=count)
+                .map(|n| json!({"id":format!("app-{n:016x}"),"name":"Game"}))
+                .collect();
+            let mut host = Box::new(Host {
+                requested: Some(json!({"action":"list","limit":requested})),
+                catalog_result: Some(
+                    json!({"ok":true,"revision":4,"entries":entries,"next_cursor":null}),
+                ),
+                ..Default::default()
+            });
+            let endpoint = HostApi {
+                header: AbiHeader::of::<HostApi>(),
+                context: (&mut *host as *mut Host).cast(),
+                invoke,
+            };
+            // SAFETY: host and endpoint remain live for the module's synchronous calls.
+            let mut module =
+                Library::start(unsafe { RuntimeClient::from_endpoint(endpoint) }).unwrap();
+            for _ in 0..3 {
+                module.tick().unwrap();
+            }
+            assert!(host.commands.iter().any(|command| matches!(command, Command::Request { service, payload, parent: Some(11), .. } if service == CATALOG && payload["limit"] == limit)));
+            let response = host.completed.as_ref().unwrap();
+            assert_eq!(response["ok"], accepted, "limit {limit}, count {count}");
+            if !accepted {
+                assert_eq!(response["error"]["code"], "invalid_catalog_response");
+            }
+        }
     }
 }
