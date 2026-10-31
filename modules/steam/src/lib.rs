@@ -772,6 +772,7 @@ struct SteamModule {
     provider: Provider,
     configuration: ProductConfiguration,
     catalog_sync: catalog_sync::CatalogSync,
+    library_principal: String,
 }
 
 impl ManagedModule for SteamModule {
@@ -799,6 +800,7 @@ impl ManagedModule for SteamModule {
             },
             configuration,
             catalog_sync: catalog_sync::CatalogSync::new(),
+            library_principal: settings.library_principal,
         })
     }
 
@@ -863,9 +865,10 @@ impl SteamModule {
                 | Action::ForceSync {}
         );
         let library_artwork_read =
-            caller == LIBRARY_CALLER && matches!(&action, Action::ArtworkRead { .. });
+            caller == self.library_principal && matches!(&action, Action::ArtworkRead { .. });
         if caller == "amaterasu.nvhttp"
-            || (caller == LIBRARY_CALLER && !library_artwork_read)
+            || (caller == LIBRARY_CALLER && caller != self.library_principal)
+            || (caller == self.library_principal && !library_artwork_read)
             || (is_management_action && !is_management_caller(caller) && !library_artwork_read)
         {
             return self.complete(id, json!({"ok":false,"code":"forbidden"}));

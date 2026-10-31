@@ -545,6 +545,38 @@ fn artwork_reads_allow_library_and_require_a_current_discovery_record() {
 }
 
 #[test]
+fn custom_library_principal_replaces_default_for_artwork() {
+    let mut host = Box::new(FakeHost {
+        startup_settings: Some(json!({"library_principal":"custom.library"})),
+        ..FakeHost::default()
+    });
+    host.product_get_results
+        .push_back(persisted_settings(true, 1));
+    for (id, caller, action) in [
+        (30, "custom.library", "artwork_read"),
+        (31, "custom.library", "status"),
+        (32, LIBRARY_CALLER, "artwork_read"),
+        (33, LIBRARY_CALLER, "status"),
+        (34, "amaterasu.nvhttp", "artwork_read"),
+    ] {
+        let payload = if action == "artwork_read" {
+            json!({"action":action,"app_id":42,"revision":"1","offset":0})
+        } else {
+            json!({"action":action})
+        };
+        host.queue_service_request(id, caller, payload);
+    }
+    let mut module = start_test_module(&mut host);
+    for _ in 0..5 {
+        module.tick().unwrap();
+    }
+    assert_eq!(host.completed[0].1["code"], "artwork_unavailable");
+    for (_, response) in &host.completed[1..] {
+        assert_eq!(response["code"], "forbidden");
+    }
+}
+
+#[test]
 fn nvhttp_cannot_call_steam_directly_but_library_may_forward_artwork() {
     let mut host = Box::new(FakeHost::default());
     host.product_get_results
@@ -812,6 +844,7 @@ fn product_settings_expose_bounded_tool_and_recent_game_policy() {
 #[derive(Default)]
 struct FakeHost {
     next_child: u64,
+    startup_settings: Option<Value>,
     product_get_results: VecDeque<Response>,
     product_update_results: VecDeque<Response>,
     child_results: BTreeMap<u64, Response>,
@@ -845,7 +878,10 @@ impl FakeHost {
     fn dispatch(&mut self, command: Command) -> Response {
         match command {
             Command::GetSettings {} => Response::Result {
-                payload: json!({"roots":[]}),
+                payload: self
+                    .startup_settings
+                    .clone()
+                    .unwrap_or_else(|| json!({"roots":[]})),
             },
             Command::Register { .. } => Response::Ok,
             Command::Request {

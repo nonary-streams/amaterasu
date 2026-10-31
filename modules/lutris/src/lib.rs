@@ -21,9 +21,41 @@ use steam_catalog::{Progress as SteamProgress, SteamCatalogRead};
 pub const SERVICE: &str = "amaterasu.lutris/1";
 const MANAGEMENT_CALLER: &str = "amaterasu.management";
 const LIBRARY_CALLER: &str = "amaterasu.library";
+const RESERVED_LIBRARY_CALLERS: &[&str] = &[
+    "amaterasu.nvhttp",
+    MANAGEMENT_CALLER,
+    LAUNCH_CALLER,
+    "amaterasu.catalog",
+];
 const LAUNCH_CALLER: &str = "amaterasu.launch";
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 const RECONCILIATION_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Deserialize)]
+struct StartupSettings {
+    #[serde(default = "default_library_principal")]
+    library_principal: String,
+}
+
+fn default_library_principal() -> String {
+    LIBRARY_CALLER.to_owned()
+}
+
+impl StartupSettings {
+    fn validate(&self) -> ModuleResult<()> {
+        let principal = &self.library_principal;
+        if principal.is_empty()
+            || principal.len() > 128
+            || !principal
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            || RESERVED_LIBRARY_CALLERS.contains(&principal.as_str())
+        {
+            return Err("invalid Lutris library principal".into());
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SourceSignature {
@@ -202,6 +234,7 @@ struct PendingSteamRead {
 
 struct LutrisModule {
     runtime: RuntimeClient,
+    library_principal: String,
     configuration: configuration::ProductConfiguration,
     catalog: catalog_sync::CatalogSync,
     artwork: artwork::ArtworkStore,
@@ -224,11 +257,18 @@ struct LutrisModule {
 
 impl ManagedModule for LutrisModule {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
+        let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
+            return Err("Lutris settings unavailable".into());
+        };
+        let settings: StartupSettings =
+            serde_json::from_value(payload).map_err(|_| "invalid Lutris settings")?;
+        settings.validate()?;
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
         Ok(Self {
             runtime,
+            library_principal: settings.library_principal,
             configuration: configuration::ProductConfiguration::new(),
             catalog: catalog_sync::CatalogSync::default(),
             artwork: artwork::ArtworkStore::default(),
@@ -479,7 +519,7 @@ impl LutrisModule {
             Ok(action) => action,
             Err(_) => return self.complete(request, json!({"ok":false,"code":"invalid_request"})),
         };
-        if !caller_can_access(caller, &action) {
+        if !caller_can_access(caller, &self.library_principal, &action) {
             return self.complete(request, json!({"ok":false,"code":"forbidden"}));
         }
         if action.is_settings() && self.configuration.busy() {
@@ -501,6 +541,7 @@ impl LutrisModule {
                     &self.artwork,
                     self.configuration.settings().enabled,
                     caller,
+                    &self.library_principal,
                     game_id,
                     None,
                 ),
@@ -515,6 +556,7 @@ impl LutrisModule {
                     &self.artwork,
                     self.configuration.settings().enabled,
                     caller,
+                    &self.library_principal,
                     game_id,
                     Some((&revision, offset)),
                 ),
@@ -596,10 +638,11 @@ fn artwork_response(
     store: &artwork::ArtworkStore,
     enabled: bool,
     caller: &str,
+    library_principal: &str,
     game_id: i64,
     read: Option<(&str, u64)>,
 ) -> Value {
-    if !is_management_caller(caller) && !(caller == LIBRARY_CALLER && read.is_some()) {
+    if !is_management_caller(caller) && !(caller == library_principal && read.is_some()) {
         return json!({"ok":false,"code":"forbidden"});
     }
     if !enabled {
@@ -825,25 +868,39 @@ mod tests {
         let mut store = artwork::ArtworkStore::default();
         store.update(&source);
 
-        let metadata = artwork_response(&store, true, MANAGEMENT_CALLER, 10, None);
+        let metadata = artwork_response(&store, true, MANAGEMENT_CALLER, LIBRARY_CALLER, 10, None);
         let revision = metadata["revision"].as_str().unwrap().to_owned();
         assert_eq!(metadata["mime_type"], "image/png");
         assert_eq!(metadata["total_bytes"], first.len());
         assert!(metadata.get("path").is_none());
-        let chunk = artwork_response(&store, true, MANAGEMENT_CALLER, 10, Some((&revision, 0)));
+        let chunk = artwork_response(
+            &store,
+            true,
+            MANAGEMENT_CALLER,
+            LIBRARY_CALLER,
+            10,
+            Some((&revision, 0)),
+        );
         assert_eq!(chunk["ok"], true);
         assert_eq!(chunk["next_offset"], Value::Null);
         assert!(chunk.get("path").is_none());
         assert_eq!(
-            artwork_response(&store, true, "amaterasu.other", 10, None)["code"],
+            artwork_response(&store, true, "amaterasu.other", LIBRARY_CALLER, 10, None)["code"],
             "forbidden"
         );
         assert_eq!(
-            artwork_response(&store, false, MANAGEMENT_CALLER, 10, None)["code"],
+            artwork_response(&store, false, MANAGEMENT_CALLER, LIBRARY_CALLER, 10, None)["code"],
             "lutris_disabled"
         );
         assert_eq!(
-            artwork_response(&store, true, MANAGEMENT_CALLER, 10, Some((&revision, 1)))["code"],
+            artwork_response(
+                &store,
+                true,
+                MANAGEMENT_CALLER,
+                LIBRARY_CALLER,
+                10,
+                Some((&revision, 1))
+            )["code"],
             "invalid_cursor"
         );
 
@@ -854,7 +911,8 @@ mod tests {
         )
         .unwrap();
         std::fs::rename(&replacement_path, &cover).unwrap();
-        let same_size_revision = artwork_response(&store, true, MANAGEMENT_CALLER, 10, None);
+        let same_size_revision =
+            artwork_response(&store, true, MANAGEMENT_CALLER, LIBRARY_CALLER, 10, None);
         assert_ne!(same_size_revision["revision"], revision);
 
         std::fs::write(
@@ -862,10 +920,17 @@ mod tests {
             [b"\x89PNG\r\n\x1a\n".as_slice(), b"replacement"].concat(),
         )
         .unwrap();
-        let changed = artwork_response(&store, true, MANAGEMENT_CALLER, 10, None);
+        let changed = artwork_response(&store, true, MANAGEMENT_CALLER, LIBRARY_CALLER, 10, None);
         assert_ne!(changed["revision"], revision);
         assert_eq!(
-            artwork_response(&store, true, MANAGEMENT_CALLER, 10, Some((&revision, 0)))["code"],
+            artwork_response(
+                &store,
+                true,
+                MANAGEMENT_CALLER,
+                LIBRARY_CALLER,
+                10,
+                Some((&revision, 0))
+            )["code"],
             "artwork_changed"
         );
         File::create(&cover)
@@ -876,19 +941,19 @@ mod tests {
         std::fs::create_dir_all(icon.parent().unwrap()).unwrap();
         std::fs::write(&icon, &first).unwrap();
         assert_eq!(
-            artwork_response(&store, true, MANAGEMENT_CALLER, 10, None)["mime_type"],
+            artwork_response(&store, true, MANAGEMENT_CALLER, LIBRARY_CALLER, 10, None)["mime_type"],
             "image/png"
         );
         std::fs::remove_file(icon).unwrap();
         assert_eq!(
-            artwork_response(&store, true, MANAGEMENT_CALLER, 10, None)["code"],
+            artwork_response(&store, true, MANAGEMENT_CALLER, LIBRARY_CALLER, 10, None)["code"],
             "artwork_unavailable"
         );
 
         source.games[2].slug = "../outside".into();
         store.update(&source);
         assert_eq!(
-            artwork_response(&store, true, MANAGEMENT_CALLER, 10, None)["code"],
+            artwork_response(&store, true, MANAGEMENT_CALLER, LIBRARY_CALLER, 10, None)["code"],
             "artwork_unavailable"
         );
         std::fs::remove_dir_all(root).unwrap();
@@ -948,30 +1013,119 @@ mod tests {
     }
 
     #[test]
+    fn startup_library_principal_is_validated_and_selects_only_artwork_reads() {
+        let default: StartupSettings = serde_json::from_value(json!({})).unwrap();
+        default.validate().unwrap();
+        assert_eq!(default.library_principal, LIBRARY_CALLER);
+        for invalid in [
+            "",
+            "bad name",
+            "é",
+            "amaterasu.nvhttp",
+            "amaterasu.management",
+            "amaterasu.launch",
+            "amaterasu.catalog",
+            &"a".repeat(129),
+        ] {
+            let settings = StartupSettings {
+                library_principal: invalid.into(),
+            };
+            assert!(settings.validate().is_err(), "accepted {invalid:?}");
+        }
+        for valid in ["a", &"a".repeat(128), "custom.library_1-2"] {
+            StartupSettings {
+                library_principal: valid.into(),
+            }
+            .validate()
+            .unwrap();
+        }
+        assert!(
+            serde_json::from_value::<StartupSettings>(json!({"library_principal": null})).is_err()
+        );
+        let selected = "custom.library";
+        let read = Action::ArtworkRead {
+            game_id: 7,
+            revision: "r".into(),
+            offset: 0,
+        };
+        assert!(caller_can_access(selected, selected, &read));
+        assert!(!caller_can_access(LIBRARY_CALLER, selected, &read));
+        assert!(!caller_can_access("amaterasu.nvhttp", selected, &read));
+        assert!(!caller_can_access(
+            selected,
+            selected,
+            &Action::ArtworkGet { game_id: 7 }
+        ));
+        let store = artwork::ArtworkStore::default();
+        assert_eq!(
+            artwork_response(&store, true, selected, selected, 7, Some(("r", 0)))["code"],
+            "invalid_cursor"
+        );
+        assert_eq!(
+            artwork_response(&store, true, LIBRARY_CALLER, selected, 7, Some(("r", 0)))["code"],
+            "forbidden"
+        );
+        assert_eq!(
+            artwork_response(
+                &store,
+                true,
+                "amaterasu.nvhttp",
+                selected,
+                7,
+                Some(("r", 0))
+            )["code"],
+            "forbidden"
+        );
+    }
+
+    #[test]
     fn library_caller_can_only_read_artwork() {
         let read = Action::ArtworkRead {
             game_id: 7,
             revision: "revision".into(),
             offset: 0,
         };
-        assert!(caller_can_access(LIBRARY_CALLER, &read));
+        assert!(caller_can_access(LIBRARY_CALLER, LIBRARY_CALLER, &read));
         assert!(!caller_can_access(
+            LIBRARY_CALLER,
             LIBRARY_CALLER,
             &Action::ArtworkGet { game_id: 7 }
         ));
-        assert!(!caller_can_access(LIBRARY_CALLER, &Action::Refresh {}));
-        assert!(!caller_can_access(LIBRARY_CALLER, &Action::Status {}));
+        assert!(!caller_can_access(
+            LIBRARY_CALLER,
+            LIBRARY_CALLER,
+            &Action::Refresh {}
+        ));
+        assert!(!caller_can_access(
+            LIBRARY_CALLER,
+            LIBRARY_CALLER,
+            &Action::Status {}
+        ));
         let store = artwork::ArtworkStore::default();
         assert_ne!(
-            artwork_response(&store, true, LIBRARY_CALLER, 7, Some(("revision", 0)))["code"],
+            artwork_response(
+                &store,
+                true,
+                LIBRARY_CALLER,
+                LIBRARY_CALLER,
+                7,
+                Some(("revision", 0))
+            )["code"],
             "forbidden"
         );
         assert_eq!(
-            artwork_response(&store, true, LIBRARY_CALLER, 7, None)["code"],
+            artwork_response(&store, true, LIBRARY_CALLER, LIBRARY_CALLER, 7, None)["code"],
             "forbidden"
         );
         assert_eq!(
-            artwork_response(&store, true, "amaterasu.other", 7, Some(("revision", 0)))["code"],
+            artwork_response(
+                &store,
+                true,
+                "amaterasu.other",
+                LIBRARY_CALLER,
+                7,
+                Some(("revision", 0))
+            )["code"],
             "forbidden"
         );
     }
@@ -1557,10 +1711,10 @@ fn is_management_caller(caller: &str) -> bool {
     caller == MANAGEMENT_CALLER
 }
 
-fn caller_can_access(caller: &str, action: &Action) -> bool {
+fn caller_can_access(caller: &str, library_principal: &str, action: &Action) -> bool {
     is_management_caller(caller)
         || (caller == LAUNCH_CALLER && matches!(action, Action::Status {}))
-        || (caller == LIBRARY_CALLER && matches!(action, Action::ArtworkRead { .. }))
+        || (caller == library_principal && matches!(action, Action::ArtworkRead { .. }))
 }
 
 #[cfg(test)]
@@ -1588,6 +1742,7 @@ mod launch_status_access_tests {
         // SAFETY: the borrowed command remains valid for this invocation.
         let command: Command = serde_json::from_slice(unsafe { input.read().unwrap() }).unwrap();
         let response = match command {
+            Command::GetSettings {} => Response::Result { payload: json!({}) },
             Command::Register { .. } => Response::Ok,
             Command::Request { .. } => Response::Accepted { id: 99 },
             Command::TakeResult { request: 99 } if !host.load_ready => Response::Pending,

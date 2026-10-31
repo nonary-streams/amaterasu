@@ -317,6 +317,30 @@ pub fn build_package_with_externals(
     external: &[(&Path, &Path)],
     call_grants: Option<&Path>,
 ) -> PackageResult<()> {
+    build_package_with_library_selection(
+        root,
+        artifacts,
+        output,
+        sequence,
+        profile,
+        external,
+        call_grants,
+        None,
+    )
+}
+
+/// Select an approved replacement only as part of one complete signed set.
+#[allow(clippy::too_many_arguments)]
+pub fn build_package_with_library_selection(
+    root: &Path,
+    artifacts: &Path,
+    output: &Path,
+    sequence: u64,
+    profile: PackageProfile,
+    external: &[(&Path, &Path)],
+    call_grants: Option<&Path>,
+    replacement_id: Option<&str>,
+) -> PackageResult<()> {
     let bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json"))?;
     if !bootstrap.development {
         return Err("development publisher cannot use a production root".into());
@@ -340,12 +364,18 @@ pub fn build_package_with_externals(
             );
         }
     }
+    validate_library_selection(profile, &external, replacement_id)?;
+    validate_unique_service_providers(profile, &external, replacement_id)?;
+    validate_library_principal_binding(&bootstrap, &external, replacement_id)?;
     let call_grants = match call_grants {
         Some(path) => {
             if external.is_empty() {
                 return Err("call grants require an external component".into());
             }
             let grants: BTreeMap<String, BTreeSet<String>> = read_json(path)?;
+            if replacement_id.is_some() && grants.contains_key("amaterasu.library") {
+                return Err("call grants cannot target the replaced component".into());
+            }
             validate_external_call_grants(&grants, profile, &external, &bootstrap)?;
             grants
         }
@@ -378,6 +408,7 @@ pub fn build_package_with_externals(
         authority.as_ref(),
         &external,
         &call_grants,
+        replacement_id,
     )?;
     if !external.is_empty() {
         verify_package(
@@ -2533,6 +2564,7 @@ fn build_signed_package_with_runtime_probe(
         None,
         &[],
         &BTreeMap::new(),
+        None,
     )
 }
 
@@ -2548,6 +2580,7 @@ fn build_signed_package_with_runtime_probe_and_authority(
     authority: Option<&crate::capture_authority_package::PackageSpec>,
     external: &[ExternalComponent],
     call_grants: &BTreeMap<String, BTreeSet<String>>,
+    replacement_id: Option<&str>,
 ) -> PackageResult<()> {
     if authority.is_some()
         && !matches!(
@@ -2570,6 +2603,9 @@ fn build_signed_package_with_runtime_probe_and_authority(
 
     let mut components = Vec::new();
     for definition in profile.components() {
+        if definition.id == "amaterasu.library" && replacement_id.is_some() {
+            continue;
+        }
         let version = if definition.id == "amaterasu.example-echo" {
             format!("0.1.{sequence}")
         } else {
@@ -2600,6 +2636,29 @@ fn build_signed_package_with_runtime_probe_and_authority(
         components.push(external.manifest.clone());
     }
 
+    if let Some(replacement_id) = replacement_id {
+        let replacement_version = external
+            .iter()
+            .find(|entry| entry.manifest.id == replacement_id)
+            .ok_or("library replacement not included")?
+            .manifest
+            .version
+            .clone();
+        for component in &mut components {
+            if let Some(required) = component.requires.remove("amaterasu.library") {
+                if required != "0.1.0" {
+                    return Err("component requires an incompatible bundled library version".into());
+                }
+                if component
+                    .requires
+                    .insert(replacement_id.to_owned(), replacement_version.clone())
+                    .is_some()
+                {
+                    return Err("replacement dependency duplicates an existing dependency".into());
+                }
+            }
+        }
+    }
     for component in &mut components {
         if let Some(calls) = call_grants.get(&component.id) {
             component.requested.call.extend(calls.iter().cloned());
@@ -2924,6 +2983,204 @@ fn read_external_component(
     Ok(ExternalComponent { manifest, bytes })
 }
 
+fn validate_library_selection(
+    profile: PackageProfile,
+    external: &[ExternalComponent],
+    replacement_id: Option<&str>,
+) -> PackageResult<()> {
+    const LIBRARY_SERVICE: &str = "amaterasu.library/1";
+    let providers: Vec<_> = external
+        .iter()
+        .filter(|entry| entry.manifest.requested.provide.contains(LIBRARY_SERVICE))
+        .collect();
+    match replacement_id {
+        Some(id) => {
+            if !profile
+                .components()
+                .iter()
+                .any(|entry| entry.id == "amaterasu.library")
+            {
+                return Err("selected profile has no bundled library to replace".into());
+            }
+            if profile
+                .components()
+                .iter()
+                .filter(|entry| entry.provides.contains(&LIBRARY_SERVICE))
+                .count()
+                != 1
+            {
+                return Err("selected profile has conflicting library providers".into());
+            }
+            if providers.len() != 1 || providers[0].manifest.id != id {
+                return Err(
+                    "library replacement must be the sole included external provider".into(),
+                );
+            }
+            if providers[0].manifest.abi_major != amaterasu_abi::ABI_MAJOR
+                || providers[0]
+                    .manifest
+                    .requires
+                    .get(RUNTIME_ID)
+                    .map(String::as_str)
+                    != Some("0.1.0")
+            {
+                return Err(
+                    "library replacement requires the selected runtime ABI and version".into(),
+                );
+            }
+            if providers[0]
+                .manifest
+                .requires
+                .contains_key("amaterasu.library")
+                || providers[0].manifest.requires.contains_key(id)
+            {
+                return Err(
+                    "library replacement cannot depend on itself or the replaced component".into(),
+                );
+            }
+        }
+        None if !providers.is_empty()
+            && profile
+                .components()
+                .iter()
+                .any(|entry| entry.id == "amaterasu.library") =>
+        {
+            return Err("external library provider requires explicit replacement selection".into());
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+fn validate_unique_service_providers(
+    profile: PackageProfile,
+    external: &[ExternalComponent],
+    replacement_id: Option<&str>,
+) -> PackageResult<()> {
+    let mut ordinary = BTreeMap::<String, String>::new();
+    let mut native = BTreeMap::<String, String>::new();
+    let mut add = |id: &str, grants: Grants| -> PackageResult<()> {
+        for service in &grants.provide {
+            if ordinary.insert(service.clone(), id.to_owned()).is_some() {
+                return Err(format!("duplicate service provider: {service}"));
+            }
+        }
+        for service in &grants.native_provide {
+            if native.insert(service.clone(), id.to_owned()).is_some() {
+                return Err(format!("duplicate native service provider: {service}"));
+            }
+        }
+        Ok(())
+    };
+    for component in profile.components() {
+        if component.id == "amaterasu.library" && replacement_id.is_some() {
+            continue;
+        }
+        add(component.id, component.grants())?;
+    }
+    for component in external {
+        add(&component.manifest.id, component.manifest.requested.clone())?;
+    }
+    Ok(())
+}
+
+/// Pack never changes local authorization: the operator must first approve the
+/// selected caller identity in the policy used to run this exact component set.
+fn validate_library_principal_binding(
+    bootstrap: &BootstrapConfig,
+    external: &[ExternalComponent],
+    replacement_id: Option<&str>,
+) -> PackageResult<()> {
+    let Some(id) = replacement_id else {
+        return Ok(());
+    };
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        || [
+            "amaterasu.nvhttp",
+            "amaterasu.management",
+            "amaterasu.launch",
+            "amaterasu.catalog",
+        ]
+        .contains(&id)
+    {
+        return Err("invalid or reserved library principal".into());
+    }
+    if let Some(principals) = bootstrap
+        .policy
+        .settings
+        .get("amaterasu.catalog")
+        .and_then(|settings| settings.get("launch_principals"))
+    {
+        let principals = principals
+            .as_array()
+            .ok_or("invalid catalog launch principals")?;
+        if principals
+            .iter()
+            .any(|principal| principal.as_str().is_none())
+        {
+            return Err("invalid catalog launch principals".into());
+        }
+        if principals
+            .iter()
+            .any(|principal| principal.as_str() == Some(id))
+        {
+            return Err("library principal conflicts with a catalog launch principal".into());
+        }
+    }
+    let replacement = external
+        .iter()
+        .find(|item| item.manifest.id == id)
+        .ok_or("library replacement not included")?;
+    for (component, service) in [
+        ("amaterasu.catalog", "amaterasu.catalog/1"),
+        ("amaterasu.state", "amaterasu.state/1"),
+        ("amaterasu.steam", "amaterasu.steam/1"),
+        ("amaterasu.lutris", "amaterasu.lutris/1"),
+        ("amaterasu.playnite", "amaterasu.playnite/1"),
+    ] {
+        if replacement.manifest.requested.call.contains(service)
+            && replacement
+                .manifest
+                .requires
+                .get(component)
+                .map(String::as_str)
+                != Some("0.1.0")
+        {
+            return Err(format!(
+                "library replacement must depend on selected {component} 0.1.0"
+            ));
+        }
+    }
+    let mut required = vec!["amaterasu.catalog"];
+    for (component, service) in [
+        ("amaterasu.steam", "amaterasu.steam/1"),
+        ("amaterasu.lutris", "amaterasu.lutris/1"),
+        ("amaterasu.playnite", "amaterasu.playnite/1"),
+    ] {
+        if replacement.manifest.requested.call.contains(service) {
+            required.push(component);
+        }
+    }
+    for component in required {
+        let actual = bootstrap
+            .policy
+            .settings
+            .get(component)
+            .and_then(|value| value.get("library_principal"))
+            .and_then(serde_json::Value::as_str);
+        if actual != Some(id) {
+            return Err(format!(
+                "operator policy must bind {component} library_principal to selected library {id}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_external_call_grants(
     calls: &BTreeMap<String, BTreeSet<String>>,
     profile: PackageProfile,
@@ -3146,6 +3403,454 @@ mod external_component_tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn replacement_bindings_require_preapproval_and_matching_provider_dependencies() {
+        let base = std::env::temp_dir().join(format!(
+            "amaterasu-library-binding-{}",
+            random_identifier().unwrap()
+        ));
+        initialize(&base).unwrap();
+        let mut bootstrap: BootstrapConfig = read_json(&base.join("bootstrap.json")).unwrap();
+        let id = "example.library-replacement";
+        let mut replacement = ExternalComponent {
+            manifest: ComponentManifest {
+                id: id.into(),
+                version: "0.1.0".into(),
+                file: "replacement.so".into(),
+                sha256: String::new(),
+                size: 0,
+                abi_major: amaterasu_abi::ABI_MAJOR,
+                runtime: false,
+                requires: BTreeMap::from([(RUNTIME_ID.into(), "0.1.0".into())]),
+                requested: Grants {
+                    provide: ["amaterasu.library/1".into()].into(),
+                    call: ["amaterasu.catalog/1".into(), "amaterasu.steam/1".into()].into(),
+                    ..Default::default()
+                },
+            },
+            bytes: Vec::new(),
+        };
+        bootstrap.policy.settings.insert(
+            "amaterasu.catalog".into(),
+            serde_json::json!({"library_principal":id}),
+        );
+        assert!(
+            validate_library_principal_binding(
+                &bootstrap,
+                std::slice::from_ref(&replacement),
+                Some(id)
+            )
+            .is_err()
+        );
+        replacement.manifest.requires.extend([
+            ("amaterasu.catalog".into(), "0.1.0".into()),
+            ("amaterasu.steam".into(), "0.1.0".into()),
+        ]);
+        assert!(
+            validate_library_principal_binding(
+                &bootstrap,
+                std::slice::from_ref(&replacement),
+                Some(id)
+            )
+            .is_err()
+        );
+        bootstrap.policy.settings.insert(
+            "amaterasu.steam".into(),
+            serde_json::json!({"library_principal":"wrong"}),
+        );
+        assert!(
+            validate_library_principal_binding(
+                &bootstrap,
+                std::slice::from_ref(&replacement),
+                Some(id)
+            )
+            .is_err()
+        );
+        bootstrap.policy.settings.insert(
+            "amaterasu.steam".into(),
+            serde_json::json!({"library_principal":id}),
+        );
+        assert!(
+            validate_library_principal_binding(
+                &bootstrap,
+                std::slice::from_ref(&replacement),
+                Some(id)
+            )
+            .is_ok()
+        );
+        replacement
+            .manifest
+            .requested
+            .call
+            .insert("amaterasu.state/1".into());
+        assert!(
+            validate_library_principal_binding(
+                &bootstrap,
+                std::slice::from_ref(&replacement),
+                Some(id)
+            )
+            .is_err()
+        );
+        replacement
+            .manifest
+            .requires
+            .insert("amaterasu.state".into(), "0.1.0".into());
+        assert!(
+            validate_library_principal_binding(
+                &bootstrap,
+                std::slice::from_ref(&replacement),
+                Some(id)
+            )
+            .is_ok()
+        );
+        bootstrap
+            .policy
+            .settings
+            .get_mut("amaterasu.catalog")
+            .unwrap()["launch_principals"] = serde_json::json!([id]);
+        assert!(validate_library_principal_binding(&bootstrap, &[replacement], Some(id)).is_err());
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn selected_set_rejects_duplicate_ordinary_and_native_services() {
+        let mut component = ExternalComponent {
+            manifest: ComponentManifest {
+                id: "example.provider".into(),
+                version: "0.1.0".into(),
+                file: "provider.so".into(),
+                sha256: String::new(),
+                size: 0,
+                abi_major: amaterasu_abi::ABI_MAJOR,
+                runtime: false,
+                requires: BTreeMap::new(),
+                requested: Grants::default(),
+            },
+            bytes: Vec::new(),
+        };
+        assert!(validate_unique_service_providers(PackageProfile::StreamProbe, &[], None).is_ok());
+        component
+            .manifest
+            .requested
+            .provide
+            .insert("amaterasu.catalog/1".into());
+        assert!(
+            validate_unique_service_providers(
+                PackageProfile::StreamProbe,
+                std::slice::from_ref(&component),
+                None
+            )
+            .is_err()
+        );
+        component.manifest.requested.provide.clear();
+        component
+            .manifest
+            .requested
+            .native_provide
+            .insert("amaterasu.host-configuration/1".into());
+        let native = PackageProfile::StreamProbe
+            .components()
+            .iter()
+            .flat_map(|item| item.native_provides.iter())
+            .next()
+            .unwrap()
+            .to_string();
+        component.manifest.requested.native_provide = [native].into();
+        assert!(
+            validate_unique_service_providers(PackageProfile::StreamProbe, &[component], None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn library_selection_rejects_conflicts_and_preserves_default_profile() {
+        let component = |id: &str| ExternalComponent {
+            manifest: ComponentManifest {
+                id: id.into(),
+                version: "0.1.0".into(),
+                file: format!("{id}.so"),
+                sha256: String::new(),
+                size: 0,
+                abi_major: amaterasu_abi::ABI_MAJOR,
+                runtime: false,
+                requires: BTreeMap::from([(RUNTIME_ID.into(), "0.1.0".into())]),
+                requested: Grants {
+                    provide: ["amaterasu.library/1".into()].into(),
+                    ..Default::default()
+                },
+            },
+            bytes: Vec::new(),
+        };
+        assert!(validate_library_selection(PackageProfile::StreamProbe, &[], None).is_ok());
+        let first = component("example.library-a");
+        assert!(
+            validate_library_selection(
+                PackageProfile::StreamProbe,
+                std::slice::from_ref(&first),
+                None
+            )
+            .is_err()
+        );
+        let second = component("example.library-b");
+        assert!(
+            validate_library_selection(
+                PackageProfile::StreamProbe,
+                &[first, second],
+                Some("example.library-a")
+            )
+            .is_err()
+        );
+        let mut self_dependent = component("example.library-a");
+        self_dependent
+            .manifest
+            .requires
+            .insert("amaterasu.library".into(), "0.1.0".into());
+        assert!(
+            validate_library_selection(
+                PackageProfile::StreamProbe,
+                &[self_dependent],
+                Some("example.library-a")
+            )
+            .is_err()
+        );
+        assert!(
+            validate_library_selection(
+                PackageProfile::Example,
+                &[component("example.library-a")],
+                Some("example.library-a")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn signed_library_selection_is_explicit_unique_approved_and_rewrites_dependencies() {
+        let base = std::env::temp_dir().join(format!(
+            "amaterasu-library-selection-{}",
+            random_identifier().unwrap()
+        ));
+        let root = base.join("root");
+        let artifacts = base.join("artifacts");
+        fs::create_dir_all(&artifacts).unwrap();
+        initialize(&root).unwrap();
+        let profile = PackageProfile::StreamProbe;
+        for definition in profile.components() {
+            fs::write(
+                artifacts.join(library_filename(definition.library)),
+                b"fixture",
+            )
+            .unwrap();
+        }
+        let mut replacement = ComponentManifest {
+            id: "example.library-replacement".into(),
+            version: "0.4.0".into(),
+            file: "replacement.so".into(),
+            sha256: String::new(),
+            size: 0,
+            abi_major: amaterasu_abi::ABI_MAJOR,
+            runtime: false,
+            requires: BTreeMap::from([(RUNTIME_ID.into(), "0.1.0".into())]),
+            requested: Grants {
+                provide: ["amaterasu.library/1".into()].into(),
+                ..Default::default()
+            },
+        };
+        let template = base.join("replacement.json");
+        let artifact = base.join("replacement.bin");
+        fs::write(&artifact, b"replacement artifact").unwrap();
+        fs::write(&template, serde_json::to_vec(&replacement).unwrap()).unwrap();
+        let external = [(template.as_path(), artifact.as_path())];
+        let output = base.join("selected");
+        let mut bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json")).unwrap();
+        bootstrap.development = false;
+        write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
+        assert!(
+            build_package_with_library_selection(
+                &root,
+                &artifacts,
+                &output,
+                1,
+                profile,
+                &external,
+                None,
+                Some(&replacement.id)
+            )
+            .is_err()
+        );
+        assert!(!output.exists());
+        bootstrap.development = true;
+        write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
+
+        assert!(
+            build_package_with_library_selection(
+                &root,
+                &artifacts,
+                &output,
+                1,
+                profile,
+                &external,
+                None,
+                Some(&replacement.id)
+            )
+            .is_err()
+        );
+        assert!(!output.exists());
+        bootstrap
+            .policy
+            .principals
+            .insert(replacement.id.clone(), replacement.requested.clone());
+        write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
+        assert!(
+            build_package_with_library_selection(
+                &root,
+                &artifacts,
+                &output,
+                1,
+                profile,
+                &external,
+                None,
+                Some(&replacement.id)
+            )
+            .is_err()
+        );
+        bootstrap
+            .policy
+            .settings
+            .entry("amaterasu.catalog".into())
+            .or_insert_with(|| serde_json::json!({}))["library_principal"] =
+            serde_json::json!(replacement.id);
+        write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
+        assert!(
+            build_package_with_library_selection(
+                &root, &artifacts, &output, 1, profile, &external, None, None
+            )
+            .is_err()
+        );
+        assert!(
+            build_package_with_library_selection(
+                &root,
+                &artifacts,
+                &output,
+                1,
+                profile,
+                &external,
+                None,
+                Some("example.missing")
+            )
+            .is_err()
+        );
+        replacement.abi_major += 1;
+        fs::write(&template, serde_json::to_vec(&replacement).unwrap()).unwrap();
+        assert!(
+            build_package_with_library_selection(
+                &root,
+                &artifacts,
+                &output,
+                1,
+                profile,
+                &external,
+                None,
+                Some(&replacement.id)
+            )
+            .is_err()
+        );
+        replacement.abi_major -= 1;
+        replacement.requested.provide = ["example.other/1".into()].into();
+        bootstrap
+            .policy
+            .principals
+            .insert(replacement.id.clone(), replacement.requested.clone());
+        write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
+        fs::write(&template, serde_json::to_vec(&replacement).unwrap()).unwrap();
+        assert!(
+            build_package_with_library_selection(
+                &root,
+                &artifacts,
+                &output,
+                1,
+                profile,
+                &external,
+                None,
+                Some(&replacement.id)
+            )
+            .is_err()
+        );
+        replacement.requested.provide = ["amaterasu.library/1".into()].into();
+        bootstrap
+            .policy
+            .principals
+            .insert(replacement.id.clone(), replacement.requested.clone());
+        write_json_atomically(&root.join("bootstrap.json"), &bootstrap).unwrap();
+        fs::write(&template, serde_json::to_vec(&replacement).unwrap()).unwrap();
+        let calls_path = base.join("removed-calls.json");
+        fs::write(&calls_path, br#"{"amaterasu.library":[]}"#).unwrap();
+        assert!(
+            build_package_with_library_selection(
+                &root,
+                &artifacts,
+                &output,
+                1,
+                profile,
+                &external,
+                Some(&calls_path),
+                Some(&replacement.id)
+            )
+            .is_err()
+        );
+        assert!(!output.exists());
+        build_package_with_library_selection(
+            &root,
+            &artifacts,
+            &output,
+            1,
+            profile,
+            &external,
+            None,
+            Some(&replacement.id),
+        )
+        .unwrap();
+        let verified = verify_package(
+            &output,
+            &bootstrap,
+            VerificationPolicy {
+                minimum_sequence: 0,
+                allow_historical: true,
+                now: unix_timestamp(),
+            },
+        )
+        .unwrap();
+        assert!(verified.signed);
+        assert!(
+            !verified
+                .manifest
+                .components
+                .iter()
+                .any(|c| c.id == "amaterasu.library")
+        );
+        assert_eq!(
+            verified
+                .manifest
+                .components
+                .iter()
+                .filter(|c| c.requested.provide.contains("amaterasu.library/1"))
+                .count(),
+            1
+        );
+        let dependent = verified
+            .manifest
+            .components
+            .iter()
+            .find(|c| c.id == "amaterasu.nvhttp")
+            .unwrap();
+        assert_eq!(
+            dependent.requires.get(&replacement.id).map(String::as_str),
+            Some("0.4.0")
+        );
+        assert!(!dependent.requires.contains_key("amaterasu.library"));
+        assert!(!output.join(library_filename("amaterasu_library")).exists());
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

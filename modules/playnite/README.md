@@ -6,6 +6,12 @@ persisted by `amaterasu.configuration`; older documents without
 `autosync_remove_uninstalled` load with its host default of `true`, and a
 settings update that omits the optional field preserves its stored value.
 
+The startup setting `library_principal` selects the trusted library broker for
+artwork reads and releases; it defaults to `amaterasu.library`. It must contain
+1–128 ASCII letters, digits, dots, underscores, or hyphens and cannot name a
+reserved management, launch, catalog, or NVHTTP principal. Changing the setting
+requires restarting the provider.
+
 Playnite cover artwork is scanned outside the UI thread with a rotating,
 bounded scan. A completed image produces an opaque SHA-256 revision; a missing
 cover clears its reference, while a failed or unfinished scan preserves the

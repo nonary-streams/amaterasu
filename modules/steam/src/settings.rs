@@ -202,10 +202,32 @@ pub struct StartupSettings {
     pub roots: Vec<std::path::PathBuf>,
     #[serde(default)]
     pub steam_artwork_cache_root: Option<std::path::PathBuf>,
+    #[serde(default = "default_library_principal")]
+    pub library_principal: String,
+}
+
+fn default_library_principal() -> String {
+    super::LIBRARY_CALLER.into()
 }
 
 impl StartupSettings {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self.library_principal.is_empty()
+            || self.library_principal.len() > 128
+            || !self
+                .library_principal
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            || matches!(
+                self.library_principal.as_str(),
+                "amaterasu.nvhttp"
+                    | "amaterasu.management"
+                    | "amaterasu.launch"
+                    | "amaterasu.catalog"
+            )
+        {
+            return Err("invalid Steam library principal");
+        }
         if self.roots.len() > 32
             || self
                 .roots
@@ -230,10 +252,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn startup_library_principal_is_bounded_and_not_reserved() {
+        let default: StartupSettings = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(default.library_principal, "amaterasu.library");
+        for value in [
+            "",
+            "bad principal",
+            "é",
+            "amaterasu.nvhttp",
+            "amaterasu.management",
+            "amaterasu.launch",
+            "amaterasu.catalog",
+            &"x".repeat(129),
+        ] {
+            let settings: StartupSettings =
+                serde_json::from_value(json!({"library_principal": value})).unwrap();
+            assert!(settings.validate().is_err(), "{value}");
+        }
+        for value in ["custom.Library_1-test", &"x".repeat(128)] {
+            let settings: StartupSettings =
+                serde_json::from_value(json!({"library_principal": value})).unwrap();
+            assert!(settings.validate().is_ok(), "{value}");
+        }
+        assert!(
+            serde_json::from_value::<StartupSettings>(json!({"library_principal":null})).is_err()
+        );
+    }
+
+    #[test]
     fn startup_artwork_cache_root_requires_a_bounded_absolute_path() {
         let mut settings = StartupSettings {
             roots: Vec::new(),
             steam_artwork_cache_root: Some(std::env::temp_dir()),
+            library_principal: default_library_principal(),
         };
         assert!(settings.validate().is_ok());
         settings.steam_artwork_cache_root = Some("relative/cache".into());

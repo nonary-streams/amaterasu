@@ -247,6 +247,7 @@ impl SnapshotWorker {
 
 struct PlayniteModule {
     runtime: RuntimeClient,
+    library_principal: String,
     configuration: ProductConfiguration,
     catalog: catalog_sync::CatalogSync,
     snapshot_worker: SnapshotWorker,
@@ -329,12 +330,17 @@ fn queue_pending_launch(
 
 impl ManagedModule for PlayniteModule {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
+        let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
+            return Err("Playnite startup settings unavailable".into());
+        };
+        let library_principal = library_principal_from_settings(&payload)?;
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
         connector::start_sunshine_actor();
         Ok(Self {
             runtime,
+            library_principal,
             configuration: ProductConfiguration::new(),
             catalog: catalog_sync::CatalogSync::default(),
             snapshot_worker: SnapshotWorker::default(),
@@ -680,7 +686,7 @@ impl PlayniteModule {
             action,
             Action::ArtworkRead { .. } | Action::ArtworkRelease { .. }
         );
-        if !artwork_caller_allowed(caller, artwork_read) {
+        if !artwork_caller_allowed(caller, &self.library_principal, artwork_read) {
             return self.complete(id, json!({"ok":false,"code":"forbidden"}));
         }
         if let Action::ArtworkRead {
@@ -696,7 +702,7 @@ impl PlayniteModule {
                 revision.clone(),
                 *offset,
                 transfer_id.clone(),
-                caller == LIBRARY_CALLER,
+                caller == self.library_principal,
             );
         }
         if action.is_launch() && !launch_caller_is_authorized(caller) {
@@ -1158,10 +1164,33 @@ impl PlayniteModule {
     }
 }
 
-fn artwork_caller_allowed(caller: &str, artwork_read: bool) -> bool {
+fn library_principal_from_settings(settings: &Value) -> ModuleResult<String> {
+    let object = settings
+        .as_object()
+        .ok_or("invalid Playnite startup settings")?;
+    let principal = match object.get("library_principal") {
+        None => LIBRARY_CALLER,
+        Some(value) => value.as_str().ok_or("invalid library_principal")?,
+    };
+    if principal.is_empty()
+        || principal.len() > 128
+        || !principal
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        || matches!(
+            principal,
+            "amaterasu.nvhttp" | MANAGEMENT_CALLER | LAUNCH_CALLER | "amaterasu.catalog"
+        )
+    {
+        return Err("invalid library_principal".into());
+    }
+    Ok(principal.to_owned())
+}
+
+fn artwork_caller_allowed(caller: &str, library_principal: &str, artwork_read: bool) -> bool {
     caller != "amaterasu.nvhttp"
-        && (caller != LIBRARY_CALLER || artwork_read)
-        && (!artwork_read || caller == MANAGEMENT_CALLER || caller == LIBRARY_CALLER)
+        && ((caller != library_principal && caller != LIBRARY_CALLER) || artwork_read)
+        && (!artwork_read || caller == MANAGEMENT_CALLER || caller == library_principal)
 }
 
 fn artwork_revision_may_be_read(

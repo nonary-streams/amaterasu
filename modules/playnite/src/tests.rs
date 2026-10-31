@@ -6,6 +6,7 @@ use std::ffi::c_void;
 
 #[derive(Default)]
 struct EpochLaunchHost {
+    settings: Option<Value>,
     inventory_calls: usize,
     epoch: u64,
     probe_ready: bool,
@@ -29,6 +30,9 @@ unsafe extern "C" fn invoke_epoch_launch_host(
     let host = unsafe { &mut *(context as *mut EpochLaunchHost) };
     let response = match &command {
         Command::Register { .. } | Command::ReleaseResult { .. } => Response::Ok,
+        Command::GetSettings {} => Response::Result {
+            payload: host.settings.clone().unwrap_or_else(|| json!({})),
+        },
         Command::Poll {} => Response::Pending,
         Command::Complete { payload, .. } => {
             host.completed.push(payload.clone());
@@ -827,11 +831,95 @@ fn artwork_snapshot_preserves_only_unknown_current_games() {
 }
 
 #[test]
-fn artwork_caller_is_limited_to_management_and_library_broker() {
-    assert!(artwork_caller_allowed(MANAGEMENT_CALLER, true));
-    assert!(artwork_caller_allowed(LIBRARY_CALLER, true));
-    assert!(!artwork_caller_allowed(LIBRARY_CALLER, false));
-    assert!(!artwork_caller_allowed("amaterasu.nvhttp", true));
-    assert!(!artwork_caller_allowed("amaterasu.nvhttp", false));
-    assert!(!artwork_caller_allowed("amaterasu.other", true));
+fn artwork_caller_is_limited_to_management_and_selected_library_broker() {
+    for selected in [LIBRARY_CALLER, "custom.library"] {
+        assert!(artwork_caller_allowed(MANAGEMENT_CALLER, selected, true));
+        assert!(artwork_caller_allowed(selected, selected, true));
+        assert!(!artwork_caller_allowed(selected, selected, false));
+        assert!(!artwork_caller_allowed("amaterasu.nvhttp", selected, true));
+        assert!(!artwork_caller_allowed("amaterasu.other", selected, true));
+        if selected != LIBRARY_CALLER {
+            assert!(!artwork_caller_allowed(LIBRARY_CALLER, selected, true));
+        }
+    }
+}
+
+#[test]
+fn selected_library_identity_controls_artwork_requests_and_release() {
+    let mut host = Box::new(EpochLaunchHost::default());
+    host.settings = Some(json!({"library_principal":"custom.library"}));
+    let endpoint = HostApi {
+        header: AbiHeader::of::<HostApi>(),
+        context: (&mut *host as *mut EpochLaunchHost).cast(),
+        invoke: invoke_epoch_launch_host,
+    };
+    // SAFETY: host remains alive for every synchronous RuntimeClient call.
+    let runtime = unsafe { RuntimeClient::from_endpoint(endpoint) };
+    let mut module = PlayniteModule::start(runtime).unwrap();
+    assert_eq!(module.library_principal, "custom.library");
+    let read = json!({"action":"artwork_read", "game_id":"a1b2c3d4-1234-5678-9abc-0123456789ab", "revision":"a".repeat(64), "offset":0, "transfer_id":"b".repeat(32)});
+    for action in [
+        read,
+        json!({"action":"artwork_release", "transfer_id":"invalid"}),
+    ] {
+        module
+            .handle_request(1, LIBRARY_CALLER, action.clone())
+            .unwrap();
+        assert_eq!(host.completed.last().unwrap()["code"], "forbidden");
+        module
+            .handle_request(2, "amaterasu.nvhttp", action.clone())
+            .unwrap();
+        assert_eq!(host.completed.last().unwrap()["code"], "forbidden");
+        module.handle_request(3, "custom.library", action).unwrap();
+        assert_ne!(host.completed.last().unwrap()["code"], "forbidden");
+    }
+    assert!(artwork_revision_may_be_read(
+        &BTreeMap::new(),
+        false,
+        true,
+        "game",
+        "revision"
+    ));
+    assert!(!artwork_revision_may_be_read(
+        &BTreeMap::new(),
+        false,
+        false,
+        "game",
+        "revision"
+    ));
+}
+
+#[test]
+fn library_principal_startup_settings_are_validated() {
+    assert_eq!(
+        library_principal_from_settings(&json!({})).unwrap(),
+        LIBRARY_CALLER
+    );
+    assert_eq!(
+        library_principal_from_settings(&json!({"library_principal":"Custom_1.library-test"}))
+            .unwrap(),
+        "Custom_1.library-test"
+    );
+    assert!(library_principal_from_settings(&json!({"library_principal":"a".repeat(128)})).is_ok());
+    for invalid in [
+        "",
+        "a b",
+        "é",
+        "amaterasu.nvhttp",
+        MANAGEMENT_CALLER,
+        LAUNCH_CALLER,
+        "amaterasu.catalog",
+    ] {
+        assert!(
+            library_principal_from_settings(&json!({"library_principal":invalid})).is_err(),
+            "{invalid}"
+        );
+    }
+    assert!(
+        library_principal_from_settings(&json!({"library_principal":"a".repeat(129)})).is_err()
+    );
+    assert!(library_principal_from_settings(&json!({"library_principal":null})).is_err());
+    for invalid in [json!(null), json!("invalid"), json!([])] {
+        assert!(library_principal_from_settings(&invalid).is_err());
+    }
 }

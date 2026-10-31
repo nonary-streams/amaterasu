@@ -143,7 +143,11 @@ icons from 256 through 48 pixels. Only regular images within the discovered
 user's data tree, up to 16 MiB, are accepted. The signed management principal
 can call `artwork_get` with a numeric `game_id` to obtain an opaque revision,
 MIME type, and byte count, then `artwork_read` with that ID, revision, and an
-8 KiB aligned offset for base64 chunks. The trusted `amaterasu.library` service may call `artwork_read` only. Changed images reject stale revisions;
+8 KiB aligned offset for base64 chunks. The startup setting `library_principal` selects the trusted principal allowed to
+call `artwork_read` only, defaulting to `amaterasu.library`. It must contain
+1–128 ASCII letters, digits, dots, underscores, or hyphens; `amaterasu.nvhttp`,
+`amaterasu.management`, `amaterasu.launch`, and `amaterasu.catalog` are reserved.
+Changed images reject stale revisions;
 paths are never accepted or returned. Disabling Lutris also disables these
 reads and clears the discovered image source. Re-enabling requires a new scan,
 even when automatic sync is off; a late scan captured under older settings
