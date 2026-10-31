@@ -569,6 +569,46 @@ pub(super) struct EndedSessionBook {
 }
 
 impl EndedSessionBook {
+    /// Resolve immutable root provenance for historical checkpoint validation.
+    /// This is not authority to control the resource or re-enter the session.
+    /// The caller must also compare its pinned output commitment to the result.
+    #[allow(dead_code, reason = "awaits closed-stream historical root integration")]
+    pub(super) fn historical_root<'a>(
+        &'a self,
+        journal: &Journal,
+        target: &LifecycleTarget,
+        admission_id: &str,
+        producer: &str,
+        resource_generation: u64,
+    ) -> Option<&'a composition::StoredOutput> {
+        let cert = self.certificates.get(&Self::key(target)?)?;
+        (cert.target == *target
+            && cert.root.admission_id == admission_id
+            && cert.producer == producer
+            && cert.resource_generation == resource_generation
+            && Self::valid_entry(journal, cert))
+        .then_some(&cert.root)
+    }
+
+    fn valid_entry(journal: &Journal, cert: &EndedSessionCertificate) -> bool {
+        cert.validate()
+            && retention::session_expired(journal, &cert.target)
+            && operations::target_parts(&cert.target)
+                .ok()
+                .is_some_and(|(_, id, _, _)| !journal.sessions.contains_key(id))
+            && journal.authority.operation_counter >= cert.operation_counter
+            && cert
+                .legacy_operation_ids
+                .is_subset(&journal.authority.issued_operation_ids)
+            && cert.provider_sequences.iter().all(|(provider, sequence)| {
+                journal
+                    .authority
+                    .sequences
+                    .get(provider)
+                    .is_some_and(|current| current >= sequence)
+            })
+    }
+
     /// Stage only on a private book clone; the caller must revalidate the
     /// source and atomically install the target fence and retire its complete
     /// cross-book lineage before persisting the staged book.
@@ -609,23 +649,7 @@ impl EndedSessionBook {
     pub(super) fn validate(&self, journal: &Journal) -> bool {
         self.certificates.len() <= MAX_CERTIFICATES
             && self.certificates.iter().all(|(key, cert)| {
-                Self::key(&cert.target).as_ref() == Some(key)
-                    && cert.validate()
-                    && retention::session_expired(journal, &cert.target)
-                    && operations::target_parts(&cert.target)
-                        .ok()
-                        .is_some_and(|(_, id, _, _)| !journal.sessions.contains_key(id))
-                    && journal.authority.operation_counter >= cert.operation_counter
-                    && cert
-                        .legacy_operation_ids
-                        .is_subset(&journal.authority.issued_operation_ids)
-                    && cert.provider_sequences.iter().all(|(provider, sequence)| {
-                        journal
-                            .authority
-                            .sequences
-                            .get(provider)
-                            .is_some_and(|current| current >= sequence)
-                    })
+                Self::key(&cert.target).as_ref() == Some(key) && Self::valid_entry(journal, cert)
             })
     }
 }

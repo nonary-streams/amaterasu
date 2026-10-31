@@ -2204,12 +2204,33 @@ mod tests {
             .stage_verified(&journal, &work.target)
             .unwrap();
         assert!(validate_journal(&checkpoint).is_ok());
+        let resolve = |snapshot: &Journal,
+                       target: &LifecycleTarget,
+                       admission: &str,
+                       producer: &str,
+                       generation| {
+            snapshot
+                .ended_session_history
+                .historical_root(snapshot, target, admission, producer, generation)
+                .is_some()
+        };
+        assert!(resolve(&checkpoint, &work.target, "root", "owner", 1));
+        assert!(!resolve(&checkpoint, &work.target, "other", "owner", 1));
+        assert!(!resolve(&checkpoint, &work.target, "root", "other", 1));
+        assert!(!resolve(&checkpoint, &work.target, "root", "owner", 2));
+        let mut wrong_target = work.target.clone();
+        if let LifecycleTarget::Session { generation, .. } = &mut wrong_target {
+            *generation += 1;
+        }
+        assert!(!resolve(&checkpoint, &wrong_target, "root", "owner", 1));
         let mut stale = checkpoint.clone();
         stale.authority.sequences.insert("owner".into(), 0);
         assert!(validate_journal(&stale).is_err());
+        assert!(!resolve(&stale, &work.target, "root", "owner", 1));
         let mut unfenced = checkpoint.clone();
         unfenced.retention = Default::default();
         assert!(validate_journal(&unfenced).is_err());
+        assert!(!resolve(&unfenced, &work.target, "root", "owner", 1));
         let directory = std::env::temp_dir().join(format!(
             "amaterasu-ended-certificate-{}",
             identifier().unwrap()
@@ -2225,6 +2246,13 @@ mod tests {
         store.replace(&checkpoint).unwrap();
         drop(store);
         let reopened = Coordinator::open(&path).unwrap();
+        assert!(resolve(
+            &reopened.shared.borrow().value,
+            &work.target,
+            "root",
+            "owner",
+            1
+        ));
         assert!(
             reopened
                 .shared
