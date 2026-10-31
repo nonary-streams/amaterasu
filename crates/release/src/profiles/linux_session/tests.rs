@@ -774,3 +774,36 @@ fn package_authority_profile_uses_only_the_inherited_channel() {
             .is_none()
     );
 }
+
+#[test]
+fn session_extensions_profile_is_explicit_and_keeps_default_profile_unchanged() {
+    let extra = [
+        (
+            "amaterasu.session-lifecycle",
+            "amaterasu.session-lifecycle/1",
+        ),
+        (
+            "amaterasu.extension-registry",
+            "amaterasu.extension-registry/1",
+        ),
+        (
+            "amaterasu.extension-actions",
+            "amaterasu.extension-actions/1",
+        ),
+    ];
+    for (id, service) in extra {
+        assert!(!COMPONENTS.iter().any(|component| component.id == id));
+        let component = EXTENSION_COMPONENTS
+            .iter()
+            .find(|component| component.id == id)
+            .unwrap();
+        assert!(component.provides.contains(&service));
+        assert!(component.dependencies.contains(&RUNTIME_ID));
+    }
+    assert_eq!(EXTENSION_COMPONENTS.len(), COMPONENTS.len() + extra.len());
+    assert!(COMPONENTS.iter().all(|component| {
+        EXTENSION_COMPONENTS
+            .iter()
+            .any(|candidate| candidate.id == component.id)
+    }));
+}

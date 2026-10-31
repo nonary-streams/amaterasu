@@ -67,7 +67,7 @@ When a selected library supplies a service that an existing component must call,
 `--call-grants CALLS_JSON` may follow the external-component pair. The JSON is
 an object mapping selected component IDs to arrays of service names, for example
 `{"amaterasu.extension-registry":["example.display/1"]}`. Each service must
-be provided by the selected external component and independently approved in
+be provided by a component selected in the signed set and independently approved in
 the installed bootstrap policy for each named caller. The publisher adds only
 those calls to the signed component requests; an absent, unselected, or
 unapproved caller or service is rejected. Add every required transit caller

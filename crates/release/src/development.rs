@@ -316,11 +316,13 @@ pub fn build_package_with_external(
     };
     let secret: String = read_json(&root.join("development-key.json"))?;
     let signing_key = SigningKey::from_bytes(&decode_hex::<32>(&secret)?);
-    let authority = if matches!(profile, PackageProfile::LinuxSession)
-        && root
-            .join(crate::capture_authority_package::SPEC_FILE)
-            .try_exists()
-            .map_err(|error| error.to_string())?
+    let authority = if matches!(
+        profile,
+        PackageProfile::LinuxSession | PackageProfile::LinuxSessionExtensions
+    ) && root
+        .join(crate::capture_authority_package::SPEC_FILE)
+        .try_exists()
+        .map_err(|error| error.to_string())?
     {
         Some(read_json::<crate::capture_authority_package::PackageSpec>(
             &root.join(crate::capture_authority_package::SPEC_FILE),
@@ -2510,15 +2512,23 @@ fn build_signed_package_with_runtime_probe_and_authority(
     external: Option<&ExternalComponent>,
     call_grants: &BTreeMap<String, BTreeSet<String>>,
 ) -> PackageResult<()> {
-    if authority.is_some() && !matches!(profile, PackageProfile::LinuxSession) {
+    if authority.is_some()
+        && !matches!(
+            profile,
+            PackageProfile::LinuxSession | PackageProfile::LinuxSessionExtensions
+        )
+    {
         return Err("capture authority is only supported by the Linux session package".into());
     }
     if output.try_exists().map_err(|error| error.to_string())? {
         return Err("package output already exists; use a new directory for each release".into());
     }
-    let linux_x264_encoder = matches!(profile, PackageProfile::LinuxSession)
-        .then(|| preflight_linux_x264(artifacts, runtime_available))
-        .transpose()?;
+    let linux_x264_encoder = matches!(
+        profile,
+        PackageProfile::LinuxSession | PackageProfile::LinuxSessionExtensions
+    )
+    .then(|| preflight_linux_x264(artifacts, runtime_available))
+    .transpose()?;
     create_private_directory(output)?;
 
     let mut components = Vec::new();
@@ -2857,9 +2867,12 @@ fn validate_external_call_grants(
                 format!("call grant target has no installed approval: {component}")
             })?;
         for service in services {
-            if !external.manifest.requested.provide.contains(service)
-                || !installed.call.contains(service)
-            {
+            let selected = external.manifest.requested.provide.contains(service)
+                || profile
+                    .components()
+                    .iter()
+                    .any(|definition| definition.provides.contains(&service.as_str()));
+            if !selected || !installed.call.contains(service) {
                 return Err(format!(
                     "external call is not provided and separately approved: {component} -> {service}"
                 ));
@@ -2945,6 +2958,78 @@ fn library_filename(name: &str) -> String {
 #[cfg(test)]
 mod external_component_tests {
     use super::*;
+
+    #[test]
+    fn added_calls_require_a_selected_service_and_operator_approval() {
+        let external = ExternalComponent {
+            manifest: ComponentManifest {
+                id: "example.provider".into(),
+                version: "0.1.0".into(),
+                file: "provider.so".into(),
+                sha256: String::new(),
+                size: 0,
+                abi_major: amaterasu_abi::ABI_MAJOR,
+                runtime: false,
+                requires: BTreeMap::new(),
+                requested: Grants {
+                    provide: ["example.provider/1".into()].into(),
+                    ..Default::default()
+                },
+            },
+            bytes: Vec::new(),
+        };
+        let mut bootstrap = BootstrapConfig {
+            development: true,
+            allow_unsigned: false,
+            trusted_keys: BTreeMap::new(),
+            policy: Default::default(),
+        };
+        let id = "amaterasu.extension-registry".to_owned();
+        let service = "amaterasu.state/1".to_owned();
+        let calls = BTreeMap::from([(id.clone(), [service.clone()].into())]);
+        assert!(
+            validate_external_call_grants(
+                &calls,
+                PackageProfile::RegistryFixture,
+                &external,
+                &bootstrap
+            )
+            .is_err()
+        );
+        bootstrap.policy.principals.insert(
+            id.clone(),
+            Grants {
+                call: [service].into(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            validate_external_call_grants(
+                &calls,
+                PackageProfile::RegistryFixture,
+                &external,
+                &bootstrap
+            )
+            .is_ok()
+        );
+        bootstrap
+            .policy
+            .principals
+            .get_mut(&id)
+            .unwrap()
+            .call
+            .insert("unknown.service/1".into());
+        let unselected = BTreeMap::from([(id, ["unknown.service/1".into()].into())]);
+        assert!(
+            validate_external_call_grants(
+                &unselected,
+                PackageProfile::RegistryFixture,
+                &external,
+                &bootstrap
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn selected_component_is_signed_and_tampering_fails_verification() {

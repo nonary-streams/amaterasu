@@ -341,6 +341,74 @@ pub const COMPONENTS: &[ComponentDefinition] = &[
     LINUX_SESSION_RTSP,
 ];
 
+/// Explicit session extension components; the ordinary Linux profile does not select them.
+const SESSION_LIFECYCLE: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.session-lifecycle",
+    library: "amaterasu_session_lifecycle",
+    provides: &["amaterasu.session-lifecycle/1"],
+    calls: &[],
+    publishes: &[],
+    dependencies: &[RUNTIME_ID],
+    native_provides: &[],
+    native_uses: &[],
+};
+const EXTENSION_REGISTRY: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.extension-registry",
+    library: "amaterasu_extension_registry",
+    provides: &["amaterasu.extension-registry/1"],
+    calls: &["amaterasu.state/1"],
+    publishes: &[],
+    dependencies: &[RUNTIME_ID, "amaterasu.state"],
+    native_provides: &[],
+    native_uses: &[],
+};
+const EXTENSION_ACTIONS: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.extension-actions",
+    library: "amaterasu_extension_actions",
+    provides: &["amaterasu.extension-actions/1"],
+    calls: &["amaterasu.state/1"],
+    publishes: &[],
+    dependencies: &[RUNTIME_ID, "amaterasu.state"],
+    native_provides: &[],
+    native_uses: &[],
+};
+
+pub const EXTENSION_COMPONENTS: &[ComponentDefinition] = &[
+    RUNTIME,
+    STATE,
+    SESSION,
+    CONFIGURATION,
+    SESSION_LIFECYCLE,
+    EXTENSION_REGISTRY,
+    EXTENSION_ACTIONS,
+    SESSION_HISTORY,
+    HOST_METRICS,
+    STEAM,
+    LUTRIS,
+    CATALOG,
+    APPLICATION,
+    AUTHENTICATION,
+    LINUX_SESSION_MANAGEMENT,
+    LINUX_SESSION_PAIRING,
+    LINUX_SESSION_NVHTTP,
+    DISPLAY,
+    LINUX_SESSION_LAUNCH,
+    INPUT,
+    VIRTUAL_DISPLAY,
+    CAPTURE_KMS,
+    CAPTURE_PIPEWIRE,
+    CAPTURE_VKMS,
+    AUDIO,
+    AUDIO_ENCODE,
+    ENCODE,
+    LINUX_SESSION_VIDEO,
+    MEDIA_TRANSPORT,
+    CONTROL_TRANSPORT,
+    FRAME_LIMITER,
+    LINUX_SESSION_STREAM_SESSION,
+    LINUX_SESSION_RTSP,
+];
+
 /// Builds the bootstrap policy for a Linux session root, creating its private
 /// state directories under `root`.
 pub fn linux_session_policy(
