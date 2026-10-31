@@ -39,6 +39,7 @@ pub(super) struct ResolvedControl {
     pub context: ControlContext,
     /// Read from the coordinator's canonical session record.
     pub session_target: LifecycleTarget,
+    pub resource_generation: u64,
     /// True only after the exact affected stream's consumers have retired.
     pub consumers_retired: bool,
 }
@@ -85,7 +86,7 @@ pub(super) fn control_endpoint(
 ) -> Value {
     match authorize(caller, payload, backend) {
         Ok((status, resolved)) => {
-            json!({"status":status, "session_target":resolved.session_target, "target":resolved.context.target, "output":resolved.context.output, "consumers_retired":resolved.consumers_retired})
+            json!({"status":status, "session_target":resolved.session_target, "target":resolved.context.target, "output":resolved.context.output, "resource_generation":resolved.resource_generation, "consumers_retired":resolved.consumers_retired})
         }
         Err(_) => json!({"status":"rejected","reason":"resource_control_not_authorized"}),
     }
@@ -162,6 +163,7 @@ mod tests {
                 participant: self.resolved.participant.clone(),
                 context: self.resolved.context.clone(),
                 session_target: self.resolved.session_target.clone(),
+                resource_generation: self.resolved.resource_generation,
                 consumers_retired: self.resolved.consumers_retired,
             })
         }
@@ -226,6 +228,7 @@ mod tests {
                     context,
                     session_target: serde_json::from_value(json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1})).unwrap(),
                     consumers_retired: false,
+                    resource_generation: 1,
                 },
                 schema_available: true,
                 consumed: false,
@@ -248,6 +251,7 @@ mod tests {
         let first = control_endpoint("owner", payload.clone(), &mut backend);
         assert_eq!(first["status"], "execute");
         assert_eq!(first["session_target"]["generation"], 1);
+        assert_eq!(first["resource_generation"], 1);
         assert_eq!(first["output"]["output_id"], "out");
         assert_eq!(first["consumers_retired"], false);
         assert_eq!(

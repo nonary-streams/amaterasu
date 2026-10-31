@@ -34,6 +34,7 @@ pub(super) struct ResolvedFinalize {
     pub participant: ParticipantSettings,
     pub context: FinalizeContext,
     pub session_target: LifecycleTarget,
+    pub resource_generation: u64,
     pub admitted_plan: ResourcePlan,
     pub consumers_retired: bool,
 }
@@ -74,7 +75,7 @@ pub(super) fn finalize_endpoint(
 ) -> Value {
     match authorize(caller, payload, backend) {
         Ok((status, resolved)) => {
-            json!({"status":status, "session_target":resolved.session_target, "target":resolved.context.target, "output":resolved.context.output, "admitted_plan":resolved.admitted_plan, "plan_revision":resolved.admitted_plan.revision, "consumers_retired":resolved.consumers_retired})
+            json!({"status":status, "session_target":resolved.session_target, "target":resolved.context.target, "output":resolved.context.output, "resource_generation":resolved.resource_generation, "admitted_plan":resolved.admitted_plan, "plan_revision":resolved.admitted_plan.revision, "consumers_retired":resolved.consumers_retired})
         }
         Err(_) => json!({"status":"rejected","reason":"resource_finalize_not_authorized"}),
     }
@@ -152,6 +153,7 @@ mod tests {
                 participant: self.resolved.participant.clone(),
                 context: self.resolved.context.clone(),
                 session_target: self.resolved.session_target.clone(),
+                resource_generation: self.resolved.resource_generation,
                 admitted_plan: self.resolved.admitted_plan.clone(),
                 consumers_retired: self.resolved.consumers_retired,
             })
@@ -219,6 +221,7 @@ mod tests {
                     session_target: serde_json::from_value(json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1})).unwrap(),
                     admitted_plan: serde_json::from_value(json!({"plan_id":"p","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]})).unwrap(),
                     consumers_retired: false,
+                    resource_generation: 1,
                 },
                 schema: true,
                 consumed: false,
@@ -241,6 +244,7 @@ mod tests {
         let first = finalize_endpoint("owner", payload.clone(), &mut backend);
         assert_eq!(first["status"], "execute");
         assert_eq!(first["session_target"]["generation"], 1);
+        assert_eq!(first["resource_generation"], 1);
         assert_eq!(first["output"]["output_id"], "out");
         assert_eq!(
             finalize_endpoint("owner", payload.clone(), &mut backend)["status"],

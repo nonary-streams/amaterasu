@@ -272,8 +272,18 @@ impl FinalizeEndpointBackend for Backend<'_> {
         for result in &controls {
             catalog.validate(&result.output.schema, &result.output.data)?;
         }
+        let resource_generation =
+            super::resource_generation::active_generation(journal, work, &current_output)?;
+        if finalize.owner_plan.request.resource_generation != Some(resource_generation)
+            || selection.stage.as_ref().is_some_and(|stage| {
+                stage.callback_proof.request.resource_generation != Some(resource_generation)
+            })
+        {
+            return Err("finalize_generation_mismatch".into());
+        }
         Ok(ResolvedFinalize {
             participant: admission.selection.participant.clone(),
+            resource_generation,
             context: FinalizeContext {
                 policy: selection.policy.clone(),
                 output: current_output,

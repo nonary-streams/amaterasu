@@ -298,13 +298,11 @@ impl Backend<'_> {
                 || stage_admission.provider != *owner
                 || stage_admission.plan != stage.plan
                 || stage_admission.selection.participant != stage.callback_proof.participant
-                || !stage_admission.selection.approvals.iter().any(|approval| {
-                    approval.broker_approval == stage.callback_proof.terminal.call.approval
-                        && super::composition::approval_matches_call(
-                            approval,
-                            &stage.callback_proof.terminal.call,
-                        )
-                })
+                || !super::composition::callback_approvals_valid(
+                    &stage.callback_proof,
+                    &stage_admission.selection.approvals,
+                    &stage_admission.provider,
+                )
             {
                 return Err("control_stage_provenance_mismatch".into());
             }
@@ -320,8 +318,16 @@ impl Backend<'_> {
             .settings
             .schema_catalog()?
             .validate(&output.schema, &output.data)?;
+        let resource_generation =
+            super::resource_generation::active_generation(journal, work, output)?;
+        if stage.is_some_and(|stage| {
+            stage.callback_proof.request.resource_generation != Some(resource_generation)
+        }) {
+            return Err("control_stage_generation_mismatch".into());
+        }
         Ok(ResolvedControl {
             participant: admission.selection.participant.clone(),
+            resource_generation,
             consumers_retired: work.phase == LifecyclePhase::StreamRelease
                 && stream.retirements == stream.required,
             session_target: LifecycleTarget::Session {
@@ -463,7 +469,7 @@ impl Coordinator {
                 .schema_catalog()?
                 .validate(&tuple.output.schema, &tuple.output.data)?;
             Ok(
-                json!({"status":"valid", "session_target":resolved.session_target, "target":resolved.context.target, "output":tuple.output, "consumers_retired":resolved.consumers_retired}),
+                json!({"status":"valid", "session_target":resolved.session_target, "target":resolved.context.target, "output":tuple.output, "resource_generation":resolved.resource_generation, "consumers_retired":resolved.consumers_retired}),
             )
         })();
         result.unwrap_or_else(
@@ -572,13 +578,11 @@ impl Coordinator {
                 || stage_admission.provider != caller
                 || stage_admission.plan != stage.plan
                 || stage_admission.selection.participant != stage.callback_proof.participant
-                || !stage_admission.selection.approvals.iter().any(|approval| {
-                    approval.broker_approval == stage.callback_proof.terminal.call.approval
-                        && super::composition::approval_matches_call(
-                            approval,
-                            &stage.callback_proof.terminal.call,
-                        )
-                })
+                || !super::composition::callback_approvals_valid(
+                    &stage.callback_proof,
+                    &stage_admission.selection.approvals,
+                    &stage_admission.provider,
+                )
             {
                 return Err("settlement_stage_provenance_mismatch".into());
             }
@@ -643,8 +647,10 @@ impl Coordinator {
         self.settings
             .schema_catalog()?
             .validate(&tuple.output.schema, &tuple.output.data)?;
+        let resource_generation =
+            super::resource_generation::historical_generation(journal, &selection.input)?;
         Ok(Some(
-            json!({"status":"valid", "session_target":{"kind":"session","host_epoch":session.host_epoch,"session_id":session.id,"generation":session.generation}, "target":tuple.request.target,"output":tuple.output,"root_output":selection.input.output,"consumers_retired":false}),
+            json!({"status":"valid", "session_target":{"kind":"session","host_epoch":session.host_epoch,"session_id":session.id,"generation":session.generation}, "target":tuple.request.target,"output":tuple.output,"root_output":selection.input.output,"resource_generation":resource_generation,"consumers_retired":false}),
         ))
     }
 }
@@ -842,7 +848,7 @@ mod tests {
         let proposal = json!({"proposal_id":"proposal","output_id":"out","owner_provider":"owner","owner_service":"owner/2","target":target,"resource":resource,"method":method("control"),"argument_schema":schema,"arguments":{},"access":"exclusive","mutation_domains":["domain"]});
         let source_plan = json!({"plan_id":"source","revision":1,"resources":[{"provider":"owner","resource_id":"output","incarnation":"native","expected_revision":1,"execution_domain":"seat","mutation_domains":["domain"],"access":"read"}],"mutation_domains":[{"domain":"domain","expected_revision":1,"borrowers":{},"access":"read"}],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]});
         let participant = |name: &str| json!({"provider":name,"plan_method":method("plan"),"callback_method":method("callback"),"status_method":method("status"),"capabilities":[],"cleanup_methods":[],"settings_revision":"one","settings":{}});
-        let source_request = json!({"version":2,"provider_sequence":1,"operation":"lifecycle_callback","transition_id":"source-transition","operation_id":"source-op","target":session,"phase":"session.prepare","settings_revision":"one","settings":{},"intent":null,"reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector"]},"remaining_ms":1000,"plan_revision":1,"admission_id":"source","approved_plan":source_plan});
+        let source_request = json!({"version":2,"provider_sequence":1,"operation":"lifecycle_callback","transition_id":"source-transition","operation_id":"source-op","target":session,"resource_generation":7,"phase":"session.prepare","settings_revision":"one","settings":{},"intent":null,"reason":null,"requested_video":null,"consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["selector"]},"remaining_ms":1000,"plan_revision":1,"admission_id":"source","approved_plan":source_plan});
         let prepared =
             json!({"status":"prepared","candidate":null,"obligations":[],"outputs":[output]});
         let callback_call = json!({"service":"owner/2","method":"callback","interface_major":2,"interface_minor":0,"approval":approval("callback")["broker_approval"],"arguments":source_request,"timeout_ms":1000,"operation_id":"source-op"});
@@ -860,7 +866,7 @@ mod tests {
         let selection = |name: &str| json!({"participant":participant(name),"approvals":[approval("plan"),approval("callback"),approval("status")],"capabilities":[],"cleanup_methods":[],"authorized_borrowers":[]});
         let admission = |provider: &str, plan: Value| json!({"provider":provider,"selection":selection(provider),"plan":plan,"rights":[]});
         let permit = json!({"context":{"policy":policy,"output":output,"target":target,"transition_id":"control-transition","parent_generation":1},"request":request,"consumed":true,"settled":true});
-        let session_record = json!({"host_epoch":epoch,"id":"session","generation":1,"phase":"ready","owner":{"caller":"transport","initiator":"transport"},"delegates":[],"application_ref":{},"settings_revision":"one","application_retired":false,"streams":{"stream":{"generation":1,"phase":"active","candidate":null,"required":[],"acknowledgements":[],"retirements":[],"provider_graph":{"order":["owner","dependent"],"dependencies":{"owner":[],"dependent":["owner"]}}}},"admission_ids":["source"],"admission_targets":{"source":session},"admission_phases":{"source":"session.prepare"}});
+        let session_record = json!({"host_epoch":epoch,"id":"session","generation":1,"phase":"ready","owner":{"caller":"transport","initiator":"transport"},"delegates":[],"application_ref":{},"settings_revision":"one","application_retired":false,"streams":{"stream":{"generation":1,"phase":"active","candidate":null,"required":[],"acknowledgements":[],"retirements":[],"provider_graph":{"order":["owner","dependent"],"dependencies":{"owner":[],"dependent":["owner"]}}}},"admission_ids":["source"],"admission_targets":{"source":session},"admission_phases":{"source":"session.prepare"},"resource_generations":{"owner":8}});
         let mut journal = coordinator.shared.borrow().value.clone();
         journal.sessions.insert(
             "session".into(),
@@ -911,6 +917,7 @@ mod tests {
         let valid = coordinator.verify_control_settlement("owner", envelope.clone());
         assert_eq!(valid["status"], "valid", "{valid}");
         assert_eq!(valid["root_output"], output);
+        assert_eq!(valid["resource_generation"], 7);
         assert_eq!(
             coordinator.verify_control_settlement("foreign", envelope.clone())["status"],
             "rejected"
