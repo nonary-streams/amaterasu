@@ -744,6 +744,77 @@ mod tests {
         std::fs::remove_dir_all(path).unwrap();
     }
     #[test]
+    fn work_authority_reconstructs_nonempty_borrower_scope() {
+        use crate::prepare_driver::PrepareAuthority;
+        let path =
+            std::env::temp_dir().join(format!("amaterasu-control-scope-{}", identifier().unwrap()));
+        std::fs::create_dir(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut coordinator = Coordinator::open(&path.join("journal.json")).unwrap();
+        let epoch = coordinator.shared.borrow().value.host_epoch.clone();
+        let target =
+            json!({"kind":"session","host_epoch":epoch,"session_id":"session","generation":1});
+        let method = json!({"service":"owner/1","method":"plan","interface_major":1,"interface_minor":0,"schema_revision":1});
+        let participant = json!({"provider":"owner","plan_method":method,"callback_method":method,"status_method":method,"capabilities":[],"cleanup_methods":[],"settings_revision":"one","settings":{}});
+        let selection: crate::prepare_authority::ProviderSelection = serde_json::from_value(json!({"participant":participant,"approvals":[{"method":method,"broker_approval":{"provider":"owner","method":{"service":"owner/1","method":"plan","interface_major":1,"interface_minor":0}}}],"capabilities":[],"cleanup_methods":[],"authorized_borrowers":[]})).unwrap();
+        let plan = serde_json::from_value(json!({"plan_id":"plan","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]})).unwrap();
+        let mut admitted_selection = selection.clone();
+        admitted_selection
+            .authorized_borrowers
+            .insert("session".into());
+        let admission = crate::prepare_authority::Admission {
+            provider: "owner".into(),
+            selection: admitted_selection,
+            plan,
+            rights: vec![],
+        };
+        let mut session: SessionRecord = serde_json::from_value(json!({"host_epoch":epoch,"id":"session","generation":1,"phase":"ready","owner":{"caller":"c","initiator":"i"},"delegates":[],"application_ref":{},"settings_revision":"one","application_retired":false,"streams":{},"obligations":[{"obligation_id":"root","provider":"owner","resource_id":"output","mutation_domain":"domain","depends_on":[],"cleanup_method":method,"payload":{}}]})).unwrap();
+        session.provider_settings.clear();
+        let work: Work = serde_json::from_value(json!({"phase":"session.prepare","target":target,"intent":null,"reason":null,"video":null,"transition_id":"transition","providers":[],"index":0,"states":{},"candidate":null,"waiting_retirement":false})).unwrap();
+        coordinator
+            .selections
+            .insert("owner".into(), selection.clone());
+        {
+            let mut shared = coordinator.shared.borrow_mut();
+            shared.value.sessions.insert("session".into(), session);
+            shared
+                .value
+                .authority
+                .admissions
+                .insert("admission".into(), admission.clone());
+        }
+        assert!(
+            coordinator
+                .authority_for_work(&work)
+                .unwrap()
+                .validate_rights(&selection.participant, &admission.plan, "admission")
+                .is_ok()
+        );
+        coordinator
+            .shared
+            .borrow_mut()
+            .value
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .obligations
+            .clear();
+        assert_eq!(
+            coordinator
+                .authority_for_work(&work)
+                .unwrap()
+                .validate_rights(&selection.participant, &admission.plan, "admission")
+                .unwrap_err(),
+            "admission changed or rights lost"
+        );
+        drop(coordinator);
+        std::fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
     fn historical_owner_ack_requires_exact_durable_tuple() {
         use sha2::{Digest, Sha256};
         let path = std::env::temp_dir().join(format!(
