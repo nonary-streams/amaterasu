@@ -515,7 +515,6 @@ impl Coordinator {
             .ok_or("settlement_selection_unavailable")?;
         if !selection.validate_structure()
             || selection.control_policy != permit.context.policy
-            || selection.input.output != permit.context.output
             || journal.composition.get(
                 caller,
                 &selection.input.output.output_id,
@@ -531,6 +530,45 @@ impl Coordinator {
                 .any(|doc| !self.settings.schema_documents.contains(doc))
         {
             return Err("settlement_selection_mismatch".into());
+        }
+        if selection.input.output != permit.context.output {
+            let stage = journal.composition.staged_for(
+                &tuple.request.target,
+                caller,
+                &selection.input.output.output_id,
+            )?;
+            let stage_admission = journal
+                .authority
+                .admissions
+                .get(&stage.admission_id)
+                .or_else(|| journal.authority.settled.get(&stage.admission_id))
+                .ok_or("settlement_stage_admission_unavailable")?;
+            let (_, session_id, _, _) = super::operations::target_parts(&stage.target)?;
+            let stage_session = journal.sessions.get(session_id).ok_or("unknown_session")?;
+            if !journal.composition.validate_structure()
+                || stage.before != selection.input.output
+                || stage.after != permit.context.output
+                || stage.transition_id != record.selection_transition_id
+                || stage.parent_generation != stage_session.generation
+                || !stage_session.admission_ids.contains(&stage.admission_id)
+                || stage_session.admission_targets.get(&stage.admission_id) != Some(&stage.target)
+                || stage_session.admission_phases.get(&stage.admission_id)
+                    != Some(&LifecyclePhase::StreamPrepare)
+                || journal.admission_transitions.get(&stage.admission_id)
+                    != Some(&stage.transition_id)
+                || stage_admission.provider != caller
+                || stage_admission.plan != stage.plan
+                || stage_admission.selection.participant != stage.callback_proof.participant
+                || !stage_admission.selection.approvals.iter().any(|approval| {
+                    approval.broker_approval == stage.callback_proof.terminal.call.approval
+                        && super::composition::approval_matches_call(
+                            approval,
+                            &stage.callback_proof.terminal.call,
+                        )
+                })
+            {
+                return Err("settlement_stage_provenance_mismatch".into());
+            }
         }
         let source = journal
             .authority
@@ -593,7 +631,7 @@ impl Coordinator {
             .schema_catalog()?
             .validate(&tuple.output.schema, &tuple.output.data)?;
         Ok(Some(
-            json!({"status":"valid", "session_target":{"kind":"session","host_epoch":session.host_epoch,"session_id":session.id,"generation":session.generation}, "target":tuple.request.target,"output":tuple.output,"consumers_retired":false}),
+            json!({"status":"valid", "session_target":{"kind":"session","host_epoch":session.host_epoch,"session_id":session.id,"generation":session.generation}, "target":tuple.request.target,"output":tuple.output,"root_output":selection.input.output,"consumers_retired":false}),
         ))
     }
 }
@@ -788,10 +826,41 @@ mod tests {
         envelope["operation"] = json!("verify_control_settlement");
         let valid = coordinator.verify_control_settlement("owner", envelope.clone());
         assert_eq!(valid["status"], "valid", "{valid}");
+        assert_eq!(valid["root_output"], output);
         assert_eq!(
             coordinator.verify_control_settlement("foreign", envelope.clone())["status"],
             "rejected"
         );
+        // A different permit input cannot claim a staged lineage without a
+        // retained authenticated stage linking it to the frozen root.
+        coordinator
+            .shared
+            .borrow_mut()
+            .value
+            .authority
+            .control_permits
+            .get_mut("permit")
+            .unwrap()
+            .context
+            .output
+            .resource
+            .revision += 1;
+        assert_eq!(
+            coordinator.verify_control_settlement("owner", envelope.clone())["status"],
+            "rejected"
+        );
+        coordinator
+            .shared
+            .borrow_mut()
+            .value
+            .authority
+            .control_permits
+            .get_mut("permit")
+            .unwrap()
+            .context
+            .output
+            .resource
+            .revision -= 1;
         let mut changed = envelope;
         changed["output"]["resource"]["revision"] = json!(2);
         assert_eq!(
