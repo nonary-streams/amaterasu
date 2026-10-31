@@ -335,6 +335,12 @@ impl PrepareDriver {
             ProviderResponse::Planned { plan }
                 if matches!(next.phase, PreparePhase::Plan | PreparePhase::PlanStatus) =>
             {
+                // Control proposals require coordinator-owned, schema-validated
+                // execution. Version 1 has no such protocol; never admit a plan
+                // whose proposed controls would otherwise be silently skipped.
+                if !plan.control_proposals.is_empty() {
+                    return Err("resource control proposals are not supported".into());
+                }
                 let admission = authority.admit_plan(participant, plan)?;
                 if admission.is_empty() {
                     return Err("empty admission ID".into());

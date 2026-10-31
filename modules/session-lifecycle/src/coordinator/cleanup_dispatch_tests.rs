@@ -87,7 +87,12 @@ impl Harness {
                         } else {
                             json!([])
                         };
-                        json!({"status":"planned","plan":{"plan_id":"plan","revision":1,"resources":resources,"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":obligations,"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]}})
+                        let proposals = if *uncertain_phase == "proposal" && provider == "a" {
+                            json!([{"proposal_id":"change", "output_id":"output", "owner_provider":"a", "owner_service":"a/1", "target":payload["target"], "resource":{"provider":"a","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":null,"mutation_domains":[]}, "method":{"service":"a/1","method":"control","interface_major":1,"interface_minor":0,"schema_revision":1}, "argument_schema":{"id":"control/1","major":1,"minor":0,"digest":"a".repeat(64)}, "arguments":{},"access":"read","mutation_domains":[]}])
+                        } else {
+                            json!([])
+                        };
+                        json!({"status":"planned","plan":{"plan_id":"plan","revision":1,"resources":resources,"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":obligations,"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[],"control_proposals":proposals}})
                     } else if method == "callback" {
                         let phase = payload["phase"].as_str().unwrap().to_owned();
                         callbacks.push((provider.clone(), phase.clone()));
@@ -272,4 +277,34 @@ fn missing_dependent_provider_blocks_prerequisite_but_not_independent() {
         .map(|(provider, _)| provider.as_str())
         .collect();
     assert_eq!(releases, ["c"]);
+}
+
+#[test]
+fn unsupported_control_proposal_is_rejected_before_admission_or_callback() {
+    let mut h = Harness::new("proposal");
+    h.coordinator.handle(
+        "caller",
+        "initiator",
+        json!({"operation":"prepare","operation_id":"prepare"}),
+    );
+    assert_eq!(h.run("prepare")["status"], "recovery_required");
+    assert!(h.callbacks.is_empty());
+    assert!(
+        h.coordinator
+            .shared
+            .borrow()
+            .value
+            .authority
+            .admissions
+            .is_empty()
+    );
+    assert!(
+        h.coordinator
+            .shared
+            .borrow()
+            .value
+            .authority
+            .settled
+            .is_empty()
+    );
 }
