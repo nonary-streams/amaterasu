@@ -486,8 +486,7 @@ impl Drop for Fixture {
         );
     }
 }
-fn display_round_trip(resizes: usize) {
-    let changed_mode = resizes > 0;
+fn display_round_trip(cycles: usize, changed_mode: bool) {
     let mut f = Fixture::new();
     let video = json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false});
     let prepared =
@@ -592,7 +591,7 @@ fn display_round_trip(resizes: usize) {
         json!({"operation":"start_stream","operation_id":"resume-start","target":resumed_target}),
     );
     assert_eq!(restarted["status"], "succeeded", "{restarted}");
-    for cycle in 1..resizes {
+    for cycle in 1..cycles {
         let pause_id = format!("cycle-{cycle}-pause");
         let fenced = f.call(
             json!({"operation":"pause_stream","operation_id":pause_id,"target":resumed_target}),
@@ -602,7 +601,7 @@ fn display_round_trip(resizes: usize) {
         assert_eq!(retired["status"], "pending", "{retired}");
         let paused = f.settled(&pause_id);
         assert_eq!(paused["status"], "succeeded", "{paused}");
-        let video = if cycle % 2 == 1 {
+        let video = if !changed_mode || cycle % 2 == 1 {
             json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false})
         } else {
             json!({"width":1280,"height":720,"refresh_millihz":60000,"hdr":false})
@@ -656,25 +655,34 @@ fn display_round_trip(resizes: usize) {
     );
     assert!(f.references.is_empty());
     assert!(f.borrows.is_empty());
-    assert_eq!(f.reconfigurations.len(), resizes);
+    assert_eq!(
+        f.reconfigurations.len(),
+        if changed_mode { cycles } else { 0 }
+    );
 }
 
 #[test]
 #[ignore = "requires an independently built display module and its example approvals"]
 fn real_display_and_lifecycle_round_trip_with_simulated_backends() {
-    display_round_trip(0);
+    display_round_trip(1, false);
 }
 
 #[test]
 #[ignore = "requires a display module with native resize support and its example approvals"]
 fn real_display_resumes_with_changed_mode() {
-    display_round_trip(1);
+    display_round_trip(1, true);
 }
 
 #[test]
 #[ignore = "requires a display module with native resize support and its example approvals"]
 fn real_display_repeats_changed_mode_beyond_checkpoint() {
-    display_round_trip(10);
+    display_round_trip(10, true);
+}
+
+#[test]
+#[ignore = "requires an independently built display module and its example approvals"]
+fn real_display_repeats_same_mode_beyond_checkpoint() {
+    display_round_trip(10, false);
 }
 
 #[test]
