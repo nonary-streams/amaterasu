@@ -101,6 +101,7 @@ impl Coordinator {
         &self,
         work: &Work,
         dependent: &str,
+        require_fresh_observation: bool,
     ) -> ModuleResult<(
         Option<super::composition::CompositionSelectionSnapshot>,
         ResourceOutput,
@@ -380,44 +381,46 @@ impl Coordinator {
         {
             return Err("release_approval_changed".into());
         }
-        let observed = journal
-            .authority
-            .snapshot
-            .resources
-            .get(&current.producer)
-            .and_then(|resources| resources.get(&current.resource.resource_id))
-            .ok_or("release_observation_missing")?;
-        let domains: BTreeSet<_> = current
-            .resource
-            .mutation_domains
-            .iter()
-            .cloned()
-            .chain(current.resource.mutation_domain.iter().cloned())
-            .collect();
-        if observed.provider != current.resource.provider
-            || observed.incarnation != current.resource.incarnation
-            || observed.revision != current.resource.revision
-            || observed.execution_domain != current.resource.execution_domain
-            || observed.mutation_domains != domains
-        {
-            return Err("release_observation_stale".into());
-        }
-        for observation in &current.domain_observations {
-            let live = journal
+        if require_fresh_observation {
+            let observed = journal
                 .authority
                 .snapshot
-                .domains
-                .get(&observation.domain)
-                .ok_or("release_domain_missing")?;
-            if !observation.complete
-                || journal
-                    .authority
-                    .refresh_required
-                    .contains(&observation.domain)
-                || live.revision != observation.revision
-                || live.borrowers != observation.borrowers
+                .resources
+                .get(&current.producer)
+                .and_then(|resources| resources.get(&current.resource.resource_id))
+                .ok_or("release_observation_missing")?;
+            let domains: BTreeSet<_> = current
+                .resource
+                .mutation_domains
+                .iter()
+                .cloned()
+                .chain(current.resource.mutation_domain.iter().cloned())
+                .collect();
+            if observed.provider != current.resource.provider
+                || observed.incarnation != current.resource.incarnation
+                || observed.revision != current.resource.revision
+                || observed.execution_domain != current.resource.execution_domain
+                || observed.mutation_domains != domains
             {
-                return Err("release_domain_stale".into());
+                return Err("release_observation_stale".into());
+            }
+            for observation in &current.domain_observations {
+                let live = journal
+                    .authority
+                    .snapshot
+                    .domains
+                    .get(&observation.domain)
+                    .ok_or("release_domain_missing")?;
+                if !observation.complete
+                    || journal
+                        .authority
+                        .refresh_required
+                        .contains(&observation.domain)
+                    || live.revision != observation.revision
+                    || live.borrowers != observation.borrowers
+                {
+                    return Err("release_domain_stale".into());
+                }
             }
         }
         self.settings
@@ -435,7 +438,7 @@ impl Coordinator {
         super::composition::CompositionSelectionSnapshot,
         ResourceOutput,
     )> {
-        let (selection, output) = self.resolve_release_state(work, dependent)?;
+        let (selection, output) = self.resolve_release_state(work, dependent, true)?;
         Ok((selection.ok_or("release_selection_missing")?, output))
     }
 
@@ -445,11 +448,24 @@ impl Coordinator {
         work: &Work,
         owner: &str,
     ) -> ModuleResult<ResourceOutput> {
-        let (selection, output) = self.resolve_release_state(work, owner)?;
+        let (selection, output) = self.resolve_release_state(work, owner, true)?;
         if selection.is_some() || output.producer != owner {
             return Err("release_owner_mismatch".into());
         }
         Ok(output)
+    }
+
+    /// Reconstruct provenance for a read-only owner observation, before freshness exists.
+    /// This result alone must never authorize an effect or freeze a dependent plan.
+    pub(super) fn resolve_release_observation_binding(
+        &self,
+        work: &Work,
+        participant: &str,
+    ) -> ModuleResult<(
+        Option<super::composition::CompositionSelectionSnapshot>,
+        ResourceOutput,
+    )> {
+        self.resolve_release_state(work, participant, false)
     }
 
     /// Atomically freeze the reconstructed binding before the dependent plan.
@@ -524,7 +540,17 @@ mod tests {
                 .freeze_release_inputs("missing", &work, "dependent")
                 .is_err()
         );
+        assert!(
+            coordinator
+                .resolve_release_observation_binding(&work, "dependent")
+                .is_err()
+        );
         work.phase = LifecyclePhase::StreamRelease;
+        assert!(
+            coordinator
+                .resolve_release_observation_binding(&work, "dependent")
+                .is_err()
+        );
         assert!(
             coordinator
                 .freeze_release_inputs("missing", &work, "dependent")
