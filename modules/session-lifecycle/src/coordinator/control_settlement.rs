@@ -159,7 +159,7 @@ fn valid_record(item: &ControlSettlementRecord) -> bool {
         && matches!(&item.applied,ResourceControlResponse::Applied { output,candidate } if **output==item.confirmed.output && candidate.as_deref()==item.confirmed.candidate.as_ref())
         && item.effect_dispatch.call.approval["provider"].as_str()
             == Some(item.settlement.request.proposal.owner_provider.as_str())
-        && matches!(&item.effect_dispatch.state, DispatchState::Completed { payload } if serde_json::to_value(&item.applied).ok().as_ref() == Some(payload))
+        && matches!(&item.effect_dispatch.state, DispatchState::Completed { payload } if serde_json::from_value::<ResourceControlResponse>(payload.clone()).ok().as_ref() == Some(&item.applied))
         && match (&item.owner_ack, &item.owner_dispatch) {
             (None, None) => true,
             (Some(ack), Some(dispatch)) => {
@@ -217,7 +217,7 @@ fn valid_dispatch(
         && dispatch.call.approval["provider"].as_str()
             == Some(item.settlement.request.proposal.owner_provider.as_str())
         && serde_json::to_value(&item.settlement).ok().as_ref() == Some(&dispatch.call.arguments)
-        && matches!(&dispatch.state, DispatchState::Completed { payload } if serde_json::to_value(ack).ok().as_ref() == Some(payload))
+        && matches!(&dispatch.state, DispatchState::Completed { payload } if serde_json::from_value::<ResourceControlResponse>(payload.clone()).ok().as_ref() == Some(ack))
 }
 
 #[cfg(test)]
@@ -275,5 +275,18 @@ mod tests {
             }
             .validate_structure()
         );
+    }
+    #[test]
+    fn retained_raw_owner_response_accepts_omitted_default_field() {
+        let mut item = fixture();
+        let candidate = json!({"capture_provider":"capture","selector_schema":"selector","selector":{},"resource":item.confirmed.output.resource,"mode":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false},"plan_revision":1,"geometry_revision":1,"generation":1});
+        let payload =
+            json!({"status":"applied","output":item.confirmed.output,"candidate":candidate});
+        item.applied = serde_json::from_value(payload.clone()).unwrap();
+        if let ResourceControlResponse::Applied { candidate, .. } = &item.applied {
+            item.confirmed.candidate = candidate.as_deref().cloned();
+        }
+        item.effect_dispatch.state = DispatchState::Completed { payload };
+        assert!(valid_record(&item));
     }
 }

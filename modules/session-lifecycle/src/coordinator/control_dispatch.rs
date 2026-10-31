@@ -181,7 +181,7 @@ impl ControlDispatch {
                             && status.as_ref().is_some_and(|status| {
                                 valid_pending_proof(&state, &status.receipt_id)
                             })))
-                        && matches!(&record.state, DispatchState::Completed { payload } if serde_json::to_value(expected).ok().as_ref() == Some(payload))
+                        && matches!(&record.state, DispatchState::Completed { payload } if serde_json::from_value::<ResourceControlResponse>(payload.clone()).ok().as_ref() == Some(&expected))
                 }
                 _ => false,
             };

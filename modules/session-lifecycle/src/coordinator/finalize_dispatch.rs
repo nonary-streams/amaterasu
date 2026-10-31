@@ -136,7 +136,7 @@ impl FinalizeDispatch {
                                 && valid_pending_proof(&state, &status.receipt_id)
                         });
                     selected
-                        && matches!(&record.state, DispatchState::Completed { payload } if serde_json::to_value(result.as_ref()).ok().as_ref() == Some(payload))
+                        && matches!(&record.state, DispatchState::Completed { payload } if serde_json::from_value::<ResourceControlResponse>(payload.clone()).ok().as_ref() == Some(result.as_ref()))
                 }
                 _ => false,
             };
