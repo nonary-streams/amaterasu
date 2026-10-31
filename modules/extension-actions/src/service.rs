@@ -2271,18 +2271,22 @@ mod tests {
         let operation_id = format!("{epoch}:1");
         host.request_input(2, json!({"operation":"reserve_input","epoch":epoch,"sequence":1,"operation_id":operation_id,"action_id":"example/action","target":{"kind":"session","host_epoch":"h","session_id":"s","expected_generation":1},"arguments":{},"expected_settings_revision":null,"input_reservation_id":"reservation"}));
         host.run();
+        host.allow_permit = false;
         host.request_input(3, json!({"operation":"cancel","epoch":epoch,"sequence":1}));
         host.run();
-        assert_eq!(host.replies[2]["status"], "cancelled");
-        assert_eq!(host.cancellation_requests, 1);
+        assert_eq!(
+            host.replies[2]["code"],
+            "reservation_cancellation_unconfirmed"
+        );
         host.request_input(4, json!({"operation":"commit_input","epoch":epoch,"sequence":1,"operation_id":operation_id}));
         host.run();
         assert_eq!(host.replies[3]["status"], "cancelled");
         assert_eq!(host.effects, 0);
+        host.allow_permit = true;
         host.request_input(5, json!({"operation":"cancel","epoch":epoch,"sequence":1}));
         host.run();
         assert_eq!(host.replies[4]["status"], "cancelled");
-        assert_eq!(host.cancellation_requests, 2);
+        assert_eq!(host.cancellation_requests, 1);
     }
     #[test]
     fn input_reservation_waits_for_independent_delivery_proof() {
