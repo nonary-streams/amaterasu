@@ -296,6 +296,8 @@ fn validate_field_name(name: &str) -> Result<(), String> {
 }
 
 pub fn validate_values(fields: &Fields, values: &Values) -> Result<(), String> {
+    // Validate nested definitions even when the provided value is null.
+    defaults(fields)?;
     for (name, value) in values {
         let definition = fields
             .get(name)
@@ -330,6 +332,7 @@ mod tests {
         }
         let bad: Fields = serde_json::from_value(json!({"hotkey":{"type":"nullable","default":null,"inner":{"type":"string","default":"x","min_length":3,"max_length":1}}})).unwrap();
         assert!(defaults(&bad).is_err());
+        assert!(validate_values(&bad, &[("hotkey".into(), Value::Null)].into()).is_err());
         let bad_default: Fields = serde_json::from_value(json!({"hotkey":{"type":"nullable","default":2,"inner":{"type":"boolean","default":false}}})).unwrap();
         assert!(defaults(&bad_default).is_err());
         let mut nested = json!({"type":"boolean","default":false});
