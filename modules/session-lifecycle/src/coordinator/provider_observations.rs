@@ -5,6 +5,143 @@ use amaterasu_extension_api::{MutationDomainPlan, ResourceAccess};
 const MAX_ITEMS: usize = 128;
 const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 
+fn obligation_remains_live(
+    obligation: &amaterasu_extension_api::ResourceObligation,
+    closed: &[&amaterasu_extension_api::ResourceObligation],
+    live: &[&amaterasu_extension_api::ResourceObligation],
+) -> bool {
+    !closed.contains(&obligation) || live.contains(&obligation)
+}
+
+fn root_plan_is_scoped_to_released_resource(root: &super::composition::StoredOutput) -> bool {
+    let resource = &root.output.resource;
+    let domains: BTreeSet<_> = resource
+        .mutation_domains
+        .iter()
+        .chain(resource.mutation_domain.iter())
+        .collect();
+    !root.plan.resources.is_empty()
+        && root.plan.resources.iter().all(|planned| {
+            planned.provider == resource.provider
+                && planned.resource_id == resource.resource_id
+                && planned.execution_domain == resource.execution_domain
+                && planned
+                    .incarnation
+                    .as_ref()
+                    .is_none_or(|incarnation| incarnation == &resource.incarnation)
+                && planned
+                    .mutation_domains
+                    .iter()
+                    .all(|domain| domains.contains(domain))
+        })
+        && root
+            .plan
+            .mutation_domains
+            .iter()
+            .all(|domain| domains.contains(&domain.domain))
+        && root.plan.obligations.iter().all(|obligation| {
+            obligation.provider == resource.provider
+                && obligation.resource_id == resource.resource_id
+                && obligation
+                    .mutation_domain
+                    .as_ref()
+                    .is_none_or(|domain| domains.contains(domain))
+        })
+}
+
+/// Only authenticated terminal action evidence closes historical admissions.
+/// Domain names and a released output flag alone do not prove cleanup.
+fn closed_admissions(journal: &Journal, session: &SessionRecord) -> ModuleResult<BTreeSet<String>> {
+    let target = LifecycleTarget::Session {
+        host_epoch: session.host_epoch.clone(),
+        session_id: session.id.clone(),
+        generation: session.generation,
+    };
+    let mut closed = BTreeSet::new();
+    for root in journal.composition.records().filter(|root| {
+        root.output.origin == target && root.state == super::composition::OutputState::Released
+    }) {
+        if journal
+            .session_releases
+            .has_valid_released(journal, &target, &root.output.producer)
+        {
+            // Standalone session closure is not an action-reprepare proof; keep
+            // its old admissions under the existing metadata rules.
+            continue;
+        }
+        let generation = super::resource_generation::historical_generation(journal, root)?;
+        let marker = super::action_disposition::verified_marker_at(
+            journal,
+            &session.id,
+            &root.output.producer,
+            generation,
+        );
+        if marker.is_none_or(|marker| marker.root_admission_id != root.admission_id) {
+            return Err("historical_release_unproven".into());
+        }
+        if !root_plan_is_scoped_to_released_resource(root) {
+            return Err("historical_release_scope_ambiguous".into());
+        }
+    }
+    for marker in journal
+        .action_dispositions
+        .values()
+        .filter(|marker| marker.session_target == target)
+    {
+        let verified = super::action_disposition::verified_marker_at(
+            journal,
+            &session.id,
+            &marker.owner,
+            marker.resource_generation,
+        )
+        .ok_or("historical_release_unproven")?;
+        if verified.resource_generation != marker.resource_generation
+            || session
+                .resource_generations
+                .get(&marker.owner)
+                .is_none_or(|cursor| *cursor < marker.resource_generation)
+        {
+            return Err("historical_release_generation_invalid".into());
+        }
+        let transfer = marker
+            .cleanup_work
+            .action_transfer
+            .as_ref()
+            .ok_or("historical_release_unproven")?;
+        let snapshot = transfer
+            .snapshot
+            .as_ref()
+            .ok_or("historical_release_unproven")?;
+        let proof = transfer
+            .release_proof
+            .as_ref()
+            .ok_or("historical_release_unproven")?;
+        closed.insert(marker.root_admission_id.clone());
+        closed.extend(snapshot.stream_admissions.keys().cloned());
+        closed.extend(
+            proof
+                .callbacks
+                .iter()
+                .filter_map(|callback| callback.request.admission_id.clone()),
+        );
+        if let Some(id) = &transfer.admission_id {
+            closed.insert(id.clone());
+        }
+    }
+    if closed
+        .iter()
+        .any(|id| journal.authority.admissions.contains_key(id))
+        || journal.composition.records().any(|root| {
+            root.output.origin == target
+                && root.state == super::composition::OutputState::Retained
+                && closed.contains(&root.admission_id)
+        })
+    {
+        return Err("historical_release_conflicts_with_active_admission".into());
+    }
+    Ok(closed)
+}
+
 /// This is called only after exact broker caller/request/admission verification.
 /// Domain entries are the last authenticated observations; entries in
 /// `stale_mutation_domains` must be refreshed before they are used as current.
@@ -31,6 +168,27 @@ fn metadata_with_scope(
     provider: &str,
     scoped_domains: Option<&BTreeSet<String>>,
 ) -> ModuleResult<Value> {
+    let mut closed_by_session = BTreeMap::new();
+    for candidate in journal.sessions.values() {
+        let relevant = candidate.id == session.id
+            || (scoped_domains.is_none()
+                && candidate.admission_ids.iter().any(|id| {
+                    journal
+                        .authority
+                        .admissions
+                        .get(id)
+                        .or_else(|| journal.authority.settled.get(id))
+                        .is_some_and(|admission| admission.provider == provider)
+                }));
+        closed_by_session.insert(
+            candidate.id.clone(),
+            if relevant {
+                closed_admissions(journal, candidate)?
+            } else {
+                BTreeSet::new()
+            },
+        );
+    }
     let owned = |id: &String| {
         journal
             .authority
@@ -41,7 +199,9 @@ fn metadata_with_scope(
     };
     let mut selected_domains = BTreeSet::new();
     for id in &session.admission_ids {
-        if let Some(admission) = owned(id) {
+        if !closed_by_session[&session.id].contains(id)
+            && let Some(admission) = owned(id)
+        {
             selected_domains.extend(
                 admission
                     .plan
@@ -65,6 +225,9 @@ fn metadata_with_scope(
         }
         let mut included = false;
         for id in &candidate_session.admission_ids {
+            if closed_by_session[&candidate_session.id].contains(id) {
+                continue;
+            }
             let Some(admission) = owned(id) else {
                 continue;
             };
@@ -129,13 +292,32 @@ fn metadata_with_scope(
             );
             included = true;
         }
-        if included {
+        if included || (is_origin && scoped_domains.is_none()) {
+            // Equal obligations still referenced by any live admission are
+            // retained, including shared domains reused by a new generation.
+            let closed_obligations: Vec<_> = closed_by_session[&candidate_session.id]
+                .iter()
+                .filter_map(&owned)
+                .flat_map(|admission| admission.plan.obligations.iter())
+                .collect();
+            let live_obligations: Vec<_> = candidate_session
+                .admission_ids
+                .iter()
+                .filter(|id| !closed_by_session[&candidate_session.id].contains(*id))
+                .filter_map(&owned)
+                .flat_map(|admission| admission.plan.obligations.iter())
+                .collect();
             obligations.extend(
                 candidate_session
                     .obligations
                     .iter()
                     .filter(|obligation| {
                         obligation.provider == provider
+                            && obligation_remains_live(
+                                obligation,
+                                &closed_obligations,
+                                &live_obligations,
+                            )
                             && ((is_origin && scoped_domains.is_none())
                                 || obligation
                                     .mutation_domain
@@ -323,7 +505,11 @@ impl Coordinator {
         }
         let mut allowed_domains = BTreeSet::new();
         let mut allowed_resources = BTreeSet::new();
+        let closed = closed_admissions(&next, session)?;
         for id in &session.admission_ids {
+            if closed.contains(id) {
+                continue;
+            }
             let Some(admission) = next
                 .authority
                 .admissions

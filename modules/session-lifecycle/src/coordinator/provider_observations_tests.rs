@@ -666,3 +666,50 @@ fn nested_finalize_plan_refresh_checks_exact_owner_and_request() {
     );
     let _ = std::fs::remove_dir_all(path);
 }
+
+#[test]
+fn released_output_without_authenticated_closure_fails_metadata_closed() {
+    let fixture = Fixture::new();
+    let mut journal = fixture.coordinator.shared.borrow().value.clone();
+    let session = &journal.sessions["session-a"];
+    let target = json!({"kind":"session","host_epoch":session.host_epoch,"session_id":"session-a","generation":1});
+    let output = json!({"output_id":"old","capability":"display","schema":{"id":"schema","major":1,"minor":0,"digest":"a".repeat(64)},"producer":"provider-a","producer_service":"provider-a/2","origin":target,"resource":{"provider":"provider-a","resource_id":"old-resource","incarnation":"old-incarnation","revision":1,"execution_domain":"seat","mutation_domain":"shared","mutation_domains":["shared"]},"domain_observations":[{"domain":"shared","revision":1,"borrowers":{},"complete":true}],"data":{}});
+    journal.composition = serde_json::from_value(json!({"outputs":[{"output":output,"admission_id":"admission-a","transition_id":"old","plan":journal.authority.settled["admission-a"].plan,"state":"released"}]})).unwrap();
+    assert!(metadata(&journal, &journal.sessions["session-a"], "provider-a").is_err());
+    assert!(journal.authority.settled.contains_key("admission-a"));
+}
+
+#[test]
+fn closed_obligation_is_kept_if_a_live_generation_shares_it() {
+    let obligation: amaterasu_extension_api::ResourceObligation = serde_json::from_value(json!({"obligation_id":"restore","provider":"provider-a","resource_id":"display","mutation_domain":"shared","depends_on":[],"cleanup_method":{"service":"provider-a/1","method":"restore","interface_major":1,"interface_minor":0,"schema_revision":1},"payload":{}})).unwrap();
+    let unknown = amaterasu_extension_api::ResourceObligation {
+        obligation_id: "other".into(),
+        ..obligation.clone()
+    };
+    assert!(!obligation_remains_live(&obligation, &[&obligation], &[]));
+    assert!(obligation_remains_live(
+        &obligation,
+        &[&obligation],
+        &[&obligation]
+    ));
+    assert!(obligation_remains_live(&unknown, &[&obligation], &[]));
+}
+
+#[test]
+fn released_root_scope_cannot_hide_unrelated_resource_or_obligation() {
+    let target =
+        json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1});
+    let output = json!({"output_id":"old","capability":"display","schema":{"id":"schema","major":1,"minor":0,"digest":"a".repeat(64)},"producer":"owner","producer_service":"owner/2","origin":target,"resource":{"provider":"owner","resource_id":"old-resource","incarnation":"old-incarnation","revision":1,"execution_domain":"seat","mutation_domain":"shared","mutation_domains":["shared"]},"domain_observations":[{"domain":"shared","revision":1,"borrowers":{},"complete":true}],"data":{}});
+    let plan = json!({"plan_id":"plan","revision":1,"resources":[{"provider":"owner","resource_id":"old-resource","incarnation":null,"expected_revision":null,"execution_domain":"seat","mutation_domains":["shared"],"access":"exclusive"}],"mutation_domains":[{"domain":"shared","expected_revision":1,"borrowers":{},"access":"exclusive"}],"required_capabilities":[],"constraints":{},"obligations":[{"obligation_id":"cleanup","provider":"owner","resource_id":"old-resource","mutation_domain":"shared","depends_on":[],"cleanup_method":{"service":"owner/2","method":"cleanup","interface_major":2,"interface_minor":0,"schema_revision":1},"payload":{}}],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]});
+    let root: super::super::composition::StoredOutput = serde_json::from_value(json!({"output":output,"admission_id":"old","transition_id":"old-transition","plan":plan,"state":"released"})).unwrap();
+    assert!(root_plan_is_scoped_to_released_resource(&root));
+    let mut unrelated = root.clone();
+    unrelated.plan.resources[0].resource_id = "other".into();
+    assert!(!root_plan_is_scoped_to_released_resource(&unrelated));
+    let mut unrelated = root.clone();
+    unrelated.plan.obligations[0].resource_id = "other".into();
+    assert!(!root_plan_is_scoped_to_released_resource(&unrelated));
+    let mut unrelated = root.clone();
+    unrelated.plan.mutation_domains[0].domain = "other-domain".into();
+    assert!(!root_plan_is_scoped_to_released_resource(&unrelated));
+}
