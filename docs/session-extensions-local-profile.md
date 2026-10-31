@@ -46,10 +46,8 @@ modules are trusted in-process code; routing grants are not a sandbox.
 This profile is an integration candidate. A verified signature and successful
 startup do not prove end-to-end session lifecycle, action execution, live capture,
 platform display changes, or recovery. The current display provider starts with
-effects disabled and its action list empty. Lifecycle currently uses the pinned
-bootstrap participant settings; it does not load settings saved through the
-registry, so changing a setting in the UI does not change a subsequent session.
-The profile has not yet been qualified for host startup with the final integrated
-binaries. Run the signed integration fixture
-and validate the relevant operating-system and hardware scenario before relying
+effects disabled and its action list empty. This profile requests registry-backed
+settings snapshots for sessions; saved-settings propagation and host startup
+with the final integrated binaries still need end-to-end qualification. Run the
+signed integration fixture and validate the relevant operating-system and hardware scenario before relying
 on those behaviors.

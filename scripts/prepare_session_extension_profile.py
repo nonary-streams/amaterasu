@@ -35,9 +35,9 @@ OPERATIONS = {
     RTSP: ["prepare_stream", "resume_stream", "lookup", "snapshot"],
     STREAM: ["validate_candidate", "ack_binding", "start_stream", "pause_stream", "retire_stream", "binding_validate", "capture_invalidated", "resource_invalidated", "issue_input_binding", "lookup"],
     INPUT: ["validate_input_binding", "reserve_input_action", "finish_input_action", "lookup_input_action"],
-    ACTIONS: ["authorize_action", "consume_action_permit", "begin_action_transition", "complete_action", "consume_input_reservation", "lookup"],
+    ACTIONS: ["authorize_action", "consume_action_permit", "begin_action_transition", "complete_action", "consume_input_reservation", "cancel_input_reservation", "lookup"],
     REGISTRY: ["resolve_settings_scope"],
-    PROVIDER: ["verify_provider_epoch", "verify_action_effect", "check_action_effect"],
+    PROVIDER: ["describe_action_target", "verify_provider_epoch", "verify_action_effect", "check_action_effect"],
 }
 
 
@@ -73,7 +73,7 @@ def prepare(bootstrap: dict, root: Path, descriptor: dict, descriptor_digest: st
         for identity in parent_chain
     }
     calls.update({
-        LIFECYCLE: ["amaterasu.launch/1", "amaterasu.input/1", PROVIDER_SERVICE,
+        LIFECYCLE: ["amaterasu.launch/1", "amaterasu.input/1", REGISTRY_SERVICE, PROVIDER_SERVICE,
                     STATE, "amaterasu.display/1", "amaterasu.virtual-display/1"],
         REGISTRY: [LIFECYCLE_SERVICE, STATE, PROVIDER_SERVICE],
         ACTIONS: [LIFECYCLE_SERVICE, REGISTRY_SERVICE, STATE, PROVIDER_SERVICE],
@@ -83,7 +83,7 @@ def prepare(bootstrap: dict, root: Path, descriptor: dict, descriptor_digest: st
         principal["call"] = sorted(set(principal.get("call", [])) | set(services))
     principals[CONSOLE]["call"] = sorted(set(principals[CONSOLE].get("call", [])) |
                                          {REGISTRY_SERVICE, ACTIONS_SERVICE, LIFECYCLE_SERVICE, STATE, PROVIDER_SERVICE})
-    validation_callers = [REGISTRY, MANAGEMENT, INPUT, STREAM, RTSP, NVHTTP, CONSOLE]
+    validation_callers = [REGISTRY, LIFECYCLE, MANAGEMENT, INPUT, STREAM, RTSP, NVHTTP, CONSOLE]
     for approval in approvals:
         if approval["method"]["method"] == "settings_validate":
             approval["callers"] = validation_callers
@@ -109,6 +109,7 @@ def prepare(bootstrap: dict, root: Path, descriptor: dict, descriptor_digest: st
         "journal_path": str(journal / "journal.json"),
         "trusted_callers": sorted(OPERATIONS), "session_delegates": [RTSP, STREAM],
         "input_actions": [], "action_service": ACTIONS, "settings_registry_caller": REGISTRY,
+        "settings_registry_service": REGISTRY_SERVICE,
         "operation_grants": OPERATIONS,
         "consumers": {"capture": [STREAM], "input": [STREAM, INPUT]},
         "consumer_requirements": {"execution_domain": "desktop", "capture_providers": ["amaterasu.capture-pipewire/1"],
