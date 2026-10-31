@@ -76,7 +76,18 @@ fn resolve_chain(
         .provider_graph
         .as_ref()
         .ok_or("provider_graph_missing")?;
+    let (epoch, session_id, Some(stream_id), generation) =
+        super::operations::target_parts(&work.target)?
+    else {
+        return Err("composition_target_invalid".into());
+    };
+    let session = journal.sessions.get(session_id).ok_or("unknown_session")?;
+    let stream = session.streams.get(stream_id).ok_or("unknown_stream")?;
     if work.phase != LifecyclePhase::StreamPrepare
+        || session.host_epoch != epoch
+        || stream.generation != generation
+        || serde_json::to_value(&stream.provider_graph).ok()
+            != serde_json::to_value(&work.provider_graph).ok()
         || work.target != selection.target
         || work.transition_id != selection.transition_id
         || work.index < work.providers.len()
@@ -210,6 +221,11 @@ fn resolve_chain(
             .ok_or("dependent_admission_missing")?;
         if admission.provider != *provider
             || admission.plan != *plan
+            || !session.admission_ids.contains(admission_id)
+            || session.admission_targets.get(admission_id) != Some(&work.target)
+            || session.admission_phases.get(admission_id) != Some(&work.phase)
+            || journal.admission_transitions.get(admission_id) != Some(&work.transition_id)
+            || state.request.admission_id.as_ref() != Some(admission_id)
             || state.request.approved_plan.as_ref() != Some(plan)
             || admission.selection.participant != state.participant
             || !admission.selection.approvals.iter().any(|approval| {
