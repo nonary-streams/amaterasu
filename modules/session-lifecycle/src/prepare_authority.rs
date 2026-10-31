@@ -1641,6 +1641,35 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
         self.persist(next)
     }
 
+    /// Atomically settle the exact consumed finalize permit and retain its
+    /// output admission. The caller's journal must persist authenticated result
+    /// evidence and the published candidate in the same write.
+    pub fn settle_finalize_and_finish_with_output(
+        &mut self,
+        provider: &str,
+        request: &ResourceFinalizeRequest,
+        resource: ResourceRef,
+    ) -> ModuleResult<()> {
+        struct Staged;
+        impl AuthorityJournal for Staged {
+            fn persist(&mut self, _: &AuthorityState) -> ModuleResult<()> {
+                Ok(())
+            }
+        }
+        if self.poisoned {
+            return Err("authority journal requires recovery".into());
+        }
+        let mut staged = CoordinatorPrepareAuthority {
+            state: self.state.clone(),
+            selections: self.selections.clone(),
+            journal: Staged,
+            poisoned: false,
+        };
+        staged.settle_finalize_permit(request)?;
+        staged.finish_admission_with_output(provider, &request.admission_id, resource)?;
+        self.persist(staged.state)
+    }
+
     fn persist(&mut self, next: AuthorityState) -> ModuleResult<()> {
         if self.poisoned {
             return Err("authority journal requires recovery".into());
@@ -2345,15 +2374,67 @@ mod tests {
                 .finish_admission("display", &request.admission_id)
                 .is_err()
         );
-        recovered.settle_finalize_permit(&request).unwrap();
+        let resource = ResourceRef {
+            provider: "display".into(),
+            resource_id: "output".into(),
+            incarnation: "native".into(),
+            revision: 2,
+            execution_domain: "seat".into(),
+            mutation_domains: ["topology".into()].into(),
+        };
+        let snapshots = recovered.journal.snapshots.len();
+        let mut wrong = resource.clone();
+        wrong.incarnation = "foreign".into();
+        assert!(
+            recovered
+                .settle_finalize_and_finish_with_output("display", &request, wrong)
+                .is_err()
+        );
+        assert_eq!(recovered.journal.snapshots.len(), snapshots);
         assert!(
             recovered
                 .validate_finalize_permit("display", &selected.participant, &context, &request)
+                .is_ok()
+        );
+        let mut failed = CoordinatorPrepareAuthority::new(
+            recovered.state.clone(),
+            vec![selected.clone()],
+            Journal {
+                fail: true,
+                ..Journal::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            failed
+                .settle_finalize_and_finish_with_output("display", &request, resource.clone())
                 .is_err()
         );
+        assert!(failed.state.admissions.contains_key(&request.admission_id));
+        assert!(
+            failed
+                .state
+                .finalize_permits
+                .get(&request.permit_id)
+                .is_some_and(|permit| !permit.settled)
+        );
         recovered
-            .finish_admission("display", &request.admission_id)
+            .settle_finalize_and_finish_with_output("display", &request, resource)
             .unwrap();
+        assert_eq!(recovered.journal.snapshots.len(), snapshots + 1);
+        assert!(
+            recovered
+                .state
+                .output_admissions
+                .contains(&request.admission_id)
+        );
+        assert!(recovered.state.settled.contains_key(&request.admission_id));
+        assert!(
+            !recovered
+                .state
+                .admissions
+                .contains_key(&request.admission_id)
+        );
     }
 
     #[test]
