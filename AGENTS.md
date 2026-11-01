@@ -1,5 +1,16 @@
 # Working on Amaterasu
 
+## Local worktrees
+
+- On this Linux host, create new Git worktrees at
+  `/run/media/chasep/ArchivedGames/worktrees/amaterasu/<worktree-name>`.
+  Verify ArchivedGames is mounted from UUID
+  `44b0381a-7a54-4be2-a13d-631a0026ab2b` before creating or building a
+  worktree; stop if it is unavailable rather than writing to the mountpoint.
+- Keep worktree build output on that volume, preferably inside the worktree;
+  set `CARGO_TARGET_DIR` there when needed. Preserve existing worktrees and
+  use the tests appropriate to the task.
+
 - Write readable Rust with descriptive domain names and normally formatted statements.
 - Keep functions focused on one operation. Extract validation, authorization, and
   persistence steps when a function starts mixing responsibilities.
