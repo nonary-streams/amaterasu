@@ -72,8 +72,23 @@ impl Drive for Plane {
     }
 }
 
-type Factory<'a> = dyn FnMut(Handles, &crate::providers::ProviderServices) -> Result<Box<dyn Drive>, &'static str>
+type Factory<'a> = dyn FnMut(
+        Handles,
+        &crate::providers::ProviderServices,
+        Option<&crate::plane::NegotiatedRoute>,
+    ) -> Result<Box<dyn Drive>, &'static str>
     + 'a;
+type Probe<'a> = dyn FnMut(
+        &crate::model::ExtensionRoute,
+        u64,
+        &crate::model::PrepareConfig,
+    ) -> Result<amaterasu_media::VideoFramingLimits, &'static str>
+    + 'a;
+
+struct NativeOperations<'a, 'b> {
+    factory: &'a mut Factory<'b>,
+    probe: &'a mut Probe<'b>,
+}
 
 pub struct Pipeline {
     settings: Settings,
@@ -272,9 +287,15 @@ impl Pipeline {
         self.tick_with(
             now,
             &mut |command| runtime.send_ephemeral(command),
-            &mut |handles, providers| {
-                Plane::new(runtime, handles, providers)
-                    .map(|plane| Box::new(plane) as Box<dyn Drive>)
+            &mut |handles, providers, route| {
+                match route {
+                    Some(route) => Plane::new_planned(runtime, handles, providers, route),
+                    None => Plane::new(runtime, handles, providers),
+                }
+                .map(|plane| Box::new(plane) as Box<dyn Drive>)
+            },
+            &mut |route, media, config| {
+                crate::plane::probe_extension_chain(runtime, route, media, config)
             },
         )
     }
@@ -284,6 +305,7 @@ impl Pipeline {
         now: u64,
         send: &mut Send<'_>,
         factory: &mut Factory<'_>,
+        probe: &mut Probe<'_>,
     ) -> ModuleResult<()> {
         if !self.journal.loaded {
             match self.journal.progress_load(send, now) {
@@ -318,7 +340,8 @@ impl Pipeline {
                 .records
                 .remove(&job.session)
                 .expect("owned workflow record");
-            let retain = self.advance(&mut record, &mut job, now, send, factory);
+            let mut operations = NativeOperations { factory, probe };
+            let retain = self.advance(&mut record, &mut job, now, send, &mut operations);
             self.records.insert(record.id, record);
             if retain {
                 self.job = Some(job);

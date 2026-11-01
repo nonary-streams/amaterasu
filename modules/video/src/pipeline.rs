@@ -457,7 +457,15 @@ pub struct Pipeline {
     operations: BTreeMap<(String, String), operations::Record>,
     portal: portal::Control,
     observations: observation::Control,
+    source_probes: VecDeque<SourceProbe>,
     pub queues: Arc<Mutex<Queues>>,
+}
+
+struct SourceProbe {
+    request: u64,
+    service: String,
+    source_id: u64,
+    configuration: Configuration,
 }
 
 fn initial_stage(provider: CaptureProvider, encoder: &EncoderSelection) -> Stage {
@@ -495,6 +503,7 @@ impl Pipeline {
             operations: BTreeMap::new(),
             portal: portal::Control::default(),
             observations: observation::Control::default(),
+            source_probes: VecDeque::new(),
             queues,
         }
     }
@@ -507,6 +516,44 @@ impl Pipeline {
         send: &mut Send<'_>,
     ) {
         match operation {
+            Operation::ProbeSource {
+                source_id,
+                encoder_provider,
+                configuration,
+            } => {
+                let registration = self.source_encoders.get(&encoder_provider);
+                let allowed = self.enabled
+                    && self.unit_service_enabled
+                    && configuration.validate_source()
+                    && registration.is_some_and(|registration| {
+                        registration.source_ids.contains(&source_id)
+                            && configuration
+                                .extension_profile
+                                .as_ref()
+                                .is_some_and(|profile| {
+                                    registration.extension_profiles.contains(profile)
+                                })
+                    });
+                if !allowed {
+                    rpc::complete(
+                        send,
+                        request,
+                        error("encoder_extension_profile_not_allowed"),
+                    );
+                } else if self.source_probes.len() >= 8 {
+                    rpc::complete(send, request, error("encoder_probe_queue_full"));
+                } else {
+                    self.source_probes.push_back(SourceProbe {
+                        request,
+                        service: registration
+                            .expect("checked registration")
+                            .control_service
+                            .clone(),
+                        source_id,
+                        configuration: *configuration,
+                    });
+                }
+            }
             Operation::SelectPortalSource {
                 source_type,
                 operation_id,
@@ -986,6 +1033,26 @@ impl Pipeline {
     pub fn tick(&mut self, plane: &mut dyn Plane, send: &mut Send<'_>) {
         self.portal.tick(send);
         self.observations.tick(&self.streams, send);
+        if let Some(probe) = self.source_probes.pop_front()
+            && matches!(
+                send(Command::CheckRequest {
+                    request: probe.request
+                }),
+                Ok(Response::Ok)
+            )
+        {
+            let payload = match plane.probe_source(
+                &probe.service,
+                probe.source_id,
+                &probe.configuration,
+            ) {
+                Ok(()) => {
+                    json!({"ok":true,"source_id":probe.source_id,"profile":probe.configuration.extension_profile})
+                }
+                Err(code) => error(code),
+            };
+            rpc::complete(send, probe.request, payload);
+        }
         if self.streams.is_empty() {
             return;
         }
@@ -3193,8 +3260,12 @@ fn accept_encoder(stream: &mut Stream, payload: &Value) -> bool {
         stream.cleanup("resource_clock_unconfirmed");
         return false;
     }
-    if payload.get("codec").and_then(Value::as_str) != Some(codec_name(stream.configuration.codec))
-    {
+    let codec_matches = if let Some(profile) = &stream.configuration.extension_profile {
+        payload.get("extension_profile") == Some(&json!(profile))
+    } else {
+        payload.get("codec").and_then(Value::as_str) == Some(codec_name(stream.configuration.codec))
+    };
+    if !codec_matches {
         stream.cleanup("encoder_codec_mismatch");
         return false;
     }

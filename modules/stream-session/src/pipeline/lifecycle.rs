@@ -9,7 +9,7 @@ impl Pipeline {
         job: &mut Job,
         now: u64,
         send: &mut Send<'_>,
-        factory: &mut Factory<'_>,
+        operations: &mut NativeOperations<'_, '_>,
     ) -> bool {
         if !job.cleanup && record.state == State::Stopping && record.outcome == State::Failed {
             job.fail(record, record.error.unwrap_or("media_failed"), now);
@@ -53,6 +53,11 @@ impl Pipeline {
                     return true;
                 }
                 rpc::Progress::Unresolved => {
+                    if job.step == Step::ProbeExtensionSource {
+                        let _ = pending.shutdown(send);
+                        record.extension_checked = true;
+                        return self.deliver_success(record, job, now, send);
+                    }
                     if job.step == Step::PersistJournal {
                         self.journal.failed = true;
                         self.recovery_blocked = true;
@@ -109,7 +114,8 @@ impl Pipeline {
                 rpc::Progress::Result(payload) => {
                     if matches!(
                         job.step,
-                        Step::ValidateLifecycleCandidate
+                        Step::ProbeExtensionSource
+                            | Step::ValidateLifecycleCandidate
                             | Step::ObserveLifecycleCapture
                             | Step::AckLifecycleCapture
                             | Step::StartLifecycle
@@ -125,9 +131,13 @@ impl Pipeline {
                         job.pending = Some(pending);
                         return true;
                     }
-                    return self.consume(record, job, payload, now, send, factory);
+                    return self.consume(record, job, payload, now, send, operations);
                 }
                 rpc::Progress::Failed => {
+                    if job.step == Step::ProbeExtensionSource {
+                        record.extension_checked = true;
+                        return self.deliver_success(record, job, now, send);
+                    }
                     if matches!(
                         job.step,
                         Step::ObserveActiveBinding | Step::ValidateActiveBinding
@@ -424,8 +434,20 @@ impl Pipeline {
         payload: Value,
         now: u64,
         send: &mut Send<'_>,
-        factory: &mut Factory<'_>,
+        operations: &mut NativeOperations<'_, '_>,
     ) -> bool {
+        if job.step == Step::ProbeExtensionSource {
+            record.extension_checked = true;
+            if let Some(route) = &record.extension_route
+                && payload["ok"] == true
+                && payload["source_id"].as_u64() == Some(route.source_id)
+                && payload["profile"] == json!(route.profile)
+                && let Some(media) = record.resources.get(&Resource::Media)
+            {
+                record.extension_limits = (operations.probe)(route, *media, &record.config).ok();
+            }
+            return self.deliver_success(record, job, now, send);
+        }
         if job.step == Step::PersistJournal {
             let Some(document) = job.journal_document.take() else {
                 self.journal.failed = true;
@@ -817,7 +839,11 @@ impl Pipeline {
             Step::Open(resource) => {
                 let result = self.opened(record, job, resource, &payload, now, send);
                 if result.is_ok() && resource == Resource::Video && !record.config.stream_audio {
-                    record.plane = Some(factory(record.handles()?, &record.providers)?);
+                    record.plane = Some((operations.factory)(
+                        record.handles()?,
+                        &record.providers,
+                        record.negotiated_route.as_ref(),
+                    )?);
                 }
                 result
             }
@@ -866,7 +892,21 @@ impl Pipeline {
                     {
                         return Err("display_lease_missing");
                     }
-                    job.step = Step::ConfigureMediaVideoFormat;
+                    job.step = if record
+                        .start
+                        .as_ref()
+                        .is_some_and(|start| start.configuration.extension_profile.is_some())
+                    {
+                        if record.config.frame_limiter_settings.is_some()
+                            && !record.limiter_attempted
+                        {
+                            Step::ApplyLimiter
+                        } else {
+                            Step::AcquireOutput
+                        }
+                    } else {
+                        Step::ConfigureMediaVideoFormat
+                    };
                     Ok(true)
                 } else if status["state"] == "discovering" {
                     if record.state == State::Armed {
@@ -907,7 +947,11 @@ impl Pipeline {
             }
             Step::AcquireAudio => {
                 require_lease(record, &payload, true)?;
-                record.plane = Some(factory(record.handles()?, &record.providers)?);
+                record.plane = Some((operations.factory)(
+                    record.handles()?,
+                    &record.providers,
+                    record.negotiated_route.as_ref(),
+                )?);
                 job.step = Step::Activate;
                 Ok(true)
             }
@@ -1212,6 +1256,7 @@ impl Pipeline {
                 if payload["state"] != "running" || payload["packet_boundaries"] != true {
                     return Err("video_not_running");
                 }
+                record.accept_negotiated_unit(payload)?;
                 configure_absolute_input(record, payload)?;
                 job.step = if record
                     .start
@@ -1254,6 +1299,21 @@ impl Pipeline {
         now: u64,
         send: &mut Send<'_>,
     ) -> bool {
+        if record.state == State::Prepared
+            && !record.extension_checked
+            && record.extension_route.is_some()
+        {
+            if record
+                .config
+                .extension_probe
+                .as_ref()
+                .is_some_and(|config| config.valid_extension_probe())
+            {
+                job.step = Step::ProbeExtensionSource;
+                return true;
+            }
+            record.extension_checked = true;
+        }
         if job.request.is_none() && record.armed_accepted {
             return false;
         }

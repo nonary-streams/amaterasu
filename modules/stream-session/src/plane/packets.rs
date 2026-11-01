@@ -153,7 +153,7 @@ impl AudioPacket {
 
 /// Exact video-unit selection supplied by trusted session composition.
 #[derive(Clone, Copy)]
-pub(super) struct VideoUnitSelection {
+pub(crate) struct VideoUnitSelection {
     pub stream: u64,
     pub generation: u64,
     pub offer_id: u64,

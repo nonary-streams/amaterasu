@@ -261,7 +261,10 @@ unsafe extern "C" fn receive_chunk(
     // SAFETY: receive supplies this context for the duration of the synchronous callback.
     let call = unsafe { &mut *context.cast::<ReceiveCall<'_>>() };
     call.calls += 1;
-    if call.calls != 1 || chunk.is_null() {
+    if call.calls != 1
+        || chunk.is_null()
+        || !(chunk as usize).is_multiple_of(align_of::<EncoderOutputChunk>())
+    {
         call.callback_status = Some(STATUS_INVALID_ARGUMENT);
         return STATUS_INVALID_ARGUMENT;
     }

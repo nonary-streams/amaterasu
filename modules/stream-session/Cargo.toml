@@ -24,3 +24,5 @@ workspace = true
 
 [dev-dependencies]
 amaterasu-runtime = { path = "../../crates/runtime" }
+amaterasu-media-transport = { path = "../media-transport", features = ["test-support"] }
+amaterasu-video = { path = "../video", features = ["test-support"] }

@@ -6,6 +6,9 @@ mod plane;
 mod queue;
 mod rpc;
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
 use model::{Operation, Settings, error};
 use pipeline::Pipeline;
@@ -148,4 +151,5 @@ impl Drop for Video {
     }
 }
 
+#[cfg(not(feature = "test-support"))]
 amaterasu_module_sdk::export_module!(Video);

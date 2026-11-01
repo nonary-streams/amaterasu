@@ -41,7 +41,12 @@ unsafe extern "C" fn bind(
     output: *mut *const NativeInterface,
 ) -> Status {
     catch_unwind(AssertUnwindSafe(|| {
-        if context.is_null() || query.is_null() || output.is_null() {
+        if context.is_null()
+            || query.is_null()
+            || output.is_null()
+            || !(query as usize).is_multiple_of(align_of::<NativeInterfaceQuery>())
+            || !(output as usize).is_multiple_of(align_of::<*const NativeInterface>())
+        {
             return STATUS_INVALID_ARGUMENT;
         }
         // SAFETY: runtime supplies live query, principal and writable output.

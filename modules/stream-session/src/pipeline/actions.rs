@@ -144,7 +144,9 @@ impl Pipeline {
             rpc::complete(send, request, error(code));
             return;
         }
-        if config.lifecycle_session_target.is_some() && owner != "amaterasu.rtsp" {
+        if (config.lifecycle_session_target.is_some() || config.extension_probe.is_some())
+            && owner != "amaterasu.rtsp"
+        {
             rpc::complete(send, request, error("permission_denied"));
             return;
         }
@@ -198,6 +200,13 @@ impl Pipeline {
             .map(|_| self.settings.enable_input);
         let mut record = Record::new(id, owner, config, self.settings.input_lease_ttl_ms);
         record.providers = self.settings.providers.clone();
+        if record.config.extension_probe.is_some()
+            && record.config.display_request.is_none()
+            && record.config.virtual_display_intent.is_none()
+            && record.config.lifecycle_session_target.is_none()
+        {
+            record.extension_route = self.settings.extension_route.clone();
+        }
         record.lifecycle_input_required = lifecycle_input_required;
         self.records.insert(id, record);
         self.job = Some(Job::new(
@@ -236,6 +245,34 @@ impl Pipeline {
             rpc::complete(send, request, error("session_not_found"));
             return;
         };
+        if let Some(profile) = configuration.configuration.extension_profile.clone() {
+            let Some(route) = record.extension_route.as_ref().filter(|route| {
+                owner == "amaterasu.rtsp"
+                    && configuration.client_feature_flags.is_some()
+                    && record.extension_limits.is_some()
+                    && route.profile == profile
+            }) else {
+                rpc::complete(send, request, error("extension_profile_not_offered"));
+                return;
+            };
+            let mut expected = record
+                .config
+                .extension_probe
+                .clone()
+                .expect("offered profile has probe configuration");
+            expected.extension_profile = Some(profile);
+            if configuration.configuration != expected
+                || configuration.source_id.is_some()
+                || configuration.encoder_provider.is_some()
+                || configuration.encoder_options.is_some()
+            {
+                rpc::complete(send, request, error("extension_configuration_mismatch"));
+                return;
+            }
+            configuration.source_id = Some(route.source_id);
+            configuration.encoder_provider = Some(route.encoder_provider.clone());
+            configuration.encoder = route.encoder.clone();
+        }
         match (
             &record.config.lifecycle_session_target,
             &configuration.lifecycle_target,
@@ -298,7 +335,9 @@ impl Pipeline {
             rpc::complete(send, request, error("audio_configuration_mismatch"));
             return;
         }
-        if !configuration.matches_prepared_codec(&record.config) {
+        if configuration.configuration.extension_profile.is_none()
+            && !configuration.matches_prepared_codec(&record.config)
+        {
             rpc::complete(send, request, error("video_codec_mismatch"));
             return;
         }

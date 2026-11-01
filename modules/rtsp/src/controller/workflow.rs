@@ -343,20 +343,46 @@ impl Controller {
                 .config
                 .validate(self.settings.allow_remote)
                 .map_err(|_| "invalid_prepare_response")?;
-            let negotiation = Negotiation::new(
-                TrustedLaunch {
-                    epoch: record.id,
-                    rtsp_target: record.url.clone(),
-                    session_token: record.session_token.clone(),
-                    encrypted_rtsp: true,
-                    audio_port: audio,
-                    video_port: video,
-                    control_port: control,
-                    control_connect_data: record.config.connect_data,
-                    udp_discovery: record.udp_discovery.clone(),
-                },
-                record.capabilities(),
-            )
+            let launch = TrustedLaunch {
+                epoch: record.id,
+                rtsp_target: record.url.clone(),
+                session_token: record.session_token.clone(),
+                encrypted_rtsp: true,
+                audio_port: audio,
+                video_port: video,
+                control_port: control,
+                control_connect_data: record.config.connect_data,
+                udp_discovery: record.udp_discovery.clone(),
+            };
+            let profile = if self.settings.extension_enabled
+                && !record.config.profile.hdr
+                && record.config.profile.max_reference_frames == 0
+                && record.config.min_threads == 2
+                && record.config.qp == 28
+                && record.config.lifecycle_session_target.is_none()
+                && !record.config.display_admission_required()
+            {
+                serde_json::from_value::<amaterasu_contracts::media_profile::VideoProfile>(
+                    payload["extension_profile"].clone(),
+                )
+                .ok()
+                .filter(|profile| profile.is_valid())
+            } else {
+                None
+            };
+            let negotiation = if let Some(profile) = &profile {
+                let snapshot = amaterasu_contracts::media_profile::VideoProfileSnapshot {
+                    profiles: vec![profile.clone()],
+                };
+                Negotiation::with_video_profiles(
+                    launch,
+                    record.capabilities(),
+                    snapshot.clone(),
+                    snapshot,
+                )
+            } else {
+                Negotiation::new(launch, record.capabilities())
+            }
             .map_err(|_| "invalid_prepare_response")?;
             self.transport.as_mut().ok_or("disabled")?.add_ticket(
                 record.id,
@@ -364,6 +390,7 @@ impl Controller {
                 &key,
             )?;
             record.session = Some(session);
+            record.extension_offer = profile;
             record.negotiation = Some(negotiation);
             record.needs_lookup = false;
             record.stream_state = Some("prepared".into());

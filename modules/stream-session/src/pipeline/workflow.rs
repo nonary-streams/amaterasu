@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Step {
     Open(Resource),
+    ProbeExtensionSource,
     Authenticate,
     ConfirmControlDisconnect,
     MediaReady,
@@ -388,6 +389,25 @@ impl Job {
                 record.service(Resource::Control),
                 json!({"action":"status","stream":record.resources[&Resource::Control]}),
             ),
+            Step::ProbeExtensionSource => {
+                let route = record
+                    .extension_route
+                    .as_ref()
+                    .expect("selected extension route");
+                let mut configuration = json!(
+                    record
+                        .config
+                        .extension_probe
+                        .as_ref()
+                        .expect("selected probe")
+                );
+                configuration["extension_profile"] = json!(route.profile);
+                (
+                    record.service(Resource::Video),
+                    json!({"action":"probe_source", "source_id":route.source_id,
+                    "encoder_provider":route.encoder_provider,"configuration":configuration}),
+                )
+            }
             Step::MediaReady => (
                 record.service(Resource::Media),
                 json!({"action":"status","stream":record.resources[&Resource::Media]}),

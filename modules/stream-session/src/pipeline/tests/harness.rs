@@ -147,6 +147,8 @@ pub struct Broker {
     pub state_revision: u64,
     pub state_value: Option<Value>,
     pub state_fail_set: bool,
+    pub extension_probe_supported: bool,
+    pub extension_bad_unit: bool,
 }
 
 impl Broker {
@@ -429,6 +431,13 @@ impl Broker {
         }
         let action = call.payload["action"].as_str().unwrap();
         let service = call.service.as_str();
+        if service == "amaterasu.video/1" && action == "probe_source" {
+            return if self.extension_probe_supported {
+                json!({"ok":true,"source_id":call.payload["source_id"],"profile":call.payload["configuration"]["extension_profile"]})
+            } else {
+                error("encoder_probe_failed")
+            };
+        }
         if service == "amaterasu.video/1" && action == "observe_capture" {
             let observation=self.lifecycle_observation_override.clone().unwrap_or_else(|| json!({"protocol":"wayland-wl-output","registry_global":4,"output_name":"Virtual-12"}));
             return json!({"ok":true,"stream":call.payload["stream"],"observed_capture":observation});
@@ -1216,6 +1225,14 @@ impl Broker {
             }
             "amaterasu.video/1" => {
                 let mut reply = json!({"ok":true,"stream":id,"state":if allocation.state=="closing" {"closing"} else {"running"},"packet_boundaries":true});
+                if let Some(profile) =
+                    allocation.request["configuration"]["extension_profile"].as_object()
+                {
+                    reply["negotiated_unit"] = json!({"stream":id,"generation":id,"offer_id":profile["wire_selector"],
+                        "source_id":if self.extension_bad_unit { 99 } else { allocation.request["source_id"].as_u64().unwrap() },
+                        "config_generation":1,"codec":profile["codec"],"framing":profile["framing"],
+                        "clock_epoch":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"clock_origin_us":100});
+                }
                 if let Some(geometry) = &self.desktop_geometry {
                     reply["desktop_geometry"] = geometry.clone();
                 }
@@ -1246,6 +1263,7 @@ pub struct PlaneState {
     pub stopping: bool,
     pub desktop_geometry: Option<amaterasu_media::CaptureGeometry>,
     pub ticks: usize,
+    pub planned_planes: usize,
     pub media_ticks: usize,
     pub media_ticks_when_stopped: Option<usize>,
     pub dropped: usize,
@@ -1332,6 +1350,7 @@ pub struct Harness {
     pub broker: Broker,
     pub plane: Rc<RefCell<PlaneState>>,
     pub now: u64,
+    pub extension_probe_limits: Option<amaterasu_media::VideoFramingLimits>,
 }
 impl Harness {
     pub fn new() -> Self {
@@ -1352,6 +1371,7 @@ impl Harness {
             broker,
             plane: Rc::new(RefCell::new(plane_state)),
             now: 0,
+            extension_probe_limits: None,
         }
     }
     pub fn with_restart_state(document: Value, revision: u64) -> Self {
@@ -1369,11 +1389,18 @@ impl Harness {
         self.now += 1;
         self.broker.now = self.now;
         let state = self.plane.clone();
+        let probe_limits = self.extension_probe_limits;
         self.pipeline
             .tick_with(
                 self.now,
                 &mut |command| self.broker.send(command),
-                &mut |_, _| Ok(Box::new(FakePlane(state.clone()))),
+                &mut |_, _, route| {
+                    if route.is_some() {
+                        state.borrow_mut().planned_planes += 1;
+                    }
+                    Ok(Box::new(FakePlane(state.clone())))
+                },
+                &mut |_, _, _| probe_limits.ok_or("unsupported"),
             )
             .unwrap();
     }

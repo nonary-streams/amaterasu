@@ -13,6 +13,7 @@ fn bound_native_tables_isolate_owners_and_remain_closed_after_shutdown() {
         enabled: true,
         allow_remote: false,
         allowed_principals: vec!["owner".into()],
+        ..Default::default()
     })));
     let id = shared
         .lock()

@@ -158,6 +158,9 @@ pub trait Plane {
     /// Select the trusted service for the stream currently being advanced.
     fn select_encoder(&mut self, _: &str) {}
     fn set_stream_clock(&mut self, _: u64, _: u64, _: [u8; 16]) {}
+    fn probe_source(&mut self, _: &str, _: u64, _: &Configuration) -> Result<(), &'static str> {
+        Err("encoder_source_unavailable")
+    }
     fn start_source(
         &mut self,
         _: u64,
@@ -662,6 +665,25 @@ unsafe extern "C" fn packet(context: *mut c_void, packet: *const EncodedPacket) 
 }
 
 impl Plane for NativePlane {
+    fn probe_source(
+        &mut self,
+        service: &str,
+        source_id: u64,
+        configuration: &Configuration,
+    ) -> Result<(), &'static str> {
+        let binding = self
+            .source_encoders
+            .get(service)
+            .ok_or("encoder_source_unavailable")?;
+        // SAFETY: the runtime retains the provider table while the probe runs.
+        let api =
+            unsafe { binding.table::<EncoderProviderApi>() }.map_err(|_| "encoder_interface")?;
+        if !encoder_provider_available(api.base.header) {
+            return Err("encoder_interface");
+        }
+        // SAFETY: the selected binding remains live through this synchronous probe.
+        unsafe { source::Source::probe(api, source_id, configuration) }
+    }
     fn select_encoder(&mut self, service: &str) {
         debug_assert!(
             self.encoders.contains_key(service) || self.source_encoders.contains_key(service)

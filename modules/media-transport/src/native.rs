@@ -1,4 +1,5 @@
 use crate::controller::Controller;
+pub mod plan;
 use amaterasu_media::{
     EncodedAudioPacket, EncodedPacket, INTERFACE_MAJOR, INTERFACE_MINOR, MEDIA_BACKEND_ERROR,
     MEDIA_BUSY, MEDIA_UNSUPPORTED, MediaTransportApi,

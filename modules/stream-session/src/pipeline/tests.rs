@@ -11,6 +11,79 @@ use super::*;
 use harness::*;
 
 #[test]
+fn extension_offer_requires_source_and_downstream_probes_then_selects_the_planned_plane() {
+    use amaterasu_media::*;
+    let profile = json!({"codec":{"namespace_id":7,"value":8,"schema":1},
+        "framing":{"namespace_id":7,"value":9,"schema":1},"wire_selector":4,
+        "payload_type":100,"encoding_name":"EXAMPLE"});
+    let route: crate::model::ExtensionRoute = serde_json::from_value(json!({"profile":profile,
+        "source_id":42,"encoder_provider":"fixture", "encoder":{"clsid":"source","friendly_name":"Source","hardware_url":null},
+        "video_unit_service":"example.units/1","framer_service":"example.framer/1","plan_transport_service":"example.plan/1"})).unwrap();
+    let limits = VideoFramingLimits {
+        size: size_of::<VideoFramingLimits>() as u32,
+        version: VIDEO_FRAMING_LIMITS_VERSION,
+        packet_size: 1024,
+        crypto_overhead: 16,
+        network_overhead: 28,
+        allowed_extensions: 0,
+        max_datagrams: 64,
+        max_queue_bytes: 65536,
+        min_parity_shards: 2,
+        max_fec_percentage: 255,
+        max_wire_bytes: 65536,
+        min_fec_percentage: 20,
+        max_fec_blocks: 1,
+        fec_policy_flags: 0,
+        reserved: 0,
+    };
+    for (source_ok, downstream_ok, expected_offer) in [
+        (false, true, false),
+        (true, false, false),
+        (true, true, true),
+    ] {
+        let mut host = Harness::new();
+        host.pipeline.settings.allowed_principals = vec!["amaterasu.rtsp".into()];
+        host.pipeline.settings.extension_route = Some(route.clone());
+        host.broker.extension_probe_supported = source_ok;
+        host.extension_probe_limits = downstream_ok.then_some(limits);
+        let mut request = prepare();
+        request["stream_audio"] = json!(false);
+        request["extension_probe"] = start(0)["configuration"]["configuration"].clone();
+        let prepared = host.response_from(1, "amaterasu.rtsp", request);
+        assert_eq!(!prepared["extension_profile"].is_null(), expected_offer);
+        let session = prepared["session"].as_u64().unwrap();
+        let mut request = start(session);
+        request["configuration"]["client_feature_flags"] = json!(0);
+        request["configuration"]["configuration"]["extension_profile"] = profile.clone();
+        let result = host.response_from(2, "amaterasu.rtsp", request);
+        if expected_offer {
+            assert_eq!(result["state"], "active");
+            assert_eq!(host.plane.borrow().planned_planes, 1);
+            let video = host
+                .broker
+                .calls
+                .iter()
+                .find(|call| {
+                    call.service == "amaterasu.video/1" && call.payload["action"] == "open"
+                })
+                .unwrap();
+            assert_eq!(video.payload["source_id"], 42);
+            assert_eq!(video.payload["configuration"]["extension_profile"], profile);
+            assert!(
+                !host
+                    .broker
+                    .calls
+                    .iter()
+                    .any(|call| call.payload["action"] == "configure_video_format")
+            );
+        } else {
+            assert_eq!(result["code"], "extension_profile_not_offered");
+            assert_eq!(host.plane.borrow().planned_planes, 0);
+        }
+    }
+}
+
+#[test]
 fn authenticated_control_disconnect_is_confirmed_on_exact_owned_stream() {
     for (reason, expected, wrong_stream, plane_error) in [
         (

@@ -241,6 +241,10 @@ impl Runtime {
                             .and_then(Value::as_str)
                             .unwrap_or("h264")
                             .into();
+                        if payload["configuration"]["extension_profile"].is_object() {
+                            result["extension_profile"] =
+                                payload["configuration"]["extension_profile"].clone();
+                        }
                         if !self.omit_reference_metadata {
                             result["max_reference_frames"] =
                                 payload["configuration"]["max_reference_frames"].clone();
@@ -262,6 +266,10 @@ impl Runtime {
                         .and_then(Value::as_str)
                         .unwrap_or("h264")
                         .into();
+                    if payload["configuration"]["extension_profile"].is_object() {
+                        result["extension_profile"] =
+                            payload["configuration"]["extension_profile"].clone();
+                    }
                     if !self.omit_reference_metadata {
                         result["max_reference_frames"] =
                             payload["configuration"]["max_reference_frames"].clone();

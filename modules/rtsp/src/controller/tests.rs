@@ -395,6 +395,8 @@ fn record(state: State) -> Record {
         client_feature_flags: None,
         negotiated_color: None,
         negotiated_video: None,
+        extension_offer: None,
+        extension_announce: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
         session_token: "00112233445566778899aabbccddeeff".into(),
         udp_discovery: None,
@@ -1119,6 +1121,8 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         client_feature_flags: None,
         negotiated_color: None,
         negotiated_video: None,
+        extension_offer: None,
+        extension_announce: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
         session_token: "00112233445566778899aabbccddeeff".into(),
         udp_discovery: None,
@@ -1907,6 +1911,118 @@ fn announced_profile_record() -> (Record, Announce) {
         profile.fec_percentage = repair_percent as u8;
     }
     (record, announce)
+}
+
+#[test]
+fn accepted_extension_announce_preserves_profile_and_rejects_changed_probe_parameters() {
+    use amaterasu_contracts::media_profile::{FormatId, VideoProfile, VideoProfileSnapshot};
+    let (mut record, _) = announced_profile_record();
+    record.config.profile.max_reference_frames = 0;
+    let profile = VideoProfile {
+        codec: FormatId {
+            namespace_id: 7,
+            value: 8,
+            schema: 1,
+        },
+        framing: FormatId {
+            namespace_id: 7,
+            value: 9,
+            schema: 1,
+        },
+        wire_selector: 4,
+        payload_type: 100,
+        encoding_name: "EXAMPLE".into(),
+    };
+    let snapshot = VideoProfileSnapshot {
+        profiles: vec![profile.clone()],
+    };
+    let announcement =
+        include_str!("../../../../crates/gamestream/src/sdp/fixtures/moonlight-h264.sdp")
+            .replace(
+                "x-ss-general.encryptionEnabled:0",
+                "x-ss-general.encryptionEnabled:7",
+            )
+            .replace(
+                "x-nv-vqos[0].bitStreamFormat:0",
+                "x-nv-vqos[0].bitStreamFormat:4",
+            )
+            .replace(
+                "x-nv-video[0].maxNumReferenceFrames:1",
+                "x-nv-video[0].maxNumReferenceFrames:0",
+            );
+    let mut announce =
+        amaterasu_gamestream::sdp::parse_profile_announce(announcement.as_bytes(), &snapshot)
+            .unwrap();
+    assert!(!record.accept_extension_announce(&announce));
+    record.extension_offer = Some(profile.clone());
+    assert!(record.accept_extension_announce(&announce));
+    let payload = record.authenticated_start_payload(23).unwrap();
+    assert_eq!(
+        payload["configuration"]["configuration"]["extension_profile"],
+        json!(profile)
+    );
+    assert_eq!(
+        payload["configuration"]["client_feature_flags"],
+        announce.client_feature_flags
+    );
+    announce.video.width += 2;
+    assert!(!record.accept_extension_announce(&announce));
+    assert!(record.authenticated_start_payload(23).is_none());
+}
+
+#[test]
+fn prepared_controller_advertises_only_the_preflighted_extension() {
+    let _guard = NETWORK_TEST_LOCK.lock().unwrap();
+    let profile = json!({"codec":{"namespace_id":7,"value":8,"schema":1},
+        "framing":{"namespace_id":7,"value":9,"schema":1},"wire_selector":4,
+        "payload_type":100,"encoding_name":"EXAMPLE"});
+    for (offered, reference_frames, expected) in
+        [(false, 0, false), (true, 0, true), (true, 1, false)]
+    {
+        let settings: Settings = serde_json::from_value(json!({"enabled":true,"extension_enabled":true,"bind":"127.0.0.1:0","allowed_principals":["caller"]})).unwrap();
+        let mut controller = Controller::new(settings).unwrap();
+        let (mut record, _) = announced_profile_record();
+        record.config.profile.max_reference_frames = reference_frames;
+        record.state = State::Preparing;
+        let job = Job {
+            ticket: record.id,
+            phase: Phase::Prepare,
+            call: Call::new(json!({"action":"prepare"}), "prepare".into(), Some(19)),
+            caller: Some(19),
+            network: None,
+            deadline: 5000,
+        };
+        let prepared = json!({"ok":true,"state":"prepared","session":23,
+            "audio_local":"127.0.0.1:51000","video_local":"127.0.0.1:51002","control_local":"127.0.0.1:51004",
+            "extension_profile":if offered { profile.clone() } else { Value::Null }});
+        let mut endpoint = Endpoint {
+            active_request: true,
+            ..Endpoint::default()
+        };
+        let runtime = client(&mut endpoint);
+        controller.prepared(&mut record, job, &prepared, 10, &runtime);
+        assert_eq!(record.state, State::Ready);
+        let target = record.url.clone();
+        let negotiation = record.negotiation.as_mut().unwrap();
+        negotiation
+            .handle(record.id, &request(Method::Options, &target, 1, false))
+            .unwrap();
+        let mut describe = request(Method::Describe, &target, 2, false);
+        describe
+            .headers
+            .push(("accept".into(), "application/sdp".into()));
+        let NegotiationStep::Reply(description) = negotiation.handle(record.id, &describe).unwrap()
+        else {
+            panic!("describe")
+        };
+        assert_eq!(
+            String::from_utf8(description)
+                .unwrap()
+                .contains("EXAMPLE/90000"),
+            expected
+        );
+        assert_eq!(record.extension_offer.is_some(), expected);
+    }
 }
 
 #[test]

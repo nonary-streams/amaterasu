@@ -7,6 +7,7 @@ rust-version.workspace = true
 crate-type = ["cdylib", "rlib"]
 [features]
 linux-ffmpeg-convert = []
+test-support = []
 [dependencies]
 amaterasu-contracts.workspace = true
 amaterasu-module-sdk.workspace = true

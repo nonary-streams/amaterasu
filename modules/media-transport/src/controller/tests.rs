@@ -8,6 +8,7 @@ fn controller() -> Controller {
         enabled: true,
         allow_remote: false,
         allowed_principals: vec!["owner".into(), "other".into()],
+        ..Default::default()
     })
 }
 

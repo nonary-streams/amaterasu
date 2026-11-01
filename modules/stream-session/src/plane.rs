@@ -9,9 +9,8 @@ use amaterasu_gamestream::control::{
 };
 use amaterasu_media::*;
 use amaterasu_module_sdk::RuntimeClient;
-use packets::{
-    AudioPacket, PcmPacket, VideoAssembly, VideoPacket, VideoUnitPacket, VideoUnitSelection,
-};
+pub(crate) use packets::VideoUnitSelection;
+use packets::{AudioPacket, PcmPacket, VideoAssembly, VideoPacket, VideoUnitPacket};
 use std::collections::VecDeque;
 
 pub type PlaneResult<T> = Result<T, &'static str>;
@@ -52,6 +51,25 @@ pub struct Handles {
     pub audio_channels: u32,
     /// ABI codec identifier of the negotiated video codec.
     pub video_codec: u32,
+}
+
+#[derive(Clone)]
+pub(crate) struct NegotiatedRoute {
+    pub video_service: String,
+    pub framer_service: String,
+    pub transport_service: String,
+    pub selection: VideoUnitSelection,
+    pub clock_origin_us: u64,
+    pub limits: VideoFramingLimits,
+}
+
+pub(crate) fn probe_extension_chain(
+    runtime: &RuntimeClient,
+    route: &crate::model::ExtensionRoute,
+    media: u64,
+    config: &crate::model::PrepareConfig,
+) -> PlaneResult<VideoFramingLimits> {
+    native::probe_chain(runtime, route, media, config)
 }
 
 #[derive(Debug)]
@@ -104,6 +122,23 @@ impl Plane {
                 handles.video_codec,
             ),
         })
+    }
+
+    pub(crate) fn new_planned(
+        runtime: &RuntimeClient,
+        handles: Handles,
+        providers: &crate::providers::ProviderServices,
+        route: &NegotiatedRoute,
+    ) -> PlaneResult<Self> {
+        let backend = native::NativeBackend::new_planned(runtime, handles, providers, route)?;
+        let mut pump = Pump::with_media(
+            backend,
+            handles.stream_audio,
+            handles.audio_channels,
+            handles.video_codec,
+        );
+        pump.negotiated_video = Some(route.selection);
+        Ok(Self { pump })
     }
 
     /// This entry is not exposed by production admission until the caller has

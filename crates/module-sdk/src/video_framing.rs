@@ -10,6 +10,34 @@ use std::{
 pub const FRAMING_CONTRACT: &str = "amaterasu.video-framing.native/2";
 pub const VIDEO_UNIT_CONTRACT: &str = "amaterasu.video-unit.native/1";
 pub const VIDEO_TRANSPORT_CONTRACT: &str = "amaterasu.video-unit-transport.native/1";
+pub const VIDEO_PLAN_TRANSPORT_CONTRACT: &str = "amaterasu.video-plan-transport.native/1";
+
+/// # Safety
+/// Factory implements the exact plan-transport table and outlives bindings.
+pub unsafe fn register_plan_transport(
+    runtime: &RuntimeClient,
+    service: &str,
+    factory: &NativeServiceFactory,
+) -> ModuleResult<()> {
+    unsafe { runtime.register_native_typed(service, VIDEO_PLAN_TRANSPORT_CONTRACT, factory) }
+}
+
+/// # Safety
+/// Runtime and provider outlive the binding and all synchronous calls.
+pub unsafe fn bind_plan_transport(
+    runtime: &RuntimeClient,
+    service: &str,
+) -> ModuleResult<NativeBinding> {
+    unsafe {
+        runtime.bind_native_typed(
+            service,
+            VIDEO_PLAN_TRANSPORT_CONTRACT,
+            1,
+            0,
+            size_of::<NegotiatedVideoPlanTransportApi>() as u32,
+        )
+    }
+}
 
 /// Owned output is borrowed to the host only during the plan callback.
 pub struct OwnedFramePlan {
@@ -22,6 +50,16 @@ pub struct OwnedFramePlan {
 /// Providers authorize the stream in their own binding and implement a pure,
 /// retry-safe plan operation. They may not retain the input or limits.
 pub trait FramingProvider: Send + Sync + 'static {
+    /// Default denies production advertisement until explicitly implemented.
+    fn probe(
+        &self,
+        _principal: &str,
+        _codec: EncoderFormatId,
+        _framing: EncoderFormatId,
+        _limits: &VideoFramingLimits,
+    ) -> Result<(), Status> {
+        Err(MEDIA_UNSUPPORTED)
+    }
     fn plan(
         &self,
         principal: &str,
@@ -36,7 +74,7 @@ pub struct Factory<P: FramingProvider> {
     provider: Arc<P>,
 }
 struct Binding<P: FramingProvider> {
-    api: VideoFramingApi,
+    api: VideoFramingApiV2_1,
     provider: Arc<P>,
     principal: String,
 }
@@ -83,34 +121,78 @@ unsafe extern "C" fn bind_factory<P: FramingProvider>(
         if !query.header.supports::<NativeInterfaceQuery>()
             || query.interface_major != VIDEO_FRAMING_INTERFACE_MAJOR
             || query.min_minor > VIDEO_FRAMING_INTERFACE_MINOR
-            || query.min_size as usize > size_of::<VideoFramingApi>()
+            || query.min_size as usize > size_of::<VideoFramingApiV2_1>()
         {
             return STATUS_INVALID_ARGUMENT;
         }
         // SAFETY: registered factory stays live during binding.
         let factory = unsafe { &*context.cast::<Factory<P>>() };
         let mut binding = Box::new(Binding {
-            api: VideoFramingApi {
-                base: NativeInterface {
-                    header: AbiHeader {
-                        size: size_of::<VideoFramingApi>() as u32,
-                        major: VIDEO_FRAMING_INTERFACE_MAJOR,
-                        minor: VIDEO_FRAMING_INTERFACE_MINOR,
+            api: VideoFramingApiV2_1 {
+                base: VideoFramingApi {
+                    base: NativeInterface {
+                        header: AbiHeader {
+                            size: size_of::<VideoFramingApiV2_1>() as u32,
+                            major: VIDEO_FRAMING_INTERFACE_MAJOR,
+                            minor: VIDEO_FRAMING_INTERFACE_MINOR,
+                        },
+                        context: std::ptr::null_mut(),
+                        release: Some(release::<P>),
                     },
-                    context: std::ptr::null_mut(),
-                    release: Some(release::<P>),
+                    plan: plan::<P>,
                 },
-                plan: plan::<P>,
+                probe: probe::<P>,
             },
             provider: factory.provider.clone(),
             principal,
         });
-        binding.api.base.context = (&mut *binding as *mut Binding<P>).cast();
+        binding.api.base.base.context = (&mut *binding as *mut Binding<P>).cast();
         // SAFETY: runtime owns output and resulting binding.
         unsafe {
-            *output = &(*Box::into_raw(binding)).api.base;
+            *output = &(*Box::into_raw(binding)).api.base.base;
         }
         STATUS_OK
+    }))
+    .unwrap_or(STATUS_INTERNAL_ERROR)
+}
+unsafe extern "C" fn probe<P: FramingProvider>(
+    context: *mut c_void,
+    codec: *const EncoderFormatId,
+    framing: *const EncoderFormatId,
+    limits: *const VideoFramingLimits,
+) -> Status {
+    catch_unwind(AssertUnwindSafe(|| {
+        if context.is_null()
+            || codec.is_null()
+            || framing.is_null()
+            || limits.is_null()
+            || !(codec as usize).is_multiple_of(align_of::<EncoderFormatId>())
+            || !(framing as usize).is_multiple_of(align_of::<EncoderFormatId>())
+            || !(limits as usize).is_multiple_of(align_of::<VideoFramingLimits>())
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: caller lends initialized descriptors during this call.
+        let (binding, codec, framing, limits) =
+            unsafe { (&*context.cast::<Binding<P>>(), *codec, *framing, &*limits) };
+        if codec.namespace_id == 0
+            || codec.value == 0
+            || codec.schema == 0
+            || framing.namespace_id == 0
+            || framing.value == 0
+            || framing.schema == 0
+            || limits.size as usize != size_of::<VideoFramingLimits>()
+            || limits.version != VIDEO_FRAMING_LIMITS_VERSION
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        match binding
+            .provider
+            .probe(&binding.principal, codec, framing, limits)
+        {
+            Ok(()) => STATUS_OK,
+            Err(status) => status,
+        }
     }))
     .unwrap_or(STATUS_INTERNAL_ERROR)
 }
@@ -196,8 +278,25 @@ pub unsafe fn bind(runtime: &RuntimeClient, service: &str) -> ModuleResult<Nativ
             service,
             FRAMING_CONTRACT,
             VIDEO_FRAMING_INTERFACE_MAJOR,
-            VIDEO_FRAMING_INTERFACE_MINOR,
+            0,
             size_of::<VideoFramingApi>() as u32,
+        )
+    }
+}
+
+/// # Safety
+/// Provider and runtime outlive the binding; the probe callback obeys v2.1.
+pub unsafe fn bind_with_probe(
+    runtime: &RuntimeClient,
+    service: &str,
+) -> ModuleResult<NativeBinding> {
+    unsafe {
+        runtime.bind_native_typed(
+            service,
+            FRAMING_CONTRACT,
+            VIDEO_FRAMING_INTERFACE_MAJOR,
+            1,
+            size_of::<VideoFramingApiV2_1>() as u32,
         )
     }
 }

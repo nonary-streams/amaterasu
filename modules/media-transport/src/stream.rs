@@ -417,11 +417,16 @@ impl Stream {
     }
 
     /// Install a profile only after trusted composition verifies the complete chain.
-    #[allow(dead_code)]
     pub fn configure_planned_video(
         &mut self,
         selection: PlannedVideoSelection,
     ) -> TransportResult<()> {
+        self.validate_planned_video(selection)?;
+        self.planned_selection = Some(selection);
+        Ok(())
+    }
+
+    fn validate_planned_video(&self, selection: PlannedVideoSelection) -> TransportResult<()> {
         let limits = selection.limits;
         let expected_crypto = if self.video_sealer.is_some() {
             VIDEO_PREFIX_BYTES as u32
@@ -456,8 +461,82 @@ impl Stream {
         {
             return Err("invalid_planned_video_selection");
         }
-        self.planned_selection = Some(selection);
         Ok(())
+    }
+
+    /// Construct limits from this stream's immutable host policy, never from a
+    /// provider or peer's proposed plan. The caller has checked its allowlist.
+    pub fn probe_video_plan(
+        &self,
+        selection: &VideoPlanSelection,
+    ) -> TransportResult<VideoFramingLimits> {
+        let valid_id =
+            |id: EncoderFormatId| id.namespace_id != 0 && id.value != 0 && id.schema != 0;
+        if selection.size as usize != size_of::<VideoPlanSelection>()
+            || selection.version != 1
+            || selection.metadata_required != 0
+            || selection.reserved != 0
+            || !valid_id(selection.codec)
+            || !valid_id(selection.framing)
+        {
+            return Err("invalid_planned_video_selection");
+        }
+        let limits = VideoFramingLimits {
+            size: size_of::<VideoFramingLimits>() as u32,
+            version: VIDEO_FRAMING_LIMITS_VERSION,
+            packet_size: self.video_settings.packet_size as u32,
+            crypto_overhead: if self.video_sealer.is_some() {
+                VIDEO_PREFIX_BYTES as u32
+            } else {
+                0
+            },
+            network_overhead: if self.peer.is_ipv6() { 48 } else { 28 },
+            allowed_extensions: VIDEO_FRAME_RECORD_START | VIDEO_FRAME_CRITICAL_PREFIX,
+            max_datagrams: MAX_DATAGRAMS as u32,
+            max_queue_bytes: MAX_QUEUE_BYTES as u32,
+            min_parity_shards: u32::from(self.video_settings.min_parity_shards),
+            max_fec_percentage: 255,
+            max_wire_bytes: MAX_QUEUE_BYTES as u64,
+            min_fec_percentage: u32::from(self.video_settings.fec_percentage),
+            max_fec_blocks: u32::from(self.video_settings.max_fec_blocks),
+            fec_policy_flags: 0,
+            reserved: 0,
+        };
+        self.validate_planned_video(PlannedVideoSelection {
+            stream: selection.stream,
+            generation: selection.generation,
+            offer_id: selection.offer_id,
+            codec: selection.codec,
+            framing: selection.framing,
+            source_id: selection.source_id,
+            config_generation: selection.config_generation,
+            clock_epoch: selection.clock_epoch,
+            clock_origin_us: selection.clock_origin_us,
+            allow_unprotected_fallback: false,
+            limits,
+        })?;
+        Ok(limits)
+    }
+
+    pub fn prepare_video_plan(
+        &mut self,
+        selection: &VideoPlanSelection,
+    ) -> TransportResult<VideoFramingLimits> {
+        let limits = self.probe_video_plan(selection)?;
+        self.configure_planned_video(PlannedVideoSelection {
+            stream: selection.stream,
+            generation: selection.generation,
+            offer_id: selection.offer_id,
+            codec: selection.codec,
+            framing: selection.framing,
+            source_id: selection.source_id,
+            config_generation: selection.config_generation,
+            clock_epoch: selection.clock_epoch,
+            clock_origin_us: selection.clock_origin_us,
+            allow_unprotected_fallback: false,
+            limits,
+        })?;
+        Ok(limits)
     }
 
     /// Admit a unit and the result of the selected, authorized framer.
@@ -465,7 +544,6 @@ impl Stream {
     /// # Safety
     /// Caller binds the plan to this exact unit and selected framer. Unit and
     /// plan buffers stay initialized and immutable until this call returns.
-    #[allow(dead_code)]
     pub unsafe fn submit_planned_video(
         &mut self,
         unit: &NegotiatedVideoUnit,

@@ -641,6 +641,9 @@ impl Configuration {
             profile.is_valid()
                 && self.video_stream_format == default_video_stream_format()
                 && self.codec == VideoCodec::H264
+                && self.max_reference_frames == 0
+                && self.min_threads == default_min_threads()
+                && self.qp == default_qp()
         }) && self.video_stream_format.validate().is_ok()
             && ((self.video_stream_format.bit_depth == 8
                 && self.video_stream_format.dynamic_range
@@ -753,6 +756,11 @@ pub enum Operation {
         encoder: EncoderSelection,
         configuration: Box<Configuration>,
     },
+    ProbeSource {
+        source_id: u64,
+        encoder_provider: String,
+        configuration: Box<Configuration>,
+    },
     Lookup {
         operation_id: String,
     },
@@ -786,6 +794,11 @@ enum OperationInput {
     },
     CancelPortalSelection {
         operation_id: String,
+    },
+    ProbeSource {
+        source_id: u64,
+        encoder_provider: String,
+        configuration: Box<Configuration>,
     },
     Open {
         #[serde(default)]
@@ -903,6 +916,15 @@ impl<'de> Deserialize<'de> for Operation {
             OperationInput::CancelPortalSelection { operation_id } => {
                 Self::CancelPortalSelection { operation_id }
             }
+            OperationInput::ProbeSource {
+                source_id,
+                encoder_provider,
+                configuration,
+            } => Self::ProbeSource {
+                source_id,
+                encoder_provider,
+                configuration,
+            },
             OperationInput::Open {
                 packet_boundaries,
                 operation_id,

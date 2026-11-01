@@ -30,6 +30,12 @@ a separate typed interface: its limits v2 tail preserves the v1 prefix offsets,
 but a v1 provider cannot be bound as v2 or bypass the policy checks.
 The framer owns neither sockets nor encryption; the transport remains responsible
 for packetization, security, delivery, fairness, cancellation and retirement.
+Production planned delivery uses the separate
+`amaterasu.video-plan-transport.native/1` family. Its probe is read-only; its
+prepare derives FEC and packet limits from the transport's own frozen settings.
+The stream-session thread calls the selected v2.1 framer probe and copies its
+plan before invoking the transport. A provider cannot mutate transport state by
+calling the plan sink twice or by returning a malformed plan.
 
 `plan` is synchronous and retry-safe; providers must not commit state or retain
 borrows. Provider bindings and callbacks remain live until work retires. The
@@ -38,20 +44,36 @@ does not request or permit HDR metadata insertion. The frame metadata and
 single codec-carriage owner are being specified separately; this interface must
 not silently drop required metadata or insert it twice.
 
-These contracts and the runtime provider tests are a foundation only. Two
-runtime-selected synthetic encoder and framer pairs exercise the same internal
-media-transport packetizer and loopback sender. A separate test drives the
-stream-session pump and native bindings with synthetic unit and transport
-providers after an RTSP offer and acceptance, including a backpressure retry.
-The negotiated pump constructor is private and has no production caller; the
-production video and transport services do not yet register these unit tables.
-No extension profile is admitted to a production stream, and there is no claim of
-PyroWave or Dolby interoperability, GPU support, or actual HDR decoding. A
-production path requires exact negotiated client/profile matching and independent
-encoder, framing and transport support, then an unchanged-consumer provider
-replacement test and real client qualification.
+The opt-in production route currently supports one configured source-driven,
+8-bit SDR 4:2:0 extension profile. It requires no reference-frame constraint
+and default QP and thread controls because the source probe cannot currently
+verify those settings. RTSP requests a fixed encoder configuration at prepare
+time. Stream-session asks Video to probe the selected source encoder,
+binds the selected unit/framer/plan interfaces, and probes the framer and actual
+owned transport against host limits before returning an offer. RTSP advertises
+only that preflighted profile and accepts only an ANNOUNCE with its selector and
+the probed geometry, rate, color and transport parameters. Start rechecks the
+profile and configuration, selects the startup-authorized source and services,
+and checks the source unit identity and transport limits again before pumping.
+Unusable or unselected routes leave legacy negotiation unchanged.
 
-## Proposed frame-to-access-unit metadata seam
+Trusted startup composition must explicitly enable RTSP's `extension_enabled`,
+select stream-session's `extension_route`, configure Video's `unit_service`
+and per-source `extension_profiles`, and configure media transport's
+`plan_service` and `extension_profiles`. The selected profile and service names
+must agree. Package grants and dependencies must authorize the unit, framer and
+plan native interfaces and the source encoder's broker/native services. The
+initiator's inherited broker call grants must include the source encoder control
+service as well as Video; native grants are trusted-code authority, not a sandbox.
+No installed settings are changed by these interfaces.
+
+Tests use two synthetic source encoders and framers through runtime bindings,
+the managed Video module, the stream-session pump and the real media transport
+over loopback. Separate tests exercise the RTSP and session handoff. This does
+not establish PyroWave or Dolby interoperability, real client compatibility,
+GPU support, codec syntax correctness, or HDR decoding.
+
+## Frame-to-access-unit metadata seam
 
 The media owner may define a versioned, bounded frame metadata bundle with one
 `EncoderFormatId` schema identity per item, a submission ID, source ID and

@@ -13,7 +13,7 @@ pub const VIDEO_UNIT_VERSION: u32 = 1;
 /// FEC policy fields extend the v1 limits prefix and require framing API v2.
 pub const VIDEO_FRAMING_LIMITS_VERSION: u32 = 2;
 pub const VIDEO_FRAMING_INTERFACE_MAJOR: u32 = 2;
-pub const VIDEO_FRAMING_INTERFACE_MINOR: u32 = 0;
+pub const VIDEO_FRAMING_INTERFACE_MINOR: u32 = 1;
 pub const VIDEO_UNIT_KEYFRAME: u32 = 1;
 pub const VIDEO_UNIT_DISCONTINUITY: u32 = 2;
 pub const VIDEO_UNIT_END_OF_STREAM: u32 = 4;
@@ -141,7 +141,7 @@ pub struct VideoFecBlock {
 /// Host-supplied bounds from trusted session composition and peer negotiation.
 /// packet_size is NV header plus payload, excluding the 16-byte RTP header.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VideoFramingLimits {
     pub size: u32,
     pub version: u32,
@@ -159,6 +159,53 @@ pub struct VideoFramingLimits {
     pub max_fec_blocks: u32,
     pub fec_policy_flags: u32,
     pub reserved: u32,
+}
+
+/// Authenticated video-source selection supplied to the transport once, before
+/// any packet or nonce state changes. Metadata-required sessions are not
+/// supported by this version.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VideoPlanSelection {
+    pub size: u32,
+    pub version: u32,
+    pub stream: u64,
+    pub generation: u64,
+    pub offer_id: u64,
+    pub source_id: u64,
+    pub config_generation: u64,
+    pub codec: EncoderFormatId,
+    pub framing: EncoderFormatId,
+    pub clock_epoch: [u8; 16],
+    pub clock_origin_us: u64,
+    pub metadata_required: u32,
+    pub reserved: u32,
+}
+
+/// Plan transport is a distinct typed family from unit-only transport. Prepare
+/// outputs host-controlled limits; it never accepts FEC policy from the caller.
+#[repr(C)]
+pub struct NegotiatedVideoPlanTransportApi {
+    pub base: NativeInterface,
+    pub probe: unsafe extern "C" fn(
+        *mut c_void,
+        u64,
+        *const VideoPlanSelection,
+        *mut VideoFramingLimits,
+    ) -> Status,
+    pub prepare: unsafe extern "C" fn(
+        *mut c_void,
+        u64,
+        *const VideoPlanSelection,
+        *mut VideoFramingLimits,
+    ) -> Status,
+    pub submit: unsafe extern "C" fn(
+        *mut c_void,
+        u64,
+        *const NegotiatedVideoUnit,
+        *const VideoFramePlan,
+    ) -> Status,
+    pub drain: unsafe extern "C" fn(*mut c_void, u64) -> Status,
 }
 
 /// Framed bytes exclude the eight-byte short header. record_starts has one byte
@@ -379,6 +426,19 @@ pub struct VideoFramingApi {
         *const NegotiatedVideoUnit,
         *const VideoFramingLimits,
         VideoFramePlanSink,
+    ) -> Status,
+}
+
+/// Optional v2.1 capability check. Success applies to the supplied identities
+/// and host limits only; it is not evidence of peer or hardware support.
+#[repr(C)]
+pub struct VideoFramingApiV2_1 {
+    pub base: VideoFramingApi,
+    pub probe: unsafe extern "C" fn(
+        *mut c_void,
+        *const EncoderFormatId,
+        *const EncoderFormatId,
+        *const VideoFramingLimits,
     ) -> Status,
 }
 
@@ -604,6 +664,20 @@ mod tests {
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn framing_tables_match_public_c_layout() {
+        assert_eq!(size_of::<VideoPlanSelection>(), 128);
+        assert_eq!(std::mem::offset_of!(VideoPlanSelection, codec), 48);
+        assert_eq!(std::mem::offset_of!(VideoPlanSelection, clock_epoch), 96);
+        assert_eq!(
+            std::mem::offset_of!(VideoPlanSelection, metadata_required),
+            120
+        );
+        assert_eq!(size_of::<NegotiatedVideoPlanTransportApi>(), 64);
+        assert_eq!(
+            std::mem::offset_of!(NegotiatedVideoPlanTransportApi, submit),
+            48
+        );
+        assert_eq!(size_of::<VideoFramingApiV2_1>(), 48);
+        assert_eq!(std::mem::offset_of!(VideoFramingApiV2_1, probe), 40);
         assert_eq!(size_of::<NegotiatedVideoUnit>(), 176);
         assert_eq!(std::mem::offset_of!(NegotiatedVideoUnit, clock), 120);
         assert_eq!(std::mem::offset_of!(NegotiatedVideoUnit, data), 160);

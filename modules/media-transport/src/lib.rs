@@ -5,6 +5,9 @@ mod model;
 mod native;
 mod stream;
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 use amaterasu_module_sdk::{
     Command, ManagedModule, ModuleResult, Response, RuntimeClient, network::Network,
 };
@@ -19,6 +22,7 @@ struct MediaTransportModule {
     runtime: RuntimeClient,
     controller: native::Shared,
     _factory: Box<native::Factory>,
+    _plan_factory: Option<Box<native::plan::Factory>>,
 }
 
 impl ManagedModule for MediaTransportModule {
@@ -99,8 +103,12 @@ impl MediaTransportModule {
             Some(network) => network,
             None => Network::from_settings(&runtime, &payload)?,
         };
+        let plan_service = settings.plan_service.clone();
         let controller = Arc::new(Mutex::new(Controller::with_network(settings, network)));
         let factory = native::Factory::new(controller.clone());
+        let plan_factory = plan_service
+            .as_ref()
+            .map(|_| native::plan::Factory::new(controller.clone()));
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
@@ -110,10 +118,21 @@ impl MediaTransportModule {
         unsafe {
             amaterasu_module_sdk::transport::register_media(&runtime, SERVICE, &factory.api)?;
         }
+        if let (Some(service), Some(factory)) = (plan_service, &plan_factory) {
+            // SAFETY: factory is retained for module lifetime and callbacks borrow synchronously.
+            unsafe {
+                amaterasu_module_sdk::video_framing::register_plan_transport(
+                    &runtime,
+                    &service,
+                    &factory.api,
+                )
+            }?;
+        }
         Ok(Self {
             runtime,
             controller,
             _factory: factory,
+            _plan_factory: plan_factory,
         })
     }
 }
@@ -126,6 +145,7 @@ impl Drop for MediaTransportModule {
     }
 }
 
+#[cfg(not(feature = "test-support"))]
 amaterasu_module_sdk::export_module!(MediaTransportModule);
 
 #[cfg(test)]

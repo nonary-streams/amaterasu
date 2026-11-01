@@ -1,6 +1,12 @@
 use crate::{model::*, stream::Stream};
-use amaterasu_media::{EncodedAudioPacket, EncodedPacket, MEDIA_CLOSED};
-use amaterasu_module_sdk::{abi::Status, network::Network};
+use amaterasu_media::{
+    EncodedAudioPacket, EncodedPacket, MEDIA_CLOSED, NegotiatedVideoUnit, VideoFramePlan,
+    VideoFramingLimits, VideoPlanSelection,
+};
+use amaterasu_module_sdk::{
+    abi::{STATUS_INVALID_ARGUMENT, Status},
+    network::Network,
+};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -256,6 +262,63 @@ impl Controller {
     pub fn drain(&mut self, owner: &str, id: u64) -> Status {
         self.owned_mut(owner, id)
             .map_or(MEDIA_CLOSED, Stream::drain)
+    }
+
+    fn plan_allowlisted(&self, selection: &VideoPlanSelection) -> bool {
+        let same = |a: &amaterasu_contracts::media_profile::FormatId,
+                    b: amaterasu_media::EncoderFormatId| {
+            a.namespace_id == b.namespace_id && a.value == b.value && a.schema == b.schema
+        };
+        self.settings.extension_profiles.iter().any(|profile| {
+            u64::from(profile.wire_selector) == selection.offer_id
+                && same(&profile.codec, selection.codec)
+                && same(&profile.framing, selection.framing)
+        })
+    }
+
+    pub fn probe_video_plan(
+        &self,
+        owner: &str,
+        id: u64,
+        selection: &VideoPlanSelection,
+    ) -> Result<VideoFramingLimits, Status> {
+        if !self.plan_allowlisted(selection) {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        self.owned(owner, id)
+            .map_err(|_| MEDIA_CLOSED)?
+            .probe_video_plan(selection)
+            .map_err(|_| STATUS_INVALID_ARGUMENT)
+    }
+
+    pub fn prepare_video_plan(
+        &mut self,
+        owner: &str,
+        id: u64,
+        selection: &VideoPlanSelection,
+    ) -> Result<VideoFramingLimits, Status> {
+        if !self.plan_allowlisted(selection) {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        self.owned_mut(owner, id)
+            .ok_or(MEDIA_CLOSED)?
+            .prepare_video_plan(selection)
+            .map_err(|_| STATUS_INVALID_ARGUMENT)
+    }
+
+    /// # Safety
+    /// Unit and plan allocations are live and immutable during this call.
+    pub unsafe fn submit_video_plan(
+        &mut self,
+        owner: &str,
+        id: u64,
+        unit: &NegotiatedVideoUnit,
+        plan: &VideoFramePlan,
+    ) -> Status {
+        match self.owned_mut(owner, id) {
+            Some(stream) => unsafe { stream.submit_planned_video(unit, plan) },
+            None => MEDIA_CLOSED,
+        }
     }
 
     fn configure_video_format(
