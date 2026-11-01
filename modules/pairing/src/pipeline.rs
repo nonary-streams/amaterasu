@@ -9,11 +9,12 @@ use crate::protocol::{Document, EffectAuthoritySettings, Identity, Operation, Se
 use crate::{EFFECT_SERVICE, SERVICE, STATE_SERVICE};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use x509_cert::der::Encode;
 
+mod protocol_admission;
 mod source_retirement;
 
 const STATE_KEY: &str = "pairing/v1";
@@ -76,6 +77,10 @@ pub struct Pipeline {
     effect_gate: Option<EffectGate>,
     effect_authority: Option<EffectAuthoritySettings>,
     effect_bindings: BTreeMap<EffectSource, (Arc<Snapshot>, Vec<u8>)>,
+    protocol_capabilities: BTreeMap<
+        EffectSource,
+        BTreeSet<amaterasu_module_sdk::effect_authority::ProtocolCapability>,
+    >,
     deferred_effect_mutation: Option<(Request, Operation)>,
     identity_generation: Option<IdentityGeneration>,
     #[cfg(test)]
@@ -151,6 +156,7 @@ impl Pipeline {
             effect_gate: EffectGate::new().ok(),
             effect_authority,
             effect_bindings: BTreeMap::new(),
+            protocol_capabilities: BTreeMap::new(),
             deferred_effect_mutation: None,
             identity_generation: None,
             #[cfg(test)]
@@ -180,6 +186,7 @@ impl Pipeline {
             gate.fence();
         }
         self.effect_bindings.clear();
+        self.protocol_capabilities.clear();
         self.identity.invalidate();
     }
 
@@ -1022,9 +1029,9 @@ impl Pipeline {
         let request: EffectRequest =
             serde_json::from_value(payload).map_err(|_| "invalid_request")?;
         let permitted = match request {
-            EffectRequest::Bind { .. } | EffectRequest::BindStream { .. } => {
-                caller == policy.protocol_owner
-            }
+            EffectRequest::Bind { .. }
+            | EffectRequest::BindStream { .. }
+            | EffectRequest::AttestProtocolCapabilities { .. } => caller == policy.protocol_owner,
             EffectRequest::Status {} => {
                 caller == policy.protocol_owner || caller == policy.effect_owner
             }
@@ -1056,6 +1063,28 @@ impl Pipeline {
                 source,
                 scope,
             } => return self.bind_effect_source(epoch, certificate_pem, source, Some(scope), now),
+            EffectRequest::AttestProtocolCapabilities {
+                version,
+                epoch,
+                source,
+                capabilities,
+            } => {
+                return self.attest_protocol_capabilities(
+                    version,
+                    epoch,
+                    source,
+                    capabilities,
+                    now,
+                );
+            }
+            EffectRequest::AdmitProtocolEffect {
+                version,
+                epoch,
+                source,
+                effect,
+            } => {
+                return self.admit_protocol_effect(version, epoch, source, *effect, caller, now);
+            }
             _ => {}
         }
         let gate = self.effect_gate.as_mut().ok_or("authority_unavailable")?;
@@ -1064,9 +1093,13 @@ impl Pipeline {
                 gate.require_epoch(&epoch)?;
                 gate.recover(&owner_epoch)?;
                 self.effect_bindings.clear();
+                self.protocol_capabilities.clear();
                 Ok(json!({"ok":true,"epoch":gate.epoch()}))
             }
-            EffectRequest::Bind { .. } | EffectRequest::BindStream { .. } => {
+            EffectRequest::Bind { .. }
+            | EffectRequest::BindStream { .. }
+            | EffectRequest::AttestProtocolCapabilities { .. }
+            | EffectRequest::AdmitProtocolEffect { .. } => {
                 unreachable!("handled above")
             }
             EffectRequest::AdmitStreamLease {
@@ -1520,6 +1553,9 @@ impl Pipeline {
                 expected_revision, ..
             }
             | Operation::UpdateClientFeedbackGrants {
+                expected_revision, ..
+            }
+            | Operation::UpdateClientProtocolGrants {
                 expected_revision, ..
             }
             | Operation::SetPermissionMode {

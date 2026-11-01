@@ -39,6 +39,7 @@ fn document() -> Document {
             permissions: crate::protocol::ClientPermissions::default(),
             config_overrides: crate::protocol::ClientConfigOverrides::default(),
             feedback_grants: Default::default(),
+            protocol_grants: Default::default(),
         }],
     }
 }
@@ -681,4 +682,46 @@ fn permission_api_reads_current_committed_certificate_policy() {
     shared.invalidate();
     assert_eq!(check(PERMISSION_LAUNCH), IDENTITY_UNAVAILABLE);
     unsafe { (api.v1_0.base.release.unwrap())(context) };
+}
+
+#[test]
+fn protocol_grant_requires_exact_client_capability_and_existing_permission() {
+    use amaterasu_module_sdk::effect_authority::ProtocolCapability;
+    let mut document = document();
+    let capability = ProtocolCapability("example.control/1".into());
+    let other = ProtocolCapability("example.usb/1".into());
+    let der = crypto_certificate_der(CLIENT_CERT);
+    let snapshot = Snapshot::prepare(&document, time()).unwrap().unwrap();
+    assert!(
+        snapshot
+            .check_protocol_grant(&der, time(), &capability, PERMISSION_LAUNCH)
+            .is_err()
+    );
+    document.clients[0]
+        .protocol_grants
+        .insert(capability.clone());
+    document.clients[0].permissions.launch_apps = false;
+    document.clients[0].permissions.view_streams = true;
+    document.permission_mode_enabled = true;
+    let snapshot = Snapshot::prepare(&document, time()).unwrap().unwrap();
+    assert!(
+        snapshot
+            .check_protocol_grant(&der, time(), &capability, PERMISSION_VIEW)
+            .is_ok()
+    );
+    assert!(
+        snapshot
+            .check_protocol_grant(&der, time(), &capability, PERMISSION_LAUNCH)
+            .is_err()
+    );
+    assert!(
+        snapshot
+            .check_protocol_grant(&der, time(), &other, PERMISSION_VIEW)
+            .is_err()
+    );
+    assert!(
+        snapshot
+            .check_protocol_grant(&[1, 2, 3], time(), &capability, PERMISSION_VIEW)
+            .is_err()
+    );
 }

@@ -3393,6 +3393,7 @@ fn pairing_mutation_fences_and_waits_for_effect_owner_completion() {
 fn host_configuration_refresh_prevents_reopening_effect_admission() {
     let mut configured = settings();
     configured.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        protocol_policies: vec![],
         protocol_owner: "nvhttp".into(),
         effect_owner: "input".into(),
         feedback_policies: vec![],
@@ -3438,6 +3439,7 @@ fn host_configuration_refresh_prevents_reopening_effect_admission() {
 fn pairing_effect_service_checks_broker_identity_and_current_certificate() {
     let (mut pipeline, _harness, _) = paired_native_client();
     pipeline.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        protocol_policies: vec![],
         protocol_owner: "nvhttp".into(),
         effect_owner: "input".into(),
         feedback_policies: vec![],
@@ -3580,6 +3582,7 @@ fn configured_authority_restart_requires_owner_retirement_before_unpair_commit()
     let (_old, mut harness, certificate_id) = paired_native_client();
     let mut configured = settings();
     configured.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        protocol_policies: vec![],
         protocol_owner: "nvhttp".into(),
         effect_owner: "input".into(),
         feedback_policies: vec![],
@@ -3633,6 +3636,7 @@ fn configured_authority_restart_requires_owner_retirement_before_unpair_commit()
 fn unavailable_configured_authority_cannot_bypass_unpair_fence() {
     let (mut pipeline, mut harness, certificate_id) = paired_native_client();
     pipeline.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        protocol_policies: vec![],
         protocol_owner: "nvhttp".into(),
         effect_owner: "input".into(),
         feedback_policies: vec![],
@@ -3652,6 +3656,7 @@ fn unavailable_configured_authority_cannot_bypass_unpair_fence() {
 fn request_canceled_after_delivery_cannot_fence_a_trust_mutation() {
     let (mut pipeline, mut harness, certificate_id) = paired_native_client();
     pipeline.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        protocol_policies: vec![],
         protocol_owner: "nvhttp".into(),
         effect_owner: "input".into(),
         feedback_policies: vec![],
@@ -3752,6 +3757,7 @@ fn real_broker_startup_recovery_blocks_pairing_mutation_until_owner_retires() {
     let mut revision = harness.revision;
     let mut configured = settings();
     configured.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        protocol_policies: vec![],
         protocol_owner: "nvhttp".into(),
         effect_owner: "input".into(),
         feedback_policies: vec![],
@@ -3835,6 +3841,7 @@ fn real_broker_startup_recovery_blocks_pairing_mutation_until_owner_retires() {
 fn real_broker_cancel_between_delivery_and_check_preserves_open_authority() {
     let (mut pipeline, _harness, certificate_id) = paired_native_client();
     pipeline.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        protocol_policies: vec![],
         protocol_owner: "nvhttp".into(),
         effect_owner: "input".into(),
         feedback_policies: vec![],
@@ -3952,6 +3959,7 @@ fn real_broker_cancelled_effect_requests_cannot_admit_or_acknowledge_drain() {
 fn trust_mutation_waits_for_stream_lease_retirement_and_owner_drain() {
     let (mut pipeline, mut harness, certificate_id) = paired_native_client();
     pipeline.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        protocol_policies: vec![],
         protocol_owner: "nvhttp".into(),
         effect_owner: "input".into(),
         feedback_policies: vec![],
@@ -4189,6 +4197,7 @@ fn policy_for_feedback(
     required_permission: crate::protocol::FeedbackPermission,
 ) -> crate::protocol::EffectAuthoritySettings {
     crate::protocol::EffectAuthoritySettings {
+        protocol_policies: vec![],
         protocol_owner: "nvhttp".into(),
         effect_owner: "input".into(),
         feedback_policies: schemas
@@ -4864,6 +4873,7 @@ fn delivered_then_cancelled_source_fence_and_completion_do_not_mutate_authority(
 fn real_broker_rejects_recovery_while_host_configuration_is_unavailable() {
     let mut configured = settings();
     configured.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        protocol_policies: vec![],
         protocol_owner: "nvhttp".into(),
         effect_owner: "input".into(),
         feedback_policies: vec![],
@@ -5431,5 +5441,210 @@ fn broker_lost_lease_lookup_reports_shared_transport_retirement() {
             json!({"action":"acknowledge","epoch":epoch,"operation_id":"second-lease","ticket":second_lease["ticket"]})
         )["ok"],
         true
+    );
+}
+
+#[test]
+fn protocol_grants_are_admin_only_revision_checked_and_default_deny() {
+    let (mut pipeline, mut harness, certificate_id) = paired_native_client();
+    let listed = harness.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"list_clients"}),
+        now(),
+    );
+    assert!(listed["clients"][0].get("protocol_grants").is_none());
+    let update = json!({"action":"update_client_protocol_grants","certificate_id":certificate_id,
+        "expected_revision":harness.revision,"grants":["example.control/1"]});
+    assert_eq!(
+        harness.request(&mut pipeline, "nvhttp", update.clone(), now())["code"],
+        "forbidden"
+    );
+    assert_eq!(
+        harness.request(&mut pipeline, "console", update.clone(), now())["ok"],
+        true
+    );
+    assert_eq!(
+        harness.request(&mut pipeline, "console", update, now())["code"],
+        "revision_conflict"
+    );
+    let mut restarted = Pipeline::new(settings());
+    let listed = harness.request(
+        &mut restarted,
+        "console",
+        json!({"action":"list_clients"}),
+        now(),
+    );
+    assert_eq!(
+        listed["clients"][0]["protocol_grants"],
+        json!(["example.control/1"])
+    );
+}
+
+#[test]
+fn broker_protocol_attestation_requires_paired_source_and_exact_client_grant() {
+    let (mut pipeline, mut state, certificate_id) = paired_native_client();
+    grant_feedback_for_test(&mut state, &mut pipeline, &certificate_id, &["speaker.pcm"]);
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "console",
+            json!({"action":"update_client_protocol_grants","certificate_id":certificate_id,
+        "expected_revision":state.revision,"grants":["example.control/1"]}),
+            now()
+        )["ok"],
+        true
+    );
+    let permissions =
+        json!({"list_apps":true,"view_streams":true,"launch_apps":false,"terminate_streams":false});
+    assert_eq!(
+        state.request(
+            &mut pipeline,
+            "console",
+            json!({"action":"update_client_permissions","certificate_id":certificate_id,
+        "permissions":permissions,"expected_revision":state.revision}),
+            now()
+        )["ok"],
+        true
+    );
+    assert_eq!(state.request(&mut pipeline,"console",json!({"action":"set_permission_mode","enabled":true,"expected_revision":state.revision}),now())["ok"],true);
+    let mut selected =
+        policy_for_feedback(&["speaker.pcm"], crate::protocol::FeedbackPermission::View);
+    let method = json!({"service":"example.effects/1","method":"apply","interface_major":1,"interface_minor":0,"schema_revision":1});
+    let cleanup = json!({"service":"example.effects/1","method":"cleanup","interface_major":1,"interface_minor":0,"schema_revision":1});
+    selected.protocol_policies = serde_json::from_value(json!([{"capability":"example.control/1","provider":"provider",
+        "message_type":21818,"method":method,"cleanup":cleanup,"max_payload_bytes":64,"required_permission":"view"}])).unwrap();
+    pipeline.effect_authority = Some(selected);
+    let initial = pipeline.effect_gate.as_ref().unwrap().epoch().to_owned();
+    let epoch = pipeline
+        .apply_effect_request(
+            "input",
+            "input",
+            json!({"action":"recover","epoch":initial,"owner_epoch":"owner"}),
+            now(),
+        )
+        .unwrap()["epoch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let source = feedback_source_for_test("owner");
+    let scope = feedback_scope_for_test(&["speaker.pcm"]);
+    assert_eq!(pipeline.apply_effect_request("nvhttp","nvhttp",json!({"action":"bind_stream","epoch":epoch,"certificate_pem":CLIENT_CERT,"source":source,"scope":scope}),now()).unwrap()["ok"],true);
+    let mut broker = authority_broker();
+    let mut next = 0_u64;
+    let mut call = |pipeline: &mut Pipeline, caller: &str, payload: Value| {
+        next += 1;
+        let Response::Accepted { id } = broker.dispatch(
+            caller,
+            Command::Request {
+                service: EFFECT_SERVICE.into(),
+                payload,
+                timeout_ms: 30_000,
+                operation_id: format!("protocol-authority-test-{next}"),
+                parent: None,
+            },
+        ) else {
+            panic!("rejected")
+        };
+        pipeline
+            .tick_at(now(), |command| Ok(broker.dispatch("pairing", command)))
+            .unwrap();
+        let Response::Result { payload } =
+            broker.dispatch(caller, Command::TakeResult { request: id })
+        else {
+            panic!("missing")
+        };
+        assert!(matches!(
+            broker.dispatch(caller, Command::ReleaseResult { request: id }),
+            Response::Ok
+        ));
+        payload
+    };
+    let attest = json!({"action":"attest_protocol_capabilities","version":1,"epoch":epoch,"source":source,"capabilities":["example.control/1"]});
+    assert_eq!(
+        call(&mut pipeline, "input", attest.clone())["code"],
+        "forbidden"
+    );
+    let mut unknown = attest.clone();
+    unknown["capabilities"] = json!(["example.usb/1"]);
+    assert_eq!(
+        call(&mut pipeline, "nvhttp", unknown)["code"],
+        "scope_denied"
+    );
+    assert_eq!(call(&mut pipeline, "nvhttp", attest.clone())["ok"], true);
+    let mut expanded = attest.clone();
+    expanded["capabilities"] = json!([]);
+    assert_eq!(
+        call(&mut pipeline, "nvhttp", expanded)["code"],
+        "protocol_attestation_conflict"
+    );
+    let effect = json!({"caller":"input","operation_id":"effect.1","issuer_epoch":"issuer-epoch",
+        "context":{"authority_epoch":epoch,"effect_owner_epoch":"owner","target":{"kind":"stream","host_epoch":source["host_epoch"],
+            "session_id":source["session_id"],"stream_id":source["stream_id"],"generation":source["stream_generation"]},"peer_ref":source["id"]},
+        "message_type":21818,"capability":"example.control/1","provider":"provider","method":method,"cleanup":cleanup,
+        "payload_sha256":"c".repeat(64),"timeout_ms":1000,"parent":null});
+    let request = json!({"action":"admit_protocol_effect","version":1,"epoch":epoch,"source":source,"effect":effect});
+    let mut forbidden = request.clone();
+    forbidden["effect"]["capability"] = json!("example.usb/1");
+    assert_eq!(
+        call(&mut pipeline, "input", forbidden)["code"],
+        "scope_denied"
+    );
+    let mut forged = request.clone();
+    forged["effect"]["provider"] = json!("other-provider");
+    assert_eq!(call(&mut pipeline, "input", forged)["code"], "scope_denied");
+    assert_eq!(
+        call(&mut pipeline, "input", request.clone())["code"],
+        "protocol_authority_unavailable"
+    );
+    pipeline
+        .effect_authority
+        .as_mut()
+        .unwrap()
+        .protocol_policies[0]
+        .provider = "replacement".into();
+    assert_eq!(
+        call(&mut pipeline, "input", request.clone())["code"],
+        "scope_denied"
+    );
+    let mut replacement = request.clone();
+    replacement["effect"]["provider"] = json!("replacement");
+    assert_eq!(
+        call(&mut pipeline, "input", replacement)["code"],
+        "protocol_authority_unavailable"
+    );
+    pipeline
+        .effect_authority
+        .as_mut()
+        .unwrap()
+        .protocol_policies[0]
+        .provider = "provider".into();
+    pipeline
+        .effect_authority
+        .as_mut()
+        .unwrap()
+        .protocol_policies[0]
+        .required_permission = crate::protocol::FeedbackPermission::Launch;
+    assert_eq!(
+        call(&mut pipeline, "input", request.clone())["code"],
+        "scope_denied"
+    );
+    assert_eq!(
+        call(
+            &mut pipeline,
+            "nvhttp",
+            json!({"action":"fence_source","epoch":epoch,"source":source,"scope":scope,"operation_id":"retire-protocol-source"})
+        )["state"],
+        "fenced"
+    );
+    assert_eq!(
+        call(&mut pipeline, "input", request.clone())["code"],
+        "source_denied"
+    );
+    let mut restarted = Pipeline::new(settings());
+    restarted.effect_authority = pipeline.effect_authority.clone();
+    assert_eq!(
+        call(&mut restarted, "input", request)["code"],
+        "stale_epoch"
     );
 }

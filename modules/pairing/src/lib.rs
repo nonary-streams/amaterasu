@@ -110,6 +110,30 @@ mod settings_tests {
     }
 
     #[test]
+    fn protocol_policy_requires_explicit_nonreserved_distinct_routes() {
+        let rule = json!({"capability":"example.control/1","provider":"example-provider",
+            "message_type":21818,"max_payload_bytes":64,"required_permission":"view",
+            "method":{"service":"example.effects/1","method":"apply","interface_major":1,"interface_minor":0,"schema_revision":1},
+            "cleanup":{"service":"example.effects/1","method":"cleanup","interface_major":1,"interface_minor":0,"schema_revision":1}});
+        let mut settings = json!({"transport_principals":["nvhttp"],"effect_authority":{
+            "protocol_owner":"nvhttp","effect_owner":"issuer","protocol_policies":[rule]}});
+        assert!(parse_settings(settings.clone()).is_ok());
+        settings["effect_authority"]["protocol_policies"][0]["message_type"] = json!(0x0109);
+        assert!(parse_settings(settings.clone()).is_err());
+        settings["effect_authority"]["protocol_policies"][0]["message_type"] = json!(21818);
+        settings["effect_authority"]["protocol_policies"][0]["provider"] = json!("issuer");
+        assert!(parse_settings(settings.clone()).is_err());
+        settings["effect_authority"]["protocol_policies"][0]["provider"] =
+            json!("example-provider");
+        let duplicate = settings["effect_authority"]["protocol_policies"][0].clone();
+        settings["effect_authority"]["protocol_policies"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        assert!(parse_settings(settings).is_err());
+    }
+
+    #[test]
     fn host_configuration_marker_must_be_boolean() {
         assert!(parse_settings(json!({"host_configuration":"enabled"})).is_err());
     }

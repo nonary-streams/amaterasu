@@ -55,6 +55,7 @@ impl Pipeline {
             gate.require_epoch(epoch)?;
             gate.fence();
             self.effect_bindings.clear();
+            self.protocol_capabilities.clear();
             return Ok(json!({"ok":true,"epoch":epoch,"operation_id":operation_id,
                 "state":"fenced","fence_generation":gate.fence_generation()}));
         }
@@ -68,6 +69,7 @@ impl Pipeline {
             } => {
                 let complete = gate.fence_source(&epoch, &source, &scope, &operation_id)?;
                 self.effect_bindings.remove(&source);
+                self.protocol_capabilities.remove(&source);
                 (epoch, source, scope, operation_id, complete)
             }
             Request::CompleteSourceRetirement {

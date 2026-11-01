@@ -1,4 +1,6 @@
-use amaterasu_module_sdk::effect_authority::FeedbackCapability;
+use amaterasu_module_sdk::effect_authority::{
+    FeedbackCapability, ProtocolCapability, ProtocolEffectPolicy,
+};
 pub use amaterasu_module_sdk::effect_authority::{FeedbackPermission, FeedbackPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -22,6 +24,8 @@ pub struct EffectAuthoritySettings {
     pub effect_owner: String,
     #[serde(default)]
     pub feedback_policies: Vec<FeedbackPolicy>,
+    #[serde(default)]
+    pub protocol_policies: Vec<ProtocolEffectPolicy>,
 }
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -36,6 +40,29 @@ impl Settings {
                 || !self.transport_principals.contains(&settings.protocol_owner)
                 || settings.protocol_owner == settings.effect_owner
                 || settings.feedback_policies.len() > 32
+                || settings.protocol_policies.len() > 32
+                || settings
+                    .protocol_policies
+                    .iter()
+                    .any(|policy| policy.provider == settings.effect_owner)
+                || settings
+                    .protocol_policies
+                    .iter()
+                    .map(|policy| policy.message_type)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    != settings.protocol_policies.len()
+                || settings
+                    .protocol_policies
+                    .iter()
+                    .any(|policy| !policy.valid())
+                || settings
+                    .protocol_policies
+                    .iter()
+                    .map(|policy| &policy.capability)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    != settings.protocol_policies.len()
                 || settings
                     .feedback_policies
                     .iter()
@@ -116,6 +143,11 @@ pub enum Operation {
     UpdateClientFeedbackGrants {
         certificate_id: String,
         grants: BTreeSet<FeedbackCapability>,
+        expected_revision: u64,
+    },
+    UpdateClientProtocolGrants {
+        certificate_id: String,
+        grants: BTreeSet<ProtocolCapability>,
         expected_revision: u64,
     },
     SetPermissionMode {
@@ -208,6 +240,15 @@ impl Operation {
                     && grants.len() <= 32
                     && grants.iter().all(FeedbackCapability::valid)
             }
+            Self::UpdateClientProtocolGrants {
+                certificate_id,
+                grants,
+                ..
+            } => {
+                hex_length(certificate_id, 32)
+                    && grants.len() <= 32
+                    && grants.iter().all(ProtocolCapability::valid)
+            }
             Self::CheckClientCertificate { certificate_pem }
             | Self::UnpairPresentedClient { certificate_pem } => certificate_pem.len() <= 4096,
             _ => true,
@@ -230,6 +271,7 @@ impl Operation {
                 | Self::UpdateClientConfigOverrides { .. }
                 | Self::UpdateClientPermissions { .. }
                 | Self::UpdateClientFeedbackGrants { .. }
+                | Self::UpdateClientProtocolGrants { .. }
                 | Self::SetPermissionMode { .. }
         )
     }
@@ -256,6 +298,7 @@ impl Operation {
                 | Self::UpdateClientConfigOverrides { .. }
                 | Self::UpdateClientPermissions { .. }
                 | Self::UpdateClientFeedbackGrants { .. }
+                | Self::UpdateClientProtocolGrants { .. }
                 | Self::SetPermissionMode { .. }
         )
     }
@@ -291,6 +334,9 @@ pub struct Client {
     /// Explicit per-client opt-in; old clients have no extension grants.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub feedback_grants: BTreeSet<FeedbackCapability>,
+    /// Optional protocol capabilities default to no grants on legacy records.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub protocol_grants: BTreeSet<ProtocolCapability>,
 }
 
 /// Certificate-bound privileges. Missing legacy metadata retains full access.
@@ -961,6 +1007,8 @@ impl Document {
                 || client.config_overrides.validate().is_err()
                 || client.feedback_grants.len() > 32
                 || client.feedback_grants.iter().any(|grant| !grant.valid())
+                || client.protocol_grants.len() > 32
+                || client.protocol_grants.iter().any(|grant| !grant.valid())
             {
                 return Err("invalid_state");
             }

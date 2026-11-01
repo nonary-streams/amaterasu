@@ -185,15 +185,68 @@ pub struct FeedbackPolicy {
     pub required_permission: FeedbackPermission,
 }
 
+/// An optional protocol effect must be selected by trusted composition and
+/// explicitly granted to the paired client. Its API route is selected by the
+/// host; this name alone never selects a provider or proves negotiation.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq, Ord, PartialOrd)]
+#[serde(transparent)]
+pub struct ProtocolCapability(pub String);
+impl ProtocolCapability {
+    pub fn valid(&self) -> bool {
+        amaterasu_contracts::valid_name(&self.0)
+    }
+}
+
+/// Trusted startup binds an optional capability to one exact selected API and
+/// provider. This policy supplements, rather than replaces, the client grant.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ProtocolEffectPolicy {
+    pub capability: ProtocolCapability,
+    pub provider: String,
+    pub message_type: u16,
+    pub method: crate::extension_api::MethodRef,
+    pub cleanup: crate::extension_api::MethodRef,
+    pub max_payload_bytes: usize,
+    pub required_permission: FeedbackPermission,
+}
+
+impl ProtocolEffectPolicy {
+    pub fn valid(&self) -> bool {
+        self.capability.valid()
+            && crate::protocol::valid_extension_message_type(self.message_type)
+            && amaterasu_contracts::valid_name(&self.provider)
+            && amaterasu_contracts::valid_name(&self.method.service)
+            && amaterasu_contracts::valid_name(&self.method.method)
+            && self.method.interface_major != 0
+            && self.method.schema_revision > 0
+            && u32::try_from(self.method.schema_revision).is_ok()
+            && amaterasu_contracts::valid_name(&self.cleanup.service)
+            && amaterasu_contracts::valid_name(&self.cleanup.method)
+            && self.cleanup.interface_major != 0
+            && self.cleanup.schema_revision > 0
+            && (self.cleanup.service != self.method.service
+                || self.cleanup.method != self.method.method
+                || self.cleanup.interface_major != self.method.interface_major)
+            && self.max_payload_bytes > 0
+            && self.max_payload_bytes <= crate::protocol::MAX_MESSAGE_BYTES
+    }
+}
+
 /// Administrator-only pairing operation. The certificate reference belongs to
 /// the existing private pairing administration API; it is never sent to clients
-/// or the effect provider. Empty grants revoke all optional feedback scopes.
+/// or the effect provider. Empty grants revoke the selected optional scopes.
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum AdministrationRequest {
     UpdateClientFeedbackGrants {
         certificate_id: String,
         grants: BTreeSet<FeedbackCapability>,
+        expected_revision: u64,
+    },
+    UpdateClientProtocolGrants {
+        certificate_id: String,
+        grants: BTreeSet<ProtocolCapability>,
         expected_revision: u64,
     },
 }
@@ -229,6 +282,17 @@ impl AdministrationRequest {
                 && certificate_id.bytes().all(|b| b.is_ascii_hexdigit())
                 && grants.len() <= 32
                 && grants.iter().all(FeedbackCapability::valid) =>
+            {
+                Ok(())
+            }
+            Self::UpdateClientProtocolGrants {
+                certificate_id,
+                grants,
+                ..
+            } if certificate_id.len() == 64
+                && certificate_id.bytes().all(|b| b.is_ascii_hexdigit())
+                && grants.len() <= 32
+                && grants.iter().all(ProtocolCapability::valid) =>
             {
                 Ok(())
             }
@@ -306,6 +370,22 @@ pub enum Request {
         certificate_pem: String,
         source: Source,
         scope: StreamScope,
+    },
+    /// Selected protocol owner attests negotiated capabilities for an already
+    /// authenticated lifecycle source. This is not a client grant.
+    AttestProtocolCapabilities {
+        version: u8,
+        epoch: String,
+        source: Source,
+        capabilities: BTreeSet<ProtocolCapability>,
+    },
+    /// Ask the selected authority to durably admit an exact protocol effect.
+    /// Unsupported hosts deny this operation without granting a ticket.
+    AdmitProtocolEffect {
+        version: u8,
+        epoch: String,
+        source: Source,
+        effect: Box<crate::protocol::PendingEffect>,
     },
     AdmitStreamLease {
         epoch: String,

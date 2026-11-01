@@ -153,6 +153,24 @@ impl Engine {
                     now,
                 )
             }
+            Operation::UpdateClientProtocolGrants {
+                certificate_id,
+                grants,
+                ..
+            } => {
+                let mut document = document;
+                let client = document
+                    .clients
+                    .iter_mut()
+                    .find(|client| client.certificate_id == certificate_id)
+                    .ok_or("not_paired")?;
+                client.protocol_grants = grants;
+                write(
+                    document,
+                    json!({"ok":true,"certificate_id":certificate_id}),
+                    now,
+                )
+            }
             Operation::SetPermissionMode { enabled, .. } => {
                 let mut document = document;
                 document.permission_mode_enabled = enabled;
@@ -241,6 +259,7 @@ impl Engine {
             permissions: ClientPermissions::default(),
             config_overrides: ClientConfigOverrides::default(),
             feedback_grants: Default::default(),
+            protocol_grants: Default::default(),
         });
         write(document, response, now)
     }
@@ -302,6 +321,7 @@ impl Engine {
                     permissions: ClientPermissions::default(),
                     config_overrides: ClientConfigOverrides::default(),
                     feedback_grants: Default::default(),
+                    protocol_grants: Default::default(),
                 },
                 salt,
                 expires_at,
@@ -482,6 +502,9 @@ fn client_metadata(document: &Document) -> Value {
             });
             if !client.feedback_grants.is_empty() {
                 value["feedback_grants"] = json!(client.feedback_grants);
+            }
+            if !client.protocol_grants.is_empty() {
+                value["protocol_grants"] = json!(client.protocol_grants);
             }
             value
         })

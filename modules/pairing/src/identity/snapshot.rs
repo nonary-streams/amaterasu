@@ -86,6 +86,8 @@ struct CertificateRecord {
     permissions: crate::protocol::ClientPermissions,
     feedback_grants:
         std::collections::BTreeSet<amaterasu_module_sdk::effect_authority::FeedbackCapability>,
+    protocol_grants:
+        std::collections::BTreeSet<amaterasu_module_sdk::effect_authority::ProtocolCapability>,
     controller: Option<bool>,
 }
 impl CertificateRecord {
@@ -98,6 +100,7 @@ impl CertificateRecord {
             der,
             permissions: crate::protocol::ClientPermissions::default(),
             feedback_grants: Default::default(),
+            protocol_grants: Default::default(),
             controller: None,
             not_before: certificate
                 .tbs_certificate
@@ -195,6 +198,7 @@ impl Snapshot {
                 )?;
                 record.permissions = client.permissions;
                 record.feedback_grants = client.feedback_grants.clone();
+                record.protocol_grants = client.protocol_grants.clone();
                 record.controller = client.config_overrides.controller;
                 Ok(record)
             })
@@ -265,6 +269,25 @@ impl Snapshot {
         self.clients
             .iter()
             .any(|client| client.der == der && client.valid(now))
+    }
+
+    pub fn check_protocol_grant(
+        &self,
+        der: &[u8],
+        now: u64,
+        capability: &amaterasu_module_sdk::effect_authority::ProtocolCapability,
+        permission: u32,
+    ) -> Result<(), Status> {
+        self.check_permission(der, now, permission)?;
+        let client = self
+            .clients
+            .iter()
+            .find(|client| client.der == der && client.valid(now))
+            .ok_or(IDENTITY_UNTRUSTED)?;
+        if !client.protocol_grants.contains(capability) {
+            return Err(IDENTITY_FORBIDDEN);
+        }
+        Ok(())
     }
 
     pub fn sign(&self, scheme: u32, message: &[u8]) -> Result<Vec<u8>, Status> {

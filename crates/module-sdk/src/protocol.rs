@@ -25,6 +25,11 @@ const RESERVED_CONTROL_TYPES: &[u16] = &[
     0x0350, 0x5500, 0x5501, 0x5502, 0x5503, 0x5601,
 ];
 
+/// Extension messages cannot take over built-in control messages.
+pub fn valid_extension_message_type(message_type: u16) -> bool {
+    !RESERVED_CONTROL_TYPES.contains(&message_type)
+}
+
 /// Trusted startup policy, not a remote request or an authorization grant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Route {
@@ -160,7 +165,7 @@ impl ProtocolRouter {
         let mut types = BTreeSet::new();
         for route in &routes {
             let method = &route.approval.method;
-            if RESERVED_CONTROL_TYPES.contains(&route.message_type)
+            if !valid_extension_message_type(route.message_type)
                 || !types.insert(route.message_type)
                 || !valid_name(&route.capability)
                 || !valid_name(&route.approval.provider)
