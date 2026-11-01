@@ -3,6 +3,7 @@ mod configuration;
 mod effect_fence;
 mod errors;
 mod events;
+mod historical_journal;
 mod hooks;
 mod requests;
 mod source_slots;
@@ -115,7 +116,7 @@ impl Broker {
                 Command::Complete { request, payload } => {
                     self.requests.complete(caller, request, payload, now)
                 }
-                Command::EffectFence { command } if matches!(&*command, amaterasu_contracts::effect_fence::EffectFenceCommand::BrokerEpoch {} | amaterasu_contracts::effect_fence::EffectFenceCommand::RecoveryRetired { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::SourceRetired { .. }) => self.handle_effect_fence(caller, *command, now),
+                Command::EffectFence { command } if matches!(&*command, amaterasu_contracts::effect_fence::EffectFenceCommand::BrokerEpoch {} | amaterasu_contracts::effect_fence::EffectFenceCommand::RecoveryRetired { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::SourceRetired { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostProviderJoined { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostRetirementReceipt { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostRecoverHistorical { .. }) => self.handle_effect_fence(caller, *command, now),
                 _ => errors::permission_denied(),
             };
         }
@@ -458,6 +459,8 @@ impl Broker {
                     | EffectFenceCommand::ProviderRetired { .. }
                     | EffectFenceCommand::RecoverFence { .. }
                     | EffectFenceCommand::LookupIdentity { .. }
+                    | EffectFenceCommand::VerifyHistoricalJournal { .. }
+                    | EffectFenceCommand::ConfirmHistoricalCleanup { .. }
             )
         {
             return Response::error("slot_required", "source slot lease is required");
@@ -522,6 +525,69 @@ impl Broker {
             EffectFenceCommand::SourceRetired { lease, scope } => {
                 self.effect_fences.source_retired(caller, &lease, &scope)
             }
+            EffectFenceCommand::HostProviderJoined {
+                provider,
+                provider_incarnation,
+            } => {
+                if caller != HOST_LIFECYCLE_CONTROL_PRINCIPAL
+                    || self
+                        .configuration
+                        .host_context
+                        .provider_incarnations
+                        .get(&provider)
+                        != Some(&provider_incarnation)
+                {
+                    return errors::permission_denied();
+                }
+                self.effect_fences
+                    .host_provider_joined(&provider, &provider_incarnation);
+                Response::Ok
+            }
+            EffectFenceCommand::HostRetirementReceipt { scope, sequence } => {
+                if caller != HOST_LIFECYCLE_CONTROL_PRINCIPAL {
+                    return errors::permission_denied();
+                }
+                self.effect_fences.host_retirement_receipt(&scope, sequence)
+            }
+            EffectFenceCommand::HostRecoverHistorical {
+                lease,
+                receipt,
+                expected_entry,
+                state_request,
+            } => {
+                if caller != HOST_LIFECYCLE_CONTROL_PRINCIPAL {
+                    return errors::permission_denied();
+                }
+                if !self.effect_fences.slot_valid(&lease, &receipt.effect.scope)
+                    || !self.effect_fences.recovery_only(&receipt.effect.scope)
+                {
+                    return Response::error("stale_source_slot", "source is not in recovery");
+                }
+                if receipt.version != 1
+                    || receipt.broker_epoch != receipt.issued_lease.broker_epoch
+                    || serde_json::to_value(&receipt.issued_lease).ok().as_ref()
+                        != expected_entry.get("issued_lease")
+                    || expected_entry
+                        .pointer("/issued_lease/broker_epoch")
+                        .and_then(serde_json::Value::as_str)
+                        != Some(&receipt.broker_epoch)
+                {
+                    return Response::error("effect_conflict", "host retirement receipt differs");
+                }
+                if let Err(error) = self.verify_historical_journal(
+                    &receipt.effect,
+                    &receipt.provider_incarnation,
+                    &expected_entry,
+                    state_request,
+                ) {
+                    return error;
+                }
+                self.effect_fences.recover_historical(
+                    receipt.effect,
+                    &receipt.provider_incarnation,
+                    &expected_entry,
+                )
+            }
             EffectFenceCommand::FinishCloseSlot {
                 lease,
                 scope,
@@ -536,7 +602,30 @@ impl Broker {
                 if !self.effect_fences.valid_epoch(&broker_epoch) {
                     Response::error("stale_source_slot", "broker epoch is stale")
                 } else {
-                    self.effect_fences.provider_retired(caller, request)
+                    self.effect_fences.provider_retired(caller, request, None)
+                }
+            }
+            EffectFenceCommand::ProviderRetiredInIncarnation {
+                broker_epoch,
+                provider_incarnation,
+                request,
+            } => {
+                if !self.effect_fences.valid_epoch(&broker_epoch) {
+                    Response::error("stale_source_slot", "broker epoch is stale")
+                } else if self
+                    .configuration
+                    .host_context
+                    .provider_incarnations
+                    .get(caller)
+                    != Some(&provider_incarnation)
+                {
+                    errors::permission_denied()
+                } else {
+                    self.effect_fences.provider_retired(
+                        caller,
+                        request,
+                        Some(&provider_incarnation),
+                    )
                 }
             }
             EffectFenceCommand::SlotCommand { lease, command } => {
@@ -549,6 +638,10 @@ impl Broker {
                     EffectFenceCommand::Compact { scope, .. } => scope,
                     EffectFenceCommand::RecoverFence { identity }
                     | EffectFenceCommand::LookupIdentity { identity } => &identity.scope,
+                    EffectFenceCommand::VerifyHistoricalJournal { identity, .. } => &identity.scope,
+                    EffectFenceCommand::ConfirmHistoricalCleanup { identity, .. } => {
+                        &identity.scope
+                    }
                     _ => {
                         return Response::error(
                             "invalid_request",
@@ -582,10 +675,72 @@ impl Broker {
                 }
             }
             EffectFenceCommand::LookupIdentity { identity } => {
-                if !self.recovery_provider_matches(&identity) {
+                if !self.recovery_provider_matches(&identity)
+                    && !self.effect_fences.is_historical(&identity)
+                {
                     return errors::permission_denied();
                 }
                 self.effect_fences.lookup_identity(caller, &identity)
+            }
+            EffectFenceCommand::VerifyHistoricalJournal {
+                identity,
+                provider_incarnation,
+                expected_entry,
+                state_request,
+            } => {
+                if !self.effect_fences.authority(caller) {
+                    return errors::permission_denied();
+                }
+                if !slotted || !self.effect_fences.recovery_only(&identity.scope) {
+                    return Response::error(
+                        "recovery_required",
+                        "historical journal verification requires a recovery-only source",
+                    );
+                }
+                match self.verify_historical_journal(
+                    &identity,
+                    &provider_incarnation,
+                    &expected_entry,
+                    state_request,
+                ) {
+                    Ok(()) => Response::Result {
+                        payload: serde_json::json!({"status":"journal_verified"}),
+                    },
+                    Err(error) => error,
+                }
+            }
+            EffectFenceCommand::ConfirmHistoricalCleanup {
+                identity,
+                provider_incarnation,
+                expected_entry,
+                state_request,
+            } => {
+                if !self.effect_fences.authority(caller) {
+                    return errors::permission_denied();
+                }
+                if !slotted || !self.effect_fences.recovery_only(&identity.scope) {
+                    return Response::error("recovery_required", "source is not in recovery");
+                }
+                if expected_entry
+                    .get("cleanup_confirmed")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+                {
+                    return Response::error("effect_pending", "durable cleanup is not confirmed");
+                }
+                if let Err(error) = self.verify_historical_journal(
+                    &identity,
+                    &provider_incarnation,
+                    &expected_entry,
+                    state_request,
+                ) {
+                    return error;
+                }
+                self.effect_fences.confirm_historical_cleanup(
+                    &identity,
+                    &provider_incarnation,
+                    &expected_entry,
+                )
             }
             EffectFenceCommand::OpenSource {
                 scope,
@@ -596,7 +751,7 @@ impl Broker {
                 retired_through,
             } => self.effect_fences.compact(caller, &scope, retired_through),
             EffectFenceCommand::ProviderRetired { request } => {
-                self.effect_fences.provider_retired(caller, request)
+                self.effect_fences.provider_retired(caller, request, None)
             }
             EffectFenceCommand::Lookup { effect } => self.effect_fences.lookup(caller, &effect),
             EffectFenceCommand::SelectedMethod { method } => {
@@ -630,7 +785,12 @@ impl Broker {
                         "selected provider or API schema differs",
                     );
                 }
-                self.effect_fences.arm(caller, effect, &selected.provider)
+                self.effect_fences.arm(
+                    caller,
+                    effect,
+                    &selected.provider,
+                    selected.provider_incarnation.as_ref(),
+                )
             }
             EffectFenceCommand::Arm { effect } => {
                 if self.effect_fences.uses_slots() {
@@ -642,7 +802,7 @@ impl Broker {
                 let Some(provider) = self.effect_provider(&effect) else {
                     return errors::permission_denied();
                 };
-                self.effect_fences.arm(caller, effect, &provider)
+                self.effect_fences.arm(caller, effect, &provider, None)
             }
             EffectFenceCommand::Fence { effect } => {
                 let Some(provider) = self.effect_provider(&effect) else {
@@ -664,7 +824,23 @@ impl Broker {
                 }
             }
             EffectFenceCommand::Dispatch { effect } => {
-                match self.effect_fences.may_dispatch(caller, &effect) {
+                let provider = self.effect_provider(&effect);
+                if provider
+                    .as_ref()
+                    .is_some_and(|provider| self.effect_fences.provider_joined(provider))
+                {
+                    return Response::error("effect_fenced", "provider instance has retired");
+                }
+                let incarnation = provider.as_ref().and_then(|name| {
+                    self.configuration
+                        .host_context
+                        .provider_incarnations
+                        .get(name)
+                });
+                match self
+                    .effect_fences
+                    .may_dispatch(caller, &effect, incarnation)
+                {
                     Ok(Some(id)) => {
                         return if self.requests.retained(caller, id) {
                             Response::Accepted { id }
@@ -724,6 +900,56 @@ impl Broker {
         }
     }
 
+    fn verify_historical_journal(
+        &self,
+        identity: &amaterasu_contracts::effect_fence::GuardedEffectIdentity,
+        incarnation: &amaterasu_contracts::effect_fence::ProviderIncarnation,
+        expected_entry: &serde_json::Value,
+        state_request: u64,
+    ) -> Result<(), Response> {
+        let Some(Some(selection)) = self
+            .configuration
+            .service_selections
+            .broker
+            .get("amaterasu.state/1")
+        else {
+            return Err(Response::error(
+                "recovery_required",
+                "durable State provider is not explicitly selected",
+            ));
+        };
+        if selection.contract != "amaterasu.state/1" {
+            return Err(errors::permission_denied());
+        }
+        let authority = self
+            .effect_fences
+            .authority_name()
+            .ok_or_else(errors::permission_denied)?;
+        let issuer = self
+            .effect_fences
+            .issuer_name()
+            .ok_or_else(errors::permission_denied)?;
+        let (request, result) = self
+            .requests
+            .selected_state_read(authority, &selection.provider, state_request)
+            .ok_or_else(errors::permission_denied)?;
+        if historical_journal::matches(
+            request,
+            result,
+            issuer,
+            identity,
+            incarnation,
+            expected_entry,
+        ) {
+            Ok(())
+        } else {
+            Err(Response::error(
+                "effect_conflict",
+                "historical journal evidence differs",
+            ))
+        }
+    }
+
     fn selected_effect_method(
         &self,
         method: &amaterasu_contracts::effect_fence::ProtectedMethod,
@@ -743,6 +969,9 @@ impl Broker {
             &method.method,
             method.interface_major,
         )?;
+        if self.effect_fences.provider_joined(&approval.provider) {
+            return None;
+        }
         Some(amaterasu_contracts::effect_fence::SelectedEffectMethod {
             version: 1,
             provider: approval.provider.clone(),

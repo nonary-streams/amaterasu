@@ -66,7 +66,7 @@ fn inject_provider_incarnations<'a>(
     let mut instances = BTreeMap::new();
     let mut identifiers = BTreeSet::new();
     for component in component_ids {
-        let mut bytes = [0_u8; 32];
+        let mut bytes = [0_u8; 16];
         getrandom::fill(&mut bytes).map_err(|error| error.to_string())?;
         let id: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
         if !identifiers.insert(id.clone())
@@ -710,7 +710,7 @@ mod tests {
         let first = config.host_context.provider_incarnations.clone();
         assert_ne!(first["provider"], first["other"]);
         assert_eq!(first["provider"].version, 1);
-        assert_eq!(first["provider"].id.len(), 64);
+        assert_eq!(first["provider"].id.len(), 32);
         inject_provider_incarnations(&mut config, ["provider"]).unwrap();
         assert_ne!(
             first["provider"],

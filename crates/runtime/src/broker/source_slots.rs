@@ -119,6 +119,19 @@ impl SourceSlots {
             && slot_for(scope) == Some(lease.slot)
             && self.slots[usize::from(lease.slot)].active.as_ref() == Some(scope)
     }
+    pub fn lease_for(&self, scope: &EffectScope) -> Option<SourceSlotLease> {
+        let index = slot_for(scope)?;
+        let slot = self.slots.get(usize::from(index))?;
+        if slot.active.as_ref() != Some(scope) {
+            return None;
+        }
+        Some(SourceSlotLease {
+            slot: index,
+            incarnation: slot.retired.checked_add(1)?,
+            broker_epoch: self.epoch.clone(),
+            token: slot.token.clone(),
+        })
+    }
     pub fn can_open(&self, lease: &SourceSlotLease, scope: &EffectScope) -> Result<bool, Response> {
         if !self.valid_lease(lease) || slot_for(scope) != Some(lease.slot) {
             return Err(stale());

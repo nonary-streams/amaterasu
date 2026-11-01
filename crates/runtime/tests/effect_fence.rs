@@ -2820,12 +2820,626 @@ fn authority_binds_selected_provider_and_complete_schema_at_arm() {
 }
 
 #[test]
+fn historical_journal_verification_uses_real_selected_state_read() {
+    use amaterasu_contracts::{
+        SelectedService,
+        effect_fence::{ProviderIncarnation, SelectedEffectMethod},
+    };
+    use amaterasu_module_sdk::state::StateRequest;
+    use amaterasu_state::test_support::TestStateStore;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let directory = std::env::temp_dir().join(format!(
+        "historical-state-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let store = TestStateStore::open(directory.clone()).unwrap();
+    let mut config = configuration();
+    let old_method = config.api_methods[0].method.clone();
+    config.effect_fence.as_mut().unwrap().source_slots = true;
+    config.host_lifecycle_control = true;
+    config.principals.insert(
+        amaterasu_contracts::HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(),
+        Grants::default(),
+    );
+    let replacement_grants = config.principals["provider"].clone();
+    config
+        .principals
+        .insert("replacement".into(), replacement_grants);
+    config.api_methods[0].provider = "replacement".into();
+    config.api_methods[0].method.interface_minor = 1;
+    config
+        .principals
+        .get_mut("authority")
+        .unwrap()
+        .call
+        .insert("amaterasu.state/1".into());
+    config.principals.insert(
+        "state".into(),
+        Grants {
+            provide: ["amaterasu.state/1".into()].into(),
+            ..Default::default()
+        },
+    );
+    config.service_selections.broker.insert(
+        "amaterasu.state/1".into(),
+        Some(SelectedService {
+            provider: "state".into(),
+            contract: "amaterasu.state/1".into(),
+        }),
+    );
+    let replacement_method = config.api_methods[0].method.clone();
+    let mut broker = Broker::new(config).unwrap();
+    assert!(matches!(
+        broker.dispatch(
+            "replacement",
+            Command::RegisterApi {
+                method: replacement_method
+            }
+        ),
+        Response::Ok
+    ));
+    assert!(matches!(
+        broker.dispatch(
+            "state",
+            Command::Register {
+                service: "amaterasu.state/1".into()
+            }
+        ),
+        Response::Ok
+    ));
+
+    let mut guarded = effect(1);
+    guarded.scope = source_for(0);
+    let identity = guarded.identity("provider");
+    let instance = ProviderIncarnation {
+        version: 1,
+        id: "d".repeat(32),
+    };
+    let mut old_config = configuration();
+    old_config.effect_fence.as_mut().unwrap().source_slots = true;
+    old_config.host_lifecycle_control = true;
+    old_config.principals.insert(
+        amaterasu_contracts::HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(),
+        Grants::default(),
+    );
+    old_config
+        .host_context
+        .provider_incarnations
+        .insert("provider".into(), instance.clone());
+    let old_registration = old_config.api_methods[0].method.clone();
+    let mut old_broker = Broker::new(old_config).unwrap();
+    assert!(matches!(
+        old_broker.dispatch(
+            "provider",
+            Command::RegisterApi {
+                method: old_registration
+            }
+        ),
+        Response::Ok
+    ));
+    let old_epoch = broker_epoch(&mut old_broker, "authority");
+    recover_slots(&mut old_broker, &old_epoch, vec![0; 64]);
+    let lease = slot_lease(&mut old_broker, 0);
+    open_slot(&mut old_broker, &lease, &identity.scope);
+    let selected = SelectedEffectMethod {
+        version: 1,
+        provider: "provider".into(),
+        method: old_method.clone(),
+        provider_incarnation: Some(instance.clone()),
+    };
+    let mut cleanup_method = old_method.clone();
+    cleanup_method.method = "cleanup".into();
+    let cleanup_approval = ApiMethodApproval {
+        provider: "provider".into(),
+        callers: ["issuer".into()].into(),
+        method: cleanup_method,
+    };
+    let journal = json!({"version":1,"slot":0,"retired_incarnation":0,"pending_close":null,
+        "active":{"lease":lease,"scope":identity.scope,"issuer":"issuer","retired_through":0,"issued_through":1,
+        "entries":[{"identity":identity,"issued_lease":lease,"provider_incarnation":instance,"selected_method":selected,
+        "cleanup_method":{"service":"example.effects/1","method":"cleanup","interface_major":1,"interface_minor":0,"schema_revision":1},
+        "cleanup_approval":cleanup_approval,"cleanup":{"id":"a".repeat(64)},"cleanup_confirmed":false}]}});
+    let expected_entry = journal["active"]["entries"][0].clone();
+    let mut cleaned_journal = journal.clone();
+    cleaned_journal["active"]["entries"][0]["cleanup_confirmed"] = json!(true);
+    let cleaned_entry = cleaned_journal["active"]["entries"][0].clone();
+    let key = "pairing/protocol-slot/v1/00";
+    let saved = store.handle(
+        "authority",
+        StateRequest::Set {
+            key: key.into(),
+            value: journal,
+            expected_revision: Some(0),
+        }
+        .payload(),
+    );
+    assert_eq!(saved["ok"], true, "journal must be durable before arm");
+    assert!(matches!(
+        slot_invoke(
+            &mut old_broker,
+            "authority",
+            &lease,
+            EffectFenceCommand::Arm {
+                effect: guarded.clone()
+            }
+        ),
+        Response::Ok
+    ));
+    assert!(matches!(
+        slot_invoke(
+            &mut old_broker,
+            "issuer",
+            &lease,
+            EffectFenceCommand::Dispatch {
+                effect: guarded.clone()
+            }
+        ),
+        Response::Accepted { .. }
+    ));
+    assert!(matches!(
+        old_broker.dispatch("provider", Command::Poll {}),
+        Response::Request { .. }
+    ));
+    let (release_worker, worker_gate) = mpsc::channel::<()>();
+    let worker = std::thread::spawn(move || worker_gate.recv().unwrap());
+    begin_close(&mut old_broker, &lease, &identity.scope);
+    release_worker.send(()).unwrap();
+    worker.join().unwrap();
+    assert!(matches!(
+        invoke(
+            &mut old_broker,
+            amaterasu_contracts::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            EffectFenceCommand::HostProviderJoined {
+                provider: "provider".into(),
+                provider_incarnation: instance.clone()
+            }
+        ),
+        Response::Ok
+    ));
+    let Response::Result { payload } = invoke(
+        &mut old_broker,
+        amaterasu_contracts::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+        EffectFenceCommand::HostRetirementReceipt {
+            scope: identity.scope.clone(),
+            sequence: 1,
+        },
+    ) else {
+        panic!("old host receipt missing")
+    };
+    let old_receipt: amaterasu_contracts::effect_fence::HostProviderRetirement =
+        serde_json::from_value(payload).unwrap();
+    drop(old_broker);
+    let epoch = broker_epoch(&mut broker, "authority");
+    for principal in [
+        "issuer",
+        "replacement",
+        "state",
+        amaterasu_contracts::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+    ] {
+        assert!(matches!(
+            invoke(
+                &mut broker,
+                principal,
+                EffectFenceCommand::RecoveryRetired {
+                    broker_epoch: epoch.clone()
+                }
+            ),
+            Response::Ok
+        ));
+    }
+    assert!(matches!(
+        invoke(
+            &mut broker,
+            "authority",
+            EffectFenceCommand::RecoverSlots {
+                broker_epoch: epoch,
+                retired_incarnations: vec![0; 64]
+            }
+        ),
+        Response::Ok
+    ));
+    let recovery_lease = slot_lease(&mut broker, 0);
+    assert!(matches!(
+        invoke(
+            &mut broker,
+            "authority",
+            EffectFenceCommand::OpenRecoverySlot {
+                lease: recovery_lease.clone(),
+                scope: identity.scope.clone(),
+                retired_through: 0,
+                issued_through: 1
+            }
+        ),
+        Response::Ok
+    ));
+    let send_state = |broker: &mut Broker, request: StateRequest, operation: &str| {
+        let Response::Accepted { id } = broker.dispatch(
+            "authority",
+            Command::Request {
+                service: "amaterasu.state/1".into(),
+                payload: request.payload(),
+                timeout_ms: 30_000,
+                operation_id: operation.into(),
+                parent: None,
+            },
+        ) else {
+            panic!("state request denied")
+        };
+        let Response::Request {
+            caller, payload, ..
+        } = broker.dispatch("state", Command::Poll {})
+        else {
+            panic!("state request missing")
+        };
+        let result = store.handle(&caller, payload);
+        assert!(matches!(
+            broker.dispatch(
+                "state",
+                Command::Complete {
+                    request: id,
+                    payload: result
+                }
+            ),
+            Response::Ok
+        ));
+        id
+    };
+    let read = send_state(
+        &mut broker,
+        StateRequest::Get { key: key.into() },
+        "journal.read",
+    );
+    let check =
+        |identity: amaterasu_contracts::effect_fence::GuardedEffectIdentity,
+         provider_incarnation| EffectFenceCommand::VerifyHistoricalJournal {
+            identity: Box::new(identity),
+            provider_incarnation,
+            expected_entry: expected_entry.clone(),
+            state_request: read,
+        };
+    assert!(
+        matches!(slot_invoke(&mut broker, "authority", &recovery_lease, check(identity.clone(), instance.clone())), Response::Result { payload } if payload["status"] == "journal_verified")
+    );
+    assert_eq!(
+        code(slot_invoke(
+            &mut broker,
+            "issuer",
+            &recovery_lease,
+            check(identity.clone(), instance.clone())
+        )),
+        "permission_denied"
+    );
+    let mut wrong = identity.clone();
+    wrong.payload_sha256 = "e".repeat(64);
+    assert_eq!(
+        code(slot_invoke(
+            &mut broker,
+            "authority",
+            &recovery_lease,
+            check(wrong, instance.clone())
+        )),
+        "effect_conflict"
+    );
+    let mut forged_entry = expected_entry.clone();
+    forged_entry["cleanup"]["id"] = json!("b".repeat(64));
+    assert_eq!(
+        code(slot_invoke(
+            &mut broker,
+            "authority",
+            &recovery_lease,
+            EffectFenceCommand::VerifyHistoricalJournal {
+                identity: Box::new(identity.clone()),
+                provider_incarnation: instance.clone(),
+                expected_entry: forged_entry,
+                state_request: read,
+            }
+        )),
+        "effect_conflict"
+    );
+    let mut wrong_instance = instance.clone();
+    wrong_instance.id = "e".repeat(32);
+    assert_eq!(
+        code(slot_invoke(
+            &mut broker,
+            "authority",
+            &recovery_lease,
+            check(identity.clone(), wrong_instance)
+        )),
+        "effect_conflict"
+    );
+    let historical = |receipt: amaterasu_contracts::effect_fence::HostProviderRetirement| {
+        EffectFenceCommand::HostRecoverHistorical {
+            lease: recovery_lease.clone(),
+            receipt: Box::new(receipt),
+            expected_entry: expected_entry.clone(),
+            state_request: read,
+        }
+    };
+    assert_eq!(
+        code(invoke(
+            &mut broker,
+            "authority",
+            historical(old_receipt.clone())
+        )),
+        "permission_denied"
+    );
+    let mut forged_receipt = old_receipt.clone();
+    forged_receipt.broker_epoch = "forged".into();
+    assert_eq!(
+        code(invoke(
+            &mut broker,
+            amaterasu_contracts::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            historical(forged_receipt)
+        )),
+        "effect_conflict"
+    );
+    let mut forged_lease = old_receipt.clone();
+    forged_lease.issued_lease.token = "forged-token".into();
+    assert_eq!(
+        code(invoke(
+            &mut broker,
+            amaterasu_contracts::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            historical(forged_lease)
+        )),
+        "effect_conflict"
+    );
+    assert!(matches!(
+        invoke(
+            &mut broker,
+            amaterasu_contracts::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            historical(old_receipt)
+        ),
+        Response::Ok
+    ));
+    assert!(
+        matches!(slot_invoke(&mut broker, "authority", &recovery_lease, EffectFenceCommand::LookupIdentity { identity: identity.clone() }), Response::Result { payload } if payload["status"] == "retired")
+    );
+    assert_eq!(
+        code(slot_invoke(
+            &mut broker,
+            "authority",
+            &recovery_lease,
+            EffectFenceCommand::Compact {
+                scope: identity.scope.clone(),
+                retired_through: 1
+            }
+        )),
+        "effect_pending"
+    );
+    assert_eq!(
+        code(slot_invoke(
+            &mut broker,
+            "authority",
+            &recovery_lease,
+            EffectFenceCommand::ConfirmHistoricalCleanup {
+                identity: Box::new(identity.clone()),
+                provider_incarnation: instance.clone(),
+                expected_entry: expected_entry.clone(),
+                state_request: read,
+            }
+        )),
+        "effect_pending"
+    );
+    // Even an authenticated later State write cannot change the original
+    // cleanup identity between host retirement and cleanup confirmation.
+    let mut changed_journal = cleaned_journal.clone();
+    changed_journal["active"]["entries"][0]["cleanup"]["id"] = json!("b".repeat(64));
+    let changed_entry = changed_journal["active"]["entries"][0].clone();
+    let changed_write = send_state(
+        &mut broker,
+        StateRequest::Set {
+            key: key.into(),
+            value: changed_journal,
+            expected_revision: Some(1),
+        },
+        "changed.write",
+    );
+    assert!(matches!(
+        broker.dispatch(
+            "authority",
+            Command::ReleaseResult {
+                request: changed_write
+            }
+        ),
+        Response::Ok
+    ));
+    let changed_read = send_state(
+        &mut broker,
+        StateRequest::Get { key: key.into() },
+        "changed.read",
+    );
+    assert_eq!(
+        code(slot_invoke(
+            &mut broker,
+            "authority",
+            &recovery_lease,
+            EffectFenceCommand::ConfirmHistoricalCleanup {
+                identity: Box::new(identity.clone()),
+                provider_incarnation: instance.clone(),
+                expected_entry: changed_entry,
+                state_request: changed_read,
+            }
+        )),
+        "effect_conflict"
+    );
+    // In production pairing writes this only after independent cleanup proof.
+    let cleanup_write = send_state(
+        &mut broker,
+        StateRequest::Set {
+            key: key.into(),
+            value: cleaned_journal,
+            expected_revision: Some(2),
+        },
+        "cleanup.write",
+    );
+    assert!(matches!(
+        broker.dispatch(
+            "authority",
+            Command::ReleaseResult {
+                request: cleanup_write
+            }
+        ),
+        Response::Ok
+    ));
+    let cleanup_read = send_state(
+        &mut broker,
+        StateRequest::Get { key: key.into() },
+        "cleanup.read",
+    );
+    assert!(matches!(
+        slot_invoke(
+            &mut broker,
+            "authority",
+            &recovery_lease,
+            EffectFenceCommand::ConfirmHistoricalCleanup {
+                identity: Box::new(identity.clone()),
+                provider_incarnation: instance.clone(),
+                expected_entry: cleaned_entry.clone(),
+                state_request: cleanup_read,
+            }
+        ),
+        Response::Ok
+    ));
+    assert!(matches!(
+        slot_invoke(
+            &mut broker,
+            "authority",
+            &recovery_lease,
+            EffectFenceCommand::Compact {
+                scope: identity.scope.clone(),
+                retired_through: 1
+            }
+        ),
+        Response::Ok
+    ));
+    let later_write = send_state(
+        &mut broker,
+        StateRequest::Set {
+            key: "unrelated".into(),
+            value: json!({"revision":2}),
+            expected_revision: Some(3),
+        },
+        "later.write",
+    );
+    assert!(matches!(
+        broker.dispatch(
+            "authority",
+            Command::ReleaseResult {
+                request: later_write
+            }
+        ),
+        Response::Ok
+    ));
+    assert_eq!(
+        code(slot_invoke(
+            &mut broker,
+            "authority",
+            &recovery_lease,
+            check(identity.clone(), instance.clone())
+        )),
+        "permission_denied"
+    );
+    let fresh_read = send_state(
+        &mut broker,
+        StateRequest::Get { key: key.into() },
+        "fresh.read",
+    );
+    let fresh_check = || EffectFenceCommand::VerifyHistoricalJournal {
+        identity: Box::new(identity.clone()),
+        provider_incarnation: instance.clone(),
+        expected_entry: cleaned_entry.clone(),
+        state_request: fresh_read,
+    };
+    assert!(matches!(
+        slot_invoke(&mut broker, "authority", &recovery_lease, fresh_check()),
+        Response::Result { .. }
+    ));
+    let Response::Accepted { id: delayed } = broker.dispatch(
+        "authority",
+        Command::Request {
+            service: "amaterasu.state/1".into(),
+            payload: StateRequest::Set {
+                key: "late".into(),
+                value: json!(true),
+                expected_revision: Some(4),
+            }
+            .payload(),
+            timeout_ms: 30_000,
+            operation_id: "late.write".into(),
+            parent: None,
+        },
+    ) else {
+        panic!("late state write denied")
+    };
+    let Response::Request {
+        caller, payload, ..
+    } = broker.dispatch("state", Command::Poll {})
+    else {
+        panic!("late state write missing")
+    };
+    assert!(matches!(
+        broker.dispatch("authority", Command::Cancel { request: delayed }),
+        Response::Ok
+    ));
+    assert_eq!(
+        code(slot_invoke(
+            &mut broker,
+            "authority",
+            &recovery_lease,
+            fresh_check()
+        )),
+        "permission_denied"
+    );
+    let late_result = store.handle(&caller, payload);
+    assert_eq!(
+        code(broker.dispatch(
+            "state",
+            Command::Complete {
+                request: delayed,
+                payload: late_result
+            }
+        )),
+        "request_ended"
+    );
+    assert_eq!(
+        code(slot_invoke(
+            &mut broker,
+            "authority",
+            &recovery_lease,
+            fresh_check()
+        )),
+        "permission_denied"
+    );
+    assert!(matches!(
+        broker.dispatch("authority", Command::ReleaseResult { request: read }),
+        Response::Ok
+    ));
+    assert_eq!(
+        code(slot_invoke(
+            &mut broker,
+            "authority",
+            &recovery_lease,
+            check(identity, instance)
+        )),
+        "permission_denied"
+    );
+    drop(broker);
+    drop(store);
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn selected_method_binds_host_issued_provider_incarnation() {
     use amaterasu_contracts::effect_fence::ProviderIncarnation;
     let mut config = configuration();
     let instance = ProviderIncarnation {
         version: 1,
-        id: "a".repeat(64),
+        id: "a".repeat(32),
     };
     config
         .host_context
@@ -2854,7 +3468,7 @@ fn selected_method_binds_host_issued_provider_incarnation() {
     let mut selected: amaterasu_contracts::effect_fence::SelectedEffectMethod =
         serde_json::from_value(payload).unwrap();
     assert_eq!(selected.provider_incarnation.as_ref(), Some(&instance));
-    selected.provider_incarnation.as_mut().unwrap().id = "b".repeat(64);
+    selected.provider_incarnation.as_mut().unwrap().id = "b".repeat(32);
     assert_eq!(
         code(invoke(
             &mut broker,
@@ -2865,6 +3479,243 @@ fn selected_method_binds_host_issued_provider_incarnation() {
             }
         )),
         "incompatible_api"
+    );
+}
+
+#[test]
+fn delivered_work_requires_the_original_host_provider_incarnation() {
+    use amaterasu_contracts::effect_fence::ProviderIncarnation;
+    let mut config = configuration();
+    config.effect_fence.as_mut().unwrap().source_slots = true;
+    config.host_lifecycle_control = true;
+    config.principals.insert(
+        amaterasu_contracts::HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(),
+        Grants::default(),
+    );
+    let instance = ProviderIncarnation {
+        version: 1,
+        id: "a".repeat(32),
+    };
+    config
+        .host_context
+        .provider_incarnations
+        .insert("provider".into(), instance.clone());
+    let method = config.api_methods[0].method.clone();
+    let mut broker = Broker::new(config).unwrap();
+    assert!(matches!(
+        broker.dispatch("provider", Command::RegisterApi { method }),
+        Response::Ok
+    ));
+    let epoch = broker_epoch(&mut broker, "authority");
+    recover_slots(&mut broker, &epoch, vec![0; 64]);
+    let lease = slot_lease(&mut broker, 0);
+    let scope = source_for(0);
+    open_slot(&mut broker, &lease, &scope);
+    let mut guarded = effect(1);
+    guarded.scope = scope.clone();
+    assert!(matches!(
+        slot_invoke(
+            &mut broker,
+            "authority",
+            &lease,
+            EffectFenceCommand::Arm {
+                effect: guarded.clone()
+            }
+        ),
+        Response::Ok
+    ));
+    let Response::Accepted { id } = slot_invoke(
+        &mut broker,
+        "issuer",
+        &lease,
+        EffectFenceCommand::Dispatch { effect: guarded },
+    ) else {
+        panic!("dispatch denied")
+    };
+    assert!(matches!(
+        broker.dispatch("provider", Command::Poll {}),
+        Response::Request { .. }
+    ));
+    begin_close(&mut broker, &lease, &scope);
+    assert_eq!(
+        code(invoke(
+            &mut broker,
+            "provider",
+            EffectFenceCommand::ProviderRetiredInEpoch {
+                broker_epoch: epoch.clone(),
+                request: id
+            }
+        )),
+        "permission_denied"
+    );
+    let mut wrong = instance.clone();
+    wrong.id = "b".repeat(32);
+    let retire = |provider_incarnation| EffectFenceCommand::ProviderRetiredInIncarnation {
+        broker_epoch: epoch.clone(),
+        provider_incarnation,
+        request: id,
+    };
+    assert_eq!(
+        code(invoke(&mut broker, "provider", retire(wrong))),
+        "permission_denied"
+    );
+    assert_eq!(
+        code(invoke(&mut broker, "outsider", retire(instance.clone()))),
+        "permission_denied"
+    );
+    assert_eq!(
+        code(slot_invoke(
+            &mut broker,
+            "authority",
+            &lease,
+            EffectFenceCommand::Compact {
+                scope: scope.clone(),
+                retired_through: 1
+            }
+        )),
+        "effect_pending"
+    );
+    assert!(matches!(
+        invoke(&mut broker, "provider", retire(instance)),
+        Response::Ok
+    ));
+    assert!(matches!(
+        slot_invoke(
+            &mut broker,
+            "authority",
+            &lease,
+            EffectFenceCommand::Compact {
+                scope,
+                retired_through: 1
+            }
+        ),
+        Response::Ok
+    ));
+}
+
+#[test]
+fn host_receipt_requires_exact_joined_provider_and_retained_effect() {
+    use amaterasu_contracts::effect_fence::{HostProviderRetirement, ProviderIncarnation};
+    let mut config = configuration();
+    config.effect_fence.as_mut().unwrap().source_slots = true;
+    config.host_lifecycle_control = true;
+    config.principals.insert(
+        amaterasu_contracts::HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(),
+        Grants::default(),
+    );
+    let instance = ProviderIncarnation {
+        version: 1,
+        id: "a".repeat(32),
+    };
+    config
+        .host_context
+        .provider_incarnations
+        .insert("provider".into(), instance.clone());
+    let method = config.api_methods[0].method.clone();
+    let mut broker = Broker::new(config).unwrap();
+    assert!(matches!(
+        broker.dispatch("provider", Command::RegisterApi { method }),
+        Response::Ok
+    ));
+    let epoch = broker_epoch(&mut broker, "authority");
+    recover_slots(&mut broker, &epoch, vec![0; 64]);
+    let lease = slot_lease(&mut broker, 0);
+    let scope = source_for(0);
+    open_slot(&mut broker, &lease, &scope);
+    let mut guarded = effect(1);
+    guarded.scope = scope.clone();
+    assert!(matches!(
+        slot_invoke(
+            &mut broker,
+            "authority",
+            &lease,
+            EffectFenceCommand::Arm {
+                effect: guarded.clone()
+            }
+        ),
+        Response::Ok
+    ));
+    assert!(matches!(
+        slot_invoke(
+            &mut broker,
+            "issuer",
+            &lease,
+            EffectFenceCommand::Dispatch {
+                effect: guarded.clone()
+            }
+        ),
+        Response::Accepted { .. }
+    ));
+    assert!(matches!(
+        broker.dispatch("provider", Command::Poll {}),
+        Response::Request { .. }
+    ));
+    let (send, receive) = mpsc::channel::<()>();
+    let worker = std::thread::spawn(move || receive.recv().unwrap());
+    begin_close(&mut broker, &lease, &scope);
+    let receipt = || EffectFenceCommand::HostRetirementReceipt {
+        scope: scope.clone(),
+        sequence: 1,
+    };
+    assert_eq!(
+        code(invoke(
+            &mut broker,
+            amaterasu_contracts::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            receipt()
+        )),
+        "effect_pending"
+    );
+    assert_eq!(
+        code(invoke(&mut broker, "authority", receipt())),
+        "permission_denied"
+    );
+    let joined = |provider_incarnation| EffectFenceCommand::HostProviderJoined {
+        provider: "provider".into(),
+        provider_incarnation,
+    };
+    assert_eq!(
+        code(invoke(&mut broker, "provider", joined(instance.clone()))),
+        "permission_denied"
+    );
+    let mut wrong = instance.clone();
+    wrong.id = "b".repeat(32);
+    assert_eq!(
+        code(invoke(
+            &mut broker,
+            amaterasu_contracts::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            joined(wrong)
+        )),
+        "permission_denied"
+    );
+    send.send(()).unwrap();
+    worker.join().unwrap();
+    assert!(matches!(
+        invoke(
+            &mut broker,
+            amaterasu_contracts::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            joined(instance.clone())
+        ),
+        Response::Ok
+    ));
+    let Response::Result { payload } = invoke(
+        &mut broker,
+        amaterasu_contracts::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+        receipt(),
+    ) else {
+        panic!("joined receipt missing")
+    };
+    let record: HostProviderRetirement = serde_json::from_value(payload).unwrap();
+    assert_eq!(record.broker_epoch, epoch);
+    assert_eq!(record.provider_incarnation, instance);
+    assert_eq!(record.effect, guarded.identity("provider"));
+    assert_eq!(
+        code(slot_invoke(
+            &mut broker,
+            "issuer",
+            &lease,
+            EffectFenceCommand::Dispatch { effect: guarded }
+        )),
+        "effect_fenced"
     );
 }
 

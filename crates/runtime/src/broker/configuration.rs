@@ -16,7 +16,7 @@ pub(super) fn validate(configuration: &RuntimeConfig) -> Result<(), String> {
     for (principal, instance) in &configuration.host_context.provider_incarnations {
         if !configuration.principals.contains_key(principal)
             || instance.version != 1
-            || instance.id.len() != 64
+            || instance.id.len() != 32
             || !instance
                 .id
                 .bytes()

@@ -43,6 +43,7 @@ pub struct ProviderIncarnation {
 pub struct HostProviderRetirement {
     pub version: u8,
     pub broker_epoch: String,
+    pub issued_lease: SourceSlotLease,
     pub provider_incarnation: ProviderIncarnation,
     pub effect: GuardedEffectIdentity,
 }
@@ -288,6 +289,26 @@ pub enum EffectFenceCommand {
         lease: SourceSlotLease,
         scope: EffectScope,
     },
+    /// Reserved host endpoint only, after this exact module's ABI destroy has
+    /// returned and joined its workers. This does not establish external cleanup.
+    HostProviderJoined {
+        provider: String,
+        provider_incarnation: ProviderIncarnation,
+    },
+    /// Reserved host endpoint: build a local-worker retirement record for an
+    /// exact retained effect after the original provider instance has joined.
+    HostRetirementReceipt {
+        scope: EffectScope,
+        sequence: u64,
+    },
+    /// Host-only recovery assertion after the original instance was actually
+    /// joined. The broker independently checks the retained canonical journal.
+    HostRecoverHistorical {
+        lease: SourceSlotLease,
+        receipt: Box<HostProviderRetirement>,
+        expected_entry: Value,
+        state_request: u64,
+    },
     /// After durable source/slot retirement and compaction, release the source
     /// and rotate its slot token. Before calling, the authority must durably
     /// persist the slot incarnation as retired, including on an uncertain reply.
@@ -307,6 +328,25 @@ pub enum EffectFenceCommand {
     LookupIdentity {
         identity: GuardedEffectIdentity,
     },
+    /// Verify an exact historical identity against a retained State Get result
+    /// from the explicitly selected State provider and authority namespace.
+    /// This reports journal evidence only; it cannot fence, retire, or dispatch.
+    VerifyHistoricalJournal {
+        identity: Box<GuardedEffectIdentity>,
+        provider_incarnation: ProviderIncarnation,
+        /// Complete non-secret entry, including original issued lease, selected
+        /// schemas and cleanup reference; compared to State, never trusted alone.
+        expected_entry: Value,
+        state_request: u64,
+    },
+    /// Confirm pairing's durable cleanup flag for a previously host-retired
+    /// historical record; it cannot manufacture a provider cleanup proof.
+    ConfirmHistoricalCleanup {
+        identity: Box<GuardedEffectIdentity>,
+        provider_incarnation: ProviderIncarnation,
+        expected_entry: Value,
+        state_request: u64,
+    },
     /// The inner command must be Arm, Dispatch, Fence, Lookup, Compact,
     /// RecoverFence or LookupIdentity. The lease binds every operation to the
     /// exact broker/slot incarnation.
@@ -318,6 +358,13 @@ pub enum EffectFenceCommand {
     /// retirement, so delayed acknowledgments cannot cross broker restarts.
     ProviderRetiredInEpoch {
         broker_epoch: String,
+        request: u64,
+    },
+    /// Exact instance-bound provider acknowledgment for host-identified
+    /// providers. The provider must retire its real workers before sending it.
+    ProviderRetiredInIncarnation {
+        broker_epoch: String,
+        provider_incarnation: ProviderIncarnation,
         request: u64,
     },
     /// Sent by the selected provider only after this request's final local work

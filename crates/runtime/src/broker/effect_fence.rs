@@ -4,8 +4,8 @@ use super::errors::{capacity_exhausted, payload_fits, permission_denied};
 use amaterasu_contracts::{
     Response, RuntimeConfig,
     effect_fence::{
-        EffectFencePolicy, EffectScope, GuardedEffect, GuardedEffectIdentity, ProtectedMethod,
-        SourceSlotLease,
+        EffectFencePolicy, EffectScope, GuardedEffect, GuardedEffectIdentity,
+        HostProviderRetirement, ProtectedMethod, ProviderIncarnation, SourceSlotLease,
     },
     valid_name,
 };
@@ -20,9 +20,13 @@ struct Record {
     identity: GuardedEffectIdentity,
     request: Option<u64>,
     provider: String,
+    provider_incarnation: Option<ProviderIncarnation>,
     delivered: bool,
     worker_retired: bool,
     fenced: bool,
+    historical: bool,
+    cleanup_confirmed: bool,
+    historical_entry: Option<serde_json::Value>,
 }
 struct SourceState {
     initial_retired: u64,
@@ -38,6 +42,7 @@ pub(super) struct EffectFences {
     provider_services: BTreeSet<String>,
     slots: Option<super::source_slots::SourceSlots>,
     sources: BTreeMap<EffectScope, SourceState>,
+    joined_providers: BTreeSet<String>,
 }
 
 impl EffectFences {
@@ -83,6 +88,9 @@ impl EffectFences {
                     .expect("validated protected method");
                 required.insert(approval.provider.clone());
             }
+            if let Some(Some(state)) = config.service_selections.broker.get("amaterasu.state/1") {
+                required.insert(state.provider.clone());
+            }
             Some(super::source_slots::SourceSlots::new(required)?)
         } else {
             None
@@ -92,6 +100,7 @@ impl EffectFences {
             provider_services,
             slots,
             sources: BTreeMap::new(),
+            joined_providers: BTreeSet::new(),
         })
     }
     pub fn protects(&self, service: &str, method: &str, major: u32) -> bool {
@@ -128,6 +137,55 @@ impl EffectFences {
     }
     pub fn issuer_name(&self) -> Option<&str> {
         self.policy.as_ref().map(|policy| policy.issuer.as_str())
+    }
+    pub fn authority_name(&self) -> Option<&str> {
+        self.policy.as_ref().map(|policy| policy.authority.as_str())
+    }
+    pub fn provider_joined(&self, provider: &str) -> bool {
+        self.joined_providers.contains(provider)
+    }
+    pub fn host_provider_joined(&mut self, provider: &str, incarnation: &ProviderIncarnation) {
+        self.joined_providers.insert(provider.to_owned());
+        for source in self.sources.values_mut() {
+            for record in source.records.values_mut() {
+                if record.provider == provider
+                    && record.provider_incarnation.as_ref() == Some(incarnation)
+                {
+                    record.worker_retired = true;
+                }
+            }
+        }
+    }
+    pub fn host_retirement_receipt(&self, scope: &EffectScope, sequence: u64) -> Response {
+        let Some(record) = self
+            .sources
+            .get(scope)
+            .and_then(|source| source.records.get(&sequence))
+        else {
+            return Response::error("recovery_required", "effect record is unavailable");
+        };
+        let Some(incarnation) = &record.provider_incarnation else {
+            return Response::error("recovery_required", "provider incarnation is unavailable");
+        };
+        let Some(slots) = &self.slots else {
+            return Response::error("unsupported", "source slots are not configured");
+        };
+        if !record.fenced || !record.worker_retired || !self.provider_joined(&record.provider) {
+            return Response::error("effect_pending", "provider worker has not been joined");
+        }
+        let receipt = HostProviderRetirement {
+            version: 1,
+            broker_epoch: slots.epoch().to_owned(),
+            issued_lease: match slots.lease_for(scope) {
+                Some(lease) => lease,
+                None => return Response::error("recovery_required", "source slot is unavailable"),
+            },
+            provider_incarnation: incarnation.clone(),
+            effect: record.identity.clone(),
+        };
+        Response::Result {
+            payload: serde_json::to_value(receipt).expect("receipt is serializable"),
+        }
     }
     pub fn uses_slots(&self) -> bool {
         self.slots.is_some()
@@ -173,6 +231,11 @@ impl EffectFences {
         self.slots
             .as_ref()
             .is_some_and(|slots| slots.valid_for(lease, scope))
+    }
+    pub fn recovery_only(&self, scope: &EffectScope) -> bool {
+        self.sources
+            .get(scope)
+            .is_some_and(|source| source.recovery_issued.is_some() && source.closing)
     }
     pub fn open_slot(
         &mut self,
@@ -393,7 +456,13 @@ impl EffectFences {
         }
         Ok(source)
     }
-    pub fn arm(&mut self, caller: &str, effect: GuardedEffect, provider: &str) -> Response {
+    pub fn arm(
+        &mut self,
+        caller: &str,
+        effect: GuardedEffect,
+        provider: &str,
+        incarnation: Option<&ProviderIncarnation>,
+    ) -> Response {
         if !self.authority(caller) {
             return permission_denied();
         }
@@ -406,6 +475,7 @@ impl EffectFences {
         }
         if let Some(record) = source.records.get(&effect.sequence) {
             return if record.identity != effect.identity(provider)
+                || record.provider_incarnation.as_ref() != incarnation
                 || record
                     .effect
                     .as_ref()
@@ -425,9 +495,13 @@ impl EffectFences {
                 effect: Some(effect),
                 request: None,
                 provider: provider.into(),
+                provider_incarnation: incarnation.cloned(),
                 delivered: false,
                 worker_retired: false,
                 fenced: false,
+                historical: false,
+                cleanup_confirmed: false,
+                historical_entry: None,
             },
         );
         Response::Ok
@@ -436,6 +510,7 @@ impl EffectFences {
         &mut self,
         caller: &str,
         effect: &GuardedEffect,
+        incarnation: Option<&ProviderIncarnation>,
     ) -> Result<Option<u64>, Response> {
         if !self.issuer(caller) {
             return Err(permission_denied());
@@ -449,6 +524,10 @@ impl EffectFences {
             .get(&effect.sequence)
             .ok_or_else(|| Response::error("effect_not_armed", "effect is not armed"))?;
         if record.identity != effect.identity(&record.provider)
+            || record
+                .provider_incarnation
+                .as_ref()
+                .is_some_and(|stored| Some(stored) != incarnation)
             || record
                 .effect
                 .as_ref()
@@ -500,9 +579,13 @@ impl EffectFences {
                 effect: Some(effect.clone()),
                 request: None,
                 provider: provider.into(),
+                provider_incarnation: None,
                 delivered: false,
                 worker_retired: false,
                 fenced: false,
+                historical: false,
+                cleanup_confirmed: false,
+                historical_entry: None,
             });
         if record.identity != effect.identity(provider)
             || record
@@ -520,13 +603,21 @@ impl EffectFences {
             Ok(None)
         }
     }
-    pub fn provider_retired(&mut self, caller: &str, request: u64) -> Response {
+    pub fn provider_retired(
+        &mut self,
+        caller: &str,
+        request: u64,
+        incarnation: Option<&ProviderIncarnation>,
+    ) -> Response {
         // Request IDs are unique for the broker lifetime. The provider need not
         // reconstruct or learn the authority's private source/operation context.
         for source in self.sources.values_mut() {
             for record in source.records.values_mut() {
                 if record.request == Some(request) {
-                    if record.provider != caller || !record.delivered {
+                    if record.provider != caller
+                        || !record.delivered
+                        || record.provider_incarnation.as_ref() != incarnation
+                    {
                         return permission_denied();
                     }
                     record.worker_retired = true;
@@ -578,7 +669,11 @@ impl EffectFences {
             payload: json!({"status":state,"request":record.request}),
         }
     }
-    fn validate_identity(&self, identity: &GuardedEffectIdentity) -> Result<(), Response> {
+    fn validate_identity(
+        &self,
+        identity: &GuardedEffectIdentity,
+        historical: bool,
+    ) -> Result<(), Response> {
         if !valid_scope(&identity.scope)
             || identity.sequence == 0
             || identity.schema_revision == 0
@@ -591,11 +686,15 @@ impl EffectFences {
             || !valid_name(&identity.provider)
             || !valid_name(&identity.operation_id)
             || !(1..=30_000).contains(&identity.timeout_ms)
-            || !self.protects(
-                &identity.service,
-                &identity.method,
-                identity.interface_major,
-            )
+            || !valid_name(&identity.service)
+            || !valid_name(&identity.method)
+            || identity.interface_major == 0
+            || (!historical
+                && !self.protects(
+                    &identity.service,
+                    &identity.method,
+                    identity.interface_major,
+                ))
         {
             return Err(invalid("invalid protected effect identity"));
         }
@@ -605,7 +704,7 @@ impl EffectFences {
         &mut self,
         identity: &GuardedEffectIdentity,
     ) -> Result<&mut SourceState, Response> {
-        self.validate_identity(identity)?;
+        self.validate_identity(identity, false)?;
         let source = self
             .sources
             .get_mut(&identity.scope)
@@ -624,6 +723,89 @@ impl EffectFences {
         }
         Ok(source)
     }
+    pub fn is_historical(&self, identity: &GuardedEffectIdentity) -> bool {
+        self.sources
+            .get(&identity.scope)
+            .and_then(|source| source.records.get(&identity.sequence))
+            .is_some_and(|record| record.historical && record.identity == *identity)
+    }
+    pub fn recover_historical(
+        &mut self,
+        identity: GuardedEffectIdentity,
+        incarnation: &ProviderIncarnation,
+        expected_entry: &serde_json::Value,
+    ) -> Response {
+        if let Err(error) = self.validate_identity(&identity, true) {
+            return error;
+        }
+        let Some(source) = self.sources.get_mut(&identity.scope) else {
+            return Response::error("recovery_required", "source is not open");
+        };
+        let Some(issued) = source.recovery_issued else {
+            return Response::error("recovery_required", "source is not in recovery");
+        };
+        if identity.sequence <= source.retired
+            || identity.sequence > issued
+            || identity.sequence.saturating_sub(source.retired) > WINDOW
+        {
+            return Response::error("effect_conflict", "historical sequence differs");
+        }
+        let mut original_entry = expected_entry.clone();
+        original_entry["cleanup_confirmed"] = serde_json::Value::Bool(false);
+        if let Some(record) = source.records.get(&identity.sequence) {
+            return if record.historical
+                && record.identity == identity
+                && record.provider_incarnation.as_ref() == Some(incarnation)
+                && record.historical_entry.as_ref() == Some(&original_entry)
+            {
+                Response::Ok
+            } else {
+                conflict()
+            };
+        }
+        source.records.insert(
+            identity.sequence,
+            Record {
+                provider: identity.provider.clone(),
+                identity,
+                effect: None,
+                request: None,
+                provider_incarnation: Some(incarnation.clone()),
+                delivered: false,
+                worker_retired: true,
+                fenced: true,
+                historical: true,
+                cleanup_confirmed: false,
+                historical_entry: Some(original_entry),
+            },
+        );
+        Response::Ok
+    }
+    pub fn confirm_historical_cleanup(
+        &mut self,
+        identity: &GuardedEffectIdentity,
+        incarnation: &ProviderIncarnation,
+        expected_entry: &serde_json::Value,
+    ) -> Response {
+        let Some(record) = self
+            .sources
+            .get_mut(&identity.scope)
+            .and_then(|source| source.records.get_mut(&identity.sequence))
+        else {
+            return Response::error("recovery_required", "historical retirement is unavailable");
+        };
+        let mut original_entry = expected_entry.clone();
+        original_entry["cleanup_confirmed"] = serde_json::Value::Bool(false);
+        if !record.historical
+            || record.identity != *identity
+            || record.provider_incarnation.as_ref() != Some(incarnation)
+            || record.historical_entry.as_ref() != Some(&original_entry)
+        {
+            return conflict();
+        }
+        record.cleanup_confirmed = true;
+        Response::Ok
+    }
     /// Fences a journal identity with no payload; it can never authorize work.
     pub fn recover_fence(
         &mut self,
@@ -640,11 +822,15 @@ impl EffectFences {
             .or_insert_with(|| Record {
                 effect: None,
                 provider: identity.provider.clone(),
+                provider_incarnation: None,
                 identity: identity.clone(),
                 request: None,
                 delivered: false,
                 worker_retired: false,
                 fenced: false,
+                historical: false,
+                cleanup_confirmed: false,
+                historical_entry: None,
             });
         if record.identity != identity {
             return Err(conflict());
@@ -661,7 +847,7 @@ impl EffectFences {
         if !self.authority(caller) {
             return permission_denied();
         }
-        if let Err(error) = self.validate_identity(identity) {
+        if let Err(error) = self.validate_identity(identity, self.is_historical(identity)) {
             return error;
         }
         let Some(source) = self.sources.get(&identity.scope) else {
@@ -710,11 +896,11 @@ impl EffectFences {
             return invalid("invalid retirement watermark");
         }
         for sequence in source.retired.saturating_add(1)..=through {
-            if !source
-                .records
-                .get(&sequence)
-                .is_some_and(|record| record.fenced && record.worker_retired)
-            {
+            if !source.records.get(&sequence).is_some_and(|record| {
+                record.fenced
+                    && record.worker_retired
+                    && (!record.historical || record.cleanup_confirmed)
+            }) {
                 return Response::error("effect_pending", "retirement is not confirmed");
             }
         }

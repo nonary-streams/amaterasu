@@ -35,6 +35,11 @@ struct RequestRecord {
 }
 
 impl RequestRecord {
+    fn uncertain_state_mutation(&self) -> bool {
+        self.delivered
+            && self.options.service == "amaterasu.state/1"
+            && self.options.payload.get("action").and_then(Value::as_str) != Some("get")
+    }
     fn finish(&mut self, result: Response, now: Instant) {
         self.result = Some(result);
         self.completed_at = Some(now);
@@ -53,9 +58,52 @@ pub(super) struct RequestRouter {
     requests: BTreeMap<u64, RequestRecord>,
     provider_queues: BTreeMap<String, VecDeque<u64>>,
     next_request_id: u64,
+    state_revisions: BTreeMap<String, u64>,
+    uncertain_state_writers: BTreeSet<String>,
 }
 
 impl RequestRouter {
+    /// Read only a delivered terminal State Get owned by the exact authority
+    /// and supplied by the trusted selected State provider. Retention and
+    /// authenticated request metadata prevent callers substituting JSON.
+    pub fn selected_state_read(
+        &self,
+        authority: &str,
+        provider: &str,
+        request_id: u64,
+    ) -> Option<(&Value, &Value)> {
+        let request = self.requests.get(&request_id)?;
+        if request.caller != authority
+            || request.authority.initiator != authority
+            || request.provider != provider
+            || request.options.service != "amaterasu.state/1"
+            || request.options.parent.is_some()
+            || !request.delivered
+            || request.options.payload.get("action")?.as_str()? != "get"
+        {
+            return None;
+        }
+        match request.result.as_ref()? {
+            Response::Result { payload } => {
+                let revision = payload.get("revision")?.as_u64()?;
+                if self.uncertain_state_writers.contains(authority)
+                    || self.state_revisions.get(authority) != Some(&revision)
+                    || self.requests.values().any(|other| {
+                        other.caller == authority
+                            && other.options.service == "amaterasu.state/1"
+                            && other.result.is_none()
+                            && other.options.payload.get("action").and_then(Value::as_str)
+                                != Some("get")
+                    })
+                {
+                    return None;
+                }
+                Some((&request.options.payload, payload))
+            }
+            _ => None,
+        }
+    }
+
     /// The initiator is inherited from a broker-owned request, never supplied
     /// as a module-controlled identity field in the command payload.
     pub fn initiator_for_parent(&self, caller: &str, parent_id: u64) -> Result<&str, Response> {
@@ -317,7 +365,27 @@ impl RequestRouter {
             );
         }
 
+        let state_revision = (request.options.service == "amaterasu.state/1"
+            && matches!(
+                request
+                    .options
+                    .payload
+                    .get("action")
+                    .and_then(Value::as_str),
+                Some("get" | "set" | "delete")
+            )
+            && payload.get("ok").and_then(Value::as_bool) == Some(true))
+        .then(|| payload.get("revision").and_then(Value::as_u64))
+        .flatten()
+        .map(|revision| (request.caller.clone(), revision));
+        if request.uncertain_state_mutation() && state_revision.is_none() {
+            self.uncertain_state_writers.insert(request.caller.clone());
+        }
         request.finish(Response::Result { payload }, now);
+        if let Some((caller, revision)) = state_revision {
+            let observed = self.state_revisions.entry(caller).or_default();
+            *observed = (*observed).max(revision);
+        }
         Response::Ok
     }
 
@@ -360,6 +428,9 @@ impl RequestRouter {
             return permission_denied();
         }
         if request.result.is_none() {
+            if request.uncertain_state_mutation() {
+                self.uncertain_state_writers.insert(request.caller.clone());
+            }
             request.finish(
                 Response::error("cancelled", "cancelled by the request owner"),
                 now,
@@ -397,6 +468,9 @@ impl RequestRouter {
     fn finish_expired_requests(&mut self, now: Instant) {
         for request in self.requests.values_mut() {
             if request.result.is_none() && now >= request.authority.deadline {
+                if request.uncertain_state_mutation() {
+                    self.uncertain_state_writers.insert(request.caller.clone());
+                }
                 request.finish(
                     Response::error("deadline_exceeded", "request deadline elapsed"),
                     now,
@@ -423,6 +497,9 @@ impl RequestRouter {
                     .parent
                     .is_some_and(|id| finished.contains(&id));
                 if request.result.is_none() && parent_ended {
+                    if request.uncertain_state_mutation() {
+                        self.uncertain_state_writers.insert(request.caller.clone());
+                    }
                     request.finish(Response::error("cancelled", "parent request ended"), now);
                     cancelled_any = true;
                 }
