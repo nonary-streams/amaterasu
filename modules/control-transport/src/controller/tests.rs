@@ -182,6 +182,7 @@ fn whole_stream_retirement_discards_unsent_feedback_and_reconciles_owned_receipt
         .unwrap()
         .to_owned();
     let local = opened.payload["local"].as_str().unwrap().to_owned();
+    let now = controller.now();
     controller
         .streams
         .get_mut(&id)
@@ -194,7 +195,7 @@ fn whole_stream_retirement_discards_unsent_feedback_and_reconciles_owned_receipt
         .streams
         .get_mut(&id)
         .unwrap()
-        .stage_reliable_enet_for_test(receiver.local_addr().unwrap(), request().connect_data);
+        .stage_reliable_enet_for_test(receiver.local_addr().unwrap(), request().connect_data, now);
     assert_eq!(
         controller.retire("bob", id, "revoke-1", &epoch),
         Err("stream_not_found")
@@ -257,6 +258,27 @@ fn whole_stream_retirement_discards_unsent_feedback_and_reconciles_owned_receipt
         restarted.retirement_status("alice", id, "revoke-1", &epoch),
         Err("retirement_epoch_mismatch")
     );
+}
+
+#[test]
+fn staged_reliable_feedback_uses_the_controller_clock_after_elapsed_time() {
+    let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut controller = configured();
+    controller.epoch = std::time::Instant::now() - std::time::Duration::from_millis(100);
+    let id = controller
+        .open("alice", request())
+        .unwrap()
+        .created
+        .unwrap();
+    let now = controller.now();
+    assert!(now >= 100);
+    controller
+        .streams
+        .get_mut(&id)
+        .unwrap()
+        .stage_reliable_enet_for_test(receiver.local_addr().unwrap(), request().connect_data, now);
+    controller.tick();
+    assert!(controller.streams.contains_key(&id));
 }
 
 #[test]
@@ -564,6 +586,7 @@ fn aggregate_feedback_lease_drains_against_actual_control_retirement_receipt() {
     .unwrap_or_else(|_| panic!("lease"));
     let queued = lease
         .enqueue(&capability, 1, "feedback", b"queued", || {
+            let now = controller.now();
             let transport = controller.streams.get_mut(&stream).unwrap();
             transport.stage_pending_datagram_for_test(
                 receiver.local_addr().unwrap(),
@@ -572,6 +595,7 @@ fn aggregate_feedback_lease_drains_against_actual_control_retirement_receipt() {
             transport.stage_reliable_enet_for_test(
                 receiver.local_addr().unwrap(),
                 request().connect_data,
+                now,
             );
             Ok::<_, ()>(true)
         })
