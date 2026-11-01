@@ -27,6 +27,10 @@ pub trait Backend {
     fn controller_input_supported(&self) -> bool {
         false
     }
+    /// True only while this selected provider owns an active slot.
+    fn feedback_device_active(&self, _controller: u16) -> bool {
+        false
+    }
     fn supported_gamepad_profiles(&self) -> &'static [&'static str] {
         GamepadProfile::implemented_profiles()
     }

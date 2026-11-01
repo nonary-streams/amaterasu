@@ -40,3 +40,7 @@ libc = "0.2"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+amaterasu-contracts.workspace = true
+amaterasu-runtime = { path = "../../crates/runtime" }

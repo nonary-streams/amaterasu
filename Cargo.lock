@@ -444,11 +444,13 @@ name = "amaterasu-input"
 version = "0.1.0"
 dependencies = [
  "amaterasu-configuration-schema",
+ "amaterasu-contracts",
  "amaterasu-extension-api",
  "amaterasu-gamestream",
  "amaterasu-input-companion",
  "amaterasu-input-policy",
  "amaterasu-module-sdk",
+ "amaterasu-runtime",
  "getrandom 0.3.4",
  "libc",
  "serde",

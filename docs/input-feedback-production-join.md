@@ -26,24 +26,42 @@ clears the existing queue, and remote stop delivery is not guaranteed. Other
 slots remain independent. Generation exhaustion fails closed until provider restart.
 The feedback lease, provider boot epoch, lifecycle source and controller slot
 must all be retained with this number; the number alone is neither globally
-unique nor an authorization. The current additive response does **not** convey
-an input boot epoch or lifecycle source label. `device_capabilities` is the
+unique nor an authorization. The ordinary peek response does **not** convey an input boot epoch or lifecycle
+source label; those require the separate observation below. `device_capabilities` is the
 capability value observed at producer creation and can originate in the client's
 controller-arrival packet; it is a claim, not proof of device, driver, client
-protocol or policy support. The current legacy stream consumer ignores the added fields, so this observation
-alone does not prevent an already queued or copied event from being sent after
-reuse. That requires the still-closed source retirement barrier.
+protocol or policy support. The stream consumer now checks tagged feedback for monotonically increasing
+per-slot device generations and consistent capabilities before enqueueing it;
+legacy providers without the fields remain supported. It fails closed on stale
+or conflicting tagged records. That check does not remove already queued or
+copied feedback, nor does it synchronously fence pairing on reuse. Those still
+require the closed source-retirement barrier.
 
-The selected stream owner still needs a direct input-provider, lease-bound
-observation (or equivalent authenticated lifecycle callback) that supplies the
-provider boot epoch, exact active lifecycle source/target and a current device
-slot/generation in one bounded result. It must independently verify the selected
-provider's supported feedback schemas, negotiated client protocol and effective
-global/application/session/client controller policy. An output callback, a raw
-client capability bit, or a caller-supplied JSON object cannot establish that
-intersection. Current input acquisition happens before stream activation, so an
-optional source observation must be refreshed after activation; existing
-`feedback_peek` is not itself that refresh.
+The selected stream owner can now request a bounded, versioned observation from
+the selected input provider:
+
+```json
+{"action":"observe_feedback_source","version":1,"lease":"<owned input lease>",
+ "input_binding":"<lifecycle binding>","controller_slot":3}
+```
+
+Only the direct `amaterasu.stream-session` caller/initiator is accepted. The
+provider requires an active owned lease, lifecycle binding, actual selected
+backend slot, and exact current device incarnation; it validates the lifecycle
+binding again with `source_version:1` and its boot epoch and rechecks the local
+state while the request is in flight. A successful selected-provider response
+returns `{ok:true,version:1,target,source,input_boot_epoch,device:{slot,
+generation,capabilities}}`. It contains no certificate. The lifecycle source
+may be unavailable until activation; absent, mismatched, expired, cancelled or
+revoked observations fail closed. The runtime broker test uses a simulated
+lifecycle service; this checkpoint does not yet connect the stream owner to the
+actual lifecycle/NVHTTP/pairing providers.
+
+The owner must independently verify the selected provider's supported feedback
+schemas, negotiated client protocol and effective global/application/session/
+client controller policy. An output callback, a raw client capability bit, or a
+caller-supplied JSON object cannot establish that intersection. The observation
+is point in time and must never itself open the feedback route.
 
 A point-in-time observation is insufficient for slot reuse. Before changing a
 bound device generation or retiring its lifecycle source, the input/lifecycle

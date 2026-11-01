@@ -84,6 +84,9 @@ impl Backend for FakeBackend {
     fn controller_input_supported(&self) -> bool {
         self.controller_input_supported
     }
+    fn feedback_device_active(&self, controller: u16) -> bool {
+        self.active_controller_slots.contains(&controller)
+    }
     fn effective_gamepad_profile(&self) -> Option<&'static str> {
         self.effective_gamepad_profile
     }
@@ -449,6 +452,69 @@ fn shortcut_filter_obeys_the_active_keyboard_gate() {
         )
         .unwrap();
     assert!(!controller.shortcut_event_enabled(&event));
+}
+
+#[test]
+fn source_observation_requires_owned_active_controller_and_current_incarnation() {
+    let now = Instant::now();
+    let mut controller = Controller::new(FakeBackend::default(), true);
+    let response = controller.handle(
+        "amaterasu.stream-session",
+        acquire_operation(),
+        now,
+        &mut || Ok(()),
+    );
+    let lease = response["lease"].as_str().unwrap().to_owned();
+    controller.backend.active_controller_slots.insert(2);
+    let generation = controller.feedback.generation();
+    let old = controller.feedback.producer(generation, 2, 0x8000);
+    assert!(old.push(HostFeedback::RgbLed {
+        controller: 2,
+        red: 1,
+        green: 2,
+        blue: 3
+    }));
+    assert_eq!(
+        controller
+            .feedback_device_observation("amaterasu.stream-session", &lease, 2)
+            .unwrap(),
+        (1, 0x8000)
+    );
+    assert!(
+        controller
+            .feedback_device_observation("other", &lease, 2)
+            .is_err()
+    );
+    assert!(
+        controller
+            .feedback_device_observation("amaterasu.stream-session", "wrong", 2)
+            .is_err()
+    );
+    controller.feedback.retire_controller(2);
+    assert!(
+        controller
+            .feedback_device_observation("amaterasu.stream-session", &lease, 2)
+            .is_err()
+    );
+    let current = controller.feedback.producer(generation, 2, 0);
+    assert!(current.push(HostFeedback::RgbLed {
+        controller: 2,
+        red: 4,
+        green: 5,
+        blue: 6
+    }));
+    assert_eq!(
+        controller
+            .feedback_device_observation("amaterasu.stream-session", &lease, 2)
+            .unwrap(),
+        (2, 0)
+    );
+    controller.backend.active_controller_slots.remove(&2);
+    assert!(
+        controller
+            .feedback_device_observation("amaterasu.stream-session", &lease, 2)
+            .is_err()
+    );
 }
 
 #[test]

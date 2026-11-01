@@ -566,6 +566,13 @@ impl<Device: GamepadDevice> GamepadSlots<Device> {
         Ok(())
     }
 
+    pub(crate) fn is_live(&self, number: u16) -> bool {
+        self.devices
+            .get(usize::from(number))
+            .and_then(Option::as_ref)
+            .is_some_and(|slot| !slot.pending_removal)
+    }
+
     pub(crate) fn remove(&mut self, number: u16) -> InputResult<()> {
         let Some(slot) = self.devices.get_mut(usize::from(number)) else {
             return Err(InputError::new(

@@ -980,6 +980,9 @@ impl Backend for LinuxBackend {
     fn controller_input_supported(&self) -> bool {
         self.controller_input_supported
     }
+    fn feedback_device_active(&self, controller: u16) -> bool {
+        self.gamepads.is_live(controller)
+    }
     fn effective_gamepad_profile(&self) -> Option<&'static str> {
         self.effective_profile
     }

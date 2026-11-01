@@ -20,6 +20,7 @@ mod shortcut_store;
 pub use model::{Key as ShortcutKey, KeyState as ShortcutKeyState};
 mod product_settings;
 mod session_binding;
+mod source_observation;
 
 use amaterasu_input_policy::KeyBindings;
 use amaterasu_module_sdk::{Command, ManagedModule, ModuleResult, Response, RuntimeClient};
@@ -75,6 +76,7 @@ struct InputModule {
     bindings: session_binding::Bindings,
     acquire_job: Option<session_binding::AcquireJob>,
     activation_job: Option<(QueuedRequest, session_binding::BatchActivationJob)>,
+    source_observation_job: Option<source_observation::Job>,
     input_boot_epoch: String,
     shortcut_cache: shortcut_cache::ShortcutCache,
     has_consumed_held: bool,
@@ -84,6 +86,7 @@ struct InputModule {
 struct QueuedRequest {
     id: u64,
     caller: String,
+    initiator: String,
     service: String,
     payload: Value,
     deadline: Instant,
@@ -219,6 +222,7 @@ impl ManagedModule for InputModule {
             bindings: session_binding::Bindings::default(),
             acquire_job: None,
             activation_job: None,
+            source_observation_job: None,
             pending_revoke: None,
         })
     }
@@ -229,27 +233,29 @@ impl ManagedModule for InputModule {
             .advance(&mut |command| runtime.send(command), &mut self.controller)?;
         self.advance_acquire()?;
         self.advance_activation()?;
+        self.advance_source_observation()?;
         self.advance_shortcut()?;
         self.advance_revoke()?;
         self.drain_queued()?;
         for _ in 0..8 {
-            let (id, caller, service, payload, remaining_ms) =
+            let (id, caller, initiator, service, payload, remaining_ms) =
                 match self.runtime.send(Command::Poll {})? {
                     Response::Pending => break,
                     Response::Request {
                         id,
                         caller,
+                        initiator,
                         service,
                         payload,
                         remaining_ms,
-                        ..
-                    } => (id, caller, service, payload, remaining_ms),
+                    } => (id, caller, initiator, service, payload, remaining_ms),
                     response => return Err(format!("input poll failed: {response:?}")),
                 };
-            self.accept_request(id, caller, service, payload, remaining_ms)?;
+            self.accept_request(id, caller, initiator, service, payload, remaining_ms)?;
         }
         self.advance_acquire()?;
         self.advance_activation()?;
+        self.advance_source_observation()?;
         self.advance_shortcut()?;
         self.advance_revoke()?;
         self.drain_queued()?;
@@ -262,6 +268,7 @@ impl InputModule {
         &mut self,
         id: u64,
         caller: String,
+        initiator: String,
         service: String,
         payload: Value,
         remaining_ms: u64,
@@ -269,6 +276,7 @@ impl InputModule {
         let request = QueuedRequest {
             id,
             caller,
+            initiator,
             service,
             payload,
             deadline: Instant::now() + Duration::from_millis(remaining_ms),
@@ -369,6 +377,7 @@ impl InputModule {
         let defer = ((self.shortcut_job.is_some()
             || self.acquire_job.is_some()
             || self.activation_job.is_some()
+            || self.source_observation_job.is_some()
             || self.pending_revoke.is_some())
             && !is_read_only_input(&request.payload))
             || should_defer_settings_request(
@@ -398,6 +407,7 @@ impl InputModule {
             && self.shortcut_job.is_none()
             && self.acquire_job.is_none()
             && self.activation_job.is_none()
+            && self.source_observation_job.is_none()
             && self.pending_revoke.is_none()
         {
             let Some(request) = self.queued.pop_front() else {
@@ -422,6 +432,76 @@ impl InputModule {
             return self.complete(
                 request.id,
                 InputError::new("invalid_service", "unsupported input service").payload(),
+                &request.caller,
+                false,
+            );
+        }
+        if request.payload.get("action").and_then(Value::as_str) == Some("observe_feedback_source")
+        {
+            let parsed =
+                serde_json::from_value::<source_observation::Request>(request.payload.clone());
+            let Ok(observation) = parsed else {
+                return self.complete(
+                    request.id,
+                    InputError::new("invalid_request", "invalid source observation").payload(),
+                    &request.caller,
+                    false,
+                );
+            };
+            if !observation.authorized(&request.caller, &request.initiator) {
+                return self.complete(
+                    request.id,
+                    InputError::new("permission_denied", "source observation denied").payload(),
+                    &request.caller,
+                    false,
+                );
+            }
+            let active = self.bindings.batch_active(
+                &request.caller,
+                &observation.lease,
+                &observation.input_binding,
+            );
+            let target = self.bindings.batch_target(
+                &request.caller,
+                &observation.lease,
+                &observation.input_binding,
+            );
+            let device = self.controller.feedback_device_observation(
+                &request.caller,
+                &observation.lease,
+                observation.controller_slot,
+            );
+            if let (Ok(true), Ok(target), Ok(device)) = (active, target, device) {
+                match source_observation::Job::new(
+                    request.id,
+                    request.caller.clone(),
+                    observation,
+                    target,
+                    device,
+                    self.input_boot_epoch.clone(),
+                    request.deadline,
+                ) {
+                    Ok(job) => {
+                        self.source_observation_job = Some(job);
+                        return Ok(());
+                    }
+                    Err(code) => {
+                        return self.complete(
+                            request.id,
+                            InputError::new(code, "source observation unavailable").payload(),
+                            &request.caller,
+                            false,
+                        );
+                    }
+                }
+            }
+            return self.complete(
+                request.id,
+                InputError::new(
+                    "source_observation_denied",
+                    "source observation unavailable",
+                )
+                .payload(),
                 &request.caller,
                 false,
             );
@@ -1013,6 +1093,45 @@ impl InputModule {
             return Ok(());
         };
         self.complete(request.id, serde_json::json!({"ok":true,"status":"retired","token":revoke.token,"target":revoke.target}), &request.caller, false)
+    }
+
+    fn advance_source_observation(&mut self) -> ModuleResult<()> {
+        let Some(mut job) = self.source_observation_job.take() else {
+            return Ok(());
+        };
+        let request = &job.request;
+        let binding_active =
+            self.bindings
+                .batch_active(&job.caller, &request.lease, &request.input_binding)
+                == Ok(true);
+        let target_matches = self
+            .bindings
+            .batch_target(&job.caller, &request.lease, &request.input_binding)
+            .ok()
+            .as_ref()
+            == Some(&job.target);
+        let device_matches = self
+            .controller
+            .feedback_device_observation(&job.caller, &request.lease, request.controller_slot)
+            .ok()
+            == Some(job.device);
+        let current = binding_active && target_matches && device_matches;
+        match job.advance(current, &mut |command| self.runtime.send(command)) {
+            Ok(None) => {
+                self.source_observation_job = Some(job);
+                Ok(())
+            }
+            Ok(Some(payload)) => self.complete(job.request_id, payload, &job.caller, false),
+            Err(code) => {
+                job.cancel(&mut |command| self.runtime.send(command));
+                self.complete(
+                    job.request_id,
+                    InputError::new(code, "source observation unavailable").payload(),
+                    &job.caller,
+                    false,
+                )
+            }
+        }
     }
 
     fn advance_activation(&mut self) -> ModuleResult<()> {

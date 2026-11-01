@@ -21,6 +21,7 @@ struct FeedbackState {
     last_peeked_sequence: u64,
     device_generation: [u64; 16],
     device_active: [bool; 16],
+    device_capabilities: [u32; 16],
     events: VecDeque<QueuedFeedback>,
 }
 
@@ -33,6 +34,7 @@ impl Default for FeedbackState {
             last_peeked_sequence: 0,
             device_generation: [1; 16],
             device_active: [false; 16],
+            device_capabilities: [0; 16],
             events: VecDeque::new(),
         }
     }
@@ -110,6 +112,7 @@ impl FeedbackQueue {
             && state.device_generation[slot] != 0
         {
             state.device_active[slot] = true;
+            state.device_capabilities[slot] = capabilities;
             state.device_generation[slot]
         } else {
             0
@@ -121,6 +124,23 @@ impl FeedbackQueue {
             controller,
             capabilities,
         }
+    }
+
+    /// A process-local observation only; caller must separately verify the
+    /// owned native slot and lifecycle binding before relying on it.
+    pub(crate) fn device_observation(&self, controller: u16) -> Option<(u64, u32)> {
+        let state = self.lock();
+        let slot = usize::from(controller);
+        (state.active
+            && slot < state.device_active.len()
+            && state.device_active[slot]
+            && state.device_generation[slot] != 0)
+            .then(|| {
+                (
+                    state.device_generation[slot],
+                    state.device_capabilities[slot],
+                )
+            })
     }
 
     pub(crate) fn peek(&self, limit: usize) -> Vec<QueuedFeedback> {

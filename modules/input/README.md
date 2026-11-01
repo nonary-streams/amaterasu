@@ -635,3 +635,10 @@ input lease, lifecycle source and slot. Client-advertised capability bits are
 not authorization or proof of client, hardware or driver support. Already
 handed-off feedback still needs the source and transport retirement barrier
 outlined in [the feedback join checkpoint](../../docs/input-feedback-production-join.md).
+
+The optional version-1 `observe_feedback_source` operation is restricted to the
+direct stream-session owner and revalidates an active lifecycle input binding,
+owned live controller slot, provider boot epoch and device incarnation. Its
+result is an observation, not permission to bind or send feedback; unavailable
+lifecycle source labels fail closed. See the feedback join checkpoint for the
+remaining pairing and transport retirement barrier.

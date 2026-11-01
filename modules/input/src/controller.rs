@@ -1091,6 +1091,30 @@ impl<B: Backend> Controller<B> {
         Ok(())
     }
 
+    /// Local observation only. A lifecycle response and a separate pairing
+    /// admission remain mandatory before a source can produce an effect.
+    pub(crate) fn feedback_device_observation(
+        &self,
+        caller: &str,
+        token: &str,
+        slot: u16,
+    ) -> InputResult<(u64, u32)> {
+        self.authorize_feedback_caller(caller)?;
+        self.authorize(caller, token, false)?;
+        if !self.effective_controller_enabled() || !self.backend.feedback_device_active(slot) {
+            return Err(InputError::new(
+                "feedback_device_unavailable",
+                "no active owned controller slot",
+            ));
+        }
+        self.feedback.device_observation(slot).ok_or_else(|| {
+            InputError::new(
+                "feedback_device_unavailable",
+                "controller feedback source unavailable",
+            )
+        })
+    }
+
     fn feedback_peek(&mut self, caller: &str, token: &str, limit: u8) -> InputResult<Value> {
         self.authorize_feedback_caller(caller)?;
         self.authorize(caller, token, false)?;

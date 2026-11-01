@@ -35,6 +35,13 @@ pub enum InputRequest<'a> {
         #[serde(skip_serializing_if = "Option::is_none")]
         operation_id: Option<String>,
     },
+    /// Point-in-time lifecycle and device observation; not an effect grant.
+    ObserveFeedbackSource {
+        version: u8,
+        lease: &'a str,
+        input_binding: &'a str,
+        controller_slot: u16,
+    },
     FeedbackPeek {
         lease: Option<&'a str>,
         limit: u8,
@@ -59,6 +66,20 @@ impl InputRequest<'_> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn feedback_source_observation_is_versioned_and_bounded_by_the_provider() {
+        let request = InputRequest::ObserveFeedbackSource {
+            version: 1,
+            lease: "lease",
+            input_binding: "binding",
+            controller_slot: 3,
+        };
+        assert_eq!(
+            request.payload(),
+            json!({"action":"observe_feedback_source","version":1,"lease":"lease","input_binding":"binding","controller_slot":3})
+        );
+    }
 
     #[test]
     fn bound_batch_preserves_wire_contract() {
