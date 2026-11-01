@@ -385,6 +385,9 @@ impl EffectGate {
         {
             return Err("stream_lease_in_use");
         }
+        if self.lease_receipts.contains_key(source) {
+            return Err("operation_complete");
+        }
         self.admit_with_scope(source, operation, sequence, Some(scope))?;
         self.lease_admissions
             .entry(source.clone())
@@ -517,11 +520,12 @@ impl EffectGate {
         {
             return Err("retirement_mismatch");
         }
-        if self
-            .lease_receipts
-            .get(&admission.source)
-            .is_some_and(|previous| previous != retirement)
-        {
+        if self.lease_receipts.values().any(|previous| {
+            previous.service == retirement.service
+                && previous.stream == retirement.stream
+                && previous.provider_epoch == retirement.provider_epoch
+                && previous != retirement
+        }) {
             return Err("retirement_mismatch");
         }
         self.lease_receipts
@@ -898,6 +902,13 @@ mod tests {
         );
         gate.complete_stream_lease(&epoch, "one", &first_ticket, &receipt)
             .unwrap();
+        let mut conflicting = receipt.clone();
+        conflicting.operation_id = "different-transport-receipt".into();
+        assert_eq!(
+            gate.complete_stream_lease(&epoch, "two", &second_ticket, &conflicting),
+            Err("retirement_mismatch")
+        );
+        assert_eq!(gate.in_flight(), 1);
         gate.complete_stream_lease(&epoch, "two", &second_ticket, &receipt)
             .unwrap();
         gate.acknowledge(&epoch, "one", &first_ticket).unwrap();
@@ -1113,6 +1124,11 @@ mod tests {
         gate.complete_stream_lease(&epoch, "first", &ticket, &retirement)
             .unwrap();
         gate.acknowledge(&epoch, "first", &ticket).unwrap();
+        assert_eq!(
+            gate.admit_stream_lease(&source, "first", 2, scope.clone()),
+            Err("operation_complete")
+        );
+        assert_eq!(gate.in_flight(), 0);
         assert_eq!(
             gate.admit_stream_lease(&source, "second", 2, scope),
             Err("stream_lease_in_use")

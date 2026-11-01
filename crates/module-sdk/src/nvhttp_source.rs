@@ -6,6 +6,7 @@
 use crate::effect_authority::{Source, StreamScope};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 pub const SERVICE: &str = "amaterasu.nvhttp/1";
 
@@ -38,9 +39,21 @@ impl BindFeedbackSource {
             "source":self.source,"scope":self.scope,"input_boot_epoch":self.input_boot_epoch})
     }
 
-    /// Stable across lost replies; unique to the lifecycle-issued source ID.
+    /// Stable across lost replies and bound to the complete source incarnation.
     pub fn retirement_operation_id(&self) -> String {
-        format!("nvhttp-source-{}", self.source.id)
+        let mut digest = Sha256::new();
+        digest.update(b"amaterasu.nvhttp.source-retirement/v1\0");
+        digest.update([self.source.version]);
+        hash_string(&mut digest, &self.source.id);
+        digest.update(self.source.generation.to_be_bytes());
+        hash_string(&mut digest, &self.source.host_epoch);
+        hash_string(&mut digest, &self.source.session_id);
+        hash_string(&mut digest, &self.source.stream_id);
+        digest.update(self.source.stream_generation.to_be_bytes());
+        hash_string(&mut digest, &self.source.device);
+        digest.update(self.source.device_generation.to_be_bytes());
+        hash_string(&mut digest, &self.source.effect_owner_epoch);
+        format!("nvhttp-source-{:x}", digest.finalize())
     }
 
     /// Query a retained uncertain join after the selected effect owner has
@@ -135,4 +148,9 @@ impl BindFeedbackSource {
             &self.payload(),
         )
     }
+}
+
+fn hash_string(digest: &mut Sha256, value: &str) {
+    digest.update((value.len() as u64).to_be_bytes());
+    digest.update(value.as_bytes());
 }
