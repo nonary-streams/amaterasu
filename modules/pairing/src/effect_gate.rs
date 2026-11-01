@@ -18,6 +18,12 @@ fn same_transport(left: &StreamScope, right: &StreamScope) -> bool {
         && left.transport_epoch == right.transport_epoch
 }
 
+fn receipt_matches_transport(receipt: &StreamRetirement, scope: &StreamScope) -> bool {
+    receipt.service == scope.transport_service
+        && receipt.stream == scope.transport_stream
+        && receipt.provider_epoch == scope.transport_epoch
+}
+
 #[derive(Clone)]
 struct Admission {
     source: Source,
@@ -163,6 +169,10 @@ impl EffectGate {
                 .retired_sources
                 .values()
                 .any(|retirement| same_transport(requested, &retirement.scope))
+                || self
+                    .lease_receipts
+                    .values()
+                    .any(|receipt| receipt_matches_transport(receipt, requested))
             {
                 return Err("transport_retired");
             }
@@ -402,6 +412,13 @@ impl EffectGate {
         }
         if self.lease_receipts.contains_key(source) {
             return Err("operation_complete");
+        }
+        if self
+            .lease_receipts
+            .values()
+            .any(|receipt| receipt_matches_transport(receipt, &scope))
+        {
+            return Err("transport_retired");
         }
         self.admit_with_scope(source, operation, sequence, Some(scope))?;
         self.lease_admissions

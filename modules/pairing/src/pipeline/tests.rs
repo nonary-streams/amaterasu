@@ -5291,3 +5291,112 @@ fn cancelled_finish_does_not_release_verified_hold() {
         Err("configuration_change_pending")
     );
 }
+
+#[test]
+fn broker_retirement_receipt_fences_every_source_on_the_transport() {
+    let (mut pipeline, _state, _certificate, epoch, first, scope) = authorized_feedback_for_test();
+    let mut broker = authority_broker();
+    let mut sequence = 0_u64;
+    let mut call = |pipeline: &mut Pipeline, caller: &str, payload: Value| {
+        sequence += 1;
+        let Response::Accepted { id } = broker.dispatch(
+            caller,
+            Command::Request {
+                service: EFFECT_SERVICE.into(),
+                payload,
+                timeout_ms: 30_000,
+                operation_id: format!("transport-receipt-test-{sequence}"),
+                parent: None,
+            },
+        ) else {
+            panic!("request rejected")
+        };
+        pipeline
+            .tick_at(now(), |command| Ok(broker.dispatch("pairing", command)))
+            .unwrap();
+        let Response::Result { payload } =
+            broker.dispatch(caller, Command::TakeResult { request: id })
+        else {
+            panic!("missing result")
+        };
+        assert!(matches!(
+            broker.dispatch(caller, Command::ReleaseResult { request: id }),
+            Response::Ok
+        ));
+        payload
+    };
+    let mut second = first.clone();
+    second["id"] = json!("b".repeat(32));
+    second["device"] = json!("second");
+    let mut second_scope = scope.clone();
+    second_scope["controller_slot"] = json!(1);
+    assert_eq!(
+        call(
+            &mut pipeline,
+            "nvhttp",
+            json!({"action":"bind_stream","epoch":epoch,"certificate_pem":CLIENT_CERT,"source":second,"scope":second_scope})
+        )["ok"],
+        true
+    );
+    let admitted = call(
+        &mut pipeline,
+        "input",
+        json!({"action":"admit_stream_lease","epoch":epoch,"source":first,"scope":scope,"operation_id":"first-lease","sequence":1}),
+    );
+    let ticket = admitted["ticket"].as_str().unwrap();
+    let receipt = json!({"ok":true,"service":"amaterasu.control-transport/1","stream":7,"provider_epoch":"c".repeat(32),"operation_id":"transport-retire","scope":"whole_control_stream","state":"retired"});
+    assert_eq!(
+        call(
+            &mut pipeline,
+            "input",
+            json!({"action":"complete_stream_lease","epoch":epoch,"operation_id":"first-lease","ticket":ticket,"retirement":receipt})
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        call(
+            &mut pipeline,
+            "input",
+            json!({"action":"admit_stream_lease","epoch":epoch,"source":second,"scope":second_scope,"operation_id":"second-lease","sequence":2})
+        )["code"],
+        "transport_retired"
+    );
+    let mut third = first.clone();
+    third["id"] = json!("d".repeat(32));
+    third["device"] = json!("third");
+    let mut third_scope = scope.clone();
+    third_scope["controller_slot"] = json!(2);
+    assert_eq!(
+        call(
+            &mut pipeline,
+            "nvhttp",
+            json!({"action":"bind_stream","epoch":epoch,"certificate_pem":CLIENT_CERT,"source":third,"scope":third_scope})
+        )["code"],
+        "transport_retired"
+    );
+    assert_eq!(
+        call(
+            &mut pipeline,
+            "input",
+            json!({"action":"acknowledge","epoch":epoch,"operation_id":"first-lease","ticket":ticket})
+        )["ok"],
+        true
+    );
+    third_scope["transport_stream"] = json!(8);
+    assert_eq!(
+        call(
+            &mut pipeline,
+            "nvhttp",
+            json!({"action":"bind_stream","epoch":epoch,"certificate_pem":CLIENT_CERT,"source":third,"scope":third_scope})
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        call(
+            &mut pipeline,
+            "input",
+            json!({"action":"admit_stream_lease","epoch":epoch,"source":third,"scope":third_scope,"operation_id":"different-transport","sequence":2})
+        )["ok"],
+        true
+    );
+}
