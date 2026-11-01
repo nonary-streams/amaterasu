@@ -244,8 +244,19 @@ impl Pipeline {
                         ),
                     );
                 }
-                if read_only && matches!(operation, Operation::Update { .. }) {
-                    return complete(send, id, error("busy", "configuration update is pending"));
+                if read_only
+                    && !matches!(
+                        operation,
+                        Operation::Readiness {}
+                            | Operation::Get {}
+                            | Operation::TransactionStatus {}
+                    )
+                {
+                    return complete(
+                        send,
+                        id,
+                        error("busy", "another configuration operation is pending"),
+                    );
                 }
                 if let Some(settings) = operation.settings()
                     && let Err(message) = settings.validate()
