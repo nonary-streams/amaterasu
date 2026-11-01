@@ -294,6 +294,9 @@ impl Pipeline {
             let state_instance = self
                 .selected_protocol_state(send)
                 .ok_or("protocol_authority_unavailable")?;
+            if !self.protocol_handoff_enabled(send) {
+                return Err("protocol_authority_unavailable");
+            }
             let Ok(Response::Result { payload }) = send(Command::EffectFence {
                 command: Box::new(EffectFenceCommand::SelectedActionApproval {
                     method: ProtectedMethod {

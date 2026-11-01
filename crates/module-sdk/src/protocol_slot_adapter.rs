@@ -5,8 +5,9 @@
 use crate::{
     Command, Response,
     broker_effect_fence::{
-        self, EffectFenceCommand, EffectScope, GuardedEffectIdentity, HostProviderRetirement,
-        ProtectedMethod, SelectedEffectMethod, SourceSlotLease,
+        self, EffectFenceCommand, EffectScope, GuardedEffect, GuardedEffectIdentity,
+        HostProviderInstanceRetirement, HostProviderRetirement, ProtectedMethod,
+        SelectedEffectMethod, SourceSlotLease,
     },
     effect_authority::Source,
     extension_api::LifecycleTarget,
@@ -15,6 +16,8 @@ use crate::{
     protocol_state::{CleanupReference, DurableStateBinding},
     state::StateRequest,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use sha2::{Digest, Sha256};
 type SendResult = Result<Response, String>;
 fn command(command: EffectFenceCommand) -> Command {
     Command::EffectFence {
@@ -145,6 +148,87 @@ impl SelectedSlotAction {
     }
     pub fn pending(&self) -> &PendingEffect {
         &self.pending
+    }
+    /// Construct the exact transient broker payload from the selected identity.
+    /// The bytes remain outside the durable slot journal.
+    pub fn guarded_effect(&self, payload: &[u8]) -> Result<GuardedEffect, &'static str> {
+        if payload.len() > crate::protocol::MAX_MESSAGE_BYTES
+            || format!("{:x}", Sha256::digest(payload)) != self.pending.payload_sha256
+        {
+            return Err("effect_identity_mismatch");
+        }
+        let schema_revision = u32::try_from(self.pending.method.schema_revision)
+            .ok()
+            .filter(|value| *value != 0)
+            .ok_or("invalid_schema_revision")?;
+        Ok(GuardedEffect {
+            scope: self.scope.clone(),
+            sequence: self.sequence,
+            capability: self.pending.capability.clone(),
+            service: self.pending.method.service.clone(),
+            method: self.pending.method.method.clone(),
+            interface_major: self.pending.method.interface_major,
+            interface_minor: self.pending.method.interface_minor,
+            schema_revision,
+            payload_sha256: self.pending.payload_sha256.clone(),
+            payload: serde_json::json!({"context":self.pending.context,"capability":self.pending.capability,"message_type":self.pending.message_type,"payload_base64":STANDARD.encode(payload)}),
+            timeout_ms: self.pending.timeout_ms,
+            operation_id: self.pending.operation_id.clone(),
+            parent: self.pending.parent,
+        })
+    }
+    /// Reconcile a lost State reply from a fresh exact journal read. This is
+    /// persistence evidence only; the broker rechecks the retained read.
+    pub fn reconcile_issue(
+        &self,
+        _binding: &DurableStateBinding,
+        response: &serde_json::Value,
+        expected: &protocol_slot_state::Entry,
+    ) -> Result<ConfirmedSlotIssue, &'static str> {
+        let (_, slot) = protocol_slot_state::read(self.lease.slot, response)?;
+        let claim = slot.active.ok_or("unknown_claim")?;
+        if claim.lease != self.lease
+            || claim.scope != self.scope
+            || claim.issuer != self.pending.caller
+            || !claim.entries.iter().any(|entry| entry == expected)
+        {
+            return Err("claim_mismatch");
+        }
+        Ok(ConfirmedSlotIssue {
+            entry: expected.clone(),
+        })
+    }
+    /// Atomically hand a confirmed issue and retained State read to the
+    /// broker. Transport failure is an uncertain result, not cancellation.
+    pub fn commit_admission(
+        &self,
+        confirmed: &ConfirmedSlotIssue,
+        payload: &[u8],
+        request: u64,
+        state_request: u64,
+        mut authority: impl FnMut(Command) -> SendResult,
+    ) -> Result<(), String> {
+        let entry = confirmed.entry();
+        let effect = self.guarded_effect(payload).map_err(str::to_owned)?;
+        if entry.issued_lease != self.lease
+            || entry.selected_method != self.selected
+            || entry.cleanup_approval != self.cleanup_approval
+            || entry.cleanup_method != self.pending.cleanup
+            || entry.cleanup_confirmed
+            || effect.identity(&self.selected.provider) != entry.identity
+        {
+            return Err("effect_identity_mismatch".into());
+        }
+        require_ok(authority(slot_command(
+            &self.lease,
+            EffectFenceCommand::CommitAdmission {
+                request,
+                effect,
+                expected: Box::new(self.selected.clone()),
+                expected_entry: serde_json::to_value(entry).map_err(|_| "invalid_journal")?,
+                state_request,
+            },
+        ))?)
     }
     /// Prepare the pairing-owned canonical slot CAS. The binding and State
     /// response must refer to the authority's selected durable CAS provider.
@@ -374,6 +458,33 @@ impl HistoricalSlotEffect {
             state_request,
             host_receipt_state_request,
         }))?)
+    }
+    /// Use the host's durable proof that the original provider instance was
+    /// joined, even when no volatile per-effect broker record survived.
+    pub fn restore_from_instance(
+        &self,
+        receipt: HostProviderInstanceRetirement,
+        state_request: u64,
+        host_receipt_state_request: u64,
+        mut host: impl FnMut(Command) -> SendResult,
+    ) -> Result<(), String> {
+        if receipt.version != 1
+            || receipt.broker_epoch != self.entry.issued_lease.broker_epoch
+            || receipt.provider != self.entry.identity.provider
+            || receipt.provider_incarnation != self.entry.provider_incarnation
+        {
+            return Err("historical_receipt_mismatch".into());
+        }
+        require_ok(host(command(
+            EffectFenceCommand::HostRecoverHistoricalInstance {
+                lease: self.lease.clone(),
+                receipt: Box::new(receipt),
+                identity: Box::new(self.entry.identity.clone()),
+                expected_entry: self.expected_entry()?,
+                state_request,
+                host_receipt_state_request,
+            },
+        ))?)
     }
     /// Use a freshly read entry only after pairing independently verifies and
     /// persists cleanup. This does not itself establish cleanup proof.

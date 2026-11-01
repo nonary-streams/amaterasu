@@ -30,9 +30,15 @@ fn broker() -> Broker {
     broker_with_state_instance('b')
 }
 fn broker_with_state_instance(state_instance: char) -> Broker {
-    broker_with_recovery(state_instance, true)
+    broker_with_options(state_instance, true, false)
 }
 fn broker_with_recovery(state_instance: char, recover: bool) -> Broker {
+    broker_with_options(state_instance, recover, false)
+}
+fn broker_with_handoff(state_instance: char) -> Broker {
+    broker_with_options(state_instance, true, true)
+}
+fn broker_with_options(state_instance: char, recover: bool, handoff: bool) -> Broker {
     let mut config = RuntimeConfig {
         host_lifecycle_control: true,
         ..Default::default()
@@ -102,6 +108,15 @@ fn broker_with_recovery(state_instance: char, recover: bool) -> Broker {
             contract: STATE_SERVICE.into(),
         }),
     );
+    if handoff {
+        config.service_selections.broker.insert(
+            "amaterasu.pairing-effects/1".into(),
+            Some(SelectedService {
+                provider: "pairing".into(),
+                contract: "amaterasu.pairing-effects/1".into(),
+            }),
+        );
+    }
     config.host_context.durable_cas_provider = Some("state".into());
     config.host_context.provider_incarnations.insert(
         "state".into(),
@@ -118,7 +133,7 @@ fn broker_with_recovery(state_instance: char, recover: bool) -> Broker {
         request: ApiSchema {
             required: Default::default(),
             optional: Default::default(),
-            allow_extra: false,
+            allow_extra: handoff,
         },
         response: ApiSchema {
             required: Default::default(),
@@ -150,6 +165,7 @@ fn broker_with_recovery(state_instance: char, recover: bool) -> Broker {
         authority: "pairing".into(),
         issuer: "issuer".into(),
         source_slots: true,
+        require_handoff: handoff,
         methods: vec![ProtectedMethod {
             service: "example.effects/1".into(),
             method: "apply".into(),
@@ -699,7 +715,7 @@ fn configured_protocol_authority_starts_closed_until_slot_recovery() {
 }
 
 #[test]
-fn real_pairing_request_persists_selected_effect_before_any_arm() {
+fn real_pairing_request_atomically_admits_selected_effect() {
     run_real_protocol_issue(false, false);
 }
 
@@ -718,11 +734,12 @@ fn run_real_protocol_issue(cancel_after_write: bool, replace_after_claim: bool) 
         effect_authority::{Request as EffectRequest, Source},
         extension_api::{LifecycleTarget, MethodRef},
         protocol::{DispatchRequest, ProtocolRouter, Route, SessionContext},
+        protocol_slot_adapter::{SelectedSlotAction, SlotActionRequest},
         protocol_state::CleanupReference,
     };
     let path = directory();
     let store = TestStateStore::open(path.clone()).unwrap();
-    let mut broker = broker();
+    let mut broker = broker_with_handoff('b');
     let (mut pairing, fixture, _certificate, epoch, source_json) =
         super::super::tests::authorized_protocol_for_test();
     assert_eq!(store.handle("pairing", json!({"action":"set","key":"pairing/v1","value":fixture.document.unwrap(),"expected_revision":0}))["revision"], 1);
@@ -746,7 +763,7 @@ fn run_real_protocol_issue(cancel_after_write: bool, replace_after_claim: bool) 
         request: ApiSchema {
             required: Default::default(),
             optional: Default::default(),
-            allow_extra: false,
+            allow_extra: true,
         },
         response: ApiSchema {
             required: Default::default(),
@@ -796,7 +813,7 @@ fn run_real_protocol_issue(cancel_after_write: bool, replace_after_claim: bool) 
     };
     let operation_id = protocol_slot_state::operation_id("issuer", &scope, 1).unwrap();
     let bytes = vec![1, 2, 3];
-    let effect = ProtocolRouter::new(vec![route])
+    let effect = ProtocolRouter::new(vec![route.clone()])
         .unwrap()
         .prepare_effect(
             "issuer",
@@ -814,10 +831,10 @@ fn run_real_protocol_issue(cancel_after_write: bool, replace_after_claim: bool) 
     let request = EffectRequest::AdmitProtocolEffectV2 {
         version: 2,
         epoch,
-        source,
-        effect: Box::new(effect),
+        source: source.clone(),
+        effect: Box::new(effect.clone()),
         sequence: 1,
-        payload: bytes,
+        payload: bytes.clone(),
         cleanup: CleanupReference::new("b".repeat(64)).unwrap(),
     };
     let payload = serde_json::to_value(request).unwrap();
@@ -825,7 +842,7 @@ fn run_real_protocol_issue(cancel_after_write: bool, replace_after_claim: bool) 
         .selected_protocol_state(&mut |command| Ok(broker.dispatch("pairing", command)))
         .unwrap();
     pairing.protocol_state_instance = Some(original_instance);
-    let mut replacement = broker_with_state_instance('c');
+    let mut replacement = broker_with_handoff('c');
     assert!(
         !pairing
             .protocol_state_current(&mut |command| Ok(replacement.dispatch("pairing", command)))
@@ -943,7 +960,40 @@ fn run_real_protocol_issue(cancel_after_write: bool, replace_after_claim: bool) 
     } else if replace_after_claim {
         assert!(replaced && pairing.protocol_claim_recovery_required);
     } else {
-        assert_eq!(result.unwrap()["code"], "protocol_reconciliation_required");
+        let response = result.unwrap();
+        assert_eq!(response["ok"], true);
+        let lease: amaterasu_module_sdk::broker_effect_fence::SourceSlotLease =
+            serde_json::from_value(response["lease"].clone()).unwrap();
+        let action = SelectedSlotAction::query(
+            SlotActionRequest {
+                pending: effect,
+                issuer: &source,
+                scope: scope.clone(),
+                lease: lease.clone(),
+                route: &route,
+                sequence: 1,
+                payload: &bytes,
+            },
+            |command| Ok(broker.dispatch("pairing", command)),
+        )
+        .unwrap();
+        let guarded = action.guarded_effect(&bytes).unwrap();
+        assert!(matches!(
+            broker.dispatch(
+                "issuer",
+                Command::EffectFence {
+                    command: Box::new(EffectFenceCommand::SlotCommand {
+                        lease,
+                        command: Box::new(EffectFenceCommand::Dispatch { effect: guarded })
+                    })
+                }
+            ),
+            Response::Accepted { .. }
+        ));
+        assert!(matches!(
+            broker.dispatch("provider", Command::Poll {}),
+            Response::Request { .. }
+        ));
     }
     let saved = store.handle(
         "pairing",
@@ -974,7 +1024,10 @@ fn run_real_protocol_issue(cancel_after_write: bool, replace_after_claim: bool) 
     ) else {
         panic!("slot status")
     };
-    assert!(payload["active"].is_null());
+    assert_eq!(
+        payload["active"].is_null(),
+        cancel_after_write || replace_after_claim
+    );
     let settings = crate::protocol::Settings {
         administrator_principals: ["console".into()].into(),
         transport_principals: ["nvhttp".into()].into(),
@@ -1477,6 +1530,7 @@ fn run_orphan_recovery(explicit_fence: bool) {
     pairing.effect_authority.as_mut().unwrap().protocol_policies=serde_json::from_value(json!([{"capability":"example.control/1","provider":"provider","message_type":21818,"method":method,"cleanup":cleanup,"method_schema":schema(&method),"cleanup_schema":schema(&cleanup),"max_payload_bytes":64,"required_permission":"view"}])).unwrap();
     pairing.protocol_state_binding = Some(binding());
     pairing.protocol_claim_recovery_required = true;
+    pairing.protocol_recovery_auto = true;
     if explicit_fence {
         let mut request = json!({"action":"fence_protocol_source","version":1,"epoch":active_scope.authority_epoch,"issuer_epoch":active_scope.issuer_epoch,"source":active_scope.source});
         request["issuer_epoch"] = json!("wrong-issuer");
@@ -1594,6 +1648,7 @@ fn fresh_broker_inventory_retains_durable_claim_without_assuming_old_workers_ret
     pairing.effect_authority.as_mut().unwrap().protocol_policies=serde_json::from_value(json!([{"capability":"example.control/1","provider":"provider","message_type":21818,"method":method,"cleanup":cleanup,"method_schema":schema(&method),"cleanup_schema":schema(&cleanup),"max_payload_bytes":64,"required_permission":"view"}])).unwrap();
     pairing.protocol_state_binding = Some(binding());
     pairing.protocol_claim_recovery_required = true;
+    pairing.protocol_recovery_auto = true;
     let mut attempted_recovery = false;
     for _ in 0..200 {
         pairing.tick_at(super::super::tests::now(), |command| {

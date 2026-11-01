@@ -165,6 +165,7 @@ fn setup_broker_with_slots(route: &Route, slots: bool) -> Broker {
     }
     config.effect_fence = Some(EffectFencePolicy {
         source_slots: slots,
+        require_handoff: false,
         authority: "authority".into(),
         issuer: "issuer".into(),
         methods: vec![ProtectedMethod {
@@ -1533,6 +1534,7 @@ fn canonical_slot_issue_binds_selected_provider_and_survives_lost_reply() {
     );
     config.effect_fence = Some(EffectFencePolicy {
         source_slots: false,
+        require_handoff: false,
         authority: "authority".into(),
         issuer: "issuer".into(),
         methods: vec![ProtectedMethod {

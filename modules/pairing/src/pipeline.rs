@@ -90,6 +90,9 @@ pub struct Pipeline {
     protocol_recovery_scan: Option<protocol_recovery::RecoveryScan>,
     protocol_recovery_inventory: Option<protocol_recovery::RecoveryInventory>,
     protocol_recovery_retry_at: Option<Instant>,
+    /// Scan old sources only for startup reconciliation. An abandoned live
+    /// admission is uncertain; it is not an implicit cancellation request.
+    protocol_recovery_auto: bool,
     protocol_claim_recovery_required: bool,
     retained_protocol_claim: Option<(
         amaterasu_module_sdk::broker_effect_fence::SourceSlotLease,
@@ -192,6 +195,7 @@ impl Pipeline {
             protocol_recovery_scan: None,
             protocol_recovery_inventory: None,
             protocol_recovery_retry_at: None,
+            protocol_recovery_auto: protocol_claim_recovery_required,
             protocol_claim_recovery_required,
             retained_protocol_claim: None,
             deferred_effect_mutation: None,
@@ -850,6 +854,19 @@ impl Pipeline {
             return match outcome {
                 Ok(protocol_issue::Outcome::Pending) => {
                     self.pending_protocol_issue = Some(issue);
+                    Ok(())
+                }
+                Ok(protocol_issue::Outcome::Committed) => {
+                    // The broker atomically completed the issuer request.
+                    // Keep the live claim for explicit fence and retirement.
+                    self.protocol_recovery_auto = false;
+                    Ok(())
+                }
+                Ok(protocol_issue::Outcome::AdmissionUncertain) => {
+                    // A lost handoff reply is not an implicit cancellation.
+                    // Keep the claim and require later reconciliation.
+                    self.protocol_claim_recovery_required = true;
+                    self.protocol_recovery_auto = false;
                     Ok(())
                 }
                 _ => {

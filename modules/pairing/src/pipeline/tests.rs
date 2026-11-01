@@ -4534,6 +4534,7 @@ fn protocol_authority_broker(method_schema: Value) -> amaterasu_runtime::Broker 
         authority: "pairing".into(),
         issuer: "input".into(),
         source_slots: false,
+        require_handoff: false,
         methods: vec![ProtectedMethod {
             service: "example.effects/1".into(),
             method: "apply".into(),

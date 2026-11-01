@@ -1266,7 +1266,7 @@ impl Broker {
                             return errors::permission_denied();
                         };
                         Response::Result {
-                            payload: serde_json::json!({"owner":caller,"provider":selection.provider,"contract":selection.contract,"capability":"amaterasu.state.durable-cas/1","provider_incarnation":instance}),
+                            payload: serde_json::json!({"owner":caller,"provider":selection.provider,"contract":selection.contract,"capability":"amaterasu.state.durable-cas/1","provider_incarnation":instance,"require_handoff":self.effect_fences.requires_handoff()}),
                         }
                     }
                     _ => errors::permission_denied(),

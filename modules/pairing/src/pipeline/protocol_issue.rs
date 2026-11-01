@@ -1,12 +1,13 @@
-//! Pairing's bounded canonical issue transaction. Persistence does not arm or
-//! dispatch an effect; the broker's atomic request handoff is still required.
+//! Pairing's bounded canonical issue transaction and broker-atomic handoff.
 use super::{STATE_SERVICE, Transport};
 use amaterasu_module_sdk::{
     Command, ModuleResult, Response,
-    broker_effect_fence::{EffectScope, SourceSlotLease},
+    broker_effect_fence::{EffectFenceCommand, EffectScope, SourceSlotLease},
     effect_authority::{ProtocolEffectPolicy, Source},
     protocol::{PendingEffect, Route},
-    protocol_slot_adapter::{PendingSlotIssue, SelectedSlotAction, SlotActionRequest},
+    protocol_slot_adapter::{
+        ConfirmedSlotIssue, PendingSlotIssue, SelectedSlotAction, SlotActionRequest,
+    },
     protocol_slot_state::{self, Entry},
     protocol_state::{CleanupReference, DurableStateBinding, fresh_state_operation_id},
 };
@@ -27,12 +28,18 @@ enum Phase {
     Reading(u64),
     Writing(u64, Box<PendingSlotIssue>, Box<Entry>),
     Reconciling(u64, Box<Entry>),
+    ReadCommit(Box<ConfirmedSlotIssue>),
+    ReadingCommit(u64, Box<ConfirmedSlotIssue>),
+    Open(u64, Box<ConfirmedSlotIssue>),
+    Commit(u64, Box<ConfirmedSlotIssue>),
     Done,
 }
 pub(super) enum Outcome {
     Pending,
-    /// The identity is durable, but no dispatch is authorized by this result.
-    Persisted,
+    /// The broker committed the arm and completed the original issuer request.
+    Committed,
+    /// The broker handoff may have committed. Do not infer cancellation.
+    AdmissionUncertain,
     Reconcile,
 }
 pub(super) struct IssueJob {
@@ -87,10 +94,20 @@ impl IssueJob {
                 Ok(Response::Ok)
             )
         {
-            if let Phase::Reading(id) | Phase::Writing(id, _, _) | Phase::Reconciling(id, _) = phase
-            {
-                let _ = send(Command::Cancel { request: id });
-                let _ = send(Command::ReleaseResult { request: id });
+            match phase {
+                Phase::Reading(id)
+                | Phase::Writing(id, _, _)
+                | Phase::Reconciling(id, _)
+                | Phase::ReadingCommit(id, _)
+                | Phase::Open(id, _) => {
+                    let _ = send(Command::Cancel { request: id });
+                    let _ = send(Command::ReleaseResult { request: id });
+                }
+                Phase::Commit(id, _) => {
+                    self.fence(&mut send);
+                    let _ = send(Command::ReleaseResult { request: id });
+                }
+                _ => {}
             }
             return Ok(Outcome::Reconcile);
         }
@@ -142,12 +159,12 @@ impl IssueJob {
                         send(Command::ReleaseResult { request: id }),
                         Ok(Response::Ok)
                     );
-                    let confirmed = match result {
-                        Ok(Response::Result { payload }) => (*issue).confirmed(payload).is_ok(),
-                        _ => false,
-                    };
-                    if released && confirmed {
-                        return Ok(Outcome::Persisted);
+                    if let Ok(Response::Result { payload }) = result
+                        && let Ok(confirmed) = (*issue).confirmed(payload)
+                        && released
+                    {
+                        self.phase = Phase::ReadCommit(Box::new(confirmed));
+                        return Ok(Outcome::Pending);
                     }
                     self.phase = Phase::Reconciling(self.read(&mut send)?, entry);
                     Ok(Outcome::Pending)
@@ -165,21 +182,96 @@ impl IssueJob {
                     ) {
                         return Ok(Outcome::Reconcile);
                     }
-                    let (_, slot) = protocol_slot_state::read(self.lease.slot, &payload)
-                        .map_err(str::to_owned)?;
-                    if slot.active.is_some_and(|claim| {
-                        claim.lease == self.lease
-                            && claim.scope == self.draft.scope
-                            && claim.issuer == self.draft.effect.caller
-                            && claim.entries.iter().any(|entry| entry == expected.as_ref())
-                    }) {
-                        Ok(Outcome::Persisted)
+                    if let Ok(confirmed) =
+                        self.selected
+                            .reconcile_issue(&self.state, &payload, &expected)
+                    {
+                        self.phase = Phase::ReadCommit(Box::new(confirmed));
+                        Ok(Outcome::Pending)
                     } else {
                         Ok(Outcome::Reconcile)
                     }
                 }
                 _ => Ok(Outcome::Reconcile),
             },
+            Phase::ReadCommit(confirmed) => {
+                self.phase = Phase::ReadingCommit(self.read(&mut send)?, confirmed);
+                Ok(Outcome::Pending)
+            }
+            Phase::ReadingCommit(id, confirmed) => {
+                match send(Command::TakeResult { request: id }) {
+                    Ok(Response::Pending) => {
+                        self.phase = Phase::ReadingCommit(id, confirmed);
+                        Ok(Outcome::Pending)
+                    }
+                    Ok(Response::Result { payload }) => {
+                        let Ok((_, slot)) = protocol_slot_state::read(self.lease.slot, &payload)
+                        else {
+                            let _ = send(Command::ReleaseResult { request: id });
+                            return Ok(Outcome::Reconcile);
+                        };
+                        if !slot.active.is_some_and(|claim| {
+                            claim.lease == self.lease
+                                && claim.scope == self.draft.scope
+                                && claim.issuer == self.draft.effect.caller
+                                && claim.entries.iter().any(|entry| entry == confirmed.entry())
+                        }) {
+                            let _ = send(Command::ReleaseResult { request: id });
+                            return Ok(Outcome::Reconcile);
+                        }
+                        // Keep this authenticated State result retained: the broker
+                        // verifies it under the same lock as admission.
+                        self.phase = Phase::Open(id, confirmed);
+                        Ok(Outcome::Pending)
+                    }
+                    _ => {
+                        let _ = send(Command::ReleaseResult { request: id });
+                        Ok(Outcome::Reconcile)
+                    }
+                }
+            }
+            Phase::Open(id, entry) => {
+                match send(Command::EffectFence {
+                    command: Box::new(EffectFenceCommand::OpenSlot {
+                        lease: self.lease.clone(),
+                        scope: self.draft.scope.clone(),
+                        retired_through: 0,
+                    }),
+                }) {
+                    Ok(Response::Ok) => {
+                        self.phase = Phase::Commit(id, entry);
+                        Ok(Outcome::Pending)
+                    }
+                    _ => {
+                        self.fence(&mut send);
+                        let _ = send(Command::ReleaseResult { request: id });
+                        Ok(Outcome::Reconcile)
+                    }
+                }
+            }
+            Phase::Commit(id, confirmed) => {
+                let mut definitive_rejection = false;
+                let response = self.selected.commit_admission(
+                    &confirmed,
+                    &self.draft.payload,
+                    self.parent,
+                    id,
+                    |command| {
+                        let result = send(command);
+                        definitive_rejection = matches!(result, Ok(Response::Error { .. }));
+                        result
+                    },
+                );
+                let _ = send(Command::ReleaseResult { request: id });
+                match response {
+                    Ok(()) => Ok(Outcome::Committed),
+                    Err(_) if definitive_rejection => {
+                        self.fence(&mut send);
+                        Ok(Outcome::Reconcile)
+                    }
+                    _ => Ok(Outcome::AdmissionUncertain),
+                }
+            }
             Phase::Done => Ok(Outcome::Reconcile),
         }
     }
@@ -195,6 +287,14 @@ impl IssueJob {
             Response::Accepted { id } => Ok(id),
             _ => Err("state_unavailable".into()),
         }
+    }
+    fn fence(&self, send: &mut impl FnMut(Command) -> Transport) {
+        let _ = send(Command::EffectFence {
+            command: Box::new(EffectFenceCommand::BeginCloseSlot {
+                lease: self.lease.clone(),
+                scope: self.draft.scope.clone(),
+            }),
+        });
     }
 }
 
@@ -223,6 +323,7 @@ impl super::Pipeline {
         let Ok(Response::Result { payload }) = send(Command::EffectFence { command: Box::new(amaterasu_module_sdk::broker_effect_fence::EffectFenceCommand::SelectedStateProvider {}) }) else { return None; };
         let instance: amaterasu_module_sdk::broker_effect_fence::ProviderIncarnation =
             serde_json::from_value(payload["provider_incarnation"].clone()).ok()?;
+        let require_handoff = payload["require_handoff"].as_bool()?;
         if instance.version != 1
             || instance.id.len() != 32
             || !instance
@@ -230,7 +331,7 @@ impl super::Pipeline {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
             || payload
-                != serde_json::json!({"owner":state.owner(),"provider":state.provider(),"contract":STATE_SERVICE,"capability":amaterasu_module_sdk::protocol_state::DURABLE_CAS_CAPABILITY,"provider_incarnation":instance})
+                != serde_json::json!({"owner":state.owner(),"provider":state.provider(),"contract":STATE_SERVICE,"capability":amaterasu_module_sdk::protocol_state::DURABLE_CAS_CAPABILITY,"provider_incarnation":instance,"require_handoff":require_handoff})
         {
             return None;
         }
@@ -242,5 +343,13 @@ impl super::Pipeline {
     ) -> bool {
         self.selected_protocol_state(send).as_ref() == self.protocol_state_instance.as_ref()
             && self.protocol_state_instance.is_some()
+            && self.protocol_handoff_enabled(send)
+    }
+
+    pub(super) fn protocol_handoff_enabled(
+        &self,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> bool {
+        matches!(send(Command::EffectFence { command:Box::new(amaterasu_module_sdk::broker_effect_fence::EffectFenceCommand::SelectedStateProvider {}) }), Ok(Response::Result { payload }) if payload["require_handoff"] == true)
     }
 }

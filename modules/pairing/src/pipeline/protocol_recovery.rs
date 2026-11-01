@@ -276,7 +276,8 @@ impl super::Pipeline {
         &mut self,
         send: &mut impl FnMut(Command) -> Transport,
     ) {
-        if !(self.protocol_claim_recovery_required || self.retained_protocol_claim.is_some())
+        if !self.protocol_recovery_auto
+            || !(self.protocol_claim_recovery_required || self.retained_protocol_claim.is_some())
             || !matches!(
                 self.host_configuration,
                 super::HostConfigurationState::Disabled
