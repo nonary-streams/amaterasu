@@ -191,8 +191,10 @@ pub struct AudioFormatOfferSinkV2 {
 /// ordered input layout. The provider must reject unsupported layouts and
 /// interpret each lane according to this explicit selection. Submit borrows
 /// one ordered capture frame synchronously. Encoders that accept a capture
-/// discontinuity must mark the next emitted unit discontinuous; output times
-/// identify the first sample in the same stream-relative epoch.
+/// discontinuity must not combine samples from opposite sides of that boundary.
+/// It must discard the pre-boundary partial unit or flush it separately before
+/// accepting the discontinuity, and mark the first post-boundary emitted unit
+/// discontinuous. Output times identify the first sample in the same epoch.
 #[repr(C)]
 pub struct OrderedAudioEncoderApiV2 {
     pub base: NativeInterface,

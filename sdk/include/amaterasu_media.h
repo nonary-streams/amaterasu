@@ -178,8 +178,10 @@ typedef struct {
     AmaterasuStatus (*write)(void *, const AmaterasuAudioFormatOfferV2 *);
 } AmaterasuAudioFormatOfferSinkV2;
 /* Configure binds the exact offer and capture generation. Accepted PCM
- * discontinuities must mark the next output unit discontinuous, and output
- * timestamps identify its first sample in the stream-relative epoch. */
+ * discontinuities must not combine samples across the boundary: discard the
+ * pre-boundary partial unit or flush it separately before accepting the new
+ * frame. Mark the first post-boundary output unit discontinuous; timestamps
+ * identify its first sample in the stream-relative epoch. */
 typedef struct {
     AmaterasuNativeInterface base;
     AmaterasuStatus (*enumerate)(void *, uint64_t, AmaterasuAudioFormatOfferSinkV2, uint64_t *);
