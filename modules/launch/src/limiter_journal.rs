@@ -15,6 +15,37 @@ use std::collections::BTreeMap;
 
 const PREFIX: &str = "launch.limiter.v1.";
 
+/// Retain each child result until the broker confirms its tracking is released.
+/// The runtime's ephemeral adapter may already release it; `not_found` then
+/// confirms the same terminal state. Transport errors keep the handle for retry.
+struct ResultHandle {
+    id: u64,
+    terminal: Option<Response>,
+}
+
+impl ResultHandle {
+    fn new(id: u64) -> Self {
+        Self { id, terminal: None }
+    }
+
+    fn poll(
+        &mut self,
+        send: &mut impl FnMut(Command) -> Result<Response, String>,
+    ) -> Option<Response> {
+        if self.terminal.is_none() {
+            match send(Command::TakeResult { request: self.id }) {
+                Ok(Response::Pending) | Err(_) => return None,
+                Ok(response) => self.terminal = Some(response),
+            }
+        }
+        match send(Command::ReleaseResult { request: self.id }) {
+            Ok(Response::Ok) => self.terminal.take(),
+            Ok(Response::Error { code, .. }) if code == "not_found" => self.terminal.take(),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
@@ -117,7 +148,7 @@ pub enum SweepResult {
 /// Read a revision-consistent bounded snapshot before replaying obligations.
 pub struct Sweep {
     service: String,
-    pending: Option<u64>,
+    pending: Option<ResultHandle>,
     cursor: Option<Value>,
     entries: Vec<Entry>,
     revision: Option<u64>,
@@ -146,12 +177,12 @@ impl Sweep {
         &mut self,
         send: &mut impl FnMut(Command) -> Result<Response, String>,
     ) -> Result<SweepResult, String> {
-        if let Some(id) = self.pending.take() {
-            match send(Command::TakeResult { request: id })? {
-                Response::Pending => {
-                    self.pending = Some(id);
-                    return Ok(SweepResult::Pending);
-                }
+        if let Some(mut handle) = self.pending.take() {
+            let Some(response) = handle.poll(send) else {
+                self.pending = Some(handle);
+                return Ok(SweepResult::Pending);
+            };
+            match response {
                 Response::Result { payload } => {
                     if payload.get("next_cursor").is_none() {
                         return Ok(SweepResult::Failed);
@@ -223,7 +254,7 @@ impl Sweep {
             parent: None,
         })? {
             Response::Accepted { id } => {
-                self.pending = Some(id);
+                self.pending = Some(ResultHandle::new(id));
                 Ok(SweepResult::Pending)
             }
             _ => Ok(SweepResult::Failed),
@@ -291,7 +322,7 @@ pub struct Recovery {
     token_digest: String,
     policy: PolicyIdentity,
     service: String,
-    pending: Option<u64>,
+    pending: Option<ResultHandle>,
     step: RecoveryStep,
     entry: Option<Entry>,
     revision: Option<u64>,
@@ -371,12 +402,12 @@ impl Recovery {
         send: &mut impl FnMut(Command) -> Result<Response, String>,
         routes: &BTreeMap<String, crate::library::Route>,
     ) -> Result<Option<bool>, String> {
-        if let Some(id) = self.pending.take() {
-            match send(Command::TakeResult { request: id })? {
-                Response::Pending => {
-                    self.pending = Some(id);
-                    return Ok(None);
-                }
+        if let Some(mut handle) = self.pending.take() {
+            let Some(response) = handle.poll(send) else {
+                self.pending = Some(handle);
+                return Ok(None);
+            };
+            match response {
                 Response::Result { payload } => {
                     if !self.consume(&payload, routes) {
                         self.finish(send, false)?;
@@ -438,7 +469,7 @@ impl Recovery {
             parent: None,
         })? {
             Response::Accepted { id } => {
-                self.pending = Some(id);
+                self.pending = Some(ResultHandle::new(id));
                 Ok(None)
             }
             _ => {
@@ -574,10 +605,12 @@ mod tests {
             Response::Result {
                 payload: serde_json::json!({"ok":true,"revision":7,"values":{"other":null},"next_cursor":{"revision":7,"after":"other"}}),
             },
+            Response::Ok,
             Response::Accepted { id: 2 },
             Response::Result {
                 payload: serde_json::json!({"ok":true,"revision":8,"values":{},"next_cursor":null}),
             },
+            Response::Ok,
         ]);
         let mut send = |_command| Ok(replies.pop_front().expect("scripted broker response"));
         assert!(matches!(
@@ -591,6 +624,67 @@ mod tests {
         assert!(matches!(
             sweep.tick(&mut send).unwrap(),
             SweepResult::Failed
+        ));
+    }
+
+    #[test]
+    fn terminal_result_is_retained_until_release_is_confirmed() {
+        let mut handle = ResultHandle::new(17);
+        let mut commands = Vec::new();
+        let mut release_attempts = 0;
+        let mut send = |command: Command| {
+            commands.push(command.clone());
+            match command {
+                Command::TakeResult { request: 17 } => Ok(Response::Result {
+                    payload: serde_json::json!({"ok":true}),
+                }),
+                Command::ReleaseResult { request: 17 } => {
+                    release_attempts += 1;
+                    if release_attempts == 1 {
+                        Err("lost release response".into())
+                    } else {
+                        Ok(Response::Ok)
+                    }
+                }
+                _ => panic!("unexpected command"),
+            }
+        };
+        assert!(handle.poll(&mut send).is_none());
+        assert!(matches!(
+            handle.poll(&mut send),
+            Some(Response::Result { .. })
+        ));
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| matches!(command, Command::TakeResult { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(release_attempts, 2);
+    }
+
+    #[test]
+    fn terminal_transport_error_is_released_before_it_is_reported() {
+        let mut handle = ResultHandle::new(19);
+        let mut replies = VecDeque::from([
+            Response::error("deadline_exceeded", "expired"),
+            Response::Ok,
+        ]);
+        let mut commands = Vec::new();
+        let mut send = |command: Command| {
+            commands.push(command);
+            Ok(replies.pop_front().expect("scripted broker response"))
+        };
+        assert!(
+            matches!(handle.poll(&mut send), Some(Response::Error { code, .. }) if code == "deadline_exceeded")
+        );
+        assert!(matches!(
+            commands.as_slice(),
+            [
+                Command::TakeResult { request: 19 },
+                Command::ReleaseResult { request: 19 }
+            ]
         ));
     }
 }
