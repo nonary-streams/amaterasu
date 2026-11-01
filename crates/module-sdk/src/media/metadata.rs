@@ -16,7 +16,8 @@ use amaterasu_media::{
 };
 pub use capabilities::{
     CAPABILITIES_CONTRACT, MetadataCapabilityClaim, MetadataCapabilitySnapshot, bind_capabilities,
-    bind_capabilities_with_probe, enumerate_capabilities, register_capabilities,
+    bind_capabilities_with_pinning, bind_capabilities_with_probe, enumerate_capabilities,
+    register_capabilities,
 };
 pub use output::{EncodedMetadataAssociation, EncodedMetadataSelection, MetadataApplication};
 

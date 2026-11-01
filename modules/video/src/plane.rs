@@ -263,6 +263,7 @@ pub struct NativePlane {
     processor_bridges: BTreeMap<u64, (String, resource_generic::ProcessorBridge)>,
     metadata_route: Option<metadata_route::BoundRoute>,
     metadata_flows: BTreeMap<u64, Arc<Mutex<MetadataFlow>>>,
+    metadata_pins: BTreeMap<u64, metadata_route::GenerationPins>,
     generic_processor: Option<NativeBinding>,
     stream_clocks: BTreeMap<u64, (u64, [u8; 16])>,
     sources: BTreeMap<u64, (String, source::Source)>,
@@ -385,6 +386,7 @@ impl NativePlane {
                 processor_bridges: BTreeMap::new(),
                 metadata_route: None,
                 metadata_flows: BTreeMap::new(),
+                metadata_pins: BTreeMap::new(),
                 generic_processor: generic_processor_service
                     .map(|service| {
                         amaterasu_module_sdk::media::bind_frame_resource_processor(runtime, service)
@@ -433,6 +435,11 @@ impl NativePlane {
 
 impl Drop for NativePlane {
     fn drop(&mut self) {
+        for flow in self.metadata_flows.values() {
+            if let Ok(mut flow) = flow.lock() {
+                flow.cancel();
+            }
+        }
         for (_, (service, mut bridge)) in std::mem::take(&mut self.resource_bridges) {
             if let Some(binding) = self.resource_consumers.get(&service)
                 && let Ok(api) = unsafe { binding.table::<FrameResourceConsumerApi>() }
@@ -459,6 +466,11 @@ impl Drop for NativePlane {
             {
                 // SAFETY: source session is retired before its retained binding.
                 unsafe { source.finish(api) };
+            }
+        }
+        if let Some(route) = &self.metadata_route {
+            for (_, pins) in std::mem::take(&mut self.metadata_pins) {
+                route.unpin(pins);
             }
         }
         self.capture_events.clear();
@@ -1314,6 +1326,11 @@ impl Plane for NativePlane {
             // SAFETY: the provider binding and control session are still live.
             unsafe { source.finish(api) };
         }
+        if let Some(pins) = self.metadata_pins.remove(&video)
+            && let Some(route) = &self.metadata_route
+        {
+            route.unpin(pins);
+        }
         self.resource_selections.remove(&video);
         self.dmabuf_resource_selections.remove(&video);
         self.capture_events.remove(video);
@@ -1511,8 +1528,21 @@ impl NativePlane {
         let (capture_policy, processor_policy, encoder_policy, versions) =
             route.policies(input.video, input.capture, input.encoder)?;
         let flow = if let Some(flow) = self.metadata_flows.get(&input.video) {
+            if !self.metadata_pins.contains_key(&input.video) {
+                return Err("metadata_pinning_unavailable");
+            }
             flow.clone()
         } else {
+            let Some(pins) = route.pin(
+                input.video,
+                input.capture,
+                input.encoder,
+                source_generation,
+                versions,
+            )?
+            else {
+                return Ok(None);
+            };
             let context = FrameMetadataContext {
                 session_id: input.video,
                 source_id: input.capture,
@@ -1521,21 +1551,33 @@ impl NativePlane {
                 clock_domain: FRAME_CLOCK_HOST_MONOTONIC,
                 clock_epoch: epoch,
             };
-            let flow = Arc::new(Mutex::new(
-                MetadataFlow::new(
-                    context,
-                    capture_policy,
-                    processor_policy,
-                    encoder_policy,
-                    vec![route.schema()],
-                )
-                .map_err(|_| "metadata_policy_invalid")?,
-            ));
-            self.queues
-                .lock()
-                .map_err(|_| "queue_failed")?
-                .configure_metadata(input.video, flow.clone(), versions)
-                .map_err(|_| "metadata_queue_failed")?;
+            let flow = match MetadataFlow::new(
+                context,
+                capture_policy,
+                processor_policy,
+                encoder_policy,
+                vec![route.schema()],
+            ) {
+                Ok(flow) => Arc::new(Mutex::new(flow)),
+                Err(_) => {
+                    route.unpin(pins);
+                    return Err("metadata_policy_invalid");
+                }
+            };
+            let configured =
+                self.queues
+                    .lock()
+                    .map_err(|_| "queue_failed")
+                    .and_then(|mut queues| {
+                        queues
+                            .configure_metadata(input.video, flow.clone(), versions)
+                            .map_err(|_| "metadata_queue_failed")
+                    });
+            if let Err(error) = configured {
+                route.unpin(pins);
+                return Err(error);
+            }
+            self.metadata_pins.insert(input.video, pins);
             self.metadata_flows.insert(input.video, flow.clone());
             flow
         };

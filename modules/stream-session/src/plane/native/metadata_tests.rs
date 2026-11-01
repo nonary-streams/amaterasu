@@ -20,7 +20,7 @@ struct State {
 }
 struct Host {
     state: State,
-    video: NegotiatedVideoApiV1_1,
+    video: NegotiatedVideoApiV1_2,
     framer: VideoFramingApiV2_2,
     transport: NegotiatedVideoPlanTransportApiV2_1,
     media: MediaTransportApi,
@@ -79,7 +79,7 @@ unsafe extern "C" fn invoke(context: *mut c_void, bytes: BorrowedBytes, sink: Re
                 return STATUS_OK;
             }
             let address = match service.as_str() {
-                "test.units/1" => &host.video.base.base as *const _ as usize,
+                "test.units/1" => &host.video.base.base.base as *const _ as usize,
                 "test.framer/1" => &host.framer.base.base.base as *const _ as usize,
                 "test.plan/1" => &host.transport.base.base as *const _ as usize,
                 "amaterasu.media-transport/1" => &host.media.base as *const _ as usize,
@@ -173,22 +173,31 @@ unsafe extern "C" fn framed(context: *mut c_void, stream: u64, unit: u64) -> Sta
     state.framed = true;
     STATUS_OK
 }
-unsafe extern "C" fn check(context: *mut c_void, stream: u64, unit: u64) -> Status {
+unsafe extern "C" fn check(_: *mut c_void, _: u64, _: u64) -> Status {
+    MEDIA_UNSUPPORTED
+}
+unsafe extern "C" fn retire(_: *mut c_void, _: u64, _: u64) -> Status {
+    MEDIA_UNSUPPORTED
+}
+unsafe extern "C" fn admit(
+    context: *mut c_void,
+    stream: u64,
+    unit: u64,
+    sink: VideoMetadataAdmissionSinkV1,
+) -> Status {
     let state = unsafe { &mut *context.cast::<State>() };
     if stream != 10 || unit != 1 || !state.framed || state.retired {
         return STATUS_INVALID_ARGUMENT;
     }
     state.check_calls += 1;
-    STATUS_OK
-}
-unsafe extern "C" fn retire(context: *mut c_void, _: u64, _: u64) -> Status {
+    // The callback's transport uses the same state; no reference spans the callback.
+    let status = unsafe { (sink.admit)(sink.context) };
     let state = unsafe { &mut *context.cast::<State>() };
-    state.retire_calls += 1;
-    if state.retire_calls == 1 {
-        return MEDIA_BUSY;
+    if status == STATUS_OK {
+        state.retire_calls += 1;
+        state.retired = true;
     }
-    state.retired = true;
-    STATUS_OK
+    status
 }
 unsafe extern "C" fn legacy_plan(
     _: *mut c_void,
@@ -367,15 +376,18 @@ impl Fixture {
                 metadata,
                 limits,
             },
-            video: NegotiatedVideoApiV1_1 {
-                base: NegotiatedVideoApi {
-                    base: native(size_of::<NegotiatedVideoApiV1_1>(), 1, 1),
-                    receive: legacy_video,
+            video: NegotiatedVideoApiV1_2 {
+                base: NegotiatedVideoApiV1_1 {
+                    base: NegotiatedVideoApi {
+                        base: native(size_of::<NegotiatedVideoApiV1_2>(), 1, 2),
+                        receive: legacy_video,
+                    },
+                    receive_metadata: metadata_video,
+                    framed_metadata: framed,
+                    check_metadata: check,
+                    retire_metadata: retire,
                 },
-                receive_metadata: metadata_video,
-                framed_metadata: framed,
-                check_metadata: check,
-                retire_metadata: retire,
+                admit_metadata: admit,
             },
             framer: VideoFramingApiV2_2 {
                 base: VideoFramingApiV2_1 {
@@ -414,7 +426,7 @@ impl Fixture {
             external_binding: 0,
         });
         let state = (&mut host.state as *mut State).cast();
-        host.video.base.base.context = state;
+        host.video.base.base.base.context = state;
         host.framer.base.base.base.context = state;
         host.transport.base.base.context = state;
         host.media.base.context = state;
@@ -520,7 +532,6 @@ fn exercise_managed_plane(external_framer: *const NativeServiceFactory, marker: 
     drop(rejected);
     let mut plane = Plane::new_planned(&runtime, handles, &Default::default(), &route).unwrap();
     assert_eq!(plane.tick(true).unwrap().accepted_video_access_units, 0);
-    assert_eq!(plane.tick(true).unwrap().accepted_video_access_units, 0);
     assert_eq!(plane.tick(true).unwrap().accepted_video_access_units, 1);
     assert_eq!(
         (
@@ -528,7 +539,7 @@ fn exercise_managed_plane(external_framer: *const NativeServiceFactory, marker: 
             fixture.host.state.submit_calls,
             fixture.host.state.retire_calls
         ),
-        (2, 2, 2)
+        (2, 2, 1)
     );
     if let Some(marker) = marker {
         assert_eq!(fixture.host.state.wire, [1, 2, 3, marker, 0xb5, 1]);

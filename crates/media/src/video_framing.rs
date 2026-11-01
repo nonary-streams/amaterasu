@@ -143,8 +143,9 @@ pub struct NegotiatedVideoMetadataUnitSinkV1 {
 /// Optional video-unit v1.1 tail. `receive_metadata` reserves the unit until
 /// `retire_metadata` after local transport admission or stream cancellation.
 /// `framed_metadata` records the selected framer's successful application;
-/// `check_metadata` must precede every transport attempt, including retries.
-/// All operations use the same authorized binding and exact access-unit ID.
+/// The split check/retire operations do not provide an admission barrier and
+/// cannot authorize metadata-required production transport. V1.2 adds that
+/// barrier. All operations use the same binding and exact access-unit ID.
 #[repr(C)]
 pub struct NegotiatedVideoApiV1_1 {
     pub base: NegotiatedVideoApi,
@@ -153,6 +154,26 @@ pub struct NegotiatedVideoApiV1_1 {
     pub framed_metadata: unsafe extern "C" fn(*mut c_void, u64, u64) -> Status,
     pub check_metadata: unsafe extern "C" fn(*mut c_void, u64, u64) -> Status,
     pub retire_metadata: unsafe extern "C" fn(*mut c_void, u64, u64) -> Status,
+}
+
+/// Synchronous transport admission callback. The callback must not reenter
+/// Video and must return OK only after local transport admission; BUSY or
+/// PENDING consumes nothing. Borrowed pointers remain live only during call.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VideoMetadataAdmissionSinkV1 {
+    pub context: *mut c_void,
+    pub admit: unsafe extern "C" fn(*mut c_void) -> Status,
+}
+
+/// V1.2 serializes generation validation, local admission and retirement under
+/// the Video ownership barrier. The older check/retire pair is not sufficient
+/// to authorize metadata-required production transport.
+#[repr(C)]
+pub struct NegotiatedVideoApiV1_2 {
+    pub base: NegotiatedVideoApiV1_1,
+    pub admit_metadata:
+        unsafe extern "C" fn(*mut c_void, u64, u64, VideoMetadataAdmissionSinkV1) -> Status,
 }
 
 #[repr(C)]
@@ -592,7 +613,9 @@ pub struct VideoFramingApiV2_1 {
     ) -> Status,
 }
 
-/// Optional v2.2 metadata carriage. A successful plan callback means the
+/// Optional v2.2 metadata carriage. A successful probe remains valid for the
+/// life of this binding; the provider must retire the binding before changing
+/// those capabilities. A successful plan callback means the
 /// selected framer applied the supplied AFM1 exactly once to this plan; this
 /// is a provider assertion, not proof of a particular codec's syntax. Calls
 /// are pure and retry-safe; the host retains an accepted plan across transport
@@ -877,6 +900,14 @@ mod tests {
             184
         );
         assert_eq!(size_of::<NegotiatedVideoApiV1_1>(), 72);
+        assert_eq!(size_of::<NegotiatedVideoApiV1_2>(), 80);
+        assert_eq!(size_of::<VideoMetadataAdmissionSinkV1>(), 16);
+        assert_eq!(
+            std::mem::offset_of!(NegotiatedVideoApiV1_2, admit_metadata),
+            72
+        );
+        assert_eq!(size_of::<crate::FrameMetadataGenerationPinV1>(), 88);
+        assert_eq!(size_of::<crate::FrameMetadataCapabilitiesApiV1_2>(), 64);
         assert_eq!(
             std::mem::offset_of!(NegotiatedVideoApiV1_1, receive_metadata),
             40

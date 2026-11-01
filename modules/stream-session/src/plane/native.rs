@@ -34,7 +34,7 @@ pub(super) fn probe_chain(
 ) -> PlaneResult<VideoFramingLimits> {
     let _video = unsafe {
         if route.metadata_schema.is_some() {
-            amaterasu_module_sdk::video_framing::bind_video_metadata(
+            amaterasu_module_sdk::video_framing::bind_video_metadata_admission(
                 runtime,
                 &route.video_unit_service,
             )
@@ -277,7 +277,41 @@ struct PendingVideoMetadata {
     bytes: Vec<u8>,
     plan: Option<planned::OwnedPlan>,
     framed: bool,
-    transport_admitted: bool,
+}
+
+struct MetadataAdmission<'a> {
+    transport: &'a NativeBinding,
+    stream: u64,
+    unit: &'a NegotiatedVideoUnit,
+    plan: &'a planned::OwnedPlan,
+    result: Option<Status>,
+}
+
+unsafe extern "C" fn submit_metadata_admission(context: *mut c_void) -> Status {
+    // SAFETY: Video invokes this once synchronously while the stack value is live.
+    let admission = unsafe { &mut *context.cast::<MetadataAdmission<'_>>() };
+    if admission.result.is_some() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    let Ok(api) = (unsafe {
+        admission
+            .transport
+            .table::<NegotiatedVideoPlanTransportApiV2>()
+    }) else {
+        admission.result = Some(STATUS_INTERNAL_ERROR);
+        return STATUS_INTERNAL_ERROR;
+    };
+    // SAFETY: transport, unit, and cached plan live until this callback returns.
+    let status = unsafe {
+        (api.submit)(
+            admission.transport.context(),
+            admission.stream,
+            admission.unit,
+            &admission.plan.header(),
+        )
+    };
+    admission.result = Some(status);
+    status
 }
 
 impl NativeBackend {
@@ -302,7 +336,7 @@ impl NativeBackend {
             .framing_limits
             .as_ref()
             .ok_or("video_metadata_unavailable")?;
-        let video_api = unsafe { video.table::<NegotiatedVideoApiV1_1>() }
+        let video_api = unsafe { video.table::<NegotiatedVideoApiV1_2>() }
             .map_err(|_| "native_layout_mismatch")?;
         if pending.plan.is_none() {
             let Some(plan) = planned::metadata_plan(framer, limits, unit, &pending.bytes)? else {
@@ -314,7 +348,11 @@ impl NativeBackend {
             // SAFETY: the selected Video binding owns the live reserved unit.
             if !accepted(
                 unsafe {
-                    (video_api.framed_metadata)(video.context(), unit.stream, unit.access_unit_id)
+                    (video_api.base.framed_metadata)(
+                        video.context(),
+                        unit.stream,
+                        unit.access_unit_id,
+                    )
                 },
                 "video_metadata_carriage_failed",
             )? {
@@ -322,43 +360,34 @@ impl NativeBackend {
             }
             pending.framed = true;
         }
-        if !pending.transport_admitted {
-            // A fresh check precedes every attempt; BUSY retains the accepted plan.
-            if !accepted(
-                unsafe {
-                    (video_api.check_metadata)(video.context(), unit.stream, unit.access_unit_id)
+        let mut admission = MetadataAdmission {
+            transport,
+            stream: self.handles.media_transport,
+            unit,
+            plan: pending.plan.as_ref().ok_or("video_metadata_plan_missing")?,
+            result: None,
+        };
+        // SAFETY: callback is synchronous and does not reenter the Video service.
+        let status = unsafe {
+            (video_api.admit_metadata)(
+                video.context(),
+                unit.stream,
+                unit.access_unit_id,
+                VideoMetadataAdmissionSinkV1 {
+                    context: (&mut admission as *mut MetadataAdmission<'_>).cast(),
+                    admit: submit_metadata_admission,
                 },
-                "video_metadata_stale",
-            )? {
+            )
+        };
+        // A successful local submission must never be retried, even if a broken
+        // provider subsequently reports an error or invokes the callback twice.
+        match (status, admission.result) {
+            (STATUS_OK, Some(STATUS_OK)) => {}
+            (MEDIA_BUSY | MEDIA_PENDING, None) => return Ok(false),
+            (MEDIA_BUSY, Some(MEDIA_BUSY)) | (MEDIA_PENDING, Some(MEDIA_PENDING)) => {
                 return Ok(false);
             }
-            let api = unsafe { transport.table::<NegotiatedVideoPlanTransportApiV2>() }
-                .map_err(|_| "native_layout_mismatch")?;
-            let plan = pending.plan.as_ref().ok_or("video_metadata_plan_missing")?;
-            // SAFETY: unit and cached plan remain owned through this synchronous call.
-            if !accepted(
-                unsafe {
-                    (api.submit)(
-                        transport.context(),
-                        self.handles.media_transport,
-                        unit,
-                        &plan.header(),
-                    )
-                },
-                "native_video_plan_submit_failed",
-            )? {
-                return Ok(false);
-            }
-            pending.transport_admitted = true;
-        }
-        // Retire only after admission. If retirement is busy, do not submit again.
-        if !accepted(
-            unsafe {
-                (video_api.retire_metadata)(video.context(), unit.stream, unit.access_unit_id)
-            },
-            "video_metadata_retirement_failed",
-        )? {
-            return Ok(false);
+            _ => return Err("video_metadata_admission_failed"),
         }
         self.pending_video_metadata = None;
         Ok(true)
@@ -481,7 +510,7 @@ impl NativeBackend {
         }
         let video = unsafe {
             if selection.metadata_required {
-                amaterasu_module_sdk::video_framing::bind_video_metadata(
+                amaterasu_module_sdk::video_framing::bind_video_metadata_admission(
                     runtime,
                     &route.video_service,
                 )
@@ -863,10 +892,10 @@ impl Backend for NativeBackend {
         };
         // SAFETY: binding and stack output remain live throughout the callback.
         let status = if selection.metadata_required {
-            let api = unsafe { binding.table::<NegotiatedVideoApiV1_1>() }
+            let api = unsafe { binding.table::<NegotiatedVideoApiV1_2>() }
                 .map_err(|_| "native_layout_mismatch")?;
             unsafe {
-                (api.receive_metadata)(
+                (api.base.receive_metadata)(
                     binding.context(),
                     self.handles.video,
                     NegotiatedVideoMetadataUnitSinkV1 {
@@ -901,7 +930,6 @@ impl Backend for NativeBackend {
                 bytes: metadata.to_vec(),
                 plan: None,
                 framed: false,
-                transport_admitted: false,
             });
         }
         Ok(packet)

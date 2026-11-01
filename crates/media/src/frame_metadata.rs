@@ -265,3 +265,40 @@ pub struct FrameMetadataCapabilitiesApiV1_1 {
     pub probe_profile:
         unsafe extern "C" fn(*mut c_void, *const FrameMetadataProfileProbeV1) -> Status,
 }
+
+/// Pins a selected provider capability and capture-source generation for one
+/// host session. A provider must defer invalidation of that selection until the
+/// matching unpin barrier returns. An invalidation request is not a completed
+/// invalidation: the provider must report it pending or busy until every lease
+/// is released. Units already pinned may be admitted while invalidation is
+/// pending. Once invalidation completes, a pin for the old generation fails.
+/// This is a trusted native contract, not a sandbox or a hardware claim.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FrameMetadataGenerationPinV1 {
+    pub size: u32,
+    pub version: u32,
+    pub stage: u32,
+    pub owner: u32,
+    pub provider_session: u64,
+    pub host_session: u64,
+    pub source_id: u64,
+    pub source_generation: u64,
+    pub config_generation: u64,
+    pub capability_generation: u64,
+    pub schema: FrameMetadataSchemaId,
+}
+
+/// A successful pin returns a nonzero lease; non-OK consumes nothing. Unpin
+/// is an infallible, bounded, nonblocking retirement barrier. The host first
+/// retires its admission work, then unpins on the owning thread; no callbacks
+/// or protected admissions can start for that lease after unpin returns. A
+/// lease is a logical generation claim, not a provider lock held across
+/// event-loop calls. Pair every successful pin with exactly one unpin.
+#[repr(C)]
+pub struct FrameMetadataCapabilitiesApiV1_2 {
+    pub base: FrameMetadataCapabilitiesApiV1_1,
+    pub pin_generation:
+        unsafe extern "C" fn(*mut c_void, *const FrameMetadataGenerationPinV1, *mut u64) -> Status,
+    pub unpin_generation: unsafe extern "C" fn(*mut c_void, u64),
+}

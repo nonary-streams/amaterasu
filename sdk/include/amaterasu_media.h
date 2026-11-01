@@ -576,6 +576,7 @@ typedef struct {
 #define AMATERASU_FRAME_METADATA_CAP_APPLY 2u
 #define AMATERASU_FRAME_METADATA_CAPABILITIES_CONTRACT "amaterasu.frame-metadata-capabilities.native/1"
 #define AMATERASU_FRAME_METADATA_PROFILE_PROBE_MINOR 1u
+#define AMATERASU_FRAME_METADATA_PINNING_INTERFACE_MINOR 2u
 typedef struct { uint64_t namespace_id, value, schema; } AmaterasuFrameMetadataSchemaId;
 typedef struct { AmaterasuFrameMetadataSchemaId schema; uint32_t operations, reserved; } AmaterasuFrameMetadataCapabilityV1;
 typedef struct { void *context; AmaterasuStatus (*write)(void *, const AmaterasuFrameMetadataCapabilityV1 *); } AmaterasuFrameMetadataCapabilitySinkV1;
@@ -599,6 +600,23 @@ typedef struct {
     AmaterasuFrameMetadataCapabilitiesApiV1 base;
     AmaterasuStatus (*probe_profile)(void *, const AmaterasuFrameMetadataProfileProbeV1 *);
 } AmaterasuFrameMetadataCapabilitiesApiV1_1;
+/* A successful lease pins the selected source and capability generation until
+ * unpin returns. Non-OK pin results consume nothing. An invalidation request
+ * remains pending until all leases retire; already pinned units may be locally
+ * admitted while it is pending, never after it completes. Leases are logical
+ * claims, not provider locks held across event-loop calls. The host retires
+ * in-flight admission before unpin; unpin is bounded and nonblocking. */
+typedef struct {
+    uint32_t size, version, stage, owner;
+    uint64_t provider_session, host_session, source_id, source_generation;
+    uint64_t config_generation, capability_generation;
+    AmaterasuFrameMetadataSchemaId schema;
+} AmaterasuFrameMetadataGenerationPinV1;
+typedef struct {
+    AmaterasuFrameMetadataCapabilitiesApiV1_1 base;
+    AmaterasuStatus (*pin_generation)(void *, const AmaterasuFrameMetadataGenerationPinV1 *, uint64_t *);
+    void (*unpin_generation)(void *, uint64_t);
+} AmaterasuFrameMetadataCapabilitiesApiV1_2;
 #define AMATERASU_FRAME_METADATA_CAPABILITIES_API_V1_SIZE ((uint32_t)sizeof(AmaterasuFrameMetadataCapabilitiesApiV1))
 #define AMATERASU_CAPTURE_METADATA_INTERFACE_MINOR 10u
 #define AMATERASU_FRAME_RESOURCE_CONSUMER_METADATA_MINOR 1u
@@ -799,7 +817,7 @@ typedef struct {
 #define AMATERASU_VIDEO_FRAMING_INTERFACE_MAJOR 2u
 #define AMATERASU_VIDEO_FRAMING_INTERFACE_MINOR 1u
 #define AMATERASU_VIDEO_FRAMING_METADATA_INTERFACE_MINOR 2u
-#define AMATERASU_NEGOTIATED_VIDEO_METADATA_INTERFACE_MINOR 1u
+#define AMATERASU_NEGOTIATED_VIDEO_METADATA_INTERFACE_MINOR 2u
 #define AMATERASU_VIDEO_PLAN_TRANSPORT_METADATA_INTERFACE_MINOR 1u
 typedef struct { uint64_t namespace_id, value, schema; } AmaterasuVideoFormatId;
 typedef struct {
@@ -835,6 +853,13 @@ typedef struct {
     AmaterasuStatus (*check_metadata)(void *, uint64_t, uint64_t);
     AmaterasuStatus (*retire_metadata)(void *, uint64_t, uint64_t);
 } AmaterasuNegotiatedVideoApiV1_1;
+/* The callback must not reenter Video. OK means locally admitted, while BUSY
+ * or PENDING consumes nothing. Video atomically validates and retires the unit. */
+typedef struct { void *context; AmaterasuStatus (*admit)(void *); } AmaterasuVideoMetadataAdmissionSinkV1;
+typedef struct {
+    AmaterasuNegotiatedVideoApiV1_1 base;
+    AmaterasuStatus (*admit_metadata)(void *, uint64_t, uint64_t, AmaterasuVideoMetadataAdmissionSinkV1);
+} AmaterasuNegotiatedVideoApiV1_2;
 typedef struct {
     AmaterasuNativeInterface base;
     AmaterasuStatus (*submit)(void *, uint64_t, const AmaterasuNegotiatedVideoUnit *);

@@ -535,39 +535,72 @@ impl Queues {
         .map_or_else(|status| status, |_| STATUS_OK)
     }
 
-    pub(crate) fn check_metadata(&mut self, owner: &str, id: u64, unit: u64) -> Status {
-        self.with_metadata_unit(owner, id, unit, |selected, header, metadata| {
-            metadata
+    /// Validate, admit and retire while holding the same flow and queue
+    /// barriers. Cancellation waits for the callback; BUSY consumes nothing.
+    /// # Safety
+    /// The sink is live synchronously, must not reenter Video and must return
+    /// OK only after the transport has admitted exactly this unit.
+    pub(crate) unsafe fn admit_metadata(
+        &mut self,
+        owner: &str,
+        id: u64,
+        unit_id: u64,
+        sink: amaterasu_media::VideoMetadataAdmissionSinkV1,
+    ) -> Status {
+        let Some(queue) = self
+            .streams
+            .get_mut(&id)
+            .filter(|stream| stream.owner == owner)
+            .and_then(|stream| stream.negotiated.as_mut())
+        else {
+            return MEDIA_CLOSED;
+        };
+        if queue.failed {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let Some(selected) = queue.metadata.as_ref() else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        let Some(unit) = queue.ready.front_mut() else {
+            return MEDIA_PENDING;
+        };
+        let header = unit_header(queue.selection, unit);
+        if unit.access_unit_id != unit_id {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let Some(metadata) = unit.metadata.as_mut().filter(|metadata| metadata.delivered) else {
+            return STATUS_INVALID_ARGUMENT;
+        };
+        let Ok(mut flow) = selected.flow.try_lock() else {
+            return MEDIA_BUSY;
+        };
+        if !flow.is_current(selected.capabilities)
+            || metadata
                 .association
-                .check_transport(header, &metadata.bytes, selected.capabilities.encoder)
-                .map_err(|_| STATUS_INVALID_ARGUMENT)
-        })
-        .map_or_else(|status| status, |_| STATUS_OK)
-    }
-
-    pub(crate) fn retire_metadata(&mut self, owner: &str, id: u64, unit: u64) -> Status {
-        let result = self.with_metadata_unit(owner, id, unit, |selected, header, metadata| {
-            let mut flow = selected.flow.lock().map_err(|_| STATUS_INVALID_ARGUMENT)?;
-            flow.retire(
+                .check_transport(&header, &metadata.bytes, selected.capabilities.encoder)
+                .is_err()
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: caller guarantees the synchronous callback and no Video reentry.
+        let status = unsafe { (sink.admit)(sink.context) };
+        if status != STATUS_OK {
+            return status;
+        }
+        if flow
+            .retire(
                 &mut metadata.association,
-                header,
+                &header,
                 &metadata.bytes,
                 selected.capabilities,
             )
-            .map_err(|_| STATUS_INVALID_ARGUMENT)
-        });
-        if let Err(status) = result {
-            return status;
+            .is_err()
+        {
+            queue.failed = true;
+            return amaterasu_module_sdk::abi::STATUS_INTERNAL_ERROR;
         }
-        let queue = self
-            .streams
-            .get_mut(&id)
-            .and_then(|stream| stream.negotiated.as_mut())
-            .expect("metadata unit was just checked");
-        let retired = queue
-            .ready
-            .pop_front()
-            .expect("metadata unit was just checked");
+        drop(flow);
+        let retired = queue.ready.pop_front().expect("admitted metadata unit");
         queue.bytes -= retired.bytes.len();
         STATUS_OK
     }

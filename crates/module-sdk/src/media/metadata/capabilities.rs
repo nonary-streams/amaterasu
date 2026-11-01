@@ -88,6 +88,23 @@ pub unsafe fn bind_capabilities_with_probe(
         )
     }
 }
+
+/// # Safety
+/// Provider and runtime outlive all generation leases and their unpin barriers.
+pub unsafe fn bind_capabilities_with_pinning(
+    runtime: &crate::RuntimeClient,
+    service: &str,
+) -> crate::ModuleResult<crate::NativeBinding> {
+    unsafe {
+        runtime.bind_native_typed(
+            service,
+            CAPABILITIES_CONTRACT,
+            1,
+            2,
+            std::mem::size_of::<amaterasu_media::FrameMetadataCapabilitiesApiV1_2>() as u32,
+        )
+    }
+}
 /// # Safety
 /// The factory implements the exact capability table and native lifetime rules.
 pub unsafe fn register_capabilities(

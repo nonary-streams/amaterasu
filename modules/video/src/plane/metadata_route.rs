@@ -15,6 +15,12 @@ pub(super) struct BoundRoute {
     encoder: NativeBinding,
 }
 
+pub(super) struct GenerationPins {
+    capture: u64,
+    processor: u64,
+    encoder: u64,
+}
+
 impl BoundRoute {
     pub fn bind(runtime: &RuntimeClient, spec: &crate::model::MetadataRoute) -> ModuleResult<Self> {
         // SAFETY: trusted settings select independently granted typed services;
@@ -22,9 +28,18 @@ impl BoundRoute {
         unsafe {
             Ok(Self {
                 spec: spec.clone(),
-                capture: metadata::bind_capabilities(runtime, &spec.capture_capabilities)?,
-                processor: metadata::bind_capabilities(runtime, &spec.processor_capabilities)?,
-                encoder: metadata::bind_capabilities(runtime, &spec.encoder_capabilities)?,
+                capture: metadata::bind_capabilities_with_pinning(
+                    runtime,
+                    &spec.capture_capabilities,
+                )?,
+                processor: metadata::bind_capabilities_with_pinning(
+                    runtime,
+                    &spec.processor_capabilities,
+                )?,
+                encoder: metadata::bind_capabilities_with_pinning(
+                    runtime,
+                    &spec.encoder_capabilities,
+                )?,
             })
         }
     }
@@ -66,9 +81,9 @@ impl BoundRoute {
         ] {
             // SAFETY: typed binding stays live on this module thread. Both size
             // and minor cover the additive source-independent callback.
-            let api = unsafe { binding.table::<FrameMetadataCapabilitiesApiV1_1>() }
+            let api = unsafe { binding.table::<FrameMetadataCapabilitiesApiV1_2>() }
                 .map_err(|_| "metadata_profile_probe_unavailable")?;
-            if api.base.base.header.minor < 1 {
+            if api.base.base.base.header.minor < 2 {
                 return Err("metadata_profile_probe_unavailable");
             }
             let query = FrameMetadataProfileProbeV1 {
@@ -87,11 +102,109 @@ impl BoundRoute {
                 reserved: 0,
                 bitrate: u64::from(configuration.bitrate),
             };
-            if unsafe { (api.probe_profile)(binding.context(), &query) } != STATUS_OK {
+            if unsafe { (api.base.probe_profile)(binding.context(), &query) } != STATUS_OK {
                 return Err("metadata_profile_unsupported");
             }
         }
         Ok(())
+    }
+
+    /// Atomically pin each selected generation at its provider. Partial
+    /// acquisition is unwound in reverse order before returning BUSY or error.
+    pub fn pin(
+        &self,
+        video: u64,
+        capture: u64,
+        encoder: u64,
+        source_generation: u64,
+        versions: MetadataCapabilities,
+    ) -> Result<Option<GenerationPins>, &'static str> {
+        let schema = FrameMetadataSchemaId {
+            namespace_id: self.spec.schema.namespace_id,
+            value: self.spec.schema.value,
+            schema: self.spec.schema.schema,
+        };
+        let mut leases = [0u64; 3];
+        let selected = [
+            (
+                &self.capture,
+                capture,
+                versions.capture,
+                FRAME_METADATA_STAGE_CAPTURE,
+            ),
+            (
+                &self.processor,
+                video,
+                versions.processor,
+                FRAME_METADATA_STAGE_PROCESSOR,
+            ),
+            (
+                &self.encoder,
+                encoder,
+                versions.encoder,
+                FRAME_METADATA_STAGE_ENCODER,
+            ),
+        ];
+        let mut tables = Vec::with_capacity(selected.len());
+        for (binding, _, _, _) in &selected {
+            // SAFETY: binding remains live on this thread throughout pinning.
+            let api = unsafe { binding.table::<FrameMetadataCapabilitiesApiV1_2>() }
+                .map_err(|_| "metadata_pinning_unavailable")?;
+            if api.base.base.base.header.minor < 2 {
+                return Err("metadata_pinning_unavailable");
+            }
+            tables.push(api);
+        }
+        for (index, (binding, provider_session, generation, stage)) in selected.iter().enumerate() {
+            let api = tables[index];
+            let request = FrameMetadataGenerationPinV1 {
+                size: size_of::<FrameMetadataGenerationPinV1>() as u32,
+                version: 1,
+                stage: *stage,
+                owner: FRAME_METADATA_OWNER_FRAMER,
+                provider_session: *provider_session,
+                host_session: video,
+                source_id: capture,
+                source_generation,
+                config_generation: 1,
+                capability_generation: *generation,
+                schema,
+            };
+            // SAFETY: the bounded request and lease output are borrowed synchronously.
+            let status =
+                unsafe { (api.pin_generation)(binding.context(), &request, &mut leases[index]) };
+            if status != STATUS_OK || leases[index] == 0 {
+                for prior in (0..index).rev() {
+                    // SAFETY: successful prior leases remain live and unpin is a barrier.
+                    unsafe {
+                        (tables[prior].unpin_generation)(selected[prior].0.context(), leases[prior])
+                    };
+                }
+                return if matches!(status, MEDIA_BUSY | MEDIA_PENDING) {
+                    Ok(None)
+                } else {
+                    Err("metadata_generation_pin_failed")
+                };
+            }
+        }
+        Ok(Some(GenerationPins {
+            capture: leases[0],
+            processor: leases[1],
+            encoder: leases[2],
+        }))
+    }
+
+    pub fn unpin(&self, pins: GenerationPins) {
+        for (binding, lease) in [
+            (&self.encoder, pins.encoder),
+            (&self.processor, pins.processor),
+            (&self.capture, pins.capture),
+        ] {
+            // SAFETY: all successful leases were obtained from these live typed bindings.
+            let api = unsafe { binding.table::<FrameMetadataCapabilitiesApiV1_2>() }
+                .expect("validated pin table");
+            unsafe { (api.unpin_generation)(binding.context(), lease) };
+        }
     }
 
     fn query(

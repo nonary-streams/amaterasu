@@ -2,7 +2,8 @@
 use crate::queue::Queues;
 use amaterasu_media::{
     MEDIA_BUSY, MEDIA_UNSUPPORTED, NegotiatedVideoApi, NegotiatedVideoApiV1_1,
-    NegotiatedVideoMetadataUnitSinkV1, NegotiatedVideoUnitSink,
+    NegotiatedVideoApiV1_2, NegotiatedVideoMetadataUnitSinkV1, NegotiatedVideoUnitSink,
+    VideoMetadataAdmissionSinkV1,
 };
 use amaterasu_module_sdk::abi::*;
 use std::{
@@ -32,7 +33,7 @@ impl Factory {
 }
 
 struct Binding {
-    api: NegotiatedVideoApiV1_1,
+    api: NegotiatedVideoApiV1_2,
     queues: Arc<Mutex<Queues>>,
     owner: String,
 }
@@ -59,8 +60,8 @@ unsafe extern "C" fn bind(
         let query = unsafe { &*query };
         if !query.header.supports::<NativeInterfaceQuery>()
             || query.interface_major != 1
-            || query.min_minor > 1
-            || query.min_size as usize > size_of::<NegotiatedVideoApiV1_1>()
+            || query.min_minor > 2
+            || query.min_size as usize > size_of::<NegotiatedVideoApiV1_2>()
         {
             return MEDIA_UNSUPPORTED;
         }
@@ -74,32 +75,35 @@ unsafe extern "C" fn bind(
         // SAFETY: factory remains registered until all bindings retire.
         let factory = unsafe { &*context.cast::<Factory>() };
         let mut binding = Box::new(Binding {
-            api: NegotiatedVideoApiV1_1 {
-                base: NegotiatedVideoApi {
-                    base: NativeInterface {
-                        header: AbiHeader {
-                            size: size_of::<NegotiatedVideoApiV1_1>() as u32,
-                            major: 1,
-                            minor: 1,
+            api: NegotiatedVideoApiV1_2 {
+                base: NegotiatedVideoApiV1_1 {
+                    base: NegotiatedVideoApi {
+                        base: NativeInterface {
+                            header: AbiHeader {
+                                size: size_of::<NegotiatedVideoApiV1_2>() as u32,
+                                major: 1,
+                                minor: 2,
+                            },
+                            context: std::ptr::null_mut(),
+                            release: Some(release),
                         },
-                        context: std::ptr::null_mut(),
-                        release: Some(release),
+                        receive,
                     },
-                    receive,
+                    receive_metadata,
+                    framed_metadata,
+                    check_metadata,
+                    retire_metadata,
                 },
-                receive_metadata,
-                framed_metadata,
-                check_metadata,
-                retire_metadata,
+                admit_metadata,
             },
             queues: factory.queues.clone(),
             owner,
         });
-        binding.api.base.base.context = (&mut *binding as *mut Binding).cast();
+        binding.api.base.base.base.context = (&mut *binding as *mut Binding).cast();
         let binding = Box::into_raw(binding);
         // SAFETY: table belongs to the transferred binding until release.
         unsafe {
-            *output = &(*binding).api.base.base;
+            *output = &(*binding).api.base.base.base;
         }
         STATUS_OK
     }))
@@ -149,11 +153,32 @@ unsafe fn metadata_operation(
 unsafe extern "C" fn framed_metadata(context: *mut c_void, stream: u64, unit: u64) -> Status {
     unsafe { metadata_operation(context, stream, unit, Queues::framed_metadata) }
 }
-unsafe extern "C" fn check_metadata(context: *mut c_void, stream: u64, unit: u64) -> Status {
-    unsafe { metadata_operation(context, stream, unit, Queues::check_metadata) }
+unsafe extern "C" fn check_metadata(_: *mut c_void, _: u64, _: u64) -> Status {
+    MEDIA_UNSUPPORTED
 }
-unsafe extern "C" fn retire_metadata(context: *mut c_void, stream: u64, unit: u64) -> Status {
-    unsafe { metadata_operation(context, stream, unit, Queues::retire_metadata) }
+unsafe extern "C" fn retire_metadata(_: *mut c_void, _: u64, _: u64) -> Status {
+    MEDIA_UNSUPPORTED
+}
+
+unsafe extern "C" fn admit_metadata(
+    context: *mut c_void,
+    stream: u64,
+    unit: u64,
+    sink: VideoMetadataAdmissionSinkV1,
+) -> Status {
+    catch_unwind(AssertUnwindSafe(|| {
+        if context.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the runtime keeps the binding alive for this synchronous call.
+        let binding = unsafe { &*context.cast::<Binding>() };
+        let Ok(mut queues) = binding.queues.try_lock() else {
+            return MEDIA_BUSY;
+        };
+        // SAFETY: the sink is synchronous and must not reenter Video.
+        unsafe { queues.admit_metadata(&binding.owner, stream, unit, sink) }
+    }))
+    .unwrap_or(STATUS_INTERNAL_ERROR)
 }
 
 unsafe extern "C" fn release(context: *mut c_void) {

@@ -76,9 +76,10 @@ The encoder options use side-data schema `{namespace_id: 1, value: 4, schema:
 stage permitted to apply metadata; under framer ownership the encoder may only
 forward it. The encoded-unit/framer owner must separately carry the submission
 association and an explicit application state, and reject missing required data
-or a second application. Current production video/session/transport paths do
-not consume these tails or enable framer-owned carriage. Codec carriage,
-negotiated client support and real HDR hardware remain separate work.
+or a second application. The submitted Video and Session paths carry the
+bundle and support a selected framer owner. Production RTSP keeps required
+metadata offers closed pending a complete managed-route replacement test.
+Codec carriage, client support and real HDR hardware remain separate work.
 
 `EncodedMetadataAssociation` is an opt-in SDK guard for this output-side work.
 It makes a one-time claim on the pending encoder-stage admission and copies its
@@ -89,15 +90,19 @@ instead of rebuilding the admission and resetting its state. Keep one
 separate admission instances do not coordinate with one another. The guard checks the exact selected
 unit and submission/source/configuration identities, preserves the original
 source generation in that bundle, and requires one declared application owner
-through encoder and framer stages before transport. Callers must provide the
-current capability generation for each operation, check before every transport
-attempt, and retire only after local admission. The capture clock in AFM1 and
+through encoder and framer stages before transport. Each selected capture,
+processor and encoder provider must support the v1.2 generation lease. An
+invalidation request stays pending while leases remain; an already pinned unit
+may finish local admission before the provider completes invalidation. Video
+v1.2 validates the association and invokes non-reentrant, nonblocking local
+transport admission under one ownership barrier, retiring only after success.
+Busy consumes nothing. Split v1.1 check/retire operations are insufficient to
+authorize this path. Leases are logical claims, not locks held across event-loop
+calls; teardown cancels admission before bounded unpin. The capture clock in AFM1 and
 the separately selected stream clock in the encoded unit are distinct; the
 guard does not infer a timestamp conversion. The application state is a
 provider assertion, not proof of encoded bytes or client interoperability. The
 caller must separately own the immutable access-unit bytes across retries; the
 guard pins its scalar identity and length, not its contents.
-No existing native unit or framer table carries this state or bundle, and no
-production path invokes the guard. Required-metadata profiles must stay closed
-until versioned provider tables, trusted selection and actual codec carriage
-are wired and verified.
+The native unit and selected framer carry this state and bundle, but their
+synthetic tests do not prove real codec carriage or client interoperability.

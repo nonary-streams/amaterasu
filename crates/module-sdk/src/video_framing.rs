@@ -563,6 +563,23 @@ pub unsafe fn bind_video_metadata(
         )
     }
 }
+
+/// # Safety
+/// The provider implements atomic metadata admission and outlives the binding.
+pub unsafe fn bind_video_metadata_admission(
+    runtime: &RuntimeClient,
+    service: &str,
+) -> ModuleResult<NativeBinding> {
+    unsafe {
+        runtime.bind_native_typed(
+            service,
+            VIDEO_UNIT_CONTRACT,
+            1,
+            2,
+            size_of::<NegotiatedVideoApiV1_2>() as u32,
+        )
+    }
+}
 /// # Safety
 /// The registered factory implements `NegotiatedVideoTransportApi` and outlives its bindings.
 pub unsafe fn register_transport(

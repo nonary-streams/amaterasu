@@ -2492,6 +2492,13 @@ mod tests {
             queues.lock().unwrap().close(1);
         }
     }
+    struct TestCapabilityState {
+        generation: u64,
+        pins: usize,
+        invalidate_requested: bool,
+        fail_stage: u32,
+    }
+
     unsafe extern "C" fn capability_enumerate(
         context: *mut c_void,
         session: u64,
@@ -2503,7 +2510,7 @@ mod tests {
             return STATUS_INVALID_ARGUMENT;
         }
         unsafe {
-            *generation = *context.cast::<u64>();
+            *generation = (*context.cast::<TestCapabilityState>()).generation;
         }
         let claim = FrameMetadataCapabilityV1 {
             schema: FrameMetadataSchemaId {
@@ -2560,6 +2567,61 @@ mod tests {
         STATUS_OK
     }
 
+    unsafe extern "C" fn capability_pin(
+        context: *mut c_void,
+        request: *const amaterasu_media::FrameMetadataGenerationPinV1,
+        lease: *mut u64,
+    ) -> Status {
+        if context.is_null() || request.is_null() || lease.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let request = unsafe { &*request };
+        let state = unsafe { &mut *context.cast::<TestCapabilityState>() };
+        if request.capability_generation != state.generation
+            || state.invalidate_requested
+            || request.stage == state.fail_stage
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        state.pins += 1;
+        unsafe { *lease = u64::from(request.stage) };
+        STATUS_OK
+    }
+
+    unsafe extern "C" fn capability_unpin(context: *mut c_void, _: u64) {
+        let state = unsafe { &mut *context.cast::<TestCapabilityState>() };
+        state.pins -= 1;
+        if state.pins == 0 && state.invalidate_requested {
+            state.generation += 1;
+        }
+    }
+
+    struct AdmissionTestState {
+        attempts: usize,
+        capabilities: *mut TestCapabilityState,
+        invalidate_on_admit: bool,
+        flow: std::sync::Arc<std::sync::Mutex<crate::plane::MetadataFlow>>,
+    }
+
+    unsafe extern "C" fn admit_unit(context: *mut c_void) -> Status {
+        let state = unsafe { &mut *context.cast::<AdmissionTestState>() };
+        state.attempts += 1;
+        if state.invalidate_on_admit {
+            // The request arrives after association validation, inside the
+            // transport callback. The provider lease keeps it pending.
+            let capabilities = unsafe { &mut *state.capabilities };
+            capabilities.invalidate_requested = true;
+            assert_eq!((capabilities.generation, capabilities.pins), (1, 3));
+            // Cancellation cannot pass its flow barrier in this callback.
+            assert!(state.flow.try_lock().is_err());
+        }
+        if state.attempts == 1 {
+            amaterasu_media::MEDIA_BUSY
+        } else {
+            STATUS_OK
+        }
+    }
+
     unsafe extern "C" fn collect_metadata_unit(
         context: *mut c_void,
         unit: *const amaterasu_media::NegotiatedVideoMetadataUnitV1,
@@ -2584,6 +2646,8 @@ mod tests {
             (FRAME_TRANSFER_SRGB, 3),
             (FRAME_TRANSFER_SRGB, 4),
             (FRAME_TRANSFER_SRGB, 5),
+            (FRAME_TRANSFER_SRGB, 6),
+            (FRAME_TRANSFER_SRGB, 7),
         ] {
             let mut source = Box::new(Producer {
                 wrong_metadata_source: fault == 1,
@@ -2641,21 +2705,34 @@ mod tests {
                 drain: submitted_drain,
                 destroy_session: submitted_destroy,
             };
-            let mut caps_generation = 1u64;
-            let caps = FrameMetadataCapabilitiesApiV1_1 {
-                base: FrameMetadataCapabilitiesApiV1 {
-                    base: NativeInterface {
-                        header: AbiHeader {
-                            size: size_of::<FrameMetadataCapabilitiesApiV1_1>() as u32,
-                            major: 1,
-                            minor: 1,
-                        },
-                        context: (&mut caps_generation as *mut u64).cast(),
-                        release: None,
-                    },
-                    enumerate: capability_enumerate,
+            let mut caps_generation = TestCapabilityState {
+                generation: 1,
+                pins: 0,
+                invalidate_requested: false,
+                fail_stage: if fault == 6 {
+                    FRAME_METADATA_STAGE_ENCODER
+                } else {
+                    0
                 },
-                probe_profile: capability_probe,
+            };
+            let caps = FrameMetadataCapabilitiesApiV1_2 {
+                base: FrameMetadataCapabilitiesApiV1_1 {
+                    base: FrameMetadataCapabilitiesApiV1 {
+                        base: NativeInterface {
+                            header: AbiHeader {
+                                size: size_of::<FrameMetadataCapabilitiesApiV1_2>() as u32,
+                                major: 1,
+                                minor: 2,
+                            },
+                            context: (&mut caps_generation as *mut TestCapabilityState).cast(),
+                            release: None,
+                        },
+                        enumerate: capability_enumerate,
+                    },
+                    probe_profile: capability_probe,
+                },
+                pin_generation: capability_pin,
+                unpin_generation: capability_unpin,
             };
             let mut host = Box::new(PipelineHost {
                 capture: capture_table(&mut source),
@@ -2674,7 +2751,7 @@ mod tests {
                 metadata_consumer: &consumer_api,
                 processor: (&processor_api as *const FrameResourceProcessorApiV1_2).cast(),
                 submitted_encoder: &submitted_api,
-                metadata_capabilities: &caps.base,
+                metadata_capabilities: &caps.base.base,
             });
             let runtime = unsafe {
                 RuntimeClient::from_endpoint(amaterasu_module_sdk::abi::HostApi {
@@ -2749,6 +2826,12 @@ mod tests {
                 sequence: 1,
                 force_idr: false,
             };
+            if fault == 6 {
+                assert!(plane.prepare_submitted_metadata(pump()).is_err());
+                assert_eq!(caps_generation.pins, 0);
+                plane.finish_stream(1);
+                continue;
+            }
             assert_eq!(plane.prepare_submitted_metadata(pump()).unwrap(), Some(9));
             assert_eq!(source.metadata_context.unwrap().source_generation, 9);
             let first = plane.pump(pump());
@@ -2786,7 +2869,17 @@ mod tests {
             assert_eq!((consumer.submitted, consumer.transfer), (1, transfer));
             let mut bytes = Vec::<u8>::new();
             let mut queue = queues.lock().unwrap();
-            assert_eq!(queue.check_metadata("owner", 1, 1), STATUS_INVALID_ARGUMENT);
+            let admission_flow = plane.metadata_flows.get(&1).unwrap().clone();
+            let mut admission_state = AdmissionTestState {
+                attempts: 0,
+                capabilities: &mut caps_generation,
+                invalidate_on_admit: fault == 5,
+                flow: admission_flow.clone(),
+            };
+            let mut sink = || VideoMetadataAdmissionSinkV1 {
+                context: (&mut admission_state as *mut AdmissionTestState).cast(),
+                admit: admit_unit,
+            };
             assert_eq!(
                 unsafe {
                     queue.receive_unit_metadata(
@@ -2801,19 +2894,10 @@ mod tests {
                 STATUS_OK
             );
             assert_eq!(bytes, consumer.metadata);
-            if fault == 5 {
-                caps_generation = 2;
-                std::hint::black_box(&caps_generation);
-                drop(queue);
-                assert!(plane.pump(pump()).is_err());
-                assert_eq!(
-                    queues.lock().unwrap().framed_metadata("owner", 1, 1),
-                    STATUS_INVALID_ARGUMENT
-                );
-                plane.finish_stream(1);
-                continue;
-            }
-            assert_eq!(queue.check_metadata("owner", 1, 1), STATUS_INVALID_ARGUMENT);
+            assert_eq!(
+                unsafe { queue.admit_metadata("owner", 1, 1, sink()) },
+                STATUS_INVALID_ARGUMENT
+            );
             assert_eq!(
                 queue.framed_metadata("owner", 1, 2),
                 STATUS_INVALID_ARGUMENT
@@ -2823,12 +2907,39 @@ mod tests {
                 queue.framed_metadata("owner", 1, 1),
                 STATUS_INVALID_ARGUMENT
             );
-            assert_eq!(queue.check_metadata("owner", 1, 1), STATUS_OK);
-            assert_eq!(queue.check_metadata("owner", 1, 1), STATUS_OK);
-            assert_eq!(queue.retire_metadata("owner", 1, 1), STATUS_OK);
-            assert_ne!(queue.retire_metadata("owner", 1, 1), STATUS_OK);
+            if fault == 7 {
+                admission_flow.lock().unwrap().cancel();
+                assert_ne!(
+                    unsafe { queue.admit_metadata("owner", 1, 1, sink()) },
+                    STATUS_OK
+                );
+                drop(queue);
+                plane.finish_stream(1);
+                assert_eq!(admission_state.attempts, 0);
+                continue;
+            }
+            assert_eq!(
+                unsafe { queue.admit_metadata("owner", 1, 1, sink()) },
+                MEDIA_BUSY
+            );
+            assert_eq!(
+                unsafe { queue.admit_metadata("owner", 1, 1, sink()) },
+                STATUS_OK
+            );
+            assert_ne!(
+                unsafe { queue.admit_metadata("owner", 1, 1, sink()) },
+                STATUS_OK
+            );
             drop(queue);
             plane.finish_stream(1);
+            if fault == 5 {
+                assert_eq!((caps_generation.generation, caps_generation.pins), (2, 0));
+                assert_ne!(
+                    unsafe { queues.lock().unwrap().admit_metadata("owner", 1, 1, sink()) },
+                    STATUS_OK
+                );
+            }
+            assert_eq!(admission_state.attempts, 2);
         }
     }
 }

@@ -1,6 +1,12 @@
 #include "amaterasu_media.h"
 #if UINTPTR_MAX == UINT64_MAX
 _Static_assert(sizeof(AmaterasuNativeInterface) == 32, "native prefix layout");
+_Static_assert(sizeof(AmaterasuFrameMetadataGenerationPinV1) == 88, "generation pin layout");
+_Static_assert(sizeof(AmaterasuFrameMetadataCapabilitiesApiV1_2) == 64, "capability pin table layout");
+_Static_assert(offsetof(AmaterasuFrameMetadataCapabilitiesApiV1_2, pin_generation) == sizeof(AmaterasuFrameMetadataCapabilitiesApiV1_1), "capability table prefix");
+_Static_assert(sizeof(AmaterasuVideoMetadataAdmissionSinkV1) == 16, "admission sink layout");
+_Static_assert(sizeof(AmaterasuNegotiatedVideoApiV1_2) == 80, "video admission table layout");
+_Static_assert(offsetof(AmaterasuNegotiatedVideoApiV1_2, admit_metadata) == sizeof(AmaterasuNegotiatedVideoApiV1_1), "video table prefix");
 _Static_assert(sizeof(AmaterasuCaptureSwapRequest) == 56, "capture swap request layout");
 _Static_assert(sizeof(AmaterasuCaptureEventSink) == 32, "capture notification sink layout");
 _Static_assert(sizeof(AmaterasuCaptureApiV1_7) == 112, "capture event table layout");
