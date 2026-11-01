@@ -38,7 +38,7 @@ impl Factory {
     }
 }
 struct Binding {
-    api: IdentityApiV1_1,
+    api: IdentityApiV1_2,
     shared: Arc<Shared>,
 }
 unsafe extern "C" fn bind(
@@ -69,32 +69,35 @@ unsafe extern "C" fn bind(
         let query = unsafe { &*query };
         if !query.header.supports::<NativeInterfaceQuery>()
             || query.interface_major != INTERFACE_MAJOR
-            || query.min_minor > INTERFACE_MINOR_PERMISSIONS
-            || query.min_size as usize > size_of::<IdentityApiV1_1>()
+            || query.min_minor > INTERFACE_MINOR_ENTITLEMENTS
+            || query.min_size as usize > size_of::<IdentityApiV1_2>()
         {
             return IDENTITY_UNSUPPORTED;
         }
         let mut binding = Box::new(Binding {
-            api: IdentityApiV1_1 {
-                v1_0: IdentityApi {
-                    base: NativeInterface {
-                        header: AbiHeader {
-                            minor: INTERFACE_MINOR_PERMISSIONS,
-                            ..AbiHeader::of::<IdentityApiV1_1>()
+            api: IdentityApiV1_2 {
+                v1_1: IdentityApiV1_1 {
+                    v1_0: IdentityApi {
+                        base: NativeInterface {
+                            header: AbiHeader {
+                                minor: INTERFACE_MINOR_ENTITLEMENTS,
+                                ..AbiHeader::of::<IdentityApiV1_2>()
+                            },
+                            context: std::ptr::null_mut(),
+                            release: Some(release),
                         },
-                        context: std::ptr::null_mut(),
-                        release: Some(release),
+                        certificate,
+                        sign,
+                        verify_client,
                     },
-                    certificate,
-                    sign,
-                    verify_client,
+                    check_permission,
                 },
-                check_permission,
+                check_entitlement,
             },
             shared: factory.shared.clone(),
         });
-        binding.api.v1_0.base.context = (&mut *binding as *mut Binding).cast();
-        let table = &binding.api.v1_0.base as *const NativeInterface;
+        binding.api.v1_1.v1_0.base.context = (&mut *binding as *mut Binding).cast();
+        let table = &binding.api.v1_1.v1_0.base as *const NativeInterface;
         let _ = Box::into_raw(binding);
         // SAFETY: transfer one provider allocation, released once after calls stop.
         unsafe {
@@ -189,6 +192,33 @@ unsafe extern "C" fn check_permission(
         let now = binding.shared.now()?;
         let snapshot = binding.shared.get(now)?;
         let result = snapshot.check_permission(certificate, now, permission);
+        if !binding.shared.current(&snapshot, binding.shared.now()?) {
+            return Err(IDENTITY_UNAVAILABLE);
+        }
+        result
+    })
+}
+unsafe extern "C" fn check_entitlement(
+    context: *mut c_void,
+    certificate: BorrowedBytes,
+    name: BorrowedBytes,
+) -> Status {
+    guarded_result(|| {
+        if certificate.len == 0
+            || certificate.len > MAX_CERTIFICATE_BYTES
+            || name.len == 0
+            || name.len > MAX_ENTITLEMENT_BYTES
+        {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        // SAFETY: both buffers and the binding are retained by the caller for this synchronous call.
+        let certificate = unsafe { certificate.read() }?;
+        let name =
+            std::str::from_utf8(unsafe { name.read() }?).map_err(|_| STATUS_INVALID_ARGUMENT)?;
+        let binding = unsafe { binding(context) }?;
+        let now = binding.shared.now()?;
+        let snapshot = binding.shared.get(now)?;
+        let result = snapshot.check_entitlement(certificate, now, name);
         if !binding.shared.current(&snapshot, binding.shared.now()?) {
             return Err(IDENTITY_UNAVAILABLE);
         }

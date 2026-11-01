@@ -82,6 +82,11 @@ pub enum Operation {
         permissions: ClientPermissions,
         expected_revision: u64,
     },
+    UpdateClientEntitlements {
+        certificate_id: String,
+        entitlements: Vec<String>,
+        expected_revision: u64,
+    },
     SetPermissionMode {
         enabled: bool,
         expected_revision: u64,
@@ -163,6 +168,11 @@ impl Operation {
                 expected_revision: _,
             } => hex_length(certificate_id, 32) && config_overrides.validate().is_ok(),
             Self::UpdateClientPermissions { certificate_id, .. } => hex_length(certificate_id, 32),
+            Self::UpdateClientEntitlements {
+                certificate_id,
+                entitlements,
+                ..
+            } => hex_length(certificate_id, 32) && valid_entitlements(entitlements),
             Self::CheckClientCertificate { certificate_pem }
             | Self::UnpairPresentedClient { certificate_pem } => certificate_pem.len() <= 4096,
             _ => true,
@@ -184,6 +194,7 @@ impl Operation {
                 | Self::UnpairPresentedClient { .. }
                 | Self::UpdateClientConfigOverrides { .. }
                 | Self::UpdateClientPermissions { .. }
+                | Self::UpdateClientEntitlements { .. }
                 | Self::SetPermissionMode { .. }
         )
     }
@@ -209,6 +220,7 @@ impl Operation {
                 | Self::Unpair { .. }
                 | Self::UpdateClientConfigOverrides { .. }
                 | Self::UpdateClientPermissions { .. }
+                | Self::UpdateClientEntitlements { .. }
                 | Self::SetPermissionMode { .. }
         )
     }
@@ -239,6 +251,8 @@ pub struct Client {
     pub paired_at: u64,
     #[serde(default, skip_serializing_if = "ClientPermissions::is_default")]
     pub permissions: ClientPermissions,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entitlements: Vec<String>,
     #[serde(default, skip_serializing_if = "ClientConfigOverrides::is_empty")]
     pub config_overrides: ClientConfigOverrides,
 }
@@ -909,6 +923,7 @@ impl Document {
                 || client.name.is_empty()
                 || client.name.len() > 128
                 || client.config_overrides.validate().is_err()
+                || !valid_entitlements(&client.entitlements)
             {
                 return Err("invalid_state");
             }
@@ -1893,4 +1908,12 @@ mod keybindings_override_tests {
         }
         assert!(serde_json::from_value::<ClientConfigOverrides>(Value::Null).is_err());
     }
+}
+
+fn valid_entitlements(names: &[String]) -> bool {
+    names.len() <= 64
+        && names
+            .iter()
+            .all(|name| amaterasu_identity::valid_entitlement(name))
+        && names.iter().collect::<BTreeSet<_>>().len() == names.len()
 }

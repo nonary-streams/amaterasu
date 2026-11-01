@@ -10,6 +10,29 @@ pub const INTERFACE_MAJOR: u32 = 1;
 pub const INTERFACE_MINOR: u32 = 0;
 /// Minor version required for the appended permission query.
 pub const INTERFACE_MINOR_PERMISSIONS: u32 = 1;
+pub const INTERFACE_MINOR_ENTITLEMENTS: u32 = 2;
+/// Maximum ASCII bytes in a namespaced entitlement.
+pub const MAX_ENTITLEMENT_BYTES: usize = 128;
+
+/// A lower-case reverse-DNS namespace followed by `/` and an operation name.
+pub fn valid_entitlement(name: &str) -> bool {
+    if name.len() > MAX_ENTITLEMENT_BYTES {
+        return false;
+    }
+    let Some((namespace, operation)) = name.split_once('/') else {
+        return false;
+    };
+    let valid_part = |part: &str| {
+        !part.is_empty()
+            && part
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    };
+    namespace.split('.').count() >= 2
+        && namespace.split('.').all(valid_part)
+        && valid_part(operation)
+}
+
 pub const PERMISSION_LIST: u32 = 1;
 pub const PERMISSION_LAUNCH: u32 = 2;
 pub const PERMISSION_VIEW: u32 = 3;
@@ -57,9 +80,38 @@ pub struct IdentityApiV1_1 {
     pub check_permission: unsafe extern "C" fn(*mut c_void, BorrowedBytes, u32) -> Status,
 }
 
+/// Version 1.2 extends 1.1. Names are exact, administrator-approved operation
+/// identifiers, not module grants. Only STATUS_OK authorizes the checked client.
+/// TLS proof of possession and operation-to-name binding are the caller's duty.
+/// Recheck before effects and delivery; this call does not reserve authorization.
+#[repr(C)]
+pub struct IdentityApiV1_2 {
+    pub v1_1: IdentityApiV1_1,
+    pub check_entitlement:
+        unsafe extern "C" fn(*mut c_void, BorrowedBytes, BorrowedBytes) -> Status,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn entitlement_names_are_bounded_and_unambiguous() {
+        assert!(valid_entitlement("org.example/read"));
+        for name in [
+            "org/read",
+            "Org.example/read",
+            "org..example/read",
+            "org.example/",
+            "org.example/read/write",
+            "org.example/read\0",
+        ] {
+            assert!(!valid_entitlement(name));
+        }
+        assert!(!valid_entitlement(&format!(
+            "org.example/{}",
+            "x".repeat(128)
+        )));
+    }
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn table_has_stable_c_prefix_and_callback_offsets() {
@@ -70,5 +122,7 @@ mod tests {
         assert_eq!(size_of::<IdentityApiV1_1>(), 64);
         assert_eq!(std::mem::offset_of!(IdentityApiV1_1, v1_0), 0);
         assert_eq!(std::mem::offset_of!(IdentityApiV1_1, check_permission), 56);
+        assert_eq!(size_of::<IdentityApiV1_2>(), 72);
+        assert_eq!(std::mem::offset_of!(IdentityApiV1_2, check_entitlement), 64);
     }
 }

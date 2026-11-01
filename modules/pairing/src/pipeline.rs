@@ -1165,6 +1165,9 @@ impl Pipeline {
             }
             | Operation::SetPermissionMode {
                 expected_revision, ..
+            }
+            | Operation::UpdateClientEntitlements {
+                expected_revision, ..
             } => Some(*expected_revision),
             Operation::Unpair {
                 expected_revision, ..

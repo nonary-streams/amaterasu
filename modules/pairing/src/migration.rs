@@ -87,6 +87,7 @@ pub fn import_legacy_pairing(
             certificate_pem: device.certificate_pem,
             paired_at: now,
             permissions: crate::protocol::ClientPermissions::default(),
+            entitlements: Vec::new(),
             config_overrides: crate::protocol::ClientConfigOverrides::default(),
         });
     }

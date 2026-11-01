@@ -37,6 +37,7 @@ fn document() -> Document {
             certificate_pem: CLIENT_CERT.into(),
             paired_at: 0,
             permissions: crate::protocol::ClientPermissions::default(),
+            entitlements: Vec::new(),
             config_overrides: crate::protocol::ClientConfigOverrides::default(),
         }],
     }
@@ -680,4 +681,67 @@ fn permission_api_reads_current_committed_certificate_policy() {
     shared.invalidate();
     assert_eq!(check(PERMISSION_LAUNCH), IDENTITY_UNAVAILABLE);
     unsafe { (api.v1_0.base.release.unwrap())(context) };
+}
+
+#[test]
+fn entitlement_checks_committed_client_policy_and_revocation() {
+    let shared = Arc::new(Shared::default());
+    let factory = Factory::new(shared.clone(), ["transport".into()].into());
+    let query = NativeInterfaceQuery {
+        header: AbiHeader::of::<NativeInterfaceQuery>(),
+        interface_major: INTERFACE_MAJOR,
+        min_minor: INTERFACE_MINOR_ENTITLEMENTS,
+        min_size: size_of::<IdentityApiV1_2>() as u32,
+    };
+    let mut output = std::ptr::null();
+    assert_eq!(
+        unsafe {
+            bind(
+                factory.api.context,
+                BorrowedBytes::new(b"transport"),
+                &query,
+                &mut output,
+            )
+        },
+        STATUS_OK
+    );
+    let api = unsafe { &*output.cast::<IdentityApiV1_2>() };
+    let context = api.v1_1.v1_0.base.context;
+    let client = crypto_certificate_der(CLIENT_CERT);
+    let check = |certificate: &[u8], name: &str| unsafe {
+        (api.check_entitlement)(
+            context,
+            BorrowedBytes::new(certificate),
+            BorrowedBytes::new(name.as_bytes()),
+        )
+    };
+    assert_eq!(check(&client, "org.alpha/read"), IDENTITY_UNAVAILABLE);
+    let mut document = document();
+    shared
+        .publish(1, Snapshot::prepare(&document, time()).unwrap())
+        .unwrap();
+    // The transport's module binding grant is not a client entitlement, even
+    // with legacy permission mode disabled.
+    assert_eq!(check(&client, "org.alpha/read"), IDENTITY_FORBIDDEN);
+    document.clients[0].entitlements = vec!["org.alpha/read".into(), "net.beta/write".into()];
+    shared
+        .publish(2, Snapshot::prepare(&document, time()).unwrap())
+        .unwrap();
+    assert_eq!(check(&client, "org.alpha/read"), STATUS_OK);
+    assert_eq!(check(&client, "net.beta/write"), STATUS_OK);
+    assert_eq!(check(&client, "org.alpha/write"), IDENTITY_FORBIDDEN);
+    assert_eq!(check(&client, "INVALID"), STATUS_INVALID_ARGUMENT);
+    assert_eq!(
+        check(&crypto_certificate_der(HOST_CERT), "org.alpha/read"),
+        IDENTITY_UNTRUSTED
+    );
+    document.clients[0].entitlements.remove(0);
+    shared
+        .publish(3, Snapshot::prepare(&document, time()).unwrap())
+        .unwrap();
+    assert_eq!(check(&client, "org.alpha/read"), IDENTITY_FORBIDDEN);
+    assert_eq!(check(&client, "net.beta/write"), STATUS_OK);
+    shared.invalidate();
+    assert_eq!(check(&client, "net.beta/write"), IDENTITY_UNAVAILABLE);
+    unsafe { (api.v1_1.v1_0.base.release.unwrap())(context) };
 }
