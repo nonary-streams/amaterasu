@@ -7,6 +7,9 @@ rust-version.workspace = true
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+test-support = ["amaterasu-module-sdk/network-test-support"]
+
 [dependencies]
 amaterasu-module-sdk.workspace = true
 amaterasu-media.workspace = true

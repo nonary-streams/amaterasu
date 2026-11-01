@@ -43,6 +43,12 @@ trait Drive {
     fn stop(&mut self);
     fn is_drained(&self) -> bool;
     fn recover_audio(&mut self);
+    fn pump_source_feedback(
+        &mut self,
+        _queue: &mut crate::plane::source_feedback::SourceFeedbackPending,
+    ) -> Result<crate::plane::source_feedback::Progress, &'static str> {
+        Err("source_feedback_unavailable")
+    }
     fn enqueue_feedback(
         &mut self,
         feedback: HostFeedback,
@@ -64,6 +70,12 @@ impl Drive for Plane {
     }
     fn recover_audio(&mut self) {
         Plane::recover_audio(self)
+    }
+    fn pump_source_feedback(
+        &mut self,
+        queue: &mut crate::plane::source_feedback::SourceFeedbackPending,
+    ) -> Result<crate::plane::source_feedback::Progress, &'static str> {
+        Plane::pump_source_feedback(self, queue)
     }
     fn enqueue_feedback(
         &mut self,
@@ -368,6 +380,13 @@ impl Pipeline {
         self.progress_session_effects(now, send);
         self.tray_activity.progress(now, send);
         self.feedback_retirement_inbox.prune_unstarted(send);
+        self.feedback_retirement_inbox.advance(
+            &mut self.records,
+            cfg!(test)
+                && self.settings.observe_feedback_sources
+                && self.settings.feedback_retirement_input_principal.is_some(),
+            send,
+        );
         if self.job.is_some() && self.settings.feedback_retirement_input_principal.is_some() {
             match send(Command::Poll {})? {
                 Response::Request {
@@ -673,6 +692,9 @@ impl Pipeline {
 
     fn schedule_control(&mut self, now: u64) -> bool {
         let observe_sources = self.settings.observe_feedback_sources;
+        let scoped_route = cfg!(test)
+            && observe_sources
+            && self.settings.feedback_retirement_input_principal.is_some();
         let source_due = |record: &Record| {
             observe_sources
                 && now >= record.feedback_source_retry_at
@@ -698,7 +720,8 @@ impl Pipeline {
                             && now >= record.feedback_poll_at)
                         || !record.input_events.is_empty()
                         || now >= record.feedback_poll_at
-                        || (record.input_controller_supported
+                        || (!scoped_route
+                            && record.input_controller_supported
                             && record.client_haptics_requested
                             && now >= record.rumble_poll_at)))
         };
@@ -719,7 +742,8 @@ impl Pipeline {
                                     && now >= record.feedback_poll_at)
                                 || !record.input_events.is_empty()
                                 || now >= record.feedback_poll_at
-                                || (record.input_controller_supported
+                                || (!scoped_route
+                                    && record.input_controller_supported
                                     && record.client_haptics_requested
                                     && now >= record.rumble_poll_at)))))
                 || (record.state == State::Armed && now >= record.next_auth_poll)
@@ -755,7 +779,8 @@ impl Pipeline {
             (Step::ObserveActiveBinding, now.saturating_add(5000))
         } else if record.audio_recovery_needed {
             (Step::RecoverAudio, now.saturating_add(5000))
-        } else if record.input_lease.is_some()
+        } else if !scoped_route
+            && record.input_lease.is_some()
             && record.input_controller_supported
             && record.client_haptics_requested
             && now >= record.rumble_poll_at
@@ -841,7 +866,14 @@ impl Pipeline {
             control::{self, Message, Profile},
             crypto::Direction,
         };
+        let scoped_route = cfg!(test)
+            && self.settings.observe_feedback_sources
+            && self.settings.feedback_retirement_input_principal.is_some();
         for record in self.records.values_mut() {
+            if scoped_route {
+                record.rumble_pending.clear();
+                record.rumble_active_until.clear();
+            }
             for slot in record
                 .rumble_active_until
                 .iter()
@@ -998,6 +1030,13 @@ impl Pipeline {
                                 record.force_idr = true
                             }
                             Message::Input(input) => {
+                                if scoped_route
+                                    && self
+                                        .feedback_retirement_inbox
+                                        .preflight_input(record, &input)
+                                {
+                                    continue;
+                                }
                                 if let Err(code) = input::queue_control_input(
                                     record,
                                     input,

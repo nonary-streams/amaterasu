@@ -863,6 +863,7 @@ name = "amaterasu-stream-session"
 version = "0.1.0"
 dependencies = [
  "amaterasu-contracts",
+ "amaterasu-control-transport",
  "amaterasu-extension-api",
  "amaterasu-gamestream",
  "amaterasu-input-policy",

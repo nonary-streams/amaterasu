@@ -54,7 +54,7 @@ pub struct Stream {
 }
 
 impl Stream {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn stage_pending_datagram_for_test(
         &mut self,
         destination: SocketAddr,
@@ -73,7 +73,7 @@ impl Stream {
         self.before_local_send = Some((entered, resume));
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn stage_reliable_enet_for_test(
         &mut self,
         destination: SocketAddr,

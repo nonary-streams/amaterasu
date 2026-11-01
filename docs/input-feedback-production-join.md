@@ -33,9 +33,10 @@ controller-arrival packet; it is a claim, not proof of device, driver, client
 protocol or policy support. The stream consumer now checks tagged feedback for monotonically increasing
 per-slot device generations and consistent capabilities before enqueueing it;
 legacy providers without the fields remain supported. It fails closed on stale
-or conflicting tagged records. That check does not remove already queued or
-copied feedback, nor does it synchronously fence pairing on reuse. Those still
-require the closed source-retirement barrier.
+or conflicting tagged records. On the test-gated scoped route, controller re-arrival, active-mask removal and
+haptics disable fence the local source and stop its stream before the event is
+forwarded to the input provider. Pairing fencing and whole-stream retirement
+then proceed asynchronously; the legacy production route is unchanged.
 
 The selected stream owner can now request a bounded, versioned observation from
 the selected input provider:
@@ -110,8 +111,8 @@ For an admitted feedback stream lease, the selected direct effect owner must:
    permission, provider, owner or host-configuration invalidation, close local
    admission and join all in-flight input/feedback workers.
 4. Submit owner-scoped `retire` to the selected control service using the exact
-   stream and provider epoch, and reconcile a lost response with
-   `retirement_status` and the same retirement operation ID. Only the
+   stream and provider epoch, and reconcile uncertainty using the same
+   idempotent retirement operation identity. Only the
    authenticated selected broker provider's exact `whole_control_stream` /
    `retired` reply is a local receipt; JSON supplied by a client is not proof.
 5. Complete and acknowledge the scoped pairing lease, then acknowledge the
@@ -120,10 +121,10 @@ For an admitted feedback stream lease, the selected direct effect owner must:
    recalled; the control receipt promises no further Network SDK sends from
    that control stream, not remote delivery.
 
-The current queue has one source item outstanding and uses the same selected
-effect owner in process; it requires batching or real throughput qualification
-for sustained 5 ms blocks. It is not installed into `pipeline/input.rs` or the
-legacy `send_rumble` path. The pairing authority admits one direct effect-owner
+The test-gated scoped queue has one source item outstanding and uses the same
+selected effect owner in process; it requires batching or real throughput
+qualification for sustained 5 ms blocks. It is installed in the scoped
+`pipeline/input.rs` path, while the legacy production path remains unchanged. The pairing authority admits one direct effect-owner
 principal; composition must select stream-session or provide a reviewed
 broker-mediated handshake, without passing Rust values across module boundaries.
 
@@ -139,40 +140,60 @@ effect, no local sends occur after the drain acknowledgment, and recovery does
 not rely on timeouts. The lifecycle and host-configuration precommit fence and
 independent review remain prerequisites, not workarounds for missing evidence.
 
-## Current source-retirement integration mismatch
+## Current source-retirement checkpoint
 
-The committed source-retirement protocol requires an exact admitted source and
-structured scope for every controller sharing a control transport. Input's raw
-controller-arrival capabilities are client claims. The source observation above
-now carries a selected-provider offer and a conservative per-lease policy flag;
-the resulting intersection is still only a snapshot, not a pairing admission or
-a policy-change fence. Other input providers must supply their own offers.
-An opt-in `feedback_retirement_service` selection makes the input revoke
-handshake wait after local cleanup for a direct
-selected-owner response matching the binding, target, input boot epoch and
-operation ID, asserting pairing settlement and a whole-control-stream receipt.
-Missing or uncertain replies remain pending. The receiving stream-owner action
-and its complete source/scope registry are not yet implemented, so the option
-must remain disabled in deployed composition.
+The input `feedback_retirement_service` handshake waits after local cleanup for a
+direct selected-owner response matching the binding, target, input boot epoch and
+operation ID. The stream owner reserves each source before NVHTTP binding and
+pairing admission, retains exact tickets and source identities, and closes the
+whole transport incarnation to new reservations before draining it. The worker
+fences all recorded sources, verifies the selected control provider's real
+whole-stream retirement receipt, reconciles uncertain lease admission, completes
+and acknowledges every admitted lease, and completes each source with the same
+receipt before replying. It retains bounded completion tombstones for retries.
+Missing or uncertain identities and receipts remain fenced. An authority status
+watch handles a same-epoch global fence and acknowledges its drain generation
+only after the registered sources and transport workers settle. A detected
+source-specific fence retires its affected whole control transport.
 
-The required bounded handoff is a direct, authenticated request from input to
-the selected stream owner when an owned binding or device retires. The stream
-owner must fence every exact admitted source on the shared control transport,
-stop its local queue, request real control-provider retirement, reconcile the
-provider receipt and complete and acknowledge every lease and source retirement
-with that same receipt before replying. Input must hold its lifecycle revoke
-acknowledgment until that reply. Missing or uncertain identities and receipts
-remain fenced. The authority worker is repairing terminal lease replay,
-controller-specific operation identities and shared-transport receipt agreement;
-these must be covered with the combined real-provider test before activation.
+The source admission, scoped feedback route and authority watch are enabled only
+under unit-test qualification. The following evidence does not open the gate:
 
-The stream pipeline now has an opt-in, bounded retirement ingress that is
-serviced while another workflow is active. It checks the startup-selected direct
-input principal, holds exact requests without acknowledging, and bounds other
-requests deferred while the active workflow runs. This removes the ingress
-scheduling obstacle, but no drain worker consumes the held requests yet. The
-receiving side must fence the exact admitted source registry and drive selected
-transport and authority cleanup without allowing later sends. A standalone acknowledgment fixture does not prove this
-join. Authority repair `200f5aa0681df533f1630f960a189ddffe855ef7` must be
-incorporated and its terminal replay, distinct-controller identity, and shared
-receipt cases included in the combined real-provider test.
+* A real broker, the actual pairing ledger and the selected control provider were
+  tested together with two source records, an uncertain admission, a lost reply,
+  queued ENet/retransmission work and the actual provider retirement receipt.
+  Pairing's TLS/certificate pipeline and lifecycle provider were not in that test.
+* A direct input-principal broker request was acknowledged after the same
+  worker settled pairing and the real control provider. Cancellation and retry
+  use the retained completion receipt. The test did not instantiate the real
+  input module or lifecycle provider.
+* Tests fence a pairing-ledger permission mutation before and during retirement,
+  check a fresh authority epoch after the ledger drains, and check controller
+  re-arrival is stopped before input-provider delivery. They do not prove the
+  real pairing administration transaction, host-configuration precommit path,
+  or a restarted stream-owner process.
+
+A stream-owner restart currently loses the in-memory source registry and lease
+operation identities. The existing lifecycle journal deliberately omits resource
+handles, input binding tokens and source records; it cannot reconstruct the exact
+pairing lookups or prove old control workers drained. Production binding must
+remain closed until a reviewed durable recovery design and a real-provider test
+cover that path. Feedback authority also does not authorize unrelated raw input
+effects. The selected source route requires independent review, capability policy
+coverage, and the full lifecycle/NVHTTP/pairing/input/stream/control integration
+test described above before activation. The queue still needs throughput
+qualification for sustained 5 ms blocks.
+
+A possible authority-owned recovery contract is an effect-owner-only,
+epoch-checked global restart fence followed by a bounded, stable snapshot of the
+old owner's exact `{source, scope, lease_operation_id, sequence, lease_state}`
+records. A completed but unacknowledged lease also needs a direct owner-only
+lookup that can recover its ticket or otherwise acknowledge the exact completed
+record; the current `lookup_stream_lease` returns `operation_complete` without a
+ticket. The owner would group these records by the full transport incarnation,
+retire each selected provider, reconcile every lease/source, acknowledge the
+matching global drain, and recover into a fresh owner epoch. The enumeration
+must not expose certificates or client identity. This is a proposed pairing API,
+not an implemented or independently reviewed guarantee. A pairing-provider
+restart additionally needs proof that old owner-scoped control transports have
+been retired even when the old ledger itself is gone.
