@@ -70,8 +70,11 @@ are bounded and are serviced while a stream workflow is active. Identical retrie
 may share a pending request; changed payloads with the same operation ID are
 rejected. Unstarted requests whose callers cancel can be removed safely.
 
-The source-scoped route, pairing join and feedback lease are compiled for unit
-qualification only; production source admission remains closed. The receiver
+A test-only source route requires a separately selected
+`feedback_source_protocol_service` implementing the version-1 source-join
+contract; there is no implicit protocol-provider fallback. The source-scoped
+route, pairing join and feedback lease are compiled for unit qualification
+only; production source admission remains closed. The receiver
 retains an exact in-process source registry, fences every source sharing the
 selected control transport, and waits for the selected provider's whole-stream
 receipt and pairing settlement before acknowledging input. A process restart

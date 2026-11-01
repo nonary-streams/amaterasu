@@ -20,6 +20,7 @@ pub struct Settings {
     pub enable_input: bool,
     pub observe_feedback_sources: bool,
     pub feedback_retirement_input_principal: Option<String>,
+    pub feedback_source_protocol_service: Option<String>,
     pub input_lease_ttl_ms: u64,
 }
 impl Default for Settings {
@@ -36,6 +37,7 @@ impl Default for Settings {
             enable_input: false,
             observe_feedback_sources: false,
             feedback_retirement_input_principal: None,
+            feedback_source_protocol_service: None,
             input_lease_ttl_ms: 30000,
         }
     }
@@ -56,6 +58,16 @@ impl Settings {
                 .feedback_retirement_input_principal
                 .as_ref()
                 .is_some_and(|name| !self.enable_input || !amaterasu_contracts::valid_name(name))
+            || self
+                .feedback_source_protocol_service
+                .as_deref()
+                .is_some_and(|service| {
+                    !self.observe_feedback_sources
+                        || !amaterasu_contracts::valid_name(service)
+                        || service
+                            .strip_suffix("/1")
+                            .is_none_or(|name| name.is_empty() || name.contains('/'))
+                })
             || self.allowed_principals.len() > 16
             || self
                 .allowed_principals

@@ -493,9 +493,10 @@ impl Inbox {
     pub fn advance(
         &mut self,
         records: &mut BTreeMap<u64, Record>,
-        allow_admission: bool,
+        selected_protocol: Option<&str>,
         send: &mut Send<'_>,
     ) {
+        let allow_admission = selected_protocol.is_some();
         if allow_admission && let Some((binding, transport)) = self.registry.first_stale(records) {
             self.enqueue_internal(binding, &transport);
         }
@@ -514,8 +515,13 @@ impl Inbox {
                     .map(|(binding, _, _)| binding.clone())
                     .collect();
                 if let Some(sequence) = next
-                    && let Some(admission) =
-                        admission::Admission::find(records, &self.registry, sequence, &retired)
+                    && let Some(admission) = admission::Admission::find(
+                        records,
+                        &self.registry,
+                        sequence,
+                        &retired,
+                        selected_protocol.expect("admission enabled"),
+                    )
                 {
                     self.next_admission_sequence = sequence;
                     self.admission = Some(admission);
@@ -844,7 +850,7 @@ mod tests {
         let mut answer = None;
         for _ in 0..100 {
             inbox.prune_unstarted(&mut |cmd| Ok(broker.dispatch("effect", cmd)));
-            inbox.advance(&mut host.pipeline.records, false, &mut |cmd| {
+            inbox.advance(&mut host.pipeline.records, None, &mut |cmd| {
                 Ok(broker.dispatch("effect", cmd))
             });
             if let Response::Request {

@@ -553,338 +553,68 @@ mod tests {
             }
         }
     }
-    #[test]
-    fn real_pairing_ledger_and_broker_settle_shared_sources_with_synthetic_control_receipt() {
-        use super::actual_pairing_ledger::EffectGate;
-        use amaterasu_contracts::{Grants, RuntimeConfig};
-        use amaterasu_runtime::Broker;
-        let mut gate = EffectGate::new().unwrap();
-        gate.recover("owner").unwrap();
-        let epoch = gate.epoch().to_owned();
-        let mut registry = Registry::default();
-        for slot in [1, 2] {
-            gate.bind_scoped(source(slot), Some(scope(slot))).unwrap();
-            registry
-                .reserve(
-                    epoch.clone(),
-                    source(slot),
-                    scope(slot),
-                    binding(),
-                    format!("lease-{slot}"),
-                    u64::from(slot),
-                )
-                .unwrap();
-        }
-        let ticket = gate
-            .admit_stream_lease(&source(1), "lease-1", 1, scope(1))
-            .unwrap()
-            .to_owned();
-        registry.accept_admission(&source(1),&json!({"ok":true,"epoch":epoch,"operation_id":"lease-1","ticket":ticket,"kind":"stream_lease","source":source(1),"scope":scope(1)})).unwrap();
-        let (transport, records) = registry.take_transport(&binding()).unwrap();
-        let mut worker = Worker::new(binding(), transport, records);
-        let mut config = RuntimeConfig::default();
-        config.principals.insert(
-            "effect".into(),
-            Grants {
-                call: [effect_authority::SERVICE.into(), "control/1".into()].into(),
-                ..Default::default()
-            },
-        );
-        config.principals.insert(
-            "pairing".into(),
-            Grants {
-                provide: [effect_authority::SERVICE.into()].into(),
-                ..Default::default()
-            },
-        );
-        config.principals.insert(
-            "control".into(),
-            Grants {
-                provide: ["control/1".into()].into(),
-                ..Default::default()
-            },
-        );
-        let mut broker = Broker::new(config).unwrap();
-        for (principal, service) in [
-            ("pairing", effect_authority::SERVICE),
-            ("control", "control/1"),
-        ] {
-            assert!(matches!(
-                broker.dispatch(
-                    principal,
-                    Command::Register {
-                        service: service.into()
-                    }
-                ),
-                Response::Ok
-            ));
-        }
-        let mut synthetic_receipts = 0;
-        let mut events = Vec::new();
-        let mut lost_once = false;
-        let mut result = None;
-        for _ in 0..1500 {
-            if let Some(receipt) = worker.advance(&mut |cmd| {
-                let is_take = matches!(cmd, Command::TakeResult { .. });
-                let reply = broker.dispatch("effect", cmd);
-                if is_take && matches!(reply, Response::Result { .. }) && !lost_once {
-                    lost_once = true;
-                    Err("reply lost".into())
-                } else {
-                    Ok(reply)
-                }
-            }) {
-                result = Some(receipt);
-                break;
-            }
-            for provider in ["pairing", "control"] {
-                let Response::Request {
-                    id,
-                    caller,
-                    initiator,
-                    payload,
-                    ..
-                } = broker.dispatch(provider, Command::Poll {})
-                else {
-                    continue;
-                };
-                assert_eq!(caller, "effect");
-                assert_eq!(initiator, "effect");
-                let action = payload["action"].as_str().unwrap();
-                let result: Result<Value, &str> = if action == "retire" {
-                    synthetic_receipts += 1;
-                    Ok(
-                        json!({"ok":true,"state":"retired","scope":"whole_control_stream","stream":payload["stream"],"operation_id":payload["operation_id"],"provider_epoch":payload["provider_epoch"]}),
-                    )
-                } else {
-                    apply_pairing(&mut gate, &payload)
-                };
-                let response = result.unwrap_or_else(|code| json!({"ok":false,"code":code}));
-                events.push(json!({"action":action,"response":response}));
-                assert!(matches!(
-                    broker.dispatch(
-                        provider,
-                        Command::Complete {
-                            request: id,
-                            payload: response
-                        }
-                    ),
-                    Response::Ok
-                ));
-            }
-        }
-        assert!(result.is_some(), "events: {events:?}");
-        assert!(lost_once);
-        assert_eq!(synthetic_receipts, 1);
-        assert_eq!(gate.in_flight(), 0);
-        assert_eq!(gate.pending_source_retirements(), 0);
-        assert!(gate.bind_scoped(source(1), Some(scope(1))).is_err());
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CombinedScenario {
+        Normal,
+        Cancel,
+        GlobalBefore,
+        GlobalDuring,
     }
 
-    #[test]
-    fn real_pairing_ledger_and_control_provider_retire_queued_enet_through_broker() {
+    /// The pairing ledger, broker and control provider are real. Lifecycle and
+    /// source admission are arranged by this fixture; no TLS pairing is claimed.
+    fn run_combined(scenario: CombinedScenario) {
         use super::actual_pairing_ledger::EffectGate;
-        use amaterasu_contracts::{Grants, RuntimeConfig};
-        use amaterasu_runtime::Broker;
-        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        receiver.set_nonblocking(true).unwrap();
-        let mut control = amaterasu_control_transport::test_support::ControlFixture::new("effect");
-        let opened = control.open("effect").unwrap();
-        let stream = opened["stream"].as_u64().unwrap();
-        let transport_epoch = opened["retirement_epoch"].as_str().unwrap().to_owned();
-        control
-            .stage_feedback("effect", stream, receiver.local_addr().unwrap())
-            .unwrap();
-        let selected_scope = |slot| {
-            let mut selected = scope(slot);
-            selected.transport_service = "amaterasu.control-transport/1".into();
-            selected.transport_stream = stream;
-            selected.transport_epoch = transport_epoch.clone();
-            selected
-        };
-        let mut gate = EffectGate::new().unwrap();
-        gate.recover("owner").unwrap();
-        let epoch = gate.epoch().to_owned();
-        let mut registry = Registry::default();
-        for slot in [1, 2] {
-            gate.bind_scoped(source(slot), Some(selected_scope(slot)))
-                .unwrap();
-            registry
-                .reserve(
-                    epoch.clone(),
-                    source(slot),
-                    selected_scope(slot),
-                    binding(),
-                    format!("lease-{slot}"),
-                    u64::from(slot),
-                )
-                .unwrap();
-        }
-        let ticket = gate
-            .admit_stream_lease(&source(1), "lease-1", 1, selected_scope(1))
-            .unwrap()
-            .to_owned();
-        registry.accept_admission(&source(1),&json!({"ok":true,"epoch":epoch,"operation_id":"lease-1","ticket":ticket,"kind":"stream_lease","source":source(1),"scope":selected_scope(1)})).unwrap();
-        let (transport, records) = registry.take_transport(&binding()).unwrap();
-        let mut worker = Worker::new(binding(), transport, records);
-        let mut config = RuntimeConfig::default();
-        config.principals.insert(
-            "effect".into(),
-            Grants {
-                call: [
-                    effect_authority::SERVICE.into(),
-                    "amaterasu.control-transport/1".into(),
-                ]
-                .into(),
-                ..Default::default()
-            },
-        );
-        config.principals.insert(
-            "pairing".into(),
-            Grants {
-                provide: [effect_authority::SERVICE.into()].into(),
-                ..Default::default()
-            },
-        );
-        config.principals.insert(
-            "control".into(),
-            Grants {
-                provide: ["amaterasu.control-transport/1".into()].into(),
-                ..Default::default()
-            },
-        );
-        let mut broker = Broker::new(config).unwrap();
-        for (principal, service) in [
-            ("pairing", effect_authority::SERVICE),
-            ("control", "amaterasu.control-transport/1"),
-        ] {
-            assert!(matches!(
-                broker.dispatch(
-                    principal,
-                    Command::Register {
-                        service: service.into()
-                    }
-                ),
-                Response::Ok
-            ));
-        }
-        let mut provider_receipts = 0;
-        let mut events = Vec::new();
-        let mut lost_once = false;
-        let mut result = None;
-        for _ in 0..1500 {
-            if let Some(receipt) = worker.advance(&mut |cmd| {
-                let is_take = matches!(cmd, Command::TakeResult { .. });
-                let reply = broker.dispatch("effect", cmd);
-                if is_take && matches!(reply, Response::Result { .. }) && !lost_once {
-                    lost_once = true;
-                    Err("reply lost".into())
-                } else {
-                    Ok(reply)
-                }
-            }) {
-                result = Some(receipt);
-                break;
-            }
-            for provider in ["pairing", "control"] {
-                let Response::Request {
-                    id,
-                    caller,
-                    initiator,
-                    payload,
-                    ..
-                } = broker.dispatch(provider, Command::Poll {})
-                else {
-                    continue;
-                };
-                assert_eq!(caller, "effect");
-                assert_eq!(initiator, "effect");
-                let action = payload["action"].as_str().unwrap();
-                let result: Result<Value, &str> = if action == "retire" {
-                    provider_receipts += 1;
-                    control.handle("effect", payload.clone())
-                } else {
-                    apply_pairing(&mut gate, &payload)
-                };
-                let response = result.unwrap_or_else(|code| json!({"ok":false,"code":code}));
-                events.push(json!({"action":action,"response":response}));
-                assert!(matches!(
-                    broker.dispatch(
-                        provider,
-                        Command::Complete {
-                            request: id,
-                            payload: response
-                        }
-                    ),
-                    Response::Ok
-                ));
-            }
-        }
-        assert!(result.is_some(), "events: {events:?}");
-        assert!(lost_once);
-        assert_eq!(provider_receipts, 1);
-        control.tick();
-        let mut buffer = [0u8; 64];
-        assert_eq!(
-            receiver.recv_from(&mut buffer).unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
-        );
-        assert_eq!(gate.in_flight(), 0);
-        assert_eq!(gate.pending_source_retirements(), 0);
-        assert!(
-            gate.bind_scoped(source(1), Some(selected_scope(1)))
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn real_broker_input_ack_follows_pairing_and_control_retirement() {
-        use super::actual_pairing_ledger::EffectGate;
-        use amaterasu_contracts::{Grants, RuntimeConfig};
-        use amaterasu_runtime::Broker;
-        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        receiver.set_nonblocking(true).unwrap();
-        let mut control = amaterasu_control_transport::test_support::ControlFixture::new("effect");
-        let opened = control.open("effect").unwrap();
-        let stream = opened["stream"].as_u64().unwrap();
-        let transport_epoch = opened["retirement_epoch"].as_str().unwrap().to_owned();
-        control
-            .stage_feedback("effect", stream, receiver.local_addr().unwrap())
-            .unwrap();
-        let selected_scope = |slot| {
-            let mut selected = scope(slot);
-            selected.transport_service = "amaterasu.control-transport/1".into();
-            selected.transport_stream = stream;
-            selected.transport_epoch = transport_epoch.clone();
-            selected
-        };
-        let mut gate = EffectGate::new().unwrap();
-        gate.recover("owner").unwrap();
-        let epoch = gate.epoch().to_owned();
-        let mut registry = Registry::default();
-        for slot in [1, 2] {
-            gate.bind_scoped(source(slot), Some(selected_scope(slot)))
-                .unwrap();
-            registry
-                .reserve(
-                    epoch.clone(),
-                    source(slot),
-                    selected_scope(slot),
-                    binding(),
-                    format!("lease-{slot}"),
-                    u64::from(slot),
-                )
-                .unwrap();
-        }
-        let ticket = gate
-            .admit_stream_lease(&source(1), "lease-1", 1, selected_scope(1))
-            .unwrap()
-            .to_owned();
-        registry.accept_admission(&source(1),&json!({"ok":true,"epoch":epoch,"operation_id":"lease-1","ticket":ticket,"kind":"stream_lease","source":source(1),"scope":selected_scope(1)})).unwrap();
         use crate::pipeline::{
             record::Resource,
             tests::harness::{Harness, prepare, start},
         };
+        use amaterasu_contracts::{Grants, RuntimeConfig};
+        use amaterasu_runtime::Broker;
+        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        let mut control = amaterasu_control_transport::test_support::ControlFixture::new("effect");
+        let opened = control.open("effect").unwrap();
+        let stream = opened["stream"].as_u64().unwrap();
+        let transport_epoch = opened["retirement_epoch"].as_str().unwrap().to_owned();
+        control
+            .stage_feedback("effect", stream, receiver.local_addr().unwrap())
+            .unwrap();
+        let selected_scope = |slot| {
+            let mut selected = scope(slot);
+            selected.transport_service = "amaterasu.control-transport/1".into();
+            selected.transport_stream = stream;
+            selected.transport_epoch = transport_epoch.clone();
+            selected
+        };
+        let mut gate = EffectGate::new().unwrap();
+        gate.recover("owner").unwrap();
+        let epoch = gate.epoch().to_owned();
+        let mut registry = Registry::default();
+        for slot in [1, 2] {
+            gate.bind_scoped(source(slot), Some(selected_scope(slot)))
+                .unwrap();
+            registry
+                .reserve(
+                    epoch.clone(),
+                    source(slot),
+                    selected_scope(slot),
+                    binding(),
+                    format!("lease-{slot}"),
+                    u64::from(slot),
+                )
+                .unwrap();
+        }
+        let ticket = gate
+            .admit_stream_lease(&source(1), "lease-1", 1, selected_scope(1))
+            .unwrap()
+            .to_owned();
+        registry.accept_admission(&source(1),&json!({"ok":true,"epoch":epoch,"operation_id":"lease-1","ticket":ticket,"kind":"stream_lease","source":source(1),"scope":selected_scope(1)})).unwrap();
+        if scenario == CombinedScenario::GlobalBefore {
+            gate.fence();
+            assert!(gate.drain_required());
+            assert!(gate.recover("replacement-owner").is_err());
+        }
         let mut host = Harness::new();
         let session = host.response(1, prepare())["session"].as_u64().unwrap();
         assert_eq!(host.response(2, start(session))["state"], "active");
@@ -935,252 +665,9 @@ mod tests {
         );
         let mut broker = Broker::new(config).unwrap();
         for (principal, service) in [
+            ("effect", "effect/1"),
             ("pairing", effect_authority::SERVICE),
             ("control", "amaterasu.control-transport/1"),
-            ("effect", "effect/1"),
-        ] {
-            assert!(matches!(
-                broker.dispatch(
-                    principal,
-                    Command::Register {
-                        service: service.into()
-                    }
-                ),
-                Response::Ok
-            ));
-        }
-        let request_payload = json!({"action":"retire_input_feedback","version":1,"operation_id":"input-retire","token":"binding","target":binding().target,"input_boot_epoch":"b".repeat(32)});
-        let Response::Accepted { id: input_request } = broker.dispatch(
-            "input",
-            Command::Request {
-                service: "effect/1".into(),
-                payload: request_payload,
-                timeout_ms: 5000,
-                operation_id: "input-retire".into(),
-                parent: None,
-            },
-        ) else {
-            panic!("input admission")
-        };
-        let Response::Request {
-            caller,
-            initiator,
-            payload,
-            ..
-        } = broker.dispatch("effect", Command::Poll {})
-        else {
-            panic!("input delivery")
-        };
-        inbox.receive(
-            input_request,
-            &caller,
-            &initiator,
-            Some("input"),
-            payload,
-            &mut |cmd| Ok(broker.dispatch("effect", cmd)),
-        );
-        assert!(matches!(
-            broker.dispatch(
-                "input",
-                Command::TakeResult {
-                    request: input_request
-                }
-            ),
-            Response::Pending
-        ));
-        let mut provider_receipts = 0;
-        let mut events = Vec::new();
-        let mut lost_once = false;
-        let mut result = None;
-        for _ in 0..1500 {
-            inbox.prune_unstarted(&mut |cmd| Ok(broker.dispatch("effect", cmd)));
-            inbox.advance(&mut host.pipeline.records, false, &mut |cmd| {
-                let is_take = matches!(cmd, Command::TakeResult { .. });
-                let reply = broker.dispatch("effect", cmd);
-                if is_take && matches!(reply, Response::Result { .. }) && !lost_once {
-                    lost_once = true;
-                    Err("reply lost".into())
-                } else {
-                    Ok(reply)
-                }
-            });
-            for provider in ["pairing", "control"] {
-                let Response::Request {
-                    id,
-                    caller,
-                    initiator,
-                    payload,
-                    ..
-                } = broker.dispatch(provider, Command::Poll {})
-                else {
-                    continue;
-                };
-                assert_eq!(caller, "effect");
-                assert_eq!(initiator, "effect");
-                let action = payload["action"].as_str().unwrap();
-                let result: Result<Value, &str> = if action == "retire" {
-                    provider_receipts += 1;
-                    control.handle("effect", payload.clone())
-                } else {
-                    apply_pairing(&mut gate, &payload)
-                };
-                let response = result.unwrap_or_else(|code| json!({"ok":false,"code":code}));
-                events.push(json!({"action":action,"response":response}));
-                assert!(matches!(
-                    broker.dispatch(
-                        provider,
-                        Command::Complete {
-                            request: id,
-                            payload: response
-                        }
-                    ),
-                    Response::Ok
-                ));
-            }
-            if let Response::Result { payload } = broker.dispatch(
-                "input",
-                Command::TakeResult {
-                    request: input_request,
-                },
-            ) {
-                result = Some(payload);
-                break;
-            }
-        }
-        let result = result.unwrap_or_else(|| panic!("events: {events:?}"));
-        assert_eq!(result["source_count"], 2);
-        assert_eq!(result["pairing_retired"], true);
-        assert_eq!(result["retirement"]["stream"], stream);
-        assert!(lost_once);
-        assert_eq!(provider_receipts, 1);
-        control.tick();
-        let mut buffer = [0u8; 64];
-        assert_eq!(
-            receiver.recv_from(&mut buffer).unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
-        );
-        assert_eq!(gate.in_flight(), 0);
-        assert_eq!(gate.pending_source_retirements(), 0);
-        assert!(
-            gate.bind_scoped(source(1), Some(selected_scope(1)))
-                .is_err()
-        );
-        assert!(
-            gate.admit_stream_lease(&source(1), "lease-1", 3, selected_scope(1))
-                .is_err()
-        );
-        let mut replacement = source(1);
-        replacement.device_generation = 2;
-        assert!(
-            gate.bind_scoped(replacement.clone(), Some(selected_scope(1)))
-                .is_err()
-        );
-        let mut other_transport = selected_scope(1);
-        other_transport.transport_stream = stream.checked_add(1).unwrap();
-        assert!(gate.bind_scoped(replacement, Some(other_transport)).is_ok());
-    }
-
-    #[test]
-    fn cancelled_input_retry_recovers_real_transport_retirement_receipt() {
-        use super::actual_pairing_ledger::EffectGate;
-        use amaterasu_contracts::{Grants, RuntimeConfig};
-        use amaterasu_runtime::Broker;
-        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        receiver.set_nonblocking(true).unwrap();
-        let mut control = amaterasu_control_transport::test_support::ControlFixture::new("effect");
-        let opened = control.open("effect").unwrap();
-        let stream = opened["stream"].as_u64().unwrap();
-        let transport_epoch = opened["retirement_epoch"].as_str().unwrap().to_owned();
-        control
-            .stage_feedback("effect", stream, receiver.local_addr().unwrap())
-            .unwrap();
-        let selected_scope = |slot| {
-            let mut selected = scope(slot);
-            selected.transport_service = "amaterasu.control-transport/1".into();
-            selected.transport_stream = stream;
-            selected.transport_epoch = transport_epoch.clone();
-            selected
-        };
-        let mut gate = EffectGate::new().unwrap();
-        gate.recover("owner").unwrap();
-        let epoch = gate.epoch().to_owned();
-        let mut registry = Registry::default();
-        for slot in [1, 2] {
-            gate.bind_scoped(source(slot), Some(selected_scope(slot)))
-                .unwrap();
-            registry
-                .reserve(
-                    epoch.clone(),
-                    source(slot),
-                    selected_scope(slot),
-                    binding(),
-                    format!("lease-{slot}"),
-                    u64::from(slot),
-                )
-                .unwrap();
-        }
-        let ticket = gate
-            .admit_stream_lease(&source(1), "lease-1", 1, selected_scope(1))
-            .unwrap()
-            .to_owned();
-        registry.accept_admission(&source(1),&json!({"ok":true,"epoch":epoch,"operation_id":"lease-1","ticket":ticket,"kind":"stream_lease","source":source(1),"scope":selected_scope(1)})).unwrap();
-        use crate::pipeline::{
-            record::Resource,
-            tests::harness::{Harness, prepare, start},
-        };
-        let mut host = Harness::new();
-        let session = host.response(1, prepare())["session"].as_u64().unwrap();
-        assert_eq!(host.response(2, start(session))["state"], "active");
-        {
-            let record = host.pipeline.records.get_mut(&session).unwrap();
-            record.lifecycle_input_token = Some("binding".into());
-            record.start.as_mut().unwrap().lifecycle_target = Some(binding().target);
-            record.resources.insert(Resource::Control, stream);
-            record.retain_control_retirement_epoch(&json!({"retirement_epoch":transport_epoch}));
-        }
-        let mut inbox = super::super::Inbox {
-            registry,
-            ..Default::default()
-        };
-        let mut config = RuntimeConfig::default();
-        config.principals.insert(
-            "input".into(),
-            Grants {
-                call: ["effect/1".into()].into(),
-                ..Default::default()
-            },
-        );
-        config.principals.insert(
-            "effect".into(),
-            Grants {
-                provide: ["effect/1".into()].into(),
-                call: [
-                    effect_authority::SERVICE.into(),
-                    "amaterasu.control-transport/1".into(),
-                ]
-                .into(),
-                ..Default::default()
-            },
-        );
-        config.principals.insert(
-            "pairing".into(),
-            Grants {
-                provide: [effect_authority::SERVICE.into()].into(),
-                ..Default::default()
-            },
-        );
-        config.principals.insert(
-            "control".into(),
-            Grants {
-                provide: ["amaterasu.control-transport/1".into()].into(),
-                ..Default::default()
-            },
-        );
-        let mut broker = Broker::new(config).unwrap();
-        for (principal, service) in [
-            ("pairing", effect_authority::SERVICE),
-            ("control", "amaterasu.control-transport/1"),
-            ("effect", "effect/1"),
         ] {
             assert!(matches!(
                 broker.dispatch(
@@ -1238,18 +725,30 @@ mod tests {
         let mut canceled = false;
         let mut retried = false;
         let mut active_request = input_request;
+        let mut mutation_requested = scenario == CombinedScenario::GlobalBefore;
         for _ in 0..1500 {
             inbox.prune_unstarted(&mut |cmd| Ok(broker.dispatch("effect", cmd)));
-            inbox.advance(&mut host.pipeline.records, false, &mut |cmd| {
-                let is_take = matches!(cmd, Command::TakeResult { .. });
-                let reply = broker.dispatch("effect", cmd);
-                if is_take && matches!(reply, Response::Result { .. }) && !lost_once {
-                    lost_once = true;
-                    Err("reply lost".into())
+            inbox.advance(
+                &mut host.pipeline.records,
+                if matches!(
+                    scenario,
+                    CombinedScenario::GlobalBefore | CombinedScenario::GlobalDuring
+                ) {
+                    Some("amaterasu.nvhttp/1")
                 } else {
-                    Ok(reply)
-                }
-            });
+                    None
+                },
+                &mut |cmd| {
+                    let is_take = matches!(cmd, Command::TakeResult { .. });
+                    let reply = broker.dispatch("effect", cmd);
+                    if is_take && matches!(reply, Response::Result { .. }) && !lost_once {
+                        lost_once = true;
+                        Err("reply lost".into())
+                    } else {
+                        Ok(reply)
+                    }
+                },
+            );
             for provider in ["pairing", "control"] {
                 let Response::Request {
                     id,
@@ -1264,14 +763,24 @@ mod tests {
                 assert_eq!(caller, "effect");
                 assert_eq!(initiator, "effect");
                 let action = payload["action"].as_str().unwrap();
-                let result: Result<Value, &str> = if action == "retire" {
+                let result = if action == "retire" {
                     provider_receipts += 1;
                     control.handle("effect", payload.clone())
                 } else {
                     apply_pairing(&mut gate, &payload)
                 };
                 let response = result.unwrap_or_else(|code| json!({"ok":false,"code":code}));
-                events.push(json!({"action":action,"response":response}));
+                if scenario == CombinedScenario::GlobalDuring
+                    && action == "fence_source"
+                    && !mutation_requested
+                {
+                    gate.fence();
+                    mutation_requested = true;
+                    assert!(gate.drain_required());
+                }
+                if events.len() < 64 {
+                    events.push(json!({"action":action,"response":response}));
+                }
                 assert!(matches!(
                     broker.dispatch(
                         provider,
@@ -1283,7 +792,10 @@ mod tests {
                     Response::Ok
                 ));
             }
-            if !canceled && gate.pending_source_retirements() > 0 {
+            if scenario == CombinedScenario::Cancel
+                && !canceled
+                && gate.pending_source_retirements() > 0
+            {
                 assert!(matches!(
                     broker.dispatch(
                         "input",
@@ -1341,7 +853,7 @@ mod tests {
                 active_request = id;
                 retried = true;
             }
-            if retried
+            if (scenario != CombinedScenario::Cancel || retried)
                 && let Response::Result { payload } = broker.dispatch(
                     "input",
                     Command::TakeResult {
@@ -1350,16 +862,27 @@ mod tests {
                 )
             {
                 result = Some(payload);
+            }
+            if result.is_some() && (!mutation_requested || !gate.drain_required()) {
                 break;
             }
         }
         let result = result.unwrap_or_else(|| panic!("events: {events:?}"));
-        assert!(canceled && retried);
         assert_eq!(result["source_count"], 2);
         assert_eq!(result["pairing_retired"], true);
         assert_eq!(result["retirement"]["stream"], stream);
         assert!(lost_once);
         assert_eq!(provider_receipts, 1);
+        if scenario == CombinedScenario::Cancel {
+            assert!(canceled && retried);
+        }
+        if matches!(
+            scenario,
+            CombinedScenario::GlobalBefore | CombinedScenario::GlobalDuring
+        ) {
+            assert!(mutation_requested);
+            assert!(!gate.drain_required());
+        }
         control.tick();
         let mut buffer = [0u8; 64];
         assert_eq!(
@@ -1368,488 +891,45 @@ mod tests {
         );
         assert_eq!(gate.in_flight(), 0);
         assert_eq!(gate.pending_source_retirements(), 0);
-        assert!(
-            gate.bind_scoped(source(1), Some(selected_scope(1)))
-                .is_err()
-        );
+        if scenario == CombinedScenario::Normal {
+            assert!(
+                gate.bind_scoped(source(1), Some(selected_scope(1)))
+                    .is_err()
+            );
+            assert!(
+                gate.admit_stream_lease(&source(1), "lease-1", 3, selected_scope(1))
+                    .is_err()
+            );
+            let mut replacement = source(1);
+            replacement.device_generation = 2;
+            assert!(
+                gate.bind_scoped(replacement.clone(), Some(selected_scope(1)))
+                    .is_err()
+            );
+            let mut other = selected_scope(1);
+            other.transport_stream = stream.checked_add(1).unwrap();
+            assert!(gate.bind_scoped(replacement, Some(other)).is_ok());
+        }
+        if scenario == CombinedScenario::GlobalBefore {
+            gate.recover("replacement-owner").unwrap();
+            assert!(gate.require_epoch(&epoch).is_err());
+        }
     }
-
+    #[test]
+    fn real_broker_input_ack_follows_pairing_and_control_retirement() {
+        run_combined(CombinedScenario::Normal);
+    }
+    #[test]
+    fn cancelled_input_retry_recovers_real_transport_retirement_receipt() {
+        run_combined(CombinedScenario::Cancel);
+    }
     #[test]
     fn global_permission_fence_waits_for_real_control_retirement_and_all_leases() {
-        use super::actual_pairing_ledger::EffectGate;
-        use amaterasu_contracts::{Grants, RuntimeConfig};
-        use amaterasu_runtime::Broker;
-        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        receiver.set_nonblocking(true).unwrap();
-        let mut control = amaterasu_control_transport::test_support::ControlFixture::new("effect");
-        let opened = control.open("effect").unwrap();
-        let stream = opened["stream"].as_u64().unwrap();
-        let transport_epoch = opened["retirement_epoch"].as_str().unwrap().to_owned();
-        control
-            .stage_feedback("effect", stream, receiver.local_addr().unwrap())
-            .unwrap();
-        let selected_scope = |slot| {
-            let mut selected = scope(slot);
-            selected.transport_service = "amaterasu.control-transport/1".into();
-            selected.transport_stream = stream;
-            selected.transport_epoch = transport_epoch.clone();
-            selected
-        };
-        let mut gate = EffectGate::new().unwrap();
-        gate.recover("owner").unwrap();
-        let epoch = gate.epoch().to_owned();
-        let mut registry = Registry::default();
-        for slot in [1, 2] {
-            gate.bind_scoped(source(slot), Some(selected_scope(slot)))
-                .unwrap();
-            registry
-                .reserve(
-                    epoch.clone(),
-                    source(slot),
-                    selected_scope(slot),
-                    binding(),
-                    format!("lease-{slot}"),
-                    u64::from(slot),
-                )
-                .unwrap();
-        }
-        let ticket = gate
-            .admit_stream_lease(&source(1), "lease-1", 1, selected_scope(1))
-            .unwrap()
-            .to_owned();
-        registry.accept_admission(&source(1),&json!({"ok":true,"epoch":epoch,"operation_id":"lease-1","ticket":ticket,"kind":"stream_lease","source":source(1),"scope":selected_scope(1)})).unwrap();
-        use crate::pipeline::{
-            record::Resource,
-            tests::harness::{Harness, prepare, start},
-        };
-        let mut host = Harness::new();
-        let session = host.response(1, prepare())["session"].as_u64().unwrap();
-        assert_eq!(host.response(2, start(session))["state"], "active");
-        {
-            let record = host.pipeline.records.get_mut(&session).unwrap();
-            record.lifecycle_input_token = Some("binding".into());
-            record.start.as_mut().unwrap().lifecycle_target = Some(binding().target);
-            record.resources.insert(Resource::Control, stream);
-            record.retain_control_retirement_epoch(&json!({"retirement_epoch":transport_epoch}));
-        }
-        gate.fence();
-        assert!(gate.drain_required());
-        assert!(gate.recover("replacement-owner").is_err());
-        let mut inbox = super::super::Inbox {
-            registry,
-            ..Default::default()
-        };
-        let mut config = RuntimeConfig::default();
-        config.principals.insert(
-            "input".into(),
-            Grants {
-                call: ["effect/1".into()].into(),
-                ..Default::default()
-            },
-        );
-        config.principals.insert(
-            "effect".into(),
-            Grants {
-                provide: ["effect/1".into()].into(),
-                call: [
-                    effect_authority::SERVICE.into(),
-                    "amaterasu.control-transport/1".into(),
-                ]
-                .into(),
-                ..Default::default()
-            },
-        );
-        config.principals.insert(
-            "pairing".into(),
-            Grants {
-                provide: [effect_authority::SERVICE.into()].into(),
-                ..Default::default()
-            },
-        );
-        config.principals.insert(
-            "control".into(),
-            Grants {
-                provide: ["amaterasu.control-transport/1".into()].into(),
-                ..Default::default()
-            },
-        );
-        let mut broker = Broker::new(config).unwrap();
-        for (principal, service) in [
-            ("pairing", effect_authority::SERVICE),
-            ("control", "amaterasu.control-transport/1"),
-            ("effect", "effect/1"),
-        ] {
-            assert!(matches!(
-                broker.dispatch(
-                    principal,
-                    Command::Register {
-                        service: service.into()
-                    }
-                ),
-                Response::Ok
-            ));
-        }
-        let request_payload = json!({"action":"retire_input_feedback","version":1,"operation_id":"input-retire","token":"binding","target":binding().target,"input_boot_epoch":"b".repeat(32)});
-        let Response::Accepted { id: input_request } = broker.dispatch(
-            "input",
-            Command::Request {
-                service: "effect/1".into(),
-                payload: request_payload,
-                timeout_ms: 5000,
-                operation_id: "input-retire".into(),
-                parent: None,
-            },
-        ) else {
-            panic!("input admission")
-        };
-        let Response::Request {
-            caller,
-            initiator,
-            payload,
-            ..
-        } = broker.dispatch("effect", Command::Poll {})
-        else {
-            panic!("input delivery")
-        };
-        inbox.receive(
-            input_request,
-            &caller,
-            &initiator,
-            Some("input"),
-            payload,
-            &mut |cmd| Ok(broker.dispatch("effect", cmd)),
-        );
-        assert!(matches!(
-            broker.dispatch(
-                "input",
-                Command::TakeResult {
-                    request: input_request
-                }
-            ),
-            Response::Pending
-        ));
-        let mut provider_receipts = 0;
-        let mut events = Vec::new();
-        let mut lost_once = false;
-        let mut result = None;
-        for _ in 0..1500 {
-            inbox.prune_unstarted(&mut |cmd| Ok(broker.dispatch("effect", cmd)));
-            inbox.advance(&mut host.pipeline.records, true, &mut |cmd| {
-                let is_take = matches!(cmd, Command::TakeResult { .. });
-                let reply = broker.dispatch("effect", cmd);
-                if is_take && matches!(reply, Response::Result { .. }) && !lost_once {
-                    lost_once = true;
-                    Err("reply lost".into())
-                } else {
-                    Ok(reply)
-                }
-            });
-            for provider in ["pairing", "control"] {
-                let Response::Request {
-                    id,
-                    caller,
-                    initiator,
-                    payload,
-                    ..
-                } = broker.dispatch(provider, Command::Poll {})
-                else {
-                    continue;
-                };
-                assert_eq!(caller, "effect");
-                assert_eq!(initiator, "effect");
-                let action = payload["action"].as_str().unwrap();
-                let result: Result<Value, &str> = if action == "retire" {
-                    provider_receipts += 1;
-                    control.handle("effect", payload.clone())
-                } else {
-                    apply_pairing(&mut gate, &payload)
-                };
-                let response = result.unwrap_or_else(|code| json!({"ok":false,"code":code}));
-                events.push(json!({"action":action,"response":response}));
-                assert!(matches!(
-                    broker.dispatch(
-                        provider,
-                        Command::Complete {
-                            request: id,
-                            payload: response
-                        }
-                    ),
-                    Response::Ok
-                ));
-            }
-            if let Response::Result { payload } = broker.dispatch(
-                "input",
-                Command::TakeResult {
-                    request: input_request,
-                },
-            ) {
-                result = Some(payload);
-            }
-            if result.is_some() && !gate.drain_required() {
-                break;
-            }
-        }
-        let result = result.unwrap_or_else(|| panic!("events: {events:?}"));
-        assert_eq!(result["source_count"], 2);
-        assert_eq!(result["pairing_retired"], true);
-        assert_eq!(result["retirement"]["stream"], stream);
-        assert!(lost_once);
-        assert_eq!(provider_receipts, 1);
-        control.tick();
-        let mut buffer = [0u8; 64];
-        assert_eq!(
-            receiver.recv_from(&mut buffer).unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
-        );
-        assert!(!gate.drain_required());
-        assert_eq!(gate.in_flight(), 0);
-        assert_eq!(gate.pending_source_retirements(), 0);
-        gate.recover("replacement-owner").unwrap();
-        assert!(gate.require_epoch(&epoch).is_err());
-        assert!(
-            gate.bind_scoped(source(1), Some(selected_scope(1)))
-                .is_err()
-        );
+        run_combined(CombinedScenario::GlobalBefore);
     }
-
     #[test]
     fn permission_fence_arriving_during_source_retirement_is_drained() {
-        use super::actual_pairing_ledger::EffectGate;
-        use amaterasu_contracts::{Grants, RuntimeConfig};
-        use amaterasu_runtime::Broker;
-        let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        receiver.set_nonblocking(true).unwrap();
-        let mut control = amaterasu_control_transport::test_support::ControlFixture::new("effect");
-        let opened = control.open("effect").unwrap();
-        let stream = opened["stream"].as_u64().unwrap();
-        let transport_epoch = opened["retirement_epoch"].as_str().unwrap().to_owned();
-        control
-            .stage_feedback("effect", stream, receiver.local_addr().unwrap())
-            .unwrap();
-        let selected_scope = |slot| {
-            let mut selected = scope(slot);
-            selected.transport_service = "amaterasu.control-transport/1".into();
-            selected.transport_stream = stream;
-            selected.transport_epoch = transport_epoch.clone();
-            selected
-        };
-        let mut gate = EffectGate::new().unwrap();
-        gate.recover("owner").unwrap();
-        let epoch = gate.epoch().to_owned();
-        let mut registry = Registry::default();
-        for slot in [1, 2] {
-            gate.bind_scoped(source(slot), Some(selected_scope(slot)))
-                .unwrap();
-            registry
-                .reserve(
-                    epoch.clone(),
-                    source(slot),
-                    selected_scope(slot),
-                    binding(),
-                    format!("lease-{slot}"),
-                    u64::from(slot),
-                )
-                .unwrap();
-        }
-        let ticket = gate
-            .admit_stream_lease(&source(1), "lease-1", 1, selected_scope(1))
-            .unwrap()
-            .to_owned();
-        registry.accept_admission(&source(1),&json!({"ok":true,"epoch":epoch,"operation_id":"lease-1","ticket":ticket,"kind":"stream_lease","source":source(1),"scope":selected_scope(1)})).unwrap();
-        use crate::pipeline::{
-            record::Resource,
-            tests::harness::{Harness, prepare, start},
-        };
-        let mut host = Harness::new();
-        let session = host.response(1, prepare())["session"].as_u64().unwrap();
-        assert_eq!(host.response(2, start(session))["state"], "active");
-        {
-            let record = host.pipeline.records.get_mut(&session).unwrap();
-            record.lifecycle_input_token = Some("binding".into());
-            record.start.as_mut().unwrap().lifecycle_target = Some(binding().target);
-            record.resources.insert(Resource::Control, stream);
-            record.retain_control_retirement_epoch(&json!({"retirement_epoch":transport_epoch}));
-        }
-        let mut inbox = super::super::Inbox {
-            registry,
-            ..Default::default()
-        };
-        let mut config = RuntimeConfig::default();
-        config.principals.insert(
-            "input".into(),
-            Grants {
-                call: ["effect/1".into()].into(),
-                ..Default::default()
-            },
-        );
-        config.principals.insert(
-            "effect".into(),
-            Grants {
-                provide: ["effect/1".into()].into(),
-                call: [
-                    effect_authority::SERVICE.into(),
-                    "amaterasu.control-transport/1".into(),
-                ]
-                .into(),
-                ..Default::default()
-            },
-        );
-        config.principals.insert(
-            "pairing".into(),
-            Grants {
-                provide: [effect_authority::SERVICE.into()].into(),
-                ..Default::default()
-            },
-        );
-        config.principals.insert(
-            "control".into(),
-            Grants {
-                provide: ["amaterasu.control-transport/1".into()].into(),
-                ..Default::default()
-            },
-        );
-        let mut broker = Broker::new(config).unwrap();
-        for (principal, service) in [
-            ("pairing", effect_authority::SERVICE),
-            ("control", "amaterasu.control-transport/1"),
-            ("effect", "effect/1"),
-        ] {
-            assert!(matches!(
-                broker.dispatch(
-                    principal,
-                    Command::Register {
-                        service: service.into()
-                    }
-                ),
-                Response::Ok
-            ));
-        }
-        let request_payload = json!({"action":"retire_input_feedback","version":1,"operation_id":"input-retire","token":"binding","target":binding().target,"input_boot_epoch":"b".repeat(32)});
-        let Response::Accepted { id: input_request } = broker.dispatch(
-            "input",
-            Command::Request {
-                service: "effect/1".into(),
-                payload: request_payload,
-                timeout_ms: 5000,
-                operation_id: "input-retire".into(),
-                parent: None,
-            },
-        ) else {
-            panic!("input admission")
-        };
-        let Response::Request {
-            caller,
-            initiator,
-            payload,
-            ..
-        } = broker.dispatch("effect", Command::Poll {})
-        else {
-            panic!("input delivery")
-        };
-        inbox.receive(
-            input_request,
-            &caller,
-            &initiator,
-            Some("input"),
-            payload,
-            &mut |cmd| Ok(broker.dispatch("effect", cmd)),
-        );
-        assert!(matches!(
-            broker.dispatch(
-                "input",
-                Command::TakeResult {
-                    request: input_request
-                }
-            ),
-            Response::Pending
-        ));
-        let mut provider_receipts = 0;
-        let mut events = Vec::new();
-        let mut lost_once = false;
-        let mut result = None;
-        let mut mutation_requested = false;
-        for _ in 0..1500 {
-            inbox.prune_unstarted(&mut |cmd| Ok(broker.dispatch("effect", cmd)));
-            inbox.advance(&mut host.pipeline.records, true, &mut |cmd| {
-                let is_take = matches!(cmd, Command::TakeResult { .. });
-                let reply = broker.dispatch("effect", cmd);
-                if is_take && matches!(reply, Response::Result { .. }) && !lost_once {
-                    lost_once = true;
-                    Err("reply lost".into())
-                } else {
-                    Ok(reply)
-                }
-            });
-            for provider in ["pairing", "control"] {
-                let Response::Request {
-                    id,
-                    caller,
-                    initiator,
-                    payload,
-                    ..
-                } = broker.dispatch(provider, Command::Poll {})
-                else {
-                    continue;
-                };
-                assert_eq!(caller, "effect");
-                assert_eq!(initiator, "effect");
-                let action = payload["action"].as_str().unwrap();
-                let result: Result<Value, &str> = if action == "retire" {
-                    provider_receipts += 1;
-                    control.handle("effect", payload.clone())
-                } else {
-                    apply_pairing(&mut gate, &payload)
-                };
-                let response = result.unwrap_or_else(|code| json!({"ok":false,"code":code}));
-                if action == "fence_source" && !mutation_requested {
-                    gate.fence();
-                    mutation_requested = true;
-                    assert!(gate.drain_required());
-                }
-                events.push(json!({"action":action,"response":response}));
-                assert!(matches!(
-                    broker.dispatch(
-                        provider,
-                        Command::Complete {
-                            request: id,
-                            payload: response
-                        }
-                    ),
-                    Response::Ok
-                ));
-            }
-            if let Response::Result { payload } = broker.dispatch(
-                "input",
-                Command::TakeResult {
-                    request: input_request,
-                },
-            ) {
-                result = Some(payload);
-            }
-            if result.is_some() && !gate.drain_required() {
-                break;
-            }
-        }
-        let result = result.unwrap_or_else(|| panic!("events: {events:?}"));
-        assert_eq!(result["source_count"], 2);
-        assert_eq!(result["pairing_retired"], true);
-        assert_eq!(result["retirement"]["stream"], stream);
-        assert!(lost_once);
-        assert_eq!(provider_receipts, 1);
-        control.tick();
-        let mut buffer = [0u8; 64];
-        assert_eq!(
-            receiver.recv_from(&mut buffer).unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
-        );
-        assert!(mutation_requested);
-        assert!(!gate.drain_required());
-        assert_eq!(gate.in_flight(), 0);
-        assert_eq!(gate.pending_source_retirements(), 0);
-        assert!(
-            gate.bind_scoped(source(1), Some(selected_scope(1)))
-                .is_err()
-        );
+        run_combined(CombinedScenario::GlobalDuring);
     }
 
     #[test]
@@ -1918,8 +998,8 @@ mod tests {
     }
 }
 
-// This test compiles the actual pairing ledger in place. Its control provider
-// reply is synthetic; it is not an end-to-end ENet retirement proof.
+// Tests compile the actual pairing ledger in place; lifecycle and TLS pairing
+// remain separately simulated and do not establish the full production join.
 #[cfg(test)]
 #[allow(dead_code, unused_imports, clippy::duplicate_mod)]
 #[path = "../../../../pairing/src/effect_gate.rs"]
