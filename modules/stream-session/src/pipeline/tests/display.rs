@@ -745,3 +745,143 @@ fn video_open_failure_restores_display_before_session_cleanup() {
         .unwrap();
     assert!(restore < finish);
 }
+
+fn pending_display_apply(host: &mut Harness, id: u64) -> rpc::Pending {
+    let operation = host.pipeline.records[&id].display_operation();
+    let payload = json!({"action":"apply", "configuration":host.broker.display_topology,
+        "expected_topology_revision":"0123456789abcdef0123456789abcdef",
+        "operation_id":operation});
+    let mut pending = rpc::Pending::new(
+        "amaterasu.display/1",
+        payload,
+        format!("retirement-display-{id}"),
+        None,
+    );
+    assert!(matches!(
+        pending.poll(&mut |command| host.broker.send(command), host.now),
+        rpc::Progress::Waiting
+    ));
+    host.pipeline
+        .records
+        .get_mut(&id)
+        .unwrap()
+        .display_attempted = true;
+    pending
+}
+
+#[test]
+fn retirement_releases_read_only_display_uncertainty() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    let mut pending = rpc::Pending::new(
+        "amaterasu.display/1",
+        json!({"action":"status"}),
+        "retirement-status".into(),
+        None,
+    );
+    assert!(matches!(
+        pending.poll(&mut |command| host.broker.send(command), host.now),
+        rpc::Progress::Waiting
+    ));
+    let record = host.pipeline.records.get_mut(&id).unwrap();
+    record.uncertain = Some(pending);
+    record.uncertain_step = Some(Step::CheckDisplay);
+    assert!(
+        host.pipeline
+            .shutdown_with(&mut |command| host.broker.send(command))
+    );
+    assert!(host.pipeline.records[&id].uncertain.is_none());
+    assert!(host.pipeline.records[&id].uncertain_step.is_none());
+}
+
+#[test]
+fn retirement_reconciles_completed_display_apply_before_clearing_uncertainty() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    let pending = pending_display_apply(&mut host, id);
+    let record = host.pipeline.records.get_mut(&id).unwrap();
+    record.uncertain = Some(pending);
+    record.uncertain_step = Some(Step::ApplyDisplay);
+    // A completed apply still owns a display lease until restore confirms it.
+    host.broker.display_restore_failures = 1;
+    assert!(
+        !host
+            .pipeline
+            .shutdown_with(&mut |command| host.broker.send(command))
+    );
+    assert!(host.pipeline.records[&id].uncertain.is_some());
+    assert!(host.broker.display_lease.is_some());
+    assert!(
+        host.pipeline
+            .shutdown_with(&mut |command| host.broker.send(command))
+    );
+    assert!(host.pipeline.records[&id].uncertain.is_none());
+    assert!(host.broker.display_lease.is_none());
+}
+
+#[test]
+fn retirement_observes_a_completed_apply_even_after_settlement_started() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    let mut pending = pending_display_apply(&mut host, id);
+    pending.cancel();
+    let record = host.pipeline.records.get_mut(&id).unwrap();
+    record.uncertain = Some(pending);
+    record.uncertain_step = Some(Step::ApplyDisplay);
+    assert!(
+        host.pipeline
+            .shutdown_with(&mut |command| host.broker.send(command))
+    );
+    assert!(host.pipeline.records[&id].uncertain.is_none());
+    assert!(host.broker.display_lease.is_none());
+    assert_eq!(
+        host.broker
+            .calls
+            .iter()
+            .filter(
+                |call| call.service == "amaterasu.display/1" && call.payload["action"] == "apply"
+            )
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn retirement_keeps_unknown_display_apply_fenced_after_rpc_cancellation() {
+    for fault in [Fault::BeforeMutation, Fault::AfterMutation] {
+        let mut host = Harness::new();
+        let id = host.response(1, prepare())["session"].as_u64().unwrap();
+        let pending = pending_display_apply(&mut host, id);
+        let record = host.pipeline.records.get_mut(&id).unwrap();
+        record.uncertain = Some(pending);
+        record.uncertain_step = Some(Step::ApplyDisplay);
+        host.broker.fault = Some(("amaterasu.display/1:apply".into(), fault));
+        assert!(
+            !host
+                .pipeline
+                .shutdown_with(&mut |command| host.broker.send(command))
+        );
+        assert!(
+            !host
+                .pipeline
+                .shutdown_with(&mut |command| host.broker.send(command))
+        );
+        assert!(host.pipeline.records[&id].uncertain.is_some());
+        assert_eq!(
+            host.broker.display_lease.is_some(),
+            matches!(fault, Fault::AfterMutation)
+        );
+        assert_eq!(
+            host.broker
+                .calls
+                .iter()
+                .filter(|call| call.service == "amaterasu.display/1"
+                    && call.payload["action"] == "apply")
+                .count(),
+            1
+        );
+        assert!(!host.broker.calls.iter().any(
+            |call| call.service == "amaterasu.display/1" && call.payload["action"] == "status"
+        ));
+    }
+}
