@@ -110,6 +110,25 @@ fn audio_pkcs7_is_legacy_unauthenticated_encryption() {
 }
 
 #[test]
+fn selected_surround_seals_large_units_without_changing_legacy_limit() {
+    let key = [7; 16];
+    let mut sealer = AudioSealer::new(&key, 9, AudioIvPolicy::RejectReuse);
+    let input = vec![0x5a; 4096];
+    assert!(sealer.encrypt(0, &input).is_err());
+    let encrypted = sealer.encrypt_surround(0, &input).unwrap();
+    assert_eq!(encrypted.len(), 4112);
+    let mut iv = [0u8; 16];
+    iv[..4].copy_from_slice(&9u32.to_be_bytes());
+    let mut buffer = encrypted;
+    let decrypted = cbc::Decryptor::<aes::Aes128>::new(&key.into(), &iv.into())
+        .decrypt_padded_mut::<Pkcs7>(&mut buffer)
+        .unwrap();
+    assert_eq!(decrypted, input);
+    assert!(sealer.encrypt_surround(1, &vec![0; 4097]).is_err());
+    assert!(sealer.encrypt_surround(1, &[1]).is_ok());
+}
+
+#[test]
 fn audio_wrap_policy_is_explicit_and_rejects_reuse_by_default_policy() {
     let mut guarded = AudioSealer::new(&[1; 16], 7, AudioIvPolicy::RejectReuse);
     for sequence in 0..=u16::MAX {

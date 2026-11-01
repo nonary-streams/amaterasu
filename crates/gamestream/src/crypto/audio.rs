@@ -36,7 +36,21 @@ impl AudioSealer {
     }
 
     pub fn encrypt(&mut self, sequence: u16, opus: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        if opus.is_empty() || opus.len() > MAX_AUDIO_PLAINTEXT_BYTES {
+        self.encrypt_with_limit(sequence, opus, MAX_AUDIO_PLAINTEXT_BYTES)
+    }
+
+    /// Seal a bounded preframed 32 ms unit after trusted format selection.
+    pub fn encrypt_surround(&mut self, sequence: u16, unit: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        self.encrypt_with_limit(sequence, unit, crate::audio::MAX_SURROUND_AUDIO_BYTES)
+    }
+
+    fn encrypt_with_limit(
+        &mut self,
+        sequence: u16,
+        opus: &[u8],
+        limit: usize,
+    ) -> Result<Vec<u8>, CryptoError> {
+        if opus.is_empty() || opus.len() > limit {
             return Err(CryptoError::InvalidPacketSize);
         }
         if self

@@ -108,6 +108,8 @@ _Static_assert(sizeof(AmaterasuAudioInputSelectionV2) == 112, "ordered input sel
 _Static_assert(sizeof(AmaterasuAudioFormatDescriptorV2) == 176, "ordered encoded format layout");
 _Static_assert(sizeof(AmaterasuOrderedAudioCaptureApiV2) == 40, "ordered capture table layout");
 _Static_assert(sizeof(AmaterasuOrderedAudioEncoderApiV2) == 72, "ordered encoder table layout");
+_Static_assert(sizeof(AmaterasuAudioTransportSelectionV2) == 224, "ordered audio transport selection layout");
+_Static_assert(sizeof(AmaterasuOrderedAudioTransportApiV2) == 56, "ordered audio transport table layout");
 _Static_assert(sizeof(AmaterasuEncodedAudioPacket) == 56, "encoded audio layout");
 _Static_assert(offsetof(AmaterasuEncodedAudioPacket, data) == 24, "encoded audio data offset");
 _Static_assert(offsetof(AmaterasuEncodedAudioPacket, timestamp_us) == 40, "encoded audio timestamp offset");

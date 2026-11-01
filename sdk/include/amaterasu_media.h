@@ -185,6 +185,20 @@ typedef struct {
     AmaterasuStatus (*receive)(void *, uint64_t, AmaterasuNegotiatedAudioPacketSink);
     AmaterasuStatus (*drain)(void *, uint64_t);
 } AmaterasuOrderedAudioEncoderApiV2;
+typedef struct {
+    uint32_t size, version;
+    uint64_t stream, generation, offer_id;
+    uint8_t clock_epoch[16];
+    AmaterasuAudioFormatDescriptorV2 format;
+} AmaterasuAudioTransportSelectionV2;
+/* Probe is read-only. Prepare copies the selected offer before any audio state
+ * advances. BUSY consumes no packet; callers retain packet bytes for retry. */
+typedef struct {
+    AmaterasuNativeInterface base;
+    AmaterasuStatus (*probe)(void *, uint64_t, const AmaterasuAudioTransportSelectionV2 *);
+    AmaterasuStatus (*prepare)(void *, uint64_t, const AmaterasuAudioTransportSelectionV2 *);
+    AmaterasuStatus (*submit)(void *, uint64_t, const AmaterasuNegotiatedAudioPacket *);
+} AmaterasuOrderedAudioTransportApiV2;
 
 /* CPU bytes are borrowed only during submit or a synchronous frame callback.
  * NV12 is Y then UV, both with the same stride and even width/height. */

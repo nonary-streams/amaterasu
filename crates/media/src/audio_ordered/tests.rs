@@ -151,4 +151,6 @@ fn ordered_audio_types_match_the_c_header() {
     assert_eq!(size_of::<AudioFormatDescriptorV2>(), 176);
     assert_eq!(size_of::<OrderedAudioCaptureApiV2>(), 40);
     assert_eq!(size_of::<OrderedAudioEncoderApiV2>(), 72);
+    assert_eq!(size_of::<AudioTransportSelectionV2>(), 224);
+    assert_eq!(size_of::<OrderedAudioTransportApiV2>(), 56);
 }

@@ -177,6 +177,25 @@ impl AudioPacketizer {
         }
     }
 
+    /// Retire an incomplete preframed group and map the next packet to its
+    /// source-relative RTP millisecond clock. Sequence slots are still skipped
+    /// for FEC and cipher continuity, but those skipped slots are not invented
+    /// source time. The caller must authenticate the source epoch and validate
+    /// timestamp monotonicity before calling this after queue reservation.
+    pub fn reset_surround_discontinuity_at(
+        &mut self,
+        timestamp_ms: u32,
+    ) -> Result<Discontinuity, AudioError> {
+        if !matches!(self.payload, AudioPayload::Surround) {
+            return Err(AudioError::UnsupportedFormat);
+        }
+        let mut reset = self.reset_discontinuity();
+        self.timestamp_ms = timestamp_ms;
+        self.group_timestamp_ms = timestamp_ms;
+        reset.timestamp_ms = timestamp_ms;
+        Ok(reset)
+    }
+
     fn duration_ms(&self) -> u32 {
         self.config.frames_per_packet / 48
     }

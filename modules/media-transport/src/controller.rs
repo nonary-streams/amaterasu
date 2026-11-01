@@ -1,7 +1,8 @@
 use crate::{model::*, stream::Stream};
 use amaterasu_media::{
-    EncodedAudioPacket, EncodedPacket, MEDIA_CLOSED, NegotiatedVideoUnit, VideoFramePlan,
-    VideoFramingLimits, VideoPlanSelection, VideoPlanSelectionV2,
+    AudioTransportSelectionV2, EncodedAudioPacket, EncodedPacket, MEDIA_CLOSED, MEDIA_UNSUPPORTED,
+    NegotiatedAudioPacket, NegotiatedVideoUnit, VideoFramePlan, VideoFramingLimits,
+    VideoPlanSelection, VideoPlanSelectionV2,
 };
 use amaterasu_module_sdk::{
     abi::{STATUS_INVALID_ARGUMENT, Status},
@@ -255,6 +256,51 @@ impl Controller {
     ) -> Status {
         match self.owned_mut(owner, id) {
             Some(stream) => unsafe { stream.submit_audio(packet) },
+            None => MEDIA_CLOSED,
+        }
+    }
+
+    pub fn probe_ordered_audio(
+        &self,
+        owner: &str,
+        id: u64,
+        selection: &AudioTransportSelectionV2,
+    ) -> Status {
+        match self.owned(owner, id) {
+            Ok(stream) if stream.probe_ordered_audio(selection).is_ok() => {
+                amaterasu_module_sdk::abi::STATUS_OK
+            }
+            Ok(_) => MEDIA_UNSUPPORTED,
+            Err(_) => MEDIA_CLOSED,
+        }
+    }
+
+    pub fn prepare_ordered_audio(
+        &mut self,
+        owner: &str,
+        id: u64,
+        selection: &AudioTransportSelectionV2,
+    ) -> Status {
+        let Some(stream) = self.owned_mut(owner, id) else {
+            return MEDIA_CLOSED;
+        };
+        if stream.prepare_ordered_audio(selection).is_ok() {
+            amaterasu_module_sdk::abi::STATUS_OK
+        } else {
+            MEDIA_UNSUPPORTED
+        }
+    }
+
+    /// # Safety
+    /// Packet header and bytes remain live and immutable for this synchronous call.
+    pub unsafe fn submit_ordered_audio(
+        &mut self,
+        owner: &str,
+        id: u64,
+        packet: &NegotiatedAudioPacket,
+    ) -> Status {
+        match self.owned_mut(owner, id) {
+            Some(stream) => unsafe { stream.submit_ordered_audio(packet) },
             None => MEDIA_CLOSED,
         }
     }

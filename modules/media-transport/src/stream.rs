@@ -17,6 +17,9 @@ use std::{
     time::Duration,
 };
 
+pub(crate) mod ordered_audio;
+use ordered_audio::OrderedAudioState;
+
 pub struct Stream {
     pub owner: String,
     pub peer: IpAddr,
@@ -33,6 +36,7 @@ pub struct Stream {
     video_format_locked: bool,
     video_codec: Option<VideoCodec>,
     audio: AudioPacketizer,
+    ordered_audio: Option<OrderedAudioState>,
     video_sealer: Option<VideoSealer>,
     audio_sealer: Option<AudioSealer>,
     pub permit_legacy_audio_iv_wrap: bool,
@@ -131,6 +135,7 @@ impl Stream {
             video_format_locked: false,
             video_codec,
             audio,
+            ordered_audio: None,
             video_sealer,
             audio_sealer,
             permit_legacy_audio_iv_wrap: request
@@ -636,6 +641,9 @@ impl Stream {
     /// # Safety
     /// The packet and its initialized immutable bytes live through this call.
     pub unsafe fn submit_audio(&mut self, packet: &EncodedAudioPacket) -> Status {
+        if self.ordered_audio.is_some() {
+            return MEDIA_UNSUPPORTED;
+        }
         if self.delivery.failure.is_some() {
             return MEDIA_BACKEND_ERROR;
         }

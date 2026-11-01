@@ -203,5 +203,49 @@ pub struct OrderedAudioEncoderApiV2 {
     pub drain: unsafe extern "C" fn(*mut c_void, u64) -> Status,
 }
 
+/// The encoder offer and stream-relative timestamp epoch authenticated by
+/// trusted session composition. The format and configuration are borrowed
+/// during probe/prepare only. The transport copies any retained state.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct AudioTransportSelectionV2 {
+    pub size: u32,
+    pub version: u32,
+    pub stream: u64,
+    pub generation: u64,
+    pub offer_id: u64,
+    pub clock_epoch: [u8; 16],
+    pub format: AudioFormatDescriptorV2,
+}
+
+impl AudioTransportSelectionV2 {
+    pub fn validate(&self) -> Result<(), Status> {
+        self.format.validate()?;
+        if self.size as usize != size_of::<Self>()
+            || self.version != AUDIO_ORDERED_VERSION
+            || self.stream == 0
+            || self.generation == 0
+            || self.offer_id == 0
+            || self.clock_epoch == [0; 16]
+        {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        Ok(())
+    }
+}
+
+/// Separate negotiated audio transport family. Probe is read-only; prepare
+/// commits exactly one preflighted selection before audio, FEC or cipher state
+/// changes. Submit is synchronous: BUSY consumes no packet or state and the
+/// caller retains its immutable packet for retry. Format support and fixed vs
+/// variable length are explicit provider capabilities, never implied by IDs.
+#[repr(C)]
+pub struct OrderedAudioTransportApiV2 {
+    pub base: NativeInterface,
+    pub probe: unsafe extern "C" fn(*mut c_void, u64, *const AudioTransportSelectionV2) -> Status,
+    pub prepare: unsafe extern "C" fn(*mut c_void, u64, *const AudioTransportSelectionV2) -> Status,
+    pub submit: unsafe extern "C" fn(*mut c_void, u64, *const NegotiatedAudioPacket) -> Status,
+}
+
 #[cfg(test)]
 mod tests;

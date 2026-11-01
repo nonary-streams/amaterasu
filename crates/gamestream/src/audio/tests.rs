@@ -100,6 +100,37 @@ fn selected_surround_rejects_invalid_units_before_sealing_or_advancing() {
 }
 
 #[test]
+fn surround_discontinuity_keeps_source_time_independent_of_skipped_fec_sequences() {
+    let mut sender = AudioPacketizer::new_surround(AudioConfig {
+        frames_per_packet: 1536,
+        wire_payload_bytes: 4,
+        ..config(4)
+    })
+    .unwrap();
+    let first = sender.packetize(&[1, 2, 3, 4], 1536).unwrap();
+    assert_eq!(&first[0][4..8], &0u32.to_be_bytes());
+    let reset = sender.reset_surround_discontinuity_at(32).unwrap();
+    assert_eq!(
+        (
+            reset.discarded_shards,
+            reset.skipped_packets,
+            reset.next_sequence
+        ),
+        (1, 3, 4)
+    );
+    assert_eq!(reset.timestamp_ms, 32);
+    let second = sender.packetize(&[5, 6, 7, 8], 1536).unwrap();
+    assert_eq!(&second[0][2..4], &4u16.to_be_bytes());
+    assert_eq!(&second[0][4..8], &32u32.to_be_bytes());
+    let mut opus = AudioPacketizer::new(config(4)).unwrap();
+    assert_eq!(
+        opus.reset_surround_discontinuity_at(32),
+        Err(AudioError::UnsupportedFormat)
+    );
+    assert_eq!(opus.next_sequence(), 0);
+}
+
+#[test]
 fn explicit_rtp_and_fixed_matrix_fixtures_match_client_wire_format() {
     let packets = group(&mut AudioPacketizer::new(config(4)).unwrap());
     assert_eq!(

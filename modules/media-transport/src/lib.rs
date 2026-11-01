@@ -24,6 +24,7 @@ struct MediaTransportModule {
     _factory: Box<native::Factory>,
     _plan_factory: Option<Box<native::legacy_plan::Factory>>,
     _plan_factory_v2: Option<Box<native::plan::Factory>>,
+    _ordered_audio_factory: Option<Box<native::ordered_audio::Factory>>,
 }
 
 impl ManagedModule for MediaTransportModule {
@@ -106,6 +107,7 @@ impl MediaTransportModule {
         };
         let plan_service = settings.plan_service.clone();
         let plan_service_v2 = settings.plan_service_v2.clone();
+        let ordered_audio_service = settings.ordered_audio_service.clone();
         let controller = Arc::new(Mutex::new(Controller::with_network(settings, network)));
         let factory = native::Factory::new(controller.clone());
         let plan_factory = plan_service
@@ -114,6 +116,9 @@ impl MediaTransportModule {
         let plan_factory_v2 = plan_service_v2
             .as_ref()
             .map(|_| native::plan::Factory::new(controller.clone()));
+        let ordered_audio_factory = ordered_audio_service
+            .as_ref()
+            .map(|_| native::ordered_audio::Factory::new(controller.clone()));
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
@@ -143,12 +148,23 @@ impl MediaTransportModule {
                 )?;
             }
         }
+        if let (Some(service), Some(factory)) = (ordered_audio_service, &ordered_audio_factory) {
+            // SAFETY: the retained factory and synchronized controller outlive bindings.
+            unsafe {
+                amaterasu_module_sdk::audio::register_ordered_transport(
+                    &runtime,
+                    &service,
+                    &factory.api,
+                )
+            }?;
+        }
         Ok(Self {
             runtime,
             controller,
             _factory: factory,
             _plan_factory: plan_factory,
             _plan_factory_v2: plan_factory_v2,
+            _ordered_audio_factory: ordered_audio_factory,
         })
     }
 }

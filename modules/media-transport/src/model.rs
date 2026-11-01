@@ -32,6 +32,7 @@ pub struct Settings {
     pub plan_service: Option<String>,
     /// Separate typed service name for the complete wire-profile contract.
     pub plan_service_v2: Option<String>,
+    pub ordered_audio_service: Option<String>,
     pub extension_profiles: Vec<amaterasu_contracts::media_profile::VideoProfile>,
 }
 
@@ -40,11 +41,15 @@ impl Settings {
         if [
             self.plan_service.as_deref(),
             self.plan_service_v2.as_deref(),
+            self.ordered_audio_service.as_deref(),
         ]
         .into_iter()
         .flatten()
         .any(|name| !amaterasu_contracts::valid_name(name) || name == "amaterasu.media-transport/1")
             || self.plan_service.is_some() && self.plan_service == self.plan_service_v2
+            || self.ordered_audio_service.is_some()
+                && (self.ordered_audio_service == self.plan_service
+                    || self.ordered_audio_service == self.plan_service_v2)
             || !(amaterasu_contracts::media_profile::VideoProfileSnapshot {
                 profiles: self.extension_profiles.clone(),
             })
