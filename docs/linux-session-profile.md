@@ -46,14 +46,16 @@ the management API rather than a tray notification.
 
 ## Build recipe
 
-Build the host, the publisher and one library per component. Use two jobs and a
-low priority on a machine that is also running a desktop and games.
+Build the host, the publisher and one library per component. Use one job and a
+low priority on a machine that is also running a desktop and games. Use the
+optimized release profile for live streaming: debug builds can spend a
+substantial part of each frame interval in packetization and error correction.
 
 ```sh
 export CARGO_TARGET_DIR=/run/media/chasep/ArchivedGames/amaterasu-targets/linux-session
 git submodule update --init third-party/libvirtualdisplay
 env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 15 \
-  cargo build --offline --locked \
+  cargo build --offline --locked --release \
     --features amaterasu-encode/software-x264,amaterasu-encode/linux-nvenc-cuda,amaterasu-virtual-display/linux-libvirtualdisplay \
     -p amaterasu -p amaterasu-release \
     -p amaterasu-runtime -p amaterasu-state -p amaterasu-session \
@@ -68,7 +70,7 @@ env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 15 \
     -p amaterasu-frame-limiter -p amaterasu-stream-session -p amaterasu-rtsp
 git submodule update --init modules/capture-vkms
 env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 15 \
-  cargo build --offline --locked --manifest-path modules/capture-vkms/capture/Cargo.toml
+  cargo build --offline --locked --release --manifest-path modules/capture-vkms/capture/Cargo.toml
 ```
 
 The provider uses its own lockfile and pinned SDK. Fetch its dependencies before
@@ -103,7 +105,8 @@ amaterasu-release stage ROOT PACKAGE
 amaterasu serve ROOT          # development console on standard input
 ```
 
-`ARTIFACTS` is `$CARGO_TARGET_DIR/debug` (or `release`). `init-linux-session`
+For the build above, `ARTIFACTS` is `$CARGO_TARGET_DIR/release`. A debug build
+uses `$CARGO_TARGET_DIR/debug` instead. `init-linux-session`
 refuses a root that already exists as a trust identity; policy options are fixed
 when it runs. To change an option, initialise a new root (pairing identity is
 imported again with the console `import_identity` call, or created by `initialize`).
