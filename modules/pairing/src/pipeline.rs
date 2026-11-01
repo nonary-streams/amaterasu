@@ -155,6 +155,11 @@ impl Pipeline {
             HostConfigurationState::Disabled
         };
         let effect_authority = settings.effect_authority.clone();
+        // A restarted optional protocol authority must reconcile its durable
+        // slots before it can authorize new work or commit trust changes.
+        let protocol_claim_recovery_required = effect_authority
+            .as_ref()
+            .is_some_and(|policy| !policy.protocol_policies.is_empty());
         Self {
             engine: Engine::new(settings),
             effect_gate: EffectGate::new().ok(),
@@ -162,7 +167,7 @@ impl Pipeline {
             effect_bindings: BTreeMap::new(),
             protocol_capabilities: BTreeMap::new(),
             pending_protocol_claim: None,
-            protocol_claim_recovery_required: false,
+            protocol_claim_recovery_required,
             retained_protocol_claim: None,
             deferred_effect_mutation: None,
             identity_generation: None,

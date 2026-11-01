@@ -540,3 +540,62 @@ fn lost_state_write_reply_reconciles_only_the_exact_durable_claim() {
     drop(store);
     std::fs::remove_dir_all(path).unwrap();
 }
+
+#[test]
+fn configured_protocol_authority_starts_closed_until_slot_recovery() {
+    let method = json!({"service":"example.effects/1","method":"apply","interface_major":1,"interface_minor":0,"schema_revision":1});
+    let cleanup = json!({"service":"example.effects/1","method":"cleanup","interface_major":1,"interface_minor":0,"schema_revision":1});
+    let schema = |method: &Value| {
+        let mut value = method.clone();
+        value.as_object_mut().unwrap().remove("schema_revision");
+        value["request"] = json!({"required":{},"optional":{},"allow_extra":false});
+        value["response"] = json!({"required":{},"optional":{},"allow_extra":false});
+        value["privilege"] = json!("user");
+        value
+    };
+    let settings:crate::protocol::Settings=serde_json::from_value(json!({"administrator_principals":["console"],"transport_principals":["nvhttp"],
+        "effect_authority":{"protocol_owner":"nvhttp","effect_owner":"issuer","protocol_policies":[{
+            "capability":"example.control/1","provider":"provider","message_type":21818,"method":method,"cleanup":cleanup,
+            "method_schema":schema(&method),"cleanup_schema":schema(&cleanup),"max_payload_bytes":64,"required_permission":"view"}]}})).unwrap();
+    settings.validate().unwrap();
+    let mut pairing = super::super::Pipeline::new(settings);
+    assert!(pairing.protocol_claim_recovery_required);
+    let initial = pairing.effect_gate.as_ref().unwrap().epoch().to_owned();
+    assert_eq!(
+        pairing.apply_effect_request(
+            "issuer",
+            "issuer",
+            json!({"action":"recover","epoch":initial,"owner_epoch":"owner"}),
+            super::super::tests::now()
+        ),
+        Err("protocol_reconciliation_required")
+    );
+    let mut broker = broker();
+    let Response::Accepted { id } = broker.dispatch(
+        "console",
+        Command::Request {
+            service: "amaterasu.pairing/1".into(),
+            payload: json!({"action":"set_permission_mode","enabled":true,"expected_revision":0}),
+            timeout_ms: 30_000,
+            operation_id: "startup-trust-change".into(),
+            parent: None,
+        },
+    ) else {
+        panic!("trust request")
+    };
+    pairing
+        .tick_at(super::super::tests::now(), |command| {
+            Ok(broker.dispatch("pairing", command))
+        })
+        .unwrap();
+    let Response::Result { payload } =
+        broker.dispatch("console", Command::TakeResult { request: id })
+    else {
+        panic!("trust response")
+    };
+    assert_eq!(payload["code"], "protocol_reconciliation_required");
+    assert!(matches!(
+        broker.dispatch("state", Command::Poll {}),
+        Response::Pending
+    ));
+}
