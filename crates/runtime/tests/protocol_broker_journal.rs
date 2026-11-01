@@ -105,6 +105,7 @@ fn setup_broker(route: &Route) -> Broker {
         .api_methods
         .extend([route.approval.clone(), route.cleanup_approval.clone()]);
     config.effect_fence = Some(EffectFencePolicy {
+        source_slots: false,
         authority: "authority".into(),
         issuer: "issuer".into(),
         methods: vec![ProtectedMethod {
