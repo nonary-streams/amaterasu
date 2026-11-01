@@ -147,9 +147,9 @@ struct DeferredRequest {
 impl Pipeline {
     pub fn new(settings: Settings) -> Result<Self, &'static str> {
         settings.validate()?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "feedback-qualification"))]
         let restart_recovery = settings.feedback_owner_restart_recovery;
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "feedback-qualification")))]
         let restart_recovery = false;
         let feedback_retirement_inbox = feedback_retirement::Inbox::new(
             restart_recovery,
@@ -390,7 +390,7 @@ impl Pipeline {
         self.feedback_retirement_inbox.prune_unstarted(send);
         self.feedback_retirement_inbox.advance(
             &mut self.records,
-            if cfg!(test)
+            if cfg!(any(test, feature = "feedback-qualification"))
                 && self.settings.observe_feedback_sources
                 && self.settings.feedback_retirement_input_principal.is_some()
             {
@@ -705,7 +705,7 @@ impl Pipeline {
 
     fn schedule_control(&mut self, now: u64) -> bool {
         let observe_sources = self.settings.observe_feedback_sources;
-        let scoped_route = cfg!(test)
+        let scoped_route = cfg!(any(test, feature = "feedback-qualification"))
             && observe_sources
             && self.settings.feedback_retirement_input_principal.is_some();
         let source_due = |record: &Record| {
@@ -879,7 +879,7 @@ impl Pipeline {
             control::{self, Message, Profile},
             crypto::Direction,
         };
-        let scoped_route = cfg!(test)
+        let scoped_route = cfg!(any(test, feature = "feedback-qualification"))
             && self.settings.observe_feedback_sources
             && self.settings.feedback_retirement_input_principal.is_some();
         for record in self.records.values_mut() {

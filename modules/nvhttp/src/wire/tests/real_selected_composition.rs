@@ -11,11 +11,13 @@ use std::{
 mod authenticated_tls;
 mod fixture_capture;
 mod fixture_video;
+mod full;
 mod rtsp_client;
 
 const CLIENT_CERT: &str = include_str!("../../../../pairing/tests/fixtures/client-cert.pem");
 const HOST_CERT: &str = include_str!("../../../../pairing/tests/fixtures/host-cert.pem");
 const HOST_KEY: &str = include_str!("../../../../pairing/tests/fixtures/host-key.pem");
+static QUALIFICATION_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 
 struct LoadedModule {
     api: ModuleApi,
@@ -24,10 +26,13 @@ struct LoadedModule {
 }
 impl LoadedModule {
     fn start(path: &Path, host: &HostApi) -> Self {
+        Self::start_entry(path, host, b"amaterasu_module_v1")
+    }
+    fn start_entry(path: &Path, host: &HostApi, symbol: &[u8]) -> Self {
         // SAFETY: This test loads locally built trusted fixtures and retains each
         // shared object until its instance has been destroyed.
         let library = unsafe { libloading::Library::new(path) }.unwrap();
-        let entry = unsafe { library.get::<abi::ModuleEntry>(b"amaterasu_module_v1") }.unwrap();
+        let entry = unsafe { library.get::<abi::ModuleEntry>(symbol) }.unwrap();
         let pointer = unsafe { entry() };
         assert!(!pointer.is_null());
         assert!(unsafe { (*pointer.cast::<abi::AbiHeader>()).supports::<ModuleApi>() });
@@ -199,6 +204,49 @@ fn run_composition(replacement: bool, scenario: &str) {
     let temp = tempfile_dir();
     let (_, cert) = pem_rfc7468::decode_vec(CLIENT_CERT.as_bytes()).unwrap();
     let cert_id = hex(&Sha256::digest(&cert));
+    let play = std::env::var_os("AMATERASU_COMPOSITION_PLAY").is_some();
+    let full = std::env::var_os("AMATERASU_COMPOSITION_FULL").is_some();
+    let streaming = crate::launch::StreamingConfig {
+        capture: CaptureConfig {
+            capture_provider: if play {
+                CaptureProvider::PipeWire
+            } else {
+                CaptureProvider::Dxgi
+            },
+            output: "00000000:00000001/\\\\.\\DISPLAY1".into(),
+            encoder: amaterasu_module_sdk::EncoderSelection::Index(0),
+            audio_endpoint: "default".into(),
+        },
+        desktop: crate::launch::DesktopSettings::default(),
+        selected_applications: vec![crate::launch::SelectedApplication {
+            id: 1,
+            name: "Game".into(),
+            application: amaterasu_module_sdk::application_library::v2::ApplicationReference {
+                library: "games".into(),
+                id: "opaque/game".into(),
+            },
+            entry_revision: "entry:opaque".into(),
+            certificates: [cert_id.clone()].into(),
+        }],
+        profile: StreamProfile {
+            codec: amaterasu_media::VideoCodec::H264,
+            max_width: 1920,
+            max_height: 1080,
+            max_fps: 60,
+            bitrate_kbps: 10_000,
+            max_reference_frames: 1,
+            packet_size: 1024,
+            fec_percentage: 20,
+            min_parity_shards: 2,
+            max_fec_blocks: 1,
+            packet_ms: 10,
+            audio_bitrate: 128_000,
+            encrypt_video: true,
+            encrypt_audio: true,
+            permit_legacy_audio_iv_wrap: false,
+        },
+    };
+    streaming.validate().unwrap();
     let services = json!([
         "amaterasu.pairing/1",
         "amaterasu.state/1",
@@ -261,9 +309,14 @@ fn run_composition(replacement: bool, scenario: &str) {
         "executor":{"callers":{"amaterasu.launch":{"initiators":["amaterasu.nvhttp","amaterasu.launch"],"lifecycle":true}}, "limiter_mode":match scenario { "limiter_success" => "supported", "limiter_mismatch" => "mismatch", "limiter_stale" => "stale", _ => "" }},
         "replacement":{"certificate_id":cert_id,"mode":scenario,"limiter_capacity":2}
     },"host_context":{"schema":1,"state_root":temp.0.join("state")}});
-    let play = std::env::var_os("AMATERASU_COMPOSITION_PLAY").is_some();
     if play {
         fixture_capture::configure(&mut config);
+    }
+    if full {
+        fixture_capture::configure_input(&mut config);
+    }
+    if full {
+        configure_full(&mut config, &streaming);
     }
     let runtime = Runtime::new(&artifact(&artifacts, "amaterasu_runtime"), config);
     let capture_fixture = runtime.client("fixture-capture");
@@ -288,7 +341,6 @@ fn run_composition(replacement: bool, scenario: &str) {
     };
     let stream = runtime.client("stream");
     let real_stream = std::env::var_os("AMATERASU_COMPOSITION_REAL_STREAM").is_some();
-    let play = std::env::var_os("AMATERASU_COMPOSITION_PLAY").is_some();
     assert!(
         !play || real_stream,
         "PLAY qualification needs the selected stream"
@@ -310,14 +362,23 @@ fn run_composition(replacement: bool, scenario: &str) {
             &runtime.endpoint("media"),
         )
     });
-    let mut selected_stream = real_stream.then(|| {
+    let mut selected_stream = (real_stream && !full).then(|| {
         LoadedModule::start(
             &artifact(&artifacts, "amaterasu_stream_session"),
             &runtime.endpoint("stream"),
         )
     });
     let session = runtime.client("session");
-    register(&session, "amaterasu.session/1");
+    let real_session = full;
+    let mut selected_session = if real_session {
+        Some(LoadedModule::start(
+            &artifact(&artifacts, "amaterasu_session"),
+            &runtime.endpoint("session"),
+        ))
+    } else {
+        register(&session, "amaterasu.session/1");
+        None
+    };
     let input = runtime.client("input");
     let real_input = std::env::var_os("AMATERASU_COMPOSITION_REAL_INPUT").is_some();
     if !real_input {
@@ -343,10 +404,22 @@ fn run_composition(replacement: bool, scenario: &str) {
     register(&display, "amaterasu.display/1");
     let application = runtime.client("application");
     register(&application, "amaterasu.application/1");
-    let mut pairing = LoadedModule::start(
-        &artifact(&artifacts, "amaterasu_pairing"),
-        &runtime.endpoint("amaterasu.pairing"),
-    );
+    let mut pairing = if full {
+        let qualification = PathBuf::from(
+            std::env::var_os("AMATERASU_FEEDBACK_QUALIFICATION_ARTIFACT_DIR")
+                .expect("set qualification artifact directory"),
+        );
+        LoadedModule::start_entry(
+            &artifact(&qualification, "amaterasu_pairing"),
+            &runtime.endpoint("amaterasu.pairing"),
+            b"amaterasu_qualification_module_v1",
+        )
+    } else {
+        LoadedModule::start(
+            &artifact(&artifacts, "amaterasu_pairing"),
+            &runtime.endpoint("amaterasu.pairing"),
+        )
+    };
     let mut launch = LoadedModule::start(
         &artifact(&artifacts, "amaterasu_launch"),
         &runtime.endpoint("amaterasu.launch"),
@@ -378,6 +451,49 @@ fn run_composition(replacement: bool, scenario: &str) {
     let mut provider =
         (!replacement).then(|| LoadedModule::start(&executor, &runtime.endpoint("executor")));
     let console = runtime.client("console");
+    if full {
+        // This test owns a fresh runtime, fresh state directory and no prior
+        // transports. Recover the initial empty authority before provisioning.
+        let owner = runtime.client("stream");
+        let pending = broker_request(
+            &owner,
+            "amaterasu.pairing-effects/1",
+            json!({"action":"status"}),
+            "initial-authority-status",
+        );
+        let mut status = None;
+        for _ in 0..500 {
+            pairing.tick();
+            memory.tick();
+            if let Some(value) = take(&owner, pending) {
+                status = Some(value);
+                break;
+            }
+        }
+        let status = status.expect("initial authority status");
+        assert_eq!(status["startup_recovery_required"], true, "{status}");
+        assert_eq!(status["bound_sources"], 0, "{status}");
+        let pending = broker_request(
+            &owner,
+            "amaterasu.pairing-effects/1",
+            json!({"action":"recover","epoch":status["epoch"],"owner_epoch":"fresh-fixture"}),
+            "initial-authority-recover",
+        );
+        let mut recovered = None;
+        for _ in 0..500 {
+            pairing.tick();
+            memory.tick();
+            if let Some(value) = take(&owner, pending) {
+                recovered = Some(value);
+                break;
+            }
+        }
+        assert_eq!(
+            recovered.as_ref().map(|value| &value["ok"]),
+            Some(&json!(true)),
+            "{recovered:?}"
+        );
+    }
     for (sequence, payload) in [json!({"action":"import_identity","certificate_pem":HOST_CERT,"private_key_pem":HOST_KEY}), json!({"action":"import_client","client_id":"test-client","name":"Client","certificate_pem":CLIENT_CERT})].into_iter().enumerate() {
         let pending = broker_request(&console, "amaterasu.pairing/1", payload, &format!("pairing-{sequence}"));
         let mut result = None;
@@ -447,47 +563,38 @@ fn run_composition(replacement: bool, scenario: &str) {
         let rejected = rejected.expect("cross-owner result");
         assert_eq!(rejected["code"], "permission_denied", "{rejected}");
     }
-    let streaming = crate::launch::StreamingConfig {
-        capture: CaptureConfig {
-            capture_provider: if play {
-                CaptureProvider::PipeWire
-            } else {
-                CaptureProvider::Dxgi
-            },
-            output: "00000000:00000001/\\\\.\\DISPLAY1".into(),
-            encoder: amaterasu_module_sdk::EncoderSelection::Index(0),
-            audio_endpoint: "default".into(),
-        },
-        desktop: crate::launch::DesktopSettings::default(),
-        selected_applications: vec![crate::launch::SelectedApplication {
-            id: 1,
-            name: "Game".into(),
-            application: amaterasu_module_sdk::application_library::v2::ApplicationReference {
-                library: "games".into(),
-                id: "opaque/game".into(),
-            },
-            entry_revision: "entry:opaque".into(),
-            certificates: [cert_id.clone()].into(),
-        }],
-        profile: StreamProfile {
-            codec: amaterasu_media::VideoCodec::H264,
-            max_width: 1920,
-            max_height: 1080,
-            max_fps: 60,
-            bitrate_kbps: 10_000,
-            max_reference_frames: 1,
-            packet_size: 1024,
-            fec_percentage: 20,
-            min_parity_shards: 2,
-            max_fec_blocks: 1,
-            packet_ms: 10,
-            audio_bitrate: 128_000,
-            encrypt_video: true,
-            encrypt_audio: true,
-            permit_legacy_audio_iv_wrap: false,
-        },
-    };
-    streaming.validate().unwrap();
+    if full {
+        full::run(full::Context {
+            runtime: &runtime,
+            console: &console,
+            pairing: &mut pairing,
+            memory: &mut memory,
+            launch: &mut launch,
+            lifecycle: &mut lifecycle,
+            rtsp: &mut rtsp,
+            selected_session: &mut selected_session,
+            selected_stream: &mut selected_stream,
+            selected_control: &mut selected_control,
+            selected_media: &mut selected_media,
+            selected_input: &mut selected_input,
+            library: &mut library,
+            policy: &mut policy,
+            generated: &mut generated,
+            provider: &mut provider,
+            video_fixture: &mut video_fixture,
+            configuration: &configuration,
+            capture_fixture: &capture_fixture,
+            video_runtime: &video_runtime,
+            session: &session,
+            stream: &stream,
+            input: &input,
+            application: &application,
+            display: &display,
+            cert_id: &cert_id,
+            cert: &cert,
+        });
+        return;
+    }
     let mut controller = LaunchController::new(Some(streaming)).unwrap();
     controller.set_session_lifecycle_required(true);
     let mut router = Router::new(
@@ -589,6 +696,7 @@ fn run_composition(replacement: bool, scenario: &str) {
     let mut backends = Hardware {
         real_input,
         real_stream,
+        real_session,
         ..Hardware::default()
     };
     let mut replies = vec![];
@@ -596,6 +704,9 @@ fn run_composition(replacement: bool, scenario: &str) {
     for _ in 0..5000 {
         if let Some(video) = &mut video_fixture {
             video.pump(&video_runtime);
+        }
+        if let Some(module) = &mut selected_session {
+            module.tick();
         }
         if let Some(module) = &mut selected_stream {
             module.tick();
@@ -766,6 +877,9 @@ fn run_composition(replacement: bool, scenario: &str) {
             .map(|(value, _)| value.to_owned())
             .expect("RTSP URL in launch reply");
         let _control_client = rtsp_client::play(&url, || {
+            if let Some(module) = &mut selected_session {
+                module.tick();
+            }
             if let Some(module) = &mut selected_stream {
                 module.tick();
             }
@@ -864,7 +978,9 @@ fn run_composition(replacement: bool, scenario: &str) {
                 backends.calls
             );
             assert!(prepared, "{:?}", backends.calls);
-            assert_eq!(backends.session_state, "active");
+            if !real_session {
+                assert_eq!(backends.session_state, "active");
+            }
             if scenario.starts_with("resume_") {
                 router.reply_delivered(1);
                 let (old_ticket, session_target) = router
@@ -1444,11 +1560,15 @@ fn run_composition(replacement: bool, scenario: &str) {
 fn pump_input_configuration(configuration: &RuntimeClient) {
     while let Some(request) = configuration.poll_serialized().unwrap() {
         assert_eq!(request.payload["action"], "product_get");
+        let payload = if request.caller == "amaterasu.nvhttp" {
+            json!({"ok":true,"found":true,"revision":1,"version":5,"values":{"hostname":"Test","port":QUALIFICATION_PORT.load(std::sync::atomic::Ordering::Relaxed),"address_family":null,"bind_address":null,"output_name":null,"stream_audio":false}})
+        } else {
+            json!({"ok":true,"found":true,"revision":1,"version":14,"values":{"proton_dualsense_compatibility":false}})
+        };
         configuration
             .require_success(Command::Complete {
                 request: request.id,
-                payload: json!({"ok":true,"found":true,"revision":1,"version":14,
-                "values":{"proton_dualsense_compatibility":false}}),
+                payload,
             })
             .unwrap();
     }
@@ -1531,6 +1651,7 @@ fn tempfile_dir() -> TestRoot {
 struct Hardware {
     real_input: bool,
     real_stream: bool,
+    real_session: bool,
     session_key: String,
     session_state: String,
     lease: Option<String>,
@@ -1553,7 +1674,10 @@ impl Hardware {
             ("application", application),
             ("display", display),
         ] {
-            if (name == "input" && self.real_input) || (name == "stream" && self.real_stream) {
+            if (name == "input" && self.real_input)
+                || (name == "stream" && self.real_stream)
+                || (name == "session" && self.real_session)
+            {
                 continue;
             }
             while let Some(request) = runtime.poll_serialized().unwrap() {
@@ -1617,4 +1741,52 @@ impl Hardware {
             }
         }
     }
+}
+
+fn configure_full(config: &mut Value, streaming: &crate::launch::StreamingConfig) {
+    let nvhttp = &mut config["principals"]["amaterasu.nvhttp"];
+    nvhttp["provide"] = json!(["amaterasu.nvhttp/1"]);
+    nvhttp["call"].as_array_mut().unwrap().extend([
+        json!("amaterasu.pairing-effects/1"),
+        json!("amaterasu.configuration/1"),
+    ]);
+    nvhttp["native_use"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("amaterasu.network/1"));
+    config["principals"]["amaterasu.pairing"]["provide"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("amaterasu.pairing-effects/1"));
+    config["principals"]["stream"]["call"]
+        .as_array_mut()
+        .unwrap()
+        .extend([
+            json!("amaterasu.pairing-effects/1"),
+            json!("amaterasu.nvhttp/1"),
+        ]);
+    config["principals"]["input"]["call"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("amaterasu.stream-session/1"));
+    let port = loop {
+        let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = first.local_addr().unwrap().port();
+        if !(1029..=65514).contains(&port) {
+            continue;
+        }
+        if let Ok(second) = std::net::TcpListener::bind(("127.0.0.1", port + 5)) {
+            drop(second);
+            drop(first);
+            break port;
+        }
+    };
+    QUALIFICATION_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
+    config["settings"]["amaterasu.nvhttp"] = json!({"enabled":true,"http_bind":format!("127.0.0.1:{port}"),"https_bind":format!("127.0.0.1:{}",port+5),"session_lifecycle_required":true,"effect_source_join":{"effect_owner":"stream","input_consumer":"input"},"streaming":streaming});
+    config["settings"]["amaterasu.pairing"]["effect_authority"] = json!({"protocol_owner":"amaterasu.nvhttp","effect_owner":"stream","feedback_policies":[{"capability":{"schema":"org.amaterasu.feedback.rgb_led","version":1,"direction":"to_client"},"required_permission":"view"}]});
+    config["settings"]["stream"]["feedback_retirement_input_principal"] = json!("input");
+    config["settings"]["stream"]["feedback_source_protocol_service"] = json!("amaterasu.nvhttp/1");
+    config["settings"]["stream"]["feedback_owner_restart_recovery"] = json!(true);
+    config["settings"]["input"]["feedback_retirement_service"] =
+        json!("amaterasu.stream-session/1");
 }

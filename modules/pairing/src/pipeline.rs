@@ -2040,7 +2040,7 @@ fn authorize_feedback_scope(
 }
 
 fn source_join_available() -> bool {
-    cfg!(test)
+    cfg!(any(test, feature = "feedback-qualification"))
 }
 
 fn is_client_configuration_update(operation: &Operation) -> bool {

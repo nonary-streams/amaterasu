@@ -42,6 +42,9 @@ impl Video {
                     json!({"ok":true,"stream":77,"state":"running","packet_boundaries":true})
                 }
                 "lookup" => json!({"ok":false,"code":"not_found"}),
+                "observe_capture" if self.live => {
+                    json!({"ok":true,"stream":77,"observed_capture":{"protocol":"wayland-wl-output","registry_global":4,"output_name":"Virtual-Fixture","width":1280,"height":720,"refresh_millihz":60000}})
+                }
                 "status" if self.live => json!({"ok":true,"stream":77,"state":"running"}),
                 "drain" => json!({"ok":true,"stream":77,"state":"drained"}),
                 "close" => {

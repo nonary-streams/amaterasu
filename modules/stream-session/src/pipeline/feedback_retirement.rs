@@ -511,7 +511,7 @@ impl Inbox {
         if self.restart_required {
             // The restart consumer remains qualification-only until reviewed
             // with the real selected providers and full authenticated session.
-            if !cfg!(test) {
+            if !cfg!(any(test, feature = "feedback-qualification")) {
                 return;
             }
             if self

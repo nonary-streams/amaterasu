@@ -1,7 +1,7 @@
 //! Real encrypted RTSP client used only by the loopback composition test.
 use amaterasu_gamestream::crypto::{Direction, RtspOpener, RtspSealer};
 use amaterasu_gamestream::{
-    crypto::{ControlProfile, ControlSealer},
+    crypto::{ControlMessage, ControlOpener, ControlOrdering, ControlProfile, ControlSealer},
     enet::{
         self, CONTROL_CHANNEL, Command, CommandBody, Connect, Datagram, FLAG_ACKNOWLEDGE, Header,
         Limits, UNCONNECTED_PEER,
@@ -16,7 +16,91 @@ use std::{
 const SDP: &str =
     include_str!("../../../../../../crates/gamestream/src/sdp/fixtures/moonlight-h264.sdp");
 
-pub(super) fn play(url: &str, mut tick: impl FnMut()) -> UdpSocket {
+pub(super) struct Client {
+    pub control: UdpSocket,
+    pub sealer: ControlSealer,
+    pub media: Vec<UdpSocket>,
+    opener: ControlOpener,
+    next_sequence: u16,
+}
+impl Client {
+    fn send_message(&mut self, kind: u16, payload: &[u8]) {
+        let encrypted = self.sealer.seal(kind, payload).unwrap();
+        let datagram = Datagram {
+            header: Header {
+                peer_id: 0,
+                session_id: 0,
+                sent_time: Some(self.next_sequence + 1),
+            },
+            commands: vec![Command {
+                channel_id: 0,
+                reliable_sequence: self.next_sequence,
+                flags: FLAG_ACKNOWLEDGE,
+                body: CommandBody::SendReliable { data: encrypted },
+            }],
+        };
+        self.next_sequence += 1;
+        self.control
+            .send(&enet::encode(&datagram, &Limits::default()).unwrap())
+            .unwrap();
+    }
+    pub fn keep_alive(&mut self) {
+        self.send_message(0x0200, &[4, 0, 0, 0, 0, 0, 0, 0]);
+    }
+    pub fn enable_haptics(&mut self) {
+        let mut payload = vec![0; 10];
+        payload[..4].copy_from_slice(&6u32.to_be_bytes());
+        payload[4..8].copy_from_slice(&0x0du32.to_le_bytes());
+        payload[8..10].copy_from_slice(&1u16.to_le_bytes());
+        self.send_message(0x0206, &payload);
+    }
+    pub fn send_controller_arrival(&mut self) {
+        let mut payload = vec![0u8; 16];
+        payload[..4].copy_from_slice(&12u32.to_be_bytes());
+        payload[4..8].copy_from_slice(&0x55000004u32.to_le_bytes());
+        payload[8] = 0;
+        payload[9] = 2;
+        payload[10..12].copy_from_slice(&1u16.to_le_bytes());
+        self.send_message(0x0206, &payload);
+        assert_eq!(self.media.len(), 2);
+    }
+    pub fn receive_feedback(&mut self) -> Option<ControlMessage> {
+        let mut bytes = [0; 4096];
+        loop {
+            let size = match self.control.recv(&mut bytes) {
+                Ok(size) => size,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return None,
+                Err(error) => panic!("control receive: {error}"),
+            };
+            let packet = enet::decode(&bytes[..size], &Limits::default()).unwrap();
+            for command in packet.commands {
+                if let CommandBody::SendReliable { data } = command.body {
+                    let ack = Datagram {
+                        header: Header {
+                            peer_id: 0,
+                            session_id: 0,
+                            sent_time: Some(10),
+                        },
+                        commands: vec![Command {
+                            channel_id: command.channel_id,
+                            reliable_sequence: command.reliable_sequence,
+                            flags: 0,
+                            body: CommandBody::Acknowledge {
+                                received_sequence: command.reliable_sequence,
+                                received_sent_time: packet.header.sent_time.unwrap(),
+                            },
+                        }],
+                    };
+                    self.control
+                        .send(&enet::encode(&ack, &Limits::default()).unwrap())
+                        .unwrap();
+                    return Some(self.opener.open(&data).expect("authenticated feedback"));
+                }
+            }
+        }
+    }
+}
+pub(super) fn play(url: &str, mut tick: impl FnMut()) -> Client {
     let address = url
         .strip_prefix("rtspenc://")
         .expect("encrypted RTSP")
@@ -63,6 +147,7 @@ pub(super) fn play(url: &str, mut tick: impl FnMut()) -> UdpSocket {
     ));
     let mut token = String::new();
     let mut control_endpoint = None;
+    let mut media_endpoints = Vec::new();
     for (sequence, target) in [
         (3, "streamid=audio/0/0"),
         (4, "streamid=video/0/0"),
@@ -83,6 +168,22 @@ pub(super) fn play(url: &str, mut tick: impl FnMut()) -> UdpSocket {
                 .unwrap()
                 .trim()
                 .to_owned();
+        }
+        if !target.starts_with("streamid=control") {
+            let port: u16 = reply
+                .lines()
+                .find_map(|line| line.strip_prefix("Transport: unicast;server_port="))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let payload = reply
+                .lines()
+                .find_map(|line| line.strip_prefix("X-SS-Ping-Payload: "))
+                .unwrap()
+                .trim()
+                .to_owned();
+            media_endpoints.push((port, payload));
         }
         if target.starts_with("streamid=control") {
             let port: u16 = reply
@@ -149,10 +250,37 @@ pub(super) fn play(url: &str, mut tick: impl FnMut()) -> UdpSocket {
     ));
     drop(send);
     let (port, hint) = control_endpoint.unwrap();
-    connect_control(port, hint, &key, &mut tick)
+    let (control, sealer) = connect_control(port, hint, &key, &mut tick);
+    let mut media = Vec::new();
+    for (port, payload) in media_endpoints {
+        assert_eq!(payload.len(), 16);
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut ping = payload.into_bytes();
+        ping.extend_from_slice(&1u32.to_be_bytes());
+        socket.send_to(&ping, ("127.0.0.1", port)).unwrap();
+        media.push(socket);
+    }
+    Client {
+        control,
+        sealer,
+        media,
+        next_sequence: 2,
+        opener: ControlOpener::new(
+            &key,
+            ControlProfile::SunshineV2,
+            Direction::HostToClient,
+            ControlOrdering::MultipleChannels,
+        )
+        .unwrap(),
+    }
 }
 
-fn connect_control(port: u16, hint: u32, key: &[u8; 16], tick: &mut impl FnMut()) -> UdpSocket {
+fn connect_control(
+    port: u16,
+    hint: u32,
+    key: &[u8; 16],
+    tick: &mut impl FnMut(),
+) -> (UdpSocket, ControlSealer) {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     socket.connect(("127.0.0.1", port)).unwrap();
     socket.set_nonblocking(true).unwrap();
@@ -281,5 +409,5 @@ fn connect_control(port: u16, hint: u32, key: &[u8; 16], tick: &mut impl FnMut()
         );
         std::thread::sleep(Duration::from_millis(1));
     }
-    socket
+    (socket, sealer)
 }

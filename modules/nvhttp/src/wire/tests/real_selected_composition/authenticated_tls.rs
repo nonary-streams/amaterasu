@@ -141,3 +141,74 @@ impl Connection {
         }
     }
 }
+
+/// TLS client whose listener and router are owned by the real NVHTTP module.
+pub(super) struct ModuleConnection {
+    socket: TcpStream,
+    tls: rustls::ClientConnection,
+}
+impl ModuleConnection {
+    pub fn connect(
+        address: std::net::SocketAddr,
+        host_cert: &[u8],
+        client_cert: &[u8],
+        target: &str,
+    ) -> Self {
+        let (_, key) = pem_rfc7468::decode_vec(CLIENT_KEY.as_bytes()).unwrap();
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key));
+        let signing_key = rustls::crypto::ring::sign::any_supported_type(&key).unwrap();
+        let client = rustls::sign::CertifiedKey::new(
+            vec![CertificateDer::from(client_cert.to_vec())],
+            signing_key,
+        );
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(PinnedHost(host_cert.to_vec())))
+        .with_client_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(client)));
+        let mut tls = rustls::ClientConnection::new(
+            Arc::new(config),
+            ServerName::try_from("qualification.invalid").unwrap(),
+        )
+        .unwrap();
+        write!(
+            tls.writer(),
+            "GET {target} HTTP/1.1\r\nHost: qualification.invalid\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let socket = TcpStream::connect(address).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        Self { socket, tls }
+    }
+    pub fn tick(&mut self) {
+        if self.tls.wants_write() {
+            match self.tls.write_tls(&mut self.socket) {
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) => panic!("client TLS write: {error}"),
+            }
+        }
+        if self.tls.wants_read() {
+            match self.tls.read_tls(&mut self.socket) {
+                Ok(0) => {}
+                Ok(_) => {
+                    self.tls
+                        .process_new_packets()
+                        .expect("authenticated TLS handshake");
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) => panic!("client TLS read: {error}"),
+            }
+        }
+    }
+    pub fn read_plaintext(&mut self, output: &mut Vec<u8>) {
+        match self.tls.reader().read_to_end(output) {
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+            Err(error) => panic!("TLS plaintext: {error}"),
+        }
+    }
+}
