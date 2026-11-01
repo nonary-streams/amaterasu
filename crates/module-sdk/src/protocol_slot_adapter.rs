@@ -1,10 +1,16 @@
-//! Versioned, pairing-journal-backed protocol slot recovery.
+//! Versioned, pairing-journal-backed protocol slot selection and recovery.
 //!
 //! Pairing authenticates the source, selected policy, permissions and State
 //! endpoint. Broker and host retirement are separate from external cleanup.
 use crate::{
     Command, Response,
-    broker_effect_fence::{EffectFenceCommand, HostProviderRetirement, SourceSlotLease},
+    broker_effect_fence::{
+        self, EffectFenceCommand, EffectScope, HostProviderRetirement, ProtectedMethod,
+        SelectedEffectMethod, SourceSlotLease,
+    },
+    effect_authority::Source,
+    extension_api::LifecycleTarget,
+    protocol::{DispatchRequest, PendingEffect, ProtocolRouter, Route},
     protocol_slot_state,
 };
 type SendResult = Result<Response, String>;
@@ -26,6 +32,144 @@ fn require_ok(response: Response) -> Result<(), String> {
         _ => Err("unexpected_broker_response".into()),
     }
 }
+/// Inputs authenticated by pairing and selected at trusted composition.
+pub struct SlotActionRequest<'a> {
+    pub pending: PendingEffect,
+    pub issuer: &'a Source,
+    pub scope: EffectScope,
+    pub lease: SourceSlotLease,
+    pub route: &'a Route,
+    pub sequence: u64,
+    pub payload: &'a [u8],
+}
+
+/// A selected action, prepared only after trusted pairing has authenticated
+/// the source, negotiated capability and checked the client's permission.
+/// This is not an admission receipt and exposes no State write or dispatch.
+pub struct SelectedSlotAction {
+    selected: SelectedEffectMethod,
+    pending: PendingEffect,
+    scope: EffectScope,
+    lease: SourceSlotLease,
+    sequence: u64,
+}
+impl SelectedSlotAction {
+    /// Query the selected broker authority and bind its host-issued instance.
+    /// `issuer` and `scope.issuer_epoch` must come from pairing attestation.
+    pub fn query(
+        request: SlotActionRequest<'_>,
+        mut authority: impl FnMut(Command) -> SendResult,
+    ) -> Result<Self, String> {
+        let SlotActionRequest {
+            pending,
+            issuer,
+            scope,
+            lease,
+            route,
+            sequence,
+            payload,
+        } = request;
+        validate_action(&pending, issuer, &scope, &lease, route, sequence, payload)?;
+        let method = &route.approval.method;
+        let response = authority(command(EffectFenceCommand::SelectedMethod {
+            method: ProtectedMethod {
+                service: method.service.clone(),
+                method: method.method.clone(),
+                interface_major: method.interface_major,
+            },
+        }))?;
+        let Response::Result { payload } = response else {
+            return Err("selection_unavailable".into());
+        };
+        let selected: SelectedEffectMethod =
+            serde_json::from_value(payload).map_err(|_| "selection_invalid")?;
+        let Some(instance) = selected.provider_incarnation.as_ref() else {
+            return Err("host_provider_incarnation_required".into());
+        };
+        if selected.version != 1
+            || selected.provider != route.approval.provider
+            || selected.method != route.approval.method
+            || !valid_incarnation(instance)
+        {
+            return Err("selection_mismatch".into());
+        }
+        Ok(Self {
+            selected,
+            pending,
+            scope,
+            lease,
+            sequence,
+        })
+    }
+    pub fn selected_method(&self) -> &SelectedEffectMethod {
+        &self.selected
+    }
+    pub fn scope(&self) -> &EffectScope {
+        &self.scope
+    }
+    pub fn lease(&self) -> &SourceSlotLease {
+        &self.lease
+    }
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+    pub fn pending(&self) -> &PendingEffect {
+        &self.pending
+    }
+    /// The committed broker does not yet expose authority-only cleanup
+    /// selection. No write or effect is admitted until that query is available.
+    pub fn prepare_issue(&self) -> Result<(), &'static str> {
+        Err("cleanup_selection_unavailable")
+    }
+}
+fn valid_incarnation(instance: &broker_effect_fence::ProviderIncarnation) -> bool {
+    instance.version == 1
+        && instance.id.len() == 32
+        && instance
+            .id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+fn validate_action(
+    pending: &PendingEffect,
+    issuer: &Source,
+    scope: &EffectScope,
+    lease: &SourceSlotLease,
+    route: &Route,
+    sequence: u64,
+    payload: &[u8],
+) -> Result<(), String> {
+    let router = ProtocolRouter::new(vec![route.clone()]).map_err(str::to_owned)?;
+    let request = DispatchRequest {
+        context: &pending.context,
+        message_type: pending.message_type,
+        payload,
+        operation_id: &pending.operation_id,
+        issuer_epoch: &pending.issuer_epoch,
+        timeout_ms: pending.timeout_ms,
+        parent: pending.parent,
+    };
+    if router.prepare_effect(&pending.caller, &request)? != *pending
+        || broker_effect_fence::source(issuer).map_err(str::to_owned)? != scope.source
+        || scope.source.slot() != Some(lease.slot)
+        || pending.context.authority_epoch != scope.authority_epoch
+        || pending.issuer_epoch != scope.issuer_epoch
+        || pending.context.effect_owner_epoch != issuer.effect_owner_epoch
+        || pending.context.peer_ref != issuer.id
+        || !matches!(&pending.context.target, LifecycleTarget::Stream { host_epoch, session_id, stream_id, generation }
+            if *host_epoch == issuer.host_epoch && *session_id == issuer.session_id
+                && *stream_id == issuer.stream_id && *generation == issuer.stream_generation)
+        || pending.operation_id
+            != protocol_slot_state::operation_id(&pending.caller, scope, sequence)
+                .map_err(str::to_owned)?
+        || !route.approval.callers.contains(&pending.caller)
+        || !route.cleanup_approval.callers.contains(&pending.caller)
+    {
+        return Err("effect_identity_mismatch".into());
+    }
+    Ok(())
+}
+
 /// A digest-only historical effect read from pairing's canonical State slot.
 /// This object is not evidence of old-worker retirement or external cleanup.
 pub struct HistoricalSlotEffect {

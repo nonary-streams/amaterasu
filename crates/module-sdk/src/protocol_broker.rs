@@ -9,7 +9,7 @@ use crate::{
     Command, Response,
     broker_effect_fence::{
         self, EffectFenceCommand, EffectScope, GuardedEffect, GuardedEffectIdentity,
-        ProtectedMethod, SelectedEffectMethod, SourceSlotLease,
+        SourceSlotLease,
     },
     effect_authority::Source,
     extension_api::LifecycleTarget,
@@ -153,76 +153,19 @@ pub struct SlottedEffect {
     lease: SourceSlotLease,
 }
 impl SlottedEffect {
-    /// The authority must confirm durable issue, authenticated pairing,
-    /// permission and its semantic schema revision before this call.
-    pub fn arm(&self, mut authority: impl FnMut(Command) -> SendResult) -> Result<(), String> {
-        let guarded = &self.effect.guarded;
-        let response = authority(command(EffectFenceCommand::SelectedMethod {
-            method: ProtectedMethod {
-                service: guarded.service.clone(),
-                method: guarded.method.clone(),
-                interface_major: guarded.interface_major,
-            },
-        }))?;
-        let Response::Result { payload } = response else {
-            return Err("selection_unavailable".into());
-        };
-        let selected: SelectedEffectMethod =
-            serde_json::from_value(payload).map_err(|_| "selection_invalid")?;
-        if selected.version != 1
-            || selected.provider != self.effect.route.approval.provider
-            || selected.method != self.effect.route.approval.method
-        {
-            return Err("selection_mismatch".into());
-        }
-        require_ok(authority(slot_command(
-            &self.lease,
-            EffectFenceCommand::ArmSelected {
-                effect: guarded.clone(),
-                expected: Box::new(selected),
-            },
-        ))?)
+    /// Legacy v4 records lack the host-selected provider incarnation. They
+    /// cannot authorize a new slotted admission and require reconciliation.
+    pub fn arm(&self, _authority: impl FnMut(Command) -> SendResult) -> Result<(), String> {
+        Err("legacy_slot_record_requires_reconciliation".into())
     }
+    /// A delayed v4 State success cannot revive admission, even if the old
+    /// broker had already armed an effect. Preserve the receipt for diagnosis.
     pub fn dispatch(
         &self,
-        receipt: &mut ReadyReservation,
-        mut issuer: impl FnMut(Command) -> SendResult,
+        _receipt: &mut ReadyReservation,
+        _issuer: impl FnMut(Command) -> SendResult,
     ) -> SendResult {
-        for approval in [
-            &self.effect.route.approval,
-            &self.effect.route.cleanup_approval,
-        ] {
-            let method = &approval.method;
-            let response = issuer(Command::QueryApiApproval {
-                service: method.service.clone(),
-                method: method.method.clone(),
-                interface_major: method.interface_major,
-                min_minor: method.interface_minor,
-            })?;
-            let Response::Result { payload } = response else {
-                return Err("approval_unavailable".into());
-            };
-            if serde_json::from_value::<amaterasu_contracts::ApiMethodApproval>(payload)
-                .ok()
-                .as_ref()
-                != Some(approval)
-            {
-                return Err("approval_mismatch".into());
-            }
-        }
-        if receipt
-            .reserve(&self.effect.pending)
-            .map_err(str::to_owned)?
-            != Reservation::New
-        {
-            return Err("operation_requires_reconciliation".into());
-        }
-        issuer(slot_command(
-            &self.lease,
-            EffectFenceCommand::Dispatch {
-                effect: self.effect.guarded.clone(),
-            },
-        ))
+        Err("legacy_slot_record_requires_reconciliation".into())
     }
     pub fn fence(&self, mut authority: impl FnMut(Command) -> SendResult) -> Result<(), String> {
         require_ok(authority(slot_command(

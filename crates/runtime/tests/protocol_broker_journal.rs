@@ -915,9 +915,12 @@ fn legacy_digest_only_recovery_requires_host_incarnation_and_stays_fenced() {
     .unwrap()
     .in_slot(old_lease.clone())
     .unwrap();
-    slotted
-        .arm(|cmd| Ok(original.dispatch("authority", cmd)))
-        .unwrap();
+    assert_eq!(
+        slotted
+            .arm(|_| panic!("legacy arm must not call the broker"))
+            .unwrap_err(),
+        "legacy_slot_record_requires_reconciliation"
+    );
     // Recovery has no access to the original payload. The late issuer keeps its
     // own stale object only to exercise the broker's anti-replay fence later.
     drop(secret);
@@ -1061,14 +1064,14 @@ fn legacy_digest_only_recovery_requires_host_incarnation_and_stays_fenced() {
         Err("reconciliation_required")
     );
     let mut delayed_receipt = pending.confirmed(delayed).unwrap();
-    assert!(matches!(
+    assert_eq!(
         slotted
-            .dispatch(&mut delayed_receipt, |cmd| Ok(
-                restarted.dispatch("issuer", cmd)
+            .dispatch(&mut delayed_receipt, |_| panic!(
+                "legacy dispatch must not call the broker"
             ))
-            .unwrap(),
-        Response::Error { .. }
-    ));
+            .unwrap_err(),
+        "legacy_slot_record_requires_reconciliation"
+    );
     assert!(matches!(
         restarted.dispatch("provider", Command::Poll {}),
         Response::Pending
@@ -1144,7 +1147,7 @@ fn completed_sources_reuse_a_slot_beyond_sixty_four_without_replaying_old_issuer
             pending.request(),
             pending.state_operation_id(),
         );
-        let mut receipt = pending.confirmed(stored).unwrap();
+        let _receipt = pending.confirmed(stored).unwrap();
         let slotted = JournaledEffect::new(
             effect.clone(),
             issuer,
@@ -1156,13 +1159,61 @@ fn completed_sources_reuse_a_slot_beyond_sixty_four_without_replaying_old_issuer
         .unwrap()
         .in_slot(lease.clone())
         .unwrap();
-        slotted
-            .arm(|cmd| Ok(broker.dispatch("authority", cmd)))
-            .unwrap();
-        let Response::Accepted { id } = slotted
-            .dispatch(&mut receipt, |cmd| Ok(broker.dispatch("issuer", cmd)))
-            .unwrap()
-        else {
+        // Exercise broker slot recycling directly. The legacy SDK adapter is
+        // intentionally closed because its v4 record has no instance identity.
+        let guarded = amaterasu_contracts::effect_fence::GuardedEffect {
+            scope: scope.clone(),
+            sequence: 1,
+            capability: effect.capability.clone(),
+            service: effect.method.service.clone(),
+            method: effect.method.method.clone(),
+            interface_major: effect.method.interface_major,
+            interface_minor: effect.method.interface_minor,
+            schema_revision: effect.method.schema_revision as u32,
+            payload_sha256: effect.payload_sha256.clone(),
+            payload: serde_json::json!({"context":effect.context,"capability":effect.capability,"message_type":effect.message_type,"payload_base64":"aGVsbG8="}),
+            timeout_ms: effect.timeout_ms,
+            operation_id: effect.operation_id.clone(),
+            parent: effect.parent,
+        };
+        let selected = match send(
+            &mut broker,
+            "authority",
+            EffectFenceCommand::SelectedMethod {
+                method: ProtectedMethod {
+                    service: guarded.service.clone(),
+                    method: guarded.method.clone(),
+                    interface_major: guarded.interface_major,
+                },
+            },
+        ) {
+            Response::Result { payload } => serde_json::from_value(payload).unwrap(),
+            _ => panic!("selection unavailable"),
+        };
+        assert!(matches!(
+            send(
+                &mut broker,
+                "authority",
+                slot_cmd(
+                    &lease,
+                    EffectFenceCommand::ArmSelected {
+                        effect: guarded.clone(),
+                        expected: Box::new(selected)
+                    }
+                )
+            ),
+            Response::Ok
+        ));
+        let Response::Accepted { id } = send(
+            &mut broker,
+            "issuer",
+            slot_cmd(
+                &lease,
+                EffectFenceCommand::Dispatch {
+                    effect: guarded.clone(),
+                },
+            ),
+        ) else {
             panic!("not admitted")
         };
         assert!(
@@ -1274,11 +1325,8 @@ fn completed_sources_reuse_a_slot_beyond_sixty_four_without_replaying_old_issuer
             ),
             Response::Ok
         ));
-        assert_eq!(
-            slotted
-                .arm(|cmd| Ok(broker.dispatch("authority", cmd)))
-                .unwrap_err(),
-            "stale_source_slot"
+        assert!(
+            matches!(send(&mut broker,"issuer",slot_cmd(&lease, EffectFenceCommand::Dispatch { effect: guarded })),Response::Error {code,..} if code == "stale_source_slot")
         );
         last_source = Some((lease, scope));
     }
@@ -1383,7 +1431,7 @@ fn failed_issuer_worker_never_acknowledges_source_retirement() {
 }
 
 #[test]
-fn slotted_adapter_rejects_different_selected_schema_before_arm() {
+fn legacy_slot_adapter_rejects_admission_before_broker_query() {
     let actual = route();
     let mut configured = actual.clone();
     configured.approval.method.request.allow_extra = true;
@@ -1419,7 +1467,146 @@ fn slotted_adapter_rejects_different_selected_schema_before_arm() {
         slotted
             .arm(|cmd| Ok(broker.dispatch("authority", cmd)))
             .unwrap_err(),
-        "selection_mismatch"
+        "legacy_slot_record_requires_reconciliation"
+    );
+    assert!(matches!(
+        broker.dispatch("provider", Command::Poll {}),
+        Response::Pending
+    ));
+}
+
+#[test]
+fn canonical_slot_selection_is_host_bound_and_cleanup_query_remains_closed() {
+    use amaterasu_contracts::effect_fence::{ProviderIncarnation, SourceSlotLease};
+    use amaterasu_module_sdk::protocol_slot_adapter::{SelectedSlotAction, SlotActionRequest};
+    let route = route();
+    let service = route.method.service.clone();
+    let mut config = RuntimeConfig::default();
+    config
+        .principals
+        .insert("authority".into(), Grants::default());
+    config.principals.insert(
+        "issuer".into(),
+        Grants {
+            call: [service.clone()].into(),
+            ..Default::default()
+        },
+    );
+    config.principals.insert(
+        "provider".into(),
+        Grants {
+            provide: [service.clone()].into(),
+            ..Default::default()
+        },
+    );
+    config
+        .api_methods
+        .extend([route.approval.clone(), route.cleanup_approval.clone()]);
+    config.host_context.provider_incarnations.insert(
+        "provider".into(),
+        ProviderIncarnation {
+            version: 1,
+            id: "d".repeat(32),
+        },
+    );
+    config.effect_fence = Some(EffectFencePolicy {
+        source_slots: false,
+        authority: "authority".into(),
+        issuer: "issuer".into(),
+        methods: vec![ProtectedMethod {
+            service: service.clone(),
+            method: "receive".into(),
+            interface_major: 1,
+        }],
+        cleanup_methods: vec![ProtectedMethod {
+            service,
+            method: "cleanup".into(),
+            interface_major: 1,
+        }],
+    });
+    let mut broker = Broker::new(config).unwrap();
+    for method in [&route.approval.method, &route.cleanup_approval.method] {
+        assert!(matches!(
+            broker.dispatch(
+                "provider",
+                Command::RegisterApi {
+                    method: method.clone()
+                }
+            ),
+            Response::Ok
+        ));
+    }
+    let issuer = source();
+    let scope = scope("issued.epoch");
+    let mut context = ctx();
+    context.peer_ref = issuer.id.clone();
+    let operation_id =
+        amaterasu_module_sdk::protocol_slot_state::operation_id("issuer", &scope, 1).unwrap();
+    let request = DispatchRequest {
+        context: &context,
+        message_type: route.message_type,
+        payload: b"hello",
+        operation_id: &operation_id,
+        issuer_epoch: &scope.issuer_epoch,
+        timeout_ms: 1000,
+        parent: None,
+    };
+    let pending = ProtocolRouter::new(vec![route.clone()])
+        .unwrap()
+        .prepare_effect("issuer", &request)
+        .unwrap();
+    let lease = SourceSlotLease {
+        slot: scope.source.slot().unwrap(),
+        incarnation: 1,
+        broker_epoch: "e".repeat(32),
+        token: "f".repeat(32),
+    };
+    let action = SelectedSlotAction::query(
+        SlotActionRequest {
+            pending: pending.clone(),
+            issuer: &issuer,
+            scope: scope.clone(),
+            lease: lease.clone(),
+            route: &route,
+            sequence: 1,
+            payload: b"hello",
+        },
+        |cmd| Ok(broker.dispatch("authority", cmd)),
+    )
+    .unwrap();
+    assert_eq!(
+        action
+            .selected_method()
+            .provider_incarnation
+            .as_ref()
+            .unwrap()
+            .id,
+        "d".repeat(32)
+    );
+    assert_eq!(action.prepare_issue(), Err("cleanup_selection_unavailable"));
+    let mut missing_instance = action.selected_method().clone();
+    missing_instance.provider_incarnation = None;
+    assert!(matches!(SelectedSlotAction::query(
+        SlotActionRequest { pending: pending.clone(), issuer: &issuer, scope: scope.clone(), lease: lease.clone(), route: &route, sequence: 1, payload: b"hello" },
+        |_| Ok(Response::Result { payload: serde_json::to_value(&missing_instance).unwrap() })
+    ), Err(error) if error == "host_provider_incarnation_required"));
+    let mut unsupported_instance = action.selected_method().clone();
+    unsupported_instance
+        .provider_incarnation
+        .as_mut()
+        .unwrap()
+        .version = 2;
+    assert!(matches!(SelectedSlotAction::query(
+        SlotActionRequest { pending: pending.clone(), issuer: &issuer, scope: scope.clone(), lease: lease.clone(), route: &route, sequence: 1, payload: b"hello" },
+        |_| Ok(Response::Result { payload: serde_json::to_value(&unsupported_instance).unwrap() })
+    ), Err(error) if error == "selection_mismatch"));
+    let mut wrong_scope = scope.clone();
+    wrong_scope.issuer_epoch = "forged".into();
+    assert!(
+        matches!(SelectedSlotAction::query(SlotActionRequest { pending: pending.clone(), issuer: &issuer, scope: wrong_scope, lease: lease.clone(), route: &route, sequence: 1, payload: b"hello" }, |_| panic!("invalid identity queried the broker")), Err(error) if error == "effect_identity_mismatch")
+    );
+    assert!(
+        matches!(SelectedSlotAction::query(SlotActionRequest { pending, issuer: &issuer, scope, lease, route: &route, sequence: 1, payload: b"different" }, |_| panic!("invalid payload queried the broker")), Err(error) if error == "effect_identity_mismatch")
     );
     assert!(matches!(
         broker.dispatch("provider", Command::Poll {}),
