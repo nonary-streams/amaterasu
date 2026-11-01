@@ -9,6 +9,9 @@ use std::{
     path::{Path, PathBuf},
 };
 mod authenticated_tls;
+mod fixture_capture;
+mod fixture_video;
+mod rtsp_client;
 
 const CLIENT_CERT: &str = include_str!("../../../../pairing/tests/fixtures/client-cert.pem");
 const HOST_CERT: &str = include_str!("../../../../pairing/tests/fixtures/host-cert.pem");
@@ -147,33 +150,6 @@ fn take(client: &RuntimeClient, id: u64) -> Option<Value> {
     }
 }
 
-#[derive(Default)]
-struct MemoryState {
-    revision: u64,
-    document: Option<Value>,
-}
-impl MemoryState {
-    fn pump(&mut self, runtime: &RuntimeClient) {
-        while let Some(request) = runtime.poll_serialized().unwrap() {
-            let payload = if request.payload["action"] == "get" {
-                json!({"ok":true,"revision":self.revision,"found":self.document.is_some(),"value":self.document})
-            } else if request.payload["expected_revision"] == self.revision {
-                self.revision += 1;
-                self.document = Some(request.payload["value"].clone());
-                json!({"ok":true,"revision":self.revision})
-            } else {
-                json!({"ok":false,"error":{"code":"revision_conflict","current_revision":self.revision}})
-            };
-            runtime
-                .require_success(Command::Complete {
-                    request: request.id,
-                    payload,
-                })
-                .unwrap();
-        }
-    }
-}
-
 #[test]
 #[ignore = "requires independently built protocol and fixture artifacts plus an ephemeral loopback listener"]
 fn real_selected_composition() {
@@ -235,26 +211,28 @@ fn run_composition(replacement: bool, scenario: &str) {
         "amaterasu.input/1",
         "amaterasu.media-transport/1",
         "amaterasu.control-transport/1",
+        "amaterasu.video/1",
         "amaterasu.application/1",
         "amaterasu.display/1",
         "fixture.library/2",
         "fixture.policy/2",
         "example.library.provider/1"
     ]);
-    let config = json!({"principals":{
+    let mut config = json!({"principals":{
         "console":{"call": ["amaterasu.pairing/1","amaterasu.state/1"]},
         "attacker":{"call":["amaterasu.launch/1","amaterasu.launch/3","example.library.provider/1"]},
         "amaterasu.nvhttp":{"call":services,"native_use":["amaterasu.identity/1"]},
         "amaterasu.pairing":{"provide":["amaterasu.pairing/1"],"call":["amaterasu.state/1"],"native_provide":["amaterasu.identity/1"]},
         "amaterasu.launch":{"provide":["amaterasu.launch/1","amaterasu.launch/2","amaterasu.launch/3"],"call":["fixture.library/2","fixture.policy/2","example.library.provider/1","amaterasu.session/1","amaterasu.application/1"]},
-        "amaterasu.rtsp":{"provide":["amaterasu.rtsp/1"],"call":["amaterasu.launch/1","amaterasu.stream-session/1","amaterasu.session/1","amaterasu.state/1","amaterasu.media-transport/1","amaterasu.control-transport/1","amaterasu.input/1","amaterasu.session-lifecycle/1","amaterasu.display/1"],"native_use":["amaterasu.network/1"]},
+        "amaterasu.rtsp":{"provide":["amaterasu.rtsp/1"],"call":["amaterasu.launch/1","amaterasu.stream-session/1","amaterasu.session/1","amaterasu.state/1","amaterasu.media-transport/1","amaterasu.control-transport/1","amaterasu.input/1","amaterasu.session-lifecycle/1","amaterasu.display/1","amaterasu.video/1"],"native_use":["amaterasu.network/1"]},
         "amaterasu.session-lifecycle":{"provide":["amaterasu.session-lifecycle/1"],"call":["amaterasu.launch/1"]},
         "network":{"native_provide":["amaterasu.network/1"]},
         "capture":{"call":["amaterasu.session-lifecycle/1"]},
         "foreign":{"call":["amaterasu.session-lifecycle/1"]},
-        "state":{"provide":["amaterasu.state/1"]},
+        "amaterasu.state":{"provide":["amaterasu.state/1"]},
         "session":{"provide":["amaterasu.session/1"]},
-        "stream":{"provide":["amaterasu.stream-session/1"],"call":["amaterasu.state/1","amaterasu.session/1","amaterasu.input/1","amaterasu.session-lifecycle/1","amaterasu.display/1","amaterasu.media-transport/1","amaterasu.control-transport/1"],"native_use":["amaterasu.media-transport/1","amaterasu.control-transport/1"]},
+        "stream":{"provide":["amaterasu.stream-session/1"],"call":["amaterasu.state/1","amaterasu.session/1","amaterasu.input/1","amaterasu.session-lifecycle/1","amaterasu.display/1","amaterasu.media-transport/1","amaterasu.control-transport/1","amaterasu.video/1"],"native_use":["amaterasu.media-transport/1","amaterasu.control-transport/1","amaterasu.video/1"]},
+        "fixture-video":{"provide":["amaterasu.video/1"],"native_provide":["amaterasu.video/1"]},
         "control":{"provide":["amaterasu.control-transport/1"],"native_provide":["amaterasu.control-transport/1"],"native_use":["amaterasu.network/1"]},
         "media":{"provide":["amaterasu.media-transport/1"],"native_provide":["amaterasu.media-transport/1"],"native_use":["amaterasu.network/1"]},
         "input":{"provide":["amaterasu.input/1"],"call":["amaterasu.configuration/1"]},
@@ -282,10 +260,20 @@ fn run_composition(replacement: bool, scenario: &str) {
         "policy":{"service":"fixture.policy/2","callers":{"amaterasu.launch":["amaterasu.nvhttp"]},"rules":[{"certificates":[cert_id],"policy":{"application":{"library":"games","id":"opaque/game"},"entry_revision":"entry:opaque","policy_revision":"policy:one","preparation":[]},"config_overrides":{},"application_display_settings":null}]},
         "executor":{"callers":{"amaterasu.launch":{"initiators":["amaterasu.nvhttp","amaterasu.launch"],"lifecycle":true}}, "limiter_mode":match scenario { "limiter_success" => "supported", "limiter_mismatch" => "mismatch", "limiter_stale" => "stale", _ => "" }},
         "replacement":{"certificate_id":cert_id,"mode":scenario,"limiter_capacity":2}
-    }});
+    },"host_context":{"schema":1,"state_root":temp.0.join("state")}});
+    let play = std::env::var_os("AMATERASU_COMPOSITION_PLAY").is_some();
+    if play {
+        fixture_capture::configure(&mut config);
+    }
     let runtime = Runtime::new(&artifact(&artifacts, "amaterasu_runtime"), config);
-    let state = runtime.client("state");
-    register(&state, "amaterasu.state/1");
+    let capture_fixture = runtime.client("fixture-capture");
+    if play {
+        fixture_capture::register(&capture_fixture);
+    }
+    let mut memory = LoadedModule::start(
+        &artifact(&artifacts, "amaterasu_state"),
+        &runtime.endpoint("amaterasu.state"),
+    );
     let network = runtime.client("network");
     let factory = amaterasu_network_sockets::Factory::new();
     // SAFETY: factory lives until after RTSP and its native binding are destroyed.
@@ -300,6 +288,13 @@ fn run_composition(replacement: bool, scenario: &str) {
     };
     let stream = runtime.client("stream");
     let real_stream = std::env::var_os("AMATERASU_COMPOSITION_REAL_STREAM").is_some();
+    let play = std::env::var_os("AMATERASU_COMPOSITION_PLAY").is_some();
+    assert!(
+        !play || real_stream,
+        "PLAY qualification needs the selected stream"
+    );
+    let video_runtime = runtime.client("fixture-video");
+    let mut video_fixture = play.then(|| fixture_video::Video::start(&video_runtime));
     if !real_stream {
         register(&stream, "amaterasu.stream-session/1");
     }
@@ -383,12 +378,11 @@ fn run_composition(replacement: bool, scenario: &str) {
     let mut provider =
         (!replacement).then(|| LoadedModule::start(&executor, &runtime.endpoint("executor")));
     let console = runtime.client("console");
-    let mut memory = MemoryState::default();
     for (sequence, payload) in [json!({"action":"import_identity","certificate_pem":HOST_CERT,"private_key_pem":HOST_KEY}), json!({"action":"import_client","client_id":"test-client","name":"Client","certificate_pem":CLIENT_CERT})].into_iter().enumerate() {
         let pending = broker_request(&console, "amaterasu.pairing/1", payload, &format!("pairing-{sequence}"));
         let mut result = None;
         for _ in 0..500 {
-            pairing.tick(); memory.pump(&state);
+            pairing.tick(); memory.tick();
             if let Some(value) = take(&console, pending) { result = Some(value); break; }
         }
         assert_eq!(result.as_ref().map(|value| &value["ok"]), Some(&json!(true)), "{result:?}");
@@ -455,7 +449,11 @@ fn run_composition(replacement: bool, scenario: &str) {
     }
     let streaming = crate::launch::StreamingConfig {
         capture: CaptureConfig {
-            capture_provider: CaptureProvider::Dxgi,
+            capture_provider: if play {
+                CaptureProvider::PipeWire
+            } else {
+                CaptureProvider::Dxgi
+            },
             output: "00000000:00000001/\\\\.\\DISPLAY1".into(),
             encoder: amaterasu_module_sdk::EncoderSelection::Index(0),
             audio_endpoint: "default".into(),
@@ -596,6 +594,9 @@ fn run_composition(replacement: bool, scenario: &str) {
     let mut replies = vec![];
     let mut cancelled = false;
     for _ in 0..5000 {
+        if let Some(video) = &mut video_fixture {
+            video.pump(&video_runtime);
+        }
         if let Some(module) = &mut selected_stream {
             module.tick();
         }
@@ -618,9 +619,12 @@ fn run_composition(replacement: bool, scenario: &str) {
             );
         }
         pairing.tick();
-        memory.pump(&state);
+        memory.tick();
         launch.tick();
         lifecycle.tick();
+        if play {
+            fixture_capture::pump(&capture_fixture);
+        }
         if let Some(module) = &mut library {
             module.tick();
         }
@@ -754,6 +758,75 @@ fn run_composition(replacement: bool, scenario: &str) {
             .calls
             .iter()
             .any(|(service, payload)| service == "stream" && payload["action"] == "prepare");
+    if play {
+        let body = std::str::from_utf8(&replies.first().expect("launch reply").1.body).unwrap();
+        let url = body
+            .split_once("<sessionUrl0>")
+            .and_then(|(_, tail)| tail.split_once("</sessionUrl0>"))
+            .map(|(value, _)| value.to_owned())
+            .expect("RTSP URL in launch reply");
+        let _control_client = rtsp_client::play(&url, || {
+            if let Some(module) = &mut selected_stream {
+                module.tick();
+            }
+            if let Some(module) = &mut selected_control {
+                module.tick();
+            }
+            if let Some(module) = &mut selected_media {
+                module.tick();
+            }
+            if let Some(module) = &mut selected_input {
+                module.tick();
+                pump_input_configuration(&configuration);
+            }
+            if let Some(video) = &mut video_fixture {
+                video.pump(&video_runtime);
+            }
+            pairing.tick();
+            memory.tick();
+            launch.tick();
+            lifecycle.tick();
+            rtsp.tick();
+            fixture_capture::pump(&capture_fixture);
+            if let Some(module) = &mut library {
+                module.tick();
+            }
+            if let Some(module) = &mut policy {
+                module.tick();
+            }
+            if let Some(module) = &mut generated {
+                module.tick();
+            }
+            if let Some(module) = &mut provider {
+                module.tick();
+            }
+            backends.pump(&session, &stream, &input, &application, &display);
+        });
+        let pending = broker_request(
+            &stream,
+            "amaterasu.control-transport/1",
+            json!({"action":"status"}),
+            "control-authenticated-check",
+        );
+        let mut status = None;
+        for _ in 0..200 {
+            selected_control.as_mut().unwrap().tick();
+            if let Some(value) = take(&stream, pending) {
+                status = Some(value);
+                break;
+            }
+        }
+        let status = status.expect("control status");
+        assert!(
+            status["streams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["authenticated"] == true
+                    && item["received_messages"].as_u64().unwrap_or(0) >= 1),
+            "{status}"
+        );
+    }
     match scenario {
         "retirement_restart" => {
             assert!(cancelled);
@@ -920,7 +993,7 @@ fn run_composition(replacement: bool, scenario: &str) {
                     let mut result = None;
                     for _ in 0..500 {
                         pairing.tick();
-                        memory.pump(&state);
+                        memory.tick();
                         if let Some(value) = take(&nvhttp, unpair) {
                             result = Some(value);
                             break;
@@ -949,7 +1022,7 @@ fn run_composition(replacement: bool, scenario: &str) {
                 let mut resumed = vec![];
                 for _ in 0..5000 {
                     pairing.tick();
-                    memory.pump(&state);
+                    memory.tick();
                     launch.tick();
                     lifecycle.tick();
                     if let Some(module) = &mut library {
