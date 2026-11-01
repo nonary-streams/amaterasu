@@ -514,3 +514,108 @@ fn exact_provider_retirement_allows_bounded_reclamation() {
     drop(store);
     std::fs::remove_dir_all(path).unwrap();
 }
+
+#[test]
+fn unresolved_digest_only_restart_stays_closed_without_retirement_evidence() {
+    use amaterasu_contracts::effect_fence::GuardedEffect;
+    use amaterasu_module_sdk::protocol_sequence::IssuerRetirement;
+    struct NoEvidence;
+    impl IssuerRetirement for NoEvidence {}
+
+    let path = directory();
+    let store = TestStateStore::open(path.clone()).unwrap();
+    let route = route();
+    let router = ProtocolRouter::new(vec![route.clone()]).unwrap();
+    let context = ctx();
+    let source = SequencedSource::new("issuer", &context).unwrap();
+    let op = source.operation_id(1).unwrap();
+    let effect = {
+        let secret = b"private-protocol-payload".to_vec();
+        let request = DispatchRequest {
+            context: &context,
+            message_type: 0x553a,
+            payload: &secret,
+            operation_id: &op,
+            issuer_epoch: "issuer.epoch",
+            timeout_ms: 1000,
+            parent: None,
+        };
+        let effect = router.prepare_effect("issuer", &request).unwrap();
+        let read = invoke(&store, &source.read_request());
+        let pending = protocol_sequence::prepare_issue(
+            &binding(),
+            &source,
+            &read,
+            effect.clone(),
+            self::source(),
+            reference(),
+        )
+        .unwrap();
+        assert_eq!(invoke(&store, pending.request())["ok"], true);
+        // Simulate a crash before the response is consumed or reconciliation runs.
+        drop(pending);
+        effect
+    }; // original payload is no longer available to recovery
+    drop(store);
+    let store = TestStateStore::open(path.clone()).unwrap();
+    let read = invoke(&store, &source.read_request());
+    assert!(!read.to_string().contains("private-protocol-payload"));
+    assert!(
+        !read
+            .to_string()
+            .contains("cHJpdmF0ZS1wcm90b2NvbC1wYXlsb2Fk")
+    );
+    let snapshot = protocol_sequence::recovery_snapshot(&source, &read).unwrap();
+    assert_eq!(
+        (
+            snapshot.retired_through,
+            snapshot.issued_through,
+            snapshot.unresolved.len()
+        ),
+        (0, 1, 1)
+    );
+    assert_eq!(snapshot.unresolved[0].effect, effect);
+    assert_eq!(
+        protocol_sequence::recovery_watermark(&source, &read),
+        Err("reconciliation_required")
+    );
+    assert!(matches!(
+        protocol_sequence::prepare_cleanup(
+            &binding(),
+            &source,
+            &read,
+            1,
+            &effect,
+            &reference(),
+            &NoEvidence
+        ),
+        Err("issuer_retirement_unproven")
+    ));
+    let mut restarted = setup_broker(&route);
+    // A digest is not a payload. Even a guessed request cannot be admitted while
+    // the broker has no recovered, authenticated OpenSource assertion.
+    let guessed = GuardedEffect {
+        scope: scope("issuer.epoch"),
+        sequence: 1,
+        capability: effect.capability.clone(),
+        service: effect.method.service.clone(),
+        method: effect.method.method.clone(),
+        interface_major: effect.method.interface_major,
+        interface_minor: effect.method.interface_minor,
+        schema_revision: 1,
+        payload_sha256: effect.payload_sha256.clone(),
+        payload: serde_json::json!({}),
+        timeout_ms: effect.timeout_ms,
+        operation_id: effect.operation_id.clone(),
+        parent: None,
+    };
+    assert!(
+        matches!(send(&mut restarted, "issuer", EffectFenceCommand::Dispatch { effect: guessed }), Response::Error { code, .. } if code == "recovery_required")
+    );
+    assert!(matches!(
+        restarted.dispatch("provider", Command::Poll {}),
+        Response::Pending
+    ));
+    drop(store);
+    std::fs::remove_dir_all(path).unwrap();
+}

@@ -171,6 +171,30 @@ fn set(
         expected_revision: Some(revision),
     })
 }
+/// Bounded durable identities for the trusted recovery coordinator. This is
+/// State data only: it does not fence an issuer, prove a provider stopped, or
+/// authorize opening a source. Payload bytes and credentials are not included.
+#[derive(Debug)]
+pub struct RecoverySnapshot {
+    pub retired_through: u64,
+    pub issued_through: u64,
+    pub unresolved: Vec<Entry>,
+}
+
+/// Read after a terminal State result from the selected durable provider.
+/// Entries marked cleaned remain visible when an earlier sequence is pending.
+pub fn recovery_snapshot(
+    source: &SequencedSource,
+    response: &Value,
+) -> Result<RecoverySnapshot, &'static str> {
+    let (_, journal) = read(source, response)?;
+    Ok(RecoverySnapshot {
+        retired_through: journal.retired,
+        issued_through: journal.issued,
+        unresolved: journal.entries,
+    })
+}
+
 /// The durable contiguous retirement watermark, not a provider result.
 /// Opening a broker source additionally requires the authority to verify old
 /// workers are retired and every unresolved record is reconciled.
