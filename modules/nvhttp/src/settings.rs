@@ -31,6 +31,7 @@ pub struct Settings {
     pub hostname: String,
     pub streaming: Option<StreamingConfig>,
     pub session_lifecycle_required: bool,
+    pub protocol_handlers: Vec<crate::wire::participants::Binding>,
 }
 
 impl Default for Settings {
@@ -47,12 +48,14 @@ impl Default for Settings {
             hostname: default_hostname(),
             streaming: None,
             session_lifecycle_required: false,
+            protocol_handlers: Vec::new(),
         }
     }
 }
 
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
+        crate::wire::participants::validate(&self.protocol_handlers)?;
         if !amaterasu_module_sdk::network::valid_provider(&self.network_provider) {
             return Err("invalid_network_provider");
         }

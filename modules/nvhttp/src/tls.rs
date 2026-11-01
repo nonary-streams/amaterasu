@@ -1,5 +1,7 @@
 //! Rustls owns TLS; the pairing provider retains private keys behind IdentityApi.
-use amaterasu_identity::{INTERFACE_MINOR_PERMISSIONS, IdentityApiV1_1};
+use amaterasu_identity::{
+    INTERFACE_MINOR_ENTITLEMENTS, INTERFACE_MINOR_PERMISSIONS, IdentityApiV1_1, IdentityApiV1_2,
+};
 use amaterasu_module_sdk::{NativeBinding, RuntimeClient, abi::*};
 use rustls::{
     CertificateError, DigitallySignedStruct, DistinguishedName, Error, ServerConfig,
@@ -26,6 +28,7 @@ struct NativeCalls {
     sign: unsafe extern "C" fn(*mut c_void, u32, BorrowedBytes, ReplySink) -> Status,
     verify: unsafe extern "C" fn(*mut c_void, BorrowedBytes) -> Status,
     permission: unsafe extern "C" fn(*mut c_void, BorrowedBytes, u32) -> Status,
+    entitlement: Option<unsafe extern "C" fn(*mut c_void, BorrowedBytes, BorrowedBytes) -> Status>,
 }
 
 struct Bridge {
@@ -137,15 +140,23 @@ pub struct Identity {
     binding: Option<NativeBinding>,
 }
 impl Identity {
-    pub fn bind(runtime: &RuntimeClient) -> Result<Self, String> {
+    pub fn bind(runtime: &RuntimeClient, require_entitlements: bool) -> Result<Self, String> {
         // SAFETY: signed dependency order keeps the identity provider loaded;
         // this owner gates all cloned signer references before releasing binding.
         let binding = unsafe {
             runtime.bind_native(
                 amaterasu_identity::SERVICE,
                 amaterasu_identity::INTERFACE_MAJOR,
-                INTERFACE_MINOR_PERMISSIONS,
-                size_of::<IdentityApiV1_1>() as u32,
+                if require_entitlements {
+                    INTERFACE_MINOR_ENTITLEMENTS
+                } else {
+                    INTERFACE_MINOR_PERMISSIONS
+                },
+                if require_entitlements {
+                    size_of::<IdentityApiV1_2>()
+                } else {
+                    size_of::<IdentityApiV1_1>()
+                } as u32,
             )
         }?;
         let bridge = {
@@ -158,6 +169,12 @@ impl Identity {
                     sign: api.v1_0.sign,
                     verify: api.v1_0.verify_client,
                     permission: api.check_permission,
+                    // SAFETY: a 1.2 full-size binding was requested above when needed.
+                    entitlement: if require_entitlements {
+                        Some(unsafe { binding.table::<IdentityApiV1_2>() }?.check_entitlement)
+                    } else {
+                        None
+                    },
                 },
                 active: Mutex::new(true),
             })
@@ -177,9 +194,35 @@ impl Identity {
     }
 
     pub fn allowed(&self, certificate: &[u8], permission: crate::wire::Permission) -> bool {
+        if let crate::wire::Permission::Entitlement(name) = permission {
+            if !amaterasu_identity::valid_entitlement(&name)
+                || certificate.is_empty()
+                || certificate.len() > amaterasu_identity::MAX_CERTIFICATE_BYTES
+            {
+                return false;
+            }
+            let Ok(active) = self.bridge.active.lock() else {
+                return false;
+            };
+            if !*active {
+                return false;
+            }
+            let Some(check) = self.bridge.calls.entitlement else {
+                return false;
+            };
+            // SAFETY: the active gate pins the binding and both slices outlive this synchronous call.
+            return unsafe {
+                check(
+                    self.bridge.calls.context,
+                    BorrowedBytes::new(certificate),
+                    BorrowedBytes::new(name.as_bytes()),
+                ) == STATUS_OK
+            };
+        }
         let selector = match permission {
             crate::wire::Permission::List => amaterasu_identity::PERMISSION_LIST,
             crate::wire::Permission::Launch => amaterasu_identity::PERMISSION_LAUNCH,
+            crate::wire::Permission::Entitlement(_) => unreachable!(),
         };
         self.bridge.permission_status(certificate, selector) == STATUS_OK
     }
@@ -488,6 +531,52 @@ mod tests {
         STATUS_OK
     }
 
+    unsafe extern "C" fn entitlement(
+        _: *mut c_void,
+        certificate: BorrowedBytes,
+        name: BorrowedBytes,
+    ) -> Status {
+        // SAFETY: the test supplies live slices for this synchronous callback.
+        if unsafe { certificate.read() }.ok() == Some(b"peer".as_slice())
+            && unsafe { name.read() }.ok() == Some(b"org.example/read".as_slice())
+        {
+            STATUS_OK
+        } else {
+            amaterasu_identity::IDENTITY_FORBIDDEN
+        }
+    }
+
+    #[test]
+    fn named_entitlement_requires_current_authority_and_live_binding() {
+        let identity = Identity {
+            bridge: Arc::new(Bridge {
+                calls: NativeCalls {
+                    context: std::ptr::null_mut(),
+                    certificate,
+                    sign,
+                    verify,
+                    permission,
+                    entitlement: Some(entitlement),
+                },
+                active: Mutex::new(true),
+            }),
+            binding: None,
+        };
+        let grant = || crate::wire::Permission::Entitlement("org.example/read".into());
+        assert!(identity.allowed(b"peer", grant()));
+        assert!(!identity.allowed(b"other", grant()));
+        assert!(!identity.allowed(
+            b"peer",
+            crate::wire::Permission::Entitlement("org.example/write".into())
+        ));
+        assert!(!identity.allowed(
+            b"peer",
+            crate::wire::Permission::Entitlement("invalid".into())
+        ));
+        identity.bridge.close();
+        assert!(!identity.allowed(b"peer", grant()));
+    }
+
     #[test]
     fn unavailable_permission_does_not_prove_session_revocation() {
         assert!(!permission_revoked(STATUS_OK));
@@ -508,6 +597,7 @@ mod tests {
                 sign,
                 verify,
                 permission,
+                entitlement: None,
             },
             active: Mutex::new(true),
         });
@@ -572,6 +662,7 @@ mod tests {
                     sign,
                     verify,
                     permission,
+                    entitlement: None,
                 },
                 active: Mutex::new(true),
             }),

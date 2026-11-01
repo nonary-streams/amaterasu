@@ -1,0 +1,191 @@
+//! Startup bindings from exact HTTP operations to already approved broker APIs.
+//! These bindings select no provider by themselves; the broker's installed
+//! API approval and call grant remain authoritative.
+use amaterasu_module_sdk::{Command, protocol_handler};
+use serde::Deserialize;
+use std::collections::BTreeSet;
+
+const MAX_BINDINGS: usize = 32;
+const RESERVED_PATHS: &[&str] = &[
+    "/serverinfo",
+    "/pair",
+    "/applist",
+    "/appasset",
+    "/launch",
+    "/cancel",
+    "/resume",
+    "/unpair",
+];
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Binding {
+    pub path: String,
+    pub http_method: String,
+    pub service: String,
+    pub method: String,
+    pub interface_major: u32,
+    pub interface_minor: u32,
+    pub schema: String,
+    pub entitlement: String,
+}
+
+pub fn validate(bindings: &[Binding]) -> Result<(), &'static str> {
+    if bindings.len() > MAX_BINDINGS {
+        return Err("too_many_protocol_bindings");
+    }
+    let mut claims = BTreeSet::new();
+    for binding in bindings {
+        let service_version = binding
+            .service
+            .rsplit_once('/')
+            .and_then(|(name, version)| {
+                (name.contains('.')
+                    && !name.starts_with("amaterasu.")
+                    && amaterasu_contracts::valid_name(name))
+                .then(|| version.parse::<u32>().ok())
+                .flatten()
+            });
+        let valid_path = binding.path.starts_with('/')
+            && binding.path.len() <= 128
+            && binding.path != "/"
+            && binding.path.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b'/' | b'-' | b'_')
+            })
+            && !binding.path.contains("//")
+            && !RESERVED_PATHS.contains(&binding.path.as_str());
+        if !valid_path
+            || !amaterasu_contracts::valid_name(&binding.service)
+            || binding.http_method.is_empty()
+            || binding.http_method.len() > 16
+            || !binding
+                .http_method
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase())
+            || service_version != Some(binding.interface_major)
+            || binding.interface_major == 0
+            || !amaterasu_contracts::valid_name(&binding.method)
+            || binding.method.contains('/')
+            || !amaterasu_contracts::valid_name(&binding.schema)
+            || !amaterasu_identity::valid_entitlement(&binding.entitlement)
+            || !claims.insert((&binding.path, &binding.http_method))
+        {
+            return Err("invalid_protocol_binding");
+        }
+    }
+    Ok(())
+}
+
+impl Binding {
+    /// Construct a broker call only from the trusted binding, never a service
+    /// or method supplied by the HTTP client. Authentication and authorization
+    /// must be checked by the protocol owner before this method is called.
+    pub fn call(
+        &self,
+        request: &protocol_handler::Request,
+        timeout_ms: u64,
+        operation_id: String,
+    ) -> Result<Command, &'static str> {
+        if !request.validate()
+            || request.schema != self.schema
+            || request.method != self.http_method
+            || request.target.split('?').next() != Some(self.path.as_str())
+            || !(1..=30_000).contains(&timeout_ms)
+            || !amaterasu_contracts::valid_name(&operation_id)
+        {
+            return Err("invalid_protocol_request");
+        }
+        let payload = serde_json::to_value(request).map_err(|_| "invalid_protocol_request")?;
+        Ok(Command::CallApi {
+            service: self.service.clone(),
+            method: self.method.clone(),
+            interface_major: self.interface_major,
+            interface_minor: self.interface_minor,
+            payload,
+            timeout_ms,
+            operation_id,
+            parent: None,
+        })
+    }
+}
+
+pub fn select<'a>(bindings: &'a [Binding], method: &str, target: &str) -> Option<&'a Binding> {
+    let path = target.split('?').next()?;
+    bindings
+        .iter()
+        .find(|binding| binding.http_method == method && binding.path == path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn binding(path: &str, http_method: &str) -> Binding {
+        Binding {
+            path: path.into(),
+            http_method: http_method.into(),
+            service: "org.example.handler/1".into(),
+            method: "handle".into(),
+            interface_major: 1,
+            interface_minor: 0,
+            schema: "org.example.request/1".into(),
+            entitlement: "org.example/read".into(),
+        }
+    }
+    #[test]
+    fn selects_exact_method_and_path_and_rejects_conflicts() {
+        let bindings = vec![binding("/neutral", "GET"), binding("/neutral", "POST")];
+        assert!(validate(&bindings).is_ok());
+        assert!(validate(&[binding("/neutral", "PUT")]).is_ok());
+        assert_eq!(
+            select(&bindings, "POST", "/neutral?key=value")
+                .unwrap()
+                .http_method,
+            "POST"
+        );
+        assert!(select(&bindings, "GET", "/neutral/other").is_none());
+        assert!(validate(&[binding("/neutral", "GET"), binding("/neutral", "GET")]).is_err());
+        assert!(validate(&[binding("/launch", "POST")]).is_err());
+    }
+    #[test]
+    fn refuses_invalid_authority_or_api_bindings() {
+        let mut value = binding("/neutral", "GET");
+        value.entitlement = "unscoped".into();
+        assert!(validate(&[value.clone()]).is_err());
+        value.entitlement = "org.example/read".into();
+        value.interface_major = 2;
+        assert!(validate(&[value]).is_err());
+    }
+    #[test]
+    fn call_uses_selected_api_and_rejects_mismatched_input() {
+        let binding = binding("/neutral", "POST");
+        let mut request = protocol_handler::Request {
+            version: 1,
+            schema: binding.schema.clone(),
+            method: "POST".into(),
+            target: "/neutral?value=1".into(),
+            body_base64: String::new(),
+            peer: protocol_handler::VerifiedPeer {
+                remote: "127.0.0.1".parse().unwrap(),
+                certificate_der_base64: "AQ==".into(),
+            },
+        };
+        match binding.call(&request, 1000, "test.call.1".into()).unwrap() {
+            Command::CallApi {
+                service,
+                method,
+                interface_major,
+                interface_minor,
+                ..
+            } => {
+                assert_eq!(service, "org.example.handler/1");
+                assert_eq!(method, "handle");
+                assert_eq!((interface_major, interface_minor), (1, 0));
+            }
+            _ => panic!("expected approved API invocation"),
+        }
+        request.target = "/another".into();
+        assert!(binding.call(&request, 1000, "test.call.1".into()).is_err());
+    }
+}

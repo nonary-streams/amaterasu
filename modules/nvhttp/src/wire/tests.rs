@@ -842,6 +842,7 @@ fn peer(
         peer_trusted,
         list_allowed: peer_trusted,
         launch_allowed: peer_trusted,
+        entitlement_allowed: false,
     }
 }
 
@@ -1293,4 +1294,510 @@ fn denied_launch_permission_blocks_known_ids_and_resume_before_work() {
         assert_eq!(reply.status, 403);
     }
     assert!(broker.accepted.is_empty());
+}
+
+fn neutral_binding(method: &str, api: &str) -> participants::Binding {
+    participants::Binding {
+        path: "/neutral".into(),
+        http_method: method.into(),
+        service: format!("org.example.{api}/1"),
+        method: "handle".into(),
+        interface_major: 1,
+        interface_minor: 0,
+        schema: "org.example.request/1".into(),
+        entitlement: "org.example/read".into(),
+    }
+}
+
+fn neutral_request(method: &str, body: &[u8]) -> Request {
+    Request {
+        method: method.into(),
+        target: "/neutral?arg=value".into(),
+        body: body.into(),
+    }
+}
+
+fn entitled_peer() -> RequestContext {
+    let mut peer = trusted_tls(b"certificate");
+    peer.entitlement_allowed = true;
+    peer
+}
+
+#[test]
+fn approved_participants_use_exact_api_and_validate_responses() {
+    let now = Instant::now();
+    let mut router = router();
+    router.set_participants(vec![
+        neutral_binding("GET", "first"),
+        neutral_binding("POST", "second"),
+    ]);
+    let mut accepted = Vec::new();
+    let mut send = |command| {
+        Ok(match command {
+            Command::CallApi {
+                service, payload, ..
+            } => {
+                accepted.push((service, payload));
+                Response::Accepted {
+                    id: accepted.len() as u64,
+                }
+            }
+            Command::TakeResult { request } => Response::Result {
+                payload: if request == 1 {
+                    json!({"version":1,"status":200,"content_type":"text/plain","body_base64":"b2s="})
+                } else {
+                    json!({"version":1,"status":200,"content_type":"text/plain\r\nInjected: x","body_base64":"b2s="})
+                },
+            },
+            _ => panic!("unexpected broker command"),
+        })
+    };
+    assert!(
+        router
+            .dispatch_with(
+                1,
+                neutral_request("GET", b""),
+                entitled_peer(),
+                now,
+                &mut send
+            )
+            .is_none()
+    );
+    assert!(
+        router
+            .dispatch_with(
+                2,
+                neutral_request("POST", b"test"),
+                entitled_peer(),
+                now,
+                &mut send
+            )
+            .is_none()
+    );
+    assert!(
+        router
+            .poll_with_identity(now, &mut send, |_, _| true)
+            .is_empty()
+    );
+    let replies = router.poll_with_identity(now, &mut send, |_, _| true);
+    assert_eq!(replies.len(), 2);
+    assert_eq!(replies[0].1.status, 200);
+    assert_eq!(replies[0].1.body, b"ok");
+    assert_eq!(replies[1].1.status, 502);
+    drop(send);
+    assert_eq!(accepted[0].0, "org.example.first/1");
+    assert_eq!(accepted[1].0, "org.example.second/1");
+}
+
+#[test]
+fn participant_denial_bounds_and_disconnect_are_enforced() {
+    let now = Instant::now();
+    let mut router = router();
+    router.set_participants(vec![neutral_binding("POST", "first")]);
+    let mut commands = Vec::new();
+    let mut send = |command| {
+        commands.push(format!("{command:?}"));
+        Ok(match command {
+            Command::CallApi { .. } => Response::Accepted { id: 7 },
+            Command::Cancel { .. } => Response::Ok,
+            Command::TakeResult { .. } => Response::Error {
+                code: "cancelled".into(),
+                message: String::new(),
+            },
+            _ => panic!("unexpected broker command"),
+        })
+    };
+    let mut denied = entitled_peer();
+    denied.entitlement_allowed = false;
+    assert_eq!(
+        router
+            .dispatch_with(1, neutral_request("POST", b""), denied, now, &mut send)
+            .unwrap()
+            .status,
+        403
+    );
+    assert_eq!(
+        router
+            .dispatch_with(
+                2,
+                neutral_request("POST", &vec![0; protocol_handler::MAX_BODY_BYTES + 1]),
+                entitled_peer(),
+                now,
+                &mut send
+            )
+            .unwrap()
+            .status,
+        413
+    );
+    assert!(
+        router
+            .dispatch_with(
+                3,
+                neutral_request("POST", b"ok"),
+                entitled_peer(),
+                now,
+                &mut send
+            )
+            .is_none()
+    );
+    assert!(
+        router
+            .poll_with_identity(now, &mut send, |_, _| true)
+            .is_empty()
+    );
+    router.cancel_with(3, now, &mut send);
+    assert!(
+        router
+            .poll_with_identity(now, &mut send, |_, _| true)
+            .is_empty()
+    );
+    drop(send);
+    assert!(commands.iter().any(|command| command.contains("Cancel")));
+}
+
+#[test]
+fn participant_revocation_cancels_pending_work() {
+    let now = Instant::now();
+    let mut router = router();
+    router.set_participants(vec![neutral_binding("POST", "first")]);
+    let mut cancelled = false;
+    let mut send = |command| {
+        Ok(match command {
+            Command::CallApi { .. } => Response::Accepted { id: 7 },
+            Command::Cancel { .. } => {
+                cancelled = true;
+                Response::Ok
+            }
+            Command::TakeResult { .. } => Response::Error {
+                code: "cancelled".into(),
+                message: String::new(),
+            },
+            _ => panic!("unexpected broker command"),
+        })
+    };
+    assert!(
+        router
+            .dispatch_with(
+                1,
+                neutral_request("POST", b"ok"),
+                entitled_peer(),
+                now,
+                &mut send
+            )
+            .is_none()
+    );
+    assert!(
+        router
+            .poll_with_identity(now, &mut send, |_, _| true)
+            .is_empty()
+    );
+    let replies = router.poll_with_identity(now, &mut send, |_, _| false);
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].1.status, 504);
+    drop(send);
+    assert!(cancelled);
+}
+
+#[test]
+fn approved_broker_can_replace_participant_without_changing_consumer() {
+    use amaterasu_contracts::{
+        ApiFieldKind, ApiMethod, ApiMethodApproval, ApiPrivilege, ApiSchema, Grants, RuntimeConfig,
+    };
+    use amaterasu_runtime::Broker;
+    let schema = |required: &[(&str, ApiFieldKind)]| ApiSchema {
+        required: required
+            .iter()
+            .map(|(name, kind)| ((*name).into(), kind.clone()))
+            .collect(),
+        optional: BTreeMap::new(),
+        allow_extra: false,
+    };
+    let request_schema = schema(&[
+        ("version", ApiFieldKind::Integer),
+        ("schema", ApiFieldKind::String),
+        ("method", ApiFieldKind::String),
+        ("target", ApiFieldKind::String),
+        ("body_base64", ApiFieldKind::String),
+        ("peer", ApiFieldKind::Object),
+    ]);
+    let response_schema = schema(&[
+        ("version", ApiFieldKind::Integer),
+        ("status", ApiFieldKind::Integer),
+        ("content_type", ApiFieldKind::String),
+        ("body_base64", ApiFieldKind::String),
+    ]);
+    let binding = neutral_binding("POST", "first");
+    let method = ApiMethod {
+        service: binding.service.clone(),
+        method: binding.method.clone(),
+        interface_major: 1,
+        interface_minor: 0,
+        request: request_schema,
+        response: response_schema,
+        privilege: ApiPrivilege::User,
+    };
+    for provider in [
+        "org.example.first-provider",
+        "org.example.replacement-provider",
+    ] {
+        let mut config = RuntimeConfig::default();
+        config.principals.insert(
+            "amaterasu.nvhttp".into(),
+            Grants {
+                call: [method.service.clone()].into(),
+                ..Default::default()
+            },
+        );
+        config.principals.insert(
+            provider.into(),
+            Grants {
+                provide: [method.service.clone()].into(),
+                ..Default::default()
+            },
+        );
+        config.api_methods.push(ApiMethodApproval {
+            provider: provider.into(),
+            callers: ["amaterasu.nvhttp".into()].into(),
+            method: method.clone(),
+        });
+        let mut broker = Broker::new(config).unwrap();
+        assert!(matches!(
+            broker.dispatch(
+                provider,
+                Command::RegisterApi {
+                    method: method.clone()
+                }
+            ),
+            Response::Ok
+        ));
+        let now = Instant::now();
+        let mut router = router();
+        router.set_participants(vec![binding.clone()]);
+        let mut owner = |command| Ok(broker.dispatch("amaterasu.nvhttp", command));
+        assert!(
+            router
+                .dispatch_with(
+                    1,
+                    neutral_request("POST", b"ok"),
+                    entitled_peer(),
+                    now,
+                    &mut owner
+                )
+                .is_none()
+        );
+        assert!(
+            router
+                .poll_with_identity(now, &mut owner, |_, _| true)
+                .is_empty()
+        );
+        let Response::Request {
+            id,
+            caller,
+            payload,
+            ..
+        } = broker.dispatch(provider, Command::Poll {})
+        else {
+            panic!("provider did not receive selected API request")
+        };
+        assert_eq!(caller, "amaterasu.nvhttp");
+        assert_eq!(payload["method"], "handle");
+        assert!(matches!(broker.dispatch(provider, Command::Complete { request: id, payload: json!({"version":1,"status":200,"content_type":"text/plain","body_base64":"b2s="}) }), Response::Ok));
+        let replies = router.poll_with_identity(
+            now,
+            &mut |command| Ok(broker.dispatch("amaterasu.nvhttp", command)),
+            |_, _| true,
+        );
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].1.body, b"ok");
+    }
+}
+
+#[test]
+fn lost_admission_retries_only_while_authorized_with_same_identity() {
+    use std::cell::RefCell;
+    let now = Instant::now();
+    let mut router = router();
+    router.set_participants(vec![neutral_binding("POST", "first")]);
+    let attempts = RefCell::new(Vec::new());
+    let mut send = |command: Command| match command {
+        Command::CallApi {
+            operation_id,
+            payload,
+            timeout_ms,
+            ..
+        } => {
+            let mut calls = attempts.borrow_mut();
+            calls.push((operation_id, payload, timeout_ms));
+            if calls.len() == 1 {
+                Err("admission reply lost".into())
+            } else {
+                Ok(Response::Accepted { id: 7 })
+            }
+        }
+        Command::Cancel { .. } => Ok(Response::Ok),
+        Command::TakeResult { .. } => Ok(Response::Error {
+            code: "cancelled".into(),
+            message: String::new(),
+        }),
+        _ => panic!("unexpected broker command"),
+    };
+    assert!(
+        router
+            .dispatch_with(
+                1,
+                neutral_request("POST", b"ok"),
+                entitled_peer(),
+                now,
+                &mut send
+            )
+            .is_none()
+    );
+    assert!(
+        router
+            .poll_with_identity(now, &mut send, |_, _| true)
+            .is_empty()
+    );
+    assert_eq!(attempts.borrow().len(), 1);
+    assert!(
+        router
+            .poll_with_identity(now + Duration::from_millis(99), &mut send, |_, _| true)
+            .is_empty()
+    );
+    assert_eq!(attempts.borrow().len(), 1);
+    assert!(
+        router
+            .poll_with_identity(now + Duration::from_millis(100), &mut send, |_, _| true)
+            .is_empty()
+    );
+    let calls = attempts.borrow();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].0, calls[1].0);
+    assert_eq!(calls[0].1, calls[1].1);
+    assert!(calls[1].2 < calls[0].2);
+    drop(calls);
+    router.cancel_with(1, now + Duration::from_millis(101), &mut send);
+}
+
+#[test]
+fn lost_admission_is_never_retried_after_disconnect_or_revocation() {
+    use std::cell::Cell;
+    for disconnect in [true, false] {
+        let now = Instant::now();
+        let mut router = router();
+        router.set_participants(vec![neutral_binding("POST", "first")]);
+        let attempts = Cell::new(0);
+        let mut send = |command: Command| {
+            if matches!(command, Command::CallApi { .. }) {
+                attempts.set(attempts.get() + 1);
+                Err("admission reply lost".into())
+            } else {
+                panic!("unknown admission must not be retried or cancelled using a guessed ID")
+            }
+        };
+        assert!(
+            router
+                .dispatch_with(
+                    1,
+                    neutral_request("POST", b"ok"),
+                    entitled_peer(),
+                    now,
+                    &mut send
+                )
+                .is_none()
+        );
+        assert!(
+            router
+                .poll_with_identity(now, &mut send, |_, _| true)
+                .is_empty()
+        );
+        if disconnect {
+            router.cancel_with(1, now + Duration::from_millis(1), &mut send);
+        } else {
+            assert_eq!(
+                router
+                    .poll_with_identity(now + Duration::from_millis(1), &mut send, |_, _| false)
+                    .len(),
+                1
+            );
+        }
+        assert!(
+            router
+                .poll_with_identity(now + Duration::from_millis(200), &mut send, |_, _| true)
+                .is_empty()
+        );
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(router.jobs.len(), 1);
+        assert!(
+            router
+                .poll_with_identity(now + SERVICE_TIMEOUT, &mut send, |_, _| true)
+                .is_empty()
+        );
+        assert!(router.jobs.is_empty());
+    }
+}
+
+#[test]
+fn participant_shutdown_cancels_known_work_without_retrying_unknown_admission() {
+    use std::cell::RefCell;
+    let now = Instant::now();
+    let mut router = router();
+    router.set_participants(vec![
+        neutral_binding("POST", "first"),
+        neutral_binding("GET", "second"),
+    ]);
+    let calls = RefCell::new(Vec::new());
+    let mut send = |command: Command| {
+        calls.borrow_mut().push(format!("{command:?}"));
+        match command {
+            Command::CallApi { service, .. } if service == "org.example.first/1" => {
+                Ok(Response::Accepted { id: 7 })
+            }
+            Command::CallApi { .. } => Err("admission reply lost".into()),
+            Command::Cancel { request: 7 } => Ok(Response::Ok),
+            Command::TakeResult { request: 7 } => Ok(Response::Error {
+                code: "cancelled".into(),
+                message: String::new(),
+            }),
+            _ => panic!("unexpected broker command"),
+        }
+    };
+    assert!(
+        router
+            .dispatch_with(
+                1,
+                neutral_request("POST", b""),
+                entitled_peer(),
+                now,
+                &mut send
+            )
+            .is_none()
+    );
+    assert!(
+        router
+            .dispatch_with(
+                2,
+                neutral_request("GET", b""),
+                entitled_peer(),
+                now,
+                &mut send
+            )
+            .is_none()
+    );
+    assert!(
+        router
+            .poll_with_identity(now, &mut send, |_, _| true)
+            .is_empty()
+    );
+    router.shutdown_with(now, &mut send);
+    let calls = calls.borrow();
+    assert_eq!(
+        calls.iter().filter(|call| call.contains("CallApi")).count(),
+        2
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call.contains("Cancel { request: 7 }"))
+    );
+    assert!(router.jobs.is_empty());
 }

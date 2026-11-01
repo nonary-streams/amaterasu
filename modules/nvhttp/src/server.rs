@@ -293,7 +293,7 @@ impl Server {
                 && output.requires_paired_tls
                 && !connection
                     .peer_certificate()
-                    .is_some_and(|certificate| verify(&certificate, output.permission))
+                    .is_some_and(|certificate| verify(&certificate, output.permission.clone()))
             {
                 events.closed.push(Closed {
                     id: *id,
@@ -399,7 +399,7 @@ impl Server {
                 .filter(|tls| !tls.is_handshaking())
                 .and_then(|tls| tls.peer_certificates())
                 .and_then(|certificates| certificates.first())
-                .is_some_and(|certificate| verify(certificate.as_ref(), reply.permission))
+                .is_some_and(|certificate| verify(certificate.as_ref(), reply.permission.clone()))
         } else {
             false
         };
@@ -804,7 +804,7 @@ fn parse_request(bytes: &[u8]) -> Result<Option<Request>, u16> {
 fn simple_reply(status: u16, message: &str) -> Reply {
     Reply {
         status,
-        content_type: "text/plain; charset=utf-8",
+        content_type: "text/plain; charset=utf-8".into(),
         body: message.as_bytes().to_vec(),
         requires_paired_tls: false,
         permission: None,

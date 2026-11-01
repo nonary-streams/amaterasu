@@ -159,7 +159,7 @@ impl Applications {
         }
         Reply {
             status: 200,
-            content_type: "application/xml; charset=utf-8",
+            content_type: "application/xml; charset=utf-8".into(),
             body: self.body.into_bytes(),
             requires_paired_tls: true,
             permission: Some(Permission::List),

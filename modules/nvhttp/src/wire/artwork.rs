@@ -184,7 +184,7 @@ impl Router {
                         connection,
                         Reply {
                             status: 200,
-                            content_type: mime,
+                            content_type: mime.into(),
                             body: bytes,
                             requires_paired_tls: true,
                             permission: Some(Permission::List),
@@ -324,6 +324,7 @@ mod tests {
             peer_trusted: true,
             list_allowed: true,
             launch_allowed: false,
+            entitlement_allowed: false,
         };
         let request = Request {
             method: "GET".into(),
@@ -395,6 +396,7 @@ mod tests {
             peer_trusted: true,
             list_allowed: true,
             launch_allowed: false,
+            entitlement_allowed: false,
         };
         let request = || Request {
             method: "GET".into(),
@@ -454,6 +456,7 @@ mod tests {
             peer_trusted: true,
             list_allowed: allowed,
             launch_allowed: false,
+            entitlement_allowed: false,
         };
         let request = || Request {
             method: "GET".into(),

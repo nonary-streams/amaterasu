@@ -274,7 +274,7 @@ impl ManagedModule for NvhttpModule {
             .then(|| amaterasu_module_sdk::network::Network::from_settings(&runtime, &payload))
             .transpose()?;
         let (server, router, identity) = if settings.enabled {
-            let identity = tls::Identity::bind(&runtime)?;
+            let identity = tls::Identity::bind(&runtime, !settings.protocol_handlers.is_empty())?;
             let server = server::Server::bind_with_network(
                 network
                     .as_ref()
@@ -284,7 +284,7 @@ impl ManagedModule for NvhttpModule {
             )?;
             let mut launches = launch::Controller::new(settings.streaming.clone())?;
             launches.set_session_lifecycle_required(settings.session_lifecycle_required);
-            let router = wire::Router::new(
+            let mut router = wire::Router::new(
                 wire::RouterConfig {
                     hostname: hostname.clone(),
                     http_port: server.http_address().port(),
@@ -292,6 +292,7 @@ impl ManagedModule for NvhttpModule {
                 },
                 launches,
             );
+            router.set_participants(settings.protocol_handlers.clone());
             (Some(server), Some(router), Some(identity))
         } else {
             (None, None, None)
@@ -531,6 +532,12 @@ impl ManagedModule for NvhttpModule {
                 };
                 let list_allowed = trusted && allowed(wire::Permission::List);
                 let launch_allowed = trusted && allowed(wire::Permission::Launch);
+                let entitlement_allowed = trusted
+                    && router
+                        .participant_entitlement(&incoming.request)
+                        .is_some_and(|name| {
+                            allowed(wire::Permission::Entitlement(name.to_owned()))
+                        });
                 if incoming.request.target.split('?').next() == Some("/launch") {
                     // Deliberately omit the query: Moonlight sends session keys there.
                     eprintln!(
@@ -548,6 +555,7 @@ impl ManagedModule for NvhttpModule {
                         peer_trusted: trusted,
                         list_allowed,
                         launch_allowed,
+                        entitlement_allowed,
                     },
                     &self.runtime,
                 ) {

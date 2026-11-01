@@ -4,6 +4,7 @@ mod artwork;
 mod capabilities;
 mod cleanup;
 mod pairing;
+pub(crate) mod participants;
 mod query;
 mod streaming;
 pub(crate) mod xml;
@@ -12,7 +13,8 @@ use crate::{
     launch::{CaptureMode, Controller as LaunchController, LaunchRequest, PeerIdentity},
     preparation::PreparationStep,
 };
-use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
+use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient, protocol_handler};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use query::Query;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -35,6 +37,7 @@ pub struct RequestContext {
     pub peer_trusted: bool,
     pub list_allowed: bool,
     pub launch_allowed: bool,
+    pub entitlement_allowed: bool,
 }
 
 impl RequestContext {
@@ -60,16 +63,17 @@ impl RequestContext {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Permission {
     List,
     Launch,
+    Entitlement(String),
 }
 
 #[derive(Debug)]
 pub struct Reply {
     pub status: u16,
-    pub content_type: &'static str,
+    pub content_type: String,
     pub body: Vec<u8>,
     pub requires_paired_tls: bool,
     pub permission: Option<Permission>,
@@ -93,6 +97,7 @@ pub struct RouterConfig {
 
 pub struct Router {
     config: RouterConfig,
+    participants: Vec<participants::Binding>,
     launches: LaunchController,
     transcripts: BTreeMap<String, pairing::Transcript>,
     jobs: BTreeMap<u64, Job>,
@@ -112,8 +117,18 @@ struct Job {
 }
 
 enum Call {
-    Ready { payload: Value, not_before: Instant },
-    Waiting { request: u64 },
+    Ready {
+        payload: Value,
+        not_before: Instant,
+    },
+    Waiting {
+        request: u64,
+    },
+    /// Admission may have succeeded even though its reply was lost.
+    Uncertain {
+        command: Command,
+        not_before: Instant,
+    },
 }
 
 #[derive(Clone)]
@@ -149,6 +164,10 @@ enum Purpose {
         id: String,
         transfer_id: String,
     },
+    Participant {
+        binding: participants::Binding,
+        certificate: Vec<u8>,
+    },
     Applications {
         desktop_enabled: bool,
         certificate: Vec<u8>,
@@ -165,6 +184,7 @@ impl Router {
         launches.set_device_name(&config.hostname);
         Self {
             config,
+            participants: Vec::new(),
             launches,
             transcripts: BTreeMap::new(),
             jobs: BTreeMap::new(),
@@ -173,6 +193,15 @@ impl Router {
             next_job: 0,
             next_call: 0,
         }
+    }
+
+    pub fn set_participants(&mut self, bindings: Vec<participants::Binding>) {
+        self.participants = bindings;
+    }
+
+    pub fn participant_entitlement(&self, request: &Request) -> Option<&str> {
+        participants::select(&self.participants, &request.method, &request.target)
+            .map(|binding| binding.entitlement.as_str())
     }
 
     pub fn set_hostname(&mut self, hostname: String) {
@@ -327,6 +356,46 @@ impl Router {
         now: Instant,
         _send: &mut impl FnMut(Command) -> ModuleResult<Response>,
     ) -> Option<Reply> {
+        if let Some(binding) =
+            participants::select(&self.participants, &request.method, &request.target).cloned()
+        {
+            if !peer.trusted() {
+                return Some(xml::error(401, "authenticated paired TLS is required"));
+            }
+            if !peer.entitlement_allowed {
+                return Some(xml::error(403, "client entitlement denied"));
+            }
+            let Some(certificate) = peer.peer_certificate else {
+                return Some(xml::error(401, "client certificate is unavailable"));
+            };
+            let envelope = protocol_handler::Request {
+                version: 1,
+                schema: binding.schema.clone(),
+                method: request.method,
+                target: request.target,
+                body_base64: STANDARD.encode(request.body),
+                peer: protocol_handler::VerifiedPeer {
+                    remote: peer.remote,
+                    certificate_der_base64: STANDARD.encode(&certificate),
+                },
+            };
+            if !envelope.validate() {
+                return Some(xml::error(413, "protocol request exceeds limits"));
+            }
+            return self
+                .queue(
+                    Some(connection),
+                    Purpose::Participant {
+                        binding,
+                        certificate,
+                    },
+                    serde_json::to_value(envelope).expect("request is serializable"),
+                    now + SERVICE_TIMEOUT,
+                    now,
+                )
+                .err()
+                .map(|error| xml::error(503, error));
+        }
         if request.method != "GET" || !request.body.is_empty() {
             return Some(xml::error(405, "only bodyless GET requests are supported"));
         }
@@ -562,6 +631,15 @@ impl Router {
             let Some(mut job) = self.jobs.remove(&key) else {
                 continue;
             };
+            // A disconnected or revoked uncertain call cannot be safely retried:
+            // doing so could create work that the broker never accepted. Keep its
+            // bounded admission slot until its original deadline instead.
+            if job.connection.is_none() && matches!(job.call, Call::Uncertain { .. }) {
+                if now < job.deadline {
+                    self.jobs.insert(key, job);
+                }
+                continue;
+            }
             let permission = match &job.purpose {
                 Purpose::Applications { certificate, .. }
                 | Purpose::Artwork { certificate, .. } => {
@@ -570,6 +648,13 @@ impl Router {
                 Purpose::LaunchIdentity { peer, .. } => {
                     Some((peer.certificate(), Permission::Launch))
                 }
+                Purpose::Participant {
+                    binding,
+                    certificate,
+                } => Some((
+                    certificate.as_slice(),
+                    Permission::Entitlement(binding.entitlement.clone()),
+                )),
                 _ => None,
             };
             if permission.is_some_and(|(certificate, permission)| !allowed(certificate, permission))
@@ -589,7 +674,9 @@ impl Router {
                 self.jobs.insert(key, job);
                 continue;
             };
-            let continued = if matches!(job.purpose, Purpose::ArtworkRelease { .. }) {
+            let continued = if matches!(job.purpose, Purpose::Participant { .. }) {
+                self.resolve_participant(job, result, &mut replies)
+            } else if matches!(job.purpose, Purpose::ArtworkRelease { .. }) {
                 self.resolve_artwork_release(job, result, now)
             } else if matches!(job.purpose, Purpose::Artwork { .. }) {
                 self.resolve_artwork(job, result, now, &mut replies)
@@ -633,24 +720,81 @@ impl Router {
                     .min(SERVICE_TIMEOUT)
                     .as_millis()
                     .max(1) as u64;
-                match send(Command::Request {
-                    service: if let Some(artwork) = &job.artwork {
-                        artwork.service()
-                    } else {
-                        job.purpose.service()
+                let command = if let Purpose::Participant { binding, .. } = &job.purpose {
+                    let request: protocol_handler::Request =
+                        match serde_json::from_value(payload.clone()) {
+                            Ok(request) => request,
+                            Err(_) => return Some(Err("invalid protocol request".into())),
+                        };
+                    // Random operation IDs prevent an old retained broker record
+                    // from being reused after this protocol owner restarts.
+                    let mut nonce = [0u8; 16];
+                    if getrandom::fill(&mut nonce).is_err() {
+                        return Some(Err("operation identifier unavailable".into()));
                     }
-                    .into(),
-                    payload: payload.clone(),
-                    timeout_ms,
-                    operation_id: format!("nvhttp-wire-{sequence}"),
-                    parent: None,
-                }) {
+                    let operation_id = format!(
+                        "nvhttp-handler-{}",
+                        nonce
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>()
+                    );
+                    match binding.call(&request, timeout_ms, operation_id) {
+                        Ok(command) => command,
+                        Err(error) => return Some(Err(error.into())),
+                    }
+                } else {
+                    Command::Request {
+                        service: if let Some(artwork) = &job.artwork {
+                            artwork.service()
+                        } else {
+                            job.purpose.service()
+                        }
+                        .into(),
+                        payload: payload.clone(),
+                        timeout_ms,
+                        operation_id: format!("nvhttp-wire-{sequence}"),
+                        parent: None,
+                    }
+                };
+                match send(command.clone()) {
                     Ok(Response::Accepted { id }) => {
                         job.call = Call::Waiting { request: id };
                         None
                     }
+                    Err(_) if matches!(job.purpose, Purpose::Participant { .. }) => {
+                        job.call = Call::Uncertain {
+                            command,
+                            not_before: now + Duration::from_millis(100),
+                        };
+                        None
+                    }
                     response => Some(Err(response_code(&response).into())),
                 }
+            }
+            Call::Uncertain { not_before, .. } if now < *not_before => None,
+            Call::Uncertain { command, .. } => {
+                let mut retry = command.clone();
+                if let Command::CallApi { timeout_ms, .. } = &mut retry {
+                    // The broker ignores timeout in idempotence matching. Lowering
+                    // it cannot extend the deadline if this is a new admission.
+                    *timeout_ms = job
+                        .deadline
+                        .saturating_duration_since(now)
+                        .as_millis()
+                        .clamp(1, 30_000) as u64;
+                }
+                match send(retry) {
+                    Ok(Response::Accepted { id }) => job.call = Call::Waiting { request: id },
+                    _ => {
+                        // A denial or another transport error on a retry does not
+                        // prove that the original admission did not happen.
+                        if let Call::Uncertain { not_before, .. } = &mut job.call {
+                            *not_before = now + Duration::from_millis(100);
+                        }
+                    }
+                }
+                None
             }
             Call::Waiting { request } => match send(Command::TakeResult { request: *request }) {
                 Ok(Response::Pending) => None,
@@ -663,6 +807,40 @@ impl Router {
                 }
             },
         }
+    }
+
+    fn resolve_participant(
+        &self,
+        job: Job,
+        result: Result<Value, String>,
+        replies: &mut Vec<(u64, Reply)>,
+    ) -> Option<Job> {
+        let Purpose::Participant { binding, .. } = &job.purpose else {
+            return None;
+        };
+        let response = result
+            .ok()
+            .and_then(|value| serde_json::from_value::<protocol_handler::Response>(value).ok())
+            .filter(|response| response.validate());
+        let reply = match response.and_then(|response| {
+            STANDARD
+                .decode(&response.body_base64)
+                .ok()
+                .map(|body| (response, body))
+        }) {
+            Some((response, body)) => Reply {
+                status: response.status,
+                content_type: response.content_type,
+                body,
+                requires_paired_tls: true,
+                permission: Some(Permission::Entitlement(binding.entitlement.clone())),
+            },
+            None => xml::error(502, "invalid participant response"),
+        };
+        if let Some(connection) = job.connection {
+            replies.push((connection, reply));
+        }
+        None
     }
 
     pub fn cancel(&mut self, connection: u64, runtime: &RuntimeClient) {
@@ -712,17 +890,46 @@ impl Router {
     }
 
     pub fn shutdown(&mut self, runtime: &RuntimeClient) {
-        self.launches
-            .shutdown(&mut |command| runtime.send_ephemeral(command));
+        self.shutdown_with(Instant::now(), &mut |command| {
+            runtime.send_ephemeral(command)
+        });
+    }
+
+    fn shutdown_with(
+        &mut self,
+        now: Instant,
+        send: &mut impl FnMut(Command) -> ModuleResult<Response>,
+    ) {
+        self.launches.shutdown(send);
+        let participants: Vec<_> = self
+            .jobs
+            .iter()
+            .filter_map(|(key, job)| {
+                matches!(job.purpose, Purpose::Participant { .. }).then_some(*key)
+            })
+            .collect();
+        for key in participants {
+            if let Some(job) = self.jobs.remove(&key)
+                && let Call::Waiting { request } = job.call
+            {
+                self.retire_request(request, now, send);
+            }
+        }
     }
 
     fn expire_job(
         &mut self,
-        job: Job,
+        mut job: Job,
         now: Instant,
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
         replies: &mut Vec<(u64, Reply)>,
     ) -> Option<Job> {
+        if matches!(job.call, Call::Uncertain { .. }) && now < job.deadline {
+            if let Some(connection) = job.connection.take() {
+                replies.push((connection, xml::error(504, "request expired")));
+            }
+            return Some(job);
+        }
         if let Call::Waiting { request } = job.call {
             self.retire_request(request, now, send);
         }
