@@ -109,3 +109,9 @@ mod tests {
 
 /// Optional, separately composed extension messages for input devices.
 pub mod extensions;
+/// Provider-side, receipt-checked whole-stream retirement handshake.
+pub mod feedback_retirement;
+/// Provider-side lifecycle-bound lease and ordered batch helpers.
+pub mod session_binding;
+/// Provider-side lifecycle and device source-observation handshake.
+pub mod source_observation;

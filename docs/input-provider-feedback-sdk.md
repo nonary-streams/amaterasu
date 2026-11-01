@@ -1,0 +1,9 @@
+# Input provider feedback helpers
+
+`amaterasu_module_sdk::input` exposes three provider-side helpers used by the built-in input service. They do not create devices or authorize a plugin. Startup composition must select a trusted provider and grant its calls; the provider remains responsible for validating the broker-attested caller and initiator and for managing its devices, leases and bounded queues.
+
+- `session_binding` tracks lifecycle-issued tokens, exact owner and lease, activation and ordered batch sequence. `AcquireJob` and `BatchActivationJob` ask the lifecycle provider to validate a token and bind the reply to the parent request. A provider must recheck cancellation before applying effects. `authorize_batch` preserves the existing unbound legacy path when no token is supplied; a lifecycle-bound feedback route must require a token explicitly.
+- `source_observation` checks a selected-owner request and resolves its active lifecycle source. The provider supplies a point-in-time owned device generation, capabilities, selected offer and immutable session policy, and must recompute `current` around each advance. The result is an observation, not a pairing grant or a promise of physical support.
+- `feedback_retirement` submits a bounded owner request and accepts only a response matching the input binding, target, boot epoch and operation, with a whole-control-stream receipt and pairing settlement. Fence new input first and retain ownership while `advance` returns false. Completion is local retirement evidence; packets already sent cannot be recalled.
+
+An independent provider still needs to implement lease acquisition and deduplication, expiry, event validation, negotiated capabilities, feedback backpressure and acknowledgement, cancellation and device cleanup. These helpers are not a complete input-provider implementation. Native providers are trusted code, not sandboxed by SDK grants.
