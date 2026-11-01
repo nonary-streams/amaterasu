@@ -5,13 +5,15 @@
 use crate::{
     Command, Response,
     broker_effect_fence::{
-        self, EffectFenceCommand, EffectScope, HostProviderRetirement, ProtectedMethod,
-        SelectedEffectMethod, SourceSlotLease,
+        self, EffectFenceCommand, EffectScope, GuardedEffectIdentity, HostProviderRetirement,
+        ProtectedMethod, SelectedEffectMethod, SourceSlotLease,
     },
     effect_authority::Source,
     extension_api::LifecycleTarget,
     protocol::{DispatchRequest, PendingEffect, ProtocolRouter, Route},
     protocol_slot_state,
+    protocol_state::{CleanupReference, DurableStateBinding},
+    state::StateRequest,
 };
 type SendResult = Result<Response, String>;
 fn command(command: EffectFenceCommand) -> Command {
@@ -45,9 +47,11 @@ pub struct SlotActionRequest<'a> {
 
 /// A selected action, prepared only after trusted pairing has authenticated
 /// the source, negotiated capability and checked the client's permission.
-/// This is not an admission receipt and exposes no State write or dispatch.
+/// This is not an admission receipt; the broker must recheck the selection
+/// under its admission lock after the canonical State write.
 pub struct SelectedSlotAction {
     selected: SelectedEffectMethod,
+    cleanup_approval: amaterasu_contracts::ApiMethodApproval,
     pending: PendingEffect,
     scope: EffectScope,
     lease: SourceSlotLease,
@@ -93,8 +97,34 @@ impl SelectedSlotAction {
         {
             return Err("selection_mismatch".into());
         }
+        let cleanup = &route.cleanup_approval.method;
+        let response = authority(command(EffectFenceCommand::SelectedCleanupMethod {
+            method: ProtectedMethod {
+                service: cleanup.service.clone(),
+                method: cleanup.method.clone(),
+                interface_major: cleanup.interface_major,
+            },
+        }))?;
+        let Response::Result { payload } = response else {
+            return Err("cleanup_selection_unavailable".into());
+        };
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct CleanupSelection {
+            approval: amaterasu_contracts::ApiMethodApproval,
+            provider_incarnation: Option<broker_effect_fence::ProviderIncarnation>,
+        }
+        let cleanup: CleanupSelection =
+            serde_json::from_value(payload).map_err(|_| "cleanup_selection_invalid")?;
+        if cleanup.approval != route.cleanup_approval
+            || cleanup.approval.provider != selected.provider
+            || cleanup.provider_incarnation != selected.provider_incarnation
+        {
+            return Err("cleanup_selection_mismatch".into());
+        }
         Ok(Self {
             selected,
+            cleanup_approval: cleanup.approval,
             pending,
             scope,
             lease,
@@ -116,10 +146,95 @@ impl SelectedSlotAction {
     pub fn pending(&self) -> &PendingEffect {
         &self.pending
     }
-    /// The committed broker does not yet expose authority-only cleanup
-    /// selection. No write or effect is admitted until that query is available.
-    pub fn prepare_issue(&self) -> Result<(), &'static str> {
-        Err("cleanup_selection_unavailable")
+    /// Prepare the pairing-owned canonical slot CAS. The binding and State
+    /// response must refer to the authority's selected durable CAS provider.
+    /// A successful State write is not a broker admission or retirement proof.
+    pub fn prepare_issue(
+        &self,
+        _binding: &DurableStateBinding,
+        response: &serde_json::Value,
+        cleanup: CleanupReference,
+    ) -> Result<PendingSlotIssue, &'static str> {
+        let (_, slot) = protocol_slot_state::read(self.lease.slot, response)?;
+        let claim = slot.active.ok_or("unknown_claim")?;
+        if claim.lease != self.lease
+            || claim.scope != self.scope
+            || claim.issuer != self.pending.caller
+        {
+            return Err("claim_mismatch");
+        }
+        let instance = self
+            .selected
+            .provider_incarnation
+            .clone()
+            .ok_or("host_provider_incarnation_required")?;
+        let schema_revision = u32::try_from(self.pending.method.schema_revision)
+            .ok()
+            .filter(|value| *value != 0)
+            .ok_or("invalid_schema_revision")?;
+        let entry = protocol_slot_state::Entry {
+            identity: GuardedEffectIdentity {
+                scope: self.scope.clone(),
+                sequence: self.sequence,
+                capability: self.pending.capability.clone(),
+                provider: self.selected.provider.clone(),
+                service: self.pending.method.service.clone(),
+                method: self.pending.method.method.clone(),
+                interface_major: self.pending.method.interface_major,
+                interface_minor: self.pending.method.interface_minor,
+                schema_revision,
+                payload_sha256: self.pending.payload_sha256.clone(),
+                timeout_ms: self.pending.timeout_ms,
+                operation_id: self.pending.operation_id.clone(),
+                parent: self.pending.parent,
+            },
+            issued_lease: self.lease.clone(),
+            provider_incarnation: instance,
+            selected_method: self.selected.clone(),
+            cleanup_method: self.pending.cleanup.clone(),
+            cleanup_approval: self.cleanup_approval.clone(),
+            cleanup,
+            cleanup_confirmed: false,
+        };
+        let write = protocol_slot_state::prepare_issue(
+            response,
+            self.lease.slot,
+            &self.lease,
+            entry.clone(),
+        )?;
+        Ok(PendingSlotIssue { write, entry })
+    }
+}
+/// A canonical pairing State CAS, not a broker admission grant.
+pub struct PendingSlotIssue {
+    write: protocol_slot_state::PendingWrite,
+    entry: protocol_slot_state::Entry,
+}
+impl PendingSlotIssue {
+    pub fn request(&self) -> &StateRequest {
+        self.write.request()
+    }
+    pub fn state_operation_id(&self) -> &str {
+        self.write.state_operation_id()
+    }
+    /// The caller must supply the terminal result of this exact selected-State
+    /// operation. A lost reply is reconciled by rereading the slot.
+    pub fn confirmed(
+        self,
+        response: serde_json::Value,
+    ) -> Result<ConfirmedSlotIssue, &'static str> {
+        self.write.confirmed(response)?;
+        Ok(ConfirmedSlotIssue { entry: self.entry })
+    }
+}
+/// A State confirmation only. Pairing must still authorize and arm the broker;
+/// this value has no dispatch method and proves no provider retirement.
+pub struct ConfirmedSlotIssue {
+    entry: protocol_slot_state::Entry,
+}
+impl ConfirmedSlotIssue {
+    pub fn entry(&self) -> &protocol_slot_state::Entry {
+        &self.entry
     }
 }
 fn valid_incarnation(instance: &broker_effect_fence::ProviderIncarnation) -> bool {

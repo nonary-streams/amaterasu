@@ -151,6 +151,13 @@ fn setup_broker_with_slots(route: &Route, slots: bool) -> Broker {
         .extend([route.approval.clone(), route.cleanup_approval.clone()]);
     config.host_lifecycle_control = slots;
     if slots {
+        config.host_context.provider_incarnations.insert(
+            "provider".into(),
+            amaterasu_contracts::effect_fence::ProviderIncarnation {
+                version: 1,
+                id: "d".repeat(32),
+            },
+        );
         config.principals.insert(
             amaterasu_contracts::HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(),
             Grants::default(),
@@ -1241,8 +1248,12 @@ fn completed_sources_reuse_a_slot_beyond_sixty_four_without_replaying_old_issuer
             send(
                 &mut broker,
                 "provider",
-                EffectFenceCommand::ProviderRetiredInEpoch {
+                EffectFenceCommand::ProviderRetiredInIncarnation {
                     broker_epoch: boot.clone(),
+                    provider_incarnation: amaterasu_contracts::effect_fence::ProviderIncarnation {
+                        version: 1,
+                        id: "d".repeat(32)
+                    },
                     request: id
                 }
             ),
@@ -1476,15 +1487,26 @@ fn legacy_slot_adapter_rejects_admission_before_broker_query() {
 }
 
 #[test]
-fn canonical_slot_selection_is_host_bound_and_cleanup_query_remains_closed() {
+fn canonical_slot_issue_binds_selected_provider_and_survives_lost_reply() {
     use amaterasu_contracts::effect_fence::{ProviderIncarnation, SourceSlotLease};
     use amaterasu_module_sdk::protocol_slot_adapter::{SelectedSlotAction, SlotActionRequest};
     let route = route();
     let service = route.method.service.clone();
     let mut config = RuntimeConfig::default();
-    config
-        .principals
-        .insert("authority".into(), Grants::default());
+    config.principals.insert(
+        "authority".into(),
+        Grants {
+            call: ["amaterasu.state/1".into()].into(),
+            ..Default::default()
+        },
+    );
+    config.principals.insert(
+        "state".into(),
+        Grants {
+            provide: ["amaterasu.state/1".into()].into(),
+            ..Default::default()
+        },
+    );
     config.principals.insert(
         "issuer".into(),
         Grants {
@@ -1524,7 +1546,39 @@ fn canonical_slot_selection_is_host_bound_and_cleanup_query_remains_closed() {
             interface_major: 1,
         }],
     });
+    let mut replacement_config = config.clone();
+    replacement_config
+        .host_context
+        .provider_incarnations
+        .insert(
+            "provider".into(),
+            ProviderIncarnation {
+                version: 1,
+                id: "f".repeat(32),
+            },
+        );
+    let mut replacement = Broker::new(replacement_config).unwrap();
+    for method in [&route.approval.method, &route.cleanup_approval.method] {
+        assert!(matches!(
+            replacement.dispatch(
+                "provider",
+                Command::RegisterApi {
+                    method: method.clone()
+                }
+            ),
+            Response::Ok
+        ));
+    }
     let mut broker = Broker::new(config).unwrap();
+    assert!(matches!(
+        broker.dispatch(
+            "state",
+            Command::Register {
+                service: "amaterasu.state/1".into()
+            }
+        ),
+        Response::Ok
+    ));
     for method in [&route.approval.method, &route.cleanup_approval.method] {
         assert!(matches!(
             broker.dispatch(
@@ -1583,7 +1637,114 @@ fn canonical_slot_selection_is_host_bound_and_cleanup_query_remains_closed() {
             .id,
         "d".repeat(32)
     );
-    assert_eq!(action.prepare_issue(), Err("cleanup_selection_unavailable"));
+    // The action and cleanup queries straddling a same-name provider restart
+    // must not be combined into one durable selection.
+    assert!(matches!(SelectedSlotAction::query(
+        SlotActionRequest { pending: pending.clone(), issuer: &issuer, scope: scope.clone(), lease: lease.clone(), route: &route, sequence: 1, payload: b"hello" },
+        |cmd| if matches!(&cmd, Command::EffectFence { command } if matches!(**command, EffectFenceCommand::SelectedCleanupMethod { .. })) {
+            Ok(replacement.dispatch("authority", cmd))
+        } else { Ok(broker.dispatch("authority", cmd)) }
+    ), Err(error) if error == "cleanup_selection_mismatch"));
+    let path = directory();
+    let store = TestStateStore::open(path.clone()).unwrap();
+    let slot_request = amaterasu_module_sdk::protocol_slot_state::read_request(lease.slot).unwrap();
+    let initial = state_exchange(&mut broker, &store, &slot_request);
+    let claim = amaterasu_module_sdk::protocol_slot_state::prepare_claim(
+        &initial,
+        lease.clone(),
+        scope.clone(),
+        "issuer".into(),
+    )
+    .unwrap();
+    let claimed = state_exchange_with_id(
+        &mut broker,
+        &store,
+        claim.request(),
+        claim.state_operation_id(),
+    );
+    claim.confirmed(claimed).unwrap();
+    let current = state_exchange(&mut broker, &store, &slot_request);
+    let durable = DurableStateBinding::new("authority", "state", DURABLE_CAS_CAPABILITY).unwrap();
+    let mut wrong_issuer = current.clone();
+    wrong_issuer["value"]["active"]["issuer"] = serde_json::json!("other");
+    assert!(matches!(
+        action.prepare_issue(&durable, &wrong_issuer, reference()),
+        Err("claim_mismatch")
+    ));
+    let issue = action
+        .prepare_issue(&binding(), &current, reference())
+        .unwrap();
+    assert!(!issue.state_operation_id().is_empty());
+    let written = state_exchange_with_id(
+        &mut broker,
+        &store,
+        issue.request(),
+        issue.state_operation_id(),
+    );
+    assert_eq!(written["ok"], true);
+    // The State write committed, but its reply was lost. Never manufacture a
+    // confirmation; reopen and reconcile the exact digest-only entry.
+    drop(issue);
+    drop(store);
+    let store = TestStateStore::open(path.clone()).unwrap();
+    let saved = state_exchange(&mut broker, &store, &slot_request);
+    assert!(!saved.to_string().contains("aGVsbG8="));
+    let (_, slot) = amaterasu_module_sdk::protocol_slot_state::read(lease.slot, &saved).unwrap();
+    let entry = &slot.active.unwrap().entries[0];
+    assert_eq!(entry.identity.operation_id, operation_id);
+    assert_eq!(entry.provider_incarnation.id, "d".repeat(32));
+    assert_eq!(entry.selected_method, *action.selected_method());
+    assert_eq!(entry.cleanup_approval, route.cleanup_approval);
+    assert!(matches!(
+        action.prepare_issue(&durable, &saved, reference()),
+        Err("sequence_conflict")
+    ));
+    let operation_two =
+        amaterasu_module_sdk::protocol_slot_state::operation_id("issuer", &scope, 2).unwrap();
+    let request_two = DispatchRequest {
+        context: &context,
+        message_type: route.message_type,
+        payload: b"hello",
+        operation_id: &operation_two,
+        issuer_epoch: &scope.issuer_epoch,
+        timeout_ms: 1000,
+        parent: None,
+    };
+    let pending_two = ProtocolRouter::new(vec![route.clone()])
+        .unwrap()
+        .prepare_effect("issuer", &request_two)
+        .unwrap();
+    let action_two = SelectedSlotAction::query(
+        SlotActionRequest {
+            pending: pending_two,
+            issuer: &issuer,
+            scope: scope.clone(),
+            lease: lease.clone(),
+            route: &route,
+            sequence: 2,
+            payload: b"hello",
+        },
+        |cmd| Ok(broker.dispatch("authority", cmd)),
+    )
+    .unwrap();
+    let issue_two = action_two
+        .prepare_issue(
+            &durable,
+            &saved,
+            CleanupReference::new("c".repeat(64)).unwrap(),
+        )
+        .unwrap();
+    let reply_two = state_exchange_with_id(
+        &mut broker,
+        &store,
+        issue_two.request(),
+        issue_two.state_operation_id(),
+    );
+    let confirmed = issue_two.confirmed(reply_two).unwrap();
+    assert_eq!(confirmed.entry().identity.operation_id, operation_two);
+    assert_eq!(confirmed.entry().provider_incarnation.id, "d".repeat(32));
+    drop(store);
+    std::fs::remove_dir_all(path).unwrap();
     let mut missing_instance = action.selected_method().clone();
     missing_instance.provider_incarnation = None;
     assert!(matches!(SelectedSlotAction::query(
@@ -1600,6 +1761,20 @@ fn canonical_slot_selection_is_host_bound_and_cleanup_query_remains_closed() {
         SlotActionRequest { pending: pending.clone(), issuer: &issuer, scope: scope.clone(), lease: lease.clone(), route: &route, sequence: 1, payload: b"hello" },
         |_| Ok(Response::Result { payload: serde_json::to_value(&unsupported_instance).unwrap() })
     ), Err(error) if error == "selection_mismatch"));
+    let mut wrong_cleanup_instance = action.selected_method().provider_incarnation.clone();
+    wrong_cleanup_instance.as_mut().unwrap().id = "f".repeat(32);
+    let selected = action.selected_method().clone();
+    assert!(matches!(SelectedSlotAction::query(
+        SlotActionRequest { pending: pending.clone(), issuer: &issuer, scope: scope.clone(), lease: lease.clone(), route: &route, sequence: 1, payload: b"hello" },
+        |cmd| match cmd {
+            Command::EffectFence { command } => match *command {
+                EffectFenceCommand::SelectedMethod { .. } => Ok(Response::Result { payload: serde_json::to_value(&selected).unwrap() }),
+                EffectFenceCommand::SelectedCleanupMethod { .. } => Ok(Response::Result { payload: serde_json::json!({"approval":route.cleanup_approval,"provider_incarnation":wrong_cleanup_instance}) }),
+                _ => panic!("unexpected query"),
+            },
+            _ => panic!("unexpected command"),
+        }
+    ), Err(error) if error == "cleanup_selection_mismatch"));
     let mut wrong_scope = scope.clone();
     wrong_scope.issuer_epoch = "forged".into();
     assert!(
