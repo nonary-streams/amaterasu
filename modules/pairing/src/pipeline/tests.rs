@@ -4480,10 +4480,17 @@ fn protocol_authority_broker(method_schema: Value) -> amaterasu_runtime::Broker 
         },
     );
     let method: ApiMethod = serde_json::from_value(method_schema).unwrap();
+    let mut cleanup_method = method.clone();
+    cleanup_method.method = "cleanup".into();
     config.api_methods.push(ApiMethodApproval {
         provider: "provider".into(),
         callers: ["input".into()].into(),
         method: method.clone(),
+    });
+    config.api_methods.push(ApiMethodApproval {
+        provider: "provider".into(),
+        callers: ["input".into()].into(),
+        method: cleanup_method.clone(),
     });
     config.effect_fence = Some(EffectFencePolicy {
         authority: "pairing".into(),
@@ -4494,11 +4501,24 @@ fn protocol_authority_broker(method_schema: Value) -> amaterasu_runtime::Broker 
             method: "apply".into(),
             interface_major: 1,
         }],
-        cleanup_methods: vec![],
+        cleanup_methods: vec![ProtectedMethod {
+            service: "example.effects/1".into(),
+            method: "cleanup".into(),
+            interface_major: 1,
+        }],
     });
     let mut broker = broker_for_authority(config);
     assert!(matches!(
         broker.dispatch("provider", Command::RegisterApi { method }),
+        Response::Ok
+    ));
+    assert!(matches!(
+        broker.dispatch(
+            "provider",
+            Command::RegisterApi {
+                method: cleanup_method
+            }
+        ),
         Response::Ok
     ));
     broker
@@ -5671,6 +5691,26 @@ fn broker_protocol_attestation_requires_paired_source_and_exact_client_grant() {
         call(&mut pipeline, "input", request.clone())["code"],
         "protocol_authority_unavailable"
     );
+    pipeline
+        .effect_authority
+        .as_mut()
+        .unwrap()
+        .protocol_policies[0]
+        .cleanup_schema
+        .request
+        .allow_extra = true;
+    assert_eq!(
+        call(&mut pipeline, "input", request.clone())["code"],
+        "scope_denied"
+    );
+    pipeline
+        .effect_authority
+        .as_mut()
+        .unwrap()
+        .protocol_policies[0]
+        .cleanup_schema
+        .request
+        .allow_extra = false;
     {
         use sha2::Digest;
         let payload = vec![1_u8, 2, 3];

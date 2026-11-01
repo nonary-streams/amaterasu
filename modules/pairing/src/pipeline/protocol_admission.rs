@@ -130,8 +130,33 @@ impl Pipeline {
             {
                 return Err("protocol_authority_unavailable");
             }
-            // The selected cleanup approval and issuer/host retirement are
-            // not yet reconciled. Do not issue a claim, State write or Arm.
+            let cleanup = Command::EffectFence {
+                command: Box::new(EffectFenceCommand::SelectedCleanupMethod {
+                    method: ProtectedMethod {
+                        service: selected.cleanup.service.clone(),
+                        method: selected.cleanup.method.clone(),
+                        interface_major: selected.cleanup.interface_major,
+                    },
+                }),
+            };
+            let Ok(Response::Result { payload }) = send(cleanup) else {
+                return Err("protocol_authority_unavailable");
+            };
+            let approval: amaterasu_module_sdk::ApiMethodApproval =
+                serde_json::from_value(payload["approval"].clone())
+                    .map_err(|_| "protocol_authority_unavailable")?;
+            let cleanup_instance: amaterasu_module_sdk::broker_effect_fence::ProviderIncarnation =
+                serde_json::from_value(payload["provider_incarnation"].clone())
+                    .map_err(|_| "protocol_authority_unavailable")?;
+            if approval.provider != actual.provider
+                || approval.method != selected.cleanup_schema
+                || !approval.callers.contains(caller)
+                || &cleanup_instance != instance
+            {
+                return Err("scope_denied");
+            }
+            // The durable source claim and the selected issuer/host drain
+            // still need reconciliation before a claim or effect can open.
             Err("protocol_authority_unavailable")
         })();
         complete(
