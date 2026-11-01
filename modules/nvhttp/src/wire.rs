@@ -379,7 +379,7 @@ impl Router {
                     certificate_der_base64: STANDARD.encode(&certificate),
                 },
             };
-            if !envelope.validate() {
+            if !binding.accepts(&envelope) {
                 return Some(xml::error(413, "protocol request exceeds limits"));
             }
             return self

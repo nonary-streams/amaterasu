@@ -79,6 +79,19 @@ pub fn validate(bindings: &[Binding]) -> Result<(), &'static str> {
 }
 
 impl Binding {
+    /// Validate the exact JSON payload that `CallApi` enqueues in the broker.
+    /// The wrapper must match the broker's method/version/arguments envelope.
+    pub fn accepts(&self, request: &protocol_handler::Request) -> bool {
+        request.validate()
+            && serde_json::to_vec(&serde_json::json!({
+                "method": self.method,
+                "interface_major": self.interface_major,
+                "interface_minor": self.interface_minor,
+                "arguments": request,
+            }))
+            .is_ok_and(|bytes| bytes.len() <= protocol_handler::MAX_MESSAGE_BYTES)
+    }
+
     /// Construct a broker call only from the trusted binding, never a service
     /// or method supplied by the HTTP client. Authentication and authorization
     /// must be checked by the protocol owner before this method is called.
@@ -88,7 +101,7 @@ impl Binding {
         timeout_ms: u64,
         operation_id: String,
     ) -> Result<Command, &'static str> {
-        if !request.validate()
+        if !self.accepts(request)
             || request.schema != self.schema
             || request.method != self.http_method
             || request.target.split('?').next() != Some(self.path.as_str())

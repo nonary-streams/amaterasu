@@ -1801,3 +1801,139 @@ fn participant_shutdown_cancels_known_work_without_retrying_unknown_admission() 
     );
     assert!(router.jobs.is_empty());
 }
+
+#[test]
+fn approved_handler_obeys_exact_wrapped_broker_size_limit() {
+    use amaterasu_contracts::{
+        ApiFieldKind, ApiMethod, ApiMethodApproval, ApiPrivilege, ApiSchema, Grants, RuntimeConfig,
+    };
+    use amaterasu_runtime::Broker;
+    let schema = |required: &[(&str, ApiFieldKind)]| ApiSchema {
+        required: required
+            .iter()
+            .map(|(name, kind)| ((*name).into(), kind.clone()))
+            .collect(),
+        optional: BTreeMap::new(),
+        allow_extra: false,
+    };
+    let mut binding = neutral_binding("POST", "first");
+    // Exercise method length and escaping in the actual broker wrapper.
+    binding.method = format!("handler{}", "x".repeat(90));
+    let method = ApiMethod {
+        service: binding.service.clone(),
+        method: binding.method.clone(),
+        interface_major: 1,
+        interface_minor: 0,
+        request: schema(&[
+            ("version", ApiFieldKind::Integer),
+            ("schema", ApiFieldKind::String),
+            ("method", ApiFieldKind::String),
+            ("target", ApiFieldKind::String),
+            ("body_base64", ApiFieldKind::String),
+            ("peer", ApiFieldKind::Object),
+        ]),
+        response: schema(&[
+            ("version", ApiFieldKind::Integer),
+            ("status", ApiFieldKind::Integer),
+            ("content_type", ApiFieldKind::String),
+            ("body_base64", ApiFieldKind::String),
+        ]),
+        privilege: ApiPrivilege::User,
+    };
+    let provider = "org.example.provider";
+    let mut config = RuntimeConfig::default();
+    config.principals.insert(
+        "amaterasu.nvhttp".into(),
+        Grants {
+            call: [method.service.clone()].into(),
+            ..Default::default()
+        },
+    );
+    config.principals.insert(
+        provider.into(),
+        Grants {
+            provide: [method.service.clone()].into(),
+            ..Default::default()
+        },
+    );
+    config.api_methods.push(ApiMethodApproval {
+        provider: provider.into(),
+        callers: ["amaterasu.nvhttp".into()].into(),
+        method: method.clone(),
+    });
+    let mut broker = Broker::new(config).unwrap();
+    assert!(matches!(
+        broker.dispatch(
+            provider,
+            Command::RegisterApi {
+                method: method.clone()
+            }
+        ),
+        Response::Ok
+    ));
+    let certificate = vec![1; 7_800];
+    let body = vec![2; protocol_handler::MAX_BODY_BYTES];
+    let mut target = "/neutral?value=\"".to_owned();
+    let wrapped_size = |target: &str| {
+        let request = protocol_handler::Request {
+            version: 1,
+            schema: binding.schema.clone(),
+            method: "POST".into(),
+            target: target.into(),
+            body_base64: STANDARD.encode(&body),
+            peer: protocol_handler::VerifiedPeer {
+                remote: "127.0.0.1".parse().unwrap(),
+                certificate_der_base64: STANDARD.encode(&certificate),
+            },
+        };
+        assert!(request.validate());
+        serde_json::to_vec(&json!({"method": binding.method, "interface_major": 1, "interface_minor": 0, "arguments": request})).unwrap().len()
+    };
+    while wrapped_size(&target) < protocol_handler::MAX_MESSAGE_BYTES {
+        target.push('x');
+    }
+    assert_eq!(wrapped_size(&target), protocol_handler::MAX_MESSAGE_BYTES);
+    assert_eq!(
+        wrapped_size(&format!("{target}x")),
+        protocol_handler::MAX_MESSAGE_BYTES + 1
+    );
+    let now = Instant::now();
+    let mut router = router();
+    router.set_participants(vec![binding]);
+    let make_peer = || {
+        let mut peer = trusted_tls(&certificate);
+        peer.entitlement_allowed = true;
+        peer
+    };
+    let request = |target: String| Request {
+        method: "POST".into(),
+        target,
+        body: body.clone(),
+    };
+    let mut owner = |command| Ok(broker.dispatch("amaterasu.nvhttp", command));
+    assert!(
+        router
+            .dispatch_with(1, request(target.clone()), make_peer(), now, &mut owner)
+            .is_none()
+    );
+    assert!(
+        router
+            .poll_with_identity(now, &mut owner, |_, _| true)
+            .is_empty()
+    );
+    assert!(matches!(
+        broker.dispatch(provider, Command::Poll {}),
+        Response::Request { .. }
+    ));
+    target.push('x');
+    let rejected = router
+        .dispatch_with(2, request(target), make_peer(), now, &mut |command| {
+            Ok(broker.dispatch("amaterasu.nvhttp", command))
+        })
+        .unwrap();
+    assert_eq!(rejected.status, 413);
+    assert!(matches!(
+        broker.dispatch(provider, Command::Poll {}),
+        Response::Pending
+    ));
+}
