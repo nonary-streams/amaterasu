@@ -3750,7 +3750,43 @@ fn historical_journal_verification_uses_real_selected_state_read() {
         )),
         "permission_denied"
     );
+    // A successful CAS in the same namespace advances past the delayed
+    // writer's expected revision, so that writer can no longer commit.
+    let fence_write = send_state(
+        &mut broker,
+        StateRequest::Set {
+            key: "state.fence".into(),
+            value: json!(true),
+            expected_revision: Some(6),
+        },
+        "state.fence",
+    );
+    assert!(matches!(
+        broker.dispatch(
+            "authority",
+            Command::ReleaseResult {
+                request: fence_write
+            }
+        ),
+        Response::Ok
+    ));
+    let fenced_read = send_state(
+        &mut broker,
+        StateRequest::Get { key: key.into() },
+        "state.fenced.read",
+    );
+    let fenced_check = || EffectFenceCommand::VerifyHistoricalJournal {
+        identity: Box::new(identity.clone()),
+        provider_incarnation: instance.clone(),
+        expected_entry: cleaned_entry.clone(),
+        state_request: fenced_read,
+    };
+    assert!(matches!(
+        slot_invoke(&mut broker, "authority", &recovery_lease, fenced_check()),
+        Response::Result { .. }
+    ));
     let late_result = store.handle(&caller, payload);
+    assert_eq!(late_result["error"]["code"], "revision_conflict");
     assert_eq!(
         code(broker.dispatch(
             "state",
@@ -3770,6 +3806,10 @@ fn historical_journal_verification_uses_real_selected_state_read() {
         )),
         "permission_denied"
     );
+    assert!(matches!(
+        slot_invoke(&mut broker, "authority", &recovery_lease, fenced_check()),
+        Response::Result { .. }
+    ));
     assert!(matches!(
         broker.dispatch("authority", Command::ReleaseResult { request: read }),
         Response::Ok
