@@ -982,7 +982,7 @@ mod tests {
     }
     #[test]
     fn concurrent_feedback_send_and_retirement_are_bounded_and_ordered() {
-        for _ in 0..8 {
+        for _ in 0..128 {
             run_combined(CombinedScenario::Concurrent);
         }
     }
@@ -1074,4 +1074,4 @@ mod tests {
 #[cfg(test)]
 #[allow(dead_code, unused_imports, clippy::duplicate_mod)]
 #[path = "../../../../pairing/src/effect_gate.rs"]
-mod actual_pairing_ledger;
+pub(super) mod actual_pairing_ledger;
