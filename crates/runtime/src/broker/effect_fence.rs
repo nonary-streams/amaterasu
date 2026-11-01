@@ -144,17 +144,29 @@ impl EffectFences {
     pub fn provider_joined(&self, provider: &str) -> bool {
         self.joined_providers.contains(provider)
     }
-    pub fn host_provider_joined(&mut self, provider: &str, incarnation: &ProviderIncarnation) {
+    pub fn host_provider_joined(
+        &mut self,
+        provider: &str,
+        incarnation: &ProviderIncarnation,
+    ) -> Vec<u64> {
         self.joined_providers.insert(provider.to_owned());
+        let mut cancel = Vec::new();
         for source in self.sources.values_mut() {
             for record in source.records.values_mut() {
                 if record.provider == provider
                     && record.provider_incarnation.as_ref() == Some(incarnation)
                 {
+                    record.fenced = true;
                     record.worker_retired = true;
+                    if !record.delivered
+                        && let Some(request) = record.request
+                    {
+                        cancel.push(request);
+                    }
                 }
             }
         }
+        cancel
     }
     pub fn host_retirement_receipt(&self, scope: &EffectScope, sequence: u64) -> Response {
         let Some(record) = self
@@ -236,6 +248,9 @@ impl EffectFences {
         self.sources
             .get(scope)
             .is_some_and(|source| source.recovery_issued.is_some() && source.closing)
+    }
+    pub fn current_lease(&self, scope: &EffectScope) -> Option<SourceSlotLease> {
+        self.slots.as_ref()?.lease_for(scope)
     }
     pub fn open_slot(
         &mut self,

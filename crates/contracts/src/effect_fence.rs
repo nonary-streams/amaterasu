@@ -308,6 +308,8 @@ pub enum EffectFenceCommand {
         receipt: Box<HostProviderRetirement>,
         expected_entry: Value,
         state_request: u64,
+        /// Retained selected-State Get in the reserved host namespace.
+        host_receipt_state_request: u64,
     },
     /// After durable source/slot retirement and compaction, release the source
     /// and rotate its slot token. Before calling, the authority must durably

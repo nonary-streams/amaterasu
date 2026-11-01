@@ -63,6 +63,29 @@ pub(super) struct RequestRouter {
 }
 
 impl RequestRouter {
+    pub fn retained_state_value_contains(
+        &self,
+        caller: &str,
+        provider: &str,
+        key: &str,
+        revision: u64,
+        expected: &Value,
+    ) -> bool {
+        self.requests.keys().any(|id| {
+            let Some((request, result)) = self.selected_state_read(caller, provider, *id) else {
+                return false;
+            };
+            request.get("key").and_then(Value::as_str) == Some(key)
+                && result.get("revision").and_then(Value::as_u64) == Some(revision)
+                && result.get("ok").and_then(Value::as_bool) == Some(true)
+                && result.get("found").and_then(Value::as_bool) == Some(true)
+                && result.pointer("/value/version").and_then(Value::as_u64) == Some(1)
+                && result
+                    .pointer("/value/receipts")
+                    .and_then(Value::as_array)
+                    .is_some_and(|items| items.len() <= 32 && items.contains(expected))
+        })
+    }
     /// Read only a delivered terminal State Get owned by the exact authority
     /// and supplied by the trusted selected State provider. Retention and
     /// authenticated request metadata prevent callers substituting JSON.

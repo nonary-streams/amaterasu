@@ -80,7 +80,8 @@ until that integration and restart tests pass.
 `VerifyHistoricalJournal`, inside a recovery-only `SlotCommand`, verifies a
 retained authority-owned State Get from the explicitly selected State provider
 against `pairing/protocol-slot/v1/{slot:02}`. It requires the saved original
-effect, selected method, provider incarnation and cleanup identity to match.
+effect, selected method, provider incarnation and cleanup identity to match;
+the persisted recovery claim must also contain the broker's current exact lease.
 It denies stale snapshots, pending State writes and uncertain delivered writes.
 The result only confirms journal data; it cannot fence, retire, dispatch, or
 prove cleanup. Entries lacking an incarnation fail closed. The authority must
@@ -100,7 +101,16 @@ until `ConfirmHistoricalCleanup` verifies a fresh journal entry with pairing's
 durable `cleanup_confirmed` flag. Pairing must set that flag only after its own
 independent cleanup proof; the broker does not perform that cleanup.
 
-The host currently has no production persistence or replay of these exact
+The reserved host endpoint may read and CAS-write its own State namespace at
+`host/effect-retirement/v1/{slot:02}`, using `{version:1, receipts:[...]}` with
+at most 32 records. A new receipt must be constructed by the live broker after
+the host verifies the actual join; an older receipt can be retained only from a
+current authenticated read of the same host-owned key. After restart,
+`HostRecoverHistorical` requires a retained host-namespace State Get containing
+the exact old receipt in addition to the pairing-journal read. The host must
+preserve unresolved records until its lifecycle and pairing cleanup complete.
+
+The host currently has no production caller that persists or replays these
 receipts. In particular, do not derive a join receipt merely from a generic
 module destroy call: the current SDK catches destructor panics without reporting
 whether every join completed. A missing host receipt or cleanup proof leaves the

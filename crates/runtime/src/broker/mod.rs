@@ -42,6 +42,61 @@ const MAX_LOG_TARGET_BYTES: usize = 128;
 const MAX_LOG_MESSAGE_BYTES: usize = 7_500;
 const MAX_LOG_PATH_BYTES: usize = 4096;
 
+fn host_retirement_state_request(payload: &serde_json::Value) -> bool {
+    use amaterasu_contracts::effect_fence::HostProviderRetirement;
+    let Some(key) = payload.get("key").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let Some(suffix) = key.strip_prefix("host/effect-retirement/v1/") else {
+        return false;
+    };
+    if suffix.len() != 2 || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(slot) = suffix.parse::<u8>() else {
+        return false;
+    };
+    if slot >= 64 {
+        return false;
+    }
+    match payload.get("action").and_then(serde_json::Value::as_str) {
+        Some("get") => true,
+        Some("set") => {
+            let Some(receipts) = payload
+                .pointer("/value/receipts")
+                .and_then(serde_json::Value::as_array)
+            else {
+                return false;
+            };
+            payload
+                .get("expected_revision")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+                && payload
+                    .pointer("/value/version")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(1)
+                && receipts.len() <= 32
+                && receipts.iter().all(|value| {
+                    serde_json::from_value::<HostProviderRetirement>(value.clone())
+                        .ok()
+                        .is_some_and(|receipt| {
+                            receipt.version == 1
+                                && receipt.issued_lease.slot == slot
+                                && receipt.effect.scope.source.slot() == Some(slot)
+                                && receipt.broker_epoch == receipt.issued_lease.broker_epoch
+                                && receipt.provider_incarnation.version == 1
+                                && receipt.provider_incarnation.id.len() == 32
+                                && receipt.provider_incarnation.id.bytes().all(|byte| {
+                                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                                })
+                        })
+                })
+        }
+        _ => false,
+    }
+}
+
 impl Broker {
     pub fn new(configuration: RuntimeConfig) -> Result<Self, String> {
         configuration::validate(&configuration)?;
@@ -112,10 +167,22 @@ impl Broker {
             }
             return match command {
                 Command::Poll {} => self.requests.poll(caller, now),
+                Command::Request { service, payload, timeout_ms, operation_id, parent } => {
+                    if service != "amaterasu.state/1" || parent.is_some()
+                        || !host_retirement_state_request(&payload)
+                        || !self.host_retirement_write_matches(&payload)
+                        || !self.configuration.service_selections.broker.get(&service).and_then(Option::as_ref).is_some_and(|selection| selection.contract == "amaterasu.state/1") {
+                        return errors::permission_denied();
+                    }
+                    let grants = Grants { call: [service.clone()].into(), ..Grants::default() };
+                    self.requests.submit(caller, &grants, RequestOptions { service, payload, timeout_ms, operation_id, parent: None, response_schema: None }, now)
+                }
                 Command::CheckRequest { request } => self.requests.check_active(caller, request),
                 Command::Complete { request, payload } => {
                     self.requests.complete(caller, request, payload, now)
                 }
+                Command::TakeResult { request } => self.requests.result(caller, request),
+                Command::ReleaseResult { request } => self.requests.release(caller, request),
                 Command::EffectFence { command } if matches!(&*command, amaterasu_contracts::effect_fence::EffectFenceCommand::BrokerEpoch {} | amaterasu_contracts::effect_fence::EffectFenceCommand::RecoveryRetired { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::SourceRetired { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostProviderJoined { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostRetirementReceipt { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostRecoverHistorical { .. }) => self.handle_effect_fence(caller, *command, now),
                 _ => errors::permission_denied(),
             };
@@ -539,8 +606,14 @@ impl Broker {
                 {
                     return errors::permission_denied();
                 }
-                self.effect_fences
+                let requests = self
+                    .effect_fences
                     .host_provider_joined(&provider, &provider_incarnation);
+                if let Some(issuer) = self.effect_fences.issuer_name() {
+                    for request in requests {
+                        let _ = self.requests.cancel(issuer, request, now);
+                    }
+                }
                 Response::Ok
             }
             EffectFenceCommand::HostRetirementReceipt { scope, sequence } => {
@@ -554,6 +627,7 @@ impl Broker {
                 receipt,
                 expected_entry,
                 state_request,
+                host_receipt_state_request,
             } => {
                 if caller != HOST_LIFECYCLE_CONTROL_PRINCIPAL {
                     return errors::permission_denied();
@@ -573,6 +647,12 @@ impl Broker {
                         != Some(&receipt.broker_epoch)
                 {
                     return Response::error("effect_conflict", "host retirement receipt differs");
+                }
+                if !self.host_retirement_record_matches(&receipt, host_receipt_state_request) {
+                    return Response::error(
+                        "recovery_required",
+                        "host retirement record is unavailable",
+                    );
                 }
                 if let Err(error) = self.verify_historical_journal(
                     &receipt.effect,
@@ -900,6 +980,89 @@ impl Broker {
         }
     }
 
+    fn host_retirement_write_matches(&self, request: &serde_json::Value) -> bool {
+        use amaterasu_contracts::effect_fence::HostProviderRetirement;
+        if request.get("action").and_then(serde_json::Value::as_str) == Some("get") {
+            return true;
+        }
+        let Some(Some(selection)) = self
+            .configuration
+            .service_selections
+            .broker
+            .get("amaterasu.state/1")
+        else {
+            return false;
+        };
+        let Some(key) = request.get("key").and_then(serde_json::Value::as_str) else {
+            return false;
+        };
+        let Some(revision) = request
+            .get("expected_revision")
+            .and_then(serde_json::Value::as_u64)
+        else {
+            return false;
+        };
+        let Some(receipts) = request
+            .pointer("/value/receipts")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return false;
+        };
+        receipts.iter().all(|value| {
+            let Ok(receipt) = serde_json::from_value::<HostProviderRetirement>(value.clone()) else { return false };
+            let current = matches!(self.effect_fences.host_retirement_receipt(&receipt.effect.scope, receipt.effect.sequence), Response::Result { payload } if payload == *value);
+            current || self.requests.retained_state_value_contains(HOST_LIFECYCLE_CONTROL_PRINCIPAL, &selection.provider, key, revision, value)
+        })
+    }
+
+    fn host_retirement_record_matches(
+        &self,
+        receipt: &amaterasu_contracts::effect_fence::HostProviderRetirement,
+        request_id: u64,
+    ) -> bool {
+        let Some(Some(selection)) = self
+            .configuration
+            .service_selections
+            .broker
+            .get("amaterasu.state/1")
+        else {
+            return false;
+        };
+        if selection.contract != "amaterasu.state/1" {
+            return false;
+        }
+        let Some((request, result)) = self.requests.selected_state_read(
+            HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            &selection.provider,
+            request_id,
+        ) else {
+            return false;
+        };
+        let key = format!("host/effect-retirement/v1/{:02}", receipt.issued_lease.slot);
+        if request.get("key").and_then(serde_json::Value::as_str) != Some(&key)
+            || result.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
+            || result.get("found").and_then(serde_json::Value::as_bool) != Some(true)
+            || result
+                .pointer("/value/version")
+                .and_then(serde_json::Value::as_u64)
+                != Some(1)
+        {
+            return false;
+        }
+        let Some(receipts) = result
+            .pointer("/value/receipts")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return false;
+        };
+        let Ok(expected) = serde_json::to_value(receipt) else {
+            return false;
+        };
+        !receipts.is_empty()
+            && receipts.len() <= 32
+            && receipts.iter().any(|item| item == &expected)
+    }
+
     fn verify_historical_journal(
         &self,
         identity: &amaterasu_contracts::effect_fence::GuardedEffectIdentity,
@@ -933,6 +1096,10 @@ impl Broker {
             .requests
             .selected_state_read(authority, &selection.provider, state_request)
             .ok_or_else(errors::permission_denied)?;
+        let current_lease = self
+            .effect_fences
+            .current_lease(&identity.scope)
+            .ok_or_else(errors::permission_denied)?;
         if historical_journal::matches(
             request,
             result,
@@ -940,6 +1107,7 @@ impl Broker {
             identity,
             incarnation,
             expected_entry,
+            &current_lease,
         ) {
             Ok(())
         } else {
