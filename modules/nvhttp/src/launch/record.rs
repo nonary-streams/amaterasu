@@ -133,6 +133,7 @@ pub struct Record {
     pub display_request: Option<Value>,
     pub display_admission_token: Option<String>,
     pub application_preflight_token: Option<String>,
+    pub selected_preflight_pending: bool,
     pub application_catalog_revision: Option<u64>,
     /// Validated cleanup budget frozen by launch preflight before provider effects.
     pub application_cleanup_budget_ms: Option<u64>,
@@ -327,6 +328,7 @@ impl Record {
             display_request: None,
             display_admission_token: None,
             application_preflight_token: None,
+            selected_preflight_pending: false,
             application_catalog_revision: None,
             application_cleanup_budget_ms: None,
             frame_limiter_snapshot: None,

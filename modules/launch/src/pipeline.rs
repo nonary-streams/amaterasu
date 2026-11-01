@@ -835,6 +835,9 @@ impl Pipeline {
                 job.begin_cleanup(record, outcome, None);
                 job.request = Some(id);
             }
+            Ok(operation @ Operation::CancelStreamingLibrary { .. }) => {
+                self.deferred_limiter_verification = Some(DeferredLimiterVerification { request:id,caller,initiator,remaining_ms,operation });
+            }
             Ok(operation @ Operation::VerifyFrameLimiterSnapshot {
                 policy_identity: Some(amaterasu_module_sdk::application_library::preflight::PolicyIdentity::Library { .. }),
                 ..
@@ -1018,6 +1021,47 @@ impl Pipeline {
                     Ok(_) => complete(send, request, error("preflight_unavailable")),
                     Err(code) => complete(send, request, error(code)),
                 }
+            }
+            Operation::CancelStreamingLibrary {
+                request: cancel_request,
+            } => {
+                use amaterasu_module_sdk::application_library::preflight::Request;
+                let Request::CancelStreaming {
+                    operation_id,
+                    certificate_id,
+                    preflight_token,
+                    policy_identity,
+                } = cancel_request
+                else {
+                    return complete(send, request, error("invalid_request"));
+                };
+                if caller != "amaterasu.nvhttp" || caller != initiator {
+                    return complete(send, request, error("permission_denied"));
+                }
+                let Ok(record) = self.records.owned_operation(caller, &operation_id) else {
+                    return complete(send, request, error("preflight_not_found"));
+                };
+                if record.streaming_certificate_id.as_deref() != Some(certificate_id.as_str())
+                    || record.preflight_token.as_deref() != Some(preflight_token.as_str())
+                    || record.library_policy_identity.as_ref() != Some(&policy_identity)
+                    || record.launch_started
+                {
+                    return complete(send, request, error("preflight_mismatch"));
+                }
+                if record.state.terminal() {
+                    return complete(
+                        send,
+                        request,
+                        serde_json::json!({"ok":true,"cancelled":true,"operation_id":operation_id}),
+                    );
+                }
+                let id = record.launch_id;
+                let record = self.records.values.get_mut(&id).expect("owned preflight");
+                record.preflight_cancel_requested = true;
+                let mut job = Workflow::launch(id, request, remaining_ms);
+                job.begin_cleanup(record, Outcome::Cancelled, None);
+                self.job = Some(job);
+                Ok(())
             }
             Operation::AcceptStreamingLibrary {
                 request: admission_request,
@@ -1878,6 +1922,19 @@ impl Pipeline {
     }
 
     fn schedule_monitor(&mut self) {
+        if let Some(record) = self.records.values.values_mut().find(|record| {
+            record.limiter_reservation_pending
+                && !record.launch_started
+                && record.state == State::Starting
+                && record
+                    .preflight_deadline
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+        }) {
+            let mut cleanup = Workflow::monitor(record.launch_id, false);
+            cleanup.begin_cleanup(record, Outcome::Cancelled, Some("preflight_expired"));
+            self.job = Some(cleanup);
+            return;
+        }
         let next = self
             .records
             .values
@@ -1976,6 +2033,10 @@ impl Pipeline {
         }
         if matches!(job.step, Step::StartPlaynite | Step::StartProvider) {
             record.provider_launch_requested = true;
+        }
+        if job.step == Step::ReserveLimiterTarget {
+            // A delivered request may reserve even if its acknowledgement is lost.
+            record.limiter_reservation_pending = true;
         }
         self.sequence = self
             .sequence
@@ -2130,7 +2191,10 @@ impl Pipeline {
                 job.step = Step::CheckLimiterCapability;
             }
             Step::CheckLimiterCapability => {
-                if payload["ok"] != true || payload["version"] != 1 || payload["supported"] != true
+                if payload["ok"] != true
+                    || payload["version"] != 1
+                    || payload["supported"] != true
+                    || payload["retirement_supported"] != true
                 {
                     return self.dependency_failed(
                         job,
@@ -2811,6 +2875,23 @@ impl Pipeline {
             .get_mut(&job.launch_id)
             .expect("workflow record");
         match job.step {
+            Step::RetireLimiterTarget => {
+                use amaterasu_module_sdk::application_library::limiter_target::Retirement;
+                let expected = crate::workflow::limiter_retirement_request(record)?;
+                let proof: Retirement = match serde_json::from_value(payload["retirement"].clone())
+                {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return self.cleanup_failed(job, "limiter_retirement_unconfirmed", send);
+                    }
+                };
+                if payload["ok"] != true || proof.validate_for(&expected).is_err() {
+                    return self.cleanup_failed(job, "limiter_retirement_unconfirmed", send);
+                }
+                record.limiter_reservation_pending = false;
+                record.limiter_target_verified = false;
+                job.step = first_cleanup_step(record);
+            }
             Step::FindSession => {
                 if payload["ok"] == true {
                     let session = match responses::session(&payload, record) {
@@ -3150,7 +3231,12 @@ impl Pipeline {
             complete(
                 send,
                 request,
-                if record.preflight_token.is_some() && !record.launch_started {
+                if record.preflight_cancel_requested
+                    && record.state == State::Cancelled
+                    && record.cleanup_error.is_none()
+                {
+                    serde_json::json!({"ok":true,"cancelled":true,"operation_id":record.operation_id})
+                } else if record.preflight_token.is_some() && !record.launch_started {
                     error(record.failure.unwrap_or("preflight_unavailable"))
                 } else {
                     record.response()

@@ -24,6 +24,7 @@ const COVER: &[u8] = &[
 struct Settings {
     callers: BTreeMap<String, CallerPolicy>,
     limiter_mode: String,
+    limiter_capacity: usize,
 }
 
 struct Fixture {
@@ -33,7 +34,12 @@ struct Fixture {
         (String, String, String),
         amaterasu_module_sdk::application_library::limiter_target::Request,
     >,
+    limiter_retirements: BTreeMap<
+        (String, String),
+        amaterasu_module_sdk::application_library::limiter_target::RetirementRequest,
+    >,
     limiter_mode: String,
+    limiter_capacity: usize,
 }
 
 fn random_token() -> Result<String, &'static str> {
@@ -48,7 +54,9 @@ impl Fixture {
             incarnation: random_token()?,
             operations: BTreeMap::new(),
             limiter_reservations: BTreeMap::new(),
+            limiter_retirements: BTreeMap::new(),
             limiter_mode: String::new(),
+            limiter_capacity: 4096,
         })
     }
 }
@@ -102,6 +110,9 @@ impl Provider for Fixture {
     fn supports_limiter_target_v1(&self) -> bool {
         !self.limiter_mode.is_empty()
     }
+    fn supports_limiter_retirement_v1(&self) -> bool {
+        !self.limiter_mode.is_empty()
+    }
     fn attest_limiter_target(
         &mut self,
         identity: &Identity<'_>,
@@ -120,12 +131,15 @@ impl Provider for Fixture {
         );
         match request.stage {
             Stage::Reserve => {
+                if self.limiter_retirements.contains_key(&key) {
+                    return Err("reservation_retired");
+                }
                 if self.operations.contains_key(&key)
                     && !self.limiter_reservations.contains_key(&reservation_key)
                 {
                     return Err("operation_already_started");
                 }
-                if self.limiter_reservations.len() >= 4096
+                if self.limiter_reservations.len() >= self.limiter_capacity
                     && !self.limiter_reservations.contains_key(&reservation_key)
                 {
                     return Err("capacity_exhausted");
@@ -181,6 +195,80 @@ impl Provider for Fixture {
             assertion.request.provider_incarnation = "stale".into();
         }
         Ok(assertion)
+    }
+
+    fn retire_limiter_target(
+        &mut self,
+        identity: &Identity<'_>,
+        request: &amaterasu_module_sdk::application_library::limiter_target::RetirementRequest,
+    ) -> Result<amaterasu_module_sdk::application_library::limiter_target::Retirement, &'static str>
+    {
+        use amaterasu_module_sdk::application_library::{
+            limiter_target::{Request, Retirement, Stage},
+            provider_lifecycle::State,
+        };
+        if identity.caller != identity.initiator {
+            return Err("unauthorized");
+        }
+        let key = (identity.caller.to_owned(), request.operation_id.clone());
+        if let Some(previous) = self.limiter_retirements.get(&key) {
+            if previous != request {
+                return Err("operation_conflict");
+            }
+            return Ok(Retirement {
+                request: request.clone(),
+                retired: true,
+            });
+        }
+        if self.limiter_retirements.len() >= 4096 {
+            return Err("fence_capacity_exhausted");
+        }
+        if self
+            .operations
+            .get(&key)
+            .is_some_and(|entry| entry.2 != State::Stopped && entry.2 != State::LaunchFailed)
+        {
+            return Err("execution_not_retired");
+        }
+        let reservation_key = (
+            identity.caller.to_owned(),
+            request.original_initiator.clone(),
+            request.operation_id.clone(),
+        );
+        let expected = Request {
+            version: request.version,
+            stage: Stage::Reserve,
+            operation_id: request.operation_id.clone(),
+            application_id: request.application_id.clone(),
+            provider_incarnation: request.provider_incarnation.clone(),
+            ticket: None,
+            policy_identity: request.policy_identity.clone(),
+        };
+        if self
+            .limiter_reservations
+            .iter()
+            .any(|((caller, _, operation), value)| {
+                caller == identity.caller
+                    && operation == &request.operation_id
+                    && value != &expected
+            })
+            || self
+                .limiter_reservations
+                .keys()
+                .any(|(caller, initiator, operation)| {
+                    caller == identity.caller
+                        && operation == &request.operation_id
+                        && initiator != &request.original_initiator
+                })
+        {
+            return Err("operation_conflict");
+        }
+        self.limiter_reservations.remove(&reservation_key);
+        self.limiter_retirements.insert(key, request.clone());
+        Ok(Retirement {
+            request: request.clone(),
+            retired: true,
+        })
     }
     fn lifecycle(
         &mut self,
@@ -271,6 +359,11 @@ impl ManagedModule for Module {
             serde_json::from_value(payload).map_err(|error| error.to_string())?;
         let mut fixture = Fixture::new().map_err(str::to_owned)?;
         fixture.limiter_mode = settings.limiter_mode;
+        fixture.limiter_capacity = if settings.limiter_capacity == 0 {
+            4096
+        } else {
+            settings.limiter_capacity.min(4096)
+        };
         let adapter = ProviderAdapter::with_policies(fixture, SERVICE.into(), settings.callers)
             .map_err(str::to_owned)?;
         runtime.require_success(Command::Register {
@@ -378,6 +471,100 @@ mod tests {
                 .attest_limiter_target(&coordinator, &request)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn limiter_retirement_reclaims_capacity_and_fences_late_replay() {
+        use amaterasu_module_sdk::application_library::{
+            limiter_target::{Request, RetirementRequest, Stage},
+            preflight::PolicyIdentity,
+            v2::ApplicationReference,
+        };
+        let mut fixture = Fixture::new().unwrap();
+        fixture.limiter_mode = "supported".into();
+        fixture.limiter_capacity = 2;
+        let owner = Identity {
+            caller: "launch",
+            initiator: "nvhttp",
+        };
+        let coordinator = Identity {
+            caller: "launch",
+            initiator: "launch",
+        };
+        for index in 0..7 {
+            let request = Request {
+                version: 1,
+                stage: Stage::Reserve,
+                operation_id: format!("operation-{index}"),
+                application_id: "fixture-game".into(),
+                provider_incarnation: fixture.incarnation.clone(),
+                ticket: None,
+                policy_identity: PolicyIdentity::Library {
+                    version: 1,
+                    application: ApplicationReference {
+                        library: "games".into(),
+                        id: "opaque".into(),
+                    },
+                    entry_revision: "entry".into(),
+                    policy_revision: "policy".into(),
+                    policy_source: Some("source".into()),
+                    snapshot_id: format!("snapshot-{index}"),
+                },
+            };
+            let retirement = RetirementRequest {
+                version: 1,
+                operation_id: request.operation_id.clone(),
+                application_id: request.application_id.clone(),
+                provider_incarnation: request.provider_incarnation.clone(),
+                original_initiator: "nvhttp".into(),
+                policy_identity: request.policy_identity.clone(),
+            };
+            let delayed_response =
+                (index != 0).then(|| fixture.attest_limiter_target(&owner, &request).unwrap());
+            // index zero models a retirement racing ahead of a delayed Reserve.
+            assert!(
+                fixture
+                    .retire_limiter_target(&coordinator, &retirement)
+                    .unwrap()
+                    .retired
+            );
+            assert!(
+                fixture
+                    .retire_limiter_target(&coordinator, &retirement)
+                    .unwrap()
+                    .retired
+            );
+            assert!(fixture.attest_limiter_target(&owner, &request).is_err());
+            if let Some(delayed_response) = delayed_response {
+                // Even if a successful Reserve response arrives after retirement,
+                // it cannot authorize a later running-target confirmation.
+                delayed_response.validate_for(&request).unwrap();
+                let mut running = request.clone();
+                running.stage = Stage::Running;
+                running.ticket = Some("late-ticket".into());
+                let key = ("launch".to_owned(), request.operation_id.clone());
+                fixture.operations.insert(
+                    key.clone(),
+                    (
+                        "fixture-game".into(),
+                        running.ticket.clone(),
+                        State::Running,
+                    ),
+                );
+                assert!(fixture.attest_limiter_target(&owner, &running).is_err());
+                fixture.operations.remove(&key);
+            }
+            let foreign = Identity {
+                caller: "launch",
+                initiator: "foreign",
+            };
+            assert!(
+                fixture
+                    .retire_limiter_target(&foreign, &retirement)
+                    .is_err()
+            );
+            assert!(fixture.limiter_reservations.is_empty());
+        }
     }
 
     #[test]

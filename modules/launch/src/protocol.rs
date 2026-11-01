@@ -45,6 +45,10 @@ pub enum Operation {
         request: amaterasu_module_sdk::application_library::preflight::Request,
     },
     #[serde(skip)]
+    CancelStreamingLibrary {
+        request: amaterasu_module_sdk::application_library::preflight::Request,
+    },
+    #[serde(skip)]
     AcceptStreamingLibrary {
         request: amaterasu_module_sdk::application_library::preflight::Request,
     },

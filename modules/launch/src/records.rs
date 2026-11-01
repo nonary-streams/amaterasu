@@ -93,6 +93,11 @@ pub struct Record {
     pub generic_provider_incarnation: Option<String>,
     #[serde(skip)]
     pub limiter_target_verified: bool,
+    /// True from before reservation dispatch until the executor confirms a replay fence.
+    #[serde(skip)]
+    pub limiter_reservation_pending: bool,
+    #[serde(skip)]
+    pub preflight_cancel_requested: bool,
     #[serde(skip)]
     pub pending_limiter_verification: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -258,7 +263,8 @@ impl Records {
         global_preparation: GlobalPreparation,
     ) -> Result<(u64, bool), &'static str> {
         self.values.retain(|_, record| {
-            record.launch_started
+            record.limiter_reservation_pending
+                || record.launch_started
                 || record.preflight_token.is_none()
                 || (record.state == State::Starting
                     && (!record.preflight_ready
@@ -380,6 +386,8 @@ impl Records {
                 library_policy_identity: None,
                 generic_provider_incarnation: None,
                 limiter_target_verified: false,
+                limiter_reservation_pending: false,
+                preflight_cancel_requested: false,
                 pending_limiter_verification: None,
                 config_overrides: None,
                 application_display_settings: None,
