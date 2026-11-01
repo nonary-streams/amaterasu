@@ -44,6 +44,33 @@ fn inject_package_root(
     Ok(())
 }
 
+fn retirement_component_order(
+    components: &[amaterasu_package::ComponentManifest],
+    providers: &[(
+        String,
+        amaterasu_contracts::effect_fence::ProviderIncarnation,
+    )],
+    state_provider: Option<&str>,
+) -> PackageResult<Vec<amaterasu_package::ComponentManifest>> {
+    let mut components = components.to_vec();
+    if !providers.is_empty() {
+        let state = state_provider.ok_or("effect retirement requires a selected State provider")?;
+        if providers.iter().any(|(provider, _)| provider == state) {
+            return Err("State cannot persist its own retirement receipt".into());
+        }
+        for (provider, _) in providers {
+            let component = components
+                .iter_mut()
+                .find(|component| component.id == *provider)
+                .ok_or("retirement provider is not in the package")?;
+            component.requires.entry(state.into()).or_default();
+        }
+    }
+    // Validate the synthetic dependency before loading modules or admitting effects.
+    ordered_components(&components)?;
+    Ok(components)
+}
+
 fn inject_running_package_digest(
     runtime_config: &mut amaterasu_contracts::RuntimeConfig,
     digest: &str,
@@ -222,7 +249,7 @@ impl LoadedComponents {
                     })
                     .collect::<BTreeMap<_, _>>()
                     .into_iter()
-                    .collect()
+                    .collect::<Vec<_>>()
             })
             .unwrap_or_default();
         let retirement_state_provider = runtime_config
@@ -266,11 +293,19 @@ impl LoadedComponents {
             .principals
             .get("amaterasu.management")
             .is_some_and(|grants| grants.call.contains(HOST_LOG_SERVICE));
+        // Retirement receipts require State throughout the protected provider's
+        // lifetime. Add this host-owned ordering constraint before loading any
+        // module; an incompatible dependency cycle must fail closed.
+        let retirement_order = retirement_component_order(
+            &package.manifest.components,
+            &retirement_providers,
+            retirement_state_provider.as_deref(),
+        )?;
+        let components = ordered_components(&retirement_order)?;
         let configuration =
             serde_json::to_vec(&runtime_config).map_err(|error| error.to_string())?;
         let mut runtime =
             RuntimeLibrary::load(&directory.join(&runtime_component.file), &configuration)?;
-        let components = ordered_components(&package.manifest.components)?;
         let lifecycle_endpoint = runtime.endpoint(HOST_LIFECYCLE_CONTROL_PRINCIPAL)?;
         let mut loaded = Self::load_features(
             runtime,
