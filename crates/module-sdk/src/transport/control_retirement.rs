@@ -51,15 +51,29 @@ pub struct Receipt {
     pub provider_epoch: String,
 }
 
+// Structural checks only; service authentication and operation identity remain
+// the responsibility of the caller and the specific receipt wrapper.
+pub(crate) fn matches_retired(
+    ok: bool,
+    state: &str,
+    scope: &str,
+    observed: (u64, &str),
+    expected: (u64, &str),
+) -> bool {
+    ok && state == "retired" && scope == "whole_control_stream" && observed == expected
+}
+
 impl Receipt {
     /// Structural match only: caller must also authenticate the broker service
     /// and compose this receipt with the protocol authority's drain barrier.
     pub fn matches(&self, stream: u64, operation_id: &str, provider_epoch: &str) -> bool {
-        self.ok
-            && self.state == "retired"
-            && self.scope == "whole_control_stream"
-            && self.stream == stream
-            && self.operation_id == operation_id
-            && self.provider_epoch == provider_epoch
+        self.operation_id == operation_id
+            && matches_retired(
+                self.ok,
+                &self.state,
+                &self.scope,
+                (self.stream, &self.provider_epoch),
+                (stream, provider_epoch),
+            )
     }
 }

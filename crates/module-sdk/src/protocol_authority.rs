@@ -1,6 +1,6 @@
 //! Client-side request builder for the shared pairing effect authority.
 //! This is not a second gate, source attestation, permission policy, or ingress.
-use crate::effect_authority::{Request, Source};
+use crate::effect_authority::{Request, Source, response_matches, response_ticket};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -60,43 +60,27 @@ impl EffectOperation {
     }
     /// Admit responses are accepted only from the selected authority endpoint.
     pub fn accepted_admission(&self, response: &Value) -> Result<AdmittedEffect, &'static str> {
-        if response.get("fenced").is_some() {
-            return Err("authority_denied");
-        }
-        self.parse_ticket(response)
+        let (ticket, _) = response_ticket(response, &self.epoch, &self.operation_id, false)
+            .ok_or("authority_denied")?;
+        Ok(self.admitted(ticket))
     }
     /// A fenced lookup retains the ticket only for worker retirement and completion.
     pub fn accepted_lookup(&self, response: &Value) -> Result<LookupResult, &'static str> {
-        let ticket = self.parse_ticket(response)?;
-        match response.get("fenced").and_then(Value::as_bool) {
-            Some(false) => Ok(LookupResult::Active(ticket)),
-            Some(true) => Ok(LookupResult::Fenced(FencedEffect(ticket))),
-            None => Err("authority_denied"),
-        }
-    }
-    fn parse_ticket(&self, response: &Value) -> Result<AdmittedEffect, &'static str> {
-        if response.get("ok").and_then(Value::as_bool) != Some(true)
-            || response.get("epoch").and_then(Value::as_str) != Some(&self.epoch)
-            || response.get("operation_id").and_then(Value::as_str) != Some(&self.operation_id)
-        {
-            return Err("authority_denied");
-        }
-        let ticket = response
-            .get("ticket")
-            .and_then(Value::as_str)
+        let (ticket, fenced) = response_ticket(response, &self.epoch, &self.operation_id, true)
             .ok_or("authority_denied")?;
-        if ticket.len() != 32
-            || !ticket
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return Err("authority_denied");
-        }
-        Ok(AdmittedEffect {
+        let admitted = self.admitted(ticket);
+        Ok(if fenced {
+            LookupResult::Fenced(FencedEffect(admitted))
+        } else {
+            LookupResult::Active(admitted)
+        })
+    }
+    fn admitted(&self, ticket: &str) -> AdmittedEffect {
+        AdmittedEffect {
             epoch: self.epoch.clone(),
             operation_id: self.operation_id.clone(),
             ticket: ticket.into(),
-        })
+        }
     }
 }
 pub enum LookupResult {
@@ -131,10 +115,7 @@ impl AdmittedEffect {
     /// A completion response may be lost. Repeat complete with this live ticket;
     /// only confirmed completion permits an acknowledgement.
     pub fn confirm_completion(&self, response: &Value) -> Result<CompletedEffect, &'static str> {
-        if response.get("ok").and_then(Value::as_bool) != Some(true)
-            || response.get("epoch").and_then(Value::as_str) != Some(&self.epoch)
-            || response.get("operation_id").and_then(Value::as_str) != Some(&self.operation_id)
-        {
+        if !response_matches(response, &self.epoch, &self.operation_id) {
             return Err("completion_unconfirmed");
         }
         Ok(CompletedEffect(AdmittedEffect {

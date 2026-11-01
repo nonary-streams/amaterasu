@@ -3,7 +3,10 @@
 //! The selected effect owner must hold each ticket until its final local effect
 //! or send completes. A source identifier is not a grant. This contract alone
 //! does not authenticate a protocol-to-lifecycle join or implement a barrier.
+use crate::{input::extensions::source_label::SourceLabel, transport::control_retirement};
+use amaterasu_extension_api::LifecycleTarget;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeSet;
 
 pub const SERVICE: &str = "amaterasu.pairing-effects/1";
@@ -24,6 +27,64 @@ pub struct Source {
 }
 
 impl Source {
+    /// Construct the full effect source from trusted lifecycle data and the
+    /// independently resolved device and owner incarnation. This is a checked
+    /// conversion, not source attestation or admission authority.
+    pub fn from_lifecycle(
+        label: &SourceLabel,
+        target: &LifecycleTarget,
+        device: String,
+        device_generation: u64,
+        effect_owner_epoch: String,
+    ) -> Result<Self, &'static str> {
+        let LifecycleTarget::Stream {
+            host_epoch,
+            session_id,
+            stream_id,
+            generation,
+        } = target
+        else {
+            return Err("invalid_source");
+        };
+        if !label.valid_for(*generation) {
+            return Err("invalid_source");
+        }
+        let source = Self {
+            version: u8::try_from(label.version).map_err(|_| "invalid_source")?,
+            id: label.id.clone(),
+            generation: label.generation,
+            host_epoch: host_epoch.clone(),
+            session_id: session_id.clone(),
+            stream_id: stream_id.clone(),
+            stream_generation: *generation,
+            device,
+            device_generation,
+            effect_owner_epoch,
+        };
+        source.valid().then_some(source).ok_or("invalid_source")
+    }
+
+    /// Extract a checked lifecycle label and stream target. These values are
+    /// selectors only; the trusted owner must authenticate them separately.
+    pub fn to_lifecycle(&self) -> Result<(SourceLabel, LifecycleTarget), &'static str> {
+        if !self.valid() {
+            return Err("invalid_source");
+        }
+        Ok((
+            SourceLabel {
+                version: u32::from(self.version),
+                id: self.id.clone(),
+                generation: self.generation,
+            },
+            LifecycleTarget::Stream {
+                host_epoch: self.host_epoch.clone(),
+                session_id: self.session_id.clone(),
+                stream_id: self.stream_id.clone(),
+                generation: self.stream_generation,
+            },
+        ))
+    }
+
     pub fn valid(&self) -> bool {
         self.version == 1
             && hex(&self.id, 32)
@@ -47,6 +108,38 @@ fn hex(value: &str, len: usize) -> bool {
 
 fn token(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+}
+
+// These checks inspect wire values only. The caller must obtain responses from
+// the selected authenticated authority endpoint and enforce its own state machine.
+pub(crate) fn response_matches(response: &Value, epoch: &str, operation_id: &str) -> bool {
+    response.get("ok").and_then(Value::as_bool) == Some(true)
+        && response.get("epoch").and_then(Value::as_str) == Some(epoch)
+        && response.get("operation_id").and_then(Value::as_str) == Some(operation_id)
+}
+
+pub(crate) fn response_ticket<'a>(
+    response: &'a Value,
+    epoch: &str,
+    operation_id: &str,
+    lookup: bool,
+) -> Option<(&'a str, bool)> {
+    if !response_matches(response, epoch, operation_id) {
+        return None;
+    }
+    let ticket = response.get("ticket")?.as_str()?;
+    if !hex(ticket, 32) {
+        return None;
+    }
+    let fenced = if lookup {
+        response.get("fenced")?.as_bool()?
+    } else {
+        if response.get("fenced").is_some() {
+            return None;
+        }
+        false
+    };
+    Some((ticket, fenced))
 }
 
 /// Wire-compatible with input extension capability identities; feedback leases
@@ -114,13 +207,15 @@ pub struct StreamRetirement {
 }
 impl StreamRetirement {
     pub fn matches(&self, scope: &StreamScope) -> bool {
-        self.ok
-            && self.service == scope.transport_service
-            && self.stream == scope.transport_stream
-            && self.provider_epoch == scope.transport_epoch
+        self.service == scope.transport_service
             && token(&self.operation_id)
-            && self.scope == "whole_control_stream"
-            && self.state == "retired"
+            && control_retirement::matches_retired(
+                self.ok,
+                &self.state,
+                &self.scope,
+                (self.stream, &self.provider_epoch),
+                (scope.transport_stream, &scope.transport_epoch),
+            )
     }
 }
 
@@ -197,6 +292,233 @@ pub mod consumer;
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn lifecycle_source_conversion_preserves_wire_fields_and_checks_incarnations() {
+        let label = SourceLabel {
+            version: 1,
+            id: "a".repeat(32),
+            generation: 3,
+        };
+        let target = LifecycleTarget::Stream {
+            host_epoch: "host".into(),
+            session_id: "session".into(),
+            stream_id: "stream".into(),
+            generation: 3,
+        };
+        let source =
+            Source::from_lifecycle(&label, &target, "device".into(), 9, "owner".into()).unwrap();
+        let expected = json!({"version":1,"id":"a".repeat(32),"generation":3,"host_epoch":"host", "session_id":"session", "stream_id":"stream", "stream_generation":3, "device":"device", "device_generation":9, "effect_owner_epoch":"owner"});
+        assert_eq!(serde_json::to_value(&source).unwrap(), expected);
+        assert_eq!(serde_json::from_value::<Source>(expected).unwrap(), source);
+        let (observed_label, observed_target) = source.to_lifecycle().unwrap();
+        assert_eq!(observed_label, label);
+        assert_eq!(observed_target, target);
+        assert_eq!(
+            Source::from_lifecycle(
+                &observed_label,
+                &observed_target,
+                "device".into(),
+                9,
+                "owner".into()
+            )
+            .unwrap(),
+            source
+        );
+        let wrong_targets = [
+            LifecycleTarget::Stream {
+                host_epoch: "other".into(),
+                session_id: "session".into(),
+                stream_id: "stream".into(),
+                generation: 3,
+            },
+            LifecycleTarget::Stream {
+                host_epoch: "host".into(),
+                session_id: "other".into(),
+                stream_id: "stream".into(),
+                generation: 3,
+            },
+            LifecycleTarget::Stream {
+                host_epoch: "host".into(),
+                session_id: "session".into(),
+                stream_id: "other".into(),
+                generation: 3,
+            },
+        ];
+        for wrong in wrong_targets {
+            assert_ne!(observed_target, wrong);
+        }
+        let mut bad = label.clone();
+        for version in [0, 2, 256] {
+            bad.version = version;
+            assert!(
+                Source::from_lifecycle(&bad, &target, "device".into(), 9, "owner".into()).is_err()
+            );
+        }
+        bad = label.clone();
+        bad.generation = 4;
+        assert!(Source::from_lifecycle(&bad, &target, "device".into(), 9, "owner".into()).is_err());
+        bad = label.clone();
+        bad.id = "A".repeat(32);
+        assert!(Source::from_lifecycle(&bad, &target, "device".into(), 9, "owner".into()).is_err());
+        assert!(
+            Source::from_lifecycle(&label, &target, "device".into(), 0, "owner".into()).is_err()
+        );
+        assert!(
+            Source::from_lifecycle(&label, &target, "device".into(), 9, String::new()).is_err()
+        );
+        let mut invalid_source = source;
+        invalid_source.stream_generation += 1;
+        assert!(invalid_source.to_lifecycle().is_err());
+    }
+
+    #[test]
+    fn shared_retirement_validation_preserves_exact_operation_and_service_checks() {
+        use crate::transport::control_retirement::Receipt;
+        let epoch = "a".repeat(32);
+        let scope = StreamScope {
+            capabilities: [FeedbackCapability {
+                schema: "org.example.feedback".into(),
+                version: 1,
+                direction: FeedbackDirection::ToClient,
+            }]
+            .into(),
+            controller_slot: 1,
+            transport_service: "example.transport/1".into(),
+            transport_stream: 5,
+            transport_epoch: epoch.clone(),
+        };
+        let mut authority_receipt = StreamRetirement {
+            ok: true,
+            service: scope.transport_service.clone(),
+            stream: 5,
+            provider_epoch: epoch.clone(),
+            operation_id: "retire".into(),
+            scope: "whole_control_stream".into(),
+            state: "retired".into(),
+        };
+        let wire = serde_json::to_value(&authority_receipt).unwrap();
+        assert_eq!(
+            serde_json::from_value::<StreamRetirement>(wire.clone()).unwrap(),
+            authority_receipt
+        );
+        let mut transport_wire = wire;
+        transport_wire.as_object_mut().unwrap().remove("service");
+        let receipt: Receipt = serde_json::from_value(transport_wire.clone()).unwrap();
+        assert!(receipt.matches(5, "retire", &epoch));
+        assert!(!receipt.matches(5, "different", &epoch));
+        assert!(!receipt.matches(6, "retire", &epoch));
+        assert!(!receipt.matches(5, "retire", "other"));
+        assert!(authority_receipt.matches(&scope));
+        authority_receipt.service = "other.transport/1".into();
+        assert!(!authority_receipt.matches(&scope));
+        authority_receipt.service = scope.transport_service.clone();
+        authority_receipt.operation_id.clear();
+        assert!(!authority_receipt.matches(&scope));
+        for (field, value) in [
+            ("ok", json!(false)),
+            ("state", json!("open")),
+            ("scope", json!("source")),
+            ("stream", json!(6)),
+            ("provider_epoch", json!("other")),
+        ] {
+            let mut changed = transport_wire.clone();
+            changed[field] = value;
+            let invalid: Receipt = serde_json::from_value(changed.clone()).unwrap();
+            assert!(!invalid.matches(5, "retire", &epoch));
+            changed["service"] = json!(scope.transport_service);
+            let invalid: StreamRetirement = serde_json::from_value(changed).unwrap();
+            assert!(!invalid.matches(&scope));
+        }
+    }
+
+    #[test]
+    fn both_authority_clients_reject_mismatched_response_identity() {
+        use super::consumer::{EffectTicket, State};
+        use crate::protocol_authority::EffectOperation;
+        let label = SourceLabel {
+            version: 1,
+            id: "a".repeat(32),
+            generation: 1,
+        };
+        let target = LifecycleTarget::Stream {
+            host_epoch: "host".into(),
+            session_id: "session".into(),
+            stream_id: "stream".into(),
+            generation: 1,
+        };
+        let source =
+            Source::from_lifecycle(&label, &target, "device".into(), 1, "owner".into()).unwrap();
+        let epoch = "e".repeat(32);
+        let protocol =
+            EffectOperation::new(epoch.clone(), source.clone(), "caller", "operation", 1).unwrap();
+        let Request::Admit {
+            operation_id: protocol_id,
+            ..
+        } = protocol.admit()
+        else {
+            unreachable!()
+        };
+        let protocol_response =
+            json!({"ok":true,"epoch":epoch,"operation_id":protocol_id,"ticket":"b".repeat(32)});
+        let owner_response =
+            json!({"ok":true,"epoch":epoch,"operation_id":"operation","ticket":"b".repeat(32)});
+        let mut owner = EffectTicket::new(epoch, source, "operation".into(), 1).unwrap();
+        for (field, value) in [
+            ("ok", json!(false)),
+            ("epoch", json!("wrong")),
+            ("operation_id", json!("wrong")),
+            ("ticket", json!("bad")),
+            ("fenced", json!(false)),
+        ] {
+            let mut bad = protocol_response.clone();
+            bad[field] = value.clone();
+            assert!(protocol.accepted_admission(&bad).is_err());
+            let mut bad = owner_response.clone();
+            bad[field] = value;
+            assert!(owner.accept_admission(&bad).is_err());
+            assert_eq!(owner.state(), State::AwaitAdmission);
+        }
+        let mut wrong_kind = owner_response.clone();
+        wrong_kind["kind"] = json!("stream_lease");
+        assert!(owner.accept_admission(&wrong_kind).is_err());
+        assert!(protocol.accepted_admission(&protocol_response).is_ok());
+        owner.accept_admission(&owner_response).unwrap();
+        assert_eq!(owner.state(), State::Ready);
+    }
+
+    #[test]
+    fn authority_response_common_checks_reject_bad_identity_ticket_and_fencing() {
+        let response =
+            json!({"ok":true,"epoch":"epoch", "operation_id":"operation", "ticket":"b".repeat(32)});
+        assert!(response_ticket(&response, "epoch", "operation", false).is_some());
+        assert!(response_ticket(&response, "epoch", "operation", true).is_none());
+        for (field, value) in [
+            ("ok", json!(false)),
+            ("epoch", json!("other")),
+            ("operation_id", json!("other")),
+            ("ticket", json!("B".repeat(32))),
+            ("ticket", json!("b".repeat(31))),
+        ] {
+            let mut invalid = response.clone();
+            invalid[field] = value;
+            assert!(response_ticket(&invalid, "epoch", "operation", false).is_none());
+        }
+        for value in [json!(true), json!(false), json!(null), json!("false")] {
+            let mut lookup = response.clone();
+            lookup["fenced"] = value.clone();
+            assert!(response_ticket(&lookup, "epoch", "operation", false).is_none());
+            assert_eq!(
+                response_ticket(&lookup, "epoch", "operation", true).map(|(_, fenced)| fenced),
+                value.as_bool()
+            );
+        }
+        assert!(!response_matches(
+            &json!({"ok":true,"epoch":"epoch","operation_id":"other"}),
+            "epoch",
+            "operation"
+        ));
+    }
 
     #[test]
     fn stream_scope_requires_exact_client_bound_capability_and_provider_epoch() {

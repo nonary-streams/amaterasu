@@ -5,7 +5,7 @@
 //! outcome or worker loss, keep the authority fenced and recover actual workers
 //! and queues before calling authority `recover`. Never replay an effect merely
 //! because a response was lost. A ticket is a secret and is not logged here.
-use super::{Request, Source, StreamRetirement, StreamScope};
+use super::{Request, Source, StreamRetirement, StreamScope, response_matches, response_ticket};
 use crate::transport::control_retirement::Receipt;
 use serde_json::Value;
 
@@ -113,25 +113,11 @@ impl EffectTicket {
         self.accept_ticket(response, true)
     }
     fn accept_ticket(&mut self, response: &Value, lookup: bool) -> Result<(), &'static str> {
-        if self.state != State::AwaitAdmission || !self.response_matches(response) {
+        if self.state != State::AwaitAdmission {
             return Err("invalid_effect_response");
         }
-        let ticket = response
-            .get("ticket")
-            .and_then(Value::as_str)
-            .filter(|v| valid_ticket(v))
+        let (ticket, fenced) = response_ticket(response, &self.epoch, &self.operation_id, lookup)
             .ok_or("invalid_effect_response")?;
-        let fenced = if lookup {
-            response
-                .get("fenced")
-                .and_then(Value::as_bool)
-                .ok_or("invalid_effect_response")?
-        } else {
-            if response.get("fenced").is_some() {
-                return Err("invalid_effect_response");
-            }
-            false
-        };
         self.ticket = Some(ticket.into());
         self.state = if fenced || self.cancel_requested {
             State::NeedsCompletion
@@ -141,10 +127,7 @@ impl EffectTicket {
         Ok(())
     }
     fn response_matches(&self, response: &Value) -> bool {
-        response.get("ok").and_then(Value::as_bool) == Some(true)
-            && response.get("epoch").and_then(Value::as_str) == Some(self.epoch.as_str())
-            && response.get("operation_id").and_then(Value::as_str)
-                == Some(self.operation_id.as_str())
+        response_matches(response, &self.epoch, &self.operation_id)
     }
     /// Cancelling an uncertain admission still requires lookup/reconciliation.
     /// Running work or a possibly queued transport message must still retire.

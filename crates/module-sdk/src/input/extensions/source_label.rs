@@ -6,10 +6,10 @@
 //! replace the selected consumer's input binding and boot-epoch checks.
 
 use amaterasu_extension_api::LifecycleTarget;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceLabel {
     pub version: u32,
@@ -18,7 +18,7 @@ pub struct SourceLabel {
 }
 
 impl SourceLabel {
-    fn valid_for(&self, stream_generation: u64) -> bool {
+    pub(crate) fn valid_for(&self, stream_generation: u64) -> bool {
         self.version == 1
             && self.generation == stream_generation
             && stream_generation != 0
