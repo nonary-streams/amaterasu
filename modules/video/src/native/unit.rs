@@ -153,11 +153,11 @@ unsafe fn metadata_operation(
 unsafe extern "C" fn framed_metadata(context: *mut c_void, stream: u64, unit: u64) -> Status {
     unsafe { metadata_operation(context, stream, unit, Queues::framed_metadata) }
 }
-unsafe extern "C" fn check_metadata(_: *mut c_void, _: u64, _: u64) -> Status {
-    MEDIA_UNSUPPORTED
+unsafe extern "C" fn check_metadata(context: *mut c_void, stream: u64, unit: u64) -> Status {
+    unsafe { metadata_operation(context, stream, unit, Queues::check_metadata) }
 }
-unsafe extern "C" fn retire_metadata(_: *mut c_void, _: u64, _: u64) -> Status {
-    MEDIA_UNSUPPORTED
+unsafe extern "C" fn retire_metadata(context: *mut c_void, stream: u64, unit: u64) -> Status {
+    unsafe { metadata_operation(context, stream, unit, Queues::retire_metadata) }
 }
 
 unsafe extern "C" fn admit_metadata(

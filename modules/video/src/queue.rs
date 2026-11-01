@@ -535,6 +535,48 @@ impl Queues {
         .map_or_else(|status| status, |_| STATUS_OK)
     }
 
+    /// Preserved v1.1 compatibility operation. New required-metadata routes
+    /// must use `admit_metadata`, which combines this check with admission.
+    pub(crate) fn check_metadata(&mut self, owner: &str, id: u64, unit: u64) -> Status {
+        self.with_metadata_unit(owner, id, unit, |selected, header, metadata| {
+            metadata
+                .association
+                .check_transport(header, &metadata.bytes, selected.capabilities.encoder)
+                .map_err(|_| STATUS_INVALID_ARGUMENT)
+        })
+        .map_or_else(|status| status, |_| STATUS_OK)
+    }
+
+    /// Preserved v1.1 compatibility retirement operation. Its split check and
+    /// retire calls cannot establish an atomic transport admission boundary.
+    pub(crate) fn retire_metadata(&mut self, owner: &str, id: u64, unit: u64) -> Status {
+        let result = self.with_metadata_unit(owner, id, unit, |selected, header, metadata| {
+            let mut flow = selected.flow.lock().map_err(|_| STATUS_INVALID_ARGUMENT)?;
+            flow.retire(
+                &mut metadata.association,
+                header,
+                &metadata.bytes,
+                selected.capabilities,
+            )
+            .map_err(|_| STATUS_INVALID_ARGUMENT)
+        });
+        if let Err(status) = result {
+            return status;
+        }
+        let Some(queue) = self
+            .streams
+            .get_mut(&id)
+            .and_then(|stream| stream.negotiated.as_mut())
+        else {
+            return MEDIA_CLOSED;
+        };
+        let Some(retired) = queue.ready.pop_front() else {
+            return MEDIA_PENDING;
+        };
+        queue.bytes -= retired.bytes.len();
+        STATUS_OK
+    }
+
     /// Validate, admit and retire while holding the same flow and queue
     /// barriers. Cancellation waits for the callback; BUSY consumes nothing.
     /// # Safety

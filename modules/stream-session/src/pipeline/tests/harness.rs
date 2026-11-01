@@ -1252,10 +1252,10 @@ impl Broker {
                     allocation.request["configuration"]["extension_profile"].as_object()
                 {
                     reply["negotiated_unit"] = json!({"stream":id,"generation":id,"offer_id":profile["wire_selector"],
-                        "source_id":if self.extension_bad_unit { 99 } else { allocation.request["source_id"].as_u64().unwrap_or(77) },
+                        "source_id":if self.extension_bad_unit { 99 } else if self.extension_metadata_schema.is_some() { 1 } else { allocation.request["source_id"].as_u64().unwrap_or(77) },
                         "config_generation":1,"codec":profile["codec"],"framing":profile["framing"],
                         "clock_epoch":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"clock_origin_us":100});
-                    if allocation.request["source_id"].is_null() {
+                    if self.extension_metadata_schema.is_some() {
                         reply["negotiated_unit"]["source_generation"] = json!(9);
                     }
                 }

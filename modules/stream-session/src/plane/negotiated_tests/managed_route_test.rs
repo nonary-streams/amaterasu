@@ -23,6 +23,13 @@ const RTSP: &str = "amaterasu.rtsp/1";
 const STREAM: &str = "amaterasu.stream-session/1";
 const LAUNCH: &str = "amaterasu.launch/1";
 const DISPLAY: &str = "amaterasu.display/1";
+const CAPTURE: &str = "test.capture/1";
+const RESOURCE: &str = "test.resource/1";
+const PROCESSOR: &str = "test.processor/1";
+const CAPTURE_CAPS: &str = "test.capture-caps/1";
+const PROCESSOR_CAPS: &str = "test.processor-caps/1";
+const ENCODER_CAPS: &str = "test.encoder-caps/1";
+const BUILTIN_ENCODE: &str = "amaterasu.encode/1";
 
 struct Fixture {
     launcher: RuntimeClient,
@@ -42,6 +49,7 @@ struct Fixture {
     opened_encoders: usize,
     encoder_live: bool,
     closed_encoders: usize,
+    metadata: bool,
     probes: Vec<Value>,
     _guard: RuntimeGuard,
 }
@@ -67,6 +75,11 @@ impl Fixture {
                     "request_sha256":payload["request_sha256"],"preflight_remaining_ms":10_000})
             } else if service == ENCODER_CONTROL {
                 match payload["action"].as_str().unwrap_or("") {
+                    "probe" if self.metadata => {
+                        self.probes.push(payload.clone());
+                        json!({"ok":true,"settled":true,"usable":true,"codec":"h264",
+                            "encoder":payload["encoder"],"configuration":payload["configuration"]})
+                    }
                     "probe_source" => {
                         self.probes.push(payload.clone());
                         json!({"ok":true,"settled":true,"usable":payload["encoder"]["clsid"] == self.selected_encoder,
@@ -77,7 +90,10 @@ impl Fixture {
                         self.opened_encoders += 1;
                         self.encoder_live = true;
                         json!({"ok":true,"session_id":77,"packet_boundaries":true,"max_reference_frames":0,
-                            "extension_profile":payload["configuration"]["extension_profile"]})
+                            "extension_profile":payload["configuration"]["extension_profile"],
+                            "resource_output_clock":payload["resource_output_clock"],
+                            "resource_callback_contract":payload["resource_callback_contract"],
+                            "resource_sequence_policy":"strict_source_echo"})
                     }
                     "lookup" if self.encoder_live => json!({"ok":true,"session_id":77}),
                     "lookup" => json!({"ok":false,"code":"not_found"}),
@@ -87,6 +103,14 @@ impl Fixture {
                         json!({"ok":true,"session_id":77})
                     }
                     "drain" => json!({"ok":true,"session_id":77}),
+                    _ => json!({"ok":false,"code":"unsupported"}),
+                }
+            } else if service == CAPTURE {
+                match payload["action"].as_str().unwrap_or("") {
+                    "open" => {
+                        json!({"ok":true,"stream":1,"resource_capture_clock":payload["resource_capture_clock"],"resource_callback_contract":"cross_service_safe"})
+                    }
+                    "lookup" | "close" => json!({"ok":true,"stream":1}),
                     _ => json!({"ok":false,"code":"unsupported"}),
                 }
             } else {
@@ -220,7 +244,12 @@ impl Fixture {
             .write_all(&sealer.seal(request.as_bytes()).unwrap())
             .unwrap();
         client.set_nonblocking(true).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(4);
+        let timeout = if request.starts_with("TEARDOWN ") {
+            Duration::from_secs(20)
+        } else {
+            Duration::from_secs(4)
+        };
+        let deadline = Instant::now() + timeout;
         let mut bytes = Vec::new();
         loop {
             self.tick();
@@ -231,7 +260,12 @@ impl Fixture {
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(error) => panic!("RTSP read failed: {error}"),
             }
-            assert!(Instant::now() < deadline, "RTSP response timed out");
+            if Instant::now() >= deadline {
+                panic!(
+                    "RTSP response timed out; video status: {}",
+                    self.video_status()
+                );
+            }
             std::thread::sleep(Duration::from_millis(1));
         }
         String::from_utf8(opener.open(&bytes).unwrap().plaintext).unwrap()
@@ -283,6 +317,14 @@ impl Drop for RuntimeGuard {
     }
 }
 fn fixture(marker: u8, encoder: &str, transport_name: &str) -> Fixture {
+    fixture_with_metadata(marker, encoder, transport_name, false)
+}
+fn fixture_with_metadata(
+    marker: u8,
+    encoder: &str,
+    transport_name: &str,
+    metadata: bool,
+) -> Fixture {
     let profile = json!({"codec":{"namespace_id":42,"value":9,"schema":1},
         "framing":{"namespace_id":42,"value":10,"schema":1},"wire_selector":9,"payload_type":99,"encoding_name":"TEST9"});
     let mut transport_profile = profile.clone();
@@ -291,7 +333,7 @@ fn fixture(marker: u8, encoder: &str, transport_name: &str) -> Fixture {
     } else {
         transport_profile["encoding_name"] = json!(transport_name);
     }
-    let native: serde_json::Map<String, Value> = [
+    let mut native: serde_json::Map<String, Value> = [
         (VIDEO, video_framing::VIDEO_UNIT_CONTRACT, "video"),
         (
             VIDEO_CONTROL,
@@ -328,6 +370,41 @@ fn fixture(marker: u8, encoder: &str, transport_name: &str) -> Fixture {
         )
     })
     .collect();
+    if metadata {
+        native.insert(BUILTIN_ENCODE.into(), json!({"provider":"provider","contract":amaterasu_module_sdk::media::native_contracts::ENCODER}));
+        native.insert(ENCODER_CONTROL.into(), json!({"provider":"provider","contract":amaterasu_module_sdk::media::native_contracts::ENCODER}));
+        for (service, contract) in [
+            (
+                CAPTURE,
+                amaterasu_module_sdk::media::native_contracts::CAPTURE,
+            ),
+            (
+                RESOURCE,
+                amaterasu_module_sdk::media::native_contracts::FRAME_RESOURCE_CONSUMER,
+            ),
+            (
+                PROCESSOR,
+                amaterasu_module_sdk::media::native_contracts::FRAME_RESOURCE_PROCESSOR,
+            ),
+            (
+                CAPTURE_CAPS,
+                amaterasu_module_sdk::media::metadata::CAPABILITIES_CONTRACT,
+            ),
+            (
+                PROCESSOR_CAPS,
+                amaterasu_module_sdk::media::metadata::CAPABILITIES_CONTRACT,
+            ),
+            (
+                ENCODER_CAPS,
+                amaterasu_module_sdk::media::metadata::CAPABILITIES_CONTRACT,
+            ),
+        ] {
+            native.insert(
+                service.into(),
+                json!({"provider":"provider","contract":contract}),
+            );
+        }
+    }
     let all_calls = [
         RTSP,
         STREAM,
@@ -340,7 +417,7 @@ fn fixture(marker: u8, encoder: &str, transport_name: &str) -> Fixture {
         LAUNCH,
         DISPLAY,
     ];
-    let settings = json!({"principals":{
+    let mut settings = json!({"principals":{
         "provider":{"provide":[SESSION,STATE,CONTROL,ENCODER_CONTROL,LAUNCH,DISPLAY],"native_provide":[ENCODER_NATIVE,FRAMER,CONTROL]},
         "transport":{"provide":[MEDIA],"native_provide":[MEDIA,PLAN]},
         "video":{"provide":[VIDEO_CONTROL],"call":[ENCODER_CONTROL],"native_provide":[VIDEO,VIDEO_CONTROL],"native_use":[ENCODER_NATIVE]},
@@ -356,6 +433,66 @@ fn fixture(marker: u8, encoder: &str, transport_name: &str) -> Fixture {
                 "video_unit_service":VIDEO,"framer_service":FRAMER,"plan_transport_service":PLAN}},
             "amaterasu.rtsp":{"enabled":true,"extension_enabled":true,"bind":"127.0.0.1:0","allowed_principals":["launcher","amaterasu.nvhttp"]}},
         "service_selections":{"native":native}});
+    if metadata {
+        let schema = json!({"namespace_id":1,"value":1,"schema":1});
+        for principal in ["consumer", "amaterasu.rtsp", "launcher", "amaterasu.nvhttp"] {
+            settings["principals"][principal]["call"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(CAPTURE));
+        }
+        settings["principals"]["provider"]["provide"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(CAPTURE));
+        for service in [
+            CAPTURE,
+            RESOURCE,
+            PROCESSOR,
+            CAPTURE_CAPS,
+            PROCESSOR_CAPS,
+            ENCODER_CAPS,
+            ENCODER_CONTROL,
+            BUILTIN_ENCODE,
+        ] {
+            settings["principals"]["provider"]["native_provide"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(service));
+            settings["principals"]["video"]["native_use"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!(service));
+        }
+        settings["principals"]["video"]["call"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!(CAPTURE));
+        settings["settings"]["transport"]["metadata_profiles"] =
+            json!([{"profile":profile,"schema":schema}]);
+        settings["settings"]["video"]["external_capture_providers"] =
+            json!({"fixture_capture":{"service":CAPTURE,"frame_transport":"generic_cpu"}});
+        settings["settings"]["video"]["external_encoder_providers"] =
+            json!({"fixture":ENCODER_CONTROL});
+        settings["settings"]["video"]["external_encoder_consumers"] = json!({"fixture":RESOURCE});
+        settings["settings"]["video"]["generic_processor_service"] = json!(PROCESSOR);
+        // The source-mode registration shares the control service but must use
+        // a distinct alias from the submitted resource consumer registration.
+        let source_registration =
+            settings["settings"]["video"]["source_encoder_providers"]["fixture"].clone();
+        settings["settings"]["video"]["source_encoder_providers"]
+            .as_object_mut()
+            .unwrap()
+            .remove("fixture");
+        settings["settings"]["video"]["source_encoder_providers"]["source_fixture"] =
+            source_registration;
+        settings["settings"]["video"]["source_encoder_providers"]["source_fixture"]["source_ids"] =
+            json!([1]);
+        settings["settings"]["video"]["metadata_route"] = json!({"profile":profile,"schema":schema,"capture_service":CAPTURE,
+            "encoder_control_service":ENCODER_CONTROL,"capture_capabilities":CAPTURE_CAPS,"processor_capabilities":PROCESSOR_CAPS,"encoder_capabilities":ENCODER_CAPS});
+        settings["settings"]["consumer"]["extension_route"]["source_id"] = json!(0);
+        settings["settings"]["consumer"]["extension_route"]["metadata_schema"] = schema;
+    }
     let api = unsafe { &*amaterasu_runtime_v1() };
     let mut runtime = std::ptr::null_mut();
     assert_eq!(
@@ -389,6 +526,13 @@ fn fixture(marker: u8, encoder: &str, transport_name: &str) -> Fixture {
             })
             .unwrap();
     }
+    if metadata {
+        provider
+            .require_success(Command::Register {
+                service: CAPTURE.into(),
+            })
+            .unwrap();
+    }
     let control = Factory::new(std::ptr::null_mut(), Kind::Control);
     let path = std::env::var(if marker == 1 {
         "AMATERASU_ROUTE_PROVIDER_ONE"
@@ -402,9 +546,61 @@ fn fixture(marker: u8, encoder: &str, transport_name: &str) -> Fixture {
             .register_native_typed(
                 ENCODER_NATIVE,
                 amaterasu_module_sdk::media::native_contracts::ENCODER_PROVIDER,
-                dynamic_provider.factory(b"route_fixture_encoder"),
+                dynamic_provider.factory(if metadata {
+                    b"route_fixture_submitted_encoder"
+                } else {
+                    b"route_fixture_encoder"
+                }),
             )
             .unwrap();
+        if metadata {
+            for (service, contract, symbol) in [
+                (
+                    CAPTURE,
+                    amaterasu_module_sdk::media::native_contracts::CAPTURE,
+                    b"route_fixture_submitted_capture".as_slice(),
+                ),
+                (
+                    RESOURCE,
+                    amaterasu_module_sdk::media::native_contracts::FRAME_RESOURCE_CONSUMER,
+                    b"route_fixture_submitted_consumer".as_slice(),
+                ),
+                (
+                    PROCESSOR,
+                    amaterasu_module_sdk::media::native_contracts::FRAME_RESOURCE_PROCESSOR,
+                    b"route_fixture_submitted_processor".as_slice(),
+                ),
+                (
+                    CAPTURE_CAPS,
+                    amaterasu_module_sdk::media::metadata::CAPABILITIES_CONTRACT,
+                    b"route_fixture_submitted_capabilities".as_slice(),
+                ),
+                (
+                    PROCESSOR_CAPS,
+                    amaterasu_module_sdk::media::metadata::CAPABILITIES_CONTRACT,
+                    b"route_fixture_submitted_capabilities".as_slice(),
+                ),
+                (
+                    ENCODER_CAPS,
+                    amaterasu_module_sdk::media::metadata::CAPABILITIES_CONTRACT,
+                    b"route_fixture_submitted_capabilities".as_slice(),
+                ),
+                (
+                    ENCODER_CONTROL,
+                    amaterasu_module_sdk::media::native_contracts::ENCODER,
+                    b"route_fixture_submitted_control".as_slice(),
+                ),
+                (
+                    BUILTIN_ENCODE,
+                    amaterasu_module_sdk::media::native_contracts::ENCODER,
+                    b"route_fixture_submitted_control".as_slice(),
+                ),
+            ] {
+                provider
+                    .register_native_typed(service, contract, dynamic_provider.factory(symbol))
+                    .unwrap();
+            }
+        }
         provider
             .register_native_typed(
                 CONTROL,
@@ -423,10 +619,70 @@ fn fixture(marker: u8, encoder: &str, transport_name: &str) -> Fixture {
     let transport =
         amaterasu_media_transport::test_support::ManagedTransport::start(endpoint("transport"))
             .unwrap();
+    if metadata {
+        let runtime = endpoint("video");
+        for (service, contract, minor, size) in [
+            (
+                CAPTURE,
+                amaterasu_module_sdk::media::native_contracts::CAPTURE,
+                0,
+                amaterasu_media::CAPTURE_API_V1_0_SIZE,
+            ),
+            (
+                ENCODER_CONTROL,
+                amaterasu_module_sdk::media::native_contracts::ENCODER,
+                0,
+                size_of::<amaterasu_media::EncoderApi>() as u32,
+            ),
+            (
+                ENCODER_NATIVE,
+                amaterasu_module_sdk::media::native_contracts::ENCODER_PROVIDER,
+                amaterasu_media::ENCODER_PROVIDER_INTERFACE_MINOR,
+                amaterasu_media::ENCODER_PROVIDER_API_V1_0_SIZE,
+            ),
+            (
+                RESOURCE,
+                amaterasu_module_sdk::media::native_contracts::FRAME_RESOURCE_CONSUMER,
+                0,
+                amaterasu_media::FRAME_RESOURCE_CONSUMER_API_V1_0_SIZE,
+            ),
+            (
+                PROCESSOR,
+                amaterasu_module_sdk::media::native_contracts::FRAME_RESOURCE_PROCESSOR,
+                amaterasu_media::FRAME_RESOURCE_PROCESSOR_PIPELINE_MINOR,
+                amaterasu_media::FRAME_RESOURCE_PROCESSOR_API_V1_0_SIZE,
+            ),
+            (
+                CAPTURE_CAPS,
+                amaterasu_module_sdk::media::metadata::CAPABILITIES_CONTRACT,
+                2,
+                size_of::<amaterasu_media::FrameMetadataCapabilitiesApiV1_2>() as u32,
+            ),
+            (
+                PROCESSOR_CAPS,
+                amaterasu_module_sdk::media::metadata::CAPABILITIES_CONTRACT,
+                2,
+                size_of::<amaterasu_media::FrameMetadataCapabilitiesApiV1_2>() as u32,
+            ),
+            (
+                ENCODER_CAPS,
+                amaterasu_module_sdk::media::metadata::CAPABILITIES_CONTRACT,
+                2,
+                size_of::<amaterasu_media::FrameMetadataCapabilitiesApiV1_2>() as u32,
+            ),
+        ] {
+            let bound = unsafe { runtime.bind_native_typed(service, contract, 1, minor, size) };
+            assert!(bound.is_ok(), "native binding failed for {service}");
+        }
+    }
     let video = amaterasu_video::test_support::VideoModule::start(endpoint("video")).unwrap();
     let session = StreamSession::start(endpoint("consumer")).unwrap();
     let rtsp =
         amaterasu_rtsp::test_support::ManagedRtsp::start(endpoint("amaterasu.rtsp")).unwrap();
+    let mut broker = Broker::new();
+    if metadata {
+        broker.extension_metadata_schema = Some(json!({"namespace_id":1,"value":1,"schema":1}));
+    }
     Fixture {
         launcher: endpoint("launcher"),
         nvhttp: endpoint("amaterasu.nvhttp"),
@@ -436,7 +692,7 @@ fn fixture(marker: u8, encoder: &str, transport_name: &str) -> Fixture {
         session,
         video,
         transport,
-        broker: Broker::new(),
+        broker,
         _dynamic_provider: dynamic_provider,
         consumer: endpoint("consumer"),
         marker,
@@ -445,6 +701,7 @@ fn fixture(marker: u8, encoder: &str, transport_name: &str) -> Fixture {
         opened_encoders: 0,
         encoder_live: false,
         closed_encoders: 0,
+        metadata,
         probes: Vec::new(),
         _guard: RuntimeGuard { api, runtime },
     }
@@ -488,7 +745,7 @@ fn prepare(fixture: &mut Fixture, video_port: u16, audio_port: u16, hdr: bool) -
     fixture.request(RTSP, "launch", json!({"action":"open","operation_id":"launch",
         "peer_ip":"127.0.0.1","video_port":video_port,"audio_port":audio_port,
         "key_hex":"00112233445566778899aabbccddeeff","key_id":1,"connect_data":2,"stream_audio":false,
-        "capture":{"capture_provider":"dxgi","output":"display","encoder":0,"audio_endpoint":"default"},
+        "capture":{"capture_provider":if fixture.metadata {"fixture_capture"} else {"dxgi"},"output":"display","encoder":0,"audio_endpoint":"default"},
         "profile":{"hdr":hdr,"width":parsed.video.width,"height":parsed.video.height,"fps":parsed.video.fps,
             "bitrate_kbps":parsed.video.bitrate_kbps,"max_reference_frames":0,"packet_size":1024,
             "fec_percentage":0,"min_parity_shards":0,"max_fec_blocks":1,"packet_ms":parsed.audio.packet_duration_ms,
@@ -591,7 +848,7 @@ fn exchange(
                 .to_owned();
         }
     }
-    let body = if hdr {
+    let mut body = if hdr {
         announcement().replace(
             "x-nv-video[0].dynamicRangeMode:0",
             "x-nv-video[0].dynamicRangeMode:1",
@@ -604,6 +861,9 @@ fn exchange(
     } else {
         announcement()
     };
+    if fixture.metadata {
+        body.push_str("a=x-amaterasu-video-metadata:9 1 1 1\r\n");
+    }
     let announce_request = format!(
         "ANNOUNCE streamid=control/13/0 RTSP/1.0\r\nCSeq: 6\r\nSession: {token}\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
@@ -632,7 +892,7 @@ fn exchange(
         let mut bytes = [0u8; 2048];
         match video_peer.recv(&mut bytes) {
             Ok(n) => {
-                assert!(n >= 44);
+                assert!(n >= if fixture.metadata { 46 } else { 44 });
                 assert_eq!(
                     &bytes[40..44],
                     &[
@@ -642,12 +902,20 @@ fn exchange(
                         fixture.marker
                     ]
                 );
+                if fixture.metadata {
+                    assert_eq!(&bytes[44..46], &[0xb5, 1]);
+                }
                 break;
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => panic!("{e}"),
         }
-        assert!(Instant::now() < deadline, "no video after PLAY");
+        if Instant::now() >= deadline {
+            panic!(
+                "no video after PLAY; video status: {}",
+                fixture.video_status()
+            );
+        }
         std::thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(fixture.opened_encoders, 1);
@@ -689,6 +957,15 @@ fn exchange(
         },
         MEDIA_CLOSED
     );
+}
+
+#[test]
+#[ignore = "requires two separately built submitted metadata providers and loopback"]
+fn managed_rtsp_negotiates_submitted_metadata_route() {
+    for marker in [1, 2] {
+        let mut host = fixture_with_metadata(marker, "source", "TEST9", true);
+        exchange(&mut host, true, true, false, false);
+    }
 }
 
 #[test]

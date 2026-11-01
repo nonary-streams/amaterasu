@@ -372,9 +372,10 @@ impl Controller {
                 }
             };
             let profile = if self.settings.extension_enabled
-                && payload
+                && (payload
                     .get("extension_metadata_schema")
                     .is_none_or(Value::is_null)
+                    || metadata_offer.is_some())
                 && !record.config.profile.hdr
                 && record.config.profile.max_reference_frames == 0
                 && record.config.min_threads == 2

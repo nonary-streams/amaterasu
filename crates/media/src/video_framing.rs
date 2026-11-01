@@ -143,9 +143,9 @@ pub struct NegotiatedVideoMetadataUnitSinkV1 {
 /// Optional video-unit v1.1 tail. `receive_metadata` reserves the unit until
 /// `retire_metadata` after local transport admission or stream cancellation.
 /// `framed_metadata` records the selected framer's successful application;
-/// The split check/retire operations do not provide an admission barrier and
-/// cannot authorize metadata-required production transport. V1.2 adds that
-/// barrier. All operations use the same binding and exact access-unit ID.
+/// The split check/retire operations are retained for v1.1 compatibility but
+/// do not provide an admission barrier. Metadata-required production transport
+/// requires v1.2. All operations use the same binding and exact access-unit ID.
 #[repr(C)]
 pub struct NegotiatedVideoApiV1_1 {
     pub base: NegotiatedVideoApi,

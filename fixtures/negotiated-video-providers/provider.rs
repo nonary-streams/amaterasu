@@ -1,3 +1,5 @@
+#[path = "submitted.rs"]
+mod submitted;
 use amaterasu_media::*;
 use amaterasu_module_sdk::{
     abi::*,
@@ -189,9 +191,18 @@ impl FramingProvider for Framer {
         metadata: &amaterasu_module_sdk::media::metadata::FrameMetadataBundle,
         limits: &VideoFramingLimits,
     ) -> Result<OwnedFramePlan, Status> {
-        let item = metadata.items.iter().find(|item| {
-            item.required && (item.schema.namespace_id, item.schema.value, item.schema.schema) == (1, 1, 1)
-        }).ok_or(STATUS_INVALID_ARGUMENT)?;
+        let item = metadata
+            .items
+            .iter()
+            .find(|item| {
+                item.required
+                    && (
+                        item.schema.namespace_id,
+                        item.schema.value,
+                        item.schema.schema,
+                    ) == (1, 1, 1)
+            })
+            .ok_or(STATUS_INVALID_ARGUMENT)?;
         let mut plan = self.plan(principal, unit, bytes, limits)?;
         // Synthetic test bytes demonstrate which independent framer was used;
         // this is not a real HDR or codec bitstream.
@@ -200,12 +211,14 @@ impl FramingProvider for Framer {
     }
 }
 struct Bundle {
+    submitted: submitted::SubmittedBundle,
     encoder: NativeServiceFactory,
     framer: Box<video_framing::Factory<Framer>>,
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn route_fixture_create() -> *mut c_void {
     Box::into_raw(Box::new(Bundle {
+        submitted: submitted::SubmittedBundle::new(),
         encoder: NativeServiceFactory {
             header: AbiHeader::of::<NativeServiceFactory>(),
             context: std::ptr::null_mut(),
@@ -239,4 +252,46 @@ pub unsafe extern "C" fn route_fixture_destroy(bundle: *mut c_void) {
             drop(Box::from_raw(bundle.cast::<Bundle>()));
         }
     }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn route_fixture_submitted_capture(
+    bundle: *mut c_void,
+) -> *const NativeServiceFactory {
+    &**unsafe { &(*bundle.cast::<Bundle>()).submitted.capture }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn route_fixture_submitted_consumer(
+    bundle: *mut c_void,
+) -> *const NativeServiceFactory {
+    &**unsafe { &(*bundle.cast::<Bundle>()).submitted.consumer }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn route_fixture_submitted_processor(
+    bundle: *mut c_void,
+) -> *const NativeServiceFactory {
+    &**unsafe { &(*bundle.cast::<Bundle>()).submitted.processor }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn route_fixture_submitted_encoder(
+    bundle: *mut c_void,
+) -> *const NativeServiceFactory {
+    &**unsafe { &(*bundle.cast::<Bundle>()).submitted.encoder }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn route_fixture_submitted_capabilities(
+    bundle: *mut c_void,
+) -> *const NativeServiceFactory {
+    &**unsafe { &(*bundle.cast::<Bundle>()).submitted.capabilities }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn route_fixture_submitted_control(
+    bundle: *mut c_void,
+) -> *const NativeServiceFactory {
+    &**unsafe { &(*bundle.cast::<Bundle>()).submitted.legacy_encoder }
 }
