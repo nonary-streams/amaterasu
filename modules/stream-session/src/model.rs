@@ -19,6 +19,7 @@ pub struct Settings {
     pub drain_timeout_ms: u64,
     pub enable_input: bool,
     pub observe_feedback_sources: bool,
+    pub feedback_retirement_input_principal: Option<String>,
     pub input_lease_ttl_ms: u64,
 }
 impl Default for Settings {
@@ -34,6 +35,7 @@ impl Default for Settings {
             drain_timeout_ms: 5000,
             enable_input: false,
             observe_feedback_sources: false,
+            feedback_retirement_input_principal: None,
             input_lease_ttl_ms: 30000,
         }
     }
@@ -50,6 +52,10 @@ impl Settings {
                 .audio_extension_route
                 .as_ref()
                 .is_some_and(|route| !route.valid())
+            || self
+                .feedback_retirement_input_principal
+                .as_ref()
+                .is_some_and(|name| !self.enable_input || !amaterasu_contracts::valid_name(name))
             || self.allowed_principals.len() > 16
             || self
                 .allowed_principals

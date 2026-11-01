@@ -1,6 +1,7 @@
 mod actions;
 mod cleanup;
 mod display;
+mod feedback_retirement;
 mod history;
 mod history_activity;
 mod host_metrics_activity;
@@ -102,6 +103,8 @@ struct NativeOperations<'a, 'b> {
 
 pub struct Pipeline {
     settings: Settings,
+    feedback_retirement_inbox: feedback_retirement::Inbox,
+    deferred_requests: VecDeque<DeferredRequest>,
     records: BTreeMap<u64, Record>,
     job: Option<Job>,
     sequence: u64,
@@ -120,11 +123,22 @@ pub struct Pipeline {
     recovery_blocked: bool,
 }
 
+struct DeferredRequest {
+    id: u64,
+    caller: String,
+    initiator: String,
+    service: String,
+    payload: Value,
+    deadline: u64,
+}
+
 impl Pipeline {
     pub fn new(settings: Settings) -> Result<Self, &'static str> {
         settings.validate()?;
         Ok(Self {
             settings,
+            feedback_retirement_inbox: feedback_retirement::Inbox::default(),
+            deferred_requests: VecDeque::new(),
             records: BTreeMap::new(),
             job: None,
             sequence: 0,
@@ -353,6 +367,37 @@ impl Pipeline {
         self.progress_host_metrics(now, send);
         self.progress_session_effects(now, send);
         self.tray_activity.progress(now, send);
+        self.feedback_retirement_inbox.prune_unstarted(send);
+        if self.job.is_some() && self.settings.feedback_retirement_input_principal.is_some() {
+            match send(Command::Poll {})? {
+                Response::Request {
+                    id,
+                    caller,
+                    initiator,
+                    service,
+                    payload,
+                    remaining_ms,
+                } => {
+                    let request = DeferredRequest {
+                        id,
+                        caller,
+                        initiator,
+                        service,
+                        payload,
+                        deadline: now.saturating_add(remaining_ms),
+                    };
+                    if self.is_feedback_retirement(&request) {
+                        self.receive_feedback_retirement(request, send);
+                    } else if self.deferred_requests.len() < 64 {
+                        self.deferred_requests.push_back(request);
+                    } else {
+                        rpc::complete(send, id, error("resource_exhausted"));
+                    }
+                }
+                Response::Pending => {}
+                _ => return Err("stream session poll failed".into()),
+            }
+        }
         if let Some(mut job) = self.job.take() {
             let session = job.session;
             let mut record = self
@@ -378,6 +423,12 @@ impl Pipeline {
             }
             return Ok(());
         }
+        if let Some(request) = self.deferred_requests.pop_front() {
+            if request.deadline > now && rpc::active(send, request.id) {
+                self.handle_deferred_request(request, now, send);
+            }
+            return Ok(());
+        }
         if !self.recovery_ready || self.recovery_blocked || self.journal.failed {
             // Keep the module responsive, but never admit new launch state while
             // durable recovery is unreadable or an owned resource is uncertain.
@@ -385,14 +436,25 @@ impl Pipeline {
                 Response::Request {
                     id,
                     caller,
+                    initiator,
                     service,
                     payload,
-                    ..
+                    remaining_ms,
                 } => {
-                    if service == SERVICE
-                        && let Ok(operation) = serde_json::from_value::<Operation>(payload)
+                    let incoming = DeferredRequest {
+                        id,
+                        caller,
+                        initiator,
+                        service,
+                        payload,
+                        deadline: now.saturating_add(remaining_ms),
+                    };
+                    if self.is_feedback_retirement(&incoming) {
+                        self.receive_feedback_retirement(incoming, send);
+                    } else if incoming.service == SERVICE
+                        && let Ok(operation) = serde_json::from_value::<Operation>(incoming.payload)
                     {
-                        self.receive(id, caller, operation, now, 0, send);
+                        self.receive(id, incoming.caller, operation, now, 0, send);
                     } else {
                         rpc::complete(send, id, error("restart_recovery_unconfirmed"));
                     }
@@ -422,11 +484,32 @@ impl Pipeline {
             Response::Request {
                 id,
                 caller,
+                initiator,
                 service,
                 payload,
                 remaining_ms,
-                ..
             } => {
+                let incoming = DeferredRequest {
+                    id,
+                    caller,
+                    initiator,
+                    service,
+                    payload,
+                    deadline: now.saturating_add(remaining_ms),
+                };
+                if self.is_feedback_retirement(&incoming) {
+                    self.receive_feedback_retirement(incoming, send);
+                    return Ok(());
+                }
+                let DeferredRequest {
+                    id,
+                    caller,
+                    service,
+                    payload,
+                    deadline,
+                    ..
+                } = incoming;
+                let remaining_ms = deadline.saturating_sub(now);
                 self.background_turn = true;
                 if service != SERVICE {
                     rpc::complete(send, id, error("invalid_service"));
@@ -445,6 +528,41 @@ impl Pipeline {
                 Ok(())
             }
             _ => Err("stream session poll failed".into()),
+        }
+    }
+
+    fn is_feedback_retirement(&self, request: &DeferredRequest) -> bool {
+        self.settings.feedback_retirement_input_principal.is_some()
+            && request.service == SERVICE
+            && request.payload.get("action").and_then(Value::as_str)
+                == Some("retire_input_feedback")
+    }
+    fn receive_feedback_retirement(&mut self, request: DeferredRequest, send: &mut Send<'_>) {
+        self.feedback_retirement_inbox.receive(
+            request.id,
+            &request.caller,
+            &request.initiator,
+            self.settings.feedback_retirement_input_principal.as_deref(),
+            request.payload,
+            send,
+        );
+    }
+    fn handle_deferred_request(&mut self, request: DeferredRequest, now: u64, send: &mut Send<'_>) {
+        if self.is_feedback_retirement(&request) {
+            self.receive_feedback_retirement(request, send);
+        } else if request.service != SERVICE {
+            rpc::complete(send, request.id, error("invalid_service"));
+        } else if let Ok(operation) = serde_json::from_value::<Operation>(request.payload) {
+            self.receive(
+                request.id,
+                request.caller,
+                operation,
+                now,
+                request.deadline.saturating_sub(now),
+                send,
+            );
+        } else {
+            rpc::complete(send, request.id, error("invalid_request"));
         }
     }
 

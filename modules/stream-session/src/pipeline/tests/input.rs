@@ -1793,3 +1793,53 @@ fn source_snapshot_intersects_live_offer_client_flags_and_stable_policy() {
         Err("unsupported_feedback_offer")
     );
 }
+
+#[test]
+fn retirement_ingress_is_serviced_while_another_workflow_is_active() {
+    let mut host = Harness::new();
+    host.pipeline.settings.enable_input = true;
+    host.pipeline.settings.feedback_retirement_input_principal = Some("input.owner".into());
+    host.broker.enqueue(1, "owner", prepare());
+    for _ in 0..20 {
+        host.tick();
+        if host.pipeline.job.is_some() {
+            break;
+        }
+    }
+    assert!(host.pipeline.job.is_some());
+    let payload = json!({"action":"retire_input_feedback","version":1,"operation_id":"retire-one","token":"binding","target":{"kind":"stream","host_epoch":"host","session_id":"session","stream_id":"stream","generation":1},"input_boot_epoch":"a".repeat(32)});
+    host.broker.enqueue(2, "input.owner", payload);
+    host.tick();
+    assert_eq!(host.pipeline.feedback_retirement_inbox.len(), 1);
+    assert!(!host.broker.replies.contains_key(&2));
+    host.broker.cancel_parent(2);
+    host.tick();
+    assert_eq!(host.pipeline.feedback_retirement_inbox.len(), 0);
+    assert!(!host.broker.replies.contains_key(&2));
+}
+
+#[test]
+fn retirement_ingress_defers_regular_requests_without_losing_them() {
+    let mut host = Harness::new();
+    host.pipeline.settings.enable_input = true;
+    host.pipeline.settings.feedback_retirement_input_principal = Some("input.owner".into());
+    host.broker.enqueue(1, "owner", prepare());
+    for _ in 0..20 {
+        host.tick();
+        if host.pipeline.job.is_some() {
+            break;
+        }
+    }
+    assert!(host.pipeline.job.is_some());
+    host.broker.enqueue(2, "owner", json!({"action":"status"}));
+    host.tick();
+    assert_eq!(host.pipeline.deferred_requests.len(), 1);
+    for _ in 0..600 {
+        host.tick();
+        if host.broker.replies.contains_key(&2) {
+            break;
+        }
+    }
+    assert!(host.broker.replies.contains_key(&1));
+    assert_eq!(host.broker.replies[&2]["ok"], true);
+}
