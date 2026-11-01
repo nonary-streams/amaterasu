@@ -10,6 +10,7 @@ amaterasu-contracts.workspace = true
 amaterasu-logging.workspace = true
 amaterasu-package.workspace = true
 amaterasu-input-companion.workspace = true
+amaterasu-module-sdk.workspace = true
 libloading.workspace = true
 serde_json.workspace = true
 serde.workspace = true

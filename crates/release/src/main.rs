@@ -275,6 +275,14 @@ fn run() -> PackageResult<()> {
                 Path::new(root),
             )
         }
+        #[cfg(target_os = "linux")]
+        [command, template, package, root] if command == "provision-fresh-feedback" => {
+            development::provision_fresh_feedback(
+                Path::new(template),
+                Path::new(package),
+                Path::new(root),
+            )
+        }
         [command, template, package, root] if command == "install-installer" => {
             development::install_installer_root(
                 Path::new(template),

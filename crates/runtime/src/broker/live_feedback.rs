@@ -17,17 +17,48 @@ const HOST_CONFIG: &str = "amaterasu.host-configuration/1";
 
 pub(super) fn validate(config: &RuntimeConfig) -> Result<(), String> {
     validate_topology(config)?;
-    if config.live_feedback.is_some() {
-        // Neither an absent journal nor a new process proves that previous
-        // workers or external effects were retired. The host must first supply
-        // an authenticated clean-bootstrap or retirement proof.
-        return Err("live feedback requires verified host bootstrap evidence".into());
+    if let Some(profile) = &config.live_feedback {
+        let proof = config
+            .host_context
+            .live_feedback_bootstrap
+            .as_ref()
+            .ok_or("live feedback requires verified host bootstrap evidence")?;
+        let state = config
+            .service_selections
+            .broker
+            .get(STATE)
+            .and_then(Option::as_ref)
+            .ok_or("selected State missing")?;
+        let valid_id = |value: &str| {
+            value.len() == 32
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        };
+        if !config.host_lifecycle_control
+            || proof.version != 1
+            || proof.profile != *profile
+            || proof.state_owner != state.provider
+            || !valid_id(&proof.installation_id)
+            || proof
+                .first_boot_claim
+                .as_deref()
+                .is_some_and(|claim| !valid_id(claim))
+        {
+            return Err("invalid trusted live feedback bootstrap evidence".into());
+        }
+    } else if config.host_context.live_feedback_bootstrap.is_some() {
+        return Err("feedback bootstrap evidence has no selected profile".into());
     }
     Ok(())
 }
 
 fn validate_topology(config: &RuntimeConfig) -> Result<(), String> {
-    if config.settings.values().any(|s| s.get(MARKER).is_some()) {
+    if config
+        .settings
+        .values()
+        .any(|s| s.get(MARKER).is_some() || s.get("live_feedback_bootstrap_claim").is_some())
+    {
         return Err("live feedback marker is broker-owned".into());
     }
     let Some(p) = &config.live_feedback else {
@@ -290,11 +321,20 @@ pub(super) fn inject(settings: &mut Value) {
     }
 }
 
+pub(super) fn claim_payload(config: &RuntimeConfig) -> Option<Value> {
+    let proof = config.host_context.live_feedback_bootstrap.as_ref()?;
+    let claim = proof.first_boot_claim.as_ref()?;
+    Some(
+        serde_json::json!({"version":1,"installation_id":proof.installation_id,
+        "claim":claim,"pairing_owner":proof.profile.pairing_owner,"effect_owner":proof.profile.stream_owner}),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Broker;
-    use amaterasu_contracts::{Command, Response};
+    use amaterasu_contracts::{Command, Grants, HOST_LIFECYCLE_CONTROL_PRINCIPAL, Response};
     use serde_json::json;
 
     fn profile() -> RuntimeConfig {
@@ -363,6 +403,308 @@ mod tests {
         assert!(
             matches!(broker.dispatch("protocol", Command::GetSettings {}), Response::Result {payload} if payload.get(MARKER).is_none())
         );
+    }
+
+    fn host_bootstrap_profile(claim: Option<&str>) -> RuntimeConfig {
+        let mut configuration = profile();
+        let selected_profile = configuration.live_feedback.clone().unwrap();
+        configuration.host_lifecycle_control = true;
+        configuration
+            .principals
+            .insert(HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(), Grants::default());
+        configuration.host_context = amaterasu_contracts::RuntimeHostContext {
+            schema: 1,
+            live_feedback_bootstrap: Some(amaterasu_contracts::LiveFeedbackHostProof {
+                version: 1,
+                installation_id: "a".repeat(32),
+                profile: selected_profile,
+                state_owner: "state".into(),
+                first_boot_claim: claim.map(str::to_owned),
+            }),
+            ..Default::default()
+        };
+        configuration
+    }
+
+    fn test_state_directory() -> std::path::PathBuf {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "amaterasu-feedback-broker-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    fn assert_error_code(response: Response, expected: &str) {
+        assert!(
+            matches!(&response, Response::Error { code, .. } if code == expected),
+            "expected {expected}, got {response:?}"
+        );
+    }
+
+    fn register_state_provider(broker: &mut Broker) {
+        assert!(matches!(
+            broker.dispatch(
+                "state",
+                Command::Register {
+                    service: STATE.into(),
+                }
+            ),
+            Response::Ok
+        ));
+    }
+
+    fn complete_real_state_bootstrap(
+        broker: &mut Broker,
+        store: &amaterasu_state::test_support::TestStateStore,
+    ) -> u64 {
+        let Response::Accepted { id } = broker.dispatch(
+            HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            Command::InitializeLiveFeedback {},
+        ) else {
+            panic!("trusted host bootstrap was not accepted");
+        };
+        let Response::Request {
+            id: state_request,
+            caller,
+            service,
+            payload,
+            ..
+        } = broker.dispatch("state", Command::Poll {})
+        else {
+            panic!("selected State provider did not receive initialization");
+        };
+        assert_eq!(service, STATE);
+        let result = store.handle(&caller, payload);
+        assert!(matches!(
+            broker.dispatch(
+                "state",
+                Command::Complete {
+                    request: state_request,
+                    payload: result,
+                }
+            ),
+            Response::Ok
+        ));
+        id
+    }
+
+    #[test]
+    fn host_bootstrap_opens_state_only_after_real_claim_persistence() {
+        let directory = test_state_directory();
+        let store = amaterasu_state::test_support::TestStateStore::open(directory.clone()).unwrap();
+        let mut broker = Broker::new(host_bootstrap_profile(Some(&"b".repeat(32)))).unwrap();
+        register_state_provider(&mut broker);
+
+        assert_error_code(
+            broker.dispatch(
+                "pairing",
+                Command::Request {
+                    service: STATE.into(),
+                    payload: json!({"action":"get","key":"unused"}),
+                    timeout_ms: 1000,
+                    operation_id: "before-host-state-init".into(),
+                    parent: None,
+                },
+            ),
+            "bootstrap_pending",
+        );
+
+        let request = complete_real_state_bootstrap(&mut broker, &store);
+        assert!(matches!(
+            broker.dispatch(
+                HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+                Command::FinishLiveFeedbackInitialization { request }
+            ),
+            Response::Result { payload } if payload["ok"] == true
+                && payload["revision"] == 1
+                && payload["claim"]["installation_id"] == "a".repeat(32)
+                && payload["claim"]["claim"] == "b".repeat(32)
+        ));
+        assert_eq!(
+            store.handle(
+                "pairing",
+                json!({"action":"get","key":"host/feedback-bootstrap/v1"})
+            )["value"]["phase"],
+            "prepared"
+        );
+        assert!(matches!(
+            broker.dispatch(
+                "pairing",
+                Command::Request {
+                    service: STATE.into(),
+                    payload: json!({"action":"get","key":"unused"}),
+                    timeout_ms: 1000,
+                    operation_id: "after-host-state-init".into(),
+                    parent: None,
+                },
+            ),
+            Response::Accepted { .. }
+        ));
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn mismatched_provider_result_fails_closed_and_keeps_state_gated() {
+        let mut broker = Broker::new(host_bootstrap_profile(Some(&"b".repeat(32)))).unwrap();
+        register_state_provider(&mut broker);
+        let Response::Accepted { id: request } = broker.dispatch(
+            HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            Command::InitializeLiveFeedback {},
+        ) else {
+            panic!("trusted host bootstrap was not accepted");
+        };
+        let Response::Request { id, .. } = broker.dispatch("state", Command::Poll {}) else {
+            panic!("selected State provider did not receive initialization");
+        };
+        assert!(matches!(
+            broker.dispatch(
+                "state",
+                Command::Complete {
+                    request: id,
+                    payload: json!({
+                        "ok":true,
+                        "revision":1,
+                        "claim":{
+                            "version":1,
+                            "installation_id":"wrong-installation",
+                            "claim":"b".repeat(32),
+                            "pairing_owner":"pairing",
+                            "effect_owner":"stream"
+                        }
+                    }),
+                }
+            ),
+            Response::Ok
+        ));
+        assert_error_code(
+            broker.dispatch(
+                HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+                Command::FinishLiveFeedbackInitialization { request },
+            ),
+            "bootstrap_claim_mismatch",
+        );
+        assert_error_code(
+            broker.dispatch(
+                "pairing",
+                Command::Request {
+                    service: STATE.into(),
+                    payload: json!({"action":"get","key":"unused"}),
+                    timeout_ms: 1000,
+                    operation_id: "after-bad-host-state-init".into(),
+                    parent: None,
+                },
+            ),
+            "bootstrap_pending",
+        );
+    }
+
+    #[test]
+    fn consumed_claim_is_not_reissued_after_lost_reply_or_restart() {
+        let directory = test_state_directory();
+        let store = amaterasu_state::test_support::TestStateStore::open(directory.clone()).unwrap();
+        let mut first = Broker::new(host_bootstrap_profile(Some(&"b".repeat(32)))).unwrap();
+        register_state_provider(&mut first);
+        let _request = complete_real_state_bootstrap(&mut first, &store);
+        // Model the host exiting before it receives the terminal State response.
+        drop(first);
+
+        let mut restarted = Broker::new(host_bootstrap_profile(None)).unwrap();
+        register_state_provider(&mut restarted);
+        assert_error_code(
+            restarted.dispatch(
+                HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+                Command::InitializeLiveFeedback {},
+            ),
+            "permission_denied",
+        );
+        assert_eq!(
+            store.handle(
+                "pairing",
+                json!({"action":"get","key":"host/feedback-bootstrap/v1"})
+            )["value"]["phase"],
+            "prepared"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn consumed_claim_is_not_reissued_after_state_history_is_lost() {
+        let directory = test_state_directory();
+        let store = amaterasu_state::test_support::TestStateStore::open(directory.clone()).unwrap();
+        let mut first = Broker::new(host_bootstrap_profile(Some(&"b".repeat(32)))).unwrap();
+        register_state_provider(&mut first);
+        let _request = complete_real_state_bootstrap(&mut first, &store);
+        assert_eq!(
+            store.handle(
+                "pairing",
+                json!({"action":"get","key":"host/feedback-bootstrap/v1"})
+            )["value"]["phase"],
+            "prepared"
+        );
+        drop(first);
+        drop(store);
+
+        // The host's consumed installation witness survives this complete loss
+        // of State namespaces. A restart therefore has no claim to offer the
+        // recreated empty provider and cannot reopen initialization.
+        std::fs::remove_dir_all(directory.join("namespaces")).unwrap();
+        let store = amaterasu_state::test_support::TestStateStore::open(directory.clone()).unwrap();
+        let mut restarted = Broker::new(host_bootstrap_profile(None)).unwrap();
+        register_state_provider(&mut restarted);
+        assert_error_code(
+            restarted.dispatch(
+                HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+                Command::InitializeLiveFeedback {},
+            ),
+            "permission_denied",
+        );
+
+        let Response::Accepted { id } = restarted.dispatch(
+            "pairing",
+            Command::Request {
+                service: STATE.into(),
+                payload: json!({"action":"get","key":"host/feedback-bootstrap/v1"}),
+                timeout_ms: 1000,
+                operation_id: "lost-state-history-read".into(),
+                parent: None,
+            },
+        ) else {
+            panic!("pairing State read was not admitted after startup");
+        };
+        let Response::Request {
+            id: state_request,
+            caller,
+            payload,
+            ..
+        } = restarted.dispatch("state", Command::Poll {})
+        else {
+            panic!("selected State provider did not receive the restart read");
+        };
+        let state_result = store.handle(&caller, payload);
+        assert_eq!(state_result["revision"], 0);
+        assert_eq!(state_result["found"], false);
+        assert!(matches!(
+            restarted.dispatch(
+                "state",
+                Command::Complete {
+                    request: state_request,
+                    payload: state_result,
+                }
+            ),
+            Response::Ok
+        ));
+        assert!(matches!(
+            restarted.dispatch("pairing", Command::TakeResult { request: id }),
+            Response::Result { payload } if payload["revision"] == 0 && payload["found"] == false
+        ));
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
     }
     #[test]
     fn replacement_control_service_uses_the_same_contract_and_owner() {

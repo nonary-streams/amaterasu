@@ -59,6 +59,7 @@ dependencies = [
  "amaterasu-contracts",
  "amaterasu-input-companion",
  "amaterasu-logging",
+ "amaterasu-module-sdk",
  "amaterasu-package",
  "ed25519-dalek",
  "libc",

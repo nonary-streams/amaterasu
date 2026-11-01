@@ -7,12 +7,27 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const STATE_SERVICE: &str = "amaterasu.state/1";
+pub const FEEDBACK_BOOTSTRAP_KEY: &str = "host/feedback-bootstrap/v1";
+
+/// One-use host-principal request, handled before other State callers run.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FeedbackBootstrapClaim {
+    pub version: u8,
+    pub installation_id: String,
+    pub claim: String,
+    pub pairing_owner: String,
+    pub effect_owner: String,
+}
 
 /// The key/value subset of the State v1 contract. Collection and snapshot
 /// operations remain available through the ordinary broker protocol.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum StateRequest {
+    InitializeFeedbackHost {
+        claim: FeedbackBootstrapClaim,
+    },
     Get {
         key: String,
     },

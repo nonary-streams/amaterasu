@@ -187,6 +187,53 @@ pub fn initialize(root: &Path) -> PackageResult<()> {
     initialize_profile(root, DevelopmentProfile::Standard)
 }
 
+#[cfg(target_os = "linux")]
+/// Provision a new Linux root only when its trusted template selects the full
+/// live feedback profile and its State and host configuration providers.
+pub fn provision_fresh_feedback(template: &Path, package: &Path, root: &Path) -> PackageResult<()> {
+    let bootstrap = materialize_installer_bootstrap(template, root)?;
+    validate_feedback_bootstrap_policy(&bootstrap)?;
+    amaterasu_package::live_feedback_bootstrap::create_new_root(root)?;
+    provision_installer_root(template, package, root)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_feedback_bootstrap_policy(bootstrap: &BootstrapConfig) -> PackageResult<()> {
+    const STATE_SERVICE: &str = "amaterasu.state/1";
+    const HOST_CONFIGURATION_SERVICE: &str = "amaterasu.host-configuration/1";
+
+    let profile = bootstrap
+        .policy
+        .live_feedback
+        .as_ref()
+        .ok_or("fresh feedback setup requires a selected live feedback profile")?;
+    if bootstrap.policy.effect_fence.is_some() {
+        return Err("fresh feedback setup cannot select a generic effect authority".into());
+    }
+    let selected_state = bootstrap
+        .policy
+        .service_selections
+        .broker
+        .get(STATE_SERVICE)
+        .and_then(Option::as_ref)
+        .ok_or("fresh feedback setup requires a selected State provider")?;
+    let selected_host_configuration = bootstrap
+        .policy
+        .service_selections
+        .broker
+        .get(HOST_CONFIGURATION_SERVICE)
+        .and_then(Option::as_ref)
+        .ok_or("fresh feedback setup requires a selected host-configuration provider")?;
+    if profile.host_configuration_owner.as_deref()
+        != Some(selected_host_configuration.provider.as_str())
+        || selected_state.contract != STATE_SERVICE
+        || selected_host_configuration.contract != HOST_CONFIGURATION_SERVICE
+    {
+        return Err("fresh feedback setup provider selections do not match the profile".into());
+    }
+    Ok(())
+}
+
 pub fn initialize_desktop_stream_smoke(root: &Path, allow_remote: bool) -> PackageResult<()> {
     initialize_profile(root, DevelopmentProfile::DesktopStreamSmoke(allow_remote))
 }
@@ -1479,6 +1526,18 @@ mod provision_tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fresh_feedback_setup_requires_an_explicit_selected_profile() {
+        let bootstrap = BootstrapConfig {
+            development: false,
+            allow_unsigned: false,
+            trusted_keys: BTreeMap::new(),
+            policy: amaterasu_contracts::RuntimeConfig::default(),
+        };
+        assert!(validate_feedback_bootstrap_policy(&bootstrap).is_err());
     }
 
     fn write_artifacts(path: &Path) {

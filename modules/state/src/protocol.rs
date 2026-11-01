@@ -4,6 +4,9 @@ use serde_json::{Value, json};
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    InitializeFeedbackHost {
+        claim: amaterasu_module_sdk::state::FeedbackBootstrapClaim,
+    },
     CollectionGet {
         collection: String,
         key: Option<String>,

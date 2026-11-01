@@ -62,8 +62,12 @@ impl StateStore {
         let operation: Operation = serde_json::from_value(payload)
             .map_err(|error| StateError::new("invalid_request", error.to_string()))?;
         validate_operation(&operation)?;
+        if let Operation::InitializeFeedbackHost { claim } = &operation {
+            return self.initialize_feedback_host(caller, claim.clone());
+        }
         let path = self.namespace_path(caller)?;
         match operation {
+            Operation::InitializeFeedbackHost { .. } => unreachable!("handled above"),
             Operation::CollectionGet { collection, key } => {
                 return crate::collection::Collection::open(&self.directory, &path, &collection)?
                     .get(key.as_deref());
@@ -134,6 +138,7 @@ impl StateStore {
         }
         let mut namespace = load_namespace(&path)?;
         match operation {
+            Operation::InitializeFeedbackHost { .. } => unreachable!("handled above"),
             Operation::CollectionGet { .. }
             | Operation::CollectionPage { .. }
             | Operation::CollectionCommit { .. }
@@ -193,10 +198,60 @@ impl StateStore {
         }
         Ok(path.join("state.json"))
     }
+
+    fn initialize_feedback_host(
+        &self,
+        caller: &str,
+        claim: amaterasu_module_sdk::state::FeedbackBootstrapClaim,
+    ) -> Result<Value, StateError> {
+        if caller != amaterasu_module_sdk::HOST_LIFECYCLE_CONTROL_PRINCIPAL {
+            return Err(StateError::new(
+                "permission_denied",
+                "only the trusted host may initialize State",
+            ));
+        }
+        if claim.version != 1
+            || !valid_hex(&claim.installation_id)
+            || !valid_hex(&claim.claim)
+            || !amaterasu_module_sdk::valid_name(&claim.pairing_owner)
+            || !amaterasu_module_sdk::valid_name(&claim.effect_owner)
+        {
+            return Err(StateError::new(
+                "invalid_request",
+                "invalid feedback bootstrap claim",
+            ));
+        }
+        match std::fs::symlink_metadata(self.directory.join("namespaces")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(_) => {
+                return Err(StateError::new(
+                    "history_present",
+                    "State is not a new store",
+                ));
+            }
+            Err(error) => return Err(storage_error(error)),
+        }
+        let path = self.namespace_path(&claim.pairing_owner)?;
+        let mut namespace = Namespace::default();
+        namespace.values.insert(
+            amaterasu_module_sdk::state::FEEDBACK_BOOTSTRAP_KEY.into(),
+            json!({"claim":claim,"phase":"prepared"}),
+        );
+        persist_mutation(&self.directory, &path, &mut namespace)?;
+        Ok(json!({"ok":true,"revision":namespace.revision,"claim":claim}))
+    }
+}
+
+fn valid_hex(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_operation(operation: &Operation) -> Result<(), StateError> {
     match operation {
+        Operation::InitializeFeedbackHost { .. } => Ok(()),
         Operation::CollectionGet { collection, .. }
         | Operation::CollectionPage { collection, .. }
         | Operation::CollectionCommit { collection, .. }

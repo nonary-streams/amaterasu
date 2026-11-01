@@ -164,6 +164,80 @@ fn null_values_are_distinct_from_missing_keys() {
     );
 }
 
+fn feedback_bootstrap_claim() -> serde_json::Value {
+    json!({
+        "version": 1,
+        "installation_id": "a".repeat(32),
+        "claim": "b".repeat(32),
+        "pairing_owner": "pairing",
+        "effect_owner": "stream"
+    })
+}
+
+#[test]
+fn feedback_bootstrap_is_host_only_durable_and_one_use() {
+    let directory = TestDirectory::new();
+    let claim = feedback_bootstrap_claim();
+    let store = directory.open();
+
+    let unauthorized = store.handle(
+        "pairing",
+        json!({"action":"initialize_feedback_host","claim":claim}),
+    );
+    assert_eq!(unauthorized["error"]["code"], "permission_denied");
+    assert!(!directory.0.join("namespaces").exists());
+
+    let initialized = store.handle(
+        amaterasu_module_sdk::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+        json!({"action":"initialize_feedback_host","claim":claim}),
+    );
+    assert_eq!(initialized, json!({"ok":true,"revision":1,"claim":claim}));
+
+    let replay = store.handle(
+        amaterasu_module_sdk::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+        json!({"action":"initialize_feedback_host","claim":claim}),
+    );
+    assert_eq!(replay["error"]["code"], "history_present");
+    drop(store);
+
+    let restarted = directory.open();
+    assert_eq!(
+        restarted.handle(
+            "pairing",
+            json!({"action":"get","key":amaterasu_module_sdk::state::FEEDBACK_BOOTSTRAP_KEY})
+        ),
+        json!({
+            "ok":true,
+            "revision":1,
+            "found":true,
+            "value":{"claim":claim,"phase":"prepared"}
+        })
+    );
+}
+
+#[test]
+fn feedback_bootstrap_refuses_any_preexisting_namespace_history() {
+    let directory = TestDirectory::new();
+    let store = directory.open();
+    assert_eq!(
+        store.handle(
+            "old-owner",
+            json!({"action":"set","key":"history","value":true})
+        )["ok"],
+        true
+    );
+
+    let response = store.handle(
+        amaterasu_module_sdk::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+        json!({"action":"initialize_feedback_host","claim":feedback_bootstrap_claim()}),
+    );
+    assert_eq!(response["error"]["code"], "history_present");
+    assert_eq!(
+        store.handle("old-owner", json!({"action":"get","key":"history"}))["value"],
+        true
+    );
+}
+
 #[test]
 fn namespace_capacity_failure_keeps_previous_revision() {
     let directory = TestDirectory::new();

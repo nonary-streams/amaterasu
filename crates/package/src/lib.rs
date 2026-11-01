@@ -7,6 +7,7 @@ mod dependencies;
 mod digest;
 pub mod handoff;
 pub mod importer;
+pub mod live_feedback_bootstrap;
 mod manifest;
 pub mod migration;
 pub mod playnite_extension;

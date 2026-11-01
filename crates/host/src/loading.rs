@@ -114,6 +114,12 @@ impl LoadedComponents {
         );
         inject_package_root(&mut runtime_config, root)?;
         inject_running_package_digest(&mut runtime_config, &package.digest)?;
+        runtime_config.host_context.live_feedback_bootstrap =
+            amaterasu_package::live_feedback_bootstrap::prepare(
+                root,
+                &state_root,
+                &runtime_config,
+            )?;
         #[cfg(target_os = "linux")]
         crate::capture_authority::inject(package, &mut runtime_config.settings)?;
         if package
@@ -150,9 +156,53 @@ impl LoadedComponents {
             .is_some_and(|grants| grants.call.contains(HOST_LOG_SERVICE));
         let configuration =
             serde_json::to_vec(&runtime_config).map_err(|error| error.to_string())?;
+        let bootstrap_state_owner = runtime_config
+            .host_context
+            .live_feedback_bootstrap
+            .as_ref()
+            .filter(|proof| proof.first_boot_claim.is_some())
+            .map(|proof| proof.state_owner.clone());
+        let bootstrap_claim = if bootstrap_state_owner.is_some() {
+            let proof = runtime_config
+                .host_context
+                .live_feedback_bootstrap
+                .as_ref()
+                .ok_or("feedback bootstrap proof disappeared")?;
+            Some(amaterasu_module_sdk::state::FeedbackBootstrapClaim {
+                version: 1,
+                installation_id: proof.installation_id.clone(),
+                claim: proof
+                    .first_boot_claim
+                    .clone()
+                    .ok_or("feedback bootstrap claim is missing")?,
+                pairing_owner: proof.profile.pairing_owner.clone(),
+                effect_owner: proof.profile.stream_owner.clone(),
+            })
+        } else {
+            None
+        };
         let mut runtime =
             RuntimeLibrary::load(&directory.join(&runtime_component.file), &configuration)?;
-        let components = ordered_components(&package.manifest.components)?;
+        let mut components = ordered_components(&package.manifest.components)?;
+        if let Some(state_owner) = &bootstrap_state_owner {
+            let index = components
+                .iter()
+                .position(|component| &component.id == state_owner)
+                .ok_or("selected bootstrap State provider is absent")?;
+            if components[index]
+                .requires
+                .keys()
+                .any(|dependency| dependency != &runtime_component.id)
+            {
+                return Err("bootstrap State provider must depend only on the runtime".into());
+            }
+            let state = components.remove(index);
+            let runtime_index = components
+                .iter()
+                .position(|component| component.runtime)
+                .ok_or("runtime missing")?;
+            components.insert(runtime_index + 1, state);
+        }
         let lifecycle_endpoint = runtime.endpoint(HOST_LIFECYCLE_CONTROL_PRINCIPAL)?;
         Self::load_features(
             runtime,
@@ -164,7 +214,17 @@ impl LoadedComponents {
                 .filter(|component| !component.runtime),
             |runtime, component| {
                 let endpoint = runtime.endpoint(&component.id)?;
-                FeatureLibrary::load(&directory.join(&component.file), &component.id, &endpoint)
+                let mut feature = FeatureLibrary::load(
+                    &directory.join(&component.file),
+                    &component.id,
+                    &endpoint,
+                )?;
+                if bootstrap_state_owner.as_deref() == Some(&component.id)
+                    && let Some(claim) = &bootstrap_claim
+                {
+                    initialize_feedback_state(&mut feature, &lifecycle_endpoint, claim)?;
+                }
+                Ok(feature)
             },
             progress,
         )
@@ -384,6 +444,41 @@ impl LoadedComponents {
             Response::HostLifecycle { action } => Ok(action),
             Response::Error { code, message } => Err(format!("{code}: {message}")),
             response => Err(format!("unexpected host lifecycle response: {response:?}")),
+        }
+    }
+}
+
+fn initialize_feedback_state(
+    state: &mut FeatureLibrary,
+    endpoint: &HostApi,
+    expected_claim: &amaterasu_module_sdk::state::FeedbackBootstrapClaim,
+) -> PackageResult<()> {
+    let expected_claim = serde_json::to_value(expected_claim).map_err(|error| error.to_string())?;
+    let send = |command: &Command| -> PackageResult<Response> {
+        let input = serde_json::to_vec(command).map_err(|error| error.to_string())?;
+        // SAFETY: the host owns this endpoint and runtime through initialization.
+        let output = unsafe { endpoint.call(&input) }
+            .map_err(|status| format!("host bootstrap transport: {status}"))?;
+        serde_json::from_slice(&output).map_err(|error| error.to_string())
+    };
+    let Response::Accepted { id } = send(&Command::InitializeLiveFeedback {})? else {
+        return Err("feedback State bootstrap was not accepted".into());
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        state.tick()?;
+        match send(&Command::FinishLiveFeedbackInitialization { request: id })? {
+            Response::Pending if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(1))
+            }
+            Response::Result { payload }
+                if payload["ok"] == true
+                    && payload["revision"] == 1
+                    && payload["claim"] == expected_claim =>
+            {
+                return Ok(());
+            }
+            _ => return Err("feedback State bootstrap did not commit".into()),
         }
     }
 }

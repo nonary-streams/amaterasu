@@ -33,6 +33,8 @@ pub struct Broker {
     logging_policy_received: bool,
     api: ApiRegistry,
     effect_fences: effect_fence::EffectFences,
+    feedback_bootstrap_pending: bool,
+    feedback_bootstrap_request: Option<u64>,
 }
 
 const HOST_LIFECYCLE_QUEUE_CAPACITY: usize = 8;
@@ -62,6 +64,7 @@ impl Broker {
                 return Err("could not register the reserved host log service".into());
             }
         }
+        let feedback_bootstrap_pending = live_feedback::claim_payload(&configuration).is_some();
         Ok(Self {
             hooks: HookRegistry::new(configuration.hooks.clone()),
             api: ApiRegistry::new(&configuration),
@@ -74,6 +77,8 @@ impl Broker {
             dropped_log_records: 0,
             logging_revision: 0,
             logging_policy_received: false,
+            feedback_bootstrap_pending,
+            feedback_bootstrap_request: None,
         })
     }
 
@@ -112,6 +117,32 @@ impl Broker {
                 return errors::permission_denied();
             }
             return match command {
+                Command::InitializeLiveFeedback {} if self.feedback_bootstrap_pending && self.feedback_bootstrap_request.is_none() => {
+                    let Some(claim) = live_feedback::claim_payload(&self.configuration) else { return errors::permission_denied(); };
+                    let grants = Grants { call: ["amaterasu.state/1".into()].into(), ..Default::default() };
+                    let response = self.requests.submit(caller, &grants, RequestOptions {
+                        service: "amaterasu.state/1".into(), payload: serde_json::json!({"action":"initialize_feedback_host","claim":claim}),
+                        timeout_ms: 30_000, operation_id: "host.feedback-bootstrap".into(), parent: None, response_schema: None,
+                    }, now);
+                    if let Response::Accepted { id } = response { self.feedback_bootstrap_request = Some(id); }
+                    response
+                }
+                Command::FinishLiveFeedbackInitialization { request } if self.feedback_bootstrap_request == Some(request) => {
+                    let result = self.requests.result(caller, request);
+                    if let Response::Result { payload } = &result {
+                        let expected = live_feedback::claim_payload(&self.configuration);
+                        if payload["ok"] != true || payload["revision"] != 1 || Some(&payload["claim"]) != expected.as_ref() {
+                            return Response::error(
+                                "bootstrap_claim_mismatch",
+                                "State did not confirm the exact host bootstrap claim",
+                            );
+                        }
+                        self.feedback_bootstrap_pending = false;
+                        let _ = self.requests.release(caller, request);
+                        self.feedback_bootstrap_request = None;
+                    }
+                    result
+                }
                 Command::Poll {} => self.requests.poll(caller, now),
                 Command::CheckRequest { request } => self.requests.check_active(caller, request),
                 Command::Complete { request, payload } => {
@@ -171,6 +202,16 @@ impl Broker {
                     .is_some_and(|profile| live_feedback::authorized(profile, caller))
                 {
                     live_feedback::inject(&mut payload);
+                    if self
+                        .configuration
+                        .live_feedback
+                        .as_ref()
+                        .is_some_and(|profile| caller == profile.pairing_owner)
+                        && let Some(claim) = live_feedback::claim_payload(&self.configuration)
+                        && let Some(object) = payload.as_object_mut()
+                    {
+                        object.insert("live_feedback_bootstrap_claim".into(), claim);
+                    }
                 }
                 Response::Result { payload }
             }
@@ -356,6 +397,12 @@ impl Broker {
                 operation_id,
                 parent,
             } => {
+                if self.feedback_bootstrap_pending && service == "amaterasu.state/1" {
+                    return Response::error(
+                        "bootstrap_pending",
+                        "trusted State initialization is pending",
+                    );
+                }
                 if (service == HOST_LOG_SERVICE && caller != "amaterasu.management")
                     || self.effect_fences.direct_service_denied(&service)
                 {
@@ -388,6 +435,8 @@ impl Broker {
             Command::TakeResult { request } => self.requests.result(caller, request),
             Command::ReleaseResult { request } => self.requests.release(caller, request),
             Command::Cancel { request } => self.requests.cancel(caller, request, now),
+            Command::InitializeLiveFeedback {}
+            | Command::FinishLiveFeedbackInitialization { .. } => errors::permission_denied(),
             Command::Subscribe {
                 topic,
                 capacity,

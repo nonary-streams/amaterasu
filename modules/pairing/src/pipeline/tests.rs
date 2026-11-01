@@ -46,6 +46,7 @@ fn settings() -> Settings {
         transport_principals: BTreeSet::from(["nvhttp".into()]),
         effect_authority: None,
         live_feedback_authorized: false,
+        live_feedback_bootstrap_claim: None,
     }
 }
 
@@ -4384,7 +4385,7 @@ fn authority_broker() -> amaterasu_runtime::Broker {
         "pairing".into(),
         Grants {
             provide: [SERVICE.into(), EFFECT_SERVICE.into()].into(),
-            call: [STATE_SERVICE.into()].into(),
+            call: [STATE_SERVICE.into(), HOST_CONFIGURATION_SERVICE.into()].into(),
             ..Default::default()
         },
     );
@@ -4392,6 +4393,13 @@ fn authority_broker() -> amaterasu_runtime::Broker {
         "state".into(),
         Grants {
             provide: [STATE_SERVICE.into()].into(),
+            ..Default::default()
+        },
+    );
+    configuration.principals.insert(
+        "configuration".into(),
+        Grants {
+            provide: [HOST_CONFIGURATION_SERVICE.into()].into(),
             ..Default::default()
         },
     );
@@ -4428,6 +4436,7 @@ fn authority_broker() -> amaterasu_runtime::Broker {
     for (principal, service) in [
         ("pairing", SERVICE),
         ("pairing", EFFECT_SERVICE),
+        ("configuration", HOST_CONFIGURATION_SERVICE),
         ("state", STATE_SERVICE),
         ("nvhttp", "amaterasu.nvhttp/1"),
     ] {
@@ -5628,6 +5637,303 @@ fn broker_lost_lease_lookup_reports_shared_transport_retirement() {
         )["ok"],
         true
     );
+}
+
+fn feedback_bootstrap_test_claim() -> amaterasu_module_sdk::state::FeedbackBootstrapClaim {
+    amaterasu_module_sdk::state::FeedbackBootstrapClaim {
+        version: 1,
+        installation_id: "a".repeat(32),
+        claim: "b".repeat(32),
+        pairing_owner: "pairing".into(),
+        effect_owner: "stream".into(),
+    }
+}
+
+fn feedback_bootstrap_test_pipeline(
+    claim: amaterasu_module_sdk::state::FeedbackBootstrapClaim,
+) -> (std::path::PathBuf, Pipeline) {
+    let (directory, effective) = configured_fixture_files();
+    let identity = ConfiguredIdentity::load(
+        effective["cert"].as_str().unwrap(),
+        effective["pkey"].as_str().unwrap(),
+        0,
+        now(),
+    )
+    .unwrap();
+    let mut configured_settings = settings();
+    configured_settings.live_feedback_authorized = true;
+    configured_settings.live_feedback_bootstrap_claim = Some(claim);
+    configured_settings.effect_authority = Some(EffectAuthoritySettings {
+        protocol_owner: "nvhttp".into(),
+        effect_owner: "stream".into(),
+        configuration_owner: Some("configuration".into()),
+        feedback_policies: Vec::new(),
+    });
+    let mut pipeline =
+        Pipeline::with_host_configuration(configured_settings, Arc::new(Shared::default()), true);
+    pipeline.configuration_reconciled = true;
+    pipeline.host_configuration = HostConfigurationState::Ready {
+        identity: Arc::new(identity),
+        refresh_at: u64::MAX,
+    };
+    (directory, pipeline)
+}
+
+#[test]
+fn trusted_bootstrap_persists_exact_claim_before_recovering_effect_gate() {
+    let claim = feedback_bootstrap_test_claim();
+    let expected_claim = serde_json::to_value(&claim).unwrap();
+    let (directory, mut pipeline) = feedback_bootstrap_test_pipeline(claim);
+    let mut results = BTreeMap::new();
+    let mut next_request = 100;
+    let mut actions = Vec::new();
+    let mut send = |command: Command| -> Transport {
+        Ok(match command {
+            Command::Request {
+                service, payload, ..
+            } => {
+                let request = next_request;
+                next_request += 1;
+                let result = if service == STATE_SERVICE && payload["action"] == "get" {
+                    actions.push("state:get");
+                    json!({"ok":true,"revision":1,"found":true,
+                        "value":{"claim":expected_claim,"phase":"prepared"}})
+                } else if service == STATE_SERVICE && payload["action"] == "set" {
+                    actions.push("state:set");
+                    assert_eq!(payload["expected_revision"], 1);
+                    json!({"ok":true,"revision":2})
+                } else if service == HOST_CONFIGURATION_SERVICE {
+                    actions.push("configuration:transaction_status");
+                    json!({"ok":true,"configuration_revision":0,"state_revision":0,
+                        "identity_fingerprint":"c".repeat(64),"transaction":null,"terminal_receipt":null})
+                } else {
+                    panic!("unexpected bootstrap service request: {service} {payload}");
+                };
+                results.insert(request, result);
+                Response::Accepted { id: request }
+            }
+            Command::TakeResult { request } => results
+                .remove(&request)
+                .map_or(Response::Pending, |payload| Response::Result { payload }),
+            Command::ReleaseResult { .. } => Response::Ok,
+            other => panic!("unexpected bootstrap command: {other:?}"),
+        })
+    };
+
+    assert!(
+        pipeline
+            .effect_gate
+            .as_ref()
+            .unwrap()
+            .startup_recovery_required()
+    );
+    for _ in 0..4 {
+        pipeline.progress_feedback_bootstrap(&mut send).unwrap();
+    }
+    assert_eq!(
+        actions,
+        ["state:get", "state:set", "configuration:transaction_status"]
+    );
+    assert!(
+        !pipeline
+            .effect_gate
+            .as_ref()
+            .unwrap()
+            .startup_recovery_required()
+    );
+    assert!(pipeline.feedback_bootstrap.as_ref().is_some());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn trusted_bootstrap_recovers_through_real_broker_and_state_without_fixture_recovery() {
+    let claim = feedback_bootstrap_test_claim();
+    let claim_value = serde_json::to_value(&claim).unwrap();
+    let state_directory = std::env::temp_dir().join(format!(
+        "amaterasu-pairing-bootstrap-state-{}-{}",
+        std::process::id(),
+        amaterasu_storage::random_identifier().unwrap()
+    ));
+    let store =
+        amaterasu_state::test_support::TestStateStore::open(state_directory.clone()).unwrap();
+    assert_eq!(
+        store.handle(
+            amaterasu_module_sdk::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            json!({"action":"initialize_feedback_host","claim":claim_value}),
+        )["revision"],
+        1
+    );
+
+    let mut broker = authority_broker();
+    let (directory, mut pipeline) = feedback_bootstrap_test_pipeline(claim);
+    let mut actions = Vec::new();
+    let mut send = |command: Command| -> Transport {
+        match command {
+            Command::Request {
+                service,
+                payload,
+                operation_id,
+                ..
+            } => {
+                actions.push((
+                    service.clone(),
+                    payload["action"].as_str().unwrap_or_default().to_owned(),
+                ));
+                Ok(broker.dispatch(
+                    "pairing",
+                    Command::Request {
+                        service,
+                        payload,
+                        timeout_ms: 30_000,
+                        operation_id,
+                        parent: None,
+                    },
+                ))
+            }
+            Command::TakeResult { request } => {
+                for provider in ["state", "configuration"] {
+                    if let Response::Request {
+                        id,
+                        caller,
+                        service,
+                        payload,
+                        ..
+                    } = broker.dispatch(provider, Command::Poll {})
+                    {
+                        let result = if provider == "state" {
+                            assert_eq!(service, STATE_SERVICE);
+                            store.handle(&caller, payload)
+                        } else {
+                            assert_eq!(service, HOST_CONFIGURATION_SERVICE);
+                            assert_eq!(payload["action"], "transaction_status");
+                            json!({"ok":true,"configuration_revision":0,"state_revision":0,
+                                "identity_fingerprint":"c".repeat(64),
+                                "transaction":null,"terminal_receipt":null})
+                        };
+                        assert!(matches!(
+                            broker.dispatch(
+                                provider,
+                                Command::Complete {
+                                    request: id,
+                                    payload: result
+                                }
+                            ),
+                            Response::Ok
+                        ));
+                    }
+                }
+                Ok(broker.dispatch("pairing", Command::TakeResult { request }))
+            }
+            Command::ReleaseResult { request } => {
+                Ok(broker.dispatch("pairing", Command::ReleaseResult { request }))
+            }
+            other => panic!("unexpected bootstrap command: {other:?}"),
+        }
+    };
+
+    for _ in 0..6 {
+        pipeline.progress_feedback_bootstrap(&mut send).unwrap();
+    }
+    drop(send);
+    assert_eq!(
+        actions,
+        [
+            (STATE_SERVICE.into(), "get".into()),
+            (STATE_SERVICE.into(), "set".into()),
+            (
+                HOST_CONFIGURATION_SERVICE.into(),
+                "transaction_status".into()
+            ),
+        ]
+    );
+    assert!(
+        !pipeline
+            .effect_gate
+            .as_ref()
+            .unwrap()
+            .startup_recovery_required(),
+        "Pairing must complete its trusted bootstrap without a fixture-issued recover request"
+    );
+    let persisted = store.handle(
+        "pairing",
+        json!({"action":"get","key":amaterasu_module_sdk::state::FEEDBACK_BOOTSTRAP_KEY}),
+    );
+    assert_eq!(persisted["revision"], 2);
+    assert_eq!(persisted["value"]["phase"], "active");
+    assert_eq!(persisted["value"]["claim"], claim_value);
+    drop(store);
+    std::fs::remove_dir_all(state_directory).unwrap();
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn bootstrap_claim_mismatch_keeps_effect_gate_fenced() {
+    let claim = feedback_bootstrap_test_claim();
+    let (directory, mut pipeline) = feedback_bootstrap_test_pipeline(claim.clone());
+    let mut result = None;
+    let mut actions = Vec::new();
+    let mut send = |command: Command| -> Transport {
+        Ok(match command {
+            Command::Request {
+                service, payload, ..
+            } => {
+                assert_eq!(service, STATE_SERVICE);
+                assert_eq!(payload["action"], "get");
+                actions.push("state:get");
+                Response::Accepted { id: 200 }
+            }
+            Command::TakeResult { request: 200 } => {
+                let mut altered_claim = serde_json::to_value(&claim).unwrap();
+                altered_claim["installation_id"] = json!("d".repeat(32));
+                Response::Result {
+                    payload: json!({"ok":true,"revision":1,"found":true,
+                        "value":{"claim":altered_claim,"phase":"prepared"}}),
+                }
+            }
+            Command::ReleaseResult { request: 200 } => {
+                result = Some(200);
+                Response::Ok
+            }
+            other => panic!("unexpected bootstrap command: {other:?}"),
+        })
+    };
+
+    pipeline.progress_feedback_bootstrap(&mut send).unwrap();
+    pipeline.progress_feedback_bootstrap(&mut send).unwrap();
+    assert_eq!(actions, ["state:get"]);
+    assert_eq!(result, Some(200));
+    assert!(
+        pipeline
+            .effect_gate
+            .as_ref()
+            .unwrap()
+            .startup_recovery_required()
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn lost_state_after_host_claim_consumption_cannot_recover_pairing_automatically() {
+    let claim = feedback_bootstrap_test_claim();
+    let (directory, mut pipeline) = feedback_bootstrap_test_pipeline(claim);
+    // A trusted restart receives the consumed host proof, which deliberately
+    // carries no reusable first-boot claim. Pairing must leave its new epoch
+    // fenced instead of treating the missing State record as first boot.
+    pipeline.feedback_bootstrap = None;
+    let epoch = pipeline.effect_gate.as_ref().unwrap().epoch().to_owned();
+    assert_eq!(
+        pipeline.apply_effect_request(
+            "stream",
+            "stream",
+            json!({"action":"recover","epoch":epoch,"owner_epoch":"restart-owner"}),
+            now(),
+        ),
+        Err("external_retirement_required")
+    );
+    let gate = pipeline.effect_gate.as_ref().unwrap();
+    assert!(gate.startup_recovery_required());
+    assert!(gate.fenced());
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 mod owner_restart_tests;

@@ -235,11 +235,30 @@ pub struct RuntimeHostContext {
     /// Only management may request it; persisted selection can differ.
     #[serde(default)]
     pub running_package_digest: Option<String>,
+    /// Verified and consumed by trusted host provisioning, never package policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_feedback_bootstrap: Option<LiveFeedbackHostProof>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveFeedbackHostProof {
+    pub version: u8,
+    pub installation_id: String,
+    pub profile: LiveFeedbackProfile,
+    pub state_owner: String,
+    /// Present once, only for the first trusted startup of a fresh root.
+    pub first_boot_claim: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
+    /// Reserved host endpoint: queue and confirm the first State claim.
+    InitializeLiveFeedback {},
+    FinishLiveFeedbackInitialization {
+        request: u64,
+    },
     NativeRegister {
         service: String,
         factory: usize,

@@ -42,8 +42,8 @@ pub use amaterasu_contracts::encoder::{
     validate_software_options,
 };
 pub use amaterasu_contracts::{
-    ApiFieldKind, ApiMethod, ApiPrivilege, ApiSchema, Command, HostLifecycleAction, Response,
-    RuntimeHostContext,
+    ApiFieldKind, ApiMethod, ApiPrivilege, ApiSchema, Command, HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+    HostLifecycleAction, Response, RuntimeHostContext, valid_name,
 };
 pub use amaterasu_extension_api as extension_api;
 pub use amaterasu_media as media_abi;

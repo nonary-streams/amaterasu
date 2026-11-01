@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use x509_cert::der::Encode;
 
+mod feedback_bootstrap;
 mod owner_restart;
 mod source_retirement;
 
@@ -98,6 +99,7 @@ pub struct Pipeline {
     effect_gate: Option<EffectGate>,
     effect_authority: Option<EffectAuthoritySettings>,
     live_feedback_authorized: bool,
+    feedback_bootstrap: Option<feedback_bootstrap::Bootstrap>,
     configuration_hold: Option<ConfigurationHold>,
     configuration_reconciled: bool,
     configuration_status_request: Option<u64>,
@@ -175,6 +177,10 @@ impl Pipeline {
         };
         let effect_authority = settings.effect_authority.clone();
         let live_feedback_authorized = settings.live_feedback_authorized;
+        let feedback_bootstrap = settings
+            .live_feedback_bootstrap_claim
+            .clone()
+            .map(feedback_bootstrap::Bootstrap::new);
         let configuration_reconciled = effect_authority
             .as_ref()
             .is_none_or(|policy| policy.configuration_owner.is_none());
@@ -183,6 +189,7 @@ impl Pipeline {
             effect_gate: EffectGate::new().ok(),
             effect_authority,
             live_feedback_authorized,
+            feedback_bootstrap,
             configuration_hold: None,
             configuration_reconciled,
             configuration_status_request: None,
@@ -278,6 +285,7 @@ impl Pipeline {
         self.progress_pairing_notice(&mut send);
         self.progress_configuration_reconciliation(&mut send)?;
         self.progress_hold_confirmation(&mut send)?;
+        self.progress_feedback_bootstrap(&mut send)?;
         if self.identity_generation.is_some() {
             let result = self.advance_identity_generation(now, &mut send);
             if result.is_err() {
@@ -1124,6 +1132,19 @@ impl Pipeline {
         };
         if !permitted {
             return Err("forbidden");
+        }
+        if matches!(&request, EffectRequest::Recover { .. })
+            && self.live_feedback_authorized
+            && self
+                .effect_gate
+                .as_ref()
+                .is_some_and(|gate| gate.startup_recovery_required())
+        {
+            return Err(if self.feedback_bootstrap.is_some() {
+                "initialization_pending"
+            } else {
+                "external_retirement_required"
+            });
         }
         if let EffectRequest::Recover { epoch, owner_epoch } = &request {
             if !self.configuration_reconciled {

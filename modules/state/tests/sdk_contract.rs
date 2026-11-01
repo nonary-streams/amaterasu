@@ -47,6 +47,9 @@ fn key_value_consumer_works_with_real_and_independent_providers() {
         let operation: StateRequest = serde_json::from_value(payload).unwrap();
         let (revision, values) = namespaces.entry(caller.into()).or_default();
         match operation {
+            StateRequest::InitializeFeedbackHost { .. } => {
+                unreachable!("the caller-scoped key/value exercise does not initialize a host")
+            }
             StateRequest::Get { key } => {
                 json!({"ok":true,"revision":revision,"found":values.contains_key(&key),"value":values.get(&key)})
             }

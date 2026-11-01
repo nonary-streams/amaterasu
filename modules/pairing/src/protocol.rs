@@ -16,6 +16,8 @@ pub struct Settings {
     pub effect_authority: Option<EffectAuthoritySettings>,
     /// Injected by the runtime after validating the selected feedback profile.
     pub live_feedback_authorized: bool,
+    /// One-use broker-injected claim; package settings cannot supply it.
+    pub live_feedback_bootstrap_claim: Option<amaterasu_module_sdk::state::FeedbackBootstrapClaim>,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
