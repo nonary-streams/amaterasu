@@ -491,6 +491,7 @@ fn run_linux_user_service(root: &Path, expected_digest: &str) -> PackageResult<(
             publish_service_readiness(root, &digest)?;
 
             while !USER_SERVICE_STOP_REQUESTED.load(Ordering::Relaxed) {
+                let tick_started = Instant::now();
                 components.tick()?;
                 components.health()?;
                 if let Some(action) = components.take_host_lifecycle_action()? {
@@ -499,7 +500,9 @@ fn run_linux_user_service(root: &Path, expected_digest: &str) -> PackageResult<(
                     return Ok(Some(action));
                 }
                 input.refresh(root, &digest, pid, starttime)?;
-                std::thread::sleep(crate::timing::TICK_INTERVAL);
+                std::thread::sleep(crate::timing::remaining_tick_interval(
+                    tick_started.elapsed(),
+                ));
             }
             input.revoke();
             drop(components);

@@ -199,13 +199,16 @@ pub fn serve(root: &Path, digest: &str) -> PackageResult<()> {
     send_line("READY")?;
     let mut heartbeat = std::time::Instant::now();
     loop {
+        let tick_started = std::time::Instant::now();
         components.tick()?;
         components.health()?;
         if let Some(action) = components.take_host_lifecycle_action()? {
             return finish_lifecycle_action(components, action);
         }
         pulse(&mut heartbeat)?;
-        match input.recv_timeout(crate::timing::TICK_INTERVAL) {
+        match input.recv_timeout(crate::timing::remaining_tick_interval(
+            tick_started.elapsed(),
+        )) {
             Ok(Ok(line)) => {
                 let outcome = match serde_json::from_str::<Command>(&line) {
                     Ok(command) => {
@@ -266,12 +269,15 @@ pub fn serve_interactive(
     components.health()?;
     send_line("READY")?;
     loop {
+        let tick_started = std::time::Instant::now();
         components.tick()?;
         components.health()?;
         if let Some(action) = components.take_host_lifecycle_action()? {
             return finish_lifecycle_action(components, action);
         }
-        std::thread::sleep(crate::timing::TICK_INTERVAL);
+        std::thread::sleep(crate::timing::remaining_tick_interval(
+            tick_started.elapsed(),
+        ));
     }
 }
 
