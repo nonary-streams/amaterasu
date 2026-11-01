@@ -25,6 +25,7 @@ enum Phase {
     CompleteLease(usize),
     AckLease(usize),
     CompleteSource(usize),
+    RecheckSource(usize),
     Confirm(usize),
     DrainStatus,
     Drain(u64),
@@ -45,6 +46,7 @@ pub(super) struct Restart {
     fence: Option<FenceReceipt>,
     records: Vec<SourceRecord>,
     source_operations: Vec<Option<String>>,
+    source_retired: Vec<bool>,
     receipts: BTreeMap<Transport, StreamRetirement>,
     attempt: u64,
 }
@@ -64,6 +66,7 @@ impl Restart {
             fence: None,
             records: Vec::new(),
             source_operations: Vec::new(),
+            source_retired: Vec::new(),
             receipts: BTreeMap::new(),
             attempt: 0,
         })
@@ -165,7 +168,7 @@ impl Restart {
                 json!({"action":"read_effect_owner_restart","version":1,"epoch":self.epoch,"owner_epoch":self.old_owner,"operation_id":self.operation,"index":index}),
                 "read",
             ),
-            Phase::Lookup(i) => (
+            Phase::Lookup(i) | Phase::RecheckSource(i) => (
                 effect_authority::SERVICE.into(),
                 json!({"action":"lookup_current_source_retirement","epoch":self.epoch,"source":self.records[i].source,"scope":self.records[i].scope}),
                 "lookup",
@@ -219,6 +222,10 @@ impl Restart {
                 )
             }
             Phase::CompleteSource(i) => {
+                if self.source_retired[i] {
+                    self.phase = Phase::CompleteSource(i + 1);
+                    return None;
+                }
                 let Some(operation) = &self.source_operations[i] else {
                     return None;
                 };
@@ -317,6 +324,7 @@ impl Restart {
                 {
                     self.records.push(page.record);
                     self.source_operations.push(None);
+                    self.source_retired.push(false);
                     self.phase = if index + 1 == page.count {
                         Phase::Lookup(0)
                     } else {
@@ -335,6 +343,7 @@ impl Restart {
                     )
                     && matches!(receipt.state, State::Fenced | State::Retired)
                 {
+                    self.source_retired[i] = receipt.state == State::Retired;
                     self.source_operations[i] = Some(receipt.operation_id);
                     self.phase = Phase::Lookup(i + 1);
                 }
@@ -350,6 +359,7 @@ impl Restart {
                         &Self::source_id(&self.records[i]),
                     )
                 {
+                    self.source_retired[i] = receipt.state == State::Retired;
                     self.source_operations[i] = Some(receipt.operation_id);
                     self.phase = Phase::Lookup(i + 1);
                 }
@@ -410,6 +420,23 @@ impl Restart {
                 }
             }
             Phase::CompleteSource(i) => {
+                if response["ok"] == false && response["code"] == "source_retirement_conflict" {
+                    self.phase = Phase::RecheckSource(i);
+                } else if let Ok(receipt) = serde_json::from_value::<SourceReceipt>(response)
+                    && self.source_operations[i].as_ref().is_some_and(|op| {
+                        receipt.matches(
+                            &self.epoch,
+                            &self.records[i].source,
+                            &self.records[i].scope,
+                            op,
+                        )
+                    })
+                    && receipt.state == State::Retired
+                {
+                    self.phase = Phase::CompleteSource(i + 1);
+                }
+            }
+            Phase::RecheckSource(i) => {
                 if let Ok(receipt) = serde_json::from_value::<SourceReceipt>(response)
                     && self.source_operations[i].as_ref().is_some_and(|op| {
                         receipt.matches(
@@ -421,6 +448,7 @@ impl Restart {
                     })
                     && receipt.state == State::Retired
                 {
+                    self.source_retired[i] = true;
                     self.phase = Phase::CompleteSource(i + 1);
                 }
             }

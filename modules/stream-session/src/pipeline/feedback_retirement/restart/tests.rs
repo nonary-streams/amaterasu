@@ -55,7 +55,7 @@ fn scope(slot: u16, stream: u64, epoch: &str) -> StreamScope {
     }
 }
 
-fn run_restart(completed_lease: bool, corrupt_receipt: bool) {
+fn run_restart(completed_lease: bool, corrupt_receipt: bool, retired_without_lease: Option<u16>) {
     let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     receiver.set_nonblocking(true).unwrap();
     let mut control = amaterasu_control_transport::test_support::ControlFixture::new("effect");
@@ -75,6 +75,25 @@ fn run_restart(completed_lease: bool, corrupt_receipt: bool) {
             .unwrap();
         gate.admit_stream_lease(&source, &format!("lease-{slot}"), u64::from(slot), scope)
             .unwrap();
+    }
+    if let Some(slot) = retired_without_lease {
+        let second = control.handle("effect", json!({"action":"open","peer_ip":"127.0.0.1",
+            "connect_data":18,"key_hex":"1123456789abcdef0123456789abcdef","operation_id":"second-open"})).unwrap();
+        let other_stream = second["stream"].as_u64().unwrap();
+        let other_scope = scope(slot, other_stream, &provider_epoch);
+        let other_source = source(slot);
+        gate.bind_scoped(other_source.clone(), Some(other_scope.clone()))
+            .unwrap();
+        gate.fence_source(&old_epoch, &other_source, &other_scope, "already-retired")
+            .unwrap();
+        gate.complete_source_retirement(
+            &old_epoch,
+            &other_source,
+            &other_scope,
+            "already-retired",
+            None,
+        )
+        .unwrap();
     }
     if completed_lease {
         let operation = format!("feedback-retire-{provider_epoch}-{stream}");
@@ -177,6 +196,15 @@ fn run_restart(completed_lease: bool, corrupt_receipt: bool) {
                 continue;
             };
             assert_eq!((caller.as_str(), initiator.as_str()), ("effect", "effect"));
+            if let Some(slot) = retired_without_lease
+                && payload["action"] == "complete_source_retirement"
+            {
+                assert_ne!(
+                    payload["source"]["device"],
+                    format!("device-{slot}"),
+                    "a completed unleased source must not be completed again"
+                );
+            }
             let result = if provider == "control" {
                 retired += 1;
                 control.handle("effect", payload).map(|mut receipt| {
@@ -205,7 +233,10 @@ fn run_restart(completed_lease: bool, corrupt_receipt: bool) {
     }
     assert!(done, "restart remained fenced");
     assert!(lost);
-    assert_eq!(retired, if corrupt_receipt { 2 } else { 1 });
+    assert_eq!(
+        retired,
+        1 + usize::from(corrupt_receipt) + usize::from(retired_without_lease.is_some())
+    );
     assert_ne!(gate.epoch(), old_epoch);
     assert_eq!(gate.in_flight(), 0);
     control.tick();
@@ -218,15 +249,22 @@ fn run_restart(completed_lease: bool, corrupt_receipt: bool) {
 
 #[test]
 fn restart_drains_shared_transport_with_lost_reply() {
-    run_restart(false, false);
+    run_restart(false, false, None);
 }
 #[test]
 fn restart_acknowledges_a_previously_completed_lease() {
-    run_restart(true, false);
+    run_restart(true, false, None);
 }
 #[test]
 fn restart_rejects_mismatched_provider_receipt_and_retries() {
-    run_restart(false, true);
+    run_restart(false, true, None);
+}
+#[test]
+fn restart_confirms_previously_retired_unleased_source_with_real_provider_receipt() {
+    run_restart(false, false, Some(0));
+    run_restart(false, false, Some(3));
+    run_restart(false, true, Some(0));
+    run_restart(false, true, Some(3));
 }
 #[test]
 fn pairing_restart_without_old_owner_remains_closed() {
@@ -280,4 +318,33 @@ fn pairing_restart_without_old_owner_remains_closed() {
     assert!(gate.fenced());
     assert!(gate.startup_recovery_required());
     assert!(gate.owner_epoch().is_none());
+}
+
+#[test]
+fn recheck_requires_the_same_source_and_retirement_operation() {
+    let mut restart = Restart::new("amaterasu.control-transport/1".into()).unwrap();
+    restart.epoch = "e".repeat(32);
+    let source = source(1);
+    let scope = scope(1, 7, &"c".repeat(32));
+    restart.records.push(SourceRecord {
+        source: source.clone(),
+        scope: scope.clone(),
+        lease: None,
+        transport_retirement: None,
+        source_retirement: None,
+    });
+    restart.source_operations.push(Some("expected".into()));
+    restart.source_retired.push(false);
+    restart.phase = Phase::RecheckSource(0);
+    let reply = |operation: &str, state: &str| {
+        json!({"ok":true,"epoch":"e".repeat(32),
+        "source":source,"scope":scope,"operation_id":operation,"state":state})
+    };
+    assert!(!restart.handle_response(reply("foreign", "retired")));
+    assert!(matches!(restart.phase, Phase::RecheckSource(0)));
+    assert!(!restart.handle_response(reply("expected", "fenced")));
+    assert!(matches!(restart.phase, Phase::RecheckSource(0)));
+    assert!(!restart.handle_response(reply("expected", "retired")));
+    assert!(restart.source_retired[0]);
+    assert!(matches!(restart.phase, Phase::Confirm(0)));
 }
