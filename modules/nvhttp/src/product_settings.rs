@@ -4419,6 +4419,7 @@ mod tests {
                     audio_endpoint: audio_endpoint.into(),
                 },
                 desktop: crate::launch::DesktopSettings::default(),
+                selected_applications: vec![],
                 profile: crate::launch::StreamProfile {
                     codec: amaterasu_media::VideoCodec::H264,
                     max_width: 1920,

@@ -41,6 +41,7 @@ pub enum Stage {
     ReserveHistory,
     ReadProtonPolicy,
     PreflightApplication,
+    AcceptPolicy,
     SnapshotDisplay,
     EnumerateDisplay,
     ConfirmDisplay,
@@ -70,6 +71,10 @@ pub struct Record {
     pub resumed: bool,
     pub peer: PeerIdentity,
     pub request: LaunchRequest,
+    pub selected_application: Option<super::SelectedApplication>,
+    pub policy_identity:
+        Option<amaterasu_module_sdk::application_library::preflight::PolicyIdentity>,
+    pub streaming_next_stage: Option<Stage>,
     /// Frozen requested physical mode; this does not assert a host display topology.
     pub physical_display_mode: PhysicalDisplayMode,
     pub device_name: String,
@@ -268,6 +273,9 @@ impl Record {
             resumed: false,
             peer,
             request,
+            selected_application: None,
+            policy_identity: None,
+            streaming_next_stage: None,
             physical_display_mode,
             device_name,
             application_operation,

@@ -46,6 +46,7 @@ pub enum Phase {
     ReserveHistory,
     ReadProtonPolicy,
     PreflightApplication,
+    AcceptPolicy,
     SnapshotDisplay,
     EnumerateDisplay,
     ConfirmDisplay,
@@ -235,6 +236,7 @@ impl Controller {
                         record.application_cleanup_blocked = true;
                     }
                     Phase::PreflightApplication
+                    | Phase::AcceptPolicy
                     | Phase::ReadProtonPolicy
                     | Phase::SnapshotDisplay
                     | Phase::EnumerateDisplay
@@ -334,6 +336,12 @@ impl Controller {
                     "settings_revision":record.global_display_revision.expect("validated revision").to_string(),
                     "requested_video":{"width":record.request.width,"height":record.request.height,
                         "refresh_millihz":record.request.fps * 1000,"hdr":record.request.hdr}});
+                if let Some(selected) = &record.selected_application {
+                    payload["application_ref"] = json!({"kind":"application",
+                        "app_id":amaterasu_module_sdk::application_library::preflight::application_scope_id(&selected.application)
+                            .expect("validated selected application"),
+                        "policy_identity":record.policy_identity});
+                }
                 // `paired()` is established from the TLS certificate and the
                 // committed pairing lookup, never from the client query.
                 if record.peer.paired() {
@@ -397,17 +405,41 @@ impl Controller {
                 )
             }
             Phase::ReadProtonPolicy => (INPUT_SERVICE, json!({"action":"settings_get"}), 5_000),
-            Phase::PreflightApplication => (
-                LAUNCH_SERVICE,
-                json!({
-                    "action": "preflight_export",
-                    "operation_id": record.application_operation,
-                    "app_id": app_id(record.request.app_id),
-                    "global_preparation": record.global_preparation,
-                    "legacy_global_preparation": record.legacy_global_preparation,
-                }),
-                10_000,
-            ),
+            Phase::PreflightApplication => {
+                if let Some(selected) = &record.selected_application {
+                    (
+                        amaterasu_module_sdk::application_library::preflight::SERVICE,
+                        json!({"action":"prepare_streaming", "operation_id":record.application_operation,
+                        "application":selected.application,"entry_revision":selected.entry_revision,
+                        "certificate_id":record.peer.certificate_id,"global_preparation":record.global_preparation,
+                        "legacy_global_preparation":record.legacy_global_preparation}),
+                        10_000,
+                    )
+                } else {
+                    (
+                        LAUNCH_SERVICE,
+                        json!({"action":"preflight_export", "operation_id":record.application_operation,
+                    "app_id":app_id(record.request.app_id),"global_preparation":record.global_preparation,
+                    "legacy_global_preparation":record.legacy_global_preparation}),
+                        10_000,
+                    )
+                }
+            }
+            Phase::AcceptPolicy => {
+                let selected = record
+                    .selected_application
+                    .as_ref()
+                    .expect("selected library");
+                (
+                    amaterasu_module_sdk::application_library::preflight::SERVICE,
+                    json!({"action":"accept_streaming", "operation_id":record.application_operation,
+                        "application":selected.application,"entry_revision":selected.entry_revision,
+                        "certificate_id":record.peer.certificate_id,"preflight_token":record.application_preflight_token,
+                        "policy_identity":record.policy_identity,"frame_limiter_settings":record.frame_limiter_snapshot,
+                        "client_frame_limiter_overrides":client_frame_limiter_overrides(record)}),
+                    10_000,
+                )
+            }
             Phase::SnapshotDisplay | Phase::ConfirmDisplay => {
                 (DISPLAY_SERVICE, json!({"action":"snapshot"}), 5_000)
             }
@@ -422,6 +454,25 @@ impl Controller {
             ),
             Phase::LaunchApplication => {
                 record.application_requested = true;
+                if let Some(selected) = &record.selected_application {
+                    let payload = json!({"action":"admit_streaming","operation_id":record.application_operation,
+                        "application":selected.application,"entry_revision":selected.entry_revision,
+                        "certificate_id":record.peer.certificate_id,"preflight_token":record.application_preflight_token,
+                        "policy_identity":record.policy_identity,"display_admission_token":record.display_admission_token,
+                        "application_display_overrides":record.application_display_overrides,
+                        "application_display_settings":record.application_display_settings,
+                        "virtual_display_intent":record.virtual_display_intent,
+                        "frame_limiter_settings":record.frame_limiter_snapshot,
+                        "client_frame_limiter_overrides":client_frame_limiter_overrides(record),
+                        "proton_dualsense_compatibility":record.proton_dualsense_compatibility,
+                        "return_on_admission":true});
+                    return Call::new(
+                        amaterasu_module_sdk::application_library::preflight::SERVICE,
+                        payload,
+                        self.next_operation(record, phase.name()),
+                        30_000,
+                    );
+                }
                 (
                     LAUNCH_SERVICE,
                     json!({
@@ -465,24 +516,24 @@ impl Controller {
                     .expect("frozen display policy");
                 let request_sha256 = display_admission_request_sha256(record)
                     .expect("serialized display admission request");
-                (
-                    LAUNCH_SERVICE,
-                    json!({
-                        "action":"prepare_display_admission",
-                        "application_operation_id":record.application_operation,
-                        "global_revision":snapshot["global_revision"],
-                        "global_overrides":snapshot["global_overrides"],
-                        "catalog_revision":snapshot["catalog_revision"],
-                        "application_display_overrides":snapshot["application_overrides"],
-                        "application_display_settings":record.application_display_settings,
-                        "certificate_id":snapshot["certificate_id"],
-                        "client_display_overrides":snapshot["client_overrides"],
-                        "rtsp_operation_id":record.rtsp_operation,
-                        "request_sha256":request_sha256,
-                        "virtual_display_intent":record.virtual_display_intent,
-                    }),
-                    5_000,
-                )
+                let mut payload = json!({
+                    "action":"prepare_display_admission",
+                    "application_operation_id":record.application_operation,
+                    "global_revision":snapshot["global_revision"],
+                    "global_overrides":snapshot["global_overrides"],
+                    "catalog_revision":snapshot["catalog_revision"],
+                    "application_display_overrides":snapshot["application_overrides"],
+                    "application_display_settings":record.application_display_settings,
+                    "certificate_id":snapshot["certificate_id"],
+                    "client_display_overrides":snapshot["client_overrides"],
+                    "rtsp_operation_id":record.rtsp_operation,
+                    "request_sha256":request_sha256,
+                    "virtual_display_intent":record.virtual_display_intent,
+                });
+                if let Some(identity) = &record.policy_identity {
+                    payload["policy_identity"] = json!(identity);
+                }
+                (LAUNCH_SERVICE, payload, 5_000)
             }
             Phase::OpenRtsp => {
                 record.rtsp_requested = true;
@@ -656,16 +707,21 @@ impl Controller {
             && (record.display_request.is_some()
                 || record.virtual_display_intent.is_some()
                 || record.application_display_settings.is_some()
-                || (record.executable_path.is_some() && record.frame_limiter_snapshot.is_some()))
+                || (record.executable_path.is_some() && record.frame_limiter_snapshot.is_some())
+                || record.selected_application.is_some())
         {
             payload["application_operation_id"] = json!(record.application_operation);
             payload["app_id"] = json!(app_id(record.request.app_id));
-            let revision = record
-                .application_catalog_revision
-                .expect("RTSP admission follows application preflight");
-            payload["catalog_revision"] = json!(revision);
-            payload["policy_identity"] =
-                json!({"source":"catalog","version":1,"revision":revision});
+            if let Some(identity) = &record.policy_identity {
+                payload["policy_identity"] = json!(identity);
+            } else {
+                let revision = record
+                    .application_catalog_revision
+                    .expect("RTSP admission follows application preflight");
+                payload["catalog_revision"] = json!(revision);
+                payload["policy_identity"] =
+                    json!({"source":"catalog","version":1,"revision":revision});
+            }
         }
         let operation = self.next_operation(record, phase.name());
         Call::new(service, payload, operation, timeout_ms)
@@ -906,6 +962,7 @@ impl Controller {
                 Ok(ApplicationPreflight {
                     token,
                     catalog_revision,
+                    policy_identity,
                     overrides: application_overrides,
                     application_display_settings,
                     executable_path,
@@ -917,7 +974,8 @@ impl Controller {
                         .or(application_overrides.capture)
                         .unwrap_or(record.global_capture_mode);
                     record.application_preflight_token = Some(token);
-                    record.application_catalog_revision = Some(catalog_revision);
+                    record.application_catalog_revision = catalog_revision;
+                    record.policy_identity = policy_identity;
                     record.application_cleanup_budget_ms = Some(cleanup_budget_ms);
                     record.executable_path = executable_path;
                     record.application_frame_limiter_settings =
@@ -987,7 +1045,9 @@ impl Controller {
                                 Err(code) => fail_record(record, code, now),
                             },
                             None | Some("disabled") => {
-                                record.stage = if record.application_display_settings.is_some() {
+                                record.stage = if record.application_display_settings.is_some()
+                                    || record.selected_application.is_some()
+                                {
                                     Stage::PrepareDisplayAdmission
                                 } else {
                                     Stage::LaunchApplication
@@ -996,10 +1056,29 @@ impl Controller {
                             Some(_) => fail_record(record, "display_mutation_unavailable", now),
                         }
                     }
+                    if record.selected_application.is_some() && record.state == State::Starting {
+                        record.streaming_next_stage = Some(record.stage);
+                        record.stage = Stage::AcceptPolicy;
+                    }
                 }
                 Ok(_) => fail_record(record, "application_preflight_unavailable", now),
                 Err(code) => fail_record(record, code, now),
             },
+            Phase::AcceptPolicy => {
+                if record.state == State::Starting
+                    && payload["ok"] == true
+                    && payload["accepted"] == true
+                    && payload["operation_id"] == record.application_operation
+                    && payload.get("policy_identity") == Some(&json!(record.policy_identity))
+                {
+                    record.stage = record
+                        .streaming_next_stage
+                        .take()
+                        .expect("selected next stage");
+                } else {
+                    fail_record(record, "application_policy_changed", now);
+                }
+            }
             Phase::SnapshotDisplay => match display_snapshot(&payload) {
                 Ok((revision, configuration, ids)) if record.state == State::Starting => {
                     record.display_topology_revision = Some(revision);
@@ -1356,7 +1435,7 @@ impl Controller {
             Phase::PrepareDisplayAdmission => {
                 fail_before_resume_stream(record, "display_admission_unavailable", now, replies);
             }
-            Phase::PreflightApplication => {
+            Phase::PreflightApplication | Phase::AcceptPolicy => {
                 fail_record(record, "application_preflight_rejected", now)
             }
             Phase::SnapshotDisplay | Phase::EnumerateDisplay | Phase::ConfirmDisplay => {
@@ -1435,7 +1514,7 @@ impl Controller {
             Phase::ReadProtonPolicy => {
                 record.request_cleanup(Some("input_policy_unavailable"), now);
             }
-            Phase::PreflightApplication => {
+            Phase::PreflightApplication | Phase::AcceptPolicy => {
                 record.request_cleanup(Some("application_preflight_unavailable"), now);
             }
             Phase::SnapshotDisplay | Phase::EnumerateDisplay | Phase::ConfirmDisplay => {
@@ -1616,6 +1695,7 @@ impl Phase {
             Self::ReserveHistory => "reserve-history",
             Self::ReadProtonPolicy => "read-proton-policy",
             Self::PreflightApplication => "preflight-launch",
+            Self::AcceptPolicy => "accept-policy",
             Self::SnapshotDisplay => "snapshot-display",
             Self::EnumerateDisplay => "enumerate-display",
             Self::ConfirmDisplay => "confirm-display",
@@ -1677,6 +1757,7 @@ fn needs_work(record: &Record, now: Instant) -> bool {
         Stage::ReserveHistory
             | Stage::ReadProtonPolicy
             | Stage::PreflightApplication
+            | Stage::AcceptPolicy
             | Stage::SnapshotDisplay
             | Stage::EnumerateDisplay
             | Stage::ConfirmDisplay
@@ -1704,11 +1785,12 @@ fn needs_work(record: &Record, now: Instant) -> bool {
 
 pub(super) fn next_phase(record: &Record) -> Phase {
     if record.state == State::Starting
-        && record.lifecycle_required
+        && (record.lifecycle_required || record.selected_application.is_some())
         && !record.lifecycle_launch_epoch_ready
         && matches!(
             record.stage,
             Stage::PreflightApplication
+                | Stage::AcceptPolicy
                 | Stage::LaunchApplication
                 | Stage::PrepareDisplayAdmission
                 | Stage::OpenRtsp
@@ -1768,6 +1850,7 @@ pub(super) fn next_phase(record: &Record) -> Phase {
         Stage::ReserveHistory => Phase::ReserveHistory,
         Stage::ReadProtonPolicy => Phase::ReadProtonPolicy,
         Stage::PreflightApplication => Phase::PreflightApplication,
+        Stage::AcceptPolicy => Phase::AcceptPolicy,
         Stage::SnapshotDisplay => Phase::SnapshotDisplay,
         Stage::EnumerateDisplay => Phase::EnumerateDisplay,
         Stage::ConfirmDisplay => Phase::ConfirmDisplay,
@@ -2083,6 +2166,12 @@ fn display_admission_request_sha256(record: &Record) -> Result<String, &'static 
     let settings = record
         .application_display_settings
         .as_ref()
+        .or_else(|| {
+            record
+                .selected_application
+                .as_ref()
+                .and(record.display_policy_snapshot.as_ref())
+        })
         .ok_or("display_request_unavailable")?;
     let bytes = serde_json::to_vec(settings).map_err(|_| "display_request_unavailable")?;
     Ok(hash_sha256(&bytes))
@@ -2836,8 +2925,12 @@ fn application_response<'a>(
     {
         return Err("invalid_application_response");
     }
-    if launch["operation_id"] != record.application_operation
-        || launch["app_id"] != app_id(record.request.app_id)
+    let expected_app_id = record
+        .selected_application
+        .as_ref()
+        .map(|selected| selected.application.id.clone())
+        .unwrap_or_else(|| app_id(record.request.app_id));
+    if launch["operation_id"] != record.application_operation || launch["app_id"] != expected_app_id
     {
         return Err("invalid_application_response");
     }
@@ -2873,7 +2966,11 @@ fn validate_application_launch_snapshot(
     if record.application_preflight_overrides.as_ref() != Some(&application_overrides) {
         return Err("application_policy_mismatch");
     }
-    if payload["launch"]["catalog_revision"].as_u64() != record.application_catalog_revision {
+    if payload["launch"]["catalog_revision"].as_u64() != record.application_catalog_revision
+        || record.policy_identity.as_ref().is_some_and(|identity| {
+            payload["launch"].get("library_policy_identity") != Some(&json!(identity))
+        })
+    {
         return Err("application_revision_mismatch");
     }
     if payload["launch"].get("application_display_overrides")
@@ -3161,6 +3258,13 @@ pub(super) fn display_policy_snapshot(record: &Record) -> Value {
         "client_overrides":client,
         "effective_overrides":effective,
     });
+    if let Some(identity) = &record.policy_identity {
+        snapshot
+            .as_object_mut()
+            .expect("snapshot object")
+            .remove("catalog_revision");
+        snapshot["policy_identity"] = json!(identity);
+    }
     if let Some(intent) = &record.virtual_display_intent {
         snapshot["virtual_display_intent"] = json!(intent);
     }
@@ -3564,7 +3668,8 @@ fn application_cleanup_budget_ms(value: &Value) -> Option<u64> {
 
 struct ApplicationPreflight {
     token: String,
-    catalog_revision: u64,
+    catalog_revision: Option<u64>,
+    policy_identity: Option<amaterasu_module_sdk::application_library::preflight::PolicyIdentity>,
     overrides: ApplicationConfigOverrides,
     application_display_settings: Option<Value>,
     executable_path: Option<String>,
@@ -3584,7 +3689,10 @@ fn application_preflight_response(
     record: &Record,
     payload: &Value,
 ) -> Result<ApplicationPreflight, &'static str> {
-    if payload["ok"] != true || payload["app_id"] != app_id(record.request.app_id) {
+    if payload["ok"] != true
+        || (record.selected_application.is_none()
+            && payload["app_id"] != app_id(record.request.app_id))
+    {
         eprintln!(
             "amaterasu application preflight rejected code={}",
             safe_rtsp_provider_code(&payload["code"])
@@ -3597,9 +3705,28 @@ fn application_preflight_response(
             !token.is_empty() && token.len() <= 256 && !token.chars().any(char::is_control)
         })
         .ok_or("invalid_application_preflight_response")?;
-    let catalog_revision = payload["catalog_revision"]
-        .as_u64()
-        .ok_or("invalid_application_preflight_response")?;
+    let (catalog_revision, policy_identity) = if let Some(selected) = &record.selected_application {
+        use amaterasu_module_sdk::application_library::preflight::PolicyIdentity;
+        let identity: PolicyIdentity = serde_json::from_value(payload["policy_identity"].clone())
+            .map_err(|_| "invalid_application_preflight_response")?;
+        if payload["admission_capable"] != true
+            || identity.validate().is_err()
+            || !matches!(&identity, PolicyIdentity::Library { application, entry_revision, policy_source: Some(_), .. }
+                if application == &selected.application && entry_revision == &selected.entry_revision)
+        {
+            return Err("invalid_application_preflight_response");
+        }
+        (None, Some(identity))
+    } else {
+        (
+            Some(
+                payload["catalog_revision"]
+                    .as_u64()
+                    .ok_or("invalid_application_preflight_response")?,
+            ),
+            None,
+        )
+    };
     let overrides = parse_application_config_overrides(payload.get("config_overrides"))
         .map_err(|_| "invalid_application_preflight_response")?;
     let application_display_settings =
@@ -3620,6 +3747,7 @@ fn application_preflight_response(
     Ok(ApplicationPreflight {
         token: token.to_owned(),
         catalog_revision,
+        policy_identity,
         overrides,
         application_display_settings,
         executable_path,

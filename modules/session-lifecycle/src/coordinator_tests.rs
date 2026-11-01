@@ -955,3 +955,31 @@ fn frozen_action_lineage_survives_restart_and_rejects_tampering() {
             == Some(&snapshot)
     );
 }
+
+#[test]
+fn selected_application_scope_requires_the_direct_paired_tls_coordinator() {
+    let dir = TestDirectory::new();
+    let mut coordinator = Coordinator::open(&dir.journal()).unwrap();
+    coordinator.configured = true;
+    let application = amaterasu_module_sdk::application_library::v2::ApplicationReference {
+        library: "games".into(),
+        id: "opaque/game".into(),
+    };
+    let scope =
+        amaterasu_module_sdk::application_library::preflight::application_scope_id(&application)
+            .unwrap();
+    let reference = json!({"kind":"application","app_id":scope,"policy_identity":{
+        "source":"library","version":1,"application":application,"entry_revision":"entry",
+        "policy_revision":"policy","policy_source":"primary","snapshot_id":"snapshot"}});
+    let make = |operation: &str| json!({"operation":"prepare","operation_id":operation,"application_ref":reference});
+    let denied = coordinator.handle("foreign", "foreign", make("foreign"));
+    assert_eq!(denied["status"], "rejected");
+    let denied = coordinator.handle("amaterasu.nvhttp", "amaterasu.nvhttp", make("unpaired"));
+    assert_eq!(denied["status"], "rejected");
+    let mut trusted = make("trusted");
+    trusted["source_attestation"] = json!({"version":1,"kind":"paired_tls"});
+    assert_eq!(
+        coordinator.handle("amaterasu.nvhttp", "amaterasu.nvhttp", trusted)["status"],
+        "pending"
+    );
+}

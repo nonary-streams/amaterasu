@@ -232,8 +232,27 @@ management and asynchronous actions, and durable execution recovery. This first
 increment supplies a usable read/handoff boundary without declaring those
 features implemented.
 
-### Source-qualified policy identity checkpoint
+### Selected streaming integration under qualification
 
-When a selected v2 library launch resolves its separately selected policy provider, Launch now retains a `PolicyIdentity::Library` containing the logical application reference, opaque entry revision, opaque policy revision and a fresh snapshot ID. The SDK also represents a catalog identity with its existing numeric revision as a distinct tagged variant. These identities compare by exact source and fields; they are not authority tokens and no library revision is converted to an integer. Before forward session, preparation and provider effects, Launch checks the stored library, application, entry revision and policy revision against the selected record. This guards internal consistency only; it does not prove that the policy is still current.
+The working-tree selected streaming path is not ready for release. It carries a
+source-qualified `PolicyIdentity` without converting opaque revisions to numeric
+catalog revisions. A configured selected-library profile uses startup-owned,
+certificate-scoped Moonlight aliases and a separately selected `/2` streaming
+policy authority. The trusted NVHTTP coordinator supplies the paired certificate
+fingerprint; the authority must explicitly authorize it. Launch re-resolves the
+library target and exact policy before accepting the immutable ordinary-policy
+snapshot, then binds display admission and RTSP verification to the identity,
+certificate and operation. Legacy catalog operation remains selected when the
+startup alias list is empty. A nonempty selected profile replaces the catalog list;
+its artwork bridge is not implemented.
 
-The opt-in `amaterasu.launch/3` endpoint now accepts a read-only `prepare` from a direct, startup-authorized component. It requires an epoch-qualified operation ID and a separately selected policy resolver, resolves both selected providers, freezes this identity and returns an owner-bound, expiring token. Its response explicitly says `admission_capable:false`: no `/3` launch, display or stream admission is implemented. The token cannot be used to start a `/2` launch, and a changed selection or expired operation cannot be replayed as a new preflight. No NVHTTP or RTSP integration is implied. The endpoint does not yet freeze a complete display/limiter policy or recheck policy changes after preview. The legacy catalog path and `/2` direct-caller restriction remain unchanged. Keep the source-qualified streaming profile closed until complete policy/display verification, RTSP integration and real streaming replacement tests exist.
+This is source work in progress, not evidence of a complete production streaming
+composition. Pairing and host-configuration revocation require the separate
+live authority fence/drain adapter and must not be replaced by the ordinary
+snapshot. The selected policy freezes global and application preparation together at
+admission, including per-application exclusion of global steps. It fails closed
+when an effective frame limiter is enabled because there is no generic
+executable-target limiter contract. Real cross-module NVHTTP/Launch/RTSP replacement tests against
+at least two independent selected libraries and policy providers, including
+failure, cancellation and revocation cases, remain required before integration.
+No installed grants or live settings are changed by this work.

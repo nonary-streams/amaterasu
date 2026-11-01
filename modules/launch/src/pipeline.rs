@@ -21,7 +21,10 @@ use std::{
 type Transport = ModuleResult<Response>;
 
 fn display_admission_eligible(record: &crate::records::Record, now: Instant) -> bool {
-    record.catalog_selection == CatalogSelection::Exported
+    (record.catalog_selection == CatalogSelection::Exported
+        || (record.catalog_selection == CatalogSelection::Library
+            && record.streaming_policy_admission.is_some()
+            && record.streaming_policy_accepted))
         && record.preflight_ready
         && record.preflight_token.is_some()
         && if record.launch_started {
@@ -32,6 +35,36 @@ fn display_admission_eligible(record: &crate::records::Record, now: Instant) -> 
                     .preflight_deadline
                     .is_some_and(|deadline| now < deadline)
         }
+}
+
+fn record_policy_matches(
+    record: &crate::records::Record,
+    catalog_revision: Option<u64>,
+    identity: Option<&amaterasu_module_sdk::application_library::preflight::PolicyIdentity>,
+) -> bool {
+    use amaterasu_module_sdk::application_library::preflight::PolicyIdentity;
+    match record.catalog_selection {
+        CatalogSelection::Exported => {
+            record.catalog_revision == catalog_revision
+                && catalog_revision.is_some()
+                && identity.is_none_or(|identity| {
+                    Some(identity)
+                        == catalog_revision
+                            .map(|revision| PolicyIdentity::Catalog {
+                                version: 1,
+                                revision,
+                            })
+                            .as_ref()
+                })
+        }
+        CatalogSelection::Library => {
+            catalog_revision.is_none()
+                && identity.is_some()
+                && record.library_policy_identity.as_ref() == identity
+                && record.validate_library_policy_identity().is_ok()
+        }
+        CatalogSelection::Initiator => false,
+    }
 }
 
 fn display_policy_snapshot(
@@ -55,6 +88,13 @@ fn display_policy_snapshot(
         "client_overrides":client_overrides,
         "effective_overrides":effective,
     });
+    if record.catalog_selection == CatalogSelection::Library {
+        snapshot
+            .as_object_mut()
+            .expect("snapshot object")
+            .remove("catalog_revision");
+        snapshot["policy_identity"] = serde_json::json!(record.library_policy_identity);
+    }
     if let Some(intent) = virtual_display_intent {
         snapshot["virtual_display_intent"] = serde_json::json!(intent);
     }
@@ -825,6 +865,305 @@ impl Pipeline {
                     Err(code) => complete(send, request, error(code)),
                 }
             }
+            Operation::PreflightStreamingLibrary {
+                operation_id,
+                application,
+                revision,
+                certificate_id,
+                global_preparation,
+                legacy_global_preparation,
+            } => {
+                if caller != "amaterasu.nvhttp"
+                    || caller != initiator
+                    || !self.records.current_epoch_operation(&operation_id)
+                {
+                    return complete(send, request, error("permission_denied"));
+                }
+                let Some(route) = self
+                    .library_routes
+                    .get(&application.library)
+                    .filter(|route| {
+                        route.callers.contains(caller)
+                            && route.streaming_policy_service.is_some()
+                            && route.streaming_policy_source.is_some()
+                    })
+                else {
+                    return complete(send, request, error("permission_denied"));
+                };
+                let selection = crate::library::Selection {
+                    application,
+                    revision,
+                    service: route.service.clone(),
+                };
+                if let Ok(record) = self.records.owned_operation(caller, &operation_id)
+                    && (record.library_selection.as_ref() != Some(&selection)
+                        || record.streaming_certificate_id.as_deref()
+                            != Some(certificate_id.as_str())
+                        || record.preflight_token.is_none())
+                {
+                    return complete(send, request, error("operation_conflict"));
+                }
+                match self.records.start(
+                    caller,
+                    initiator,
+                    operation_id,
+                    selection.application.id.clone(),
+                    CatalogSelection::Library,
+                    GlobalPreparation {
+                        structured_steps: global_preparation,
+                        legacy_commands: legacy_global_preparation,
+                    },
+                ) {
+                    Ok((id, true)) => {
+                        let token = match random_display_admission_token() {
+                            Ok(token) => token,
+                            Err(code) => {
+                                self.records.values.remove(&id);
+                                return complete(send, request, error(code));
+                            }
+                        };
+                        let record = self
+                            .records
+                            .values
+                            .get_mut(&id)
+                            .expect("streaming preflight record");
+                        record.preflight_token = Some(token);
+                        record.library_selection = Some(selection);
+                        record.streaming_certificate_id = Some(certificate_id);
+                        record.streaming_policy_service = route.streaming_policy_service.clone();
+                        record.streaming_policy_source = route.streaming_policy_source.clone();
+                        let mut workflow = Workflow::launch(id, request, remaining_ms);
+                        workflow.step = Step::Library;
+                        self.job = Some(workflow);
+                        Ok(())
+                    }
+                    Ok((id, false)) if self.records.values[&id].preflight_ready => complete(
+                        send,
+                        request,
+                        self.records.values[&id].library_preflight_response(),
+                    ),
+                    Ok(_) => complete(send, request, error("preflight_unavailable")),
+                    Err(code) => complete(send, request, error(code)),
+                }
+            }
+            Operation::AcceptStreamingLibrary {
+                request: admission_request,
+            } => {
+                use amaterasu_module_sdk::application_library::preflight::Request;
+                let Request::AcceptStreaming {
+                    operation_id,
+                    application,
+                    entry_revision,
+                    certificate_id,
+                    preflight_token,
+                    policy_identity,
+                    frame_limiter_settings,
+                    client_frame_limiter_overrides,
+                } = admission_request
+                else {
+                    return complete(send, request, error("invalid_request"));
+                };
+                if caller != "amaterasu.nvhttp" || caller != initiator {
+                    return complete(send, request, error("permission_denied"));
+                }
+                let Ok(record) = self.records.owned_operation(caller, &operation_id) else {
+                    return complete(send, request, error("preflight_not_found"));
+                };
+                let Some(selection) = &record.library_selection else {
+                    return complete(send, request, error("preflight_mismatch"));
+                };
+                if record.catalog_selection != CatalogSelection::Library
+                    || record.catalog_initiator != initiator
+                    || selection.application != application
+                    || selection.revision != entry_revision
+                    || record.streaming_certificate_id.as_deref() != Some(certificate_id.as_str())
+                    || record.preflight_token.as_deref() != Some(preflight_token.as_str())
+                    || record.library_policy_identity.as_ref() != Some(&policy_identity)
+                    || !record.preflight_ready
+                    || record
+                        .preflight_deadline
+                        .is_none_or(|deadline| Instant::now() >= deadline)
+                    || record.validate_library_policy_identity().is_err()
+                {
+                    return complete(send, request, error("preflight_mismatch"));
+                }
+                if frame_limiter_settings
+                    .get("settings")
+                    .and_then(|settings| settings.get("frame_limiter_enable"))
+                    != Some(&Value::Bool(false))
+                    || !valid_frame_limiter_snapshot(&frame_limiter_settings)
+                    || !valid_client_frame_limiter_overrides(&client_frame_limiter_overrides)
+                    || !snapshot_matches_application_policy(
+                        record,
+                        &frame_limiter_settings,
+                        Some(&client_frame_limiter_overrides),
+                    )
+                {
+                    return complete(send, request, error("selected_library_limiter_unavailable"));
+                }
+                if record.streaming_policy_accepted {
+                    if record.frame_limiter_settings.as_ref() != Some(&frame_limiter_settings)
+                        || record.client_frame_limiter_overrides.as_ref()
+                            != Some(&client_frame_limiter_overrides)
+                    {
+                        return complete(send, request, error("operation_conflict"));
+                    }
+                    return complete(
+                        send,
+                        request,
+                        serde_json::json!({"ok":true,"accepted":true,
+                        "operation_id":operation_id,"policy_identity":policy_identity}),
+                    );
+                }
+                let id = record.launch_id;
+                let record = self
+                    .records
+                    .values
+                    .get_mut(&id)
+                    .expect("verified preflight");
+                record.frame_limiter_settings = Some(frame_limiter_settings);
+                record.client_frame_limiter_overrides = Some(client_frame_limiter_overrides);
+                let mut workflow = Workflow::launch(record.launch_id, request, remaining_ms);
+                workflow.step = Step::RevalidateLibrary;
+                self.job = Some(workflow);
+                Ok(())
+            }
+            Operation::AdmitStreamingLibrary {
+                request: admission_request,
+            } => {
+                use amaterasu_module_sdk::application_library::preflight::Request;
+                let Request::AdmitStreaming {
+                    operation_id,
+                    application,
+                    entry_revision,
+                    certificate_id,
+                    preflight_token,
+                    policy_identity,
+                    display_admission_token,
+                    application_display_overrides,
+                    application_display_settings,
+                    virtual_display_intent,
+                    frame_limiter_settings,
+                    client_frame_limiter_overrides,
+                    proton_dualsense_compatibility,
+                    return_on_admission,
+                } = admission_request
+                else {
+                    return complete(send, request, error("invalid_request"));
+                };
+                if caller != "amaterasu.nvhttp" || caller != initiator {
+                    return complete(send, request, error("permission_denied"));
+                }
+                let Ok(record) = self.records.owned_operation(caller, &operation_id) else {
+                    return complete(send, request, error("preflight_not_found"));
+                };
+                let id = record.launch_id;
+                let Some(selection) = &record.library_selection else {
+                    return complete(send, request, error("preflight_mismatch"));
+                };
+                let settings = match application_display_settings {
+                    None => None,
+                    Some(value) => {
+                        match serde_json::from_value::<ApplicationDisplaySettings>(value) {
+                            Ok(settings) if settings.validate().is_ok() => Some(settings),
+                            _ => {
+                                return complete(
+                                    send,
+                                    request,
+                                    error("invalid_application_display_settings"),
+                                );
+                            }
+                        }
+                    }
+                };
+                let intent = match virtual_display_intent {
+                    None => None,
+                    Some(value) => match serde_json::from_value::<VirtualDisplayIntent>(value) {
+                        Ok(intent) if intent.validate().is_ok() => Some(intent),
+                        _ => {
+                            return complete(
+                                send,
+                                request,
+                                error("invalid_virtual_display_intent"),
+                            );
+                        }
+                    },
+                };
+                if record.catalog_selection != CatalogSelection::Library
+                    || record.catalog_initiator != initiator
+                    || selection.application != application
+                    || selection.revision != entry_revision
+                    || record.streaming_certificate_id.as_deref() != Some(certificate_id.as_str())
+                    || record.preflight_token.as_deref() != Some(preflight_token.as_str())
+                    || record.library_policy_identity.as_ref() != Some(&policy_identity)
+                    || !record.preflight_ready
+                    || !record.streaming_policy_accepted
+                    || (!record.launch_started
+                        && record
+                            .preflight_deadline
+                            .is_none_or(|deadline| Instant::now() >= deadline))
+                    || record.validate_library_policy_identity().is_err()
+                    || record.application_display_overrides != application_display_overrides
+                    || record.application_display_settings != settings
+                    || record.virtual_display_intent != intent
+                {
+                    return complete(send, request, error("preflight_mismatch"));
+                }
+                match (
+                    &record.display_admission,
+                    display_admission_token.as_deref(),
+                ) {
+                    (Some(admission), Some(token))
+                        if admission.token == token
+                            && admission.certificate_id == certificate_id => {}
+                    _ => return complete(send, request, error("display_admission_denied")),
+                }
+                if frame_limiter_settings
+                    .get("settings")
+                    .and_then(|settings| settings.get("frame_limiter_enable"))
+                    != Some(&Value::Bool(false))
+                {
+                    return complete(send, request, error("selected_library_limiter_unavailable"));
+                }
+                if record.frame_limiter_settings.as_ref() != Some(&frame_limiter_settings)
+                    || record.client_frame_limiter_overrides.as_ref()
+                        != Some(&client_frame_limiter_overrides)
+                    || !valid_frame_limiter_snapshot(&frame_limiter_settings)
+                    || !valid_client_frame_limiter_overrides(&client_frame_limiter_overrides)
+                    || !snapshot_matches_application_policy(
+                        record,
+                        &frame_limiter_settings,
+                        Some(&client_frame_limiter_overrides),
+                    )
+                {
+                    return complete(send, request, error("frame_limiter_policy_mismatch"));
+                }
+                if record.launch_started {
+                    if record.frame_limiter_settings.as_ref() != Some(&frame_limiter_settings)
+                        || record.client_frame_limiter_overrides.as_ref()
+                            != Some(&client_frame_limiter_overrides)
+                        || record.proton_dualsense_compatibility != proton_dualsense_compatibility
+                        || record.return_on_admission != return_on_admission
+                    {
+                        return complete(send, request, error("operation_conflict"));
+                    }
+                    return complete(send, request, record.response());
+                }
+                let record = self
+                    .records
+                    .values
+                    .get_mut(&id)
+                    .expect("verified streaming record");
+                record.frame_limiter_settings = Some(frame_limiter_settings);
+                record.client_frame_limiter_overrides = Some(client_frame_limiter_overrides);
+                record.proton_dualsense_compatibility = proton_dualsense_compatibility;
+                record.return_on_admission = return_on_admission;
+                record.launch_started = true;
+                let mut workflow = Workflow::launch(id, request, remaining_ms);
+                workflow.step = Step::CreateSession;
+                self.job = Some(workflow);
+                Ok(())
+            }
             Operation::LaunchLibrary {
                 operation_id,
                 application,
@@ -1107,6 +1446,7 @@ impl Pipeline {
                 global_revision,
                 global_overrides,
                 catalog_revision,
+                policy_identity,
                 application_display_overrides,
                 application_display_settings,
                 certificate_id,
@@ -1127,7 +1467,10 @@ impl Pipeline {
                 };
                 if !display_admission_eligible(record, Instant::now())
                     || record.preflight_token.is_none()
-                    || record.catalog_revision != Some(catalog_revision)
+                    || !record_policy_matches(record, catalog_revision, policy_identity.as_ref())
+                    || (record.catalog_selection == CatalogSelection::Library
+                        && record.streaming_certificate_id.as_deref()
+                            != Some(certificate_id.as_str()))
                     || record.application_display_overrides != application_display_overrides
                     || record.application_display_settings != application_display_settings
                     || virtual_display_intent.as_ref().is_some_and(|intent| {
@@ -1217,12 +1560,14 @@ impl Pipeline {
                     let verified = record.owner == "amaterasu.nvhttp"
                         && record.operation_id == application_operation_id
                         && display_admission_eligible(record, now)
-                        && record.catalog_revision == Some(catalog_revision)
-                        && policy_identity.as_ref().is_none_or(|identity| {
-                            identity == &amaterasu_module_sdk::application_library::preflight::PolicyIdentity::Catalog {
-                                version: 1, revision: catalog_revision,
-                            }
-                        })
+                        && record_policy_matches(
+                            record,
+                            catalog_revision,
+                            policy_identity.as_ref(),
+                        )
+                        && (record.catalog_selection != CatalogSelection::Library
+                            || record.streaming_certificate_id.as_deref()
+                                == Some(certificate_id.as_str()))
                         && record.display_admission.as_ref().is_some_and(|admission| {
                             admission.token == token
                                 && admission.certificate_id == certificate_id
@@ -1610,8 +1955,13 @@ impl Pipeline {
                 let Some(route) = self.library_routes.get(&selection.application.library) else {
                     return self.dependency_failed(job, "library_not_configured", send);
                 };
+                record.resolved_library_payload = Some(payload.clone());
+                let mut selected_route = route.clone();
+                if record.streaming_certificate_id.is_some() {
+                    selected_route.require_application_policy = false;
+                }
                 let (target, service, resource) =
-                    match crate::library::resolve_target(selection, route, payload) {
+                    match crate::library::resolve_target(selection, &selected_route, payload) {
                         Ok(target) => target,
                         Err(code) => return self.dependency_failed(job, code, send),
                     };
@@ -1621,11 +1971,134 @@ impl Pipeline {
                 record.generic_provider_service = Some(service);
                 record.library_policy_service = route.policy_service.clone();
                 record.resource = Some(resource);
-                job.step = if route.policy_service.is_some() {
+                job.step = if record.streaming_certificate_id.is_some() {
+                    Step::StreamingPolicy
+                } else if route.policy_service.is_some() {
                     Step::LibraryPolicy
                 } else {
                     Step::CreateSession
                 };
+            }
+            Step::RevalidateLibrary => {
+                if record.resolved_library_payload.as_ref() != Some(&payload) {
+                    return self.dependency_failed(job, "library_revision_conflict", send);
+                }
+                job.step = Step::RevalidateStreamingPolicy;
+            }
+            Step::RevalidateStreamingPolicy => {
+                if record.streaming_policy_admission.as_ref() != payload.get("admission")
+                    || record
+                        .preflight_deadline
+                        .is_none_or(|deadline| Instant::now() >= deadline)
+                    || record.validate_library_policy_identity().is_err()
+                {
+                    return self.dependency_failed(job, "policy_revision_conflict", send);
+                }
+                record.streaming_policy_accepted = true;
+                return complete(
+                    send,
+                    job.request.expect("streaming acceptance request"),
+                    serde_json::json!({
+                    "ok":true,"accepted":true,"operation_id":record.operation_id,
+                    "policy_identity":record.library_policy_identity}),
+                );
+            }
+            Step::StreamingPolicy => {
+                if !serde_json::to_vec(&payload).is_ok_and(|bytes| {
+                    bytes.len()
+                        <= amaterasu_module_sdk::application_library::policy::MAX_POLICY_BYTES
+                }) {
+                    return self.dependency_failed(job, "invalid_policy_response", send);
+                }
+                use amaterasu_module_sdk::application_library::streaming_policy::{
+                    Admission, AdmitAction, Request,
+                };
+                let Some(selection) = record.library_selection.as_ref() else {
+                    return self.dependency_failed(job, "invalid_policy_response", send);
+                };
+                let Some(certificate_id) = record.streaming_certificate_id.as_ref() else {
+                    return self.dependency_failed(job, "invalid_policy_response", send);
+                };
+                let request = Request {
+                    action: AdmitAction::Admit,
+                    application: selection.application.clone(),
+                    entry_revision: selection.revision.clone(),
+                    certificate_id: certificate_id.clone(),
+                };
+                let Ok(admission) =
+                    serde_json::from_value::<Admission>(payload["admission"].clone())
+                else {
+                    return self.dependency_failed(job, "invalid_policy_response", send);
+                };
+                if admission.validate_for(&request).is_err() {
+                    return self.dependency_failed(job, "invalid_policy_response", send);
+                }
+                let Ok(overrides) = serde_json::from_value::<ApplicationConfigOverrides>(
+                    admission.config_overrides.clone(),
+                ) else {
+                    return self.dependency_failed(job, "invalid_policy_response", send);
+                };
+                if overrides.validate().is_err() {
+                    return self.dependency_failed(job, "invalid_policy_response", send);
+                }
+                let display_settings = match admission.application_display_settings.clone() {
+                    None => None,
+                    Some(value) => {
+                        match serde_json::from_value::<ApplicationDisplaySettings>(value) {
+                            Ok(settings) if settings.validate().is_ok() => Some(settings),
+                            _ => {
+                                return self.dependency_failed(
+                                    job,
+                                    "invalid_policy_response",
+                                    send,
+                                );
+                            }
+                        }
+                    }
+                };
+                let Some(target) = record.target.as_mut() else {
+                    return self.dependency_failed(job, "invalid_policy_response", send);
+                };
+                let revision = match crate::library::apply_policy_with_global(
+                    selection,
+                    target,
+                    serde_json::json!({"ok":true,"policy":admission.policy}),
+                    &record.global_preparation,
+                    &record.legacy_global_preparation,
+                    !admission.exclude_global_preparation,
+                ) {
+                    Ok(revision) => revision,
+                    Err(code) => return self.dependency_failed(job, code, send),
+                };
+                record.cleanup_budget_ms = u64::try_from(cleanup_budget(Some(target)).as_millis())
+                    .map_err(|_| "cleanup budget exceeds protocol range")?;
+                let snapshot_id = match random_display_admission_token() {
+                    Ok(id) => id,
+                    Err(code) => return self.dependency_failed(job, code, send),
+                };
+                record.library_policy_identity = Some(
+                    amaterasu_module_sdk::application_library::preflight::PolicyIdentity::Library {
+                        version: 1,
+                        application: selection.application.clone(),
+                        entry_revision: selection.revision.clone(),
+                        policy_revision: revision.clone(),
+                        policy_source: record.streaming_policy_source.clone(),
+                        snapshot_id,
+                    },
+                );
+                record.library_policy_revision = Some(revision);
+                record.application_display_overrides = overrides.display_overrides();
+                record.config_overrides = Some(overrides);
+                record.application_display_settings = display_settings;
+                record.streaming_policy_admission = Some(payload["admission"].clone());
+                record.preflight_deadline = Some(Instant::now() + Duration::from_secs(120));
+                record.preflight_ready = true;
+                let response = record.library_preflight_response();
+                return complete(
+                    send,
+                    job.request.expect("streaming preflight request"),
+                    response,
+                );
             }
             Step::LibraryPolicy => {
                 let Some(selection) = record.library_selection.as_ref() else {
@@ -1650,6 +2123,7 @@ impl Pipeline {
                         application: selection.application.clone(),
                         entry_revision: selection.revision.clone(),
                         policy_revision: revision.clone(),
+                        policy_source: None,
                         snapshot_id,
                     },
                 );

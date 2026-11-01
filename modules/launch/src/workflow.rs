@@ -13,6 +13,9 @@ pub enum Step {
     Catalog,
     Library,
     LibraryPolicy,
+    StreamingPolicy,
+    RevalidateLibrary,
+    RevalidateStreamingPolicy,
     LutrisStatus,
     LutrisPreSpawn,
     CreateSession,
@@ -124,7 +127,7 @@ impl Workflow {
                 };
                 (CATALOG, json!({"action":action,"id":record.app_id}))
             }
-            Step::Library => {
+            Step::Library | Step::RevalidateLibrary => {
                 let selection = record
                     .library_selection
                     .as_ref()
@@ -147,6 +150,25 @@ impl Workflow {
                 (
                     service,
                     json!({"action":"resolve","application":selection.application,"entry_revision":selection.revision}),
+                )
+            }
+            Step::StreamingPolicy | Step::RevalidateStreamingPolicy => {
+                let selection = record
+                    .library_selection
+                    .as_ref()
+                    .ok_or("invalid_workflow")?;
+                let service = record
+                    .streaming_policy_service
+                    .as_deref()
+                    .ok_or("invalid_workflow")?;
+                let certificate_id = record
+                    .streaming_certificate_id
+                    .as_deref()
+                    .ok_or("invalid_workflow")?;
+                (
+                    service,
+                    json!({"action":"admit", "application":selection.application,
+                    "entry_revision":selection.revision, "certificate_id":certificate_id}),
                 )
             }
             Step::LutrisStatus | Step::LutrisPreSpawn => (LUTRIS, json!({"action":"status"})),

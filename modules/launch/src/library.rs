@@ -15,6 +15,11 @@ pub struct Route {
     /// Optional independently selected private policy resolver.
     #[serde(default)]
     pub policy_service: Option<String>,
+    /// Authenticated streaming admission, selected independently of /1 policy.
+    #[serde(default)]
+    pub streaming_policy_service: Option<String>,
+    #[serde(default)]
+    pub streaming_policy_source: Option<String>,
     /// Policies are selected by the library-local application ID, never by an
     /// executor response. They are supplied by trusted startup composition.
     #[serde(default)]
@@ -69,6 +74,24 @@ pub fn validate_routes(routes: &BTreeMap<String, Route>) -> Result<(), &'static 
                         || route.executors.values().any(|executor| executor == service)
                         || !route.application_policies.is_empty()
                 })
+                || route.streaming_policy_service.is_some()
+                    != route.streaming_policy_source.is_some()
+                || (route.streaming_policy_service.is_some()
+                    && !route.application_policies.is_empty())
+                || route
+                    .streaming_policy_source
+                    .as_ref()
+                    .is_some_and(|source| !key(source))
+                || route
+                    .streaming_policy_service
+                    .as_ref()
+                    .is_some_and(|service| {
+                        service.strip_suffix("/2").is_none_or(|name| !key(name))
+                            || service == &route.service
+                            || service
+                                == amaterasu_module_sdk::application_library::preflight::SERVICE
+                            || route.executors.values().any(|executor| executor == service)
+                    })
                 || route.application_policies.iter().any(|(id, policy)| {
                     ApplicationReference {
                         library: name.clone(),
@@ -122,15 +145,23 @@ pub fn decode(
         let request: amaterasu_module_sdk::application_library::preflight::Request =
             serde_json::from_value(payload).map_err(|_| "invalid_request")?;
         request.validate()?;
-        let amaterasu_module_sdk::application_library::preflight::Request::Prepare {
-            operation_id,
-            application,
-            entry_revision,
-        } = request;
-        return Ok(Operation::PreflightLibrary {
-            operation_id,
-            application,
-            revision: entry_revision,
+        return Ok(match request {
+            amaterasu_module_sdk::application_library::preflight::Request::Prepare {
+                operation_id, application, entry_revision,
+            } => Operation::PreflightLibrary { operation_id, application, revision: entry_revision },
+            amaterasu_module_sdk::application_library::preflight::Request::PrepareStreaming {
+                operation_id, application, entry_revision, certificate_id,
+                global_preparation, legacy_global_preparation,
+            } => {
+                crate::protocol::validate_preparation(&global_preparation)?;
+                crate::protocol::validate_legacy_preparation(&legacy_global_preparation)?;
+                Operation::PreflightStreamingLibrary { operation_id, application, revision: entry_revision,
+                    certificate_id, global_preparation, legacy_global_preparation }
+            },
+            request @ amaterasu_module_sdk::application_library::preflight::Request::AdmitStreaming { .. } =>
+                Operation::AdmitStreamingLibrary { request },
+            request @ amaterasu_module_sdk::application_library::preflight::Request::AcceptStreaming { .. } =>
+                Operation::AcceptStreamingLibrary { request },
         });
     }
     if service != v2::LAUNCH_SERVICE {
@@ -233,6 +264,18 @@ pub fn apply_policy(
     target: &mut crate::protocol::LaunchTarget,
     payload: Value,
 ) -> Result<String, &'static str> {
+    apply_policy_with_global(selection, target, payload, &[], &[], false)
+}
+
+/// Merge the trusted, frozen global plan before the selected application plan.
+pub fn apply_policy_with_global(
+    selection: &Selection,
+    target: &mut crate::protocol::LaunchTarget,
+    payload: Value,
+    global: &[crate::protocol::PreparationStep],
+    legacy_global: &[crate::protocol::LegacyPreparationCommand],
+    include_global: bool,
+) -> Result<String, &'static str> {
     use amaterasu_module_sdk::application_library::policy::{
         MAX_POLICY_BYTES, Request, ResolveAction, Snapshot,
     };
@@ -278,11 +321,11 @@ pub fn apply_policy(
         .map(crate::protocol::PlannedPreparationStep::Structured)
         .collect();
     *preparation = crate::protocol::merge_preparation_plan(
-        &[],
-        &[],
+        global,
+        legacy_global,
         steps,
         vec![],
-        false,
+        include_global,
         reply.policy.working_directory.as_deref(),
     )?;
     *working_directory = reply.policy.working_directory;
@@ -312,6 +355,8 @@ mod tests {
             callers: ["consumer".into()].into(),
             executors: BTreeMap::from([("runner".into(), "selected.executor/1".into())]),
             policy_service: None,
+            streaming_policy_service: None,
+            streaming_policy_source: None,
             application_policies: BTreeMap::new(),
             require_application_policy: false,
         }

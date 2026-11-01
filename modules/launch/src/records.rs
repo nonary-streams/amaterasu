@@ -73,8 +73,20 @@ pub struct Record {
     pub library_policy_service: Option<String>,
     #[serde(skip)]
     pub library_policy_revision: Option<String>,
-    /// Immutable source-qualified identity; it is not an authorization token.
     #[serde(skip)]
+    pub streaming_certificate_id: Option<String>,
+    #[serde(skip)]
+    pub streaming_policy_service: Option<String>,
+    #[serde(skip)]
+    pub streaming_policy_source: Option<String>,
+    #[serde(skip)]
+    pub streaming_policy_admission: Option<Value>,
+    #[serde(skip)]
+    pub resolved_library_payload: Option<Value>,
+    #[serde(skip)]
+    pub streaming_policy_accepted: bool,
+    /// Immutable source-qualified identity; it is not an authorization token.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub library_policy_identity:
         Option<amaterasu_module_sdk::application_library::preflight::PolicyIdentity>,
     #[serde(skip)]
@@ -158,7 +170,7 @@ impl Record {
     pub fn validate_library_policy_identity(&self) -> Result<(), &'static str> {
         use amaterasu_module_sdk::application_library::preflight::PolicyIdentity;
         if self.catalog_selection != CatalogSelection::Library
-            || self.library_policy_service.is_none()
+            || (self.library_policy_service.is_none() && self.streaming_policy_service.is_none())
         {
             return Ok(());
         }
@@ -170,6 +182,7 @@ impl Record {
                 application,
                 entry_revision,
                 policy_revision,
+                policy_source,
                 ..
             },
         ) = &self.library_policy_identity
@@ -180,6 +193,7 @@ impl Record {
             || application != &selection.application
             || entry_revision != &selection.revision
             || Some(policy_revision.as_str()) != self.library_policy_revision.as_deref()
+            || policy_source.as_deref() != self.streaming_policy_source.as_deref()
         {
             return Err("policy_identity_mismatch");
         }
@@ -190,9 +204,18 @@ impl Record {
         json!({"ok":true,"launch":self})
     }
     pub fn library_preflight_response(&self) -> Value {
-        json!({"ok":true,"preflight_token":self.preflight_token,
-            "policy_identity":self.library_policy_identity,"admission_capable":false,
-            "reason":"display_and_rtsp_preflight_unavailable"})
+        if self.streaming_policy_admission.is_some() {
+            json!({"ok":true,"preflight_token":self.preflight_token,
+                "policy_identity":self.library_policy_identity,"admission_capable":true,
+                "config_overrides":self.config_overrides.clone().unwrap_or_default(),
+                "application_display_overrides":self.application_display_overrides,
+                "application_display_settings":self.application_display_settings,
+                "executable_path":self.executable_path,"cleanup_budget_ms":self.cleanup_budget_ms})
+        } else {
+            json!({"ok":true,"preflight_token":self.preflight_token,
+                "policy_identity":self.library_policy_identity,"admission_capable":false,
+                "reason":"display_and_rtsp_preflight_unavailable"})
+        }
     }
     pub fn preflight_response(&self) -> Value {
         json!({"ok":true,"preflight_token":self.preflight_token,"app_id":self.app_id,"catalog_revision":self.catalog_revision,"config_overrides":self.config_overrides.clone().unwrap_or_default(),"application_display_overrides":self.application_display_overrides,"application_display_settings":self.application_display_settings,"executable_path":self.executable_path,"cleanup_budget_ms":self.cleanup_budget_ms})
@@ -344,6 +367,12 @@ impl Records {
                 generic_provider_service: None,
                 library_policy_service: None,
                 library_policy_revision: None,
+                streaming_certificate_id: None,
+                streaming_policy_service: None,
+                streaming_policy_source: None,
+                streaming_policy_admission: None,
+                resolved_library_payload: None,
+                streaming_policy_accepted: false,
                 library_policy_identity: None,
                 generic_provider_incarnation: None,
                 config_overrides: None,

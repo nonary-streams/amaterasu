@@ -742,8 +742,17 @@ impl Open {
             serde_json::to_vec(intent).ok()?
         } else if let Some(request) = &self.display_request {
             serde_json::to_vec(request).ok()?
+        } else if let Some(settings) = &self.application_display_settings {
+            serde_json::to_vec(settings).ok()?
+        } else if matches!(
+            self.policy_identity,
+            Some(
+                amaterasu_module_sdk::application_library::preflight::PolicyIdentity::Library { .. }
+            )
+        ) {
+            serde_json::to_vec(self.display_policy_snapshot.as_ref()?).ok()?
         } else {
-            serde_json::to_vec(self.application_display_settings.as_ref()?).ok()?
+            return None;
         };
         let digest = Sha256::digest(bytes);
         Some(digest.iter().map(|byte| format!("{byte:02x}")).collect())
@@ -753,15 +762,39 @@ impl Open {
         self.display_request.is_some()
             || self.virtual_display_intent.is_some()
             || self.application_display_settings.is_some()
+            || matches!(
+                self.policy_identity,
+                Some(
+                    amaterasu_module_sdk::application_library::preflight::PolicyIdentity::Library { .. }
+                )
+            )
     }
 
     pub fn validate(&self, allow_remote: bool) -> Result<[u8; 16], &'static str> {
+        use amaterasu_module_sdk::application_library::preflight::PolicyIdentity;
         if let Some(identity) = &self.policy_identity {
-            use amaterasu_module_sdk::application_library::preflight::PolicyIdentity;
-            if identity.validate().is_err()
-                || !matches!(identity, PolicyIdentity::Catalog { version: 1, revision }
-                    if Some(*revision) == self.catalog_revision)
-            {
+            let consistent = match identity {
+                PolicyIdentity::Catalog {
+                    version: 1,
+                    revision,
+                } => Some(*revision) == self.catalog_revision,
+                PolicyIdentity::Library {
+                    policy_source: Some(_),
+                    ..
+                } => {
+                    self.catalog_revision.is_none()
+                        && self.frame_limiter_settings.is_none()
+                        && self
+                            .display_policy_snapshot
+                            .as_ref()
+                            .is_some_and(|snapshot| {
+                                snapshot.get("policy_identity")
+                                    == Some(&serde_json::json!(identity))
+                            })
+                }
+                _ => false,
+            };
+            if identity.validate().is_err() || !consistent {
                 return Err("invalid_policy_identity");
             }
         }
@@ -788,7 +821,11 @@ impl Open {
                         .is_some_and(|snapshot| {
                             snapshot["catalog_revision"].as_u64() == Some(revision)
                         }) => {}
-            (None, None, None) => {}
+            (None, Some(app_id), None)
+                if self.display_admission_required()
+                    && valid_name(app_id)
+                    && matches!(self.policy_identity, Some(PolicyIdentity::Library { .. })) => {}
+            (None, None, None) if self.policy_identity.is_none() => {}
             _ => return Err("frame_limiter_unattested"),
         }
         if self.frame_limiter_settings.is_some()
@@ -1507,6 +1544,7 @@ fn application_display_settings_match_snapshot(open: &Open, snapshot: &serde_jso
 }
 
 fn valid_display_policy_snapshot(snapshot: &serde_json::Value) -> bool {
+    use amaterasu_module_sdk::application_library::preflight::PolicyIdentity;
     let Some(fields) = snapshot.as_object() else {
         return false;
     };
@@ -1544,6 +1582,7 @@ fn valid_display_policy_snapshot(snapshot: &serde_json::Value) -> bool {
                 "global_revision"
                     | "global_overrides"
                     | "catalog_revision"
+                    | "policy_identity"
                     | "certificate_id"
                     | "application_overrides"
                     | "client_overrides"
@@ -1557,7 +1596,23 @@ fn valid_display_policy_snapshot(snapshot: &serde_json::Value) -> bool {
                 .get("global_revision")
                 .is_none_or(|revision| !revision.is_null() && !revision.is_u64())
                 || !snapshot["global_overrides"].is_object()))
-        || snapshot["catalog_revision"].as_u64().is_none()
+        || !match (
+            snapshot.get("catalog_revision"),
+            snapshot.get("policy_identity"),
+        ) {
+            (Some(revision), None) => revision.as_u64().is_some(),
+            (None, Some(value)) => serde_json::from_value::<PolicyIdentity>(value.clone())
+                .is_ok_and(|identity| {
+                    matches!(
+                        identity,
+                        PolicyIdentity::Library {
+                            policy_source: Some(_),
+                            ..
+                        }
+                    ) && identity.validate().is_ok()
+                }),
+            _ => false,
+        }
         || certificate_id.len() != 64
         || !certificate_id.bytes().all(|byte| byte.is_ascii_hexdigit())
         || application

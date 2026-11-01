@@ -25,6 +25,35 @@ struct ScopeRequest {
     input_boot_epoch: Option<String>,
 }
 
+/// A source-qualified application may only be introduced by the paired-TLS
+/// coordinator after its Launch admission. The string scope is a stable lookup
+/// key, while the frozen tagged identity remains bound to the session record.
+pub(super) fn valid_selected_application_ref(value: &Value) -> bool {
+    use amaterasu_module_sdk::application_library::preflight::{
+        PolicyIdentity, application_scope_id,
+    };
+    let Some(identity) = value.get("policy_identity") else {
+        return true;
+    };
+    let Ok(identity) = serde_json::from_value::<PolicyIdentity>(identity.clone()) else {
+        return false;
+    };
+    if identity.validate().is_err() {
+        return false;
+    }
+    match identity {
+        PolicyIdentity::Library {
+            application,
+            policy_source: Some(_),
+            ..
+        } => {
+            value["kind"] == "application"
+                && application_scope_id(&application).ok().as_deref() == value["app_id"].as_str()
+        }
+        _ => false,
+    }
+}
+
 impl Coordinator {
     /// Registry attests source using the parent broker request, never end-user
     /// JSON. The registry's broker identity must be selected by installed policy.
@@ -127,11 +156,37 @@ impl Coordinator {
                 if session.application_ref.get("kind").and_then(Value::as_str)
                     == Some("application") =>
             {
-                session
+                let app_id = session
                     .application_ref
                     .get("app_id")
                     .and_then(Value::as_str)
-                    .filter(|id| valid_id(id))
+                    .filter(|id| valid_id(id));
+                if let Some(value) = session.application_ref.get("policy_identity") {
+                    use amaterasu_module_sdk::application_library::preflight::{
+                        PolicyIdentity, application_scope_id,
+                    };
+                    let identity = serde_json::from_value::<PolicyIdentity>(value.clone()).ok();
+                    match identity {
+                        Some(
+                            identity @ PolicyIdentity::Library {
+                                policy_source: Some(_),
+                                ..
+                            },
+                        ) if identity.validate().is_ok() => {
+                            let PolicyIdentity::Library { application, .. } = identity else {
+                                unreachable!()
+                            };
+                            if application_scope_id(&application).ok().as_deref() == app_id {
+                                app_id
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                } else {
+                    app_id
+                }
             }
             _ => None,
         };
@@ -227,6 +282,59 @@ mod tests {
             coordinator.resolve_settings_scope("registry", wrong)["status"],
             "rejected"
         );
+        let application = amaterasu_module_sdk::application_library::v2::ApplicationReference {
+            library: "games".into(),
+            id: "opaque/game".into(),
+        };
+        let scope = amaterasu_module_sdk::application_library::preflight::application_scope_id(
+            &application,
+        )
+        .unwrap();
+        let identity = json!({"source":"library","version":1,"application":application,
+            "entry_revision":"entry:opaque","policy_revision":"policy:opaque",
+            "policy_source":"primary","snapshot_id":"snapshot"});
+        coordinator
+            .shared
+            .borrow_mut()
+            .value
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .application_ref =
+            json!({"kind":"application","app_id":scope,"policy_identity":identity});
+        let mut selected_request = request.clone();
+        selected_request["scope_id"] = json!(scope);
+        assert_eq!(
+            coordinator.resolve_settings_scope("registry", selected_request.clone())["status"],
+            "succeeded"
+        );
+        selected_request["scope_id"] = json!("app");
+        assert_eq!(
+            coordinator.resolve_settings_scope("registry", selected_request)["status"],
+            "rejected"
+        );
+        coordinator
+            .shared
+            .borrow_mut()
+            .value
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .application_ref["policy_identity"]["application"]["id"] = json!("other");
+        let mut mismatched = request.clone();
+        mismatched["scope_id"] = json!(scope);
+        assert_eq!(
+            coordinator.resolve_settings_scope("registry", mismatched)["status"],
+            "rejected"
+        );
+        coordinator
+            .shared
+            .borrow_mut()
+            .value
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .application_ref = json!({"kind":"application","app_id":"app"});
         let mut delegate = request;
         delegate["source"] = json!({"caller":"delegate","initiator":"delegate"});
         delegate["scope"] = json!("session");

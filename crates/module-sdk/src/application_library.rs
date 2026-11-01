@@ -424,6 +424,8 @@ pub mod preflight;
 /// Adapter for a broker-registered provider service. Host-side routing and
 /// lifecycle ownership remain separate responsibilities.
 pub mod provider_adapter;
+/// Authenticated-client admission for an independently selected streaming policy.
+pub mod streaming_policy;
 
 /// Incarnation-bound lifecycle requests and retirement assertions.
 pub mod provider_lifecycle;
