@@ -477,7 +477,7 @@ fn profile() -> VideoProfile {
     serde_json::from_value(json!({"codec":{"namespace_id":42,"value":9,"schema":1},
         "framing":{"namespace_id":42,"value":10,"schema":1},"wire_selector":9,"payload_type":99,"encoding_name":"TEST9"})).unwrap()
 }
-fn prepare(fixture: &mut Fixture, video_port: u16, audio_port: u16) -> Value {
+fn prepare(fixture: &mut Fixture, video_port: u16, audio_port: u16, hdr: bool) -> Value {
     let parsed = amaterasu_gamestream::sdp::parse_profile_announce(
         announcement().as_bytes(),
         &VideoProfileSnapshot {
@@ -489,12 +489,18 @@ fn prepare(fixture: &mut Fixture, video_port: u16, audio_port: u16) -> Value {
         "peer_ip":"127.0.0.1","video_port":video_port,"audio_port":audio_port,
         "key_hex":"00112233445566778899aabbccddeeff","key_id":1,"connect_data":2,"stream_audio":false,
         "capture":{"capture_provider":"dxgi","output":"display","encoder":0,"audio_endpoint":"default"},
-        "profile":{"width":parsed.video.width,"height":parsed.video.height,"fps":parsed.video.fps,
+        "profile":{"hdr":hdr,"width":parsed.video.width,"height":parsed.video.height,"fps":parsed.video.fps,
             "bitrate_kbps":parsed.video.bitrate_kbps,"max_reference_frames":0,"packet_size":1024,
             "fec_percentage":0,"min_parity_shards":0,"max_fec_blocks":1,"packet_ms":parsed.audio.packet_duration_ms,
             "encrypt_video":false,"encrypt_audio":false}}))
 }
-fn exchange(fixture: &mut Fixture, offer_expected: bool, do_play: bool, wrong_selector: bool) {
+fn exchange(
+    fixture: &mut Fixture,
+    offer_expected: bool,
+    do_play: bool,
+    wrong_selector: bool,
+    hdr: bool,
+) {
     let video_peer = UdpSocket::bind("127.0.0.1:0").unwrap();
     let audio_peer = UdpSocket::bind("127.0.0.1:0").unwrap();
     video_peer.set_nonblocking(true).unwrap();
@@ -508,6 +514,7 @@ fn exchange(fixture: &mut Fixture, offer_expected: bool, do_play: bool, wrong_se
         fixture,
         video_peer.local_addr().unwrap().port(),
         audio_peer.local_addr().unwrap().port(),
+        hdr,
     );
     assert_eq!(prepared["state"], "ready", "{prepared}");
     let url = prepared["rtsp_url"].as_str().unwrap().to_owned();
@@ -547,7 +554,7 @@ fn exchange(fixture: &mut Fixture, offer_expected: bool, do_play: bool, wrong_se
         offer_expected,
         "{describe}"
     );
-    if !do_play {
+    if !do_play && !hdr {
         let closed = fixture.request(
             RTSP,
             "close-mismatch",
@@ -584,7 +591,12 @@ fn exchange(fixture: &mut Fixture, offer_expected: bool, do_play: bool, wrong_se
                 .to_owned();
         }
     }
-    let body = if wrong_selector {
+    let body = if hdr {
+        announcement().replace(
+            "x-nv-video[0].dynamicRangeMode:0",
+            "x-nv-video[0].dynamicRangeMode:1",
+        )
+    } else if wrong_selector {
         announcement().replace(
             "x-nv-vqos[0].bitStreamFormat:9",
             "x-nv-vqos[0].bitStreamFormat:10",
@@ -596,7 +608,7 @@ fn exchange(fixture: &mut Fixture, offer_expected: bool, do_play: bool, wrong_se
         "ANNOUNCE streamid=control/13/0 RTSP/1.0\r\nCSeq: 6\r\nSession: {token}\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
-    if wrong_selector {
+    if wrong_selector || hdr {
         let rejected = fixture.transaction(&address, &mut sealer, &mut opener, announce_request);
         assert!(rejected.starts_with("RTSP/1.0 406"), "{rejected}");
         assert_eq!(fixture.opened_encoders, 0);
@@ -684,11 +696,11 @@ fn exchange(fixture: &mut Fixture, offer_expected: bool, do_play: bool, wrong_se
 fn managed_rtsp_negotiates_the_real_session_route() {
     for marker in [1, 2] {
         let mut host = fixture(marker, "source", "TEST9");
-        exchange(&mut host, true, true, false);
+        exchange(&mut host, true, true, false, false);
     }
     {
         let mut host = fixture(1, "source", "TEST9");
-        exchange(&mut host, true, true, true);
+        exchange(&mut host, true, true, true, false);
     }
     for (encoder, wire_name) in [
         ("sibling", "TEST9"),
@@ -696,9 +708,22 @@ fn managed_rtsp_negotiates_the_real_session_route() {
         ("source", "PAYLOAD"),
     ] {
         let mut host = fixture(1, encoder, wire_name);
-        exchange(&mut host, false, false, false);
+        exchange(&mut host, false, false, false, false);
         assert_eq!(host.opened_encoders, 0);
         assert_eq!(host.probes[0]["encoder"]["clsid"], encoder);
+    }
+}
+
+#[test]
+#[ignore = "requires two separately built native fixture provider artifacts"]
+fn managed_rtsp_withholds_unsupported_hdr_metadata_route() {
+    for marker in [1, 2] {
+        let mut host = fixture(marker, "source", "TEST9");
+        exchange(&mut host, false, false, false, true);
+        // The session never probes or opens the source, because this profile
+        // cannot negotiate or carry frame-associated HDR metadata yet.
+        assert!(host.probes.is_empty());
+        assert_eq!(host.opened_encoders, 0);
     }
 }
 

@@ -349,6 +349,9 @@ mod tests {
         selection.base.version = 1;
         check_rejected(&selection);
         selection = exact;
+        selection.base.metadata_required = 1;
+        check_rejected(&selection);
+        selection = exact;
         selection.base.offer_id = 5;
         assert_eq!(
             unsafe {
