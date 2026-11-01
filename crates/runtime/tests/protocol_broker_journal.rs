@@ -1615,6 +1615,22 @@ fn canonical_slot_issue_binds_selected_provider_and_survives_lost_reply() {
         broker_epoch: "e".repeat(32),
         token: "f".repeat(32),
     };
+    // Legacy effects remain decodable, but lack the approval binding required
+    // for a new canonical issuance and must not reach broker selection.
+    let mut legacy = serde_json::to_value(&pending).unwrap();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("action_approval_sha256");
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("cleanup_approval_sha256");
+    let legacy = serde_json::from_value(legacy).unwrap();
+    assert!(matches!(SelectedSlotAction::query(
+        SlotActionRequest { pending: legacy, issuer: &issuer, scope: scope.clone(), lease: lease.clone(), route: &route, sequence: 1, payload: b"hello" },
+        |_| panic!("legacy effect reached broker selection")
+    ), Err(error) if error == "effect_identity_mismatch"));
     let action = SelectedSlotAction::query(
         SlotActionRequest {
             pending: pending.clone(),

@@ -5670,6 +5670,7 @@ fn broker_protocol_attestation_requires_paired_source_and_exact_client_grant() {
         "context":{"authority_epoch":epoch,"effect_owner_epoch":"owner","target":{"kind":"stream","host_epoch":source["host_epoch"],
             "session_id":source["session_id"],"stream_id":source["stream_id"],"generation":source["stream_generation"]},"peer_ref":source["id"]},
         "message_type":21818,"capability":"example.control/1","provider":"provider","method":method,"cleanup":cleanup,
+        "action_approval_sha256":"a".repeat(64),"cleanup_approval_sha256":"b".repeat(64),
         "payload_sha256":"c".repeat(64),"timeout_ms":1000,"parent":null});
     let request = json!({"action":"admit_protocol_effect","version":1,"epoch":epoch,"source":source,"effect":effect});
     let mut forged_issuer = request.clone();
@@ -5976,6 +5977,7 @@ fn real_state_pairing_and_broker_keep_protocol_admission_closed_across_restart()
         "context":{"authority_epoch":epoch,"effect_owner_epoch":"owner","target":{"kind":"stream","host_epoch":source["host_epoch"],
             "session_id":source["session_id"],"stream_id":source["stream_id"],"generation":source["stream_generation"]},"peer_ref":source["id"]},
         "message_type":21818,"capability":"example.control/1","provider":"provider","method":method,"cleanup":cleanup,
+        "action_approval_sha256":"a".repeat(64),"cleanup_approval_sha256":"b".repeat(64),
         "payload_sha256":"c".repeat(64),"timeout_ms":1000,"parent":null});
     let request = json!({"action":"admit_protocol_effect","version":1,"epoch":epoch,"source":source,"effect":effect});
     assert_eq!(

@@ -95,7 +95,9 @@ pub struct PendingEffect {
     pub method: MethodRef,
     pub cleanup: MethodRef,
     /// Fingerprints of exact trusted startup approvals, including their schemas.
+    #[serde(default)]
     pub action_approval_sha256: String,
+    #[serde(default)]
     pub cleanup_approval_sha256: String,
     /// Digest only; the obligation does not retain the message body.
     pub payload_sha256: String,
