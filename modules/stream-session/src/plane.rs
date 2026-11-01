@@ -246,7 +246,7 @@ impl Plane {
 
 // These are local contract identities, not client wire-negotiation tokens.
 // The protocol adapter must establish the offered intersection before install.
-fn feedback_scope(
+pub(super) fn feedback_scope(
     feedback: &HostFeedback,
 ) -> (u16, amaterasu_module_sdk::input::extensions::Capability) {
     use amaterasu_module_sdk::input::extensions::{Capability, Direction};

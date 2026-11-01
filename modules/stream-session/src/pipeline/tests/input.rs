@@ -1590,3 +1590,42 @@ fn malformed_keybindings_start_cannot_acquire_an_input_lease() {
         }));
     }
 }
+
+#[test]
+fn feedback_device_incarnations_are_consumed_and_stale_generation_fails_closed() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    let id = host.response_from(1, "amaterasu.rtsp", prepare())["session"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        host.response_from(2, "amaterasu.rtsp", start(id))["state"],
+        "active"
+    );
+    let rumble = |sequence: u64, generation: u64| {
+        json!({"sequence":sequence,"device_generation":generation,"device_capabilities":0,
+        "feedback":{"type":"rumble","controller":2,"low_frequency":0,"high_frequency":0}})
+    };
+    host.broker.input_feedback_events.push_back(rumble(1, 1));
+    host.broker.input_feedback_events.push_back(rumble(2, 2));
+    host.idle();
+    assert_eq!(
+        host.pipeline.records[&id]
+            .feedback_device_observations
+            .get(&2),
+        Some(&(2, 0))
+    );
+    assert_eq!(host.broker.input_feedback_acks, vec![2]);
+    let delivered = host.plane.borrow().feedback.len();
+    host.broker.input_feedback_events.push_back(rumble(3, 1));
+    host.idle();
+    assert_eq!(host.plane.borrow().feedback.len(), delivered);
+    assert_eq!(
+        host.pipeline.records[&id].error,
+        Some("stale_feedback_device")
+    );
+}

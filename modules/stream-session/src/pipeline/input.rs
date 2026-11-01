@@ -77,9 +77,9 @@ pub(super) fn accept_feedback_peek(
             .client_feature_flags
             .is_some_and(|flags| flags & amaterasu_gamestream::sdp::CLIENT_FEATURE_HAPTICS_PCM != 0)
     });
-    let Some(plane) = record.plane.as_mut() else {
+    if record.plane.is_none() {
         return Err("feedback_plane_unavailable");
-    };
+    }
     let mut last_accepted = None;
     let mut previous = 0;
     for event in events {
@@ -96,14 +96,30 @@ pub(super) fn accept_feedback_peek(
         )
         .map_err(|_| "invalid_feedback_response")?;
         previous = sequence;
+        let device = feedback_device_metadata(record, event, &feedback)?;
 
         if matches!(&feedback, HostFeedback::HapticsPcm { .. }) && !pcm_enabled {
+            if let Some((slot, generation, capabilities)) = device {
+                record
+                    .feedback_device_observations
+                    .insert(slot, (generation, capabilities));
+            }
             last_accepted = Some(sequence);
             continue;
         }
-        match plane.enqueue_feedback(feedback) {
+        match record
+            .plane
+            .as_mut()
+            .expect("feedback plane exists")
+            .enqueue_feedback(feedback)
+        {
             Ok(crate::plane::FeedbackEnqueueOutcome::Queued)
             | Ok(crate::plane::FeedbackEnqueueOutcome::DroppedBestEffort) => {
+                if let Some((slot, generation, capabilities)) = device {
+                    record
+                        .feedback_device_observations
+                        .insert(slot, (generation, capabilities));
+                }
                 last_accepted = Some(sequence);
             }
             Err(crate::plane::FeedbackEnqueueError::QueueFull) => break,
@@ -120,6 +136,43 @@ pub(super) fn accept_feedback_peek(
         record.feedback_poll_at = now.saturating_add(FEEDBACK_POLL_INTERVAL_MS);
         Ok(None)
     }
+}
+
+/// This only tracks monotonic input-provider observations. It does not admit a
+/// source or replace a pairing fence for an already queued transport message.
+fn feedback_device_metadata(
+    record: &Record,
+    event: &Value,
+    feedback: &HostFeedback,
+) -> Result<Option<(u16, u64, u32)>, &'static str> {
+    let generation = event.get("device_generation");
+    let capabilities = event.get("device_capabilities");
+    if generation.is_none()
+        && capabilities.is_none()
+        && record.feedback_device_observations.is_empty()
+    {
+        return Ok(None);
+    }
+    let generation = generation
+        .and_then(Value::as_u64)
+        .filter(|value| *value != 0)
+        .ok_or("invalid_feedback_device")?;
+    let capabilities = capabilities
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or("invalid_feedback_device")?;
+    let (slot, _) = crate::plane::feedback_scope(feedback);
+    if slot >= MAX_CONTROLLER_SLOT {
+        return Err("invalid_feedback_device");
+    }
+    if let Some((current_generation, current_capabilities)) =
+        record.feedback_device_observations.get(&slot)
+        && (generation < *current_generation
+            || (generation == *current_generation && capabilities != *current_capabilities))
+    {
+        return Err("stale_feedback_device");
+    }
+    Ok(Some((slot, generation, capabilities)))
 }
 
 pub(super) fn accept_feedback_ack(
@@ -485,6 +538,7 @@ pub(super) fn clear_input(record: &mut Record) {
     record.input_renew_at = 0;
     record.feedback_poll_at = 0;
     record.feedback_ack_through = None;
+    record.feedback_device_observations.clear();
     record.input_absolute_pointer = false;
     record.input_controller_supported = false;
     record.client_haptics_requested = false;
