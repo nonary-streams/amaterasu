@@ -15,6 +15,10 @@ _Static_assert(sizeof(AmaterasuFrameDescriptor) == 40, "resource descriptor layo
 _Static_assert(sizeof(AmaterasuCaptureResourceOffer) == 144, "resource offer layout");
 _Static_assert(sizeof(AmaterasuCaptureResourceFrame) == 248, "resource frame layout");
 _Static_assert(sizeof(AmaterasuFrameResourceMetadataFrameV1) == 272, "metadata frame layout");
+_Static_assert(sizeof(AmaterasuFrameMetadataSchemaRuleV1) == 32, "metadata schema rule layout");
+_Static_assert(sizeof(AmaterasuFrameMetadataCaptureContextV1) == 600, "capture metadata context layout");
+_Static_assert(offsetof(AmaterasuFrameMetadataCaptureContextV1, schemas) == 88, "capture metadata schemas offset");
+_Static_assert(offsetof(AmaterasuCaptureApiV1_11, configure_frame_metadata) == sizeof(AmaterasuCaptureApiV1_10), "capture metadata setup tail offset");
 _Static_assert(sizeof(AmaterasuFrameMetadataSchemaId) == 24, "metadata schema layout");
 _Static_assert(sizeof(AmaterasuFrameMetadataCapabilityV1) == 32, "metadata capability layout");
 _Static_assert(sizeof(AmaterasuFrameMetadataCapabilitiesApiV1) == 40, "metadata capabilities table layout");

@@ -20,6 +20,89 @@ impl FrameMetadataContext {
             && self.clock_domain == identity.clock_domain
             && self.clock_epoch == identity.clock_epoch
     }
+    pub fn capture_setup(
+        self,
+        policy: &MetadataPolicy,
+        schemas: &[(crate::encode::FormatId, bool)],
+    ) -> Result<amaterasu_media::FrameMetadataCaptureContextV1, MetadataError> {
+        if !self.valid()
+            || policy.session_id != self.session_id
+            || policy.capability_generation == 0
+            || policy.stage != MetadataStage::Capture
+            || schemas.is_empty()
+            || schemas.len() > FRAME_METADATA_MAX_ITEMS
+        {
+            return Err(MetadataError::Invalid);
+        }
+        policy.validate(&FrameMetadataBundle {
+            identity: FrameMetadataIdentity {
+                session_id: self.session_id,
+                submission_id: 1,
+                source_id: self.source_id,
+                source_generation: self.source_generation,
+                config_generation: self.config_generation,
+                timestamp_us: 0,
+                clock_domain: self.clock_domain,
+                clock_epoch: self.clock_epoch,
+            },
+            owner: policy.owner,
+            items: Vec::new(),
+        })?;
+        let mut rules = [amaterasu_media::FrameMetadataSchemaRuleV1 {
+            schema: amaterasu_media::FrameMetadataSchemaId {
+                namespace_id: 0,
+                value: 0,
+                schema: 0,
+            },
+            flags: 0,
+            reserved: 0,
+        }; FRAME_METADATA_MAX_ITEMS];
+        let mut previous = None;
+        for (index, (schema, required)) in schemas.iter().enumerate() {
+            if !schema_valid(*schema)
+                || previous.is_some_and(|key| key >= schema_key(*schema))
+                || !policy.capabilities.iter().any(|capability| {
+                    capability.schema == *schema
+                        && capability.treatment == MetadataTreatment::Forward
+                })
+            {
+                return Err(MetadataError::Unsupported);
+            }
+            previous = Some(schema_key(*schema));
+            rules[index] = amaterasu_media::FrameMetadataSchemaRuleV1 {
+                schema: amaterasu_media::FrameMetadataSchemaId {
+                    namespace_id: schema.namespace_id,
+                    value: schema.value,
+                    schema: schema.schema,
+                },
+                flags: if *required {
+                    FRAME_METADATA_ITEM_REQUIRED
+                } else {
+                    0
+                },
+                reserved: 0,
+            };
+        }
+        Ok(amaterasu_media::FrameMetadataCaptureContextV1 {
+            size: std::mem::size_of::<amaterasu_media::FrameMetadataCaptureContextV1>() as u32,
+            version: 1,
+            session_id: self.session_id,
+            source_id: self.source_id,
+            source_generation: self.source_generation,
+            config_generation: self.config_generation,
+            capability_generation: policy.capability_generation,
+            clock: FrameClockMetadata {
+                version: 1,
+                size: std::mem::size_of::<FrameClockMetadata>() as u32,
+                domain: self.clock_domain,
+                reserved: 0,
+                epoch_id: self.clock_epoch,
+            },
+            owner: policy.owner.raw(),
+            schema_count: schemas.len() as u32,
+            schemas: rules,
+        })
+    }
     fn valid(self) -> bool {
         FrameMetadataIdentity {
             session_id: self.session_id,
@@ -166,6 +249,7 @@ pub struct FrameMetadataAdmission {
     context: FrameMetadataContext,
     policy: MetadataPolicy,
     max_bytes: usize,
+    required_schemas: Vec<crate::encode::FormatId>,
     last_retired: u64,
     pending: Option<PreparedFrameMetadata>,
     closed: bool,
@@ -176,6 +260,18 @@ impl FrameMetadataAdmission {
         context: FrameMetadataContext,
         policy: MetadataPolicy,
         max_bytes: usize,
+    ) -> Result<Self, MetadataError> {
+        Self::with_required_schemas(context, policy, max_bytes, &[])
+    }
+
+    /// The selected route may require particular schemas on every admitted
+    /// frame. The required bit in an untrusted envelope cannot replace this
+    /// host-owned selection; missing, downgraded or unknown schemas fail closed.
+    pub fn with_required_schemas(
+        context: FrameMetadataContext,
+        policy: MetadataPolicy,
+        max_bytes: usize,
+        required_schemas: &[crate::encode::FormatId],
     ) -> Result<Self, MetadataError> {
         if !context.valid() || max_bytes == 0 || max_bytes > 2 * FRAME_METADATA_MAX_BUNDLE_BYTES {
             return Err(MetadataError::Invalid);
@@ -195,10 +291,23 @@ impl FrameMetadataAdmission {
             items: Vec::new(),
         };
         policy.validate(&empty)?;
+        if required_schemas.len() > FRAME_METADATA_MAX_ITEMS
+            || required_schemas.iter().enumerate().any(|(index, schema)| {
+                !schema_valid(*schema)
+                    || required_schemas[..index].contains(schema)
+                    || !policy
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability.schema == *schema)
+            })
+        {
+            return Err(MetadataError::Unsupported);
+        }
         Ok(Self {
             context,
             policy,
             max_bytes,
+            required_schemas: required_schemas.to_vec(),
             last_retired: 0,
             pending: None,
             closed: false,
@@ -228,6 +337,14 @@ impl FrameMetadataAdmission {
         // SAFETY: caller guarantees wrapper and metadata storage remain live.
         let (mut bundle, dispositions) =
             unsafe { copy_frame_metadata(frame, expected, &self.policy) }?;
+        if self.required_schemas.iter().any(|schema| {
+            !bundle
+                .items
+                .iter()
+                .any(|item| item.schema == *schema && item.required)
+        }) {
+            return Err(MetadataError::Unsupported);
+        }
         // SAFETY: the caller guarantees initialized live bytes; decoding established a nonempty envelope.
         let source = unsafe { std::slice::from_raw_parts(frame.metadata.ptr, frame.metadata.len) };
         if let Some(pending) = &self.pending {

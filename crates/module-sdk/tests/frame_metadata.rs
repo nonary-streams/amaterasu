@@ -995,3 +995,115 @@ fn processor_transition_rejects_lost_or_changed_required_payload() {
         Ok(())
     );
 }
+
+#[test]
+fn selected_capture_context_and_required_schemas_are_host_owned() {
+    let capture = policy(
+        MetadataStage::Capture,
+        CarriageOwner::FramerInsert,
+        &[
+            (1, MetadataTreatment::Forward),
+            (2, MetadataTreatment::Forward),
+        ],
+        false,
+    );
+    let setup = context(identity())
+        .capture_setup(&capture, &[(schema(1), true), (schema(2), false)])
+        .unwrap();
+    assert_eq!(
+        (
+            setup.session_id,
+            setup.source_id,
+            setup.source_generation,
+            setup.config_generation
+        ),
+        (11, 13, 14, 15)
+    );
+    assert_eq!(setup.owner, FRAME_METADATA_OWNER_FRAMER);
+    assert!(setup.validate().is_ok());
+    let mut bad = setup;
+    bad.schemas[2].flags = FRAME_METADATA_ITEM_REQUIRED;
+    assert!(bad.validate().is_err());
+    bad = setup;
+    bad.clock.epoch_id = [0; 16];
+    assert!(bad.validate().is_err());
+    assert_eq!(setup.clock.epoch_id, [9; 16]);
+    assert_eq!(setup.schema_count, 2);
+    assert_eq!(setup.schemas[0].flags, FRAME_METADATA_ITEM_REQUIRED);
+    assert_eq!(setup.schemas[1].flags, 0);
+    assert_eq!(setup.schemas[2].schema.namespace_id, 0);
+    assert!(
+        context(identity())
+            .capture_setup(&capture, &[(schema(2), true), (schema(1), true)])
+            .is_err()
+    );
+    assert!(
+        context(identity())
+            .capture_setup(&capture, &[(schema(3), true)])
+            .is_err()
+    );
+    let wrong_stage = policy(
+        MetadataStage::Encoder,
+        CarriageOwner::FramerInsert,
+        &[(1, MetadataTreatment::Forward)],
+        false,
+    );
+    assert!(
+        context(identity())
+            .capture_setup(&wrong_stage, &[(schema(1), true)])
+            .is_err()
+    );
+
+    let encoder = policy(
+        MetadataStage::Encoder,
+        CarriageOwner::FramerInsert,
+        &[
+            (1, MetadataTreatment::Forward),
+            (2, MetadataTreatment::Forward),
+        ],
+        false,
+    );
+    let mut admission = FrameMetadataAdmission::with_required_schemas(
+        context(identity()),
+        encoder,
+        4096,
+        &[schema(1)],
+    )
+    .unwrap();
+    let mut missing = bundle();
+    missing.items.remove(0);
+    let bytes = missing.encode().unwrap();
+    assert_eq!(
+        unsafe { admission.prepare(&frame(&bytes, identity()), identity(), 1) },
+        Err(MetadataError::Unsupported)
+    );
+    let mut optional = bundle();
+    optional.items[0].required = false;
+    let bytes = optional.encode().unwrap();
+    assert_eq!(
+        unsafe { admission.prepare(&frame(&bytes, identity()), identity(), 1) },
+        Err(MetadataError::Unsupported)
+    );
+    let bytes = bundle().encode().unwrap();
+    assert_eq!(
+        unsafe { admission.prepare(&frame(&bytes, identity()), identity(), 1) },
+        Ok(MetadataAdmissionResult::Prepared)
+    );
+    assert_eq!(
+        unsafe { admission.prepare(&frame(&bytes, identity()), identity(), 1) },
+        Ok(MetadataAdmissionResult::Retry)
+    );
+    #[cfg(target_pointer_width = "64")]
+    {
+        assert_eq!(size_of::<FrameMetadataSchemaRuleV1>(), 32);
+        assert_eq!(size_of::<FrameMetadataCaptureContextV1>(), 600);
+        assert_eq!(
+            std::mem::offset_of!(FrameMetadataCaptureContextV1, schemas),
+            88
+        );
+        assert_eq!(
+            std::mem::offset_of!(CaptureApiV1_11, configure_frame_metadata),
+            size_of::<CaptureApiV1_10>()
+        );
+    }
+}

@@ -882,6 +882,24 @@ typedef struct {
     AmaterasuStatus (*read_resource_frame_with_metadata)(void *, uint64_t, AmaterasuFrameResourceMetadataSinkV1);
 } AmaterasuCaptureApiV1_10;
 #define AMATERASU_CAPTURE_API_V1_10_SIZE ((uint32_t)sizeof(AmaterasuCaptureApiV1_10))
+/* The authenticated host freezes this context before capture produces AFM1. */
+typedef struct {
+    AmaterasuFrameMetadataSchemaId schema;
+    uint32_t flags, reserved;
+} AmaterasuFrameMetadataSchemaRuleV1;
+typedef struct {
+    uint32_t size, version;
+    uint64_t session_id, source_id, source_generation, config_generation, capability_generation;
+    AmaterasuFrameClockMetadata clock;
+    uint32_t owner, schema_count;
+    AmaterasuFrameMetadataSchemaRuleV1 schemas[AMATERASU_FRAME_METADATA_MAX_ITEMS];
+} AmaterasuFrameMetadataCaptureContextV1;
+typedef struct {
+    AmaterasuCaptureApiV1_10 base;
+    AmaterasuStatus (*configure_frame_metadata)(void *, uint64_t, const AmaterasuFrameMetadataCaptureContextV1 *);
+} AmaterasuCaptureApiV1_11;
+#define AMATERASU_CAPTURE_METADATA_CONTEXT_INTERFACE_MINOR 11u
+#define AMATERASU_CAPTURE_API_V1_11_SIZE ((uint32_t)sizeof(AmaterasuCaptureApiV1_11))
 typedef struct {
     AmaterasuVideoApiV1_1 base;
     AmaterasuStatus (*hdr_metadata)(void *, uint64_t, AmaterasuHdrMetadata *);

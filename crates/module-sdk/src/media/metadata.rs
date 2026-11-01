@@ -477,6 +477,26 @@ pub unsafe fn bind_capture_with_metadata(
         )
     }
 }
+/// Bind capture with the authenticated context-setup and metadata-read tails.
+///
+/// # Safety
+/// Provider and runtime remain live until binding release and every captured
+/// frame and metadata borrow has retired.
+pub unsafe fn bind_capture_with_metadata_context(
+    runtime: &crate::RuntimeClient,
+    service: &str,
+) -> crate::ModuleResult<crate::NativeBinding> {
+    unsafe {
+        runtime.bind_native_typed(
+            service,
+            super::native_contracts::CAPTURE,
+            1,
+            amaterasu_media::CAPTURE_METADATA_CONTEXT_INTERFACE_MINOR,
+            amaterasu_media::CAPTURE_API_V1_11_SIZE,
+        )
+    }
+}
+
 /// Bind an existing resource-consumer family with its metadata tail.
 ///
 /// # Safety

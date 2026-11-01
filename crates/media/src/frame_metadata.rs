@@ -1,6 +1,7 @@
 //! Optional frame-associated side data. Existing frame and table prefixes remain unchanged.
 use crate::{
-    CaptureApiV1_9, CaptureResourceFrame, FrameResourceConsumerApi, FrameResourceProcessorApi,
+    CaptureApiV1_9, CaptureResourceFrame, FrameClockMetadata, FrameResourceConsumerApi,
+    FrameResourceProcessorApi,
 };
 use amaterasu_abi::{BorrowedBytes, Status};
 use std::{ffi::c_void, mem::size_of};
@@ -52,6 +53,106 @@ pub struct CaptureApiV1_10 {
     pub read_resource_frame_with_metadata:
         unsafe extern "C" fn(*mut c_void, u64, FrameResourceMetadataSinkV1) -> Status,
 }
+
+/// Bounded schema requirement chosen by authenticated session composition.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FrameMetadataSchemaRuleV1 {
+    pub schema: FrameMetadataSchemaId,
+    /// Only FRAME_METADATA_ITEM_REQUIRED is defined.
+    pub flags: u32,
+    pub reserved: u32,
+}
+
+/// Immutable context passed to the selected capture stream before metadata read.
+/// The capture provider must copy the descriptor during setup. Source generation
+/// is the independently negotiated capture-resource generation; it is not
+/// supplied by the metadata envelope. The unused schema entries are zero.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FrameMetadataCaptureContextV1 {
+    pub size: u32,
+    pub version: u32,
+    pub session_id: u64,
+    pub source_id: u64,
+    pub source_generation: u64,
+    pub config_generation: u64,
+    /// Generation returned by the selected capture capability query.
+    pub capability_generation: u64,
+    pub clock: FrameClockMetadata,
+    pub owner: u32,
+    pub schema_count: u32,
+    pub schemas: [FrameMetadataSchemaRuleV1; FRAME_METADATA_MAX_ITEMS],
+}
+
+impl FrameMetadataCaptureContextV1 {
+    /// Validate the bounded pointer-free descriptor before capture retains it.
+    pub fn validate(&self) -> Result<(), amaterasu_abi::Status> {
+        use amaterasu_abi::STATUS_INVALID_ARGUMENT;
+        let clock = self.clock;
+        if self.size as usize != size_of::<Self>()
+            || self.version != 1
+            || self.session_id == 0
+            || self.source_id == 0
+            || self.source_generation == 0
+            || self.config_generation == 0
+            || self.capability_generation == 0
+            || clock.version != 1
+            || clock.size as usize != size_of::<FrameClockMetadata>()
+            || !matches!(
+                clock.domain,
+                crate::FRAME_CLOCK_HOST_MONOTONIC | crate::FRAME_CLOCK_STREAM_RELATIVE
+            )
+            || clock.reserved != 0
+            || clock.epoch_id == [0; 16]
+            || !matches!(
+                self.owner,
+                FRAME_METADATA_OWNER_ENCODER | FRAME_METADATA_OWNER_FRAMER
+            )
+            || self.schema_count == 0
+            || self.schema_count as usize > FRAME_METADATA_MAX_ITEMS
+        {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        let mut previous = None;
+        for (index, rule) in self.schemas.iter().enumerate() {
+            let key = (
+                rule.schema.namespace_id,
+                rule.schema.value,
+                rule.schema.schema,
+            );
+            if index >= self.schema_count as usize {
+                if key != (0, 0, 0) || rule.flags != 0 || rule.reserved != 0 {
+                    return Err(STATUS_INVALID_ARGUMENT);
+                }
+            } else {
+                if key.0 == 0
+                    || key.1 == 0
+                    || key.2 == 0
+                    || rule.reserved != 0
+                    || rule.flags & !FRAME_METADATA_ITEM_REQUIRED != 0
+                    || previous.is_some_and(|value| value >= key)
+                {
+                    return Err(STATUS_INVALID_ARGUMENT);
+                }
+                previous = Some(key);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Capture metadata setup tail. Setup is idempotent for identical context; a
+/// conflicting setup must fail without changing the live selection. A non-OK
+/// result admits nothing. Closing capture retires its setup and borrowed frames.
+#[repr(C)]
+pub struct CaptureApiV1_11 {
+    pub base: CaptureApiV1_10,
+    pub configure_frame_metadata:
+        unsafe extern "C" fn(*mut c_void, u64, *const FrameMetadataCaptureContextV1) -> Status,
+}
+pub const CAPTURE_METADATA_CONTEXT_INTERFACE_MINOR: u32 = 11;
+pub const CAPTURE_API_V1_11_SIZE: u32 = size_of::<CaptureApiV1_11>() as u32;
 
 /// Additive consumer tail. The bound session's trusted composition selects the
 /// accepted schemas and exactly one carriage owner before admission. A provider
