@@ -77,3 +77,183 @@ fn payload_cannot_select_another_caller_and_bad_responses_fail() {
     assert!(state::decode_response::<StateLookup>(json!({"ok":true,"found":true})).is_err());
     assert!(state::decode_response::<StateLookup>(json!({"ok":false})).is_err());
 }
+
+// Exercise delivered and cancelled broker requests against the real State
+// store. A provider may execute a request after its broker result has ended.
+#[test]
+fn broker_cancellation_requires_a_same_namespace_cas_before_abort() {
+    use amaterasu_contracts::{Command, Grants, Response, RuntimeConfig};
+    use amaterasu_runtime::Broker;
+
+    const STATE: &str = "amaterasu.state/1";
+    const CONFIGURATION: &str = "amaterasu.host-configuration";
+    const PAIRING: &str = "amaterasu.pairing";
+    let directory = std::env::temp_dir().join(format!(
+        "amaterasu-state-cancel-fence-{}",
+        amaterasu_storage::random_identifier().unwrap()
+    ));
+    let store = TestStateStore::open(directory.clone()).unwrap();
+    let mut config = RuntimeConfig::default();
+    config.principals.insert(
+        "state".into(),
+        Grants {
+            provide: [STATE.into()].into(),
+            ..Default::default()
+        },
+    );
+    for caller in [CONFIGURATION, PAIRING] {
+        config.principals.insert(
+            caller.into(),
+            Grants {
+                call: [STATE.into()].into(),
+                ..Default::default()
+            },
+        );
+    }
+    let mut broker = Broker::new(config).unwrap();
+    assert!(matches!(
+        broker.dispatch(
+            "state",
+            Command::Register {
+                service: STATE.into()
+            }
+        ),
+        Response::Ok
+    ));
+
+    let request = |payload: Value, operation: &str| Command::Request {
+        service: STATE.into(),
+        payload,
+        timeout_ms: 30_000,
+        operation_id: operation.into(),
+        parent: None,
+    };
+    let call = |broker: &mut Broker, caller: &str, payload: Value, operation: &str| {
+        let Response::Accepted { id } = broker.dispatch(caller, request(payload, operation)) else {
+            panic!("state request not accepted")
+        };
+        let Response::Request {
+            id: delivered,
+            caller: authenticated_caller,
+            payload,
+            ..
+        } = broker.dispatch("state", Command::Poll {})
+        else {
+            panic!("state request not delivered")
+        };
+        assert_eq!(id, delivered);
+        let result = store.handle(&authenticated_caller, payload);
+        assert!(matches!(
+            broker.dispatch(
+                "state",
+                Command::Complete {
+                    request: id,
+                    payload: result.clone()
+                }
+            ),
+            Response::Ok
+        ));
+        assert!(
+            matches!(broker.dispatch(caller, Command::TakeResult { request: id }), Response::Result { payload } if payload == result)
+        );
+        assert!(matches!(
+            broker.dispatch(caller, Command::ReleaseResult { request: id }),
+            Response::Ok
+        ));
+        result
+    };
+    let original = json!({"identity":"old"});
+    let pending = json!({"action":"set","key":"configuration","expected_revision":0,"value":{"identity":"new"}});
+    let Response::Accepted { id } =
+        broker.dispatch(CONFIGURATION, request(pending, "delayed-write"))
+    else {
+        panic!("write not accepted")
+    };
+    let Response::Request {
+        id: delivered,
+        caller,
+        payload,
+        ..
+    } = broker.dispatch("state", Command::Poll {})
+    else {
+        panic!("write not delivered")
+    };
+    assert_eq!(id, delivered);
+    assert!(matches!(
+        broker.dispatch(CONFIGURATION, Command::Cancel { request: id }),
+        Response::Ok
+    ));
+
+    // An unrelated namespace cannot fence the delivered configuration write.
+    assert_eq!(
+        call(
+            &mut broker,
+            PAIRING,
+            json!({"action":"set","key":"fence","value":true,"expected_revision":0}),
+            "other-namespace"
+        )["revision"],
+        1
+    );
+    assert_eq!(
+        call(
+            &mut broker,
+            CONFIGURATION,
+            json!({"action":"get","key":"configuration"}),
+            "read-before-fence"
+        )["revision"],
+        0
+    );
+    // This successful CAS advances the *same* namespace, so the earlier write
+    // can no longer succeed even though the State provider received it already.
+    assert_eq!(
+        call(
+            &mut broker,
+            CONFIGURATION,
+            json!({"action":"set","key":"configuration","value":original,"expected_revision":0}),
+            "abort-fence"
+        )["revision"],
+        1
+    );
+    let late = store.handle(&caller, payload);
+    assert_eq!(late["error"]["code"], "revision_conflict");
+    assert!(
+        matches!(broker.dispatch("state", Command::Complete { request: id, payload: late }), Response::Error { code, .. } if code == "request_ended")
+    );
+    drop(store);
+    let store = TestStateStore::open(directory.clone()).unwrap();
+    let recovered = store.handle(CONFIGURATION, json!({"action":"get","key":"configuration"}));
+    assert_eq!(recovered["revision"], 1);
+    assert_eq!(recovered["value"], original);
+
+    // The opposite ordering proves cancellation alone is not an abort: State
+    // can persist after cancellation and the attempted abort CAS must conflict.
+    let Response::Accepted { id } = broker.dispatch(CONFIGURATION, request(json!({"action":"set","key":"configuration","expected_revision":1,"value":{"identity":"new"}}), "cancelled-write-wins")) else { panic!("write not accepted") };
+    let Response::Request {
+        caller, payload, ..
+    } = broker.dispatch("state", Command::Poll {})
+    else {
+        panic!("write not delivered")
+    };
+    assert!(matches!(
+        broker.dispatch(CONFIGURATION, Command::Cancel { request: id }),
+        Response::Ok
+    ));
+    let persisted = store.handle(&caller, payload);
+    assert_eq!(persisted["revision"], 2);
+    assert!(
+        matches!(broker.dispatch("state", Command::Complete { request: id, payload: persisted }), Response::Error { code, .. } if code == "request_ended")
+    );
+    assert_eq!(
+        store.handle(
+            CONFIGURATION,
+            json!({"action":"set","key":"configuration","value":original,"expected_revision":1})
+        )["error"]["code"],
+        "revision_conflict"
+    );
+    assert_eq!(
+        store.handle(CONFIGURATION, json!({"action":"get","key":"configuration"}))["value"]["identity"],
+        "new"
+    );
+    drop(store);
+    std::fs::remove_dir_all(directory).unwrap();
+}

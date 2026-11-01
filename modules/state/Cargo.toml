@@ -22,3 +22,7 @@ workspace = true
 [[test]]
 name = "sdk_contract"
 required-features = ["test-support"]
+
+[dev-dependencies]
+amaterasu-contracts.workspace = true
+amaterasu-runtime = { path = "../../crates/runtime" }
