@@ -4249,6 +4249,45 @@ fn host_receipt_requires_exact_joined_provider_and_retained_effect() {
     assert_eq!(record.broker_epoch, epoch);
     assert_eq!(record.provider_incarnation, instance);
     assert_eq!(record.effect, guarded.identity("provider"));
+    let page = || EffectFenceCommand::HostProviderSlotReceiptsPage {
+        provider: "provider".into(),
+        provider_incarnation: instance.clone(),
+        slot: 0,
+        after_sequence: None,
+    };
+    assert_eq!(
+        code(invoke(&mut broker, "issuer", page())),
+        "permission_denied"
+    );
+    let first = invoke(
+        &mut broker,
+        amaterasu_contracts::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+        page(),
+    );
+    assert!(matches!(
+        slot_invoke(
+            &mut broker,
+            "authority",
+            &lease,
+            EffectFenceCommand::Compact {
+                scope: guarded.scope.clone(),
+                retired_through: 1
+            }
+        ),
+        Response::Ok
+    ));
+    let replay = invoke(
+        &mut broker,
+        amaterasu_contracts::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+        page(),
+    );
+    match (first, replay) {
+        (Response::Result { payload: first }, Response::Result { payload: replay }) => {
+            assert_eq!(first, replay);
+            assert_eq!(first["receipt"], serde_json::to_value(&record).unwrap());
+        }
+        _ => panic!("joined receipt snapshot unavailable"),
+    }
     assert_eq!(
         code(slot_invoke(
             &mut broker,
