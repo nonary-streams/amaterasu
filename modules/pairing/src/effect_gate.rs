@@ -7,6 +7,9 @@ const MAX_OPERATIONS: usize = 256;
 const MAX_RETIRED_SOURCES: usize = 4096;
 
 pub use amaterasu_module_sdk::effect_authority::{Request, Source, StreamRetirement, StreamScope};
+use amaterasu_module_sdk::effect_owner_recovery::{
+    Lease, MAX_RECORDS, SourceRecord, SourceRetirement as RestartSourceRetirement,
+};
 
 fn token(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
@@ -41,6 +44,14 @@ struct SourceRetirement {
     receipt: Option<StreamRetirement>,
 }
 
+struct OwnerRestart {
+    owner_epoch: String,
+    operation_id: String,
+    fence_generation: u64,
+    records: Vec<SourceRecord>,
+    confirmed: BTreeMap<Source, StreamRetirement>,
+}
+
 /// An admission is kept until its source is retired. A lost reply can be
 /// reconciled by repeating the same operation ID; a ticket is never expired
 /// merely because a deadline elapsed while an effect could still be running.
@@ -59,6 +70,8 @@ pub struct EffectGate {
     fence_generation: u64,
     drain_required: bool,
     startup_recovery_required: bool,
+    owner_restart: Option<OwnerRestart>,
+    unscoped_restart_blocked: bool,
 }
 
 impl EffectGate {
@@ -80,6 +93,8 @@ impl EffectGate {
             fence_generation: 0,
             drain_required: false,
             startup_recovery_required: true,
+            owner_restart: None,
+            unscoped_restart_blocked: false,
         })
     }
 
@@ -104,6 +119,7 @@ impl EffectGate {
     /// authority epoch. This is a trusted owner's assertion, not a timer.
     pub fn recover(&mut self, owner_epoch: &str) -> Result<(), &'static str> {
         if !token(owner_epoch)
+            || self.unscoped_restart_blocked
             || self.in_flight() != 0
             || self.drain_required
             || self
@@ -129,6 +145,7 @@ impl EffectGate {
         self.drain_required = false;
         self.owner_epoch = Some(owner_epoch.into());
         self.startup_recovery_required = false;
+        self.owner_restart = None;
         self.fenced = false;
         Ok(())
     }
@@ -313,6 +330,15 @@ impl EffectGate {
             } else {
                 Err("source_retirement_conflict")
             };
+        }
+        if self.owner_restart.as_ref().is_some_and(|restart| {
+            restart
+                .records
+                .iter()
+                .any(|record| &record.source == source)
+        }) && receipt.is_none()
+        {
+            return Err("retirement_mismatch");
         }
         if self
             .configuration_sources
@@ -608,6 +634,175 @@ impl EffectGate {
         self.sources.clear();
     }
 
+    /// Capture exact identities before clearing live bindings. The snapshot is
+    /// immutable through settlement, including tickets already completed.
+    pub fn fence_owner_restart(
+        &mut self,
+        epoch: &str,
+        owner_epoch: &str,
+        operation_id: &str,
+    ) -> Result<(u64, u32), &'static str> {
+        self.require_epoch(epoch)?;
+        if !token(owner_epoch) || !token(operation_id) {
+            return Err("invalid_request");
+        }
+        if self.startup_recovery_required || self.owner_epoch.as_deref() != Some(owner_epoch) {
+            return Err("owner_epoch_unknown");
+        }
+        if let Some(restart) = &self.owner_restart {
+            return if restart.owner_epoch == owner_epoch && restart.operation_id == operation_id {
+                Ok((restart.fence_generation, restart.records.len() as u32))
+            } else {
+                Err("owner_restart_pending")
+            };
+        }
+        if self.unscoped_restart_blocked
+            || self.sources.values().any(Option::is_none)
+            || self
+                .operations
+                .values()
+                .any(|admission| admission.scope.is_none())
+        {
+            self.unscoped_restart_blocked = true;
+            self.fence();
+            return Err("unscoped_effects_pending");
+        }
+        let mut records = BTreeMap::new();
+        for (source, scope) in &self.fenced_scoped_sources {
+            records.insert(source.clone(), scope.clone());
+        }
+        for (source, scope) in &self.sources {
+            if let Some(scope) = scope {
+                records.insert(source.clone(), scope.clone());
+            }
+        }
+        for (source, retirement) in &self.retired_sources {
+            records.insert(source.clone(), retirement.scope.clone());
+        }
+        for admission in self.operations.values() {
+            if let Some(scope) = &admission.scope {
+                records.insert(admission.source.clone(), scope.clone());
+            }
+        }
+        let records: Vec<_> = records
+            .into_iter()
+            .map(|(source, scope)| {
+                let lease = self
+                    .operations
+                    .iter()
+                    .find(|(_, admission)| admission.source == source)
+                    .map(|(operation_id, admission)| Lease {
+                        operation_id: operation_id.clone(),
+                        sequence: admission.sequence,
+                        ticket: admission.ticket.clone(),
+                        complete: admission.complete,
+                        retirement: self.lease_receipts.get(&source).cloned(),
+                    });
+                let source_retirement =
+                    self.retired_sources
+                        .get(&source)
+                        .map(|retirement| RestartSourceRetirement {
+                            operation_id: retirement.operation_id.clone(),
+                            complete: retirement.complete,
+                            retirement: retirement.receipt.clone(),
+                        });
+                SourceRecord {
+                    transport_retirement: self.lease_receipts.get(&source).cloned(),
+                    source,
+                    scope,
+                    lease,
+                    source_retirement,
+                }
+            })
+            .collect();
+        if records.len() > MAX_RECORDS as usize {
+            self.fence_for_configuration_change()?;
+            return Err("owner_restart_capacity");
+        }
+        self.fence_for_configuration_change()?;
+        for record in &records {
+            self.configuration_sources
+                .insert(record.source.clone(), record.scope.clone());
+        }
+        let generation = self.fence_generation;
+        let count = records.len() as u32;
+        self.owner_restart = Some(OwnerRestart {
+            owner_epoch: owner_epoch.into(),
+            operation_id: operation_id.into(),
+            fence_generation: generation,
+            records,
+            confirmed: BTreeMap::new(),
+        });
+        Ok((generation, count))
+    }
+
+    pub fn owner_restart_record(
+        &self,
+        epoch: &str,
+        owner_epoch: &str,
+        operation_id: &str,
+        index: u32,
+    ) -> Result<(&SourceRecord, u32), &'static str> {
+        self.require_epoch(epoch)?;
+        let restart = self.owner_restart.as_ref().ok_or("owner_restart_unknown")?;
+        if restart.owner_epoch != owner_epoch || restart.operation_id != operation_id {
+            return Err("owner_restart_unknown");
+        }
+        let record = restart
+            .records
+            .get(index as usize)
+            .ok_or("index_out_of_range")?;
+        Ok((record, restart.records.len() as u32))
+    }
+
+    pub fn confirm_owner_restart_record(
+        &mut self,
+        epoch: &str,
+        owner_epoch: &str,
+        operation_id: &str,
+        index: u32,
+        receipt: &StreamRetirement,
+    ) -> Result<(), &'static str> {
+        let (record, _) = self.owner_restart_record(epoch, owner_epoch, operation_id, index)?;
+        if !receipt.matches(&record.scope)
+            || record
+                .transport_retirement
+                .as_ref()
+                .is_some_and(|prior| prior != receipt)
+            || record
+                .lease
+                .as_ref()
+                .and_then(|lease| lease.retirement.as_ref())
+                .is_some_and(|prior| prior != receipt)
+            || record
+                .source_retirement
+                .as_ref()
+                .and_then(|retirement| retirement.retirement.as_ref())
+                .is_some_and(|prior| prior != receipt)
+        {
+            return Err("retirement_mismatch");
+        }
+        let source = record.source.clone();
+        let restart = self.owner_restart.as_mut().expect("snapshot verified");
+        if restart.confirmed.values().any(|prior| {
+            prior.service == receipt.service
+                && prior.stream == receipt.stream
+                && prior.provider_epoch == receipt.provider_epoch
+                && prior != receipt
+        }) {
+            return Err("retirement_mismatch");
+        }
+        if restart
+            .confirmed
+            .get(&source)
+            .is_some_and(|prior| prior != receipt)
+        {
+            return Err("retirement_mismatch");
+        }
+        restart.confirmed.insert(source, receipt.clone());
+        Ok(())
+    }
+
     /// A configuration transaction requires the selected owner's explicit
     /// acknowledgement even when the local ledger currently has no sources.
     pub fn fence_for_configuration_change(&mut self) -> Result<(), &'static str> {
@@ -666,6 +861,23 @@ impl EffectGate {
         }
         if self.in_flight() != 0 {
             return Err("effects_in_flight");
+        }
+        if self.owner_restart.as_ref().is_some_and(|restart| {
+            restart.records.iter().any(|record| {
+                record
+                    .lease
+                    .as_ref()
+                    .is_some_and(|lease| self.operations.contains_key(&lease.operation_id))
+            })
+        }) {
+            return Err("lease_acknowledgment_pending");
+        }
+        if self
+            .owner_restart
+            .as_ref()
+            .is_some_and(|restart| restart.confirmed.len() != restart.records.len())
+        {
+            return Err("restart_confirmation_pending");
         }
         if !self.configuration_sources_retired() {
             return Err("source_retirement_pending");

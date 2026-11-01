@@ -5628,3 +5628,5 @@ fn broker_lost_lease_lookup_reports_shared_transport_retirement() {
         true
     );
 }
+
+mod owner_restart_tests;
