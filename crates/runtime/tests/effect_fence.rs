@@ -2949,7 +2949,7 @@ fn completed_source_histories_still_exhaust_the_broker_lifetime_limit() {
 }
 
 #[test]
-fn authority_cannot_verify_provider_before_arm_without_broker_support() {
+fn legacy_unslotted_arm_does_not_pin_the_selected_provider() {
     let mut broker = setup();
     let query = || Command::QueryApiApproval {
         service: "example.effects/1".into(),
@@ -2965,8 +2965,8 @@ fn authority_cannot_verify_provider_before_arm_without_broker_support() {
         panic!("issuer cannot query selected provider")
     };
     assert_eq!(payload["provider"], "provider");
-    // Arm has no expected-provider field, and its response does not identify the
-    // chosen provider. The authority cannot pin its selected provider here.
+    // The legacy unslotted Arm does not pin the selected provider. Slot mode
+    // uses SelectedMethod and ArmSelected for that binding instead.
     let request = effect(1);
     open(&mut broker, scope(), 0);
     arm(&mut broker, &request);
