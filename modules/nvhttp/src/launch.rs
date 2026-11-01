@@ -63,6 +63,9 @@ pub(crate) struct VideoEncryptionPolicySnapshot {
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct LaunchRequest {
+    /// Validated participant options for this stream generation.
+    pub options: amaterasu_module_sdk::launch_options::LaunchOptions,
+    pub entitlements: Vec<String>,
     pub hdr: bool,
     pub app_id: u32,
     pub width: u32,
@@ -1521,23 +1524,33 @@ impl Controller {
         }
     }
 
+    #[cfg(test)]
     pub fn revoke_untrusted(
         &mut self,
         now: Instant,
         mut trusted: impl FnMut(&[u8]) -> bool,
     ) -> Vec<u64> {
+        self.revoke_untrusted_with_options(now, |certificate, _| trusted(certificate))
+    }
+
+    pub fn revoke_untrusted_with_options(
+        &mut self,
+        now: Instant,
+        mut trusted: impl FnMut(&[u8], &[String]) -> bool,
+    ) -> Vec<u64> {
         let mut close = Vec::new();
-        if self
-            .pending_resume
-            .as_ref()
-            .is_some_and(|pending| !trusted(&pending.peer.certificate))
-            && let Some(pending) = self.pending_resume.take()
+        if self.pending_resume.as_ref().is_some_and(|pending| {
+            !trusted(&pending.peer.certificate, &pending.request.entitlements)
+        }) && let Some(pending) = self.pending_resume.take()
         {
             close.push(pending.connection);
         }
         let mut affected = Vec::new();
         for record in self.records.values_mut() {
-            if !record.state.terminal() && !record.revoked && !trusted(&record.peer.certificate) {
+            if !record.state.terminal()
+                && !record.revoked
+                && !trusted(&record.peer.certificate, &record.request.entitlements)
+            {
                 record.revoked = true;
                 close.extend(record.launch_connection.take());
                 close.extend(record.cancel_connection.take());
@@ -1646,7 +1659,11 @@ fn success_reply(record: &Record) -> Reply {
     }
     let mut reply = xml::response(200, "OK", &fields);
     reply.requires_paired_tls = true;
-    reply.permission = Some(crate::wire::Permission::Launch);
+    reply.permission = Some(if record.request.entitlements.is_empty() {
+        crate::wire::Permission::Launch
+    } else {
+        crate::wire::Permission::LaunchWithEntitlements(record.request.entitlements.clone())
+    });
     reply
 }
 

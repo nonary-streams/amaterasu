@@ -194,6 +194,12 @@ impl Identity {
     }
 
     pub fn allowed(&self, certificate: &[u8], permission: crate::wire::Permission) -> bool {
+        if let crate::wire::Permission::LaunchWithEntitlements(names) = permission {
+            return self.allowed(certificate, crate::wire::Permission::Launch)
+                && names.into_iter().all(|name| {
+                    self.allowed(certificate, crate::wire::Permission::Entitlement(name))
+                });
+        }
         if let crate::wire::Permission::Entitlement(name) = permission {
             if !amaterasu_identity::valid_entitlement(&name)
                 || certificate.is_empty()
@@ -222,7 +228,8 @@ impl Identity {
         let selector = match permission {
             crate::wire::Permission::List => amaterasu_identity::PERMISSION_LIST,
             crate::wire::Permission::Launch => amaterasu_identity::PERMISSION_LAUNCH,
-            crate::wire::Permission::Entitlement(_) => unreachable!(),
+            crate::wire::Permission::Entitlement(_)
+            | crate::wire::Permission::LaunchWithEntitlements(_) => unreachable!(),
         };
         self.bridge.permission_status(certificate, selector) == STATUS_OK
     }

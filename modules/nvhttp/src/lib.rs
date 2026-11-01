@@ -405,7 +405,10 @@ impl ManagedModule for NvhttpModule {
             .then(|| amaterasu_module_sdk::network::Network::from_settings(&runtime, &payload))
             .transpose()?;
         let (server, router, identity) = if settings.enabled {
-            let identity = tls::Identity::bind(&runtime, !settings.protocol_handlers.is_empty())?;
+            let identity = tls::Identity::bind(
+                &runtime,
+                !settings.protocol_handlers.is_empty() || !settings.launch_participants.is_empty(),
+            )?;
             let server = server::Server::bind_with_network(
                 network
                     .as_ref()
@@ -424,6 +427,7 @@ impl ManagedModule for NvhttpModule {
                 launches,
             );
             router.set_participants(settings.protocol_handlers.clone());
+            router.set_launch_participants(settings.launch_participants.clone());
             (Some(server), Some(router), Some(identity))
         } else {
             (None, None, None)
@@ -642,10 +646,18 @@ impl ManagedModule for NvhttpModule {
         self.product_settings.flush_completion(&self.runtime);
         self.refresh_identity();
         if let (Some(server), Some(router)) = (&mut self.server, &mut self.router) {
-            let revoked = router.revoke_untrusted(|certificate| {
+            let revoked = router.revoke_untrusted_with_options(|certificate, entitlements| {
                 self.identity
                     .as_ref()
-                    .is_none_or(|identity| identity.launch_not_revoked(certificate))
+                    .map_or(entitlements.is_empty(), |identity| {
+                        identity.launch_not_revoked(certificate)
+                            && entitlements.iter().all(|name| {
+                                identity.allowed(
+                                    certificate,
+                                    wire::Permission::Entitlement(name.clone()),
+                                )
+                            })
+                    })
             });
             for connection in revoked {
                 server.close(connection);

@@ -70,6 +70,11 @@ pub struct Record {
     pub resumed: bool,
     pub peer: PeerIdentity,
     pub request: LaunchRequest,
+    /// Previous generation options until the resumed stream is admitted.
+    pub resume_previous_options: Option<(
+        amaterasu_module_sdk::launch_options::LaunchOptions,
+        Vec<String>,
+    )>,
     /// Frozen requested physical mode; this does not assert a host display topology.
     pub physical_display_mode: PhysicalDisplayMode,
     pub device_name: String,
@@ -268,6 +273,7 @@ impl Record {
             resumed: false,
             peer,
             request,
+            resume_previous_options: None,
             physical_display_mode,
             device_name,
             application_operation,

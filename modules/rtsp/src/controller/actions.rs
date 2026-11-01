@@ -43,6 +43,9 @@ impl Controller {
         runtime: &RuntimeClient,
     ) {
         match operation {
+            Operation::LaunchOptionCapabilities => {
+                rpc::complete(runtime, request, json!({"version":1,"options":[]}));
+            }
             Operation::Open(config) => self.open(
                 OpenRequest {
                     request,

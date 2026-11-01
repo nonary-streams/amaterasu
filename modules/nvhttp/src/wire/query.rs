@@ -50,6 +50,12 @@ impl Query {
         })
     }
 
+    pub(super) fn fields(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.fields
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+
     pub fn get(&self, name: &str) -> Option<&str> {
         self.fields.get(name).map(String::as_str)
     }

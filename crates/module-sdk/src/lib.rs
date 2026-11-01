@@ -6,6 +6,7 @@ pub mod data_plane;
 pub mod encode;
 pub mod exports;
 pub mod input;
+pub mod launch_options;
 pub mod media;
 mod native;
 pub mod network;

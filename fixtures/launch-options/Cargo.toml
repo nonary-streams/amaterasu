@@ -1,0 +1,15 @@
+[package]
+name = "amaterasu-launch-options-fixture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+amaterasu-module-sdk.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

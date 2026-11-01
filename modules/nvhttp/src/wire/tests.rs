@@ -196,6 +196,9 @@ impl Broker {
                             }
                         }
                     }),
+                    ("amaterasu.rtsp/1", "launch_option_capabilities") => {
+                        fixture_option_capabilities()
+                    }
                     ("amaterasu.rtsp/1", "open") => json!({
                         "ok": true,
                         "ticket": 1,
@@ -266,6 +269,10 @@ fn router() -> Router {
 }
 
 fn streaming_router() -> Router {
+    streaming_router_with_desktop(false)
+}
+
+fn streaming_router_with_desktop(enabled: bool) -> Router {
     Router::new(
         RouterConfig {
             hostname: "Amaterasu".into(),
@@ -279,7 +286,7 @@ fn streaming_router() -> Router {
                 encoder: amaterasu_module_sdk::EncoderSelection::Index(0),
                 audio_endpoint: "default".into(),
             },
-            desktop: crate::launch::DesktopSettings::default(),
+            desktop: crate::launch::DesktopSettings { enabled },
             profile: StreamProfile {
                 codec: amaterasu_media::VideoCodec::H264,
                 max_width: 1920,
@@ -2047,4 +2054,842 @@ fn configured_upgrade_requires_distinct_acceptance_and_fails_closed() {
             .queue_upgrade(1, binding, offer, b"certificate".to_vec())
             .is_err()
     );
+}
+
+fn neutral_launch_binding(field: &str, namespace: &str) -> launch_participants::Binding {
+    use amaterasu_module_sdk::extension_api::SchemaRef;
+    let schema = SchemaRef {
+        id: "org.example.option".into(),
+        major: 1,
+        minor: 0,
+        digest: "e020a99a8ed4ec086459efba9b8f0c73420143d452a894200c54b112560cc84d".into(),
+    };
+    launch_participants::Binding {
+        service: format!("org.example.{field}/1"), method: "project".into(),
+        interface_major: 1, interface_minor: 0, entitlement: "org.example/use".into(),
+        fields: vec![field.into()], namespace: namespace.into(), version: 1,
+        output_schema: schema.clone(), consumer_service: "amaterasu.rtsp/1".into(),
+        consumer_schema: schema,
+        schema_document: r#"{"$id":"org.example.option","$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","properties":{"enabled":{"type":"boolean"}},"required":["enabled"],"additionalProperties":false}"#.into(),
+    }
+}
+
+fn fixture_option_capabilities() -> Value {
+    let schema = neutral_launch_binding("alpha", "org.example.alpha").consumer_schema;
+    json!({"version":1,"options":[{"namespace":"org.example.alpha","version":1,"schema":schema},{"namespace":"org.example.beta","version":1,"schema":schema}]})
+}
+
+#[test]
+fn launch_participant_bindings_fail_closed_for_conflict_and_schema_mismatch() {
+    let alpha = neutral_launch_binding("alpha", "org.example.alpha");
+    let beta = neutral_launch_binding("beta", "org.example.beta");
+    assert!(launch_participants::validate(&[alpha.clone(), beta.clone()]).is_ok());
+    let mut bad = beta.clone();
+    bad.consumer_schema.digest = "0".repeat(64);
+    assert!(launch_participants::validate(&[bad]).is_err());
+    let mut bad = beta.clone();
+    bad.fields = vec!["rikey".into()];
+    assert!(launch_participants::validate(&[bad]).is_err());
+    let mut bad = beta;
+    bad.namespace = alpha.namespace.clone();
+    bad.version = 2;
+    assert!(launch_participants::validate(&[alpha.clone(), bad]).is_err());
+    assert!(
+        alpha
+            .validate_reply(
+                json!({"namespace":"org.example.beta", "version":1, "value":{"enabled":true}})
+            )
+            .is_err()
+    );
+    assert!(
+        alpha
+            .validate_reply(
+                json!({"namespace":"org.example.alpha", "version":2, "value":{"enabled":true}})
+            )
+            .is_err()
+    );
+    assert!(
+        alpha
+            .validate_reply(
+                json!({"namespace":"org.example.alpha", "version":1, "value":{"unknown":true}})
+            )
+            .is_err()
+    );
+    assert!(alpha.validate_reply(json!({"namespace":"org.example.alpha", "version":1, "value":{"enabled":true,"unknown":true}})).is_err());
+}
+
+#[test]
+fn approved_launch_participants_reach_the_unchanged_stream_consumer_via_real_broker() {
+    use amaterasu_contracts::{
+        ApiFieldKind, ApiMethod, ApiMethodApproval, ApiPrivilege, ApiSchema, Grants, RuntimeConfig,
+    };
+    use amaterasu_runtime::Broker as RuntimeBroker;
+    let shape = |fields: &[(&str, ApiFieldKind)]| ApiSchema {
+        required: fields
+            .iter()
+            .map(|(name, kind)| ((*name).into(), kind.clone()))
+            .collect(),
+        optional: BTreeMap::new(),
+        allow_extra: false,
+    };
+    let bindings = vec![
+        neutral_launch_binding("alpha", "org.example.alpha"),
+        neutral_launch_binding("beta", "org.example.beta"),
+    ];
+    assert!(launch_participants::validate(&bindings).is_ok());
+    for provider in ["org.example.provider-one", "org.example.provider-two"] {
+        let mut config = RuntimeConfig::default();
+        let mut services: BTreeSet<String> = bindings
+            .iter()
+            .map(|binding| binding.service.clone())
+            .collect();
+        services.insert("amaterasu.rtsp/1".into());
+        config.principals.insert(
+            "amaterasu.nvhttp".into(),
+            Grants {
+                call: services.clone(),
+                ..Default::default()
+            },
+        );
+        config.principals.insert(
+            provider.into(),
+            Grants {
+                provide: services,
+                ..Default::default()
+            },
+        );
+        let methods: Vec<_> = bindings
+            .iter()
+            .map(|binding| ApiMethod {
+                service: binding.service.clone(),
+                method: binding.method.clone(),
+                interface_major: 1,
+                interface_minor: 0,
+                request: shape(&[
+                    ("version", ApiFieldKind::Integer),
+                    ("resume", ApiFieldKind::Boolean),
+                    ("fields", ApiFieldKind::Object),
+                ]),
+                response: shape(&[
+                    ("namespace", ApiFieldKind::String),
+                    ("version", ApiFieldKind::Integer),
+                    ("value", ApiFieldKind::Object),
+                ]),
+                privilege: ApiPrivilege::User,
+            })
+            .collect();
+        for method in &methods {
+            config.api_methods.push(ApiMethodApproval {
+                provider: provider.into(),
+                callers: ["amaterasu.nvhttp".into()].into(),
+                method: method.clone(),
+            });
+        }
+        let mut real = RuntimeBroker::new(config).unwrap();
+        for method in methods {
+            assert!(matches!(
+                real.dispatch(provider, Command::RegisterApi { method }),
+                Response::Ok
+            ));
+        }
+        assert!(matches!(
+            real.dispatch(
+                provider,
+                Command::Register {
+                    service: "amaterasu.rtsp/1".into()
+                }
+            ),
+            Response::Ok
+        ));
+        let mut fake = Broker::default();
+        let now = Instant::now();
+        let mut router = streaming_router();
+        router.set_launch_participants(bindings.clone());
+        let target = "/launch?appid=7&mode=1280x720x60&rikey=00112233445566778899aabbccddeeff&rikeyid=17&alpha=1&beta=2";
+        assert!(
+            router
+                .dispatch_with(
+                    1,
+                    request(target),
+                    trusted_tls(b"certificate"),
+                    now,
+                    &mut |cmd| fake.send(cmd)
+                )
+                .is_none()
+        );
+        let mut calls = Vec::new();
+        let mut consumer_open = None;
+        let mut reply = None;
+        for _ in 0..200 {
+            let replies = router.poll_with_identity(
+                now,
+                &mut |command| match command {
+                    command @ Command::CallApi { .. } => match real
+                        .dispatch("amaterasu.nvhttp", command)
+                    {
+                        Response::Accepted { id } => Ok(Response::Accepted { id: id + 1_000_000 }),
+                        response => Ok(response),
+                    },
+                    command @ Command::Request { .. }
+                        if matches!(&command, Command::Request { service, .. } if service == "amaterasu.rtsp/1") =>
+                    {
+                        match real.dispatch("amaterasu.nvhttp", command) {
+                            Response::Accepted { id } => {
+                                Ok(Response::Accepted { id: id + 1_000_000 })
+                            }
+                            response => Ok(response),
+                        }
+                    }
+                    Command::TakeResult { request } if request >= 1_000_000 => Ok(real.dispatch(
+                        "amaterasu.nvhttp",
+                        Command::TakeResult {
+                            request: request - 1_000_000,
+                        },
+                    )),
+                    Command::Cancel { request } if request >= 1_000_000 => Ok(real.dispatch(
+                        "amaterasu.nvhttp",
+                        Command::Cancel {
+                            request: request - 1_000_000,
+                        },
+                    )),
+                    command => fake.send(command),
+                },
+                |_, _| true,
+            );
+            if let Some((_, received)) = replies.into_iter().next() {
+                reply = Some(received);
+                break;
+            }
+            if let Response::Request {
+                id,
+                service,
+                payload,
+                ..
+            } = real.dispatch(provider, Command::Poll {})
+            {
+                if service == "amaterasu.rtsp/1" {
+                    if payload["action"] == "launch_option_capabilities" {
+                        assert!(matches!(
+                            real.dispatch(
+                                provider,
+                                Command::Complete {
+                                    request: id,
+                                    payload: fixture_option_capabilities()
+                                }
+                            ),
+                            Response::Ok
+                        ));
+                        continue;
+                    }
+                    assert_eq!(payload["action"], "open");
+                    assert_eq!(
+                        payload["launch_options"][0]["namespace"],
+                        "org.example.alpha"
+                    );
+                    assert_eq!(
+                        payload["launch_options"][1]["namespace"],
+                        "org.example.beta"
+                    );
+                    let response = json!({"ok":true,"ticket":1,"encoder":payload["capture"]["encoder"],"sw_preset":payload["sw_preset"],"sw_tune":payload["sw_tune"],"min_threads":payload["min_threads"],"qp":payload["qp"],"nvenc_settings":payload["nvenc_settings"],"nvenc_spatial_aq":payload["nvenc_spatial_aq"],"rtsp_url":"rtspenc://127.0.0.1:48010","state":"ready","frame_limiter_settings":payload["frame_limiter_settings"],"frame_limiter_executable_path":payload["frame_limiter_executable_path"],"display_policy_snapshot":payload["display_policy_snapshot"],"display_request":payload["display_request"],"failure":null,"cleanup_error":null});
+                    consumer_open = Some(payload);
+                    assert!(matches!(
+                        real.dispatch(
+                            provider,
+                            Command::Complete {
+                                request: id,
+                                payload: response
+                            }
+                        ),
+                        Response::Ok
+                    ));
+                    continue;
+                }
+                assert_eq!(payload["method"], "project");
+                assert_eq!(payload["interface_major"], 1);
+                assert_eq!(payload["interface_minor"], 0);
+                let arguments = &payload["arguments"];
+                assert_eq!(arguments["version"], 1);
+                assert_eq!(arguments["resume"], false);
+                let field = if service == bindings[0].service {
+                    "alpha"
+                } else {
+                    "beta"
+                };
+                assert_eq!(arguments["fields"].as_object().unwrap().len(), 1);
+                assert!(arguments["fields"].get(field).is_some());
+                assert!(
+                    arguments
+                        .to_string()
+                        .find("00112233445566778899aabbccddeeff")
+                        .is_none()
+                );
+                calls.push(field.to_owned());
+                let namespace = if field == "alpha" {
+                    "org.example.alpha"
+                } else {
+                    "org.example.beta"
+                };
+                assert!(matches!(real.dispatch(provider, Command::Complete { request:id, payload:json!({"namespace":namespace,"version":1,"value":{"enabled":true}}) }), Response::Ok));
+            }
+        }
+        assert_eq!(calls, ["alpha", "beta"]);
+        assert_eq!(reply.expect("launch reply").status, 200);
+        let open = consumer_open.expect("selected consumer stream open");
+        assert_eq!(open["launch_options"][0]["namespace"], "org.example.alpha");
+        assert_eq!(open["launch_options"][1]["namespace"], "org.example.beta");
+    }
+}
+
+#[test]
+fn launch_participant_revocation_and_disconnect_discard_late_results() {
+    use std::cell::Cell;
+    for disconnect in [false, true] {
+        let now = Instant::now();
+        let mut router = streaming_router();
+        router.set_launch_participants(vec![neutral_launch_binding("alpha", "org.example.alpha")]);
+        let mut broker = Broker::default();
+        let admitted = Cell::new(0);
+        let cancelled = Cell::new(0);
+        let mut send = |command| match command {
+            Command::CallApi { .. } => {
+                admitted.set(admitted.get() + 1);
+                Ok(Response::Accepted { id: 1_000_000 })
+            }
+            Command::Cancel { request: 1_000_000 } => {
+                cancelled.set(cancelled.get() + 1);
+                Ok(Response::Ok)
+            }
+            Command::ReleaseResult { request: 1_000_000 } => Ok(Response::Ok),
+            Command::TakeResult { request: 1_000_000 } => Ok(Response::Result {
+                payload: json!({"namespace":"org.example.alpha","version":1,"value":{"enabled":true}}),
+            }),
+            command => broker.send(command),
+        };
+        let target = "/launch?appid=7&mode=1280x720x60&rikey=00112233445566778899aabbccddeeff&rikeyid=17&alpha=1";
+        assert!(
+            router
+                .dispatch_with(
+                    9,
+                    request(target),
+                    trusted_tls(b"certificate"),
+                    now,
+                    &mut send
+                )
+                .is_none()
+        );
+        for _ in 0..10 {
+            router.poll_with_identity(now, &mut send, |_, _| true);
+            if admitted.get() > 0 {
+                break;
+            }
+        }
+        assert_eq!(admitted.get(), 1);
+        if disconnect {
+            router.cancel_with(9, now, &mut send);
+        } else {
+            router.poll_with_identity(now, &mut send, |_, permission| {
+                !matches!(permission, Permission::LaunchWithEntitlements(_))
+            });
+        }
+        assert_eq!(cancelled.get(), 1);
+        assert!(
+            router
+                .poll_with_identity(now + Duration::from_secs(1), &mut send, |_, _| true)
+                .is_empty()
+        );
+        assert!(!router.launches.busy());
+    }
+}
+
+#[test]
+fn unknown_launch_participant_admission_is_held_until_deadline_without_retry_after_disconnect() {
+    use std::cell::Cell;
+    let now = Instant::now();
+    let mut router = streaming_router();
+    router.set_launch_participants(vec![neutral_launch_binding("alpha", "org.example.alpha")]);
+    let mut broker = Broker::default();
+    let attempts = Cell::new(0);
+    let mut send = |command| match command {
+        Command::CallApi { .. } => {
+            attempts.set(attempts.get() + 1);
+            Err("lost admission".into())
+        }
+        command => broker.send(command),
+    };
+    let target = "/launch?appid=7&mode=1280x720x60&rikey=00112233445566778899aabbccddeeff&rikeyid=17&alpha=1";
+    assert!(
+        router
+            .dispatch_with(
+                9,
+                request(target),
+                trusted_tls(b"certificate"),
+                now,
+                &mut send
+            )
+            .is_none()
+    );
+    for _ in 0..10 {
+        router.poll_with_identity(now, &mut send, |_, _| true);
+        if attempts.get() > 0 {
+            break;
+        }
+    }
+    assert_eq!(attempts.get(), 1);
+    router.cancel_with(9, now, &mut send);
+    assert_eq!(router.jobs.len(), 1);
+    router.poll_with_identity(now + Duration::from_secs(1), &mut send, |_, _| true);
+    assert_eq!(attempts.get(), 1);
+    assert_eq!(router.jobs.len(), 1);
+    router.poll_with_identity(now + Duration::from_secs(6), &mut send, |_, _| true);
+    assert_eq!(attempts.get(), 1);
+    assert!(router.jobs.is_empty());
+    assert!(!router.launches.busy());
+}
+
+#[test]
+fn resume_invokes_approved_participant_and_projects_new_generation() {
+    let now = Instant::now();
+    let mut router = streaming_router_with_desktop(true);
+    router.set_launch_participants(vec![neutral_launch_binding("alpha", "org.example.alpha")]);
+    let mut broker = Broker::default();
+    let initial = "/launch?appid=2147483647&mode=1280x720x60&rikey=00112233445566778899aabbccddeeff&rikeyid=17";
+    assert!(
+        router
+            .dispatch_with(
+                1,
+                request(initial),
+                trusted_tls(b"certificate"),
+                now,
+                &mut |cmd| broker.send(cmd)
+            )
+            .is_none()
+    );
+    let (_, initial_reply) = poll_until_reply(&mut router, &mut broker, now);
+    assert_eq!(initial_reply.status, 200);
+    router.reply_delivered(1);
+    let resume = "/resume?appid=2147483647&mode=1280x720x60&rikey=11112233445566778899aabbccddeeff&rikeyid=18&alpha=1";
+    assert!(
+        router
+            .dispatch_with(
+                2,
+                request(resume),
+                trusted_tls(b"certificate"),
+                now,
+                &mut |cmd| broker.send(cmd)
+            )
+            .is_none()
+    );
+    let mut seen = false;
+    let mut reply = None;
+    for _ in 0..200 {
+        let replies = router.poll_with_identity(now, &mut |command| match command {
+            Command::CallApi { payload, .. } => {
+                assert_eq!(payload["resume"], true);
+                assert_eq!(payload["fields"], json!({"alpha":"1"}));
+                seen = true;
+                Ok(Response::Accepted { id:1_000_000 })
+            }
+            Command::TakeResult { request:1_000_000 } => Ok(Response::Result { payload:json!({"namespace":"org.example.alpha","version":1,"value":{"enabled":true}}) }),
+            command => broker.send(command),
+        }, |_, _| true);
+        if let Some((_, response)) = replies.into_iter().next() {
+            reply = Some(response);
+            break;
+        }
+    }
+    assert!(seen);
+    assert_eq!(reply.expect("resume reply").status, 200);
+    let open = broker
+        .accepted
+        .iter()
+        .rev()
+        .find(|payload| payload["action"] == "open")
+        .expect("resumed stream open");
+    assert_eq!(open["launch_options"][0]["namespace"], "org.example.alpha");
+}
+
+#[test]
+fn invalid_launch_participant_reply_never_starts_a_session() {
+    for invalid in [
+        json!({"namespace":"org.example.other","version":1,"value":{"enabled":true}}),
+        json!({"namespace":"org.example.alpha","version":2,"value":{"enabled":true}}),
+        json!({"namespace":"org.example.alpha","version":1,"value":{"unknown":true}}),
+    ] {
+        let now = Instant::now();
+        let mut router = streaming_router();
+        router.set_launch_participants(vec![neutral_launch_binding("alpha", "org.example.alpha")]);
+        let mut broker = Broker::default();
+        let target = "/launch?appid=7&mode=1280x720x60&rikey=00112233445566778899aabbccddeeff&rikeyid=17&alpha=1";
+        assert!(
+            router
+                .dispatch_with(
+                    9,
+                    request(target),
+                    trusted_tls(b"certificate"),
+                    now,
+                    &mut |cmd| broker.send(cmd)
+                )
+                .is_none()
+        );
+        let mut reply = None;
+        for _ in 0..15 {
+            let replies = router.poll_with_identity(
+                now,
+                &mut |command| match command {
+                    Command::CallApi { .. } => Ok(Response::Accepted { id: 1_000_000 }),
+                    Command::TakeResult { request: 1_000_000 } => Ok(Response::Result {
+                        payload: invalid.clone(),
+                    }),
+                    command => broker.send(command),
+                },
+                |_, _| true,
+            );
+            if let Some((_, response)) = replies.into_iter().next() {
+                reply = Some(response);
+                break;
+            }
+        }
+        assert_eq!(reply.expect("invalid option response").status, 502);
+        assert!(!router.launches.busy());
+        assert!(
+            !broker
+                .accepted
+                .iter()
+                .any(|payload| payload["action"] == "open")
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires independently built neutral fixture and runtime libraries"]
+fn independently_loaded_sdk_fixture_serves_unchanged_launch_consumer() {
+    use amaterasu_contracts::{
+        ApiFieldKind, ApiMethod, ApiMethodApproval, ApiPrivilege, ApiSchema, Grants, RuntimeConfig,
+    };
+    use amaterasu_module_sdk::abi::{
+        BorrowedBytes, HostApi, ModuleApi, ModuleEntry, RuntimeApi, RuntimeEntry, STATUS_OK,
+    };
+    use std::{ffi::c_void, mem::MaybeUninit, path::PathBuf};
+    let runtime_path =
+        PathBuf::from(std::env::var_os("AMATERASU_TEST_RUNTIME").expect("runtime path"));
+    let fixture_path =
+        PathBuf::from(std::env::var_os("AMATERASU_TEST_LAUNCH_FIXTURE").expect("fixture path"));
+    // SAFETY: these are explicitly supplied test artifacts and remain loaded until all instances are destroyed.
+    let runtime_library = unsafe { libloading::Library::new(runtime_path) }.unwrap();
+    let fixture_library = unsafe { libloading::Library::new(fixture_path) }.unwrap();
+    // SAFETY: both libraries export their documented, versioned entry points.
+    let runtime_entry: libloading::Symbol<RuntimeEntry> =
+        unsafe { runtime_library.get(b"amaterasu_runtime_v1\0") }.unwrap();
+    let fixture_entry: libloading::Symbol<ModuleEntry> =
+        unsafe { fixture_library.get(b"amaterasu_module_v1\0") }.unwrap();
+    // SAFETY: the entry points return static ABI tables owned by their loaded libraries.
+    let runtime_api = unsafe { &*runtime_entry() };
+    let fixture_api = unsafe { &*fixture_entry() };
+    assert!(runtime_api.header.supports::<RuntimeApi>());
+    assert!(fixture_api.header.supports::<ModuleApi>());
+    let shape = |fields: &[(&str, ApiFieldKind)]| ApiSchema {
+        required: fields
+            .iter()
+            .map(|(name, kind)| ((*name).into(), kind.clone()))
+            .collect(),
+        optional: BTreeMap::new(),
+        allow_extra: false,
+    };
+    let bindings = vec![
+        neutral_launch_binding("alpha", "org.example.alpha"),
+        neutral_launch_binding("beta", "org.example.beta"),
+    ];
+    assert!(launch_participants::validate(&bindings).is_ok());
+    for provider in ["org.example.fixture-one", "org.example.fixture-two"] {
+        let mut config = RuntimeConfig::default();
+        let mut services: BTreeSet<String> = bindings
+            .iter()
+            .map(|binding| binding.service.clone())
+            .collect();
+        services.insert("amaterasu.rtsp/1".into());
+        config.principals.insert(
+            "amaterasu.nvhttp".into(),
+            Grants {
+                call: services.clone(),
+                ..Default::default()
+            },
+        );
+        config.principals.insert(
+            provider.into(),
+            Grants {
+                provide: services,
+                ..Default::default()
+            },
+        );
+        for binding in &bindings {
+            config.api_methods.push(ApiMethodApproval {
+                provider: provider.into(),
+                callers: ["amaterasu.nvhttp".into()].into(),
+                method: ApiMethod {
+                    service: binding.service.clone(),
+                    method: binding.method.clone(),
+                    interface_major: 1,
+                    interface_minor: 0,
+                    request: shape(&[
+                        ("version", ApiFieldKind::Integer),
+                        ("resume", ApiFieldKind::Boolean),
+                        ("fields", ApiFieldKind::Object),
+                    ]),
+                    response: shape(&[
+                        ("namespace", ApiFieldKind::String),
+                        ("version", ApiFieldKind::Integer),
+                        ("value", ApiFieldKind::Object),
+                    ]),
+                    privilege: ApiPrivilege::User,
+                },
+            });
+        }
+        let config_bytes = serde_json::to_vec(&config).unwrap();
+        let mut runtime: *mut c_void = std::ptr::null_mut();
+        // SAFETY: input and output remain valid during creation and runtime is destroyed after the fixture.
+        assert_eq!(
+            unsafe { (runtime_api.create)(BorrowedBytes::new(&config_bytes), &mut runtime) },
+            STATUS_OK
+        );
+        let endpoint = |principal: &str| {
+            let mut output = MaybeUninit::<HostApi>::uninit();
+            // SAFETY: runtime is live, principal bytes and output are valid during the call.
+            assert_eq!(
+                unsafe {
+                    (runtime_api.endpoint)(
+                        runtime,
+                        BorrowedBytes::new(principal.as_bytes()),
+                        output.as_mut_ptr(),
+                    )
+                },
+                STATUS_OK
+            );
+            // SAFETY: a successful endpoint call initialized the table.
+            unsafe { output.assume_init() }
+        };
+        let owner_endpoint = endpoint("amaterasu.nvhttp");
+        let provider_endpoint = endpoint(provider);
+        let mut fixture: *mut c_void = std::ptr::null_mut();
+        // SAFETY: endpoint and output are valid, and fixture is retired before runtime destruction.
+        assert_eq!(
+            unsafe { (fixture_api.create)(&provider_endpoint, &mut fixture) },
+            STATUS_OK
+        );
+        assert!(!fixture.is_null());
+        // SAFETY: the runtime and endpoint outlive this client and all calls.
+        let owner = unsafe { RuntimeClient::from_endpoint(owner_endpoint) };
+        let mut fake = Broker::default();
+        let now = Instant::now();
+        let mut router = streaming_router();
+        router.set_launch_participants(bindings.clone());
+        let target = "/launch?appid=7&mode=1280x720x60&rikey=00112233445566778899aabbccddeeff&rikeyid=17&alpha=1&beta=2";
+        assert!(
+            router
+                .dispatch_with(
+                    1,
+                    request(target),
+                    trusted_tls(b"certificate"),
+                    now,
+                    &mut |cmd| fake.send(cmd)
+                )
+                .is_none()
+        );
+        let mut response = None;
+        for _ in 0..200 {
+            let replies = router.poll_with_identity(now, &mut |command| match command {
+                command @ Command::CallApi { .. } => match owner.send_ephemeral(command)? {
+                    Response::Accepted { id } => Ok(Response::Accepted { id:id + 1_000_000 }),
+                    other => Ok(other),
+                },
+                command @ Command::Request { .. } if matches!(&command, Command::Request { service, .. } if service == "amaterasu.rtsp/1") => match owner.send_ephemeral(command)? {
+                    Response::Accepted { id } => Ok(Response::Accepted { id:id + 1_000_000 }),
+                    other => Ok(other),
+                },
+                Command::TakeResult { request } if request >= 1_000_000 => owner.send_ephemeral(Command::TakeResult { request:request - 1_000_000 }),
+                Command::Cancel { request } if request >= 1_000_000 => owner.send_ephemeral(Command::Cancel { request:request - 1_000_000 }),
+                command => fake.send(command),
+            }, |_, _| true);
+            // SAFETY: fixture remains live and lifecycle calls are serialized by this test.
+            assert_eq!(unsafe { (fixture_api.tick)(fixture) }, STATUS_OK);
+            if let Some((_, reply)) = replies.into_iter().next() {
+                response = Some(reply);
+                break;
+            }
+        }
+        assert_eq!(response.expect("loaded fixture launch reply").status, 200);
+        // SAFETY: fixture is destroyed once, before the runtime and loaded libraries.
+        unsafe { (fixture_api.destroy)(fixture) };
+        // SAFETY: all endpoint users are retired before runtime destruction.
+        unsafe { (runtime_api.destroy)(runtime) };
+    }
+}
+
+#[test]
+fn oversized_participant_output_stops_before_application_preparation() {
+    let now = Instant::now();
+    let mut router = streaming_router();
+    router.set_launch_participants(vec![neutral_launch_binding("alpha", "org.example.alpha")]);
+    let mut broker = Broker::default();
+    let target = "/launch?appid=7&mode=1280x720x60&rikey=00112233445566778899aabbccddeeff&rikeyid=17&alpha=1";
+    assert!(
+        router
+            .dispatch_with(
+                9,
+                request(target),
+                trusted_tls(b"certificate"),
+                now,
+                &mut |cmd| broker.send(cmd)
+            )
+            .is_none()
+    );
+    let mut reply = None;
+    for _ in 0..15 {
+        let replies = router.poll_with_identity(now, &mut |command| match command {
+            Command::CallApi { .. } => Ok(Response::Accepted { id:1_000_000 }),
+            Command::TakeResult { request:1_000_000 } => Ok(Response::Result { payload:json!({"namespace":"org.example.alpha","version":1,"value":{"enabled":true,"oversized":"x".repeat(4096)}}) }),
+            command => broker.send(command),
+        }, |_, _| true);
+        if let Some((_, response)) = replies.into_iter().next() {
+            reply = Some(response);
+            break;
+        }
+    }
+    assert_eq!(reply.expect("oversized participant response").status, 502);
+    assert!(!router.launches.busy());
+    assert!(!broker.accepted.iter().any(|payload| matches!(
+        payload["action"].as_str(),
+        Some("preflight_export" | "launch_export" | "open")
+    )));
+}
+
+#[test]
+fn unsupported_or_invalid_stream_declaration_rejects_before_participants_and_preparation() {
+    let cases = [
+        json!({"version":1,"options":[]}),
+        json!({"version":1,"options":[{"namespace":"org.example.alpha","version":1,"schema":{"id":"org.example.option","major":1,"minor":0,"digest":"0".repeat(64)}}]}),
+        json!({"version":2,"options":[]}),
+        json!({"version":1,"options":[],"extra":"x".repeat(8192)}),
+    ];
+    for declaration in cases {
+        let now = Instant::now();
+        let mut router = streaming_router();
+        router.set_launch_participants(vec![neutral_launch_binding("alpha", "org.example.alpha")]);
+        let mut broker = Broker::default();
+        let target = "/launch?appid=7&mode=1280x720x60&rikey=00112233445566778899aabbccddeeff&rikeyid=17&alpha=1";
+        assert!(
+            router
+                .dispatch_with(
+                    1,
+                    request(target),
+                    trusted_tls(b"certificate"),
+                    now,
+                    &mut |cmd| broker.send(cmd)
+                )
+                .is_none()
+        );
+        let mut called = false;
+        let mut response = None;
+        for _ in 0..20 {
+            let replies = router.poll_with_identity(
+                now,
+                &mut |command| match command {
+                    Command::CallApi { .. } => {
+                        called = true;
+                        Ok(Response::error("unexpected", "participant called"))
+                    }
+                    Command::TakeResult { request }
+                        if broker
+                            .requests
+                            .get(&request)
+                            .is_some_and(|v| v["action"] == "launch_option_capabilities") =>
+                    {
+                        Ok(Response::Result {
+                            payload: declaration.clone(),
+                        })
+                    }
+                    command => broker.send(command),
+                },
+                |_, _| true,
+            );
+            if let Some((_, reply)) = replies.into_iter().next() {
+                response = Some(reply);
+                break;
+            }
+        }
+        assert_eq!(response.expect("rejection").status, 502);
+        assert!(!called);
+        assert!(!router.launches.busy());
+        assert!(!broker.accepted.iter().any(|p| matches!(
+            p["action"].as_str(),
+            Some("preflight_export" | "launch_export" | "open")
+        )));
+    }
+}
+
+#[test]
+fn pending_stream_declaration_is_retired_on_disconnect_or_deadline() {
+    for disconnect in [true, false] {
+        let now = Instant::now();
+        let mut router = streaming_router();
+        router.set_launch_participants(vec![neutral_launch_binding("alpha", "org.example.alpha")]);
+        let mut broker = Broker::default();
+        let target = "/launch?appid=7&mode=1280x720x60&rikey=00112233445566778899aabbccddeeff&rikeyid=17&alpha=1";
+        assert!(
+            router
+                .dispatch_with(
+                    1,
+                    request(target),
+                    trusted_tls(b"certificate"),
+                    now,
+                    &mut |cmd| broker.send(cmd)
+                )
+                .is_none()
+        );
+        for _ in 0..10 {
+            router.poll_with_identity(
+                now,
+                &mut |command| match command {
+                    Command::TakeResult { request }
+                        if broker
+                            .requests
+                            .get(&request)
+                            .is_some_and(|v| v["action"] == "launch_option_capabilities") =>
+                    {
+                        Ok(Response::Pending)
+                    }
+                    command => broker.send(command),
+                },
+                |_, _| true,
+            );
+            if broker
+                .requests
+                .values()
+                .any(|v| v["action"] == "launch_option_capabilities")
+            {
+                break;
+            }
+        }
+        let request_id = *broker
+            .requests
+            .iter()
+            .find(|(_, v)| v["action"] == "launch_option_capabilities")
+            .unwrap()
+            .0;
+        if disconnect {
+            router.cancel_with(1, now, &mut |command| broker.send(command));
+        } else {
+            let replies = router.poll_with_identity(
+                now + Duration::from_secs(6),
+                &mut |command| broker.send(command),
+                |_, _| true,
+            );
+            assert_eq!(replies[0].1.status, 504);
+        }
+        assert!(broker.cancelled.contains(&request_id));
+        assert!(!router.launches.busy());
+        assert!(!broker.accepted.iter().any(|p| matches!(
+            p["action"].as_str(),
+            Some("preflight_export" | "launch_export" | "open")
+        )));
+    }
 }

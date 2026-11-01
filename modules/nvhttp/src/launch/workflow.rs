@@ -99,6 +99,20 @@ impl Controller {
             record.retrying_uncertainty = false;
         }
         let phase = next_phase(&record);
+        if record.state == State::Starting
+            && !record.request.options.entries().is_empty()
+            && matches!(
+                record.stage,
+                Stage::LaunchApplication | Stage::PrepareDisplayAdmission | Stage::OpenRtsp
+            )
+            && !self.stream_open_fits_before_effects(&record)
+        {
+            let mut replies = Vec::new();
+            fail_before_resume_stream(&mut record, "stream_request_too_large", now, &mut replies);
+            self.management_replies.extend(replies);
+            self.records.insert(id, record);
+            return;
+        }
         if matches!(phase, Phase::PrepareLifecycle | Phase::LookupLifecycle)
             && now >= record.deadline
         {
@@ -127,6 +141,15 @@ impl Controller {
         }
         eprintln!("amaterasu launch phase start={phase:?}");
         let call = self.make_call(&mut record, phase);
+        if phase == Phase::OpenRtsp && !call.payload_within_limit(16_384) {
+            // No request was sent; do not fence rollback as an uncertain open.
+            record.rtsp_requested = false;
+            let mut replies = Vec::new();
+            fail_before_resume_stream(&mut record, "stream_request_too_large", now, &mut replies);
+            self.management_replies.extend(replies);
+            self.records.insert(id, record);
+            return;
+        }
         let deadline = if matches!(
             phase,
             Phase::AwaitApplication | Phase::MonitorApplication | Phase::MonitorRtsp
@@ -322,7 +345,7 @@ impl Controller {
         if record.application_reconcile == Some(phase) {
             record.application_reconcile = None;
         }
-        let (service, mut payload, timeout_ms) = match phase {
+        let (service, payload, timeout_ms) = match phase {
             Phase::ReadLaunchEpoch => (LAUNCH_SERVICE, json!({"action":"operation_epoch"}), 5_000),
             Phase::PrepareLifecycle => {
                 record.lifecycle_prepare_dispatched = true;
@@ -484,110 +507,7 @@ impl Controller {
             }
             Phase::OpenRtsp => {
                 record.rtsp_requested = true;
-                let config = self.config.as_ref().expect("enabled streaming config");
-                let capture = json!({
-                    "capture_provider":record.capture_provider,
-                    "constant_rate":record.constant_rate,
-                    "output":record.capture_output,
-                    "encoder":record.selected_encoder,
-                    "audio_endpoint":record.audio_endpoint,
-                    "host_audio_enabled":record.request.host_audio_enabled,
-                });
-                let mut profile = json!({
-                    "width": record.request.width,
-                    "height": record.request.height,
-                    "fps": record.request.fps,
-                    "bitrate_kbps": config.profile.bitrate_kbps,
-                    "max_reference_frames": config.profile.max_reference_frames,
-                    "packet_size": config.profile.packet_size,
-                    "fec_percentage": record.effective_fec_percentage,
-                    "video_max_batch_size_kb": record.effective_video_max_batch_size_kb,
-                    "min_parity_shards": config.profile.min_parity_shards,
-                    "max_fec_blocks": config.profile.max_fec_blocks,
-                    "packet_ms": config.profile.packet_ms,
-                    "audio_bitrate": config.profile.audio_bitrate,
-                    "encrypt_video": config.profile.encrypt_video,
-                    "encrypt_audio": config.profile.encrypt_audio,
-                    "permit_legacy_audio_iv_wrap": config.profile.permit_legacy_audio_iv_wrap,
-                });
-                if record.request.hdr {
-                    profile["hdr"] = json!(true);
-                }
-                let offer = &record.video_codec_offer;
-                if offer.codecs != [amaterasu_media::VideoCodec::H264] {
-                    profile["codecs"] = json!(offer.codecs);
-                }
-                let (max_width, max_height, max_fps) = negotiation_mode_limit(config, offer);
-                let negotiation_bounds = json!({
-                    "max_width": max_width,
-                    "max_height": max_height,
-                    "max_fps": max_fps,
-                    "max_bitrate_kbps": record.effective_max_bitrate_kbps
-                        .filter(|maximum| *maximum > 0)
-                        .map_or(config.profile.bitrate_kbps, |maximum| {
-                            maximum.min(config.profile.bitrate_kbps)
-                        }),
-                    "max_reference_frames": config.profile.max_reference_frames,
-                });
-                (
-                    RTSP_SERVICE,
-                    json!({
-                        "action": "open",
-                        "operation_id": record.rtsp_operation,
-                        "peer_ip": record.peer.remote,
-                        "device_name": record.device_name.as_str(),
-                        "discover_peers": true,
-                        "key_hex": key_hex(&record.request.remote_input_key),
-                        "key_id": record.request.key_id,
-                        "connect_data": record.connect_data,
-                        "stream_audio": record.effective_stream_audio,
-                        "continuous_audio":
-                            record.request.continuous_audio && record.effective_stream_audio,
-                        "capture_sink_without_routing": record.capture_sink_without_routing,
-                        "virtual_sink": record.resolved_virtual_sink,
-                        "channels": record.resolved_virtual_sink.as_ref().map(|_| record.request.audio_channels),
-                        "back_button_timeout": record.scoped_back_button_timeout,
-                        "controller": record.scoped_controller,
-                        "gamepad": record.scoped_gamepad,
-                        "keyboard": record.scoped_keyboard,
-                        "mouse": record.scoped_mouse,
-                        "native_pen_touch": record.scoped_native_pen_touch,
-                        "ds4_back_as_touchpad_click": record
-                            .scoped_ds4_back_as_touchpad_click,
-                        "motion_as_ds4": record.scoped_motion_as_ds4,
-                        "touchpad_as_ds4": record.scoped_touchpad_as_ds4,
-                        "ds5_inputtino_randomize_mac": record.scoped_ds5_inputtino_randomize_mac,
-                        "high_resolution_scrolling": record.scoped_high_resolution_scrolling,
-                        "always_send_scancodes": record.scoped_always_send_scancodes,
-                        "key_rightalt_to_key_win": record.scoped_key_rightalt_to_key_win,
-                        "keybindings": record.scoped_keybindings,
-                        "key_repeat_delay": record.scoped_key_repeat_delay,
-                        "key_repeat_frequency": record.scoped_key_repeat_frequency,
-                        "ping_timeout_ms": record.global_ping_timeout_ms,
-                        "max_bitrate_kbps": record.effective_max_bitrate_kbps,
-                        "minimum_fps_target": record.effective_minimum_fps_target,
-                        "wgc_pacing_smoothing": record.global_wgc_pacing_smoothing,
-                        "sw_preset":record.effective_software_encoder.effective_preset(),
-                        "sw_tune":record.effective_software_encoder.effective_tune(),
-                        "min_threads":record.effective_software_encoder.effective_threads(),
-                        "qp":record.effective_qp,
-                        "nvenc_settings":record.effective_nvenc_settings,
-                        "nvenc_spatial_aq":record.effective_nvenc_spatial_aq,
-                        "adapter_name":resolved_adapter_setting(record, "adapter_name"),
-                        "adapter_pnp_id":resolved_adapter_setting(record, "adapter_pnp_id"),
-                        "frame_limiter_settings": record.executable_path.as_ref().and(record.frame_limiter_snapshot.as_ref()),
-                        "frame_limiter_executable_path": record.executable_path,
-                        "display_policy_snapshot": record.display_policy_snapshot,
-                        "display_request": record.display_request,
-                        "application_display_settings": record.application_display_settings,
-                        "virtual_display_intent": record.virtual_display_intent,
-                        "display_admission_token": record.display_admission_token,
-                        "capture": capture,
-                        "profile": profile,
-                        "negotiation_bounds": negotiation_bounds,
-                    }),
-                    15_000,
-                )
+                (RTSP_SERVICE, self.stream_open_payload(record), 15_000)
             }
             Phase::LookupRtsp => (
                 RTSP_SERVICE,
@@ -621,12 +541,119 @@ impl Controller {
                 5_000,
             ),
         };
-        if matches!(phase, Phase::OpenRtsp) && record.history_reserved {
+        let operation = self.next_operation(record, phase.name());
+        Call::new(service, payload, operation, timeout_ms)
+    }
+
+    /// Construct the exact stream request without changing operation state.
+    fn stream_open_payload(&self, record: &Record) -> Value {
+        let config = self.config.as_ref().expect("enabled streaming config");
+        let capture = json!({
+            "capture_provider":record.capture_provider,
+            "constant_rate":record.constant_rate,
+            "output":record.capture_output,
+            "encoder":record.selected_encoder,
+            "audio_endpoint":record.audio_endpoint,
+            "host_audio_enabled":record.request.host_audio_enabled,
+        });
+        let mut profile = json!({
+            "width": record.request.width,
+            "height": record.request.height,
+            "fps": record.request.fps,
+            "bitrate_kbps": config.profile.bitrate_kbps,
+            "max_reference_frames": config.profile.max_reference_frames,
+            "packet_size": config.profile.packet_size,
+            "fec_percentage": record.effective_fec_percentage,
+            "video_max_batch_size_kb": record.effective_video_max_batch_size_kb,
+            "min_parity_shards": config.profile.min_parity_shards,
+            "max_fec_blocks": config.profile.max_fec_blocks,
+            "packet_ms": config.profile.packet_ms,
+            "audio_bitrate": config.profile.audio_bitrate,
+            "encrypt_video": config.profile.encrypt_video,
+            "encrypt_audio": config.profile.encrypt_audio,
+            "permit_legacy_audio_iv_wrap": config.profile.permit_legacy_audio_iv_wrap,
+        });
+        if record.request.hdr {
+            profile["hdr"] = json!(true);
+        }
+        let offer = &record.video_codec_offer;
+        if offer.codecs != [amaterasu_media::VideoCodec::H264] {
+            profile["codecs"] = json!(offer.codecs);
+        }
+        let (max_width, max_height, max_fps) = negotiation_mode_limit(config, offer);
+        let negotiation_bounds = json!({
+            "max_width": max_width,
+            "max_height": max_height,
+            "max_fps": max_fps,
+            "max_bitrate_kbps": record.effective_max_bitrate_kbps
+                .filter(|maximum| *maximum > 0)
+                .map_or(config.profile.bitrate_kbps, |maximum| {
+                    maximum.min(config.profile.bitrate_kbps)
+                }),
+            "max_reference_frames": config.profile.max_reference_frames,
+        });
+        let mut payload = json!({
+            "action": "open",
+            "operation_id": record.rtsp_operation,
+            "peer_ip": record.peer.remote,
+            "device_name": record.device_name.as_str(),
+            "discover_peers": true,
+            "key_hex": key_hex(&record.request.remote_input_key),
+            "key_id": record.request.key_id,
+            "connect_data": record.connect_data,
+            "stream_audio": record.effective_stream_audio,
+            "continuous_audio":
+                record.request.continuous_audio && record.effective_stream_audio,
+            "capture_sink_without_routing": record.capture_sink_without_routing,
+            "virtual_sink": record.resolved_virtual_sink,
+            "channels": record.resolved_virtual_sink.as_ref().map(|_| record.request.audio_channels),
+            "back_button_timeout": record.scoped_back_button_timeout,
+            "controller": record.scoped_controller,
+            "gamepad": record.scoped_gamepad,
+            "keyboard": record.scoped_keyboard,
+            "mouse": record.scoped_mouse,
+            "native_pen_touch": record.scoped_native_pen_touch,
+            "ds4_back_as_touchpad_click": record
+                .scoped_ds4_back_as_touchpad_click,
+            "motion_as_ds4": record.scoped_motion_as_ds4,
+            "touchpad_as_ds4": record.scoped_touchpad_as_ds4,
+            "ds5_inputtino_randomize_mac": record.scoped_ds5_inputtino_randomize_mac,
+            "high_resolution_scrolling": record.scoped_high_resolution_scrolling,
+            "always_send_scancodes": record.scoped_always_send_scancodes,
+            "key_rightalt_to_key_win": record.scoped_key_rightalt_to_key_win,
+            "keybindings": record.scoped_keybindings,
+            "key_repeat_delay": record.scoped_key_repeat_delay,
+            "key_repeat_frequency": record.scoped_key_repeat_frequency,
+            "ping_timeout_ms": record.global_ping_timeout_ms,
+            "max_bitrate_kbps": record.effective_max_bitrate_kbps,
+            "minimum_fps_target": record.effective_minimum_fps_target,
+            "wgc_pacing_smoothing": record.global_wgc_pacing_smoothing,
+            "sw_preset":record.effective_software_encoder.effective_preset(),
+            "sw_tune":record.effective_software_encoder.effective_tune(),
+            "min_threads":record.effective_software_encoder.effective_threads(),
+            "qp":record.effective_qp,
+            "nvenc_settings":record.effective_nvenc_settings,
+            "nvenc_spatial_aq":record.effective_nvenc_spatial_aq,
+            "adapter_name":resolved_adapter_setting(record, "adapter_name"),
+            "adapter_pnp_id":resolved_adapter_setting(record, "adapter_pnp_id"),
+            "frame_limiter_settings": record.executable_path.as_ref().and(record.frame_limiter_snapshot.as_ref()),
+            "frame_limiter_executable_path": record.executable_path,
+            "display_policy_snapshot": record.display_policy_snapshot,
+            "display_request": record.display_request,
+            "application_display_settings": record.application_display_settings,
+            "virtual_display_intent": record.virtual_display_intent,
+            "display_admission_token": record.display_admission_token,
+            "capture": capture,
+            "profile": profile,
+            "negotiation_bounds": negotiation_bounds,
+        });
+        if !record.request.options.entries().is_empty() {
+            payload["launch_options"] = json!(record.request.options.entries());
+        }
+        if record.history_reserved {
             payload["history_activity_id"] = json!(record.rtsp_operation);
         }
-        if matches!(phase, Phase::OpenRtsp)
-            && let Some(target) = record.lifecycle_session_target.as_ref()
-        {
+        if let Some(target) = record.lifecycle_session_target.as_ref() {
             payload["lifecycle_session_target"] = json!(target);
             payload["lifecycle_settings_revision"] = json!(
                 record
@@ -636,25 +663,22 @@ impl Controller {
             );
             payload["lifecycle_intent"] = json!(if record.resumed { "resume" } else { "initial" });
         }
-        if matches!(phase, Phase::OpenRtsp)
-            && let Some(policy) = record.video_encryption_policy
-        {
+        if let Some(policy) = record.video_encryption_policy {
             payload["video_encryption_policy"] = json!({
                 "lan_mode": policy.lan_mode,
                 "wan_mode": policy.wan_mode,
             });
         }
-        if matches!(phase, Phase::OpenRtsp) && record.display_request.is_none() {
+        if record.display_request.is_none() {
             payload
                 .as_object_mut()
                 .expect("RTSP open payload")
                 .remove("display_request");
         }
-        if matches!(phase, Phase::OpenRtsp)
-            && (record.display_request.is_some()
-                || record.virtual_display_intent.is_some()
-                || record.application_display_settings.is_some()
-                || (record.executable_path.is_some() && record.frame_limiter_snapshot.is_some()))
+        if record.display_request.is_some()
+            || record.virtual_display_intent.is_some()
+            || record.application_display_settings.is_some()
+            || (record.executable_path.is_some() && record.frame_limiter_snapshot.is_some())
         {
             payload["application_operation_id"] = json!(record.application_operation);
             payload["app_id"] = json!(app_id(record.request.app_id));
@@ -664,8 +688,30 @@ impl Controller {
                     .expect("RTSP admission follows application preflight")
             );
         }
-        let operation = self.next_operation(record, phase.name());
-        Call::new(service, payload, operation, timeout_ms)
+        payload
+    }
+
+    /// Count a conservative final request before admission or application effects.
+    fn stream_open_fits_before_effects(&self, record: &Record) -> bool {
+        let mut payload = self.stream_open_payload(record);
+        if record.lifecycle_required {
+            // The lifecycle parser admits only ASCII identifiers of at most 128
+            // bytes and a nonzero u64 generation. Reserve their maximum shape.
+            payload["lifecycle_session_target"] = json!({
+                "kind":"session", "host_epoch":"x".repeat(128),
+                "session_id":"x".repeat(128), "generation":u64::MAX,
+            });
+            payload["lifecycle_settings_revision"] = json!(u64::MAX.to_string());
+            payload["lifecycle_intent"] = json!("initial");
+        }
+        if record.display_request.is_some()
+            || record.virtual_display_intent.is_some()
+            || record.application_display_settings.is_some()
+        {
+            // The display admission response accepts exactly 64 lowercase hex bytes.
+            payload["display_admission_token"] = json!("0".repeat(64));
+        }
+        Call::new(RTSP_SERVICE, payload, String::new(), 1).payload_within_limit(16_384)
     }
 
     fn consume(
@@ -2540,6 +2586,10 @@ fn fail_before_resume_stream(
 }
 
 pub(super) fn reject_resume(record: &mut Record, replies: &mut Vec<(u64, Reply)>) {
+    if let Some((previous, entitlements)) = record.resume_previous_options.take() {
+        record.request.options = previous;
+        record.request.entitlements = entitlements;
+    }
     record.resume_abandoned = false;
     if let Some(connection) = record.launch_connection.take() {
         replies.push((
@@ -2596,6 +2646,7 @@ fn complete_launch(record: &mut Record, now: Instant, replies: &mut Vec<(u64, Re
     record.state = State::AwaitingDelivery;
     record.stage = Stage::AwaitingDelivery;
     if let Some(connection) = record.launch_connection {
+        record.resume_previous_options = None;
         replies.push((connection, success_reply(record)));
     } else {
         record.request_cleanup(Some("launch_response_unavailable"), now);
@@ -4114,5 +4165,66 @@ mod rtsp_provider_code_tests {
             "unavailable"
         );
         assert_eq!(safe_rtsp_provider_code(&json!(null)), "unavailable");
+    }
+}
+
+#[cfg(test)]
+mod legacy_option_bound_tests {
+    use super::*;
+    use crate::launch::tests::{config, peer, request};
+
+    #[test]
+    fn no_options_keeps_exact_open_when_conservative_estimate_exceeds_limit() {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        assert!(controller.launch(10, request(1), peer(1), now).is_none());
+        let id = *controller.records.keys().next().unwrap();
+        {
+            let record = controller.records.get_mut(&id).unwrap();
+            record.stage = Stage::OpenRtsp;
+            record.lifecycle_required = true;
+            record.lifecycle_launch_epoch_ready = true;
+            record.lifecycle_session_target = serde_json::from_value(json!({
+                "kind":"session", "host_epoch":"e", "session_id":"s", "generation":1
+            }))
+            .ok();
+            record.global_display_revision = Some(1);
+            record.capture_output = "o".repeat(512);
+            record.scoped_keybindings =
+                Some(amaterasu_input_policy::KeyBindings::from_flat(vec![255; 512]).unwrap());
+            assert!(record.request.options.entries().is_empty());
+        }
+        let mut found = false;
+        for n in 1..=4096 {
+            {
+                let record = controller.records.get_mut(&id).unwrap();
+                record.audio_endpoint = "\"".repeat(n);
+                record.executable_path = Some("\"".repeat(n));
+            }
+            let record = &controller.records[&id];
+            let actual = Call::new(
+                RTSP_SERVICE,
+                controller.stream_open_payload(record),
+                "test".into(),
+                1,
+            );
+            if actual.payload_within_limit(16_384)
+                && !controller.stream_open_fits_before_effects(record)
+            {
+                found = true;
+                break;
+            }
+        }
+        assert!(
+            found,
+            "fixture must straddle the conservative and actual limits"
+        );
+        controller.schedule(now);
+        let job = controller
+            .job
+            .as_ref()
+            .expect("legacy open remains scheduled");
+        assert_eq!(job.phase, Phase::OpenRtsp);
+        assert!(job.call.payload_within_limit(16_384));
     }
 }

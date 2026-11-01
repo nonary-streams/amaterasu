@@ -137,6 +137,12 @@ impl ResumeSnapshot {
     /// resources and obtain a fresh display-admission token before opening RTSP.
     pub(super) fn apply(self, retained: &mut Record) {
         let stream = self.stream;
+        if retained.resume_previous_options.is_none() {
+            retained.resume_previous_options = Some((
+                retained.request.options.clone(),
+                retained.request.entitlements.clone(),
+            ));
+        }
         macro_rules! move_fields { ($($field:ident),+ $(,)?) => { $(retained.$field = stream.$field;)+ }; }
         move_fields!(
             peer,
@@ -270,20 +276,187 @@ mod tests {
     }
 
     #[test]
+    fn resume_replaces_only_the_validated_stream_option_snapshot() {
+        use amaterasu_module_sdk::launch_options::{LaunchOption, LaunchOptions};
+
+        let snapshot = |name: &str, value| {
+            LaunchOptions::validate(
+                vec![LaunchOption {
+                    namespace: name.into(),
+                    version: 1,
+                    value,
+                }],
+                |namespace, version| {
+                    matches!(
+                        (namespace, version),
+                        ("org.example.alpha", 1) | ("net.example.beta", 1)
+                    )
+                },
+            )
+            .unwrap()
+        };
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        controller.set_global_display_policy(7, json!({}));
+        let mut first = request(1);
+        first.options = snapshot("org.example.alpha", json!(true));
+        assert!(controller.launch(1, first, peer(1), now).is_none());
+        controller.global_display_revision = Some(7);
+        controller
+            .records
+            .values_mut()
+            .next()
+            .unwrap()
+            .application_display_overrides = Some(json!({}));
+        let original = controller.records.values().next().unwrap();
+        assert_eq!(
+            original.request.options.entries()[0].namespace,
+            "org.example.alpha"
+        );
+        let mut next = request(2);
+        next.options = snapshot("net.example.beta", json!({"value": 2}));
+        let candidate =
+            ResumeSnapshot::build(&controller, original, next, peer(1), 42, true).unwrap();
+        let retained = controller.records.values_mut().next().unwrap();
+        candidate.apply(retained);
+        assert_eq!(
+            retained.request.options.entries()[0].namespace,
+            "net.example.beta"
+        );
+        let candidate = ResumeSnapshot::build(
+            &controller,
+            controller.records.values().next().unwrap(),
+            request(3),
+            peer(1),
+            43,
+            true,
+        )
+        .unwrap();
+        candidate.apply(controller.records.values_mut().next().unwrap());
+        assert!(
+            controller
+                .records
+                .values()
+                .next()
+                .unwrap()
+                .request
+                .options
+                .entries()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn authorization_failure_after_candidate_application_restores_prior_options() {
+        use amaterasu_module_sdk::launch_options::{LaunchOption, LaunchOptions};
+        use amaterasu_module_sdk::{Command, Response};
+        use std::time::Duration;
+
+        let snapshot = |name: &str| {
+            LaunchOptions::validate(
+                vec![LaunchOption {
+                    namespace: name.into(),
+                    version: 1,
+                    value: json!(true),
+                }],
+                |_, _| true,
+            )
+            .unwrap()
+        };
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        controller.set_global_display_policy(7, json!({}));
+        let mut first = request(1);
+        first.options = snapshot("org.example.alpha");
+        first.entitlements = vec!["org.example/old".into()];
+        assert!(controller.launch(1, first, peer(1), now).is_none());
+        controller.global_display_revision = Some(7);
+        controller
+            .records
+            .values_mut()
+            .next()
+            .unwrap()
+            .application_display_overrides = Some(json!({}));
+        let mut next = request(2);
+        next.options = snapshot("net.example.beta");
+        next.entitlements = vec!["net.example/new".into()];
+        let record = controller.records.values().next().unwrap();
+        let id = record.id;
+        let candidate =
+            ResumeSnapshot::build(&controller, record, next, peer(1), 42, true).unwrap();
+        let record = controller.records.get_mut(&id).unwrap();
+        candidate.apply(record);
+        record.stage = super::super::record::Stage::AuthorizeResumeSnapshot;
+        record.history_release_required = true;
+        assert_eq!(
+            record.request.options.entries()[0].namespace,
+            "net.example.beta"
+        );
+        let mut job = super::super::workflow::Job {
+            record: id,
+            phase: super::super::workflow::Phase::AuthorizeResumeSnapshot,
+            call: super::super::call::Call::new("test/1", json!({}), "test".into(), 5000),
+            deadline: now + Duration::from_secs(10),
+        };
+        let mut replies = Vec::new();
+        for _ in 0..2 {
+            controller.advance(
+                &mut job,
+                now,
+                &mut |command| match command {
+                    Command::Request { .. } => Ok(Response::Accepted { id: 7 }),
+                    Command::TakeResult { .. } => Ok(Response::Result {
+                        payload: json!({"ok": false}),
+                    }),
+                    Command::ReleaseResult { .. } => Ok(Response::Ok),
+                    _ => panic!("unexpected broker command"),
+                },
+                &mut replies,
+            );
+            if let Some(next) = controller.job.take() {
+                job = next;
+            }
+        }
+        let record = &controller.records[&id];
+        assert_eq!(
+            record.request.options.entries()[0].namespace,
+            "org.example.alpha"
+        );
+        assert_eq!(record.request.entitlements, ["org.example/old"]);
+        assert!(record.resume_previous_options.is_none());
+        assert_eq!(
+            record.stage,
+            super::super::record::Stage::ReleaseRejectedResumeHistory
+        );
+        assert_eq!(replies.len(), 1);
+    }
+
+    #[test]
     fn invalid_resume_candidate_leaves_retained_record_unchanged() {
         let now = Instant::now();
         let mut controller = Controller::new(Some(config())).unwrap();
         controller.set_global_display_policy(7, json!({}));
-        assert!(controller.launch(1, request(1), peer(1), now).is_none());
+        let mut first = request(1);
+        first.options = amaterasu_module_sdk::launch_options::LaunchOptions::validate(
+            vec![amaterasu_module_sdk::launch_options::LaunchOption {
+                namespace: "org.example.alpha".into(),
+                version: 1,
+                value: json!(true),
+            }],
+            |_, _| true,
+        )
+        .unwrap();
+        assert!(controller.launch(1, first, peer(1), now).is_none());
+        controller.global_display_revision = Some(7);
         let original = controller.records.values().next().unwrap();
         let width = original.request.width;
+        let options = original.request.options.clone();
         let mut invalid = request(2);
         invalid.width = 50_000;
         assert!(ResumeSnapshot::build(&controller, original, invalid, peer(1), 42, true).is_err());
-        assert_eq!(
-            controller.records.values().next().unwrap().request.width,
-            width
-        );
+        let retained = controller.records.values().next().unwrap();
+        assert_eq!(retained.request.width, width);
+        assert_eq!(retained.request.options, options);
     }
 
     #[test]

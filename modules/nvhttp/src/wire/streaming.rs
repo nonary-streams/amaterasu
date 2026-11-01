@@ -1,5 +1,9 @@
 use super::query::{Query, hex_bytes};
 use crate::launch::LaunchRequest;
+use std::collections::{BTreeMap, BTreeSet};
+
+type ParticipantFields = BTreeMap<String, String>;
+type LaunchProjection = (LaunchRequest, Vec<ParticipantFields>);
 
 const LAUNCH_FIELDS: &[&str] = &[
     "appid",
@@ -28,8 +32,41 @@ const LAUNCH_FIELDS: &[&str] = &[
     "continuousAudio",
 ];
 
+#[cfg(test)]
 pub(super) fn launch_request(query: &Query) -> Result<LaunchRequest, &'static str> {
-    query.require_only(LAUNCH_FIELDS)?;
+    let (request, _) = launch_request_with_fields(query, &[])?;
+    Ok(request)
+}
+
+/// The caller supplies field claims from trusted participant bindings. Each
+/// returned map is scoped to its matching participant; no core field (including
+/// keys) can be claimed. This function does not invoke or authorize participants.
+pub(super) fn launch_request_with_fields(
+    query: &Query,
+    claims: &[&[&str]],
+) -> Result<LaunchProjection, &'static str> {
+    validate_claims(claims)?;
+    let mut projected = vec![BTreeMap::new(); claims.len()];
+    let mut total = 0usize;
+    for (name, value) in query.fields() {
+        if LAUNCH_FIELDS.contains(&name) {
+            continue;
+        }
+        let index = claims
+            .iter()
+            .position(|fields| fields.contains(&name))
+            .ok_or("unsupported query field")?;
+        if value.len() > 512 {
+            return Err("launch option field too large");
+        }
+        total = total
+            .checked_add(name.len() + value.len())
+            .ok_or("launch option fields too large")?;
+        if total > 4096 {
+            return Err("launch option fields too large");
+        }
+        projected[index].insert(name.to_owned(), value.to_owned());
+    }
     validate_metadata(query)?;
     let app_id = decimal_u32(query.required("appid")?)?;
     if app_id == 0 {
@@ -49,19 +86,43 @@ pub(super) fn launch_request(query: &Query) -> Result<LaunchRequest, &'static st
     {
         return Err("invalid device name");
     }
-    Ok(LaunchRequest {
-        hdr: query.get("hdrMode") == Some("1"),
-        app_id,
-        width,
-        height,
-        fps,
-        host_audio_enabled,
-        continuous_audio: query.get("continuousAudio") == Some("1"),
-        audio_channels,
-        device_name: (!device_name.is_empty()).then(|| device_name.to_owned()),
-        remote_input_key,
-        key_id,
-    })
+    Ok((
+        LaunchRequest {
+            options: Default::default(),
+            entitlements: Vec::new(),
+            hdr: query.get("hdrMode") == Some("1"),
+            app_id,
+            width,
+            height,
+            fps,
+            host_audio_enabled,
+            continuous_audio: query.get("continuousAudio") == Some("1"),
+            audio_channels,
+            device_name: (!device_name.is_empty()).then(|| device_name.to_owned()),
+            remote_input_key,
+            key_id,
+        },
+        projected,
+    ))
+}
+
+pub(super) fn validate_claims(claims: &[&[&str]]) -> Result<(), &'static str> {
+    if claims.len() > 16 {
+        return Err("too many launch participants");
+    }
+    let mut claimed = BTreeSet::new();
+    for name in claims.iter().flat_map(|fields| fields.iter().copied()) {
+        if claimed.len() >= 24
+            || name.is_empty()
+            || name.len() > 64
+            || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            || LAUNCH_FIELDS.contains(&name)
+            || !claimed.insert(name)
+        {
+            return Err("invalid launch participant field claim");
+        }
+    }
+    Ok(())
 }
 
 fn validate_metadata(query: &Query) -> Result<(), &'static str> {
@@ -206,6 +267,32 @@ mod tests {
 
     fn parse(fields: &str) -> Result<LaunchRequest, &'static str> {
         launch_request(&Query::parse(&format!("/launch?{fields}")).unwrap())
+    }
+
+    #[test]
+    fn participant_fields_are_scoped_bounded_and_never_include_core_fields() {
+        let base = "appid=7&mode=1920x1080x60&rikey=00112233445566778899aabbccddeeff&rikeyid=1";
+        let query = Query::parse(&format!("/launch?{base}&alphaFlag=1&betaMode=two")).unwrap();
+        assert!(launch_request(&query).is_err());
+        let (_, inputs) =
+            launch_request_with_fields(&query, &[&["alphaFlag"], &["betaMode"]]).unwrap();
+        assert_eq!(inputs[0].get("alphaFlag").map(String::as_str), Some("1"));
+        assert!(!inputs[0].contains_key("betaMode"));
+        assert_eq!(inputs[1].get("betaMode").map(String::as_str), Some("two"));
+        assert!(!inputs.iter().any(|input| input.contains_key("rikey")));
+        assert!(
+            launch_request_with_fields(&query, &[&["alphaFlag", "rikey"], &["betaMode"]]).is_err()
+        );
+        assert!(
+            launch_request_with_fields(&query, &[&["alphaFlag"], &["alphaFlag", "betaMode"]])
+                .is_err()
+        );
+        assert!(launch_request_with_fields(&query, &[&["alphaFlag"]]).is_err());
+        let oversized =
+            Query::parse(&format!("/launch?{base}&alphaFlag={}", "a".repeat(513))).unwrap();
+        assert!(launch_request_with_fields(&oversized, &[&["alphaFlag"]]).is_err());
+        let duplicate = format!("/launch?{base}&alphaFlag=1&alphaFlag=2");
+        assert!(Query::parse(&duplicate).is_err());
     }
 
     #[test]

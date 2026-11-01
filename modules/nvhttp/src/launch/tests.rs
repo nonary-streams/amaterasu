@@ -361,6 +361,8 @@ fn peer_with_ds4_back_as_touchpad_click(
 
 pub(super) fn request(key: u8) -> LaunchRequest {
     LaunchRequest {
+        options: Default::default(),
+        entitlements: Vec::new(),
         hdr: false,
         app_id: 1,
         width: 1280,
@@ -1193,6 +1195,42 @@ fn virtual_sink_overrides_follow_client_app_global_precedence_and_empty_clears_i
     // Explicit empty in the app scope clears the global selector while the
     // regular application endpoint keeps its capture-only policy.
     launch_payload(None, Some(""), None, "endpoint.application", true);
+}
+
+#[test]
+fn approved_launch_options_reach_the_selected_stream_request() {
+    use amaterasu_module_sdk::launch_options::{LaunchOption, LaunchOptions};
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    let mut stream = request(71);
+    stream.options = LaunchOptions::validate(
+        vec![
+            LaunchOption {
+                namespace: "org.example.alpha".into(),
+                version: 1,
+                value: json!({"enabled":true}),
+            },
+            LaunchOption {
+                namespace: "net.example.beta".into(),
+                version: 2,
+                value: json!({"mode":"test"}),
+            },
+        ],
+        |name, version| {
+            matches!(
+                (name, version),
+                ("org.example.alpha", 1) | ("net.example.beta", 2)
+            )
+        },
+    )
+    .unwrap();
+    assert!(controller.launch(10, stream, peer(71), now).is_none());
+    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+    assert_eq!(reply.status, 200);
+    let open = opened_rtsp_payload(&broker);
+    assert_eq!(open["launch_options"][0]["namespace"], "org.example.alpha");
+    assert_eq!(open["launch_options"][1]["namespace"], "net.example.beta");
 }
 
 #[test]
@@ -6066,4 +6104,106 @@ fn external_capture_alias_rejects_invalid_names_and_builtin_override_works() {
     let external = CaptureProvider::External("acme".into());
     assert_eq!(CaptureMode::Auto.resolve(external.clone()), (external.clone(), false));
     assert_eq!(CaptureMode::Wgcc.resolve(external), (CaptureProvider::Wgc, true));
+}
+
+#[test]
+fn oversized_assembled_resume_request_restores_previous_snapshot_before_dispatch() {
+    use amaterasu_module_sdk::launch_options::{LaunchOption, LaunchOptions};
+    let snapshot = |name: &str| LaunchOptions::validate(vec![LaunchOption {
+        namespace: name.into(), version: 1, value: json!({"enabled":true}),
+    }], |_, _| true).unwrap();
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let record = controller.records.values_mut().next().unwrap();
+    let id = record.id;
+    record.stage = Stage::OpenRtsp;
+    record.resumed = true;
+    record.lifecycle_session_target = serde_json::from_value(json!({"kind":"session","host_epoch":"e","session_id":"s","generation":1})).ok();
+    record.global_display_revision = Some(7);
+    record.capture_output = "x".repeat(512);
+    record.audio_endpoint = "a".repeat(4096);
+    record.executable_path = Some("p".repeat(4096));
+    record.request.options = LaunchOptions::validate(
+        ["org.example.new", "org.example.other"].into_iter().map(|name| LaunchOption {
+            namespace: name.into(), version: 1, value: json!({"text":"x".repeat(3900)}),
+        }).collect(), |_, _| true,
+    ).unwrap();
+    record.request.entitlements = vec!["org.example/new".into()];
+    record.resume_previous_options = Some((snapshot("org.example.old"), vec!["org.example/old".into()]));
+    controller.schedule(now);
+    let record = &controller.records[&id];
+    assert!(!record.rtsp_requested);
+    assert_eq!(record.state, State::Paused);
+    assert_eq!(record.request.options.entries()[0].namespace, "org.example.old");
+    assert_eq!(record.request.entitlements, ["org.example/old"]);
+    assert!(controller.job.is_none());
+}
+
+#[test]
+fn oversized_late_stream_request_compensates_an_already_started_application() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    assert!(controller.launch(10, request(75), peer(75), now).is_none());
+    let mut injected = false;
+    for step in 0..150 {
+        let tick = now + Duration::from_millis(step * 100);
+        let _ = controller.poll(tick, &mut |command| broker.send(command));
+        if !injected && broker.actions().contains(&("amaterasu.launch/1", "launch_export")) {
+            let record = controller.records.values_mut().next().unwrap();
+            record.capture_output = "x".repeat(16_384);
+            injected = true;
+        }
+        if controller.records.get(&1).is_some_and(|record| record.state.terminal() || record.state == State::CleanupFailed) { break; }
+    }
+    assert!(injected);
+    let record = controller.records.get(&1).expect("retained record");
+    assert_eq!(record.state, State::Failed);
+    assert_eq!(record.failure, Some("stream_request_too_large"));
+    assert!(broker.actions().contains(&("amaterasu.launch/1", "stop")));
+    assert!(broker.application_stopped);
+    assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
+}
+
+#[test]
+fn assembled_options_and_valid_preflight_values_are_bounded_before_effects() {
+    use amaterasu_module_sdk::launch_options::{LaunchOption, LaunchOptions};
+    for oversized in [true, false] {
+        let now = Instant::now();
+        let mut configured = config();
+        if oversized {
+            configured.capture.output = "o".repeat(512);
+            configured.capture.audio_endpoint = "a".repeat(4096);
+        }
+        let mut controller = Controller::new(Some(configured)).unwrap();
+        if oversized {
+            controller.set_session_lifecycle_required(true);
+            controller.set_global_display_policy(1, json!({}));
+        }
+        let mut broker = Broker {
+            application_executable_path: Some(if oversized { "p".repeat(4096) } else { "program".into() }),
+            application_display_settings: Some(json!({"virtual_screen":false})),
+            ..Broker::default()
+        };
+        let length = if oversized { 3900 } else { 8 };
+        let mut launch = request(1);
+        launch.options = LaunchOptions::validate(vec![
+            LaunchOption { namespace:"org.example.alpha".into(), version:1, value:json!({"text":"x".repeat(length)}) },
+            LaunchOption { namespace:"org.example.beta".into(), version:1, value:json!({"text":"x".repeat(length)}) },
+        ], |_, _| true).unwrap();
+        assert!(controller.launch(10, launch, peer(1), now).is_none());
+        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
+        if oversized {
+            assert_ne!(reply.status, 200);
+            assert!(broker.actions().contains(&("amaterasu.launch/1", "preflight_export")));
+            assert!(!broker.commands.iter().any(|command| matches!(command, Command::Request { service, payload, .. } if service == "amaterasu.session-lifecycle/1" && payload["operation"] == "prepare")));
+            for action in ["prepare_display_admission", "launch_export", "open"] {
+                assert!(!broker.actions().iter().any(|(_, seen)| *seen == action), "dispatched {action}");
+            }
+        } else {
+            assert_eq!(reply.status, 200);
+            assert!(broker.actions().contains(&("amaterasu.rtsp/1", "open")));
+        }
+    }
 }

@@ -605,6 +605,9 @@ pub struct VideoEncryptionPolicySnapshot {
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Open {
+    /// Opaque options require a consumer that explicitly supports them.
+    #[serde(default)]
+    pub launch_options: Vec<amaterasu_module_sdk::launch_options::LaunchOption>,
     pub operation_id: String,
     /// Coordinator-issued session selector; it grants no authority by itself.
     #[serde(default)]
@@ -752,6 +755,10 @@ impl Open {
     }
 
     pub fn validate(&self, allow_remote: bool) -> Result<[u8; 16], &'static str> {
+        // The built-in consumer has no approved launch option schemas.
+        if !self.launch_options.is_empty() {
+            return Err("unsupported_launch_options");
+        }
         if self.frame_limiter_settings.is_some() != self.frame_limiter_executable_path.is_some() {
             return Err("invalid_frame_limiter_snapshot");
         }
@@ -1729,6 +1736,7 @@ fn valid_minimum_fps_target(value: f64) -> bool {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    LaunchOptionCapabilities,
     Open(Box<Open>),
     NetworkConfigure {
         port: u16,
@@ -1822,6 +1830,15 @@ mod tests {
 
     fn open() -> Open {
         serde_json::from_value(open_json()).unwrap()
+    }
+
+    #[test]
+    fn built_in_consumer_rejects_unrecognized_launch_options() {
+        let mut input = open_json();
+        input["launch_options"] =
+            json!([{"namespace":"org.example.alpha", "version":1, "value":{"enabled":true}}]);
+        let open: Open = serde_json::from_value(input).unwrap();
+        assert_eq!(open.validate(false), Err("unsupported_launch_options"));
     }
 
     #[test]

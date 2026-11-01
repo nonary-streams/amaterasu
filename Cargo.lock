@@ -496,6 +496,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "amaterasu-launch-options-fixture"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-module-sdk",
+ "serde_json",
+]
+
+[[package]]
 name = "amaterasu-library"
 version = "0.1.0"
 dependencies = [

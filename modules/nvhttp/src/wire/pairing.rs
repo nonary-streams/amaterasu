@@ -309,7 +309,7 @@ impl Router {
 
     pub(super) fn resolve(
         &mut self,
-        job: Job,
+        mut job: Job,
         result: Result<Value, String>,
         now: Instant,
         replies: &mut Vec<(u64, Reply)>,
@@ -392,6 +392,7 @@ impl Router {
                 request,
                 peer,
                 resume,
+                pending,
             } => {
                 let connection = job.connection?;
                 let Some(client_id) = payload.get("client_id").and_then(Value::as_str) else {
@@ -448,6 +449,22 @@ impl Router {
                         return None;
                     }
                 };
+                if !pending.is_empty() {
+                    job.purpose = Purpose::LaunchParticipants {
+                        request,
+                        peer,
+                        resume,
+                        pending,
+                        position: 0,
+                        declaring: true,
+                        results: Vec::new(),
+                    };
+                    job.call = Call::Ready {
+                        payload: json!({}),
+                        not_before: now,
+                    };
+                    return Some(job);
+                }
                 let reply = if resume {
                     self.launches.resume(connection, request, &peer, now)
                 } else {
@@ -460,6 +477,7 @@ impl Router {
             }
             Purpose::Participant { .. }
             | Purpose::UpgradeParticipant { .. }
+            | Purpose::LaunchParticipants { .. }
             | Purpose::Cleanup
             | Purpose::Applications { .. }
             | Purpose::Artwork { .. }

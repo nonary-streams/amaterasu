@@ -3,6 +3,7 @@ mod applications;
 mod artwork;
 mod capabilities;
 mod cleanup;
+pub(crate) mod launch_participants;
 mod pairing;
 pub(crate) mod participants;
 mod query;
@@ -67,6 +68,7 @@ impl RequestContext {
 pub enum Permission {
     List,
     Launch,
+    LaunchWithEntitlements(Vec<String>),
     Entitlement(String),
 }
 
@@ -99,6 +101,7 @@ pub struct Router {
     config: RouterConfig,
     participants: Vec<participants::Binding>,
     approved_upgrades: BTreeSet<u64>,
+    launch_participants: Vec<launch_participants::Binding>,
     launches: LaunchController,
     transcripts: BTreeMap<String, pairing::Transcript>,
     jobs: BTreeMap<u64, Job>,
@@ -152,6 +155,16 @@ enum Purpose {
         request: LaunchRequest,
         peer: PeerIdentity,
         resume: bool,
+        pending: Vec<launch_participants::Pending>,
+    },
+    LaunchParticipants {
+        request: LaunchRequest,
+        peer: PeerIdentity,
+        resume: bool,
+        pending: Vec<launch_participants::Pending>,
+        position: usize,
+        declaring: bool,
+        results: Vec<amaterasu_module_sdk::launch_options::LaunchOption>,
     },
     /// Removes the certificate presented on this paired TLS connection.
     Unpair,
@@ -179,6 +192,14 @@ enum Purpose {
     },
 }
 
+fn launch_permission(entitlements: Vec<String>) -> Permission {
+    if entitlements.is_empty() {
+        Permission::Launch
+    } else {
+        Permission::LaunchWithEntitlements(entitlements)
+    }
+}
+
 const PAIRING_SERVICE: &str = "amaterasu.pairing/1";
 const MAX_JOBS: usize = 32;
 const SERVICE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -191,6 +212,7 @@ impl Router {
             config,
             participants: Vec::new(),
             approved_upgrades: BTreeSet::new(),
+            launch_participants: Vec::new(),
             launches,
             transcripts: BTreeMap::new(),
             jobs: BTreeMap::new(),
@@ -199,6 +221,32 @@ impl Router {
             next_job: 0,
             next_call: 0,
         }
+    }
+
+    pub fn set_launch_participants(&mut self, bindings: Vec<launch_participants::Binding>) {
+        self.launch_participants = bindings;
+    }
+
+    fn parse_launch_options(
+        &self,
+        query: &Query,
+    ) -> Result<(LaunchRequest, Vec<launch_participants::Pending>), &'static str> {
+        let claims: Vec<Vec<&str>> = self
+            .launch_participants
+            .iter()
+            .map(|binding| binding.fields.iter().map(String::as_str).collect())
+            .collect();
+        let claims: Vec<&[&str]> = claims.iter().map(Vec::as_slice).collect();
+        let (request, inputs) = streaming::launch_request_with_fields(query, &claims)?;
+        let pending = self
+            .launch_participants
+            .iter()
+            .cloned()
+            .zip(inputs)
+            .filter(|(_, fields)| !fields.is_empty())
+            .map(|(binding, fields)| launch_participants::Pending { binding, fields })
+            .collect();
+        Ok((request, pending))
     }
 
     pub fn set_participants(&mut self, bindings: Vec<participants::Binding>) {
@@ -484,7 +532,7 @@ impl Router {
                 } else if !peer.launch_allowed {
                     Some(xml::error(403, "launch permission denied"))
                 } else {
-                    let request = match streaming::launch_request(&query) {
+                    let (request, pending) = match self.parse_launch_options(&query) {
                         Ok(request) => request,
                         Err(error) => return Some(xml::error(400, error)),
                     };
@@ -505,6 +553,7 @@ impl Router {
                             request,
                             peer: identity,
                             resume: false,
+                            pending,
                         },
                         json!({
                             "action": "check_client_certificate",
@@ -537,7 +586,7 @@ impl Router {
                 if !peer.launch_allowed {
                     return Some(xml::error(403, "launch permission denied"));
                 }
-                let request = match streaming::launch_request(&query) {
+                let (request, pending) = match self.parse_launch_options(&query) {
                     Ok(request) => request,
                     Err(error) => return Some(xml::error(400, error)),
                 };
@@ -557,6 +606,7 @@ impl Router {
                         request,
                         peer: identity,
                         resume: true,
+                        pending,
                     },
                     json!({"action":"check_client_certificate", "certificate_pem":certificate_pem}),
                     now + SERVICE_TIMEOUT,
@@ -698,9 +748,16 @@ impl Router {
                 | Purpose::Artwork { certificate, .. } => {
                     Some((certificate.as_slice(), Permission::List))
                 }
-                Purpose::LaunchIdentity { peer, .. } => {
-                    Some((peer.certificate(), Permission::Launch))
-                }
+                Purpose::LaunchIdentity { peer, pending, .. }
+                | Purpose::LaunchParticipants { peer, pending, .. } => Some((
+                    peer.certificate(),
+                    launch_permission(
+                        pending
+                            .iter()
+                            .map(|item| item.binding.entitlement.clone())
+                            .collect(),
+                    ),
+                )),
                 Purpose::Participant {
                     binding,
                     certificate,
@@ -733,6 +790,8 @@ impl Router {
             };
             let continued = if matches!(job.purpose, Purpose::UpgradeParticipant { .. }) {
                 self.resolve_upgrade(job, result, &mut replies)
+            } else if matches!(job.purpose, Purpose::LaunchParticipants { .. }) {
+                self.resolve_launch_participant(job, result, now, &mut replies)
             } else if matches!(job.purpose, Purpose::Participant { .. }) {
                 self.resolve_participant(job, result, &mut replies)
             } else if matches!(job.purpose, Purpose::ArtworkRelease { .. }) {
@@ -779,7 +838,57 @@ impl Router {
                     .min(SERVICE_TIMEOUT)
                     .as_millis()
                     .max(1) as u64;
-                let command = if let Purpose::Participant { binding, .. }
+                let command = if let Purpose::LaunchParticipants {
+                    pending,
+                    position,
+                    resume,
+                    declaring,
+                    ..
+                } = &job.purpose
+                {
+                    if *declaring {
+                        let mut nonce = [0u8; 16];
+                        if getrandom::fill(&mut nonce).is_err() {
+                            return Some(Err("operation identifier unavailable".into()));
+                        }
+                        let operation_id = format!(
+                            "nvhttp-option-capabilities-{}",
+                            nonce
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<String>()
+                        );
+                        Command::Request {
+                            service: "amaterasu.rtsp/1".into(),
+                            payload: json!({"action":"launch_option_capabilities"}),
+                            timeout_ms,
+                            operation_id,
+                            parent: None,
+                        }
+                    } else {
+                        let Some(item) = pending.get(*position) else {
+                            return Some(Err("invalid participant state".into()));
+                        };
+                        let mut nonce = [0u8; 16];
+                        if getrandom::fill(&mut nonce).is_err() {
+                            return Some(Err("operation identifier unavailable".into()));
+                        }
+                        let operation_id = format!(
+                            "nvhttp-launch-option-{}",
+                            nonce
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect::<String>()
+                        );
+                        match item
+                            .binding
+                            .call(&item.fields, *resume, timeout_ms, operation_id)
+                        {
+                            Ok(command) => command,
+                            Err(error) => return Some(Err(error.into())),
+                        }
+                    }
+                } else if let Purpose::Participant { binding, .. }
                 | Purpose::UpgradeParticipant { binding, .. } = &job.purpose
                 {
                     // Random operation IDs prevent an old retained broker record
@@ -832,7 +941,9 @@ impl Router {
                     Err(_)
                         if matches!(
                             job.purpose,
-                            Purpose::Participant { .. } | Purpose::UpgradeParticipant { .. }
+                            Purpose::Participant { .. }
+                                | Purpose::UpgradeParticipant { .. }
+                                | Purpose::LaunchParticipants { .. }
                         ) =>
                     {
                         job.call = Call::Uncertain {
@@ -847,7 +958,9 @@ impl Router {
             Call::Uncertain { not_before, .. } if now < *not_before => None,
             Call::Uncertain { command, .. } => {
                 let mut retry = command.clone();
-                if let Command::CallApi { timeout_ms, .. } = &mut retry {
+                if let Command::CallApi { timeout_ms, .. } | Command::Request { timeout_ms, .. } =
+                    &mut retry
+                {
                     // The broker ignores timeout in idempotence matching. Lowering
                     // it cannot extend the deadline if this is a new admission.
                     *timeout_ms = job
@@ -905,6 +1018,113 @@ impl Router {
                     ),
                 ));
             }
+        }
+        None
+    }
+
+    fn resolve_launch_participant(
+        &mut self,
+        mut job: Job,
+        result: Result<Value, String>,
+        now: Instant,
+        replies: &mut Vec<(u64, Reply)>,
+    ) -> Option<Job> {
+        let Purpose::LaunchParticipants {
+            request,
+            peer,
+            resume,
+            pending,
+            position,
+            declaring,
+            results,
+        } = &mut job.purpose
+        else {
+            return None;
+        };
+        if *declaring {
+            let supported = result.ok().and_then(|value| {
+                amaterasu_module_sdk::launch_options::OptionCapabilities::parse(value).ok()
+            });
+            if !supported.is_some_and(|supported| {
+                pending.iter().all(|item| {
+                    supported.accepts(
+                        &item.binding.namespace,
+                        item.binding.version,
+                        &item.binding.consumer_schema,
+                    )
+                })
+            }) {
+                if let Some(connection) = job.connection {
+                    replies.push((connection, xml::error(502, "unsupported launch options")));
+                }
+                return None;
+            }
+            *declaring = false;
+            job.call = Call::Ready {
+                payload: json!({}),
+                not_before: now,
+            };
+            return Some(job);
+        }
+        let item = pending.get(*position)?;
+        let option =
+            result.and_then(|reply| item.binding.validate_reply(reply).map_err(str::to_owned));
+        match option {
+            Ok(option) => results.push(option),
+            Err(_) => {
+                if let Some(connection) = job.connection {
+                    replies.push((
+                        connection,
+                        xml::error(502, "invalid launch participant response"),
+                    ));
+                }
+                return None;
+            }
+        }
+        *position += 1;
+        if *position < pending.len() {
+            job.call = Call::Ready {
+                payload: json!({}),
+                not_before: now,
+            };
+            return Some(job);
+        }
+        let bindings = pending
+            .iter()
+            .map(|item| (&item.binding.namespace, item.binding.version))
+            .collect::<Vec<_>>();
+        request.options = match amaterasu_module_sdk::launch_options::LaunchOptions::validate(
+            std::mem::take(results),
+            |name, version| {
+                bindings
+                    .iter()
+                    .any(|(n, v)| n.as_str() == name && *v == version)
+            },
+        ) {
+            Ok(options) => options,
+            Err(_) => {
+                if let Some(connection) = job.connection {
+                    replies.push((
+                        connection,
+                        xml::error(502, "invalid launch participant response"),
+                    ));
+                }
+                return None;
+            }
+        };
+        request.entitlements = pending
+            .iter()
+            .map(|item| item.binding.entitlement.clone())
+            .collect();
+        let connection = job.connection?;
+        let reply = if *resume {
+            self.launches.resume(connection, request.clone(), peer, now)
+        } else {
+            self.launches
+                .launch(connection, request.clone(), peer.clone(), now)
+        };
+        if let Some(reply) = reply {
+            replies.push((connection, reply));
         }
         None
     }
@@ -986,8 +1206,17 @@ impl Router {
         self.launches.reply_delivered(connection, Instant::now());
     }
 
+    #[cfg(test)]
     pub fn revoke_untrusted(&mut self, trusted: impl FnMut(&[u8]) -> bool) -> Vec<u64> {
         self.launches.revoke_untrusted(Instant::now(), trusted)
+    }
+
+    pub fn revoke_untrusted_with_options(
+        &mut self,
+        trusted: impl FnMut(&[u8], &[String]) -> bool,
+    ) -> Vec<u64> {
+        self.launches
+            .revoke_untrusted_with_options(Instant::now(), trusted)
     }
 
     pub fn shutdown(&mut self, runtime: &RuntimeClient) {
@@ -1008,7 +1237,9 @@ impl Router {
             .filter_map(|(key, job)| {
                 matches!(
                     job.purpose,
-                    Purpose::Participant { .. } | Purpose::UpgradeParticipant { .. }
+                    Purpose::Participant { .. }
+                        | Purpose::UpgradeParticipant { .. }
+                        | Purpose::LaunchParticipants { .. }
                 )
                 .then_some(*key)
             })

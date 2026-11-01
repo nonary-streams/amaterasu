@@ -27,6 +27,7 @@ members = [
     "crates/release",
     "crates/vkms-frame-helper",
     "fixtures/echo",
+    "fixtures/launch-options",
     "fixtures/data-plane",
     "fixtures/extension-example",
     "fixtures/media-probe",
