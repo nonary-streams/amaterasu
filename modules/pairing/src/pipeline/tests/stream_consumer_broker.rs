@@ -43,11 +43,13 @@ fn request_over_broker(
 
 #[test]
 fn scoped_consumer_exchanges_admission_and_retirement_with_actual_pairing_broker() {
-    let (mut pipeline, _harness, _) = paired_native_client();
-    pipeline.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
-        protocol_owner: "nvhttp".into(),
-        effect_owner: "input".into(),
-    });
+    let (mut pipeline, mut harness, certificate_id) = paired_native_client();
+    let schema = "org.amaterasu.feedback.haptics_pcm";
+    grant_feedback_for_test(&mut harness, &mut pipeline, &certificate_id, &[schema]);
+    pipeline.effect_authority = Some(policy_for_feedback(
+        &[schema],
+        crate::protocol::FeedbackPermission::View,
+    ));
     let initial = pipeline.effect_gate.as_ref().unwrap().epoch().to_owned();
     let recovered = pipeline
         .apply_effect_request(
