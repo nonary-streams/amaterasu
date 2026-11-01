@@ -146,6 +146,7 @@ impl Provider for GeneratedPolicy {
 }
 // Independently implemented synthetic executor: it never starts an OS process.
 struct GeneratedExecutor {
+    limiter_v2: amaterasu_module_sdk::application_library::limiter_target_v2::FenceLedger,
     incarnation: String,
     mode: String,
     limiter_capacity: usize,
@@ -380,6 +381,141 @@ impl amaterasu_module_sdk::application_library::provider_adapter::Provider for G
             retired: true,
         })
     }
+
+    fn supports_limiter_target_v2(&self) -> bool {
+        self.mode == "limiter_range"
+    }
+
+    fn attest_limiter_target_v2(
+        &mut self,
+        identity: &Identity<'_>,
+        request: &amaterasu_module_sdk::application_library::limiter_target_v2::Request,
+    ) -> Result<
+        amaterasu_module_sdk::application_library::limiter_target_v2::Attestation,
+        &'static str,
+    > {
+        use amaterasu_module_sdk::application_library::{
+            limiter_target::Stage, limiter_target_v2::Attestation, provider_lifecycle::State,
+        };
+        if request.target.application_id != "fixture-game" {
+            return Err("not_found");
+        }
+        match request.target.stage {
+            Stage::Reserve => {
+                self.limiter_v2
+                    .reserve(identity.caller, identity.initiator, request)?
+            }
+            Stage::Running | Stage::Verify => {
+                if !self.limiter_v2.contains(identity.caller, request)?
+                    || !self
+                        .operations
+                        .get(&(
+                            identity.caller.to_owned(),
+                            request.target.operation_id.clone(),
+                        ))
+                        .is_some_and(|entry| {
+                            entry.0 == request.target.application_id
+                                && entry.1 == request.target.ticket
+                                && entry.2 == State::Running
+                        })
+                {
+                    return Err("execution_mismatch");
+                }
+            }
+        }
+        Ok(Attestation {
+            request: request.clone(),
+            executable_path: "/synthetic/replacement-game".into(),
+        })
+    }
+
+    fn retire_limiter_target_v2(
+        &mut self,
+        identity: &Identity<'_>,
+        request: &amaterasu_module_sdk::application_library::limiter_target_v2::RetirementRequest,
+    ) -> Result<
+        amaterasu_module_sdk::application_library::limiter_target_v2::Retirement,
+        &'static str,
+    > {
+        use amaterasu_module_sdk::application_library::{
+            limiter_target_v2::Retirement, provider_lifecycle::State,
+        };
+        let key = (
+            identity.caller.to_owned(),
+            request.retirement.operation_id.clone(),
+        );
+        if self
+            .operations
+            .get(&key)
+            .is_some_and(|entry| entry.2 != State::Stopped && entry.2 != State::LaunchFailed)
+        {
+            return Err("execution_not_retired");
+        }
+        self.limiter_v2.retire(identity.caller, request)?;
+        self.operations.remove(&key);
+        Ok(Retirement {
+            request: request.clone(),
+            retired: true,
+        })
+    }
+
+    fn fence_limiter_targets_v2(
+        &mut self,
+        identity: &Identity<'_>,
+        request: &amaterasu_module_sdk::application_library::limiter_target_v2::FenceRequest,
+    ) -> Result<amaterasu_module_sdk::application_library::limiter_target_v2::Fence, &'static str>
+    {
+        self.limiter_v2.fence(identity.caller, request)
+    }
+
+    fn limiter_lifecycle_v2(
+        &mut self,
+        identity: &Identity<'_>,
+        request: &amaterasu_module_sdk::application_library::limiter_target_v2::LifecycleRequest,
+    ) -> Result<
+        amaterasu_module_sdk::application_library::limiter_target_v2::LifecycleObservation,
+        &'static str,
+    > {
+        use amaterasu_module_sdk::application_library::limiter_target_v2::{
+            LifecycleAction, LifecycleObservation, RetirementRequest,
+        };
+        let reservation = &request.reservation;
+        if self.limiter_v2.is_fenced(
+            identity.caller,
+            &reservation.original_initiator,
+            &reservation.target.provider_incarnation,
+            &reservation.position,
+        )? {
+            return Err("sequence_fenced");
+        }
+        if request.action == LifecycleAction::Launch
+            && !self.limiter_v2.contains(identity.caller, reservation)?
+        {
+            return Err("reservation_unconfirmed");
+        }
+        let observation = self.lifecycle(identity, request.provider_request())?;
+        if request.action == LifecycleAction::RecoverStop {
+            let retirement = RetirementRequest {
+                version: 2,
+                position: reservation.position.clone(),
+                retirement:
+                    amaterasu_module_sdk::application_library::limiter_target::RetirementRequest {
+                        version: 1,
+                        operation_id: reservation.target.operation_id.clone(),
+                        application_id: reservation.target.application_id.clone(),
+                        provider_incarnation: reservation.target.provider_incarnation.clone(),
+                        original_initiator: reservation.original_initiator.clone(),
+                        policy_identity: reservation.target.policy_identity.clone(),
+                    },
+            };
+            self.limiter_v2.retire(identity.caller, &retirement)?;
+        }
+        Ok(LifecycleObservation {
+            request: request.clone(),
+            observation,
+        })
+    }
+
     fn lifecycle(
         &mut self,
         identity: &Identity<'_>,
@@ -503,7 +639,7 @@ impl ManagedModule for Module {
         getrandom::fill(&mut nonce).map_err(|_| "entropy unavailable")?;
         let incarnation = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
         let executor=amaterasu_module_sdk::application_library::provider_adapter::ProviderAdapter::with_policies(
-            GeneratedExecutor { incarnation, mode:executor_mode, limiter_capacity:if settings.limiter_capacity == 0 { 4096 } else { settings.limiter_capacity.min(4096) }, operations:BTreeMap::new(), reservations:BTreeMap::new(), retirements:BTreeMap::new() },
+            GeneratedExecutor { incarnation, mode:executor_mode, limiter_capacity:if settings.limiter_capacity == 0 { 4096 } else { settings.limiter_capacity.min(4096) }, limiter_v2:Default::default(), operations:BTreeMap::new(), reservations:BTreeMap::new(), retirements:BTreeMap::new() },
             "example.library.provider/1".into(), BTreeMap::from([("amaterasu.launch".into(),amaterasu_module_sdk::application_library::provider_adapter::CallerPolicy { initiators:["amaterasu.nvhttp".into(),"amaterasu.launch".into()].into(), lifecycle:true,..Default::default() })])
         ).map_err(str::to_owned)?;
         for service in [
@@ -540,3 +676,24 @@ impl ManagedModule for Module {
     }
 }
 amaterasu_module_sdk::export_module!(Module);
+
+#[cfg(test)]
+#[path = "../../support/range_contract_tests.rs"]
+mod range_contract_tests;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn sequenced_replacement_range_contract() {
+        let provider = super::GeneratedExecutor {
+            incarnation: "replacement-incarnation".into(),
+            mode: "limiter_range".into(),
+            limiter_capacity: 2,
+            limiter_v2: Default::default(),
+            operations: Default::default(),
+            reservations: Default::default(),
+            retirements: Default::default(),
+        };
+        crate::range_contract_tests::exercise(provider, "example.library.provider/2");
+    }
+}

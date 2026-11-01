@@ -420,6 +420,7 @@ mod provider_tests {
 pub mod artwork;
 /// Executor-attested target for selected streaming limiter operations.
 pub mod limiter_target;
+pub mod limiter_target_v2;
 /// Private, selected application-policy resolver profile.
 pub mod policy;
 pub mod preflight;

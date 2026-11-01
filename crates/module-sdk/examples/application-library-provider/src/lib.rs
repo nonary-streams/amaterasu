@@ -28,6 +28,7 @@ struct Settings {
 }
 
 struct Fixture {
+    limiter_v2: amaterasu_module_sdk::application_library::limiter_target_v2::FenceLedger,
     incarnation: String,
     operations: BTreeMap<(String, String), (String, Option<String>, State)>,
     limiter_reservations: BTreeMap<
@@ -57,6 +58,7 @@ impl Fixture {
             limiter_retirements: BTreeMap::new(),
             limiter_mode: String::new(),
             limiter_capacity: 4096,
+            limiter_v2: Default::default(),
         })
     }
 }
@@ -270,6 +272,141 @@ impl Provider for Fixture {
             retired: true,
         })
     }
+
+    fn supports_limiter_target_v2(&self) -> bool {
+        self.limiter_mode == "range_supported"
+    }
+
+    fn attest_limiter_target_v2(
+        &mut self,
+        identity: &Identity<'_>,
+        request: &amaterasu_module_sdk::application_library::limiter_target_v2::Request,
+    ) -> Result<
+        amaterasu_module_sdk::application_library::limiter_target_v2::Attestation,
+        &'static str,
+    > {
+        use amaterasu_module_sdk::application_library::{
+            limiter_target::Stage, limiter_target_v2::Attestation, provider_lifecycle::State,
+        };
+        if request.target.application_id != "fixture-game" {
+            return Err("not_found");
+        }
+        match request.target.stage {
+            Stage::Reserve => {
+                self.limiter_v2
+                    .reserve(identity.caller, identity.initiator, request)?
+            }
+            Stage::Running | Stage::Verify => {
+                if !self.limiter_v2.contains(identity.caller, request)?
+                    || !self
+                        .operations
+                        .get(&(
+                            identity.caller.to_owned(),
+                            request.target.operation_id.clone(),
+                        ))
+                        .is_some_and(|entry| {
+                            entry.0 == request.target.application_id
+                                && entry.1 == request.target.ticket
+                                && entry.2 == State::Running
+                        })
+                {
+                    return Err("execution_mismatch");
+                }
+            }
+        }
+        Ok(Attestation {
+            request: request.clone(),
+            executable_path: "/synthetic/game".into(),
+        })
+    }
+
+    fn retire_limiter_target_v2(
+        &mut self,
+        identity: &Identity<'_>,
+        request: &amaterasu_module_sdk::application_library::limiter_target_v2::RetirementRequest,
+    ) -> Result<
+        amaterasu_module_sdk::application_library::limiter_target_v2::Retirement,
+        &'static str,
+    > {
+        use amaterasu_module_sdk::application_library::{
+            limiter_target_v2::Retirement, provider_lifecycle::State,
+        };
+        let key = (
+            identity.caller.to_owned(),
+            request.retirement.operation_id.clone(),
+        );
+        if self
+            .operations
+            .get(&key)
+            .is_some_and(|entry| entry.2 != State::Stopped && entry.2 != State::LaunchFailed)
+        {
+            return Err("execution_not_retired");
+        }
+        self.limiter_v2.retire(identity.caller, request)?;
+        self.operations.remove(&key);
+        Ok(Retirement {
+            request: request.clone(),
+            retired: true,
+        })
+    }
+
+    fn fence_limiter_targets_v2(
+        &mut self,
+        identity: &Identity<'_>,
+        request: &amaterasu_module_sdk::application_library::limiter_target_v2::FenceRequest,
+    ) -> Result<amaterasu_module_sdk::application_library::limiter_target_v2::Fence, &'static str>
+    {
+        self.limiter_v2.fence(identity.caller, request)
+    }
+
+    fn limiter_lifecycle_v2(
+        &mut self,
+        identity: &Identity<'_>,
+        request: &amaterasu_module_sdk::application_library::limiter_target_v2::LifecycleRequest,
+    ) -> Result<
+        amaterasu_module_sdk::application_library::limiter_target_v2::LifecycleObservation,
+        &'static str,
+    > {
+        use amaterasu_module_sdk::application_library::limiter_target_v2::{
+            LifecycleAction, LifecycleObservation, RetirementRequest,
+        };
+        let reservation = &request.reservation;
+        if self.limiter_v2.is_fenced(
+            identity.caller,
+            &reservation.original_initiator,
+            &reservation.target.provider_incarnation,
+            &reservation.position,
+        )? {
+            return Err("sequence_fenced");
+        }
+        if request.action == LifecycleAction::Launch
+            && !self.limiter_v2.contains(identity.caller, reservation)?
+        {
+            return Err("reservation_unconfirmed");
+        }
+        let observation = self.lifecycle(identity, request.provider_request())?;
+        if request.action == LifecycleAction::RecoverStop {
+            let retirement = RetirementRequest {
+                version: 2,
+                position: reservation.position.clone(),
+                retirement:
+                    amaterasu_module_sdk::application_library::limiter_target::RetirementRequest {
+                        version: 1,
+                        operation_id: reservation.target.operation_id.clone(),
+                        application_id: reservation.target.application_id.clone(),
+                        provider_incarnation: reservation.target.provider_incarnation.clone(),
+                        original_initiator: reservation.original_initiator.clone(),
+                        policy_identity: reservation.target.policy_identity.clone(),
+                    },
+            };
+            self.limiter_v2.retire(identity.caller, &retirement)?;
+        }
+        Ok(LifecycleObservation {
+            request: request.clone(),
+            observation,
+        })
+    }
+
     fn lifecycle(
         &mut self,
         identity: &Identity<'_>,
@@ -392,11 +529,46 @@ mod library_composition;
 mod artwork_composition;
 
 #[cfg(test)]
+#[path = "../../support/range_contract_tests.rs"]
+mod range_contract_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use amaterasu_module_sdk::requests::IncomingRequest;
     use serde_json::{Value, json};
     use std::collections::BTreeSet;
+
+    #[test]
+    fn sequenced_provider_range_contract() {
+        let mut provider = Fixture::new().unwrap();
+        provider.limiter_mode = "range_supported".into();
+        crate::range_contract_tests::exercise(provider, "example.library.provider/2");
+    }
+
+    #[test]
+    fn opting_into_sequenced_service_preserves_v1_opaque_operation_ids() {
+        let mut provider = Fixture::new().unwrap();
+        provider.limiter_mode = "range_supported".into();
+        let incarnation = provider.incarnation.clone();
+        let mut adapter = ProviderAdapter::with_policies(
+            provider,
+            SERVICE.into(),
+            BTreeMap::from([(
+                "launch".into(),
+                CallerPolicy {
+                    initiators: ["nvhttp".into()].into(),
+                    lifecycle: true,
+                    ..Default::default()
+                },
+            )]),
+        )
+        .unwrap();
+        let result = adapter.dispatch(&IncomingRequest { id:1, caller:"launch".into(), initiator:"nvhttp".into(),
+            service:SERVICE.into(), remaining_ms:10_000,
+            payload:json!({"action":"launch","operation_id":"lim2.valid-legacy-id","application_id":"fixture-game","provider_incarnation":incarnation}) });
+        assert_eq!(result["state"], "running", "{result}");
+    }
 
     fn request(payload: Value) -> IncomingRequest<Value> {
         IncomingRequest {

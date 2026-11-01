@@ -35,6 +35,19 @@ enum Request {
     RetireLimiterTargetV1 {
         request: super::limiter_target::RetirementRequest,
     },
+    LimiterTargetCapabilitiesV2 {},
+    AttestLimiterTargetV2 {
+        request: super::limiter_target_v2::Request,
+    },
+    RetireLimiterTargetV2 {
+        request: super::limiter_target_v2::RetirementRequest,
+    },
+    FenceLimiterTargetsV2 {
+        request: super::limiter_target_v2::FenceRequest,
+    },
+    LimiterLifecycleV2 {
+        request: super::limiter_target_v2::LifecycleRequest,
+    },
     Launch {
         operation_id: String,
         application_id: String,
@@ -103,6 +116,38 @@ pub trait Provider {
     fn supports_limiter_retirement_v1(&self) -> bool {
         false
     }
+    /// Advertise only if sequenced reserves and starts are both fenced.
+    fn supports_limiter_target_v2(&self) -> bool {
+        false
+    }
+    fn attest_limiter_target_v2(
+        &mut self,
+        _identity: &Identity<'_>,
+        _request: &super::limiter_target_v2::Request,
+    ) -> Result<super::limiter_target_v2::Attestation, &'static str> {
+        Err("unsupported")
+    }
+    fn retire_limiter_target_v2(
+        &mut self,
+        _identity: &Identity<'_>,
+        _request: &super::limiter_target_v2::RetirementRequest,
+    ) -> Result<super::limiter_target_v2::Retirement, &'static str> {
+        Err("unsupported")
+    }
+    fn fence_limiter_targets_v2(
+        &mut self,
+        _identity: &Identity<'_>,
+        _request: &super::limiter_target_v2::FenceRequest,
+    ) -> Result<super::limiter_target_v2::Fence, &'static str> {
+        Err("unsupported")
+    }
+    fn limiter_lifecycle_v2(
+        &mut self,
+        _identity: &Identity<'_>,
+        _request: &super::limiter_target_v2::LifecycleRequest,
+    ) -> Result<super::limiter_target_v2::LifecycleObservation, &'static str> {
+        Err("unsupported")
+    }
     /// Bind the reserved target to this operation and keep it unchanged through
     /// the running ticket's retirement. Reject if that guarantee is unavailable.
     fn attest_limiter_target(
@@ -132,6 +177,7 @@ pub struct ProviderAdapter<P> {
     provider: P,
     service: String,
     callers: BTreeMap<String, CallerPolicy>,
+    sequenced: bool,
 }
 
 /// Startup authorization for a single immediate caller. Grants are independent;
@@ -186,11 +232,30 @@ impl<P: Provider> ProviderAdapter<P> {
         service: String,
         callers: BTreeMap<String, CallerPolicy>,
     ) -> Result<Self, &'static str> {
+        Self::with_contract(provider, service, callers, false)
+    }
+
+    /// Register the additive sequenced contract on a distinct `/2` service.
+    /// The original `/1` service keeps its complete legacy operation space.
+    pub fn with_sequenced_policies(
+        provider: P,
+        service: String,
+        callers: BTreeMap<String, CallerPolicy>,
+    ) -> Result<Self, &'static str> {
+        Self::with_contract(provider, service, callers, true)
+    }
+
+    fn with_contract(
+        provider: P,
+        service: String,
+        callers: BTreeMap<String, CallerPolicy>,
+        sequenced: bool,
+    ) -> Result<Self, &'static str> {
         let Some((namespace, version)) = service.rsplit_once('/') else {
             return Err("invalid service");
         };
         if !valid_identifier(namespace)
-            || version != "1"
+            || version != if sequenced { "2" } else { "1" }
             || callers.len() > 16
             || callers.iter().any(|(caller, policy)| {
                 !valid_identifier(caller)
@@ -204,6 +269,7 @@ impl<P: Provider> ProviderAdapter<P> {
             provider,
             service,
             callers,
+            sequenced,
         })
     }
 
@@ -224,6 +290,19 @@ impl<P: Provider> ProviderAdapter<P> {
         let Ok(request) = incoming.decode::<Request>() else {
             return failure("invalid_request");
         };
+        let sequenced_request = matches!(
+            &request,
+            Request::LimiterTargetCapabilitiesV2 { .. }
+                | Request::AttestLimiterTargetV2 { .. }
+                | Request::RetireLimiterTargetV2 { .. }
+                | Request::FenceLimiterTargetsV2 { .. }
+                | Request::LimiterLifecycleV2 { .. }
+        );
+        if !matches!(&request, Request::Describe {} | Request::Identity {})
+            && sequenced_request != self.sequenced
+        {
+            return failure("unsupported_contract");
+        }
         let policy = &self.callers[&incoming.caller];
         let capabilities = self.provider.capabilities();
         let authorized = match &request {
@@ -234,6 +313,11 @@ impl<P: Provider> ProviderAdapter<P> {
             | Request::LimiterTargetCapabilitiesV1 { .. }
             | Request::AttestLimiterTargetV1 { .. }
             | Request::RetireLimiterTargetV1 { .. }
+            | Request::LimiterTargetCapabilitiesV2 { .. }
+            | Request::AttestLimiterTargetV2 { .. }
+            | Request::RetireLimiterTargetV2 { .. }
+            | Request::FenceLimiterTargetsV2 { .. }
+            | Request::LimiterLifecycleV2 { .. }
             | Request::Launch { .. }
             | Request::Lookup { .. }
             | Request::RecoverStop { .. }
@@ -306,6 +390,79 @@ impl<P: Provider> ProviderAdapter<P> {
                 json!({"version":1,"supported":self.provider.supports_limiter_target_v1(),
                     "retirement_supported":self.provider.supports_limiter_retirement_v1()}),
             ),
+            Request::LimiterTargetCapabilitiesV2 {} => {
+                Ok(json!({"version":2,"supported":self.provider.supports_limiter_target_v2()}))
+            }
+            Request::AttestLimiterTargetV2 { request } => request.validate().and_then(|()| {
+                use super::limiter_target::Stage;
+                if !self.provider.supports_limiter_target_v2()
+                    || !policy.initiators.contains(&request.original_initiator)
+                    || self.provider.incarnation() != request.target.provider_incarnation
+                    || match request.target.stage {
+                        Stage::Reserve | Stage::Running => {
+                            identity.initiator != request.original_initiator
+                        }
+                        Stage::Verify => identity.initiator != identity.caller,
+                    }
+                {
+                    return Err("unauthorized");
+                }
+                let proof = self
+                    .provider
+                    .attest_limiter_target_v2(&identity, &request)?;
+                proof.validate_for(&request)?;
+                Ok(json!({"attestation":proof}))
+            }),
+            Request::RetireLimiterTargetV2 { request } => request.validate().and_then(|()| {
+                if !self.provider.supports_limiter_target_v2()
+                    || identity.caller != identity.initiator
+                    || !policy
+                        .initiators
+                        .contains(&request.retirement.original_initiator)
+                    || self.provider.incarnation() != request.retirement.provider_incarnation
+                {
+                    return Err("unauthorized");
+                }
+                let proof = self
+                    .provider
+                    .retire_limiter_target_v2(&identity, &request)?;
+                proof.validate_for(&request)?;
+                Ok(json!({"retirement":proof}))
+            }),
+            Request::FenceLimiterTargetsV2 { request } => request.validate().and_then(|()| {
+                if !self.provider.supports_limiter_target_v2()
+                    || identity.caller != identity.initiator
+                    || !policy.initiators.contains(&request.original_initiator)
+                    || self.provider.incarnation() != request.provider_incarnation
+                {
+                    return Err("unauthorized");
+                }
+                let proof = self
+                    .provider
+                    .fence_limiter_targets_v2(&identity, &request)?;
+                proof.validate_for(&request)?;
+                Ok(json!({"fence":proof}))
+            }),
+            Request::LimiterLifecycleV2 { request } => request.validate().and_then(|()| {
+                use super::limiter_target_v2::LifecycleAction;
+                let owner = &request.reservation.original_initiator;
+                if !self.provider.supports_limiter_target_v2()
+                    || !policy.initiators.contains(owner)
+                    || self.provider.incarnation()
+                        != request.reservation.target.provider_incarnation
+                    || match request.action {
+                        LifecycleAction::Launch => identity.initiator != owner,
+                        LifecycleAction::Lookup | LifecycleAction::RecoverStop => {
+                            identity.initiator != identity.caller
+                        }
+                    }
+                {
+                    return Err("unauthorized");
+                }
+                let observation = self.provider.limiter_lifecycle_v2(&identity, &request)?;
+                observation.validate_for(&request)?;
+                Ok(json!({"lifecycle":observation}))
+            }),
             Request::AttestLimiterTargetV1 { request } => request.validate().and_then(|()| {
                 if !self.provider.supports_limiter_target_v1() {
                     return Err("unsupported");
