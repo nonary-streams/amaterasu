@@ -22,6 +22,8 @@ pub struct MutationResult<A> {
     pub response: Value,
     pub admission: Option<A>,
     pub effect: MutationEffect,
+    /// Confirmed release of one shared reference, after persistence succeeded.
+    pub confirmed_shared_release: Option<OwnerReference>,
 }
 
 /// Manager-owned classification, independent of human-readable error codes.
@@ -114,6 +116,7 @@ struct OperationRecord {
     reply: Reply,
     cleanup: bool,
     creation_fenced: bool,
+    fenced_by_removal: Option<String>,
 }
 
 #[derive(Default)]
@@ -135,9 +138,15 @@ impl Adapter {
         identity: &str,
         reference: Option<&str>,
         except: Option<&str>,
-    ) {
+        removal_id: Option<&str>,
+    ) -> Vec<String> {
+        let mut newly_fenced = Vec::new();
         for ((principal, operation_id), record) in &mut self.operations {
-            if principal != caller || except == Some(operation_id.as_str()) || record.cleanup {
+            if principal != caller
+                || except == Some(operation_id.as_str())
+                || record.cleanup
+                || record.creation_fenced
+            {
                 continue;
             }
             if let Request::Create { owner, .. } = &record.request
@@ -145,28 +154,61 @@ impl Adapter {
                 && reference.is_none_or(|id| id == owner.reference_id)
             {
                 record.creation_fenced = true;
+                record.fenced_by_removal = removal_id.map(str::to_owned);
+                newly_fenced.push(operation_id.clone());
             }
         }
+        newly_fenced
     }
 
-    fn settle_fenced_creations(&mut self, caller: &str, owner: &OwnerReference) {
+    fn mark_absent(record: &mut OperationRecord) {
+        record.reply = Reply::Effect {
+            state: EffectState::Absent,
+            topology: None,
+            observation: ModeObservation::NotObserved,
+        };
+        record.creation_fenced = false;
+        record.fenced_by_removal = None;
+    }
+
+    // Only the removal that fenced a record may settle it. Older unrelated
+    // uncertainty is not resolved by releasing a newer reference epoch.
+    fn settle_fenced_creations(&mut self, caller: &str, owner: &OwnerReference, removal_id: &str) {
         for ((principal, _), record) in &mut self.operations {
             if principal == caller
                 && record.creation_fenced
                 && !record.cleanup
+                && record.fenced_by_removal.as_deref() == Some(removal_id)
                 && matches!(&record.request, Request::Create { owner: original, .. } if original == owner)
             {
-                record.reply = Reply::Effect {
-                    state: EffectState::Absent,
-                    topology: None,
-                    observation: ModeObservation::NotObserved,
-                };
-                record.creation_fenced = false;
+                Self::mark_absent(record);
             }
         }
     }
 
-    pub fn observe_legacy_mutation(&mut self, caller: &str, operation: &Operation) {
+    /// Called synchronously for a manager-confirmed shared-reference release.
+    /// The IDs were fenced by this same invocation, before any later request.
+    pub fn settle_legacy_shared_release(
+        &mut self,
+        caller: &str,
+        owner: &OwnerReference,
+        newly_fenced: &[String],
+    ) {
+        for operation_id in newly_fenced {
+            if let Some(record) = self
+                .operations
+                .get_mut(&(caller.to_owned(), operation_id.clone()))
+                && record.creation_fenced
+                && record.fenced_by_removal.is_none()
+                && !record.cleanup
+                && matches!(&record.request, Request::Create { owner: original, .. } if original == owner)
+            {
+                Self::mark_absent(record);
+            }
+        }
+    }
+
+    pub fn observe_legacy_mutation(&mut self, caller: &str, operation: &Operation) -> Vec<String> {
         match operation {
             Operation::Create {
                 identity,
@@ -176,13 +218,13 @@ impl Adapter {
             | Operation::Remove {
                 identity,
                 reference_id,
-            } => self.observe_mutation(caller, identity, reference_id.as_deref(), None),
+            } => self.observe_mutation(caller, identity, reference_id.as_deref(), None, None),
             // Reconfiguration can replace the output shared by all references.
             Operation::Reconfigure { identity, .. }
             | Operation::ReconfigureModeOnly { identity, .. } => {
-                self.observe_mutation(caller, identity, None, None)
+                self.observe_mutation(caller, identity, None, None, None)
             }
-            _ => {}
+            _ => Vec::new(),
         }
     }
 
@@ -247,8 +289,7 @@ impl<B: Backend> Invocation<'_, B> {
     // Missing/malformed or unreconciled status never proves cleanup settled.
     fn release_confirmed(result: &Value) -> bool {
         result["removed"] == true
-            || (result["reference_released"].as_bool().is_some()
-                && result["reference_owned"] == false)
+            || (result["reference_released"] == true && result["reference_owned"] == false)
     }
 
     fn cleanup_status(&mut self, caller: &str, owner: &OwnerReference) -> Reply {
@@ -384,6 +425,7 @@ impl<B: Backend> Invocation<'_, B> {
             {
                 saved.reply = reply.clone();
                 saved.creation_fenced = false;
+                saved.fenced_by_removal = None;
             }
             return reply;
         }
@@ -415,7 +457,8 @@ impl<B: Backend> Invocation<'_, B> {
                 }
             )
         {
-            self.adapter.settle_fenced_creations(caller, owner);
+            self.adapter
+                .settle_fenced_creations(caller, owner, operation_id);
         }
         reply
     }
@@ -477,6 +520,7 @@ impl<B: Backend> Invocation<'_, B> {
                     &owner.identity,
                     Some(&owner.reference_id),
                     Some(operation_id),
+                    Some(operation_id),
                 );
                 result
             }
@@ -493,7 +537,8 @@ impl<B: Backend> Invocation<'_, B> {
             saved.reply = reply.clone();
         }
         if state == EffectState::Completed {
-            self.adapter.settle_fenced_creations(caller, owner);
+            self.adapter
+                .settle_fenced_creations(caller, owner, operation_id);
         }
         reply
     }
@@ -588,6 +633,7 @@ impl<B: Backend> Invocation<'_, B> {
                 &owner.identity,
                 Some(&owner.reference_id),
                 Some(operation_id),
+                cleanup.then_some(operation_id),
             );
         }
         let uncertain_create =
@@ -610,10 +656,12 @@ impl<B: Backend> Invocation<'_, B> {
                 reply: reply.clone(),
                 cleanup,
                 creation_fenced: uncertain_create,
+                fenced_by_removal: None,
             },
         );
         if cleanup && state == EffectState::Completed {
-            self.adapter.settle_fenced_creations(caller, owner);
+            self.adapter
+                .settle_fenced_creations(caller, owner, operation_id);
         }
         reply
     }
@@ -716,6 +764,7 @@ impl<B: Backend> Provider for Invocation<'_, B> {
                 &owner.identity,
                 Some(&owner.reference_id),
                 Some(operation_id),
+                None,
             );
         }
         self.backend.completion_lost(self.admission.take());
@@ -745,6 +794,7 @@ mod tests {
         revision: u64,
         partial_failure: bool,
         shared: bool,
+        shared_release_confirmed: bool,
         uncertain_create: bool,
         remove_calls: usize,
     }
@@ -756,6 +806,7 @@ mod tests {
                 revision: 7,
                 partial_failure: false,
                 shared: false,
+                shared_release_confirmed: true,
                 uncertain_create: false,
                 remove_calls: 0,
             }
@@ -767,7 +818,7 @@ mod tests {
             match operation {
                 Operation::Status { .. } => (
                     json!({"ok":true, "enabled":true, "recovery_ready":true,
-                    "mutation_domain":{"id":"test-domain", "revision":self.revision},
+                    "mutation_domain":{"id":"test-domain", "revision":self.revision, "pending_mutations":0},
                     "reference_owned":self.reference_owned,
                     "monitors":self.state.map(|state| vec![json!({"state":state,"specification":{"identity":"display","name":"Display","width":1920,"height":1080,"refresh_millihz":60000,"hdr_enabled":false},"virtual_display_layout":"extended","dd_virtual_display_scale":0})]).unwrap_or_default()}),
                     None,
@@ -777,7 +828,7 @@ mod tests {
                     self.reference_owned = false;
                     if self.shared {
                         return (
-                            json!({"ok":true,"removed":false,"reference_released":true,"reference_owned":false}),
+                            json!({"ok":true,"removed":false,"reference_released":self.shared_release_confirmed,"reference_owned":false}),
                             None,
                         );
                     }
@@ -800,6 +851,7 @@ mod tests {
                     response: json!({"ok":false,"code":"journal_unavailable"}),
                     admission: None,
                     effect: MutationEffect::Attempted,
+                    confirmed_shared_release: None,
                 };
             }
             let (response, admission) = self.admit(caller, operation);
@@ -807,6 +859,7 @@ mod tests {
                 response,
                 admission,
                 effect: MutationEffect::Unchanged,
+                confirmed_shared_release: None,
             }
         }
         fn remove_owned(&mut self, caller: &str, owner: &OwnerReference) -> RemovalOutcome {
@@ -858,6 +911,125 @@ mod tests {
         matches!(reply, Reply::Effect { state, .. } if state == expected)
     }
 
+    fn seed_create(
+        adapter: &mut Adapter,
+        principal: &str,
+        id: &str,
+        owner: OwnerReference,
+        fenced: bool,
+    ) {
+        let request = Request::Create {
+            owner,
+            operation_id: id.into(),
+            expected: topology(7),
+            mode: amaterasu_module_sdk::virtual_display_service::Mode {
+                width: 1920,
+                height: 1080,
+                refresh_millihz: 60000,
+                hdr: false,
+            },
+            acceptance: amaterasu_module_sdk::virtual_display_service::ModeAcceptance {
+                max_refresh_delta_ppm: 0,
+                require_hdr_match: true,
+            },
+            name: "Display".into(),
+            layout: Layout::Extended,
+            scale: Some(0),
+        };
+        adapter.operations.insert(
+            (principal.into(), id.into()),
+            OperationRecord {
+                request,
+                reply: Invocation::<FakeBackend>::effect(EffectState::Unknown, None),
+                cleanup: false,
+                creation_fenced: fenced,
+                fenced_by_removal: None,
+            },
+        );
+    }
+
+    #[test]
+    fn legacy_shared_release_settles_only_its_new_fences() {
+        let mut adapter = Adapter::default();
+        let peer = OwnerReference {
+            identity: "display".into(),
+            reference_id: "peer".into(),
+        };
+        seed_create(&mut adapter, "alice", "older-uncertain", owner(), true);
+        seed_create(&mut adapter, "alice", "current", owner(), false);
+        seed_create(&mut adapter, "alice", "peer", peer, false);
+        seed_create(&mut adapter, "bob", "other-owner", owner(), false);
+        let fenced = adapter.observe_legacy_mutation(
+            "alice",
+            &Operation::Remove {
+                identity: "display".into(),
+                reference_id: Some("stream".into()),
+            },
+        );
+        assert_eq!(fenced, vec!["current".to_string()]);
+        adapter.settle_legacy_shared_release("alice", &owner(), &fenced);
+        assert!(adapter.operations[&("alice".into(), "older-uncertain".into())].creation_fenced);
+        assert!(matches!(
+            adapter.operations[&("alice".into(), "current".into())].reply,
+            Reply::Effect {
+                state: EffectState::Absent,
+                ..
+            }
+        ));
+        assert!(!adapter.operations[&("alice".into(), "peer".into())].creation_fenced);
+        assert!(!adapter.operations[&("bob".into(), "other-owner".into())].creation_fenced);
+    }
+
+    #[test]
+    fn typed_shared_release_preserves_earlier_uncertainty_and_peer() {
+        let mut backend = FakeBackend::new();
+        backend.shared = true;
+        let mut adapter = Adapter::default();
+        seed_create(&mut adapter, "alice", "older-uncertain", owner(), true);
+        seed_create(&mut adapter, "alice", "current", owner(), false);
+        seed_create(
+            &mut adapter,
+            "alice",
+            "peer",
+            OwnerReference {
+                identity: "display".into(),
+                reference_id: "peer".into(),
+            },
+            false,
+        );
+        assert!(has_state(
+            run(&mut adapter, &mut backend, &remove()),
+            EffectState::Completed
+        ));
+        assert!(adapter.operations[&("alice".into(), "older-uncertain".into())].creation_fenced);
+        assert!(matches!(
+            adapter.operations[&("alice".into(), "current".into())].reply,
+            Reply::Effect {
+                state: EffectState::Absent,
+                ..
+            }
+        ));
+        assert!(!adapter.operations[&("alice".into(), "peer".into())].creation_fenced);
+    }
+
+    #[test]
+    fn typed_shared_remove_without_release_confirmation_does_not_settle() {
+        let mut backend = FakeBackend::new();
+        backend.shared = true;
+        backend.shared_release_confirmed = false;
+        let mut adapter = Adapter::default();
+        seed_create(&mut adapter, "alice", "current", owner(), false);
+        assert!(has_state(
+            run(&mut adapter, &mut backend, &remove()),
+            EffectState::Pending
+        ));
+        assert!(adapter.operations[&("alice".into(), "current".into())].creation_fenced);
+        assert_eq!(
+            run(&mut adapter, &mut backend, &release()),
+            Reply::OperationNotSettled
+        );
+    }
+
     #[test]
     fn reference_mutation_fences_old_create_even_if_status_looks_ready() {
         let mut backend = FakeBackend::new();
@@ -887,6 +1059,7 @@ mod tests {
                 reply: Invocation::<FakeBackend>::effect(EffectState::Unknown, None),
                 cleanup: false,
                 creation_fenced: false,
+                fenced_by_removal: None,
             },
         );
         let recover = Request::Recover {
@@ -985,6 +1158,7 @@ mod tests {
                 reply: Invocation::<FakeBackend>::effect(EffectState::Pending, None),
                 cleanup: false,
                 creation_fenced: false,
+                fenced_by_removal: None,
             },
         );
         let mut next = request;
@@ -1050,6 +1224,7 @@ mod tests {
                 reply: Invocation::<FakeBackend>::effect(EffectState::Unknown, None),
                 cleanup: false,
                 creation_fenced: false,
+                fenced_by_removal: None,
             },
         );
         adapter.observe_legacy_mutation(
@@ -1188,6 +1363,7 @@ mod tests {
                     ),
                     cleanup: true,
                     creation_fenced: false,
+                    fenced_by_removal: None,
                 },
             );
         }

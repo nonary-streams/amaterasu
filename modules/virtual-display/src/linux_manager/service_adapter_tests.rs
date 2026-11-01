@@ -1247,6 +1247,433 @@ fn production_linux_manager_routes_fenced_requests_to_fake_worker_via_broker() {
         ),
         Reply::OperationReleased
     );
+    // Two references share one output. A confirmed legacy release settles R's
+    // create record without waiting for S or removing the shared output.
+    let Reply::Capabilities { capabilities } = exchange(
+        &mut manager,
+        &mut adapter,
+        &alice,
+        "shared-caps",
+        Request::Capabilities,
+    ) else {
+        panic!("missing capabilities")
+    };
+    let shared_r = OwnerReference {
+        identity: "00000000-0000-0000-0000-000000000004".into(),
+        reference_id: "r".into(),
+    };
+    let shared_s = OwnerReference {
+        identity: shared_r.identity.clone(),
+        reference_id: "s".into(),
+    };
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "shared-create-r",
+            create(shared_r.clone(), "shared-r", capabilities.topology.unwrap())
+        ),
+        Reply::Effect {
+            state: EffectState::Pending,
+            ..
+        }
+    ));
+    assert_eq!(
+        observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "create"
+    );
+    events
+        .send(Event::Created {
+            key: ("alice".into(), shared_r.identity.clone()),
+            result: Ok(Record {
+                owner: "alice".into(),
+                specification: Specification {
+                    hdr_enabled: false,
+                    identity: shared_r.identity.clone(),
+                    width: 1920,
+                    height: 1080,
+                    refresh_millihz: 60000,
+                    name: "Display".into(),
+                },
+                output: "virtual-4".into(),
+                layout: None,
+                references: Some(["r".into()].into()),
+                transition: None,
+            }),
+        })
+        .unwrap();
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "shared-r-ready",
+            Request::Recover {
+                owner: shared_r.clone(),
+                operation_id: "shared-r".into()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Applied,
+            ..
+        }
+    ));
+    let Reply::Capabilities { capabilities } = exchange(
+        &mut manager,
+        &mut adapter,
+        &alice,
+        "shared-caps-s",
+        Request::Capabilities,
+    ) else {
+        panic!("missing capabilities")
+    };
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "shared-create-s",
+            create(shared_s.clone(), "shared-s", capabilities.topology.unwrap())
+        ),
+        Reply::Effect {
+            state: EffectState::Pending,
+            ..
+        }
+    ));
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "shared-s-ready",
+            Request::Recover {
+                owner: shared_s.clone(),
+                operation_id: "shared-s".into()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Applied,
+            ..
+        }
+    ));
+    let release = exchange_legacy(
+        &mut manager,
+        &mut adapter,
+        "shared-legacy-remove-r",
+        Operation::Remove {
+            identity: shared_r.identity.clone(),
+            reference_id: Some(shared_r.reference_id.clone()),
+        },
+    );
+    assert_eq!(release["reference_released"], true);
+    assert_eq!(release["reference_owned"], false);
+    assert!(
+        observed.try_recv().is_err(),
+        "peer output must not be removed"
+    );
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "shared-r-absent",
+            Request::Recover {
+                owner: shared_r.clone(),
+                operation_id: "shared-r".into()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Absent,
+            ..
+        }
+    ));
+    assert_eq!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "shared-release-r",
+            Request::ReleaseOperation {
+                owner: shared_r.clone(),
+                operation_id: "shared-r".into()
+            }
+        ),
+        Reply::OperationReleased
+    );
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "shared-s-survives",
+            Request::Recover {
+                owner: shared_s.clone(),
+                operation_id: "shared-s".into()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Applied,
+            ..
+        }
+    ));
+    // Reacquire R, then repeat the shared release through the typed path.
+    let Reply::Capabilities { capabilities } = exchange(
+        &mut manager,
+        &mut adapter,
+        &alice,
+        "shared-caps-r2",
+        Request::Capabilities,
+    ) else {
+        panic!("missing capabilities")
+    };
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "shared-create-r2",
+            create(
+                shared_r.clone(),
+                "shared-r2",
+                capabilities.topology.unwrap()
+            )
+        ),
+        Reply::Effect {
+            state: EffectState::Pending,
+            ..
+        }
+    ));
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "shared-r2-ready",
+            Request::Recover {
+                owner: shared_r.clone(),
+                operation_id: "shared-r2".into()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Applied,
+            ..
+        }
+    ));
+    let Reply::Capabilities { capabilities } = exchange(
+        &mut manager,
+        &mut adapter,
+        &alice,
+        "shared-caps-remove",
+        Request::Capabilities,
+    ) else {
+        panic!("missing capabilities")
+    };
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "shared-typed-remove-r",
+            Request::Remove {
+                owner: shared_r.clone(),
+                operation_id: "remove-r2".into(),
+                expected: capabilities.topology.unwrap()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Completed,
+            ..
+        }
+    ));
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "shared-r2-absent",
+            Request::Recover {
+                owner: shared_r.clone(),
+                operation_id: "shared-r2".into()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Absent,
+            ..
+        }
+    ));
+    assert_eq!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "shared-release-r2",
+            Request::ReleaseOperation {
+                owner: shared_r.clone(),
+                operation_id: "shared-r2".into()
+            }
+        ),
+        Reply::OperationReleased
+    );
+    assert_eq!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "shared-release-remove",
+            Request::ReleaseOperation {
+                owner: shared_r,
+                operation_id: "remove-r2".into()
+            }
+        ),
+        Reply::OperationReleased
+    );
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "shared-s-still-valid",
+            Request::Recover {
+                owner: shared_s.clone(),
+                operation_id: "shared-s".into()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Applied,
+            ..
+        }
+    ));
+    assert!(
+        observed.try_recv().is_err(),
+        "shared output must remain alive"
+    );
+    // A cancelled legacy completion does not undo a manager-confirmed release.
+    let Reply::Capabilities { capabilities } = exchange(
+        &mut manager,
+        &mut adapter,
+        &alice,
+        "shared-caps-r3",
+        Request::Capabilities,
+    ) else {
+        panic!("missing capabilities")
+    };
+    let shared_r3 = OwnerReference {
+        identity: "00000000-0000-0000-0000-000000000004".into(),
+        reference_id: "r".into(),
+    };
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "shared-create-r3",
+            create(
+                shared_r3.clone(),
+                "shared-r3",
+                capabilities.topology.unwrap()
+            )
+        ),
+        Reply::Effect {
+            state: EffectState::Pending,
+            ..
+        }
+    ));
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "shared-r3-ready",
+            Request::Recover {
+                owner: shared_r3.clone(),
+                operation_id: "shared-r3".into()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Applied,
+            ..
+        }
+    ));
+    let token = alice
+        .request_serialized(
+            RequestOptions {
+                service: crate::SERVICE,
+                timeout_ms: 5000,
+                operation_id: "legacy-remove-lost",
+                parent: None,
+            },
+            &Operation::Remove {
+                identity: shared_r3.identity.clone(),
+                reference_id: Some(shared_r3.reference_id.clone()),
+            },
+        )
+        .unwrap();
+    let incoming = provider.poll_serialized().unwrap().unwrap();
+    let fault = CancelCompletionEndpoint {
+        broker: p.broker.clone(),
+        request_id: token,
+    };
+    crate::handle_legacy(
+        &cancellation_client(&fault),
+        &mut manager,
+        &mut adapter,
+        incoming,
+    )
+    .unwrap();
+    assert!(alice.take_serialized::<Value>(token).is_err());
+    alice
+        .require_success(Command::ReleaseResult { request: token })
+        .unwrap();
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "shared-r3-absent",
+            Request::Recover {
+                owner: shared_r3.clone(),
+                operation_id: "shared-r3".into()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Absent,
+            ..
+        }
+    ));
+    assert_eq!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "shared-release-r3",
+            Request::ReleaseOperation {
+                owner: shared_r3,
+                operation_id: "shared-r3".into()
+            }
+        ),
+        Reply::OperationReleased
+    );
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "shared-s-after-lost",
+            Request::Recover {
+                owner: shared_s,
+                operation_id: "shared-s".into()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Applied,
+            ..
+        }
+    ));
+    assert!(
+        observed.try_recv().is_err(),
+        "shared output must remain alive"
+    );
     drop(manager); // Joins the fake worker without touching OS display state.
 }
 

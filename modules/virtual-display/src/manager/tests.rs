@@ -1654,3 +1654,48 @@ fn create_effect_classification_preserves_noop_and_pre_effect_rejection() {
     assert_eq!(rejected.response["code"], "identity_conflict");
     assert_eq!(calls.borrow().creates.len(), 1);
 }
+
+#[test]
+fn legacy_shared_release_receipt_names_only_the_released_reference() {
+    let (mut manager, _) = setup(true);
+    assert_eq!(
+        manager.admit("owner", create_with_reference("r")).0["ok"],
+        true
+    );
+    assert_eq!(
+        manager.admit("owner", create_with_reference("s")).0["ok"],
+        true
+    );
+    let outcome = manager.admit_with_effect(
+        "owner",
+        Operation::Remove {
+            identity: ID.into(),
+            reference_id: Some("r".into()),
+        },
+    );
+    assert_eq!(
+        outcome.confirmed_shared_release,
+        Some(
+            amaterasu_module_sdk::virtual_display_service::OwnerReference {
+                identity: ID.into(),
+                reference_id: "r".into()
+            }
+        )
+    );
+    let duplicate = manager.admit_with_effect(
+        "owner",
+        Operation::Remove {
+            identity: ID.into(),
+            reference_id: Some("r".into()),
+        },
+    );
+    assert_eq!(duplicate.confirmed_shared_release, None);
+    let status = manager.handle(
+        "owner",
+        Operation::Status {
+            identity: Some(ID.into()),
+            reference_id: Some("s".into()),
+        },
+    );
+    assert_eq!(status["reference_owned"], true);
+}

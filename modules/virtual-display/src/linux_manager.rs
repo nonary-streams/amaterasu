@@ -208,6 +208,7 @@ pub struct Manager {
     topology_revision: u64,
     pending_mutations: usize,
     request_may_mutate: bool,
+    request_shared_release: Option<amaterasu_module_sdk::virtual_display_service::OwnerReference>,
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl Manager {
@@ -237,6 +238,7 @@ impl Manager {
             topology_revision: 0,
             pending_mutations: 0,
             request_may_mutate: false,
+            request_shared_release: None,
             stopped: Default::default(),
         };
         if manager.settings.enabled {
@@ -375,10 +377,12 @@ impl Manager {
         operation: Operation,
     ) -> crate::service_adapter::MutationResult<Admission> {
         self.request_may_mutate = false;
+        self.request_shared_release = None;
         let (response, admission) = self.admit(caller, operation);
         crate::service_adapter::MutationResult {
             response,
             admission,
+            confirmed_shared_release: self.request_shared_release.take(),
             effect: if self.request_may_mutate {
                 crate::service_adapter::MutationEffect::Attempted
             } else {
@@ -720,6 +724,7 @@ impl Manager {
         reference_id: &str,
     ) -> crate::service_adapter::RemovalOutcome {
         self.request_may_mutate = false;
+        self.request_shared_release = None;
         self.tick();
         match self.remove_outcome(caller, identity, Some(reference_id)) {
             crate::service_adapter::RemovalOutcome::Attempted(value)
@@ -790,6 +795,14 @@ impl Manager {
                 return Attempted(failure("journal_unavailable"));
             }
             if !last {
+                if released {
+                    self.request_shared_release = Some(
+                        amaterasu_module_sdk::virtual_display_service::OwnerReference {
+                            identity: identity.into(),
+                            reference_id: reference.into(),
+                        },
+                    );
+                }
                 return Attempted(
                     json!({"ok":true,"removed":false,"identity":identity,"reference_released":released,"reference_owned":false}),
                 );

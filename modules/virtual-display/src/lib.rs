@@ -140,7 +140,10 @@ fn handle_legacy<B: service_adapter::Backend>(
             ) {
                 let outcome = manager.admit_with_effect(&request.caller, operation.clone());
                 if outcome.effect == service_adapter::MutationEffect::Attempted {
-                    adapter.observe_legacy_mutation(&request.caller, &operation);
+                    let newly_fenced = adapter.observe_legacy_mutation(&request.caller, &operation);
+                    if let Some(owner) = &outcome.confirmed_shared_release {
+                        adapter.settle_legacy_shared_release(&request.caller, owner, &newly_fenced);
+                    }
                 }
                 admitted_operation = Some(operation);
                 (outcome.response, outcome.admission)

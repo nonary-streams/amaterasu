@@ -78,6 +78,7 @@ pub struct Manager<D: Driver> {
     journal: Option<Journal>,
     cursor: usize,
     request_may_mutate: bool,
+    request_shared_release: Option<amaterasu_module_sdk::virtual_display_service::OwnerReference>,
 }
 
 impl<D: Driver> Manager<D> {
@@ -89,6 +90,7 @@ impl<D: Driver> Manager<D> {
             journal: None,
             cursor: 0,
             request_may_mutate: false,
+            request_shared_release: None,
         }
     }
 
@@ -260,10 +262,12 @@ impl<D: Driver> Manager<D> {
         operation: Operation,
     ) -> crate::service_adapter::MutationResult<Admission> {
         self.request_may_mutate = false;
+        self.request_shared_release = None;
         let (response, admission) = self.admit(caller, operation);
         crate::service_adapter::MutationResult {
             response,
             admission,
+            confirmed_shared_release: self.request_shared_release.take(),
             effect: if self.request_may_mutate {
                 crate::service_adapter::MutationEffect::Attempted
             } else {
@@ -757,6 +761,14 @@ impl<D: Driver> Manager<D> {
                 return failure("journal_unavailable");
             }
             if !no_references {
+                if released {
+                    self.request_shared_release = Some(
+                        amaterasu_module_sdk::virtual_display_service::OwnerReference {
+                            identity: identity.into(),
+                            reference_id: reference_id.into(),
+                        },
+                    );
+                }
                 let still_owned = monitor
                     .references
                     .as_ref()
