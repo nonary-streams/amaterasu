@@ -314,7 +314,9 @@ impl Controller {
             } else {
                 u64::from(record.config.ping_timeout_ms)
             };
-            if record.display_preflight_deadline.is_some() {
+            if record.display_preflight_deadline.is_some()
+                && record.config.display_operation_required()
+            {
                 payload["display_prepare_timeout_ms"] = json!(effective_timeout);
                 record.display_prepare_timeout_ms = Some(effective_timeout as u32);
             }

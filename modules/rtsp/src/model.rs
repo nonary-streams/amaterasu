@@ -773,6 +773,16 @@ impl Open {
             )
     }
 
+    /// A policy may need admission without creating a display lease. Only an
+    /// actual display request or active virtual display owns a stream timeout.
+    pub fn display_operation_required(&self) -> bool {
+        self.display_request.is_some()
+            || self
+                .virtual_display_intent
+                .as_ref()
+                .is_some_and(amaterasu_contracts::virtual_display::VirtualDisplayIntent::active)
+    }
+
     pub fn validate(&self, allow_remote: bool) -> Result<[u8; 16], &'static str> {
         use amaterasu_module_sdk::application_library::preflight::PolicyIdentity;
         if let Some(identity) = &self.policy_identity {

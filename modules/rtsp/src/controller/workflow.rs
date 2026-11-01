@@ -421,10 +421,7 @@ impl Controller {
             if record.config.display_admission_required() && expires <= now {
                 return Err("display_lease_expired");
             }
-            record.display_applied = record.config.display_request.is_some()
-                || record.config.virtual_display_intent.as_ref().is_some_and(
-                    amaterasu_contracts::virtual_display::VirtualDisplayIntent::active,
-                );
+            record.display_applied = record.config.display_operation_required();
             record.state = State::Ready;
             record.expires = expires;
             Ok(())
