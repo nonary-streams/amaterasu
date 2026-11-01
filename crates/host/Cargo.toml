@@ -23,3 +23,6 @@ libc = "0.2"
 
 [dev-dependencies]
 ed25519-dalek.workspace = true
+amaterasu-runtime = { path = "../runtime" }
+amaterasu-module-sdk.workspace = true
+amaterasu-state = { path = "../../modules/state", features = ["test-support"] }

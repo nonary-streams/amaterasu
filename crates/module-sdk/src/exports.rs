@@ -1,9 +1,11 @@
 //! ABI adapters shared by Rust modules. Calls are serialized by the host.
-use amaterasu_abi::{HostApi, STATUS_INTERNAL_ERROR, STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
+use amaterasu_abi::{
+    HostApi, STATUS_INTERNAL_ERROR, STATUS_INVALID_ARGUMENT, STATUS_OK, STATUS_PENDING, Status,
+};
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use crate::{ManagedModule, ModuleResult, RuntimeClient};
+use crate::{ManagedModule, ModuleResult, RetirableModule, RetirementProgress, RuntimeClient};
 
 fn contain_failure(operation: impl FnOnce() -> ModuleResult<()>) -> Status {
     match catch_unwind(AssertUnwindSafe(operation)) {
@@ -61,6 +63,36 @@ pub unsafe extern "C" fn health<M: ManagedModule>(instance: *mut c_void) -> Stat
     }
     // SAFETY: the instance remains alive throughout the lifecycle call.
     contain_failure(|| unsafe { &*instance.cast::<M>() }.health())
+}
+
+/// # Safety
+/// `instance` must be a live M, exclusively borrowed; retirement polls must
+/// never overlap other lifecycle calls and the runtime outlives all workers.
+pub unsafe extern "C" fn poll_retirement<M: RetirableModule>(instance: *mut c_void) -> Status {
+    if instance.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    match catch_unwind(AssertUnwindSafe(|| {
+        unsafe { &mut *instance.cast::<M>() }.poll_retirement()
+    })) {
+        Ok(Ok(RetirementProgress::Pending)) => STATUS_PENDING,
+        Ok(Ok(RetirementProgress::Complete)) => STATUS_OK,
+        Ok(Err(_)) | Err(_) => STATUS_INTERNAL_ERROR,
+    }
+}
+
+/// # Safety
+/// `instance` is a live, exclusively owned M whose workers have retired.
+/// This consumes it even on failure; the host must never destroy it twice.
+pub unsafe extern "C" fn destroy_retired<M: RetirableModule>(instance: *mut c_void) -> Status {
+    if instance.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    contain_failure(|| {
+        // SAFETY: the host transfers this allocation exactly once.
+        drop(unsafe { Box::from_raw(instance.cast::<M>()) });
+        Ok(())
+    })
 }
 
 /// # Safety

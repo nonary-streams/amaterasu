@@ -92,6 +92,9 @@ fn feature(name: &'static str, trace: &DestructionTrace) -> FeatureLibrary {
             health: healthy,
             destroy,
         },
+        retirement: None,
+        retirement_failed: false,
+        retirement_complete: false,
         instance: fixture_instance(name, trace),
         _library: executable_library(),
     }
