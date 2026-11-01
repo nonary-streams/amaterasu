@@ -90,6 +90,54 @@ fn extension_offer_requires_source_and_downstream_probes_then_selects_the_planne
 }
 
 #[test]
+fn retirement_observes_display_completion_that_wins_cancellation_race() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    let mut pending = rpc::Pending::new(
+        "amaterasu.virtual-display/1",
+        json!({"action":"create"}),
+        "completion-race".into(),
+        None,
+    );
+    let mut completed = false;
+    let mut released = false;
+    let mut send = |command: Command| -> ModuleResult<Response> {
+        match command {
+            Command::Request {
+                ref operation_id, ..
+            } if operation_id == "completion-race" => Ok(Response::Accepted { id: 999_999 }),
+            Command::TakeResult { request: 999_999 } if completed && !released => {
+                Ok(Response::Result {
+                    payload: json!({"ok":true}),
+                })
+            }
+            Command::TakeResult { request: 999_999 } => Ok(Response::Pending),
+            Command::Cancel { request: 999_999 } => {
+                completed = true;
+                Ok(Response::Ok)
+            }
+            Command::ReleaseResult { request: 999_999 } => {
+                released = true;
+                Ok(Response::Ok)
+            }
+            other => host.broker.send(other),
+        }
+    };
+    assert!(matches!(
+        pending.poll(&mut send, host.now),
+        rpc::Progress::Waiting
+    ));
+    let mut job = Job::new(id, None, Step::CreateVirtualDisplay, u64::MAX);
+    job.pending = Some(pending);
+    host.pipeline.job = Some(job);
+    let _ = host.pipeline.shutdown_with(&mut send);
+    assert!(host.pipeline.shutdown_with(&mut send));
+    drop(send);
+    assert!(completed && released);
+    assert!(host.pipeline.records[&id].uncertain.is_none());
+}
+
+#[test]
 fn selected_control_retirement_epoch_is_retained_only_with_the_owned_stream() {
     for (offered, valid) in [
         (json!("c".repeat(32)), true),

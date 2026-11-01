@@ -65,6 +65,16 @@ impl Pending {
     }
 
     pub fn shutdown(&mut self, send: &mut Send<'_>) -> bool {
+        self.shutdown_inner(send, false)
+    }
+
+    /// Keep a provider completion that wins the race with cancellation so its
+    /// owner can reconcile the mutation before releasing the result.
+    pub fn shutdown_preserving_completion(&mut self, send: &mut Send<'_>) -> bool {
+        self.shutdown_inner(send, true)
+    }
+
+    fn shutdown_inner(&mut self, send: &mut Send<'_>, preserve_completion: bool) -> bool {
         if self.settled_without_completion || self.released_completion {
             return true;
         }
@@ -92,6 +102,40 @@ impl Pending {
             if self.request.is_none() {
                 return false;
             }
+        }
+        if preserve_completion {
+            if self.completed.is_some() {
+                return false;
+            }
+            let request = self.request.expect("request recovered above");
+            match send(Command::Cancel { request }) {
+                Ok(Response::Ok) => {}
+                Ok(Response::Error { code, .. }) if code == "not_found" => {}
+                _ => return false,
+            }
+            match send(Command::TakeResult { request }) {
+                Ok(Response::Result { payload }) => {
+                    self.completed = Some(payload);
+                    return false;
+                }
+                Ok(Response::Pending) => {}
+                Ok(Response::Error { code, .. })
+                    if matches!(
+                        code.as_str(),
+                        "cancelled" | "deadline_exceeded" | "not_found"
+                    ) => {}
+                // If observation itself failed, keep the request so a retry
+                // can still retrieve a completion before releasing it.
+                _ => return false,
+            }
+            match send(Command::ReleaseResult { request }) {
+                Ok(Response::Ok) => {}
+                Ok(Response::Error { code, .. }) if code == "not_found" => {}
+                _ => return false,
+            }
+            self.request = None;
+            self.settled_without_completion = true;
+            return true;
         }
         for _ in 0..4 {
             match self.poll(send, u64::MAX) {
@@ -261,6 +305,45 @@ pub(super) fn active(send: &mut Send<'_>, request: u64) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn retirement_retries_failed_completion_observation_before_release() {
+        let mut pending = Pending::new("service", json!({}), "operation".into(), None);
+        assert!(matches!(
+            pending.poll(&mut |_| Ok(Response::Accepted { id: 7 }), 1),
+            Progress::Waiting
+        ));
+        let mut observations = 0;
+        let mut released = false;
+        let mut send = |command| match command {
+            Command::Cancel { request: 7 } => Ok(Response::Ok),
+            Command::TakeResult { request: 7 } => {
+                observations += 1;
+                if observations == 1 {
+                    Err("observation lost".into())
+                } else {
+                    Ok(Response::Result {
+                        payload: json!({"ok": true}),
+                    })
+                }
+            }
+            Command::ReleaseResult { request: 7 } => {
+                released = true;
+                Ok(Response::Ok)
+            }
+            _ => panic!("unexpected command"),
+        };
+        assert!(!pending.shutdown_preserving_completion(&mut send));
+        assert!(!pending.shutdown_preserving_completion(&mut send));
+        assert_eq!(
+            pending.observe_completion(&mut send),
+            Some(json!({"ok": true}))
+        );
+        assert!(pending.release_result(&mut send));
+        drop(send);
+        assert_eq!(observations, 2);
+        assert!(released);
+    }
 
     #[test]
     fn later_admission_rejection_does_not_disprove_a_lost_first_send() {

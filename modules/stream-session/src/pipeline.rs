@@ -152,7 +152,7 @@ fn reconcile_uncertain_display(record: &mut Record, send: &mut Send<'_>) -> bool
             }
             None if !mutating => terminal = pending.shutdown(send),
             None => {
-                let _ = pending.shutdown(send);
+                let _ = pending.shutdown_preserving_completion(send);
             }
         }
     }
@@ -331,7 +331,7 @@ impl Pipeline {
                 if !resolved {
                     // Cancel/release settles only the RPC. The provider may
                     // still finish the display mutation after cancellation.
-                    let _ = pending.shutdown(send);
+                    let _ = pending.shutdown_preserving_completion(send);
                     record.uncertain = Some(pending);
                     record.uncertain_step = Some(Step::ApplyDisplay);
                     settled = false;
@@ -372,7 +372,19 @@ impl Pipeline {
                 record.uncertain = Some(pending);
                 record.uncertain_step = Some(job.step);
             } else {
-                let settled_request = pending.shutdown(send);
+                let settled_request = if matches!(
+                    job.step,
+                    Step::CreateVirtualDisplay
+                        | Step::RemoveVirtualDisplay
+                        | Step::RestoreDisplay
+                        | Step::RecoverDisplay
+                        | Step::CreateOwnedVirtualDisplay
+                        | Step::RemoveOwnedVirtualDisplay
+                ) {
+                    pending.shutdown_preserving_completion(send)
+                } else {
+                    pending.shutdown(send)
+                };
                 if !settled_request
                     || matches!(
                         job.step,
