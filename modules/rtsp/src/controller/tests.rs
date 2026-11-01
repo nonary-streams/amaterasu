@@ -2097,6 +2097,29 @@ fn accepted_announce_freezes_pcm_haptics_flag_into_authenticated_start() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn ten_bit_depth_and_launch_dynamic_range_are_independent() {
+    for hdr in [false, true] {
+        let (mut record, mut announce) = announced_profile_record();
+        record.config.profile.codecs = vec![amaterasu_media::VideoCodec::Hevc];
+        record.config.profile.hdr = hdr;
+        announce.video.format = amaterasu_module_sdk::VideoStreamFormat {
+            codec: amaterasu_module_sdk::VideoCodec::Hevc,
+            bit_depth: 10,
+            dynamic_range: amaterasu_module_sdk::DynamicRange::Hdr,
+        };
+        assert!(record.accept_announce(&announce));
+        let payload = record.authenticated_start_payload(23).unwrap();
+        let format = &payload["configuration"]["configuration"]["video_stream_format"];
+        assert_eq!(format["bit_depth"], 10);
+        assert_eq!(format["dynamic_range"], if hdr { "hdr" } else { "sdr" });
+        announce.video.format.bit_depth = 8;
+        announce.video.format.dynamic_range = amaterasu_module_sdk::DynamicRange::Sdr;
+        assert_eq!(record.accept_announce(&announce), !hdr);
+    }
+}
+
 #[test]
 fn unsupported_negotiated_codec_cannot_arm_h264_start_configuration() {
     let (mut record, mut announce) = announced_profile_record();

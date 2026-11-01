@@ -36,7 +36,7 @@ through `video_stream_format`; unknown source colour is not inferred from a
 fourcc alone.
 
 Validation must distinguish a synthetic RGB10 encoder test from guarded real
-capture and client playback. The opt-in `nvenc_cuda_gpu_hdr10` test encodes real
+capture and client playback. The opt-in `nvenc_cuda_gpu_ten_bit_preserves_precision_and_signaling` test encodes real
 GPU RGB10 DMA-BUFs, decodes both codecs and checks colour signalling and samples.
 An installed qualification additionally needs a real HDR output, matching loaded
 driver identity, frame-lease diagnostics, full decode, metadata propagation and
@@ -51,3 +51,15 @@ presentation; a changed sequence or layout is retried. Both descriptor sets
 remain owned until the GPU snapshot completes. Protocol 4 requires updating
 the helper and capture plugin together; the already installed HDR driver works
 with this path without another reboot.
+
+Ten-bit SDR is independent of HDR. HEVC and AV1 accept SDR in ten-bit output,
+with BT.601/BT.709 and limited/full-range signalling retained. GPU conversion
+uses P010 legal levels (64..940 luma and neutral chroma 512 for limited range).
+CPU BGRA may be encoded into ten-bit SDR, while a ten-bit SDR DMA-BUF preserves
+source precision. Encoding an eight-bit source into ten bits does not restore
+missing source precision. HDR still requires validated PQ/BT.2020 input.
+
+For GameStream, the ANNOUNCE `dynamicRangeMode` selects bit depth. The trusted
+launch profile independently selects SDR or HDR; a ten-bit ANNOUNCE during an
+SDR launch must not enable HDR. Transport accepts the shared format contract for
+8-bit SDR and HEVC/AV1 ten-bit SDR/HDR and freezes it before sending frames.

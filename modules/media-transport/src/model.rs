@@ -359,12 +359,7 @@ impl Open {
 pub(crate) fn validate_video_stream_format(
     format: amaterasu_module_sdk::VideoStreamFormat,
 ) -> TransportResult<()> {
-    use amaterasu_module_sdk::{DynamicRange, VideoCodec};
-
-    match (format.codec, format.bit_depth, format.dynamic_range) {
-        (VideoCodec::H264 | VideoCodec::Hevc | VideoCodec::Av1, 8, DynamicRange::Sdr) => Ok(()),
-        _ => Err("unsupported_video_format"),
-    }
+    format.validate()
 }
 
 pub fn validate_ping_timeout_ms(value: i64) -> TransportResult<u64> {

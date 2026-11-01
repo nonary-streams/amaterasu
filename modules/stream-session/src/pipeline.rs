@@ -815,6 +815,7 @@ impl Pipeline {
                     }
                 }
                 Err(failure) => {
+                    eprintln!("amaterasu session media failed code={}", failure.code);
                     record.history.observe_media(
                         failure.progress.accepted_video_access_units,
                         failure.progress.accepted_media_payload_bytes,

@@ -29,6 +29,7 @@ pub struct Stream {
     pub audio_local: SocketAddr,
     pub delivery: Delivery,
     video: VideoPacketizer,
+    video_stream_format: Option<amaterasu_module_sdk::VideoStreamFormat>,
     video_format_locked: bool,
     video_codec: Option<VideoCodec>,
     audio: AudioPacketizer,
@@ -108,6 +109,7 @@ impl Stream {
             audio_local,
             delivery,
             video,
+            video_stream_format: None,
             video_format_locked: false,
             video_codec,
             audio,
@@ -200,7 +202,12 @@ impl Stream {
             amaterasu_module_sdk::VideoCodec::Hevc => VideoCodec::Hevc,
             amaterasu_module_sdk::VideoCodec::Av1 => VideoCodec::Av1,
         };
-        if self.video_format_locked && self.video_codec.is_some_and(|selected| selected != codec) {
+        if self
+            .video_stream_format
+            .is_some_and(|selected| selected != format)
+            || (self.video_format_locked
+                && self.video_codec.is_some_and(|selected| selected != codec))
+        {
             return Err("video_format_conflict");
         }
         if !self.video_settings.offered_codecs().contains(&codec)
@@ -212,6 +219,7 @@ impl Stream {
         self.video_settings.codec = codec;
         self.video_settings.codecs.clear();
         self.video_codec = Some(codec);
+        self.video_stream_format = Some(format);
         self.video_format_locked = true;
         Ok(())
     }

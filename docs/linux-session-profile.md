@@ -50,10 +50,11 @@ Build the host, the publisher and one library per component. Use two jobs and a
 low priority on a machine that is also running a desktop and games.
 
 ```sh
-export CARGO_TARGET_DIR=$HOME/sources/amaterasu-targets/linux-session
-env CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 nice -n 10 \
+export CARGO_TARGET_DIR=/run/media/chasep/ArchivedGames/amaterasu-targets/linux-session
+git submodule update --init third-party/libvirtualdisplay
+env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 15 \
   cargo build --offline --locked \
-    --features amaterasu-encode/software-x264 \
+    --features amaterasu-encode/software-x264,amaterasu-encode/linux-nvenc-cuda,amaterasu-virtual-display/linux-libvirtualdisplay \
     -p amaterasu -p amaterasu-release \
     -p amaterasu-runtime -p amaterasu-state -p amaterasu-session \
     -p amaterasu-configuration -p amaterasu-session-history -p amaterasu-host-metrics \
@@ -66,14 +67,15 @@ env CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 nice -n 10 \
     -p amaterasu-media-transport -p amaterasu-control-transport \
     -p amaterasu-frame-limiter -p amaterasu-stream-session -p amaterasu-rtsp
 git submodule update --init modules/capture-vkms
-env CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 nice -n 10 \
+env CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 nice -n 15 \
   cargo build --offline --locked --manifest-path modules/capture-vkms/capture/Cargo.toml
 ```
 
 The provider uses its own lockfile and pinned SDK. Fetch its dependencies before
 using `--offline`. Both builds share the `CARGO_TARGET_DIR` above.
 
-`scripts/test_linux_session_profile.py` runs this same build.
+`scripts/test_linux_session_profile.py` uses software encoding and loopback fixtures.
+It does not verify the native GPU encoder or the Linux virtual-display backend.
 
 * **Software x264.** `--features amaterasu-encode/software-x264` compiles the
   binding. It needs `x264.h` (found through `pkg-config x264` or
@@ -81,10 +83,15 @@ using `--offline`. Both builds share the `CARGO_TARGET_DIR` above.
   the build still succeeds but warns `x264 unavailable`, and the encoder reports
   `software_encoder.available=false` with a reason. x264 is GPL-2.0-or-later (or
   commercial), so shipping it is an explicit choice.
-* **NVENC.** There is no cargo feature. Once the Linux NVENC backend lands in
-  the encoder, it compiles in automatically when the ffnvcodec and CUDA headers
-  are present. It is not in `main` today, so the profile currently encodes with
-  software x264 only.
+* **NVENC.** `amaterasu-encode/linux-nvenc-cuda` explicitly enables the native
+  NVIDIA backend. It needs nv-codec-headers and EGL/GL/GBM development headers.
+  Verify the running encoder enumeration includes the hardware codecs; a
+  successful software-only build does not establish native encoder support.
+* **Linux virtual displays.** `amaterasu-virtual-display/linux-libvirtualdisplay`
+  explicitly enables the Linux backend. Without it the plugin uses the
+  unsupported-platform path on Linux, and owned-display streams fail before
+  sending media. It builds the pinned userspace driver library, not a kernel
+  module, and does not reload the installed display driver.
 
 ## Initialise, pack, stage, run
 
@@ -256,8 +263,12 @@ Not implemented, and not claimed:
 
 * **No mDNS/DNS-SD announcement.** Clients must add the host by IP address.
 * **No `/resume`.** A client that disconnects must start a new launch.
-* **SDR only.** HDR and 10-bit paths are not part of this profile.
-* **Software x264 until NVENC lands**, hence the 1920x1080 at 60 Hz cap.
+* **Native colour modes require native qualification.** HEVC/AV1 support
+  ten-bit SDR and guarded HDR10 with the NVIDIA backend. See
+  [HDR capture](hdr-capture.md); fixture/profile tests do not prove HDR capture
+  or client playback.
+* **Software x264 remains capped at 1920x1080 at 60 Hz.** Hardware limits are
+  reported by the selected encoder.
 * **Settings added after their owners land.** The session `journal_directory`
   (session ledger) and catalog `seed_desktop_entry` (desktop launch kind) are
   not set here yet: module settings parse strictly, so naming them early would

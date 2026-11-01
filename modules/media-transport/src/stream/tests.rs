@@ -876,6 +876,13 @@ fn authenticated_format_freezes_codec_and_rejects_later_reconfiguration() {
     stream.configure_video_format(av1).unwrap();
     assert_eq!(stream.video_codec(), Some(VideoCodec::Av1));
     assert_eq!(
+        stream.configure_video_format(VideoStreamFormat {
+            bit_depth: 10,
+            ..av1
+        }),
+        Err("video_format_conflict")
+    );
+    assert_eq!(
         stream.configure_video_format(VideoStreamFormat::H264_SDR),
         Err("video_format_conflict")
     );
@@ -896,7 +903,7 @@ fn authenticated_format_freezes_codec_and_rejects_later_reconfiguration() {
 }
 
 #[test]
-fn explicit_open_format_selects_hevc_and_rejects_hdr_before_binding() {
+fn explicit_open_format_selects_hevc_and_accepts_ten_bit_formats() {
     use amaterasu_module_sdk::{DynamicRange, VideoCodec as NegotiatedCodec, VideoStreamFormat};
     let (video, audio) = receivers();
     let mut settings = request(&video, &audio, false);
@@ -914,6 +921,16 @@ fn explicit_open_format_selects_hevc_and_rejects_hdr_before_binding() {
         bit_depth: 10,
         dynamic_range: DynamicRange::Hdr,
     });
+    assert_eq!(
+        Stream::open("owner", &settings).unwrap().video_codec(),
+        Some(VideoCodec::Hevc)
+    );
+    settings.video_stream_format.as_mut().unwrap().dynamic_range = DynamicRange::Sdr;
+    assert_eq!(
+        Stream::open("owner", &settings).unwrap().video_codec(),
+        Some(VideoCodec::Hevc)
+    );
+    settings.video_stream_format.as_mut().unwrap().codec = NegotiatedCodec::H264;
     assert!(matches!(
         Stream::open("owner", &settings),
         Err("unsupported_video_format")

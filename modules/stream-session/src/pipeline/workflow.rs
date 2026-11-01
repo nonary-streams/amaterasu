@@ -119,6 +119,7 @@ impl Job {
     }
 
     pub fn fail(&mut self, record: &mut Record, code: &'static str, now: u64) {
+        eprintln!("amaterasu session failed step={:?} code={code}", self.step);
         record.error.get_or_insert(code);
         record.outcome = if code == "request_cancelled" {
             State::Cancelled

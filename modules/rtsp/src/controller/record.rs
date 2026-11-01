@@ -104,7 +104,13 @@ impl Record {
             audio: announce.encryption.audio,
         });
         self.negotiated_slices_per_frame = accepted.then_some(announce.video.slices_per_frame);
-        self.negotiated_video_stream_format = accepted.then_some(announce.video.format);
+        // GameStream dynamicRangeMode selects ten-bit encoding; the trusted
+        // launch profile independently decides whether those samples are HDR.
+        let mut format = announce.video.format;
+        if format.bit_depth == 10 && !self.config.effective_profile().hdr {
+            format.dynamic_range = amaterasu_module_sdk::DynamicRange::Sdr;
+        }
+        self.negotiated_video_stream_format = accepted.then_some(format);
         self.client_feature_flags = accepted.then_some(announce.client_feature_flags);
         self.negotiated_color = accepted.then_some(announce.video.color);
         self.negotiated_video = negotiated_video;

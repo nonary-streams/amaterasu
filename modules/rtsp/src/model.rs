@@ -979,9 +979,11 @@ impl Open {
         let format_allowed = if profile.hdr {
             cfg!(target_os = "linux") && hdr && announce.video.format.bit_depth == 10
         } else {
-            !hdr && announce.video.format.bit_depth == 8
+            (!hdr && announce.video.format.bit_depth == 8)
+                || (cfg!(target_os = "linux") && announce.video.format.bit_depth == 10)
         };
-        if !format_allowed
+        if announce.video.format.validate().is_err()
+            || !format_allowed
             || !video_matches
             || !audio_matches
             || !profile.matches_transport(announce)

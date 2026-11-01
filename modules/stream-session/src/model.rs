@@ -1216,10 +1216,7 @@ impl VideoConfiguration {
             && ((self.video_stream_format.bit_depth == 8
                 && self.video_stream_format.dynamic_range
                     == amaterasu_module_sdk::DynamicRange::Sdr)
-                || (cfg!(target_os = "linux")
-                    && self.video_stream_format.bit_depth == 10
-                    && self.video_stream_format.dynamic_range
-                        == amaterasu_module_sdk::DynamicRange::Hdr))
+                || (cfg!(target_os = "linux") && self.video_stream_format.bit_depth == 10))
             && (16..=3840).contains(&self.width)
             && (16..=2160).contains(&self.height)
             && self.width.is_multiple_of(2)
@@ -1662,7 +1659,7 @@ mod tests {
     }
 
     #[test]
-    fn negotiated_video_format_accepts_hdr10_but_rejects_invalid_depths() {
+    fn negotiated_video_format_accepts_ten_bit_sdr_and_hdr_but_rejects_invalid_depths() {
         let legacy: StartConfig = serde_json::from_value(start_json()).unwrap();
         assert_eq!(
             legacy.configuration.video_stream_format,
@@ -1678,7 +1675,7 @@ mod tests {
         for codec in ["h264", "hevc", "av1"] {
             for (bits, range, accepted) in [
                 (8, "sdr", true),
-                (10, "sdr", false),
+                (10, "sdr", cfg!(target_os = "linux") && codec != "h264"),
                 (10, "hdr", cfg!(target_os = "linux") && codec != "h264"),
                 (8, "hdr", false),
             ] {
