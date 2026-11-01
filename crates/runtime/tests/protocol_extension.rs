@@ -81,6 +81,7 @@ fn route(provider: &str, service: &str) -> Route {
 fn context(peer: &str) -> SessionContext {
     SessionContext {
         authority_epoch: "authority.epoch".into(),
+        effect_owner_epoch: "owner.epoch".into(),
         target: LifecycleTarget::Stream {
             host_epoch: "epoch".into(),
             session_id: "session".into(),
@@ -90,13 +91,41 @@ fn context(peer: &str) -> SessionContext {
         peer_ref: peer.into(),
     }
 }
+fn issuer(ctx: &SessionContext) -> amaterasu_module_sdk::effect_authority::Source {
+    let LifecycleTarget::Stream {
+        host_epoch,
+        session_id,
+        stream_id,
+        generation,
+    } = &ctx.target
+    else {
+        panic!()
+    };
+    amaterasu_module_sdk::effect_authority::Source {
+        version: 1,
+        id: "a".repeat(32),
+        generation: *generation,
+        host_epoch: host_epoch.clone(),
+        session_id: session_id.clone(),
+        stream_id: stream_id.clone(),
+        stream_generation: *generation,
+        device: "device".into(),
+        device_generation: 1,
+        effect_owner_epoch: ctx.effect_owner_epoch.clone(),
+    }
+}
 struct Authority {
     negotiated: bool,
     permitted: bool,
 }
 impl SessionAuthority for Authority {
     type AdmissionGuard = ();
-    fn admit(&self, ctx: &SessionContext, cap: &str) -> Result<(), &'static str> {
+    fn admit(
+        &self,
+        ctx: &SessionContext,
+        cap: &str,
+        _effect: &PendingEffect,
+    ) -> Result<(), &'static str> {
         if *ctx == context("verified")
             && cap == "example.control/1"
             && self.negotiated
@@ -980,6 +1009,7 @@ fn sequenced_journal_receipt_routes_through_unchanged_broker_consumer() {
         &source,
         &initial,
         effect,
+        issuer(&ctx),
         CleanupReference::new("a".repeat(64)).unwrap(),
     )
     .unwrap();
@@ -1008,4 +1038,167 @@ fn sequenced_journal_receipt_routes_through_unchanged_broker_consumer() {
             .unwrap_err(),
         "reservation_mismatch"
     );
+}
+
+#[test]
+fn retired_issuer_cannot_dispatch_a_delayed_success_after_reconciliation() {
+    use amaterasu_module_sdk::{
+        effect_authority::Source,
+        protocol_sequence::{self, IssuerRetirement, Lookup, SequencedSource},
+        protocol_state::{CleanupReference, DURABLE_CAS_CAPABILITY, DurableStateBinding},
+    };
+    use std::sync::{Mutex, MutexGuard, mpsc};
+
+    // This models the trusted authority/runtime contract, not a production
+    // authority implementation. The guard serializes broker admission against
+    // permanent retirement of the exact issuing continuation.
+    struct Authority<'a> {
+        retired: &'a Mutex<bool>,
+        operation: &'a str,
+    }
+    impl<'a> SessionAuthority for Authority<'a> {
+        type AdmissionGuard = MutexGuard<'a, bool>;
+        fn admit(
+            &self,
+            _: &SessionContext,
+            _: &str,
+            effect: &PendingEffect,
+        ) -> Result<Self::AdmissionGuard, &'static str> {
+            let retired = self.retired.lock().unwrap();
+            if *retired || effect.operation_id != self.operation {
+                return Err("issuer_retired");
+            }
+            Ok(retired)
+        }
+    }
+    struct RuntimeRetirement<'a> {
+        retired: &'a Mutex<bool>,
+        issuer: Source,
+        effect: PendingEffect,
+    }
+    impl IssuerRetirement for RuntimeRetirement<'_> {
+        fn verify_retired(
+            &self,
+            issuer: &Source,
+            effect: &PendingEffect,
+        ) -> Result<(), &'static str> {
+            if issuer != &self.issuer || effect != &self.effect || !*self.retired.lock().unwrap() {
+                return Err("issuer_retirement_unproven");
+            }
+            Ok(())
+        }
+    }
+    struct NoEvidence;
+    impl IssuerRetirement for NoEvidence {}
+
+    let selection = route("example.provider_a", "example.a/1");
+    let broker = setup(std::slice::from_ref(&selection));
+    let router = ProtocolRouter::new(vec![selection]).unwrap();
+    let ctx = context("verified");
+    let source = SequencedSource::new(CLIENT, &ctx).unwrap();
+    let operation = source.operation_id(1).unwrap();
+    let request = || DispatchRequest {
+        context: &ctx,
+        message_type: KIND,
+        payload: b"hello",
+        operation_id: &operation,
+        timeout_ms: 1000,
+        parent: None,
+    };
+    let effect = router.prepare_effect(CLIENT, &request()).unwrap();
+    let issuing_source = issuer(&ctx);
+    let binding = DurableStateBinding::new("owner", "state", DURABLE_CAS_CAPABILITY).unwrap();
+    let cleanup_ref = CleanupReference::new("a".repeat(64)).unwrap();
+    let initial = serde_json::json!({"ok":true,"revision":0,"found":false,"value":null});
+    let pending = protocol_sequence::prepare_issue(
+        &binding,
+        &source,
+        &initial,
+        effect.clone(),
+        issuing_source.clone(),
+        cleanup_ref.clone(),
+    )
+    .unwrap();
+    // The State CAS has committed but its success reply is held by the live issuer.
+    let stored = serde_json::json!({"ok":true,"revision":1,"found":true,"value":pending.request().payload()["value"]});
+    let retired = Mutex::new(false);
+    let retirement = RuntimeRetirement {
+        retired: &retired,
+        issuer: issuing_source,
+        effect: effect.clone(),
+    };
+    let (continue_tx, continue_rx) = mpsc::sync_channel::<()>(0);
+    let (started_tx, started_rx) = mpsc::sync_channel::<()>(0);
+    std::thread::scope(|scope| {
+        let retired_ref = &retired;
+        let operation_ref = operation.as_str();
+        let thread = scope.spawn(move || {
+            let mut broker = broker;
+            started_tx.send(()).unwrap();
+            continue_rx.recv().unwrap();
+            let mut receipt = pending
+                .confirmed(serde_json::json!({"ok":true,"revision":1}))
+                .unwrap();
+            let result = router.dispatch(
+                &Authority {
+                    retired: retired_ref,
+                    operation: operation_ref,
+                },
+                &mut receipt,
+                request(),
+                BrokerEndpoint::new(CLIENT, |cmd| Ok(broker.dispatch(CLIENT, cmd))),
+            );
+            (result, broker)
+        });
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            protocol_sequence::prepare_cleanup(
+                &binding,
+                &source,
+                &stored,
+                1,
+                &effect,
+                &cleanup_ref,
+                &NoEvidence
+            ),
+            Err("issuer_retirement_unproven")
+        ));
+        assert!(matches!(
+            protocol_sequence::prepare_cleanup(
+                &binding,
+                &source,
+                &stored,
+                1,
+                &effect,
+                &cleanup_ref,
+                &retirement
+            ),
+            Err("issuer_retirement_unproven")
+        ));
+        // Simulated existing authority fences the exact issuer. Its held lock
+        // would wait for any broker admission already in progress to finish.
+        *retired.lock().unwrap() = true;
+        let cleanup = protocol_sequence::prepare_cleanup(
+            &binding,
+            &source,
+            &stored,
+            1,
+            &effect,
+            &cleanup_ref,
+            &retirement,
+        )
+        .unwrap();
+        let compacted = serde_json::json!({"ok":true,"revision":2,"found":true,"value":cleanup.payload()["value"]});
+        assert_eq!(
+            protocol_sequence::lookup(&source, &compacted, 1).unwrap(),
+            Lookup::Retired
+        );
+        continue_tx.send(()).unwrap();
+        let (result, mut broker) = thread.join().unwrap();
+        assert_eq!(result.unwrap_err(), "issuer_retired");
+        assert!(matches!(
+            broker.dispatch("example.provider_a", Command::Poll {}),
+            Response::Pending
+        ));
+    });
 }

@@ -36,6 +36,7 @@ fn effect(caller: &str, operation: &str) -> PendingEffect {
         operation_id: operation.into(),
         context: amaterasu_module_sdk::protocol::SessionContext {
             authority_epoch: "authority.epoch".into(),
+            effect_owner_epoch: "owner.epoch".into(),
             target: LifecycleTarget::Stream {
                 host_epoch: "epoch".into(),
                 session_id: "session".into(),
@@ -52,6 +53,42 @@ fn effect(caller: &str, operation: &str) -> PendingEffect {
         payload_sha256: "a".repeat(64),
         timeout_ms: 1000,
         parent: None,
+    }
+}
+fn issuer(
+    context: &amaterasu_module_sdk::protocol::SessionContext,
+) -> amaterasu_module_sdk::effect_authority::Source {
+    let LifecycleTarget::Stream {
+        host_epoch,
+        session_id,
+        stream_id,
+        generation,
+    } = &context.target
+    else {
+        panic!()
+    };
+    amaterasu_module_sdk::effect_authority::Source {
+        version: 1,
+        id: "a".repeat(32),
+        generation: *generation,
+        host_epoch: host_epoch.clone(),
+        session_id: session_id.clone(),
+        stream_id: stream_id.clone(),
+        stream_generation: *generation,
+        device: "device".into(),
+        device_generation: 1,
+        effect_owner_epoch: context.effect_owner_epoch.clone(),
+    }
+}
+// Storage tests inject an assumed retirement; this is not a production authority.
+struct MockRetired;
+impl amaterasu_module_sdk::protocol_sequence::IssuerRetirement for MockRetired {
+    fn verify_retired(
+        &self,
+        _: &amaterasu_module_sdk::effect_authority::Source,
+        _: &PendingEffect,
+    ) -> Result<(), &'static str> {
+        Ok(())
     }
 }
 fn reference() -> CleanupReference {
@@ -347,6 +384,7 @@ fn sequenced_source_runs_two_thousand_effects_without_global_epoch_rotation() {
         &other_source,
         &other_read,
         unrelated.clone(),
+        issuer(&unrelated.context),
         reference(),
     )
     .unwrap();
@@ -360,13 +398,53 @@ fn sequenced_source_runs_two_thousand_effects_without_global_epoch_rotation() {
         );
         let mut item = template.clone();
         item.operation_id = source.operation_id(sequence).unwrap();
-        let pending =
-            protocol_sequence::prepare_issue(&binding(), &source, &read, item.clone(), reference())
-                .unwrap();
+        if sequence == 1 {
+            let mut forged_issuer = issuer(&item.context);
+            forged_issuer.effect_owner_epoch = "other.owner".into();
+            assert!(matches!(
+                protocol_sequence::prepare_issue(
+                    &binding(),
+                    &source,
+                    &read,
+                    item.clone(),
+                    forged_issuer,
+                    reference()
+                ),
+                Err("identity_mismatch")
+            ));
+        }
+        let pending = protocol_sequence::prepare_issue(
+            &binding(),
+            &source,
+            &read,
+            item.clone(),
+            issuer(&item.context),
+            reference(),
+        )
+        .unwrap();
         let result = invoke(&store, pending.request());
         let mut receipt = pending.confirmed(result).unwrap();
         assert_eq!(receipt.reserve(&item), Ok(Reservation::New));
         let current = invoke(&store, &source.read_request());
+        if sequence == 1 {
+            struct NoEvidence;
+            impl protocol_sequence::IssuerRetirement for NoEvidence {}
+            assert!(matches!(
+                protocol_sequence::prepare_cleanup(
+                    &binding(),
+                    &source,
+                    &current,
+                    sequence,
+                    &item,
+                    &reference(),
+                    &NoEvidence
+                ),
+                Err("issuer_retirement_unproven")
+            ));
+            assert!(
+                matches!(protocol_sequence::lookup(&source, &invoke(&store, &source.read_request()), sequence).unwrap(), Lookup::Existing(entry) if !entry.cleaned)
+            );
+        }
         let cleanup = protocol_sequence::prepare_cleanup(
             &binding(),
             &source,
@@ -374,6 +452,7 @@ fn sequenced_source_runs_two_thousand_effects_without_global_epoch_rotation() {
             sequence,
             &item,
             &reference(),
+            &MockRetired,
         )
         .unwrap();
         assert_eq!(invoke(&store, &cleanup)["ok"], true);
@@ -417,12 +496,24 @@ fn sequenced_cleanup_gaps_loss_and_replays_fail_closed() {
         let read = invoke(&store, &source.read_request());
         let mut item = template.clone();
         item.operation_id = source.operation_id(sequence).unwrap();
-        let pending =
-            protocol_sequence::prepare_issue(&binding(), &source, &read, item.clone(), reference())
-                .unwrap();
-        let another =
-            protocol_sequence::prepare_issue(&binding(), &source, &read, item.clone(), reference())
-                .unwrap();
+        let pending = protocol_sequence::prepare_issue(
+            &binding(),
+            &source,
+            &read,
+            item.clone(),
+            issuer(&item.context),
+            reference(),
+        )
+        .unwrap();
+        let another = protocol_sequence::prepare_issue(
+            &binding(),
+            &source,
+            &read,
+            item.clone(),
+            issuer(&item.context),
+            reference(),
+        )
+        .unwrap();
         assert_ne!(pending.state_operation_id(), another.state_operation_id());
         assert_eq!(invoke(&store, pending.request())["ok"], true);
         let stale_response = invoke(&store, another.request());
@@ -445,6 +536,7 @@ fn sequenced_cleanup_gaps_loss_and_replays_fail_closed() {
             sequence,
             &effects[(sequence - 1) as usize],
             &reference(),
+            &MockRetired,
         )
         .unwrap();
         assert_eq!(invoke(&store, &cleanup)["ok"], true); // lose reply
@@ -469,6 +561,7 @@ fn sequenced_cleanup_gaps_loss_and_replays_fail_closed() {
         1,
         &effects[0],
         &reference(),
+        &MockRetired,
     )
     .unwrap();
     assert_eq!(invoke(&store, &cleanup)["ok"], true);
@@ -489,13 +582,21 @@ fn sequenced_cleanup_gaps_loss_and_replays_fail_closed() {
             &read,
             1,
             &effects[0],
-            &reference()
+            &reference(),
+            &MockRetired,
         ),
         Err("retired")
     ));
     let mut replay = effects[0].clone();
     assert!(matches!(
-        protocol_sequence::prepare_issue(&binding(), &source, &read, replay.clone(), reference()),
+        protocol_sequence::prepare_issue(
+            &binding(),
+            &source,
+            &read,
+            replay.clone(),
+            issuer(&replay.context),
+            reference()
+        ),
         Err("identity_mismatch")
     ));
     replay.context.target = match replay.context.target {
@@ -513,9 +614,53 @@ fn sequenced_cleanup_gaps_loss_and_replays_fail_closed() {
         _ => unreachable!(),
     };
     assert!(matches!(
-        protocol_sequence::prepare_issue(&binding(), &source, &read, replay, reference()),
+        protocol_sequence::prepare_issue(
+            &binding(),
+            &source,
+            &read,
+            replay.clone(),
+            issuer(&replay.context),
+            reference()
+        ),
         Err("identity_mismatch")
     ));
+    drop(store);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn sequenced_version_one_without_issuer_fails_closed() {
+    use amaterasu_module_sdk::protocol_sequence::{self, SequencedSource};
+    let path = directory();
+    let store = TestStateStore::open(path.clone()).unwrap();
+    let template = effect("caller", "unused");
+    let source = SequencedSource::new(&template.caller, &template.context).unwrap();
+    let StateRequest::Get { key } = source.read_request() else {
+        panic!()
+    };
+    assert_eq!(
+        key,
+        "protocol-sequence/v1/047a3e2910de735ac225a616bf6f05349d9456761bf9cec633f0f831bdb053f3"
+    );
+    let source_hash = key
+        .strip_prefix("protocol-sequence/v1/")
+        .unwrap()
+        .to_string();
+    let legacy = StateRequest::Set {
+        key,
+        value: serde_json::json!({"version":1,"source":source_hash,"retired":0,"issued":0,"entries":[]}),
+        expected_revision: Some(0),
+    };
+    assert_eq!(invoke(&store, &legacy)["ok"], true);
+    let read = invoke(&store, &source.read_request());
+    assert_eq!(
+        protocol_sequence::next_sequence(&source, &read),
+        Err("invalid_journal")
+    );
+    assert_eq!(
+        invoke(&store, &source.read_request())["value"]["version"],
+        1
+    );
     drop(store);
     std::fs::remove_dir_all(path).unwrap();
 }

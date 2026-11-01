@@ -1,8 +1,11 @@
 //! Opt-in v1 sequence journal for one trusted caller and session generation.
 //!
-//! The host allocates a fresh, contiguous sequence in the same State CAS that
-//! records the effect. A sequence is not a credential: authenticated ingress
-//! and the selected shared authority must reject stale sources before dispatch.
+//! Journal format version 2 binds each issuer to its lifecycle source and
+//! effect-owner incarnation. Version 1 journals fail closed and need safe
+//! migration; they are never reset. The host allocates a fresh, contiguous
+//! sequence in the same State CAS that records the effect. A sequence is not a
+//! credential: authenticated ingress and the selected shared authority must
+//! reject stale sources before dispatch.
 //! Only confirmed cleanup advances the contiguous retired watermark. Retired
 //! sequences are rejected, with no reconstruction of a result. Client-chosen
 //! arbitrary operation IDs are not deduplicated by this opt-in contract. Use a
@@ -15,6 +18,8 @@
 //! still bound the number of distinct sources. The owner must use non-secret
 //! opaque source identifiers and a selected provider with durable atomic CAS.
 use crate::{
+    effect_authority::Source,
+    extension_api::LifecycleTarget,
     protocol::{PendingEffect, SessionContext, valid_context},
     protocol_state::{
         CleanupReference, DurableStateBinding, ReadyReservation, fresh_state_operation_id,
@@ -26,7 +31,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const WINDOW: usize = 8;
-const MAX_BYTES: usize = 8_000;
+const MAX_BYTES: usize = 12_000;
 
 /// Created solely from host-authenticated session context and broker caller.
 /// This selector is not an admission grant and must never come from client JSON.
@@ -40,7 +45,20 @@ impl SequencedSource {
         if !amaterasu_contracts::valid_name(caller) || !valid_context(context) {
             return Err("invalid_source");
         }
-        let encoded = serde_json::to_vec(&(caller, context)).map_err(|_| "invalid_source")?;
+        // Preserve the original source key so existing v1 journals are found
+        // and rejected, rather than silently starting a new sequence namespace.
+        #[derive(Serialize)]
+        struct OriginalSourceKey<'a> {
+            authority_epoch: &'a str,
+            target: &'a LifecycleTarget,
+            peer_ref: &'a str,
+        }
+        let original = OriginalSourceKey {
+            authority_epoch: &context.authority_epoch,
+            target: &context.target,
+            peer_ref: &context.peer_ref,
+        };
+        let encoded = serde_json::to_vec(&(caller, original)).map_err(|_| "invalid_source")?;
         let mut hash = Sha256::new();
         hash.update(b"amaterasu.protocol.source-sequence/v1\0");
         hash.update(encoded);
@@ -68,6 +86,8 @@ impl SequencedSource {
 pub struct Entry {
     pub sequence: u64,
     pub effect: PendingEffect,
+    /// Lifecycle-issued source and effect-owner incarnation for this issuer.
+    pub issuer: Source,
     pub cleanup: CleanupReference,
     pub cleaned: bool,
 }
@@ -83,7 +103,7 @@ struct Journal {
 impl Journal {
     fn empty(source: &SequencedSource) -> Self {
         Self {
-            version: 1,
+            version: 2,
             source: source.hash.clone(),
             retired: 0,
             issued: 0,
@@ -100,7 +120,7 @@ fn read(source: &SequencedSource, response: &Value) -> Result<(u64, Journal), &'
     } else {
         Journal::empty(source)
     };
-    if journal.version != 1
+    if journal.version != 2
         || journal.source != source.hash
         || journal.retired > journal.issued
         || journal.entries.len() > WINDOW
@@ -120,6 +140,7 @@ fn read(source: &SequencedSource, response: &Value) -> Result<(u64, Journal), &'
         if entry.sequence != sequence
             || entry.effect.caller != source.caller
             || entry.effect.context != source.context
+            || !source_matches_context(&entry.issuer, &source.context)
             || entry.effect.operation_id != source.operation_id(sequence)?
             || CleanupReference::new(entry.cleanup.id.clone()).is_err()
         {
@@ -190,6 +211,31 @@ pub fn lookup(
         .map(|entry| Lookup::Existing(Box::new(entry)))
         .ok_or("invalid_journal")
 }
+fn source_matches_context(issuer: &Source, context: &SessionContext) -> bool {
+    issuer.valid()
+        && issuer.effect_owner_epoch == context.effect_owner_epoch
+        && matches!(&context.target, LifecycleTarget::Stream { host_epoch, session_id, stream_id, generation }
+            if issuer.host_epoch == *host_epoch && issuer.session_id == *session_id
+            && issuer.stream_id == *stream_id && issuer.stream_generation == *generation)
+}
+
+/// Evidence supplied by the selected authority/runtime, never client input.
+/// Success must mean the exact issuing continuation for this source, owner
+/// incarnation and effect is permanently unable to admit or deliver any effect,
+/// and all calls admitted before the fence have retired. A State read, timeout,
+/// cleanup reply, or unverified owner assertion does not establish retirement.
+/// This hook is not a new authority: production must adapt the existing trusted
+/// runtime and shared effect authority, and must fail closed until it can.
+pub trait IssuerRetirement {
+    fn verify_retired(
+        &self,
+        _issuer: &Source,
+        _effect: &PendingEffect,
+    ) -> Result<(), &'static str> {
+        Err("issuer_retirement_unproven")
+    }
+}
+
 /// The effect must use the candidate operation ID returned by operation_id.
 /// Match the State reply to this exact CAS and selected endpoint.
 pub fn prepare_issue(
@@ -197,6 +243,7 @@ pub fn prepare_issue(
     source: &SequencedSource,
     response: &Value,
     effect: PendingEffect,
+    issuer: Source,
     cleanup: CleanupReference,
 ) -> Result<PendingIssue, &'static str> {
     CleanupReference::new(cleanup.id.clone())?;
@@ -207,6 +254,7 @@ pub fn prepare_issue(
     let sequence = journal.issued.checked_add(1).ok_or("sequence_exhausted")?;
     if effect.caller != source.caller
         || effect.context != source.context
+        || !source_matches_context(&issuer, &source.context)
         || effect.operation_id != source.operation_id(sequence)?
     {
         return Err("identity_mismatch");
@@ -215,6 +263,7 @@ pub fn prepare_issue(
     journal.entries.push(Entry {
         sequence,
         effect: effect.clone(),
+        issuer,
         cleanup,
         cleaned: false,
     });
@@ -253,7 +302,10 @@ impl PendingIssue {
     }
 }
 /// The owner must independently confirm the exact provider cleanup and worker
-/// retirement. The CAS compacts only the cleaned contiguous prefix; gaps remain.
+/// retirement. The issuing continuation must also be permanently fenced by the
+/// selected authority/runtime before this function marks or compacts the entry;
+/// this excludes delayed successful State replies from retired dispatchers.
+/// The CAS compacts only the cleaned contiguous prefix; gaps remain.
 /// Submit this write with a fresh `protocol_state::fresh_state_operation_id`.
 pub fn prepare_cleanup(
     _binding: &DurableStateBinding,
@@ -262,6 +314,7 @@ pub fn prepare_cleanup(
     sequence: u64,
     effect: &PendingEffect,
     cleanup: &CleanupReference,
+    retirement: &impl IssuerRetirement,
 ) -> Result<StateRequest, &'static str> {
     let (revision, mut journal) = read(source, response)?;
     if sequence <= journal.retired {
@@ -274,6 +327,7 @@ pub fn prepare_cleanup(
             entry.sequence == sequence && &entry.effect == effect && &entry.cleanup == cleanup
         })
         .ok_or("unknown_obligation")?;
+    retirement.verify_retired(&entry.issuer, &entry.effect)?;
     entry.cleaned = true;
     while journal.entries.first().is_some_and(|entry| entry.cleaned) {
         journal.entries.remove(0);

@@ -45,15 +45,19 @@ pub struct Route {
 pub struct SessionContext {
     /// Epoch issued by the selected shared effect authority.
     pub authority_epoch: String,
+    /// Incarnation of the selected shared-authority effect owner.
+    pub effect_owner_epoch: String,
     pub target: LifecycleTarget,
     pub peer_ref: String,
 }
 
 /// The trusted authority checks the exact current `context.authority_epoch`,
 /// authenticated identity, stream generation,
-/// negotiated capability and purpose-specific permission together. Its guard must
-/// fence revocation through broker admission. Providers must revalidate before an
-/// effect; this guard does not authorize work after the admission call returns.
+/// negotiated capability and purpose-specific permission together. It must also
+/// reject the exact effect if its issuing continuation has been retired. Its
+/// guard must fence revocation through broker admission. Providers must
+/// revalidate before an effect; this guard does not authorize work after the
+/// admission call returns.
 /// The default denies. The production ingress must not enable this helper until it
 /// can implement these semantics, including crash and revocation reconciliation.
 pub trait SessionAuthority {
@@ -62,6 +66,7 @@ pub trait SessionAuthority {
         &self,
         _context: &SessionContext,
         _capability: &str,
+        _effect: &PendingEffect,
     ) -> Result<Self::AdmissionGuard, &'static str> {
         Err("unauthorized")
     }
@@ -241,7 +246,7 @@ impl ProtocolRouter {
             .find(|route| route.message_type == request.message_type)
             .ok_or("unregistered_route")?;
         let _guard = authority
-            .admit(request.context, &route.capability)
+            .admit(request.context, &route.capability, &effect)
             .map_err(str::to_owned)?;
         for expected in [&route.approval, &route.cleanup_approval] {
             let approved = &expected.method;
@@ -308,6 +313,7 @@ fn valid_name(value: &str) -> bool {
 }
 pub(crate) fn valid_context(context: &SessionContext) -> bool {
     valid_name(&context.authority_epoch)
+        && valid_name(&context.effect_owner_epoch)
         && matches!(&context.target, LifecycleTarget::Stream { host_epoch, session_id, stream_id, generation }
         if valid_name(host_epoch) && valid_name(session_id) && valid_name(stream_id) && *generation > 0)
         && valid_name(&context.peer_ref)
