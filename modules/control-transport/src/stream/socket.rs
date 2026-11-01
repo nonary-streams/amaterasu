@@ -60,7 +60,7 @@ impl Stream {
             let Some(packet) = self.pending_datagram.as_ref() else {
                 return;
             };
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             if let Some((entered, resume)) = self.before_local_send.take() {
                 entered.send(()).expect("test observer remains live");
                 resume

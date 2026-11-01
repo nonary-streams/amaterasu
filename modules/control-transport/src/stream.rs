@@ -38,8 +38,11 @@ pub struct Stream {
     sealer: ControlSealer,
     opener: ControlOpener,
     pending_datagram: Option<Vec<u8>>,
-    #[cfg(test)]
-    before_local_send: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    #[cfg(any(test, feature = "test-support"))]
+    before_local_send: Option<(
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
     incoming: VecDeque<Received>,
     incoming_bytes: usize,
     opened: u64,
@@ -64,10 +67,10 @@ impl Stream {
         self.pending_datagram = Some(bytes);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn pause_local_send_for_test(
         &mut self,
-        entered: std::sync::mpsc::Sender<()>,
+        entered: std::sync::mpsc::SyncSender<()>,
         resume: std::sync::mpsc::Receiver<()>,
     ) {
         self.before_local_send = Some((entered, resume));
@@ -189,7 +192,7 @@ impl Stream {
             sealer,
             opener,
             pending_datagram: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             before_local_send: None,
             incoming: VecDeque::new(),
             incoming_bytes: 0,
