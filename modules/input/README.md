@@ -11,6 +11,11 @@ Startup settings:
 {"allow_injection":false,"uinput_path":"/dev/uinput"}
 ```
 
+The trusted startup setting `feedback_owner` selects the direct runtime principal
+allowed to observe and pull feedback. It defaults to `amaterasu.stream-session`;
+its name must be valid and must match the separately selected effect owner. This
+setting does not grant broker access or authorize a source route.
+
 Injection defaults off. The Linux path is an administrator setting, never a request
 field. It must be an absolute, non-symlink character-device path and is opened
 only when an enabled acquire reaches its active-request check. No devices are

@@ -20,6 +20,7 @@ const MAX_SCROLL_STEPS_PER_EVENT: i32 = 100;
 const DEFAULT_KEY_REPEAT_DELAY_MS: u32 = 500;
 const DEFAULT_KEY_REPEAT_FREQUENCY_HZ: f64 = 24.9;
 const DEFAULT_BACK_BUTTON_TIMEOUT_MS: i32 = -1;
+#[cfg(test)]
 const STREAM_SESSION_CALLER: &str = "amaterasu.stream-session";
 const MAX_FEEDBACK_PEEK: u8 = 16;
 
@@ -211,6 +212,7 @@ impl ActivePenTouch {
 pub struct Controller<B: Backend> {
     backend: B,
     enabled: bool,
+    feedback_owner: String,
     device_policy: DevicePolicy,
     high_resolution_scrolling: bool,
     always_send_scancodes: bool,
@@ -242,7 +244,12 @@ pub struct Controller<B: Backend> {
     terminal_acquires: VecDeque<TerminalAcquire>,
 }
 impl<B: Backend> Controller<B> {
-    pub fn new(mut backend: B, enabled: bool) -> Self {
+    #[cfg(test)]
+    pub fn new(backend: B, enabled: bool) -> Self {
+        Self::with_feedback_owner(backend, enabled, STREAM_SESSION_CALLER.into())
+    }
+
+    pub fn with_feedback_owner(mut backend: B, enabled: bool, feedback_owner: String) -> Self {
         let feedback = FeedbackQueue::default();
         backend.set_feedback_queue(feedback.clone());
         backend.set_keybindings(&KeyBindings::default());
@@ -250,6 +257,7 @@ impl<B: Backend> Controller<B> {
         Self {
             backend,
             enabled,
+            feedback_owner,
             device_policy: DevicePolicy::default(),
             high_resolution_scrolling: true,
             always_send_scancodes: true,
@@ -1158,7 +1166,7 @@ impl<B: Backend> Controller<B> {
     }
 
     fn authorize_feedback_caller(&self, caller: &str) -> InputResult<()> {
-        if caller == STREAM_SESSION_CALLER {
+        if caller == self.feedback_owner {
             Ok(())
         } else {
             Err(InputError::new(

@@ -45,7 +45,8 @@ the selected input provider:
  "input_binding":"<lifecycle binding>","controller_slot":3}
 ```
 
-Only the direct `amaterasu.stream-session` caller/initiator is accepted. The
+Only the direct startup-selected feedback owner caller/initiator is accepted;
+its default is `amaterasu.stream-session`. The
 provider requires an active owned lease, lifecycle binding, actual selected
 backend slot, and exact current device incarnation; it validates the lifecycle
 binding again with `source_version:1` and its boot epoch and rechecks the local
@@ -127,3 +128,25 @@ precommit trust mutation passes the barrier, stale incarnations never create an
 effect, no local sends occur after the drain acknowledgment, and recovery does
 not rely on timeouts. The lifecycle and host-configuration precommit fence and
 independent review remain prerequisites, not workarounds for missing evidence.
+
+## Current source-retirement integration mismatch
+
+The committed source-retirement protocol requires an exact admitted source and
+structured scope for every controller sharing a control transport. Input's raw
+controller-arrival capabilities are client claims; the selected provider does
+not expose an independently attested feedback schema intersection, and the
+stream owner lacks an effective per-session controller-policy decision. Neither
+value may be fabricated from the observation above. The input revoke path also
+acknowledges local cleanup without a stream-owner retirement response; it has
+no complete source/scope registry to issue a pairing fence.
+
+The required bounded handoff is a direct, authenticated request from input to
+the selected stream owner when an owned binding or device retires. The stream
+owner must fence every exact admitted source on the shared control transport,
+stop its local queue, request real control-provider retirement, reconcile the
+provider receipt and complete and acknowledge every lease and source retirement
+with that same receipt before replying. Input must hold its lifecycle revoke
+acknowledgment until that reply. Missing or uncertain identities and receipts
+remain fenced. The authority worker is repairing terminal lease replay,
+controller-specific operation identities and shared-transport receipt agreement;
+these must be covered with the combined real-provider test before activation.

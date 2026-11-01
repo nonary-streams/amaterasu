@@ -12,6 +12,7 @@ crate-type = ["cdylib", "rlib"]
 qualification-fake-backend = []
 
 [dependencies]
+amaterasu-contracts.workspace = true
 amaterasu-extension-api.workspace = true
 amaterasu-configuration-schema.workspace = true
 amaterasu-module-sdk.workspace = true
@@ -42,5 +43,4 @@ libc = "0.2"
 workspace = true
 
 [dev-dependencies]
-amaterasu-contracts.workspace = true
 amaterasu-runtime = { path = "../../crates/runtime" }
