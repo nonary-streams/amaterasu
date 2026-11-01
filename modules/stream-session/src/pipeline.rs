@@ -1,5 +1,6 @@
 mod actions;
 mod cleanup;
+mod contribution_barrier;
 mod display;
 mod history;
 mod history_activity;
@@ -46,9 +47,27 @@ trait Drive {
         &mut self,
         feedback: HostFeedback,
     ) -> Result<FeedbackEnqueueOutcome, FeedbackEnqueueError>;
+    fn enqueue_contribution(
+        &mut self,
+        message: amaterasu_gamestream::control::HostFeedbackMessage,
+    ) -> Result<FeedbackEnqueueOutcome, FeedbackEnqueueError>;
+    fn pump_contributions(&mut self, allowed: bool) -> Result<(), &'static str>;
+    fn discard_contributions(&mut self);
 }
 
 impl Drive for Plane {
+    fn enqueue_contribution(
+        &mut self,
+        message: amaterasu_gamestream::control::HostFeedbackMessage,
+    ) -> Result<FeedbackEnqueueOutcome, FeedbackEnqueueError> {
+        Plane::enqueue_contribution(self, message)
+    }
+    fn pump_contributions(&mut self, allowed: bool) -> Result<(), &'static str> {
+        Plane::pump_contributions(self, allowed)
+    }
+    fn discard_contributions(&mut self) {
+        Plane::discard_contributions(self);
+    }
     fn tick(&mut self, media_active: bool) -> Result<PlaneProgress, PlaneFailure> {
         Plane::tick(self, media_active)
     }
@@ -591,6 +610,11 @@ impl Pipeline {
                 Step::FeedbackAck,
                 record.input_expires_at.min(now.saturating_add(5000)),
             )
+        } else if record.input_lease.is_some()
+            && now >= record.feedback_poll_at
+            && record.contribution_barrier.ready_generation().is_some()
+        {
+            (Step::FeedbackPeek, now.saturating_add(5000))
         } else if !record.input_events.is_empty() {
             (
                 Step::InputBatch,
@@ -797,6 +821,7 @@ impl Pipeline {
                                 record.force_idr = true
                             }
                             Message::Input(input) => {
+                                let generation = record.contribution_barrier.generation();
                                 if let Err(code) = input::queue_control_input(
                                     record,
                                     input,
@@ -805,6 +830,11 @@ impl Pipeline {
                                 ) {
                                     input::stop_for_input_failure(record, code);
                                 }
+                                if record.contribution_barrier.generation() != generation
+                                    && let Some(plane) = record.plane.as_mut()
+                                {
+                                    plane.discard_contributions();
+                                }
                             }
                             Message::Ping { .. } | Message::Start => {}
                             _ => {
@@ -812,6 +842,14 @@ impl Pipeline {
                                     record.unsupported_controls.saturating_add(1)
                             }
                         }
+                    }
+                    let allowed = record.state == State::Active
+                        && record.input_lease.is_some()
+                        && record.contribution_barrier.ready_generation().is_some();
+                    if let Some(plane) = record.plane.as_mut()
+                        && let Err(code) = plane.pump_contributions(allowed)
+                    {
+                        input::stop_for_input_failure(record, code);
                     }
                 }
                 Err(failure) => {

@@ -2,6 +2,8 @@
 //! pipeline; this plane owns only bindings and bounded copied pending output.
 mod native;
 mod packets;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use amaterasu_gamestream::control::{
     FeedbackEncodeError, HostFeedback, HostFeedbackDelivery, HostFeedbackMessage,
@@ -122,6 +124,24 @@ impl Plane {
         self.pump.enqueue_feedback(feedback)
     }
 
+    pub fn enqueue_contribution(
+        &mut self,
+        message: HostFeedbackMessage,
+    ) -> Result<FeedbackEnqueueOutcome, FeedbackEnqueueError> {
+        self.pump.enqueue_message(PendingFeedback {
+            message,
+            contribution: true,
+        })
+    }
+
+    pub fn pump_contributions(&mut self, allowed: bool) -> PlaneResult<()> {
+        self.pump.pump_feedback(allowed)
+    }
+
+    pub fn discard_contributions(&mut self) {
+        self.pump.discard_contributions();
+    }
+
     /// Stops new PCM capture and cancels pending feedback. The pipeline separately
     /// drains the video provider.
     pub fn stop(&mut self) {
@@ -157,6 +177,11 @@ trait Backend {
     fn drain_transport(&mut self) -> PlaneResult<bool>;
 }
 
+struct PendingFeedback {
+    message: HostFeedbackMessage,
+    contribution: bool,
+}
+
 struct Pump<B> {
     backend: B,
     stream_audio: bool,
@@ -164,7 +189,7 @@ struct Pump<B> {
     video: VideoAssembly,
     pending_pcm: Option<PcmPacket>,
     pending_audio: Option<AudioPacket>,
-    pending_feedback: VecDeque<HostFeedbackMessage>,
+    pending_feedback: VecDeque<PendingFeedback>,
     pending_feedback_bytes: usize,
     stopping: bool,
     encoder_draining: bool,
@@ -244,7 +269,7 @@ impl<B: Backend> Pump<B> {
             };
             progress.controls.push(message);
         }
-        if let Err(code) = self.pump_feedback() {
+        if let Err(code) = self.pump_feedback(false) {
             return Err(TickFailure { code, progress });
         }
         if !media_active {
@@ -275,20 +300,32 @@ impl<B: Backend> Pump<B> {
             return Err(FeedbackEnqueueError::Stopped);
         }
         let message = encode_host_feedback(feedback).map_err(FeedbackEnqueueError::Invalid)?;
-        let message_bytes = message.payload.len();
+        self.enqueue_message(PendingFeedback {
+            message,
+            contribution: false,
+        })
+    }
+
+    fn enqueue_message(
+        &mut self,
+        pending: PendingFeedback,
+    ) -> Result<FeedbackEnqueueOutcome, FeedbackEnqueueError> {
+        if self.stopping || self.failure.is_some() {
+            return Err(FeedbackEnqueueError::Stopped);
+        }
+        let message_bytes = pending.message.payload.len();
         if message_bytes > MAX_PENDING_FEEDBACK_BYTES {
             return Err(FeedbackEnqueueError::QueueFull);
         }
-        if message.delivery == HostFeedbackDelivery::SequencedUnreliable
+        if pending.message.delivery == HostFeedbackDelivery::SequencedUnreliable
             && self.would_exceed_feedback_bounds(message_bytes)
         {
             return Ok(FeedbackEnqueueOutcome::DroppedBestEffort);
         }
         while self.would_exceed_feedback_bounds(message_bytes) {
-            let pcm_index = self
-                .pending_feedback
-                .iter()
-                .position(|pending| pending.delivery == HostFeedbackDelivery::SequencedUnreliable);
+            let pcm_index = self.pending_feedback.iter().position(|pending| {
+                pending.message.delivery == HostFeedbackDelivery::SequencedUnreliable
+            });
             let Some(pcm_index) = pcm_index else {
                 return Err(FeedbackEnqueueError::QueueFull);
             };
@@ -296,10 +333,10 @@ impl<B: Backend> Pump<B> {
                 .pending_feedback
                 .remove(pcm_index)
                 .expect("located PCM entry");
-            self.pending_feedback_bytes -= dropped.payload.len();
+            self.pending_feedback_bytes -= dropped.message.payload.len();
         }
         self.pending_feedback_bytes += message_bytes;
-        self.pending_feedback.push_back(message);
+        self.pending_feedback.push_back(pending);
         Ok(FeedbackEnqueueOutcome::Queued)
     }
 
@@ -309,24 +346,37 @@ impl<B: Backend> Pump<B> {
                 > MAX_PENDING_FEEDBACK_BYTES
     }
 
+    fn discard_contributions(&mut self) {
+        self.pending_feedback
+            .retain(|pending| !pending.contribution);
+        self.pending_feedback_bytes = self
+            .pending_feedback
+            .iter()
+            .map(|pending| pending.message.payload.len())
+            .sum();
+    }
+
     fn cancel_feedback(&mut self) {
         self.pending_feedback.clear();
         self.pending_feedback_bytes = 0;
     }
 
-    fn pump_feedback(&mut self) -> PlaneResult<()> {
+    fn pump_feedback(&mut self, allow_contributions: bool) -> PlaneResult<()> {
         for _ in 0..FEEDBACK_SEND_BUDGET {
             let Some(message) = self.pending_feedback.front() else {
                 break;
             };
-            if !self.backend.send_feedback(message)? {
+            if message.contribution && !allow_contributions {
+                break;
+            }
+            if !self.backend.send_feedback(&message.message)? {
                 break;
             }
             let accepted = self
                 .pending_feedback
                 .pop_front()
                 .expect("front was present");
-            self.pending_feedback_bytes -= accepted.payload.len();
+            self.pending_feedback_bytes -= accepted.message.payload.len();
         }
         Ok(())
     }

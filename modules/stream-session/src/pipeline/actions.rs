@@ -227,6 +227,16 @@ impl Pipeline {
             rpc::complete(send, request, error("permission_denied"));
             return;
         }
+        if let Some(agreement) = &configuration.outbound_agreement
+            && self
+                .settings
+                .outbound_policy
+                .as_ref()
+                .is_none_or(|policy| policy.authority != owner || !policy.approves(agreement))
+        {
+            rpc::complete(send, request, error("permission_denied"));
+            return;
+        }
 
         let Some(record) = self
             .records

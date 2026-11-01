@@ -362,6 +362,9 @@ impl Pipeline {
         if job.step == Step::InputBatch {
             record.input_inflight = next_input_batch_size(record);
         }
+        if job.step == Step::FeedbackPeek {
+            record.feedback_peek_generation = record.contribution_barrier.ready_generation();
+        }
         if job.step != Step::PersistJournal
             && (transferred_display_restore
                 || (!job.cleanup && !self.journal.matches_record(record)))
@@ -787,6 +790,17 @@ impl Pipeline {
             if matches!(job.step, Step::FeedbackPeek | Step::FeedbackAck) {
                 if job.step == Step::FeedbackPeek {
                     record.feedback_ack_through = None;
+                    if record
+                        .start
+                        .as_ref()
+                        .is_some_and(|start| start.outbound_agreement.is_some())
+                        && matches!(
+                            payload["error"]["code"].as_str(),
+                            Some("invalid_request" | "unsupported")
+                        )
+                    {
+                        record.feedback_contributions_unsupported = true;
+                    }
                 }
                 record.feedback_poll_at = now.saturating_add(100);
                 return false;

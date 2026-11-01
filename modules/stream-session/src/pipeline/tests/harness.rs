@@ -31,6 +31,223 @@ pub enum Fault {
     Admission,
 }
 
+type SharedRuntimeBroker = std::sync::Arc<std::sync::Mutex<amaterasu_runtime::Broker>>;
+
+struct LoadedRuntime {
+    api: amaterasu_module_sdk::abi::RuntimeApi,
+    instance: *mut std::ffi::c_void,
+    session: RuntimeClient,
+    provider: amaterasu_module_sdk::abi::HostApi,
+    _library: libloading::Library,
+}
+impl LoadedRuntime {
+    fn load(path: &std::path::Path) -> Self {
+        use amaterasu_module_sdk::abi::{
+            BorrowedBytes, HostApi, RuntimeApi, RuntimeEntry, STATUS_OK,
+        };
+        // SAFETY: the supplied runtime artifact is built from this workspace and
+        // remains loaded until its instances and endpoints are destroyed.
+        let library = unsafe { libloading::Library::new(path) }.unwrap();
+        // SAFETY: the runtime exports the documented entry point and ABI table.
+        let entry: libloading::Symbol<RuntimeEntry> =
+            unsafe { library.get(b"amaterasu_runtime_v1\0") }.unwrap();
+        let api = unsafe { *entry() };
+        assert!(api.header.supports::<RuntimeApi>());
+        let mut config = amaterasu_contracts::RuntimeConfig::default();
+        config.principals.insert(
+            "amaterasu.stream-session".into(),
+            amaterasu_contracts::Grants {
+                call: ["amaterasu.input/1".into()].into(),
+                ..Default::default()
+            },
+        );
+        config.principals.insert(
+            "test.neutral-provider".into(),
+            amaterasu_contracts::Grants {
+                provide: ["amaterasu.input/1".into()].into(),
+                ..Default::default()
+            },
+        );
+        let bytes = serde_json::to_vec(&config).unwrap();
+        let mut instance = std::ptr::null_mut();
+        // SAFETY: configuration bytes and output slot live for this synchronous call.
+        assert_eq!(
+            unsafe { (api.create)(BorrowedBytes::new(&bytes), &mut instance) },
+            STATUS_OK
+        );
+        let endpoint = |principal: &str| {
+            let mut result = std::mem::MaybeUninit::<HostApi>::uninit();
+            // SAFETY: live runtime and output slot outlive the endpoint creation call.
+            assert_eq!(
+                unsafe {
+                    (api.endpoint)(
+                        instance,
+                        BorrowedBytes::new(principal.as_bytes()),
+                        result.as_mut_ptr(),
+                    )
+                },
+                STATUS_OK
+            );
+            // SAFETY: successful endpoint creation initialized this output.
+            unsafe { result.assume_init() }
+        };
+        let provider = endpoint("test.neutral-provider");
+        // SAFETY: runtime outlives the session client and all its calls.
+        let session = unsafe { RuntimeClient::from_endpoint(endpoint("amaterasu.stream-session")) };
+        Self {
+            api,
+            instance,
+            session,
+            provider,
+            _library: library,
+        }
+    }
+}
+impl Drop for LoadedRuntime {
+    fn drop(&mut self) {
+        // SAFETY: provider instance has already been destroyed; no calls remain.
+        unsafe { (self.api.destroy)(self.instance) };
+    }
+}
+struct LoadedProvider {
+    api: amaterasu_module_sdk::abi::ModuleApi,
+    instance: *mut std::ffi::c_void,
+    _library: libloading::Library,
+}
+impl LoadedProvider {
+    fn load(path: &std::path::Path, host: &amaterasu_module_sdk::abi::HostApi) -> Self {
+        use amaterasu_module_sdk::abi::{ModuleEntry, STATUS_OK};
+        // SAFETY: test supplies a trusted workspace-built module and keeps it
+        // loaded until after the module instance is destroyed.
+        let library = unsafe { libloading::Library::new(path) }.unwrap();
+        // SAFETY: fixture exports the documented module entry point.
+        let entry: libloading::Symbol<ModuleEntry> =
+            unsafe { library.get(b"amaterasu_module_v1\0") }.unwrap();
+        let api = unsafe { *entry() };
+        assert!(
+            api.header
+                .supports::<amaterasu_module_sdk::abi::ModuleApi>()
+        );
+        let mut instance = std::ptr::null_mut();
+        // SAFETY: runtime endpoint and output slot are valid throughout creation;
+        // the runtime outlives the module and all endpoint calls.
+        assert_eq!(unsafe { (api.create)(host, &mut instance) }, STATUS_OK);
+        assert!(!instance.is_null());
+        Self {
+            api,
+            instance,
+            _library: library,
+        }
+    }
+    fn tick(&mut self) {
+        // SAFETY: the instance is live and module calls are serial.
+        assert_eq!(
+            unsafe { (self.api.tick)(self.instance) },
+            amaterasu_module_sdk::abi::STATUS_OK
+        );
+    }
+}
+impl Drop for LoadedProvider {
+    fn drop(&mut self) {
+        // SAFETY: destroy runs once before the module library and runtime drop.
+        unsafe { (self.api.destroy)(self.instance) };
+    }
+}
+
+/// Independent neutral input provider: its mailbox is scoped to a lease,
+/// session and resource incarnation owned by the provider fixture.
+pub struct NeutralProvider {
+    pub session: u64,
+    pub lease: String,
+    pub incarnation: u64,
+    pub events: VecDeque<Value>,
+}
+impl NeutralProvider {
+    pub fn emit(
+        &mut self,
+        session: u64,
+        incarnation: u64,
+        sequence: u64,
+        schema: &str,
+        payload: Vec<u8>,
+    ) -> bool {
+        if session != self.session || incarnation != self.incarnation {
+            return false;
+        }
+        let event = amaterasu_module_sdk::input::outbound::OutboundFeedbackEvent {
+            sequence,
+            contribution: amaterasu_module_sdk::input::outbound::OutboundContribution {
+                version: 1,
+                schema: schema.into(),
+                schema_version: 1,
+                session,
+                resource: if schema == "org.example.beta" {
+                    "neutral-resource-b"
+                } else {
+                    "neutral-resource"
+                }
+                .into(),
+                incarnation,
+                payload,
+            },
+        };
+        if event.contribution.validate().is_err() || self.events.len() >= 256 {
+            return false;
+        }
+        let value = serde_json::to_value(event).unwrap();
+        if amaterasu_module_sdk::input::outbound::bounded_feedback_response(std::slice::from_ref(
+            &value,
+        ))
+        .is_err()
+        {
+            return false;
+        }
+        self.events.push_back(value);
+        true
+    }
+    pub fn retire_resource(&mut self) {
+        self.incarnation += 1;
+        self.events
+            .retain(|event| event["contribution"]["incarnation"] == self.incarnation);
+    }
+    pub fn peek(&self, caller: &str, payload: &Value) -> Value {
+        if caller != "amaterasu.stream-session"
+            || payload["contribution_version"] != 1
+            || payload["lease"] != self.lease
+            || payload["session"] != self.session
+        {
+            return json!({"ok":false,"error":{"code":"permission_denied"}});
+        }
+        let mut events = Vec::new();
+        for event in self
+            .events
+            .iter()
+            .take(payload["limit"].as_u64().unwrap_or(16) as usize)
+        {
+            events.push(event.clone());
+            if amaterasu_module_sdk::input::outbound::bounded_feedback_response(&events).is_err() {
+                events.pop();
+                break;
+            }
+        }
+        amaterasu_module_sdk::input::outbound::bounded_feedback_response(&events).unwrap()
+    }
+    fn ack(&mut self, payload: &Value) -> Value {
+        if payload["lease"] != self.lease {
+            return json!({"ok":false,"error":{"code":"permission_denied"}});
+        }
+        let through = payload["through_sequence"].as_u64().unwrap();
+        while self
+            .events
+            .front()
+            .is_some_and(|event| event["sequence"].as_u64().is_some_and(|seq| seq <= through))
+        {
+            self.events.pop_front();
+        }
+        json!({"ok":true,"through_sequence":through})
+    }
+}
+
 #[derive(Default)]
 pub struct Broker {
     pub lifecycle_success: bool,
@@ -78,6 +295,11 @@ pub struct Broker {
     pub input_terminal: bool,
     pub input_events: Vec<Value>,
     pub input_feedback_events: VecDeque<Value>,
+    pub neutral_provider: Option<NeutralProvider>,
+    real_input_broker: Option<SharedRuntimeBroker>,
+    loaded_provider: Option<LoadedProvider>,
+    loaded_runtime: Option<LoadedRuntime>,
+    pub reject_optional_feedback: bool,
     pub input_feedback_acks: Vec<u64>,
     pub feedback_ack_failures: usize,
     pub gamepad_feedback: VecDeque<Value>,
@@ -168,6 +390,143 @@ impl Broker {
         }
     }
 
+    pub fn enable_real_input_broker(&mut self) {
+        let mut configuration = amaterasu_contracts::RuntimeConfig::default();
+        configuration.principals.insert(
+            "amaterasu.stream-session".into(),
+            amaterasu_contracts::Grants {
+                call: ["amaterasu.input/1".into()].into(),
+                ..Default::default()
+            },
+        );
+        configuration.principals.insert(
+            "test.neutral-provider".into(),
+            amaterasu_contracts::Grants {
+                provide: ["amaterasu.input/1".into()].into(),
+                ..Default::default()
+            },
+        );
+        let mut broker = amaterasu_runtime::Broker::new(configuration).unwrap();
+        assert!(matches!(
+            broker.dispatch(
+                "test.neutral-provider",
+                Command::Register {
+                    service: "amaterasu.input/1".into()
+                }
+            ),
+            Response::Ok
+        ));
+        self.real_input_broker = Some(std::sync::Arc::new(std::sync::Mutex::new(broker)));
+    }
+
+    pub fn load_neutral_provider(&mut self, path: &std::path::Path) {
+        let runtime_path =
+            std::env::var_os("AMATERASU_RUNTIME_PLUGIN").expect("separately built runtime path");
+        let runtime = LoadedRuntime::load(std::path::Path::new(&runtime_path));
+        self.loaded_provider = Some(LoadedProvider::load(path, &runtime.provider));
+        self.loaded_runtime = Some(runtime);
+    }
+
+    fn session_broker_send(&self, command: Command) -> ModuleResult<Response> {
+        if let Some(runtime) = &self.loaded_runtime {
+            return runtime.session.send(command);
+        }
+        Ok(self
+            .real_input_broker
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .dispatch("amaterasu.stream-session", command))
+    }
+
+    fn route_real_feedback(&mut self, command: &Command) -> Option<ModuleResult<Response>> {
+        const OFFSET: u64 = 1 << 62;
+        self.real_input_broker.as_ref()?;
+        match command {
+            Command::Request {
+                service,
+                payload,
+                parent,
+                ..
+            } if service == "amaterasu.input/1"
+                && (self.loaded_provider.is_some()
+                    || matches!(
+                        payload["action"].as_str(),
+                        Some("feedback_peek" | "feedback_ack")
+                    )) =>
+            {
+                // The surrounding session/launch broker is synthetic in this
+                // harness; the selected provider's real runtime has no matching
+                // parent request, so this isolated dependency call is unparented.
+                let mut routed = command.clone();
+                if let Command::Request { parent, .. } = &mut routed {
+                    *parent = None;
+                }
+                let _ = parent;
+                let response = self.session_broker_send(routed).unwrap();
+                Some(Ok(match response {
+                    Response::Accepted { id } => Response::Accepted { id: id + OFFSET },
+                    response => response,
+                }))
+            }
+            Command::TakeResult { request } if *request >= OFFSET => {
+                let request = *request - OFFSET;
+                if let Some(provider) = &mut self.loaded_provider {
+                    provider.tick();
+                } else {
+                    let pending = self
+                        .real_input_broker
+                        .as_ref()
+                        .unwrap()
+                        .lock()
+                        .unwrap()
+                        .dispatch("test.neutral-provider", Command::Poll {});
+                    if let Response::Request {
+                        id,
+                        caller,
+                        service,
+                        payload,
+                        ..
+                    } = pending
+                    {
+                        assert_eq!(caller, "amaterasu.stream-session");
+                        assert_eq!(service, "amaterasu.input/1");
+                        let action = payload["action"].as_str().unwrap();
+                        let result = self.input(action, &payload);
+                        assert!(matches!(
+                            self.real_input_broker
+                                .as_ref()
+                                .unwrap()
+                                .lock()
+                                .unwrap()
+                                .dispatch(
+                                    "test.neutral-provider",
+                                    Command::Complete {
+                                        request: id,
+                                        payload: result
+                                    }
+                                ),
+                            Response::Ok
+                        ));
+                    }
+                }
+                Some(self.session_broker_send(Command::TakeResult { request }))
+            }
+            Command::ReleaseResult { request } if *request >= OFFSET => {
+                Some(self.session_broker_send(Command::ReleaseResult {
+                    request: *request - OFFSET,
+                }))
+            }
+            Command::Cancel { request } if *request >= OFFSET => {
+                Some(self.session_broker_send(Command::Cancel {
+                    request: *request - OFFSET,
+                }))
+            }
+            _ => None,
+        }
+    }
+
     pub fn enqueue(&mut self, request: u64, owner: &str, payload: Value) {
         self.incoming.push_back(Response::Request {
             id: request,
@@ -236,6 +595,9 @@ impl Broker {
 
     pub fn send(&mut self, command: Command) -> ModuleResult<Response> {
         self.commands.push(command.clone());
+        if let Some(result) = self.route_real_feedback(&command) {
+            return result;
+        }
         match command {
             Command::Poll {} => Ok(self.incoming.pop_front().unwrap_or(Response::Pending)),
             Command::CheckRequest { request } => Ok(if self.cancelled.contains(&request) {
@@ -1095,12 +1457,21 @@ impl Broker {
                 reply
             }
             "feedback_peek" => {
+                if self.reject_optional_feedback && !payload["session"].is_null() {
+                    return json!({"ok":false,"error":{"code":"invalid_request"}});
+                }
+                if let Some(provider) = &self.neutral_provider {
+                    return provider.peek("amaterasu.stream-session", payload);
+                }
                 assert_eq!(payload["lease"], json!(self.input_lease));
                 json!({"ok":true,"events":self.input_feedback_events.iter().take(
                     payload["limit"].as_u64().unwrap_or(16) as usize
                 ).cloned().collect::<Vec<_>>()})
             }
             "feedback_ack" => {
+                if let Some(provider) = &mut self.neutral_provider {
+                    return provider.ack(payload);
+                }
                 assert_eq!(payload["lease"], json!(self.input_lease));
                 let through = payload["through_sequence"].as_u64().unwrap();
                 if self.feedback_ack_failures > 0 {
@@ -1256,6 +1627,9 @@ pub struct PlaneState {
     pub observed_video_sequence_gaps: u64,
     pub feedback: Vec<amaterasu_gamestream::control::HostFeedback>,
     pub feedback_queue_full: usize,
+    pub contribution_queue: Vec<amaterasu_gamestream::control::HostFeedbackMessage>,
+    pub contributions_sent: Vec<amaterasu_gamestream::control::HostFeedbackMessage>,
+    pub contribution_busy: bool,
     pub rumble_commands: Vec<crate::plane::RumbleCommand>,
     pub rumble_error: bool,
     pub rumble_busy: bool,
@@ -1263,6 +1637,24 @@ pub struct PlaneState {
 }
 struct FakePlane(Rc<RefCell<PlaneState>>);
 impl Drive for FakePlane {
+    fn enqueue_contribution(
+        &mut self,
+        message: amaterasu_gamestream::control::HostFeedbackMessage,
+    ) -> Result<crate::plane::FeedbackEnqueueOutcome, crate::plane::FeedbackEnqueueError> {
+        self.0.borrow_mut().contribution_queue.push(message);
+        Ok(crate::plane::FeedbackEnqueueOutcome::Queued)
+    }
+    fn pump_contributions(&mut self, allowed: bool) -> Result<(), &'static str> {
+        let mut state = self.0.borrow_mut();
+        if allowed && !state.contribution_busy && !state.stopping {
+            let entries = std::mem::take(&mut state.contribution_queue);
+            state.contributions_sent.extend(entries);
+        }
+        Ok(())
+    }
+    fn discard_contributions(&mut self) {
+        self.0.borrow_mut().contribution_queue.clear();
+    }
     fn recover_audio(&mut self) {
         self.0.borrow_mut().failure = None;
     }
@@ -1299,6 +1691,7 @@ impl Drive for FakePlane {
     fn stop(&mut self) {
         let mut state = self.0.borrow_mut();
         state.stopping = true;
+        state.contribution_queue.clear();
         state.media_ticks_when_stopped = Some(state.media_ticks);
     }
     fn is_drained(&self) -> bool {
@@ -1327,10 +1720,46 @@ impl Drop for FakePlane {
     }
 }
 
+struct QueuePlane(crate::plane::test_support::TestPlane);
+impl Drive for QueuePlane {
+    fn tick(&mut self, _: bool) -> Result<PlaneProgress, PlaneFailure> {
+        self.0.tick()
+    }
+    fn send_rumble(&mut self, _: crate::plane::RumbleCommand) -> Result<bool, &'static str> {
+        Ok(true)
+    }
+    fn stop(&mut self) {
+        self.0.stop();
+    }
+    fn is_drained(&self) -> bool {
+        self.0.is_drained()
+    }
+    fn recover_audio(&mut self) {}
+    fn enqueue_feedback(
+        &mut self,
+        feedback: HostFeedback,
+    ) -> Result<FeedbackEnqueueOutcome, FeedbackEnqueueError> {
+        self.0.enqueue_feedback(feedback)
+    }
+    fn enqueue_contribution(
+        &mut self,
+        message: amaterasu_gamestream::control::HostFeedbackMessage,
+    ) -> Result<FeedbackEnqueueOutcome, FeedbackEnqueueError> {
+        self.0.enqueue_contribution(message)
+    }
+    fn pump_contributions(&mut self, allowed: bool) -> Result<(), &'static str> {
+        self.0.pump_contributions(allowed)
+    }
+    fn discard_contributions(&mut self) {
+        self.0.discard_contributions();
+    }
+}
+
 pub struct Harness {
     pub pipeline: Pipeline,
     pub broker: Broker,
     pub plane: Rc<RefCell<PlaneState>>,
+    pub real_transport: Option<Rc<RefCell<crate::plane::test_support::TransportState>>>,
     pub now: u64,
 }
 impl Harness {
@@ -1351,6 +1780,7 @@ impl Harness {
             .unwrap(),
             broker,
             plane: Rc::new(RefCell::new(plane_state)),
+            real_transport: None,
             now: 0,
         }
     }
@@ -1369,11 +1799,20 @@ impl Harness {
         self.now += 1;
         self.broker.now = self.now;
         let state = self.plane.clone();
+        let real_transport = self.real_transport.clone();
         self.pipeline
             .tick_with(
                 self.now,
                 &mut |command| self.broker.send(command),
-                &mut |_, _| Ok(Box::new(FakePlane(state.clone()))),
+                &mut |_, _| {
+                    if let Some(transport) = &real_transport {
+                        Ok(Box::new(QueuePlane(
+                            crate::plane::test_support::TestPlane::new(transport.clone()),
+                        )))
+                    } else {
+                        Ok(Box::new(FakePlane(state.clone())))
+                    }
+                },
             )
             .unwrap();
     }

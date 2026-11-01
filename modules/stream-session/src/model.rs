@@ -17,6 +17,7 @@ pub struct Settings {
     pub drain_timeout_ms: u64,
     pub enable_input: bool,
     pub input_lease_ttl_ms: u64,
+    pub outbound_policy: Option<OutboundPolicy>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -29,13 +30,51 @@ impl Default for Settings {
             drain_timeout_ms: 5000,
             enable_input: false,
             input_lease_ttl_ms: 30000,
+            outbound_policy: None,
         }
     }
 }
+/// Trusted startup selection, independent of any peer-supplied agreement.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutboundPolicy {
+    pub authority: String,
+    pub input_service: String,
+    pub approved: amaterasu_module_sdk::input::outbound::OutboundAgreement,
+}
+
+impl OutboundPolicy {
+    fn valid(&self, allowed_principals: &[String]) -> bool {
+        valid_name(&self.authority)
+            && allowed_principals.contains(&self.authority)
+            && self.input_service == amaterasu_module_sdk::input::INPUT_SERVICE
+            && self.approved.validate().is_ok()
+            && self
+                .approved
+                .schemas
+                .iter()
+                .all(|schema| !reserved_control_type(schema.message_type))
+    }
+
+    pub(crate) fn approves(
+        &self,
+        agreement: &amaterasu_module_sdk::input::outbound::OutboundAgreement,
+    ) -> bool {
+        agreement
+            .schemas
+            .iter()
+            .all(|schema| self.approved.schemas.contains(schema))
+    }
+}
+
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
         self.providers.validate()?;
-        if self.allowed_principals.len() > 16
+        if self
+            .outbound_policy
+            .as_ref()
+            .is_some_and(|policy| !policy.valid(&self.allowed_principals))
+            || self.allowed_principals.len() > 16
             || self
                 .allowed_principals
                 .iter()
@@ -908,6 +947,9 @@ pub struct StartConfigData {
     pub touchpad_as_ds4: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ds5_inputtino_randomize_mac: Option<bool>,
+    /// Frozen agreement supplied by the trusted protocol owner; absent denies contributions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound_agreement: Option<amaterasu_module_sdk::input::outbound::OutboundAgreement>,
     /// Immutable Moonlight feature flags retained from the accepted RTSP ANNOUNCE.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_feature_flags: Option<u32>,
@@ -1018,6 +1060,28 @@ impl<'de> Deserialize<'de> for StartConfig {
     }
 }
 
+// Reject types owned by the existing control protocol in either direction.
+// Further extension mappings are selected by the trusted protocol owner.
+fn reserved_control_type(kind: u16) -> bool {
+    matches!(
+        kind,
+        0 | 0x0001
+            | 0x0109
+            | 0x010b
+            | 0x010e
+            | 0x0200
+            | 0x0201
+            | 0x0204
+            | 0x0206
+            | 0x0301
+            | 0x0302
+            | 0x0305
+            | 0x0307
+            | 0x0350
+            | 0x5500..=0x5503 | 0x5601
+    )
+}
+
 impl StartConfig {
     pub fn matches_prepared_codec(&self, prepared: &PrepareConfig) -> bool {
         prepared
@@ -1083,6 +1147,15 @@ impl StartConfig {
         }
         if self.continuous_audio == Some(true) && !stream_audio {
             return Err("continuous_audio_requires_stream_audio");
+        }
+        if self.outbound_agreement.as_ref().is_some_and(|agreement| {
+            agreement.validate().is_err()
+                || agreement
+                    .schemas
+                    .iter()
+                    .any(|schema| reserved_control_type(schema.message_type))
+        }) {
+            return Err("invalid_outbound_agreement");
         }
         if self.client_feature_flags.is_some_and(|flags| {
             flags & !amaterasu_gamestream::sdp::KNOWN_CLIENT_FEATURE_FLAGS != 0
@@ -1640,6 +1713,26 @@ mod tests {
             request["minimum_fps_target"] = json!(invalid);
             let parsed: StartConfig = serde_json::from_value(request).unwrap();
             assert_eq!(parsed.validate(true), Err("invalid_minimum_fps_target"));
+        }
+    }
+
+    #[test]
+    fn outbound_agreement_is_optional_bounded_and_rejects_reserved_types() {
+        let absent: StartConfig = serde_json::from_value(start_json()).unwrap();
+        assert!(absent.outbound_agreement.is_none());
+        let mut value = start_json();
+        value["outbound_agreement"] = json!({"version":1,"schemas":[
+            {"name":"org.example.alpha","version":1,"message_type":24577},
+            {"name":"org.example.beta","version":2,"message_type":24578}
+        ]});
+        let accepted: StartConfig = serde_json::from_value(value.clone()).unwrap();
+        assert!(accepted.validate(true).is_ok());
+        for reserved in [
+            0x0001, 0x0109, 0x010b, 0x010e, 0x0206, 0x0307, 0x5500, 0x5503, 0x5601,
+        ] {
+            value["outbound_agreement"]["schemas"][0]["message_type"] = json!(reserved);
+            let rejected: StartConfig = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(rejected.validate(true), Err("invalid_outbound_agreement"));
         }
     }
 

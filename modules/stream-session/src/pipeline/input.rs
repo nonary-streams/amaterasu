@@ -72,6 +72,15 @@ pub(super) fn accept_feedback_peek(
         return Ok(None);
     }
 
+    let invalidation_uncertain = record.contribution_barrier.uncertain();
+    let session = record.id;
+    let agreement = record
+        .start
+        .as_ref()
+        .and_then(|start| start.outbound_agreement.clone());
+    let contributions_ready = !record.feedback_contributions_unsupported
+        && record.contribution_barrier.ready_generation().is_some()
+        && record.contribution_barrier.ready_generation() == record.feedback_peek_generation;
     let pcm_enabled = record.start.as_ref().is_some_and(|start| {
         start
             .client_feature_flags
@@ -88,6 +97,48 @@ pub(super) fn accept_feedback_peek(
             .and_then(Value::as_u64)
             .filter(|sequence| *sequence > previous)
             .ok_or("invalid_feedback_response")?;
+        previous = sequence;
+        if let Some(value) = event.get("contribution") {
+            if invalidation_uncertain || record.feedback_contributions_unsupported {
+                last_accepted = Some(sequence);
+                continue;
+            }
+            if !contributions_ready {
+                break;
+            }
+            let contribution = serde_json::from_value::<
+                amaterasu_module_sdk::input::outbound::OutboundContribution,
+            >(value.clone());
+            let approved = contribution.ok().and_then(|item| {
+                if item.session != session {
+                    return None;
+                }
+                let message_type = agreement.as_ref()?.message_type(&item)?;
+                Some(amaterasu_gamestream::control::HostFeedbackMessage {
+                    message_type,
+                    channel: 0,
+                    delivery: amaterasu_gamestream::control::HostFeedbackDelivery::Reliable,
+                    payload: item.payload,
+                })
+            });
+            if let Some(message) = approved {
+                match plane.enqueue_contribution(message) {
+                    Ok(crate::plane::FeedbackEnqueueOutcome::Queued) => {}
+                    Ok(crate::plane::FeedbackEnqueueOutcome::DroppedBestEffort) => {
+                        return Err("invalid_feedback_response");
+                    }
+                    Err(
+                        crate::plane::FeedbackEnqueueError::QueueFull
+                        | crate::plane::FeedbackEnqueueError::Stopped,
+                    ) => break,
+                    Err(crate::plane::FeedbackEnqueueError::Invalid(_)) => {
+                        return Err("invalid_feedback_response");
+                    }
+                }
+            }
+            last_accepted = Some(sequence);
+            continue;
+        }
         let feedback: HostFeedback = serde_json::from_value(
             event
                 .get("feedback")
@@ -95,7 +146,6 @@ pub(super) fn accept_feedback_peek(
                 .ok_or("invalid_feedback_response")?,
         )
         .map_err(|_| "invalid_feedback_response")?;
-        previous = sequence;
 
         if matches!(&feedback, HostFeedback::HapticsPcm { .. }) && !pcm_enabled {
             last_accepted = Some(sequence);
@@ -213,10 +263,16 @@ pub(super) fn queue_control_input(
         return Ok(());
     }
     if let Some(event) = controller_payload(&input) {
+        let arrival = matches!(&input, Input::ControllerArrival(_));
         if record.input_events.len() >= MAX_QUEUED_EVENTS {
             return Err("input_queue_overflow");
         }
         record.input_events.push_back(event);
+        if arrival {
+            record
+                .contribution_barrier
+                .arrival(record.input_events.len());
+        }
         return Ok(());
     }
     if let Input::PenTouch(packet) = input {
@@ -239,6 +295,10 @@ pub(super) fn queue_control_input(
         record.input_events.push_back(event);
         return Ok(());
     }
+    let controller_mask = match &input {
+        Input::Controller(state) => Some(state.active_mask),
+        _ => None,
+    };
     let batch = match record.input_translator.translate(input) {
         Ok(batch) => batch,
         Err(TranslationError::InvalidPointer) => {
@@ -270,6 +330,11 @@ pub(super) fn queue_control_input(
     record
         .input_events
         .extend(batch.into_events().into_iter().map(event_payload));
+    if let Some(mask) = controller_mask {
+        record
+            .contribution_barrier
+            .controller_mask(mask, record.input_events.len());
+    }
     Ok(())
 }
 
@@ -401,6 +466,7 @@ pub(super) fn accept_input_batch(record: &mut Record, payload: &Value) -> Result
     for _ in 0..record.input_inflight {
         record.input_events.pop_front();
     }
+    record.contribution_barrier.accepted(record.input_inflight);
     record.input_events_sent = record
         .input_events_sent
         .saturating_add(record.input_inflight as u64);
@@ -436,6 +502,7 @@ pub(super) fn accept_controller_batch_failure(
         record.input_events.pop_front();
     }
     record.input_events.pop_front();
+    record.contribution_barrier.partial_failure(accepted);
     record.input_events_sent = record.input_events_sent.saturating_add(accepted as u64);
     if accepted != 0 {
         record.input_batches = record.input_batches.saturating_add(1);
@@ -485,6 +552,8 @@ pub(super) fn clear_input(record: &mut Record) {
     record.input_renew_at = 0;
     record.feedback_poll_at = 0;
     record.feedback_ack_through = None;
+    record.feedback_peek_generation = None;
+    record.feedback_contributions_unsupported = false;
     record.input_absolute_pointer = false;
     record.input_controller_supported = false;
     record.client_haptics_requested = false;
@@ -492,6 +561,7 @@ pub(super) fn clear_input(record: &mut Record) {
     record.input_native_pen_touch = false;
     record.touch_port = None;
     record.input_events.clear();
+    record.contribution_barrier = Default::default();
     record.input_inflight = 0;
     record.input_translator = Default::default();
 }
