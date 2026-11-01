@@ -42,7 +42,8 @@ pub(super) struct EffectFences {
     provider_services: BTreeSet<String>,
     slots: Option<super::source_slots::SourceSlots>,
     sources: BTreeMap<EffectScope, SourceState>,
-    joined_providers: BTreeSet<String>,
+    joined_providers: BTreeMap<String, ProviderIncarnation>,
+    retiring_providers: BTreeSet<String>,
 }
 
 impl EffectFences {
@@ -100,12 +101,20 @@ impl EffectFences {
             provider_services,
             slots,
             sources: BTreeMap::new(),
-            joined_providers: BTreeSet::new(),
+            joined_providers: BTreeMap::new(),
+            retiring_providers: BTreeSet::new(),
         })
     }
     pub fn protects(&self, service: &str, method: &str, major: u32) -> bool {
         self.policy.as_ref().is_some_and(|policy| {
             policy.methods.iter().any(|item| {
+                item.service == service && item.method == method && item.interface_major == major
+            })
+        })
+    }
+    pub fn protects_cleanup(&self, service: &str, method: &str, major: u32) -> bool {
+        self.policy.as_ref().is_some_and(|policy| {
+            policy.cleanup_methods.iter().any(|item| {
                 item.service == service && item.method == method && item.interface_major == major
             })
         })
@@ -141,15 +150,15 @@ impl EffectFences {
     pub fn authority_name(&self) -> Option<&str> {
         self.policy.as_ref().map(|policy| policy.authority.as_str())
     }
-    pub fn provider_joined(&self, provider: &str) -> bool {
-        self.joined_providers.contains(provider)
+    pub fn provider_unavailable(&self, provider: &str) -> bool {
+        self.joined_providers.contains_key(provider) || self.retiring_providers.contains(provider)
     }
-    pub fn host_provider_joined(
+    pub fn host_provider_retiring(
         &mut self,
         provider: &str,
         incarnation: &ProviderIncarnation,
     ) -> Vec<u64> {
-        self.joined_providers.insert(provider.to_owned());
+        self.retiring_providers.insert(provider.to_owned());
         let mut cancel = Vec::new();
         for source in self.sources.values_mut() {
             for record in source.records.values_mut() {
@@ -157,16 +166,75 @@ impl EffectFences {
                     && record.provider_incarnation.as_ref() == Some(incarnation)
                 {
                     record.fenced = true;
-                    record.worker_retired = true;
-                    if !record.delivered
-                        && let Some(request) = record.request
-                    {
-                        cancel.push(request);
+                    if !record.delivered {
+                        record.worker_retired = true;
+                        if let Some(request) = record.request {
+                            cancel.push(request);
+                        }
                     }
                 }
             }
         }
         cancel
+    }
+    pub fn host_provider_joined(
+        &mut self,
+        provider: &str,
+        incarnation: &ProviderIncarnation,
+    ) -> Vec<u64> {
+        let cancel = self.host_provider_retiring(provider, incarnation);
+        self.joined_providers
+            .insert(provider.to_owned(), incarnation.clone());
+        for source in self.sources.values_mut() {
+            for record in source.records.values_mut() {
+                if record.provider == provider
+                    && record.provider_incarnation.as_ref() == Some(incarnation)
+                {
+                    record.fenced = true;
+                    record.worker_retired = true;
+                }
+            }
+        }
+        cancel
+    }
+    pub fn host_provider_slot_receipts(
+        &self,
+        provider: &str,
+        incarnation: &ProviderIncarnation,
+        slot: u8,
+    ) -> Response {
+        if slot >= 64 || self.joined_providers.get(provider) != Some(incarnation) {
+            return Response::error("effect_pending", "provider worker is not joined");
+        }
+        let mut receipts = Vec::new();
+        for (scope, source) in &self.sources {
+            if scope.source.slot() != Some(slot) {
+                continue;
+            }
+            for (sequence, record) in &source.records {
+                if record.provider == provider
+                    && record.provider_incarnation.as_ref() == Some(incarnation)
+                {
+                    let Response::Result { payload } =
+                        self.host_retirement_receipt(scope, *sequence)
+                    else {
+                        return Response::error(
+                            "effect_pending",
+                            "retirement receipt is unavailable",
+                        );
+                    };
+                    receipts.push(payload);
+                }
+            }
+        }
+        let payload = json!({"receipts":receipts});
+        if !payload_fits(&payload) {
+            return Response::error(
+                "resource_exhausted",
+                "retirement receipt page exceeds the broker limit",
+            );
+        }
+        Response::Result { payload }
     }
     pub fn host_retirement_receipt(&self, scope: &EffectScope, sequence: u64) -> Response {
         let Some(record) = self
@@ -182,7 +250,10 @@ impl EffectFences {
         let Some(slots) = &self.slots else {
             return Response::error("unsupported", "source slots are not configured");
         };
-        if !record.fenced || !record.worker_retired || !self.provider_joined(&record.provider) {
+        if !record.fenced
+            || !record.worker_retired
+            || self.joined_providers.get(&record.provider) != Some(incarnation)
+        {
             return Response::error("effect_pending", "provider worker has not been joined");
         }
         let receipt = HostProviderRetirement {
@@ -369,6 +440,23 @@ impl EffectFences {
         scope: &EffectScope,
         retired: u64,
     ) -> Response {
+        let ready = self.close_ready(caller, lease, scope, retired);
+        if !matches!(ready, Response::Result { .. }) {
+            return ready;
+        }
+        if let Err(error) = self.slots.as_mut().expect("slot mode").close(lease, scope) {
+            return error;
+        }
+        self.sources.remove(scope);
+        Response::Ok
+    }
+    pub fn close_ready(
+        &self,
+        caller: &str,
+        lease: &SourceSlotLease,
+        scope: &EffectScope,
+        retired: u64,
+    ) -> Response {
         if !self.authority(caller) {
             return permission_denied();
         }
@@ -392,11 +480,9 @@ impl EffectFences {
                 "source retirement or compaction is incomplete",
             );
         }
-        if let Err(error) = self.slots.as_mut().expect("slot mode").close(lease, scope) {
-            return error;
+        Response::Result {
+            payload: json!({"ready":true,"lease":lease,"scope":scope,"retired_through":retired}),
         }
-        self.sources.remove(scope);
-        Response::Ok
     }
     pub fn open(&mut self, caller: &str, scope: EffectScope, retired: u64) -> Response {
         if !self.authority(caller) {
@@ -586,6 +672,9 @@ impl EffectFences {
             return Err(permission_denied());
         }
         let source = self.source_mut(&effect)?;
+        if source.closing && !source.records.contains_key(&effect.sequence) {
+            return Err(Response::error("effect_fenced", "source is closing"));
+        }
         let record = source
             .records
             .entry(effect.sequence)
@@ -831,6 +920,9 @@ impl EffectFences {
             return Err(permission_denied());
         }
         let source = self.identity_source_mut(&identity)?;
+        if source.closing && !source.records.contains_key(&identity.sequence) {
+            return Err(Response::error("effect_fenced", "source is closing"));
+        }
         let record = source
             .records
             .entry(identity.sequence)

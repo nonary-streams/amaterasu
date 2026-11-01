@@ -183,7 +183,7 @@ impl Broker {
                 }
                 Command::TakeResult { request } => self.requests.result(caller, request),
                 Command::ReleaseResult { request } => self.requests.release(caller, request),
-                Command::EffectFence { command } if matches!(&*command, amaterasu_contracts::effect_fence::EffectFenceCommand::BrokerEpoch {} | amaterasu_contracts::effect_fence::EffectFenceCommand::RecoveryRetired { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::SourceRetired { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostProviderJoined { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostRetirementReceipt { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostRecoverHistorical { .. }) => self.handle_effect_fence(caller, *command, now),
+                Command::EffectFence { command } if matches!(&*command, amaterasu_contracts::effect_fence::EffectFenceCommand::BrokerEpoch {} | amaterasu_contracts::effect_fence::EffectFenceCommand::RecoveryRetired { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::SourceRetired { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostProviderJoined { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostProviderRetiring { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostProviderSlotReceipts { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostRetirementReceipt { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostRecoverHistorical { .. }) => self.handle_effect_fence(caller, *command, now),
                 _ => errors::permission_denied(),
             };
         }
@@ -368,6 +368,14 @@ impl Broker {
                         .direct_call_denied(&service, &method, interface_major)
                 {
                     return errors::permission_denied();
+                }
+                if self.configuration.api_methods.iter().any(|approval| {
+                    approval.method.service == service
+                        && approval.method.method == method
+                        && approval.method.interface_major == interface_major
+                        && self.effect_fences.provider_unavailable(&approval.provider)
+                }) {
+                    return Response::error("effect_fenced", "provider instance is retiring");
                 }
                 let initiator = match parent {
                     Some(parent_id) => {
@@ -592,6 +600,52 @@ impl Broker {
             EffectFenceCommand::SourceRetired { lease, scope } => {
                 self.effect_fences.source_retired(caller, &lease, &scope)
             }
+            EffectFenceCommand::HostProviderRetiring {
+                provider,
+                provider_incarnation,
+            } => {
+                if caller != HOST_LIFECYCLE_CONTROL_PRINCIPAL
+                    || self
+                        .configuration
+                        .host_context
+                        .provider_incarnations
+                        .get(&provider)
+                        != Some(&provider_incarnation)
+                {
+                    return errors::permission_denied();
+                }
+                let requests = self
+                    .effect_fences
+                    .host_provider_retiring(&provider, &provider_incarnation);
+                self.requests.cancel_undelivered_to_provider(&provider, now);
+                if let Some(issuer) = self.effect_fences.issuer_name() {
+                    for request in requests {
+                        let _ = self.requests.cancel(issuer, request, now);
+                    }
+                }
+                Response::Ok
+            }
+            EffectFenceCommand::HostProviderSlotReceipts {
+                provider,
+                provider_incarnation,
+                slot,
+            } => {
+                if caller != HOST_LIFECYCLE_CONTROL_PRINCIPAL
+                    || self
+                        .configuration
+                        .host_context
+                        .provider_incarnations
+                        .get(&provider)
+                        != Some(&provider_incarnation)
+                {
+                    return errors::permission_denied();
+                }
+                self.effect_fences.host_provider_slot_receipts(
+                    &provider,
+                    &provider_incarnation,
+                    slot,
+                )
+            }
             EffectFenceCommand::HostProviderJoined {
                 provider,
                 provider_incarnation,
@@ -609,6 +663,7 @@ impl Broker {
                 let requests = self
                     .effect_fences
                     .host_provider_joined(&provider, &provider_incarnation);
+                self.requests.cancel_undelivered_to_provider(&provider, now);
                 if let Some(issuer) = self.effect_fences.issuer_name() {
                     for request in requests {
                         let _ = self.requests.cancel(issuer, request, now);
@@ -675,6 +730,13 @@ impl Broker {
             } => self
                 .effect_fences
                 .finish_close(caller, &lease, &scope, retired_through),
+            EffectFenceCommand::CloseReady {
+                lease,
+                scope,
+                retired_through,
+            } => self
+                .effect_fences
+                .close_ready(caller, &lease, &scope, retired_through),
             EffectFenceCommand::ProviderRetiredInEpoch {
                 broker_epoch,
                 request,
@@ -738,6 +800,15 @@ impl Broker {
                 self.handle_effect_fence_inner(caller, *command, now, true)
             }
             EffectFenceCommand::RecoverFence { identity } => {
+                if !self.effect_fences.authority(caller) {
+                    return errors::permission_denied();
+                }
+                if self.effect_fences.recovery_only(&identity.scope) {
+                    return Response::error(
+                        "historical_evidence_required",
+                        "recovery requires a host retirement receipt and canonical journal",
+                    );
+                }
                 if !self.recovery_provider_matches(&identity) {
                     return errors::permission_denied();
                 }
@@ -845,6 +916,32 @@ impl Broker {
                     None => errors::permission_denied(),
                 }
             }
+            EffectFenceCommand::SelectedCleanupMethod { method } => {
+                if !self.effect_fences.authority(caller)
+                    || !self.effect_fences.protects_cleanup(
+                        &method.service,
+                        &method.method,
+                        method.interface_major,
+                    )
+                {
+                    return errors::permission_denied();
+                }
+                let Some(approval) = self.api.registered_approval(
+                    &method.service,
+                    &method.method,
+                    method.interface_major,
+                ) else {
+                    return errors::permission_denied();
+                };
+                if approval.method.privilege != amaterasu_contracts::ApiPrivilege::User
+                    || self.effect_fences.provider_unavailable(&approval.provider)
+                {
+                    return errors::permission_denied();
+                }
+                Response::Result {
+                    payload: serde_json::json!({"approval":approval,"provider_incarnation":self.configuration.host_context.provider_incarnations.get(&approval.provider)}),
+                }
+            }
             EffectFenceCommand::ArmSelected { effect, expected } => {
                 if !self.effect_fences.authority(caller) {
                     return errors::permission_denied();
@@ -857,6 +954,12 @@ impl Broker {
                 let Some(selected) = self.selected_effect_method(&method) else {
                     return errors::permission_denied();
                 };
+                if self.effect_fences.uses_slots() && selected.provider_incarnation.is_none() {
+                    return Response::error(
+                        "provider_incarnation_required",
+                        "source slots require a host-issued provider incarnation",
+                    );
+                }
                 if *expected != selected
                     || effect.interface_minor != selected.method.interface_minor
                 {
@@ -885,6 +988,15 @@ impl Broker {
                 self.effect_fences.arm(caller, effect, &provider, None)
             }
             EffectFenceCommand::Fence { effect } => {
+                if !self.effect_fences.authority(caller) {
+                    return errors::permission_denied();
+                }
+                if self.effect_fences.recovery_only(&effect.scope) {
+                    return Response::error(
+                        "historical_evidence_required",
+                        "recovery requires a host retirement receipt and canonical journal",
+                    );
+                }
                 let Some(provider) = self.effect_provider(&effect) else {
                     return errors::permission_denied();
                 };
@@ -907,7 +1019,7 @@ impl Broker {
                 let provider = self.effect_provider(&effect);
                 if provider
                     .as_ref()
-                    .is_some_and(|provider| self.effect_fences.provider_joined(provider))
+                    .is_some_and(|provider| self.effect_fences.provider_unavailable(provider))
                 {
                     return Response::error("effect_fenced", "provider instance has retired");
                 }
@@ -1137,7 +1249,7 @@ impl Broker {
             &method.method,
             method.interface_major,
         )?;
-        if self.effect_fences.provider_joined(&approval.provider) {
+        if self.effect_fences.provider_unavailable(&approval.provider) {
             return None;
         }
         Some(amaterasu_contracts::effect_fence::SelectedEffectMethod {
