@@ -1,5 +1,5 @@
 //! Real broker and State integration for the host's optional retirement path.
-use super::{FeatureLibrary, LoadedComponents, RuntimeLibrary};
+use super::{FeatureLibrary, LoadedComponents, RuntimeLibrary, retirement_component_order};
 use amaterasu_abi::{
     AbiHeader, BorrowedBytes, HostApi, ModuleApi, ModuleRetirementApi, ReplySink, RuntimeApi,
     STATUS_INTERNAL_ERROR, STATUS_OK, Status,
@@ -22,6 +22,40 @@ use serde_json::json;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+fn manifest_component(id: &str) -> amaterasu_package::ComponentManifest {
+    amaterasu_package::ComponentManifest {
+        id: id.into(),
+        version: "1".into(),
+        file: String::new(),
+        sha256: String::new(),
+        size: 0,
+        abi_major: 1,
+        runtime: false,
+        requires: Default::default(),
+        service_provides: Vec::new(),
+        service_requires: Vec::new(),
+        requested: Grants::default(),
+    }
+}
+
+#[test]
+fn state_ordering_rejects_incompatible_dependency_cycles() {
+    let mut state = manifest_component("state");
+    state.requires.insert("provider".into(), "1".into());
+    let instance = ProviderIncarnation {
+        version: 1,
+        id: "a".repeat(32),
+    };
+    assert!(
+        retirement_component_order(
+            &[manifest_component("provider"), state],
+            &[("provider".into(), instance)],
+            Some("state")
+        )
+        .is_err()
+    );
+}
 
 struct Harness {
     broker: Mutex<Broker>,
@@ -474,12 +508,21 @@ fn exercise(mode: Mode) {
     let mut worker = Some(std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(delay))
     }));
+    // Deliberately put the independent State provider after the protected
+    // provider in the manifest; host composition must reverse this ordering.
+    let manifest = retirement_component_order(
+        &[manifest_component("provider"), manifest_component("state")],
+        &[("provider".into(), incarnation.clone())],
+        Some("state"),
+    )
+    .unwrap();
+    let ordered = amaterasu_package::ordered_components(&manifest).unwrap();
     let mut loaded = LoadedComponents::load_features(
         runtime,
         None,
         endpoint,
         false,
-        ["state", "provider"],
+        ordered.into_iter().map(|component| component.id.as_str()),
         |_, name| {
             if name == "state" {
                 Ok(feature(
