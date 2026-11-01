@@ -204,8 +204,12 @@ impl amaterasu_module_sdk::application_library::provider_adapter::Provider for G
                 | "limiter_stale_recheck"
                 | "resume_limiter"
                 | "limiter_no_retirement"
+                | "limiter_unconfigured"
                 | "retirement_cancel"
                 | "retirement_restart"
+                | "retirement_restart_running"
+                | "retirement_uncertain_write"
+                | "retirement_unconfirmed"
         )
     }
     fn supports_limiter_retirement_v1(&self) -> bool {
@@ -310,6 +314,9 @@ impl amaterasu_module_sdk::application_library::provider_adapter::Provider for G
             limiter_target::{Request, Retirement, Stage},
             provider_lifecycle::State,
         };
+        if self.mode == "retirement_unconfirmed" {
+            return Err("injected_retirement_failure");
+        }
         if identity.caller != identity.initiator {
             return Err("unauthorized");
         }

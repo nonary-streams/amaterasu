@@ -97,6 +97,12 @@ pub struct Record {
     #[serde(skip)]
     pub limiter_reservation_pending: bool,
     #[serde(skip)]
+    pub limiter_journal_service: Option<String>,
+    #[serde(skip)]
+    pub limiter_journal_revision: Option<u64>,
+    #[serde(skip)]
+    pub limiter_retirement_confirmed: bool,
+    #[serde(skip)]
     pub preflight_cancel_requested: bool,
     #[serde(skip)]
     pub pending_limiter_verification: Option<Value>,
@@ -387,6 +393,9 @@ impl Records {
                 generic_provider_incarnation: None,
                 limiter_target_verified: false,
                 limiter_reservation_pending: false,
+                limiter_journal_service: None,
+                limiter_journal_revision: None,
+                limiter_retirement_confirmed: false,
                 preflight_cancel_requested: false,
                 pending_limiter_verification: None,
                 config_overrides: None,

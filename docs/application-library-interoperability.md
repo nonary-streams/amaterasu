@@ -268,26 +268,31 @@ retirement fence even if reservation completion is uncertain. A provider keeps
 bounded replay fences for its incarnation and rejects new work if full; a late
 reserve cannot recreate a retired reservation. Cancelling an admitted preflight
 uses the same cleanup path before NVHTTP releases its history reservation.
-An unknown preflight after a Launch restart is not a retirement proof: NVHTTP
-retains its cleanup obligation until the provider fence can be confirmed. The
-in-memory Launch record cannot currently reconstruct that fence after restart,
-so such cleanup remains failed and requires a recovery mechanism.
+Launch can opt into durable limiter recovery with the trusted startup setting
+`"limiter_journal_service":"amaterasu.state/1"`. The composition must declare
+Launch's call grant and a dependency on the selected State provider. Without this
+configured route, selected-library limiter admission fails closed. This setting
+does not change installed grants.
 
-Durable recovery needs a trusted, bounded journal committed before dispatching
-the reservation. Its minimum cleanup identity is the authenticated coordinator
-and original initiator, Launch operation and owner/certificate binding, trusted
-executor route and application ID, executor operation ID and incarnation, and
-the complete tagged policy identity. It must also retain a preflight token
-digest and whether execution was requested, with any known execution ticket, so
-recovery can fence an uncertain execution before retiring its reservation. A
-restarted coordinator must validate the stored route against trusted startup
-composition, obtain the executor's matching retirement proof, and only then
-remove the obligation; a missing record or a changed incarnation is not that
-proof. Journal writes and completion need crash-safe ordering and bounded replay
-retention. The current Launch composition has no configured durable store or
-grant for this journal; the ordinary snapshot is not a substitute for one.
+Before reserving, Launch commits an owner-scoped State entry containing the
+Launch operation, certificate and preflight-token digest, exact trusted executor
+route and application ID, executor operation and incarnation, original
+initiator, and tagged policy identity. Before submitting an executor start, it
+commits the execution-pending phase. A restarted Launch scans the bounded State
+namespace and reconciles outstanding entries; it checks the stored route
+against current trusted composition, obtains an operation-bound executor stop
+fence, then obtains the matching limiter retirement proof. Only then does it
+commit a retirement tombstone. NVHTTP can also request reconciliation by its
+original owner-bound preflight identity. CAS writes fence delayed journal
+mutations, and missing records, changed incarnations, and unconfirmed provider
+responses remain failures. Retired entries remain bounded by State's namespace
+capacity and are not silently evicted; capacity exhaustion fails closed.
+This journal proves executor and limiter retirement only. Session leases,
+preparation work, and the separate lifecycle revocation barrier still require
+their own authoritative cleanup; the journal tombstone is not proof that the
+entire streaming session has retired.
 
-A Linux composition test exercises the real NVHTTP router, Launch, RTSP, pairing
+A Linux composition test exercises the real NVHTTP router, Launch, RTSP, State, pairing
 and lifecycle entrypoints with independently built library, policy and executor
 implementations and synthetic hardware. It covers attested limiter replacement,
 stale and mismatched targets, foreign-owner tokens, stale policy, display

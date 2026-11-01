@@ -2167,9 +2167,23 @@ pub struct Settings {
     pub library_routes: BTreeMap<String, crate::library::Route>,
     /// Experimental read-only library preflight; streaming admission remains unavailable.
     pub enable_library_preflight: bool,
+    /// Explicit trusted state route for owner-scoped limiter recovery records.
+    pub limiter_journal_service: Option<String>,
 }
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self
+            .limiter_journal_service
+            .as_deref()
+            .is_some_and(|service| {
+                service
+                    .strip_suffix("/1")
+                    .is_none_or(|name| !valid_catalog_principal(name))
+                    || service == crate::SERVICE
+            })
+        {
+            return Err("invalid_launch_settings");
+        }
         crate::library::validate_routes(&self.library_routes)?;
         if self.enable_library_preflight
             && !self.library_routes.values().any(|route| {

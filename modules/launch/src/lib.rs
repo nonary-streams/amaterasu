@@ -1,5 +1,6 @@
 //! Catalog-backed application launch and session ownership.
 mod library;
+mod limiter_journal;
 mod pipeline;
 mod protocol;
 pub mod provider_evidence;
@@ -29,6 +30,7 @@ impl ManagedModule for LaunchModule {
         pipeline.set_retirement_observers(settings.retirement_observers);
         pipeline.set_provider_routes(settings.provider_routes);
         pipeline.set_library_routes(settings.library_routes);
+        pipeline.set_limiter_journal_service(settings.limiter_journal_service);
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;

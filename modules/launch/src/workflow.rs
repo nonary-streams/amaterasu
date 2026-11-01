@@ -18,6 +18,12 @@ pub enum Step {
     RevalidateStreamingPolicy,
     IdentifyLimiterProvider,
     CheckLimiterCapability,
+    JournalReserveRead,
+    JournalReserveWrite,
+    JournalExecutionRead,
+    JournalExecutionWrite,
+    JournalRetireRead,
+    JournalRetireWrite,
     ReserveLimiterTarget,
     VerifyLimiterTarget,
     VerifyActiveLimiterTarget,
@@ -195,6 +201,30 @@ impl Workflow {
                     .ok_or("invalid_workflow")?,
                 json!({"action":"limiter_target_capabilities_v1"}),
             ),
+            Step::JournalReserveRead | Step::JournalExecutionRead | Step::JournalRetireRead => (
+                record
+                    .limiter_journal_service
+                    .as_deref()
+                    .ok_or("journal_unavailable")?,
+                json!({"action":"get","key":crate::limiter_journal::key(&record.owner, &record.operation_id)}),
+            ),
+            Step::JournalReserveWrite | Step::JournalExecutionWrite | Step::JournalRetireWrite => {
+                use crate::limiter_journal::{Entry, Phase};
+                let phase = match self.step {
+                    Step::JournalReserveWrite => Phase::ReservationPending,
+                    Step::JournalExecutionWrite => Phase::ExecutionPending,
+                    Step::JournalRetireWrite => Phase::Retired,
+                    _ => unreachable!(),
+                };
+                (
+                    record
+                        .limiter_journal_service
+                        .as_deref()
+                        .ok_or("journal_unavailable")?,
+                    json!({"action":"set","key":crate::limiter_journal::key(&record.owner, &record.operation_id),
+                        "value":Entry::from_record(record, phase)?, "expected_revision":record.limiter_journal_revision.ok_or("invalid_workflow")?}),
+                )
+            }
             Step::ReserveLimiterTarget
             | Step::VerifyLimiterTarget
             | Step::VerifyActiveLimiterTarget => {
@@ -527,6 +557,8 @@ pub fn first_cleanup_step(record: &Record) -> Step {
         Step::FindPlaynite
     } else if record.provider_ticket.is_some() && !record.provider_stopped {
         Step::StopPlaynite
+    } else if record.limiter_reservation_pending && record.limiter_retirement_confirmed {
+        Step::JournalRetireRead
     } else if record.limiter_reservation_pending {
         Step::RetireLimiterTarget
     } else if record.preparation_requested && !record.preparation_stopped {
