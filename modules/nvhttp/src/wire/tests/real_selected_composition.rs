@@ -8,6 +8,7 @@ use std::{
     ffi::c_void,
     path::{Path, PathBuf},
 };
+mod authenticated_tls;
 
 const CLIENT_CERT: &str = include_str!("../../../../pairing/tests/fixtures/client-cert.pem");
 const HOST_CERT: &str = include_str!("../../../../pairing/tests/fixtures/host-cert.pem");
@@ -218,7 +219,7 @@ fn run_composition(replacement: bool, scenario: &str) {
     let config = json!({"principals":{
         "console":{"call": ["amaterasu.pairing/1","amaterasu.state/1"]},
         "attacker":{"call":["amaterasu.launch/1","amaterasu.launch/3","example.library.provider/1"]},
-        "amaterasu.nvhttp":{"call":services},
+        "amaterasu.nvhttp":{"call":services,"native_use":["amaterasu.identity/1"]},
         "amaterasu.pairing":{"provide":["amaterasu.pairing/1"],"call":["amaterasu.state/1"],"native_provide":["amaterasu.identity/1"]},
         "amaterasu.launch":{"provide":["amaterasu.launch/1","amaterasu.launch/2","amaterasu.launch/3"],"call":["fixture.library/2","fixture.policy/2","example.library.provider/1","amaterasu.session/1","amaterasu.application/1","amaterasu.state/1"]},
         "amaterasu.rtsp":{"provide":["amaterasu.rtsp/1"],"call":["amaterasu.launch/1","amaterasu.stream-session/1"],"native_use":["amaterasu.network/1"]},
@@ -459,21 +460,80 @@ fn run_composition(replacement: bool, scenario: &str) {
     let nvhttp = runtime.client("amaterasu.nvhttp");
     let target =
         "/launch?appid=1&mode=1280x720x60&rikey=00112233445566778899aabbccddeeff&rikeyid=17";
-    // The transport is synthetic, but the router still performs its production
-    // broker-backed pairing check using the actual imported certificate.
-    let peer = RequestContext {
-        secure: true,
-        remote: "127.0.0.1".parse().unwrap(),
-        peer_certificate: Some(cert.clone()),
-        peer_trusted: true,
-        list_allowed: true,
-        launch_allowed: true,
-    };
-    assert!(router.dispatch(1, request(target), peer, &nvhttp).is_none());
+    let use_tls = std::env::var_os("AMATERASU_COMPOSITION_USE_TLS").is_some();
+    let identity = use_tls.then(|| crate::tls::Identity::bind(&nvhttp).unwrap());
+    let mut tls = identity.as_ref().map(|identity| {
+        let (_, host_der) = pem_rfc7468::decode_vec(HOST_CERT.as_bytes()).unwrap();
+        authenticated_tls::Connection::new(identity, &host_der, &cert, target)
+    });
+    let (request_id, actual_request, peer) =
+        if let (Some(tls), Some(identity)) = (&mut tls, &identity) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let incoming = loop {
+                let mut events = tls.tick(identity);
+                if let Some(incoming) = events.requests.pop() {
+                    break incoming;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "TLS launch request timed out"
+                );
+                std::thread::yield_now();
+            };
+            assert!(incoming.secure);
+            assert_eq!(incoming.peer_certificate.as_deref(), Some(cert.as_slice()));
+            let trusted = incoming
+                .peer_certificate
+                .as_ref()
+                .is_some_and(|cert| identity.trusted(cert));
+            let allowed = |permission| {
+                incoming
+                    .peer_certificate
+                    .as_ref()
+                    .is_some_and(|cert| identity.allowed(cert, permission))
+            };
+            let context = RequestContext {
+                secure: incoming.secure,
+                remote: incoming.remote,
+                peer_trusted: trusted,
+                list_allowed: trusted && allowed(Permission::List),
+                launch_allowed: trusted && allowed(Permission::Launch),
+                peer_certificate: incoming.peer_certificate,
+            };
+            assert!(context.peer_trusted && context.launch_allowed);
+            (incoming.id, incoming.request, context)
+        } else {
+            // The legacy fixture injects transport trust and is not TLS qualification.
+            (
+                1,
+                request(target),
+                RequestContext {
+                    secure: true,
+                    remote: "127.0.0.1".parse().unwrap(),
+                    peer_certificate: Some(cert.clone()),
+                    peer_trusted: true,
+                    list_allowed: true,
+                    launch_allowed: true,
+                },
+            )
+        };
+    assert!(
+        router
+            .dispatch(request_id, actual_request, peer, &nvhttp)
+            .is_none()
+    );
     let mut backends = Hardware::default();
     let mut replies = vec![];
     let mut cancelled = false;
     for turn in 0..5000 {
+        if let (Some(tls), Some(identity)) = (&mut tls, &identity) {
+            let events = tls.tick(identity);
+            assert!(events.requests.is_empty());
+            assert!(
+                events.closed.is_empty(),
+                "TLS connection closed before launch response"
+            );
+        }
         pairing.tick();
         memory.tick();
         if scenario == "retirement_uncertain_write"
@@ -516,7 +576,11 @@ fn run_composition(replacement: bool, scenario: &str) {
         }
         rtsp.tick();
         backends.pump(&session, &stream, &input, &application, &display);
-        replies.extend(router.poll_with_trust(&nvhttp, |presented, _| presented == cert));
+        replies.extend(router.poll_with_trust(&nvhttp, |presented, permission| {
+            identity.as_ref().map_or(presented == cert, |identity| {
+                identity.allowed(presented, permission)
+            })
+        }));
         if scenario == "retirement_cancel"
             && !cancelled
             && router.launches.selected_preflight_state_for_test() == Some((true, false))
@@ -616,7 +680,7 @@ fn run_composition(replacement: bool, scenario: &str) {
                 service == "stream" && payload["action"] == "reserve_history_activity"
             })
         {
-            router.cancel(1, &nvhttp);
+            router.cancel(request_id, &nvhttp);
             cancelled = true;
         }
         if scenario == "retirement_unconfirmed" {
@@ -637,6 +701,40 @@ fn run_composition(replacement: bool, scenario: &str) {
         } else if !replies.is_empty() {
             break;
         }
+    }
+    if let (Some(tls), Some(identity), Some((id, reply))) = (&mut tls, &identity, replies.first()) {
+        let outbound = Reply {
+            status: reply.status,
+            content_type: reply.content_type,
+            body: reply.body.clone(),
+            requires_paired_tls: reply.requires_paired_tls,
+            permission: reply.permission,
+        };
+        assert!(
+            tls.server
+                .respond_checked(*id, outbound, |cert, permission| permission.map_or_else(
+                    || identity.trusted(cert),
+                    |permission| identity.allowed(cert, permission)
+                ))
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut response = Vec::new();
+        loop {
+            tls.tick(identity);
+            tls.read_plaintext(&mut response);
+            if response
+                .windows(reply.body.len())
+                .any(|window| window == reply.body)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "TLS launch response timed out"
+            );
+            std::thread::yield_now();
+        }
+        assert!(response.starts_with(format!("HTTP/1.1 {}", reply.status).as_bytes()));
     }
     let prepared = backends
         .calls
