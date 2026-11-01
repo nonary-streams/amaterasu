@@ -247,6 +247,9 @@ pub struct LiveFeedbackHostProof {
     pub installation_id: String,
     pub profile: LiveFeedbackProfile,
     pub state_owner: String,
+    /// Device and inode of the provisioned State root, encoded as 32 lowercase
+    /// hexadecimal characters so replacement history cannot be adopted.
+    pub state_root_identity: String,
     /// The exact first-boot claim is retained until Pairing finishes recovery.
     pub first_boot_claim: Option<String>,
     #[serde(default)]
@@ -263,6 +266,30 @@ pub struct FeedbackBootstrapClaim {
     pub effect_owner: String,
 }
 
+/// State-root provenance shared by trusted host bootstrap and the State
+/// provider. Its phase is monotonic so losing the namespace history file
+/// cannot make a previously used State root look fresh again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveFeedbackStateOrigin {
+    pub version: u8,
+    pub installation_id: String,
+    pub state_root_identity: String,
+    pub phase: LiveFeedbackStateOriginPhase,
+    /// The exact bootstrap claim token while initialization is pending or
+    /// committed. `StateHistory` retains the full structured claim.
+    pub bootstrap_claim: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveFeedbackStateOriginPhase {
+    Fresh,
+    Used,
+    BootstrapIntent,
+    BootstrapCommitted,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LiveFeedbackBootstrapPhase {
@@ -274,7 +301,8 @@ pub enum LiveFeedbackBootstrapPhase {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
-    /// Reserved host endpoint: queue and confirm the first State claim.
+    /// Reserved host endpoint: create or resume the exact first State claim.
+    /// Resume may initialize only while State's durable history remains fresh.
     InitializeLiveFeedback {
         resume_existing: bool,
     },

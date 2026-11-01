@@ -40,6 +40,7 @@ pub(super) fn validate(config: &RuntimeConfig) -> Result<(), String> {
             || proof.profile != *profile
             || proof.state_owner != state.provider
             || !valid_id(&proof.installation_id)
+            || !valid_id(&proof.state_root_identity)
             || proof
                 .first_boot_claim
                 .as_deref()
@@ -262,38 +263,23 @@ fn validate_topology(config: &RuntimeConfig) -> Result<(), String> {
                 .get(HOST_CONFIG)
                 .and_then(Option::as_ref)
                 .ok_or("live feedback host configuration not selected")?;
-            let owner_settings = settings(config, owner)?;
-            let mismatch = if roles.contains(&owner) {
-                Some("configuration owner overlaps a live-feedback role")
-            } else if selected.provider != *owner {
-                Some("selected host-configuration provider differs from profile")
-            } else if selected.contract != HOST_CONFIG {
-                Some("selected host-configuration contract is invalid")
-            } else if pairing["host_configuration"] != true {
-                Some("Pairing host-configuration mode is disabled")
-            } else if pairing["effect_authority"]["configuration_owner"] != *owner {
-                Some("Pairing effect authority names a different configuration owner")
-            } else if owner_settings["pairing_effect_authority"]["principal"] != p.pairing_owner {
-                Some("host configuration selects a different Pairing principal")
-            } else if !config
-                .principals
-                .get(owner)
-                .is_some_and(|g| g.call.contains(PAIRING))
+            if roles.contains(&owner)
+                || selected.provider != *owner
+                || selected.contract != HOST_CONFIG
+                || pairing["host_configuration"] != true
+                || pairing["effect_authority"]["configuration_owner"] != *owner
+                || settings(config, owner)?["pairing_effect_authority"]["principal"]
+                    != p.pairing_owner
+                || !config
+                    .principals
+                    .get(owner)
+                    .is_some_and(|g| g.call.contains(PAIRING))
+                || !config
+                    .principals
+                    .get(&p.pairing_owner)
+                    .is_some_and(|g| g.call.contains(HOST_CONFIG))
             {
-                Some("configuration owner lacks the Pairing call grant")
-            } else if !config
-                .principals
-                .get(&p.pairing_owner)
-                .is_some_and(|g| g.call.contains(HOST_CONFIG))
-            {
-                Some("Pairing lacks the host-configuration call grant")
-            } else {
-                None
-            };
-            if let Some(mismatch) = mismatch {
-                return Err(format!(
-                    "live feedback host configuration mismatch: {mismatch}"
-                ));
+                return Err("live feedback host configuration mismatch".into());
             }
         }
         None => {
@@ -422,6 +408,16 @@ mod tests {
     }
 
     fn host_bootstrap_profile(claim: Option<&str>) -> RuntimeConfig {
+        host_bootstrap_profile_with_phase(
+            claim,
+            amaterasu_contracts::LiveFeedbackBootstrapPhase::Pending,
+        )
+    }
+
+    fn host_bootstrap_profile_with_phase(
+        claim: Option<&str>,
+        phase: amaterasu_contracts::LiveFeedbackBootstrapPhase,
+    ) -> RuntimeConfig {
         let mut configuration = profile();
         let selected_profile = configuration.live_feedback.clone().unwrap();
         configuration.host_lifecycle_control = true;
@@ -435,9 +431,9 @@ mod tests {
                 installation_id: "a".repeat(32),
                 profile: selected_profile,
                 state_owner: "state".into(),
+                state_root_identity: "c".repeat(32),
                 first_boot_claim: claim.map(str::to_owned),
-                first_boot_phase: claim
-                    .map(|_| amaterasu_contracts::LiveFeedbackBootstrapPhase::Pending),
+                first_boot_phase: claim.map(|_| phase),
             }),
             ..Default::default()
         };
@@ -475,12 +471,11 @@ mod tests {
     fn complete_real_state_bootstrap(
         broker: &mut Broker,
         store: &amaterasu_state::test_support::TestStateStore,
+        resume_existing: bool,
     ) -> u64 {
         let Response::Accepted { id } = broker.dispatch(
             HOST_LIFECYCLE_CONTROL_PRINCIPAL,
-            Command::InitializeLiveFeedback {
-                resume_existing: false,
-            },
+            Command::InitializeLiveFeedback { resume_existing },
         ) else {
             panic!("trusted host bootstrap was not accepted");
         };
@@ -530,7 +525,7 @@ mod tests {
             "bootstrap_pending",
         );
 
-        let request = complete_real_state_bootstrap(&mut broker, &store);
+        let request = complete_real_state_bootstrap(&mut broker, &store, false);
         assert!(matches!(
             broker.dispatch(
                 HOST_LIFECYCLE_CONTROL_PRINCIPAL,
@@ -567,12 +562,67 @@ mod tests {
     }
 
     #[test]
+    fn initializing_claim_retries_when_the_state_provider_never_received_the_request() {
+        let directory = test_state_directory();
+        let store = amaterasu_state::test_support::TestStateStore::open(directory.clone()).unwrap();
+        let proof_phase = amaterasu_contracts::LiveFeedbackBootstrapPhase::Initializing;
+        let mut interrupted = Broker::new(host_bootstrap_profile_with_phase(
+            Some(&"b".repeat(32)),
+            proof_phase,
+        ))
+        .unwrap();
+        register_state_provider(&mut interrupted);
+        assert!(matches!(
+            interrupted.dispatch(
+                HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+                Command::InitializeLiveFeedback {
+                    resume_existing: true,
+                }
+            ),
+            Response::Accepted { .. }
+        ));
+        // The process exits after broker admission but before the selected
+        // State provider polls the request. The State history marker is still
+        // fresh, so the exact host claim may safely initialize it on restart.
+        assert!(!directory.join("namespaces").exists());
+        drop(interrupted);
+
+        let mut restarted = Broker::new(host_bootstrap_profile_with_phase(
+            Some(&"b".repeat(32)),
+            proof_phase,
+        ))
+        .unwrap();
+        register_state_provider(&mut restarted);
+        let request = complete_real_state_bootstrap(&mut restarted, &store, true);
+        assert!(matches!(
+            restarted.dispatch(
+                HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+                Command::FinishLiveFeedbackInitialization { request }
+            ),
+            Response::Result { payload }
+                if payload["ok"] == true
+                    && payload["phase"] == "prepared"
+                    && payload["claim"]["claim"] == "b".repeat(32)
+        ));
+        assert_eq!(
+            store.handle(
+                "pairing",
+                json!({"action":"get","key":"host/feedback-bootstrap/v1"})
+            )["value"]["phase"],
+            "prepared"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn pairing_acknowledgment_is_exact_owner_scoped_and_consumes_the_host_claim() {
         let directory = test_state_directory();
         let store = amaterasu_state::test_support::TestStateStore::open(directory.clone()).unwrap();
         let mut broker = Broker::new(host_bootstrap_profile(Some(&"b".repeat(32)))).unwrap();
         register_state_provider(&mut broker);
-        let request = complete_real_state_bootstrap(&mut broker, &store);
+        let request = complete_real_state_bootstrap(&mut broker, &store, false);
         assert!(matches!(
             broker.dispatch(
                 HOST_LIFECYCLE_CONTROL_PRINCIPAL,
@@ -608,15 +658,16 @@ mod tests {
             ),
             "permission_denied",
         );
-        assert!(matches!(
-            broker.dispatch(
-                "pairing",
-                Command::CompleteLiveFeedbackBootstrap {
-                    claim: claim.clone(),
-                }
-            ),
-            Response::Ok
-        ));
+        let committed_reply = broker.dispatch(
+            "pairing",
+            Command::CompleteLiveFeedbackBootstrap {
+                claim: claim.clone(),
+            },
+        );
+        assert!(matches!(&committed_reply, Response::Ok));
+        // Model a committed broker transition whose response is dropped in
+        // transport before the host performs its completion read.
+        drop(committed_reply);
         assert!(matches!(
             broker.dispatch(
                 HOST_LIFECYCLE_CONTROL_PRINCIPAL,
@@ -696,7 +747,7 @@ mod tests {
         let store = amaterasu_state::test_support::TestStateStore::open(directory.clone()).unwrap();
         let mut first = Broker::new(host_bootstrap_profile(Some(&"b".repeat(32)))).unwrap();
         register_state_provider(&mut first);
-        let _request = complete_real_state_bootstrap(&mut first, &store);
+        let _request = complete_real_state_bootstrap(&mut first, &store, false);
         // Model the host exiting before it receives the terminal State response.
         drop(first);
 
@@ -729,7 +780,7 @@ mod tests {
         let store = amaterasu_state::test_support::TestStateStore::open(directory.clone()).unwrap();
         let mut first = Broker::new(host_bootstrap_profile(Some(&"b".repeat(32)))).unwrap();
         register_state_provider(&mut first);
-        let _request = complete_real_state_bootstrap(&mut first, &store);
+        let _request = complete_real_state_bootstrap(&mut first, &store, false);
         assert_eq!(
             store.handle(
                 "pairing",

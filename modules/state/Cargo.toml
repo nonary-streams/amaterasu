@@ -12,6 +12,7 @@ test-support = []
 
 [dependencies]
 amaterasu-module-sdk.workspace = true
+amaterasu-contracts.workspace = true
 amaterasu-storage = { path = "../../crates/storage" }
 serde.workspace = true
 serde_json.workspace = true
@@ -24,5 +25,4 @@ name = "sdk_contract"
 required-features = ["test-support"]
 
 [dev-dependencies]
-amaterasu-contracts.workspace = true
 amaterasu-runtime = { path = "../../crates/runtime" }

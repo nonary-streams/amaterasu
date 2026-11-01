@@ -7,7 +7,8 @@ use crate::{
     write_json_atomically,
 };
 use amaterasu_contracts::{
-    LiveFeedbackBootstrapPhase, LiveFeedbackHostProof, LiveFeedbackProfile, RuntimeConfig,
+    LiveFeedbackBootstrapPhase, LiveFeedbackHostProof, LiveFeedbackProfile,
+    LiveFeedbackStateOrigin, LiveFeedbackStateOriginPhase, RuntimeConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -15,12 +16,12 @@ use std::path::Path;
 const DIRECTORY: &str = ".live-feedback-origin";
 const WITNESS: &str = "witness.json";
 const STATE_SERVICE: &str = "amaterasu.state/1";
+const STATE_ORIGIN_FILE: &str = ".live-feedback-state-origin-v1.json";
 
-/// State phases that prove Pairing had begun first-boot recovery before a
-/// process restart. The trusted host quarantines rather than resumes the claim.
+/// The State phase whose commit point is ambiguous across restart. The trusted
+/// host quarantines rather than repeating potentially completed gate recovery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConfirmedFeedbackBootstrapStatePhase {
-    RecoveryStarted,
     Active,
 }
 
@@ -40,6 +41,7 @@ enum Witness {
         installation_id: String,
         profile: LiveFeedbackProfile,
         state_owner: String,
+        state_root_identity: String,
         claim: String,
     },
     Initializing {
@@ -47,6 +49,7 @@ enum Witness {
         installation_id: String,
         profile: LiveFeedbackProfile,
         state_owner: String,
+        state_root_identity: String,
         claim: String,
     },
     StateInitialized {
@@ -54,6 +57,7 @@ enum Witness {
         installation_id: String,
         profile: LiveFeedbackProfile,
         state_owner: String,
+        state_root_identity: String,
         claim: String,
     },
     Consumed {
@@ -61,6 +65,7 @@ enum Witness {
         installation_id: String,
         profile: LiveFeedbackProfile,
         state_owner: String,
+        state_root_identity: String,
     },
 }
 
@@ -125,15 +130,18 @@ pub fn prepare(
         }
         Ok(selected.provider.clone())
     };
-    let verified_state = || -> PackageResult<()> {
-        let expected = root
-            .join("data/state")
-            .canonicalize()
-            .map_err(|error| error.to_string())?;
+    let verified_state = |installation_id: &str, create_origin: bool| -> PackageResult<String> {
+        let expected = canonical_state_root(root)?;
         if state_root != expected {
             return Err("feedback state root differs from the provisioned root".into());
         }
-        Ok(())
+        let state_identity = state_root_identity(state_root)?;
+        if create_origin {
+            ensure_state_origin(state_root, installation_id, &state_identity)?;
+        } else {
+            verify_state_origin(state_root, installation_id, &state_identity)?;
+        }
+        Ok(state_identity)
     };
     match witness {
         Witness::Fresh {
@@ -157,7 +165,7 @@ pub fn prepare(
             if config.effect_fence.is_some() || profile.host_configuration_owner.is_none() {
                 return Err("fresh feedback requires selected host configuration and no historical generic authority".into());
             }
-            verified_state()?;
+            let state_root_identity = verified_state(&installation_id, true)?;
             let state_owner = state_owner()?;
             let claim = random_identifier()?;
             write_json_atomically(
@@ -167,6 +175,7 @@ pub fn prepare(
                     installation_id: installation_id.clone(),
                     profile: profile.clone(),
                     state_owner: state_owner.clone(),
+                    state_root_identity: state_root_identity.clone(),
                     claim: claim.clone(),
                 },
             )?;
@@ -175,6 +184,7 @@ pub fn prepare(
                 installation_id,
                 profile,
                 state_owner,
+                state_root_identity,
                 first_boot_claim: Some(claim),
                 first_boot_phase: Some(LiveFeedbackBootstrapPhase::Pending),
             }))
@@ -184,14 +194,23 @@ pub fn prepare(
             installation_id,
             profile,
             state_owner: previous_state,
+            state_root_identity: previous_state_root_identity,
             claim,
         } => {
-            verify_pending_selection(config, &profile, &previous_state, &state_owner()?)?;
-            verified_state()?;
+            let current_state_root_identity = verified_state(&installation_id, false)?;
+            verify_pending_selection(
+                config,
+                &profile,
+                &previous_state,
+                &state_owner()?,
+                &previous_state_root_identity,
+                &current_state_root_identity,
+            )?;
             Ok(Some(proof(
                 installation_id,
                 profile,
                 previous_state,
+                previous_state_root_identity,
                 claim,
                 LiveFeedbackBootstrapPhase::Pending,
             )))
@@ -201,14 +220,23 @@ pub fn prepare(
             installation_id,
             profile,
             state_owner: previous_state,
+            state_root_identity: previous_state_root_identity,
             claim,
         } => {
-            verify_pending_selection(config, &profile, &previous_state, &state_owner()?)?;
-            verified_state()?;
+            let current_state_root_identity = verified_state(&installation_id, false)?;
+            verify_pending_selection(
+                config,
+                &profile,
+                &previous_state,
+                &state_owner()?,
+                &previous_state_root_identity,
+                &current_state_root_identity,
+            )?;
             Ok(Some(proof(
                 installation_id,
                 profile,
                 previous_state,
+                previous_state_root_identity,
                 claim,
                 LiveFeedbackBootstrapPhase::Initializing,
             )))
@@ -218,14 +246,23 @@ pub fn prepare(
             installation_id,
             profile,
             state_owner: previous_state,
+            state_root_identity: previous_state_root_identity,
             claim,
         } => {
-            verify_pending_selection(config, &profile, &previous_state, &state_owner()?)?;
-            verified_state()?;
+            let current_state_root_identity = verified_state(&installation_id, false)?;
+            verify_pending_selection(
+                config,
+                &profile,
+                &previous_state,
+                &state_owner()?,
+                &previous_state_root_identity,
+                &current_state_root_identity,
+            )?;
             Ok(Some(proof(
                 installation_id,
                 profile,
                 previous_state,
+                previous_state_root_identity,
                 claim,
                 LiveFeedbackBootstrapPhase::StateInitialized,
             )))
@@ -235,11 +272,13 @@ pub fn prepare(
             installation_id,
             profile,
             state_owner: previous_state,
+            state_root_identity: previous_state_root_identity,
         } => {
-            verified_state()?;
+            let current_state_root_identity = verified_state(&installation_id, false)?;
             if config.live_feedback.as_ref() != Some(&profile)
                 || config.effect_fence.is_some()
                 || state_owner()? != previous_state
+                || current_state_root_identity != previous_state_root_identity
             {
                 return Err("previous feedback authority requires verified retirement before profile changes".into());
             }
@@ -248,6 +287,7 @@ pub fn prepare(
                 installation_id,
                 profile,
                 state_owner: previous_state,
+                state_root_identity: previous_state_root_identity,
                 first_boot_claim: None,
                 first_boot_phase: None,
             }))
@@ -261,6 +301,7 @@ fn proof(
     installation_id: String,
     profile: LiveFeedbackProfile,
     state_owner: String,
+    state_root_identity: String,
     claim: String,
     phase: LiveFeedbackBootstrapPhase,
 ) -> LiveFeedbackHostProof {
@@ -269,9 +310,110 @@ fn proof(
         installation_id,
         profile,
         state_owner,
+        state_root_identity,
         first_boot_claim: Some(claim),
         first_boot_phase: Some(phase),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn state_root_identity(path: &Path) -> PackageResult<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("feedback State root is not a real directory".into());
+    }
+    Ok(format!("{:016x}{:016x}", metadata.dev(), metadata.ino()))
+}
+
+#[cfg(target_os = "linux")]
+fn valid_identifier(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+#[cfg(target_os = "linux")]
+fn verify_proof_state_root(root: &Path, proof: &LiveFeedbackHostProof) -> PackageResult<()> {
+    let expected = canonical_state_root(root)?;
+    verify_state_origin(
+        &expected,
+        &proof.installation_id,
+        &proof.state_root_identity,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn canonical_state_root(root: &Path) -> PackageResult<std::path::PathBuf> {
+    let state_root = root.join("data/state");
+    let metadata = std::fs::symlink_metadata(&state_root).map_err(|error| error.to_string())?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("feedback State root is not a real directory".into());
+    }
+    state_root.canonicalize().map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_state_origin(
+    state_root: &Path,
+    installation_id: &str,
+    state_root_identity: &str,
+) -> PackageResult<()> {
+    let path = state_root.join(STATE_ORIGIN_FILE);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            verify_state_origin(state_root, installation_id, state_root_identity)
+        }
+        Ok(_) => Err("feedback State origin marker is not a regular file".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            write_json_atomically(
+                &path,
+                &LiveFeedbackStateOrigin {
+                    version: 1,
+                    installation_id: installation_id.into(),
+                    state_root_identity: state_root_identity.into(),
+                    phase: LiveFeedbackStateOriginPhase::Fresh,
+                    bootstrap_claim: None,
+                },
+            )?;
+            amaterasu_storage::sync_directory(state_root)?;
+            Ok(())
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_state_origin(
+    state_root: &Path,
+    installation_id: &str,
+    state_root_identity: &str,
+) -> PackageResult<()> {
+    let path = state_root.join(STATE_ORIGIN_FILE);
+    let metadata = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err("feedback State origin marker is not a regular file".into());
+    }
+    let origin: LiveFeedbackStateOrigin = read_json(&path)?;
+    let valid_claim = match (origin.phase, origin.bootstrap_claim.as_deref()) {
+        (LiveFeedbackStateOriginPhase::Fresh | LiveFeedbackStateOriginPhase::Used, None) => true,
+        (
+            LiveFeedbackStateOriginPhase::BootstrapIntent
+            | LiveFeedbackStateOriginPhase::BootstrapCommitted,
+            Some(claim),
+        ) => valid_identifier(claim),
+        _ => false,
+    };
+    if origin.version != 1
+        || origin.installation_id != installation_id
+        || origin.state_root_identity != state_root_identity
+        || !valid_claim
+    {
+        return Err("feedback State root was replaced after bootstrap preparation".into());
+    }
+    Ok(())
 }
 
 fn verify_pending_selection(
@@ -279,11 +421,14 @@ fn verify_pending_selection(
     expected_profile: &LiveFeedbackProfile,
     expected_state_owner: &str,
     selected_state_owner: &str,
+    expected_state_root_identity: &str,
+    selected_state_root_identity: &str,
 ) -> PackageResult<()> {
     if config.live_feedback.as_ref() != Some(expected_profile)
         || config.effect_fence.is_some()
         || expected_profile.host_configuration_owner.is_none()
         || selected_state_owner != expected_state_owner
+        || selected_state_root_identity != expected_state_root_identity
     {
         return Err(
             "previous feedback authority requires verified retirement before profile changes"
@@ -294,9 +439,10 @@ fn verify_pending_selection(
 }
 
 /// Persist the write-ahead phase before asking State to create the claim.
-/// Once initialization may have started, retries are verification-only.
+/// State's root marker distinguishes an unreceived request from lost history.
 #[cfg(target_os = "linux")]
 pub fn begin_state_initialization(root: &Path, proof: &LiveFeedbackHostProof) -> PackageResult<()> {
+    verify_proof_state_root(root, proof)?;
     let (origin, _lock, witness) = read_locked(root)?;
     match &witness {
         Witness::Pending {
@@ -304,8 +450,17 @@ pub fn begin_state_initialization(root: &Path, proof: &LiveFeedbackHostProof) ->
             installation_id,
             profile,
             state_owner,
+            state_root_identity,
             claim,
-        } if matches_proof(installation_id, profile, state_owner, claim, proof) => {
+        } if matches_proof(
+            installation_id,
+            profile,
+            state_owner,
+            state_root_identity,
+            claim,
+            proof,
+        ) =>
+        {
             write_json_atomically(
                 &origin.join(WITNESS),
                 &Witness::Initializing {
@@ -313,6 +468,7 @@ pub fn begin_state_initialization(root: &Path, proof: &LiveFeedbackHostProof) ->
                     installation_id: installation_id.clone(),
                     profile: profile.clone(),
                     state_owner: state_owner.clone(),
+                    state_root_identity: state_root_identity.clone(),
                     claim: claim.clone(),
                 },
             )?;
@@ -322,6 +478,7 @@ pub fn begin_state_initialization(root: &Path, proof: &LiveFeedbackHostProof) ->
             installation_id,
             profile,
             state_owner,
+            state_root_identity,
             claim,
             ..
         }
@@ -329,9 +486,20 @@ pub fn begin_state_initialization(root: &Path, proof: &LiveFeedbackHostProof) ->
             installation_id,
             profile,
             state_owner,
+            state_root_identity,
             claim,
             ..
-        } if matches_proof(installation_id, profile, state_owner, claim, proof) => Ok(()),
+        } if matches_proof(
+            installation_id,
+            profile,
+            state_owner,
+            state_root_identity,
+            claim,
+            proof,
+        ) =>
+        {
+            Ok(())
+        }
         _ => Err("feedback bootstrap witness changed during State initialization".into()),
     }
 }
@@ -340,6 +508,7 @@ pub fn begin_state_initialization(root: &Path, proof: &LiveFeedbackHostProof) ->
 /// commits its first owner epoch and opens the effect gate.
 #[cfg(target_os = "linux")]
 pub fn mark_state_initialized(root: &Path, proof: &LiveFeedbackHostProof) -> PackageResult<()> {
+    verify_proof_state_root(root, proof)?;
     let (origin, _lock, witness) = read_locked(root)?;
     match &witness {
         Witness::Initializing {
@@ -347,8 +516,17 @@ pub fn mark_state_initialized(root: &Path, proof: &LiveFeedbackHostProof) -> Pac
             installation_id,
             profile,
             state_owner,
+            state_root_identity,
             claim,
-        } if matches_proof(installation_id, profile, state_owner, claim, proof) => {
+        } if matches_proof(
+            installation_id,
+            profile,
+            state_owner,
+            state_root_identity,
+            claim,
+            proof,
+        ) =>
+        {
             write_json_atomically(
                 &origin.join(WITNESS),
                 &Witness::StateInitialized {
@@ -356,6 +534,7 @@ pub fn mark_state_initialized(root: &Path, proof: &LiveFeedbackHostProof) -> Pac
                     installation_id: installation_id.clone(),
                     profile: profile.clone(),
                     state_owner: state_owner.clone(),
+                    state_root_identity: state_root_identity.clone(),
                     claim: claim.clone(),
                 },
             )?;
@@ -365,9 +544,20 @@ pub fn mark_state_initialized(root: &Path, proof: &LiveFeedbackHostProof) -> Pac
             installation_id,
             profile,
             state_owner,
+            state_root_identity,
             claim,
             ..
-        } if matches_proof(installation_id, profile, state_owner, claim, proof) => Ok(()),
+        } if matches_proof(
+            installation_id,
+            profile,
+            state_owner,
+            state_root_identity,
+            claim,
+            proof,
+        ) =>
+        {
+            Ok(())
+        }
         _ => Err("feedback State claim was not initialized by this host".into()),
     }
 }
@@ -378,15 +568,25 @@ pub fn finish_after_pairing_recovery(
     root: &Path,
     proof: &LiveFeedbackHostProof,
 ) -> PackageResult<()> {
+    verify_proof_state_root(root, proof)?;
     let (origin, _lock, witness) = read_locked(root)?;
     match &witness {
         Witness::StateInitialized {
             installation_id,
             profile,
             state_owner,
+            state_root_identity,
             claim,
             ..
-        } if matches_proof(installation_id, profile, state_owner, claim, proof) => {
+        } if matches_proof(
+            installation_id,
+            profile,
+            state_owner,
+            state_root_identity,
+            claim,
+            proof,
+        ) =>
+        {
             let consumed = consumed_from_state_initialized(&witness)?;
             write_json_atomically(&origin.join(WITNESS), &consumed)?;
             Ok(())
@@ -396,11 +596,13 @@ pub fn finish_after_pairing_recovery(
             installation_id,
             profile,
             state_owner,
+            state_root_identity,
         } if proof.first_boot_claim.as_deref().is_some()
             && proof.version == 1
             && proof.installation_id.as_str() == installation_id
             && &proof.profile == profile
-            && proof.state_owner.as_str() == state_owner =>
+            && proof.state_owner.as_str() == state_owner
+            && proof.state_root_identity.as_str() == state_root_identity =>
         {
             Ok(())
         }
@@ -425,12 +627,14 @@ pub fn quarantine_after_state_recovery(
     ) {
         return Err("feedback bootstrap claim has no interrupted State initialization".into());
     }
+    verify_proof_state_root(root, proof)?;
     let (origin, _lock, witness) = read_locked(root)?;
     match &witness {
         Witness::Initializing {
             installation_id,
             profile,
             state_owner,
+            state_root_identity,
             claim,
             ..
         }
@@ -438,9 +642,18 @@ pub fn quarantine_after_state_recovery(
             installation_id,
             profile,
             state_owner,
+            state_root_identity,
             claim,
             ..
-        } if matches_proof(installation_id, profile, state_owner, claim, proof) => {
+        } if matches_proof(
+            installation_id,
+            profile,
+            state_owner,
+            state_root_identity,
+            claim,
+            proof,
+        ) =>
+        {
             // This typed value is supplied only after validating the selected
             // State provider's exact persisted response.
             let _confirmed_phase = state_phase;
@@ -468,6 +681,7 @@ fn matches_proof(
     installation_id: &str,
     profile: &LiveFeedbackProfile,
     state_owner: &str,
+    state_root_identity: &str,
     claim: &str,
     proof: &LiveFeedbackHostProof,
 ) -> bool {
@@ -475,6 +689,7 @@ fn matches_proof(
         && proof.installation_id == installation_id
         && proof.profile == *profile
         && proof.state_owner == state_owner
+        && proof.state_root_identity == state_root_identity
         && proof.first_boot_claim.as_deref() == Some(claim)
 }
 
@@ -485,12 +700,14 @@ fn consumed_from_state_initialized(witness: &Witness) -> PackageResult<Witness> 
             installation_id,
             profile,
             state_owner,
+            state_root_identity,
             ..
         } => Ok(Witness::Consumed {
             version: 1,
             installation_id: installation_id.clone(),
             profile: profile.clone(),
             state_owner: state_owner.clone(),
+            state_root_identity: state_root_identity.clone(),
         }),
         _ => Err("feedback bootstrap witness cannot be finalized".into()),
     }
@@ -504,6 +721,7 @@ fn consumed_from_interrupted(witness: &Witness) -> PackageResult<Witness> {
             installation_id,
             profile,
             state_owner,
+            state_root_identity,
             ..
         }
         | Witness::StateInitialized {
@@ -511,12 +729,14 @@ fn consumed_from_interrupted(witness: &Witness) -> PackageResult<Witness> {
             installation_id,
             profile,
             state_owner,
+            state_root_identity,
             ..
         } => Ok(Witness::Consumed {
             version: 1,
             installation_id: installation_id.clone(),
             profile: profile.clone(),
             state_owner: state_owner.clone(),
+            state_root_identity: state_root_identity.clone(),
         }),
         _ => Err("feedback bootstrap witness cannot be quarantined".into()),
     }
@@ -657,6 +877,26 @@ mod tests {
     }
 
     #[test]
+    fn writeahead_witness_retries_after_crash_before_state_receives_the_claim() {
+        let root = TestRoot::new();
+        create_new_root(&root.0).unwrap();
+        let state_root = root.state_root();
+        let config = selected_profile();
+        let first = prepare(&root.0, &state_root, &config).unwrap().unwrap();
+
+        // This is the durable host boundary immediately before sending the
+        // request. No State response exists yet.
+        begin_state_initialization(&root.0, &first).unwrap();
+        let restarted = prepare(&root.0, &state_root, &config).unwrap().unwrap();
+        assert_eq!(restarted.first_boot_claim, first.first_boot_claim);
+        assert_eq!(
+            restarted.first_boot_phase,
+            Some(LiveFeedbackBootstrapPhase::Initializing)
+        );
+        assert_eq!(restarted.state_root_identity, first.state_root_identity);
+    }
+
+    #[test]
     fn state_initialized_claim_resumes_until_pairing_finishes_recovery() {
         let root = TestRoot::new();
         create_new_root(&root.0).unwrap();
@@ -707,6 +947,39 @@ mod tests {
             resumed.first_boot_phase,
             Some(LiveFeedbackBootstrapPhase::StateInitialized)
         );
+    }
+
+    #[test]
+    fn pending_claim_rejects_a_replaced_state_root() {
+        let root = TestRoot::new();
+        create_new_root(&root.0).unwrap();
+        let state_root = root.state_root();
+        let config = selected_profile();
+        let proof = prepare(&root.0, &state_root, &config).unwrap().unwrap();
+        let displaced_root = root.0.join("data/state-displaced");
+        std::fs::rename(&state_root, &displaced_root).unwrap();
+        create_private_directory(&state_root).unwrap();
+
+        assert!(prepare(&root.0, &state_root, &config).is_err());
+        assert_ne!(
+            state_root_identity(&state_root).unwrap(),
+            proof.state_root_identity
+        );
+    }
+
+    #[test]
+    fn pending_claim_refuses_state_root_contents_loss_before_retry() {
+        let root = TestRoot::new();
+        create_new_root(&root.0).unwrap();
+        let state_root = root.state_root();
+        let config = selected_profile();
+        let _proof = prepare(&root.0, &state_root, &config).unwrap().unwrap();
+        let origin_path = state_root.join(STATE_ORIGIN_FILE);
+        assert!(origin_path.exists());
+        std::fs::remove_file(&origin_path).unwrap();
+
+        assert!(prepare(&root.0, &state_root, &config).is_err());
+        assert!(!origin_path.exists());
     }
 
     #[test]

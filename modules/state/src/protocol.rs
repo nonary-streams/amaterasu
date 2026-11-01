@@ -6,6 +6,8 @@ use serde_json::{Value, json};
 pub enum Operation {
     InitializeFeedbackHost {
         claim: amaterasu_module_sdk::state::FeedbackBootstrapClaim,
+        /// Resume the exact claim, or retry it if the durable marker proves
+        /// State has never accepted any history for this root.
         #[serde(default)]
         resume_existing: bool,
     },
@@ -78,6 +80,12 @@ pub struct StateError {
     code: &'static str,
     message: String,
     current_revision: Option<u64>,
+}
+
+impl std::fmt::Display for StateError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.message)
+    }
 }
 
 impl StateError {

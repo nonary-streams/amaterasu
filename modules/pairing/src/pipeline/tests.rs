@@ -5766,6 +5766,83 @@ fn trusted_bootstrap_persists_exact_claim_before_recovering_effect_gate() {
 }
 
 #[test]
+fn recovery_started_claim_rechecks_configuration_and_finishes_the_same_gate_recovery() {
+    let claim = feedback_bootstrap_test_claim();
+    let claim_value = serde_json::to_value(&claim).unwrap();
+    let (directory, mut pipeline) = feedback_bootstrap_test_pipeline(claim);
+    let configured_identity = pipeline.configured_identity().unwrap();
+    let certificate_hash = Sha256::digest(configured_identity.certificate_pem.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let configuration_revision = configured_identity.provider_revision;
+    let mut results = BTreeMap::new();
+    let mut next_request = 500;
+    let mut actions = Vec::new();
+    let mut completed_claim = None;
+    let mut send = |command: Command| -> Transport {
+        Ok(match command {
+            Command::Request {
+                service, payload, ..
+            } => {
+                let request = next_request;
+                next_request += 1;
+                let result = if service == STATE_SERVICE && payload["action"] == "get" {
+                    actions.push("state:get");
+                    json!({"ok":true,"revision":2,"found":true,
+                        "value":{"claim":claim_value,"phase":"recovery_started",
+                            "configuration_revision":configuration_revision,
+                            "certificate_sha256":certificate_hash}})
+                } else if service == HOST_CONFIGURATION_SERVICE {
+                    actions.push("configuration:transaction_status");
+                    json!({"ok":true,"configuration_revision":0,"state_revision":0,
+                        "identity_fingerprint":"c".repeat(64),"transaction":null,"terminal_receipt":null})
+                } else if service == STATE_SERVICE && payload["action"] == "set" {
+                    actions.push("state:set-active");
+                    assert_eq!(payload["expected_revision"], 2);
+                    assert_eq!(payload["value"]["phase"], "active");
+                    json!({"ok":true,"revision":3})
+                } else {
+                    panic!("unexpected bootstrap service request: {service} {payload}");
+                };
+                results.insert(request, result);
+                Response::Accepted { id: request }
+            }
+            Command::CompleteLiveFeedbackBootstrap { claim } => {
+                completed_claim = Some(serde_json::to_value(claim).unwrap());
+                Response::Ok
+            }
+            Command::TakeResult { request } => results
+                .remove(&request)
+                .map_or(Response::Pending, |payload| Response::Result { payload }),
+            Command::ReleaseResult { .. } => Response::Ok,
+            other => panic!("unexpected bootstrap command: {other:?}"),
+        })
+    };
+
+    for _ in 0..4 {
+        pipeline.progress_feedback_bootstrap(&mut send).unwrap();
+    }
+    assert_eq!(
+        actions,
+        [
+            "state:get",
+            "configuration:transaction_status",
+            "state:set-active"
+        ]
+    );
+    assert_eq!(completed_claim, Some(claim_value));
+    assert!(
+        !pipeline
+            .effect_gate
+            .as_ref()
+            .unwrap()
+            .startup_recovery_required()
+    );
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn lost_pairing_recovery_ack_refences_the_gate_after_local_recovery() {
     let claim = feedback_bootstrap_test_claim();
     let expected_claim = serde_json::to_value(&claim).unwrap();
@@ -5820,11 +5897,7 @@ fn lost_pairing_recovery_ack_refences_the_gate_after_local_recovery() {
     }
     assert!(completion_attempted);
     assert!(
-        pipeline
-            .effect_gate
-            .as_ref()
-            .unwrap()
-            .startup_recovery_required(),
+        pipeline.effect_gate.as_ref().unwrap().fenced(),
         "a lost acknowledgment must leave the local effect gate fenced"
     );
     std::fs::remove_dir_all(directory).unwrap();
@@ -5851,6 +5924,20 @@ fn trusted_bootstrap_recovers_through_real_broker_and_state_without_fixture_reco
 
     let mut broker = authority_broker();
     let (directory, mut pipeline) = feedback_bootstrap_test_pipeline(claim);
+    let configured_identity = pipeline.configured_identity().unwrap();
+    let certificate_hash = Sha256::digest(configured_identity.certificate_pem.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let persisted_recovery = store.handle(
+        "pairing",
+        json!({"action":"set","key":amaterasu_module_sdk::state::FEEDBACK_BOOTSTRAP_KEY,
+            "value":{"claim":claim_value,"phase":"recovery_started",
+                "configuration_revision":configured_identity.provider_revision,
+                "certificate_sha256":certificate_hash},
+            "expected_revision":1}),
+    );
+    assert_eq!(persisted_recovery["revision"], 2);
     let mut actions = Vec::new();
     let mut send = |command: Command| -> Transport {
         match command {
@@ -5928,7 +6015,6 @@ fn trusted_bootstrap_recovers_through_real_broker_and_state_without_fixture_reco
         actions,
         [
             (STATE_SERVICE.into(), "get".into()),
-            (STATE_SERVICE.into(), "set".into()),
             (
                 HOST_CONFIGURATION_SERVICE.into(),
                 "transaction_status".into()

@@ -71,6 +71,28 @@ fn take(send: &mut impl FnMut(Command) -> Transport, request: u64) -> Option<Res
     }
 }
 
+fn submit_configuration_status(
+    send: &mut impl FnMut(Command) -> Transport,
+    recovery_state_revision: u64,
+    configuration_revision: u64,
+    certificate_hash: String,
+) -> Stage {
+    match submit(
+        send,
+        HOST_CONFIGURATION_SERVICE,
+        json!({"action":"transaction_status"}),
+        "feedback-bootstrap-status",
+    ) {
+        Some(request) => Stage::Checking {
+            request,
+            recovery_state_revision,
+            configuration_revision,
+            certificate_hash,
+        },
+        None => Stage::Failed,
+    }
+}
+
 fn identity(pipeline: &Pipeline) -> Option<(u64, String)> {
     let identity = pipeline.configured_identity()?;
     let hash = Sha256::digest(identity.certificate_pem.as_bytes());
@@ -123,28 +145,49 @@ impl Pipeline {
                             .as_u64()
                             .is_some_and(|revision| revision > 0)
                         && payload["found"] == true
-                        && payload["value"]["phase"] == "prepared"
+                        && matches!(
+                            payload["value"]["phase"].as_str(),
+                            Some("prepared" | "recovery_started")
+                        )
                         && payload["value"]["claim"] == json!(bootstrap.claim) =>
                 {
                     if let Some((configuration_revision, certificate_hash)) = identity(self) {
-                        let previous_state_revision = payload["revision"].as_u64().unwrap();
-                        let value = json!({"claim":bootstrap.claim,"phase":"recovery_started",
-                            "configuration_revision":configuration_revision,
-                            "certificate_sha256":certificate_hash});
-                        match submit(
-                            send,
-                            STATE_SERVICE,
-                            json!({"action":"set","key":FEEDBACK_BOOTSTRAP_KEY,
-                                "value":value,"expected_revision":previous_state_revision}),
-                            "feedback-bootstrap-recovery-started",
-                        ) {
-                            Some(request) => Stage::MarkingRecovery {
-                                request,
-                                previous_state_revision,
-                                configuration_revision,
-                                certificate_hash,
-                            },
-                            None => Stage::Failed,
+                        let state_revision = payload["revision"].as_u64().unwrap();
+                        match payload["value"]["phase"].as_str() {
+                            Some("prepared") => {
+                                let value = json!({"claim":bootstrap.claim,"phase":"recovery_started",
+                                    "configuration_revision":configuration_revision,
+                                    "certificate_sha256":certificate_hash});
+                                match submit(
+                                    send,
+                                    STATE_SERVICE,
+                                    json!({"action":"set","key":FEEDBACK_BOOTSTRAP_KEY,
+                                        "value":value,"expected_revision":state_revision}),
+                                    "feedback-bootstrap-recovery-started",
+                                ) {
+                                    Some(request) => Stage::MarkingRecovery {
+                                        request,
+                                        previous_state_revision: state_revision,
+                                        configuration_revision,
+                                        certificate_hash,
+                                    },
+                                    None => Stage::Failed,
+                                }
+                            }
+                            Some("recovery_started")
+                                if payload["value"]["configuration_revision"].as_u64()
+                                    == Some(configuration_revision)
+                                    && payload["value"]["certificate_sha256"].as_str()
+                                        == Some(certificate_hash.as_str()) =>
+                            {
+                                submit_configuration_status(
+                                    send,
+                                    state_revision,
+                                    configuration_revision,
+                                    certificate_hash,
+                                )
+                            }
+                            _ => Stage::Failed,
                         }
                     } else {
                         Stage::Failed
@@ -169,20 +212,12 @@ impl Pipeline {
                         && payload["revision"].as_u64()
                             == previous_state_revision.checked_add(1) =>
                 {
-                    match submit(
+                    submit_configuration_status(
                         send,
-                        HOST_CONFIGURATION_SERVICE,
-                        json!({"action":"transaction_status"}),
-                        "feedback-bootstrap-status",
-                    ) {
-                        Some(request) => Stage::Checking {
-                            request,
-                            recovery_state_revision: previous_state_revision + 1,
-                            configuration_revision,
-                            certificate_hash,
-                        },
-                        None => Stage::Failed,
-                    }
+                        previous_state_revision + 1,
+                        configuration_revision,
+                        certificate_hash,
+                    )
                 }
                 _ => Stage::Failed,
             },
@@ -201,9 +236,9 @@ impl Pipeline {
                 Some(Ok(payload)) => {
                     let status =
                         serde_json::from_value::<HostConfigurationTransactionStatus>(payload);
-                    let stable = identity(self).as_ref().is_some_and(|(revision, hash)| {
-                        *revision == configuration_revision && hash == &certificate_hash
-                    }) && self.configuration_reconciled
+                    let stable = identity(self)
+                        == Some((configuration_revision, certificate_hash.clone()))
+                        && self.configuration_reconciled
                         && self.configuration_hold.is_none()
                         && status.is_ok_and(|status| {
                             status.valid()

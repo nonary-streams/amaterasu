@@ -547,14 +547,20 @@ fn initialize_feedback_state(
                         )?;
                         return Ok(true);
                     }
-                    Some("recovery_started") | Some("active") => {
-                        let state_phase = if payload["phase"] == "recovery_started" {
-                            amaterasu_package::live_feedback_bootstrap::ConfirmedFeedbackBootstrapStatePhase::RecoveryStarted
-                        } else {
-                            amaterasu_package::live_feedback_bootstrap::ConfirmedFeedbackBootstrapStatePhase::Active
-                        };
+                    Some("recovery_started") => {
+                        // The State marker proves this exact claim made it to
+                        // Pairing, but it does not prove that gate recovery
+                        // completed. Resume status checks with the same claim.
+                        amaterasu_package::live_feedback_bootstrap::mark_state_initialized(
+                            root, proof,
+                        )?;
+                        return Ok(true);
+                    }
+                    Some("active") => {
                         amaterasu_package::live_feedback_bootstrap::quarantine_after_state_recovery(
-                            root, proof, state_phase,
+                            root,
+                            proof,
+                            amaterasu_package::live_feedback_bootstrap::ConfirmedFeedbackBootstrapStatePhase::Active,
                         )?;
                         match send(&Command::QuarantineLiveFeedbackBootstrap {
                             claim: serde_json::from_value(expected_claim)

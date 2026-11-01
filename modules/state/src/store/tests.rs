@@ -15,6 +15,18 @@ impl TestDirectory {
     fn open(&self) -> StateStore {
         StateStore::open(self.0.clone()).unwrap()
     }
+
+    fn write_origin(&self, phase: LiveFeedbackStateOriginPhase, bootstrap_claim: Option<&str>) {
+        amaterasu_storage::create_private_directory(&self.0).unwrap();
+        let origin = LiveFeedbackStateOrigin {
+            version: 1,
+            installation_id: "a".repeat(32),
+            state_root_identity: "c".repeat(32),
+            phase,
+            bootstrap_claim: bootstrap_claim.map(str::to_owned),
+        };
+        amaterasu_storage::write_json_atomically(&self.0.join(STATE_ORIGIN_FILE), &origin).unwrap();
+    }
 }
 
 impl Drop for TestDirectory {
@@ -175,7 +187,7 @@ fn feedback_bootstrap_claim() -> serde_json::Value {
 }
 
 #[test]
-fn feedback_bootstrap_is_host_only_durable_and_one_use() {
+fn feedback_bootstrap_is_host_only_durable_and_idempotent_for_the_exact_claim() {
     let directory = TestDirectory::new();
     let claim = feedback_bootstrap_claim();
     let store = directory.open();
@@ -206,7 +218,17 @@ fn feedback_bootstrap_is_host_only_durable_and_one_use() {
         amaterasu_module_sdk::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
         json!({"action":"initialize_feedback_host","claim":claim}),
     );
-    assert_eq!(replay["error"]["code"], "history_present");
+    assert_eq!(replay, initialized);
+    let mut different_claim = claim.clone();
+    different_claim["claim"] = json!("d".repeat(32));
+    let replay_with_different_claim = store.handle(
+        amaterasu_module_sdk::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+        json!({"action":"initialize_feedback_host","claim":different_claim}),
+    );
+    assert_eq!(
+        replay_with_different_claim["error"]["code"],
+        "bootstrap_claim_mismatch"
+    );
     drop(store);
 
     let restarted = directory.open();
@@ -221,6 +243,147 @@ fn feedback_bootstrap_is_host_only_durable_and_one_use() {
             "found":true,
             "value":{"claim":claim,"phase":"prepared"}
         })
+    );
+}
+
+#[test]
+fn feedback_bootstrap_retries_exact_claim_after_host_writeahead_before_state_receives_it() {
+    let directory = TestDirectory::new();
+    let claim = feedback_bootstrap_claim();
+    directory.write_origin(LiveFeedbackStateOriginPhase::Fresh, None);
+    let store = directory.open();
+
+    // The host already persisted its Initializing witness, but the State
+    // request had not yet reached this provider when the process stopped.
+    assert_eq!(
+        store.load_history_record().unwrap().phase,
+        StateHistoryPhase::Fresh
+    );
+    let resumed = store.handle(
+        amaterasu_module_sdk::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+        json!({"action":"initialize_feedback_host","claim":claim,"resume_existing":true}),
+    );
+    assert_eq!(resumed["ok"], true);
+    assert_eq!(resumed["revision"], 1);
+    assert_eq!(resumed["phase"], "prepared");
+    assert_eq!(
+        store.load_history_record().unwrap().phase,
+        StateHistoryPhase::BootstrapCommitted
+    );
+    assert_eq!(
+        store.load_state_origin().unwrap().unwrap().phase,
+        LiveFeedbackStateOriginPhase::BootstrapCommitted
+    );
+}
+
+#[test]
+fn feedback_bootstrap_recovers_exact_intent_when_state_history_write_was_interrupted() {
+    let directory = TestDirectory::new();
+    let claim = feedback_bootstrap_claim();
+    directory.write_origin(
+        LiveFeedbackStateOriginPhase::BootstrapIntent,
+        Some(claim["claim"].as_str().unwrap()),
+    );
+    let store = directory.open();
+
+    let resumed = store.handle(
+        amaterasu_module_sdk::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+        json!({"action":"initialize_feedback_host","claim":claim,"resume_existing":true}),
+    );
+    assert_eq!(resumed["ok"], true);
+    assert_eq!(resumed["revision"], 1);
+    assert_eq!(
+        store.load_history_record().unwrap().phase,
+        StateHistoryPhase::BootstrapCommitted
+    );
+    assert_eq!(
+        store.load_state_origin().unwrap().unwrap().phase,
+        LiveFeedbackStateOriginPhase::BootstrapCommitted
+    );
+}
+
+#[test]
+fn missing_history_after_use_or_bootstrap_never_reverts_origin_to_fresh() {
+    let ordinary = TestDirectory::new();
+    ordinary.write_origin(LiveFeedbackStateOriginPhase::Fresh, None);
+    let store = ordinary.open();
+    assert_eq!(
+        store.handle(
+            "prior-owner",
+            json!({"action":"set","key":"old","value":true})
+        )["ok"],
+        true
+    );
+    drop(store);
+    std::fs::remove_file(ordinary.0.join(HISTORY_FILE)).unwrap();
+    let restarted = ordinary.open();
+    assert_eq!(
+        restarted.handle("prior-owner", json!({"action":"get","key":"old"}))["error"]["code"],
+        "bootstrap_history_lost"
+    );
+    assert_eq!(
+        restarted.handle(
+            amaterasu_module_sdk::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            json!({"action":"initialize_feedback_host","claim":feedback_bootstrap_claim(),"resume_existing":true}),
+        )["error"]["code"],
+        "bootstrap_history_lost"
+    );
+
+    let bootstrapped = TestDirectory::new();
+    bootstrapped.write_origin(LiveFeedbackStateOriginPhase::Fresh, None);
+    let store = bootstrapped.open();
+    let claim = feedback_bootstrap_claim();
+    assert_eq!(
+        store.handle(
+            amaterasu_module_sdk::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            json!({"action":"initialize_feedback_host","claim":claim}),
+        )["phase"],
+        "prepared"
+    );
+    drop(store);
+    std::fs::remove_file(bootstrapped.0.join(HISTORY_FILE)).unwrap();
+    let restarted = bootstrapped.open();
+    assert_eq!(
+        restarted.handle(
+            amaterasu_module_sdk::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            json!({"action":"initialize_feedback_host","claim":claim,"resume_existing":true}),
+        )["error"]["code"],
+        "bootstrap_history_lost"
+    );
+}
+
+#[test]
+fn feedback_bootstrap_resumes_same_claim_after_state_writeahead_intent() {
+    let directory = TestDirectory::new();
+    let claim: amaterasu_module_sdk::state::FeedbackBootstrapClaim =
+        serde_json::from_value(feedback_bootstrap_claim()).unwrap();
+    let store = directory.open();
+    store
+        .write_history_record(&StateHistory {
+            version: 1,
+            phase: StateHistoryPhase::BootstrapIntent,
+            claim: Some(claim.clone()),
+        })
+        .unwrap();
+    assert_eq!(
+        store.handle(
+            "pairing",
+            json!({"action":"get","key":"blocked-during-intent"})
+        )["error"]["code"],
+        "bootstrap_pending"
+    );
+    drop(store);
+
+    let restarted = directory.open();
+    let resumed = restarted.handle(
+        amaterasu_module_sdk::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+        json!({"action":"initialize_feedback_host","claim":claim,"resume_existing":true}),
+    );
+    assert_eq!(resumed["ok"], true);
+    assert_eq!(resumed["phase"], "prepared");
+    assert_eq!(
+        restarted.load_history_record().unwrap().phase,
+        StateHistoryPhase::BootstrapCommitted
     );
 }
 
@@ -263,9 +426,60 @@ fn feedback_bootstrap_resume_does_not_recreate_lost_state_history() {
     std::fs::remove_dir_all(directory.0.join("namespaces")).unwrap();
     let store = directory.open();
     assert_eq!(
+        store.load_history_record().unwrap().phase,
+        StateHistoryPhase::BootstrapCommitted
+    );
+    assert_eq!(
         store.handle(
             amaterasu_module_sdk::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
             json!({"action":"initialize_feedback_host","claim":claim,"resume_existing":true}),
+        )["error"]["code"],
+        "bootstrap_history_lost"
+    );
+    assert!(!directory.0.join("namespaces").exists());
+}
+
+#[test]
+fn feedback_bootstrap_does_not_adopt_a_previously_used_store_after_namespace_loss() {
+    let directory = TestDirectory::new();
+    let claim = feedback_bootstrap_claim();
+    {
+        let store = directory.open();
+        assert_eq!(
+            store.handle(
+                "prior-owner",
+                json!({"action":"set","key":"old","value":true})
+            )["ok"],
+            true
+        );
+    }
+    std::fs::remove_dir_all(directory.0.join("namespaces")).unwrap();
+    let store = directory.open();
+
+    assert_eq!(
+        store.handle(
+            amaterasu_module_sdk::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            json!({"action":"initialize_feedback_host","claim":claim,"resume_existing":true}),
+        )["error"]["code"],
+        "bootstrap_history_lost"
+    );
+    assert!(!directory.0.join("namespaces").exists());
+}
+
+#[test]
+fn feedback_bootstrap_does_not_adopt_an_empty_but_previously_used_store() {
+    let directory = TestDirectory::new();
+    let store = directory.open();
+    assert_eq!(
+        store.handle("prior-reader", json!({"action":"get","key":"missing"}))["found"],
+        false
+    );
+    assert!(!directory.0.join("namespaces").exists());
+
+    assert_eq!(
+        store.handle(
+            amaterasu_module_sdk::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            json!({"action":"initialize_feedback_host","claim":feedback_bootstrap_claim(),"resume_existing":true}),
         )["error"]["code"],
         "bootstrap_history_lost"
     );

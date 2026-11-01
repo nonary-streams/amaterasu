@@ -17,6 +17,8 @@ pub const FEEDBACK_BOOTSTRAP_KEY: &str = "host/feedback-bootstrap/v1";
 pub enum StateRequest {
     InitializeFeedbackHost {
         claim: FeedbackBootstrapClaim,
+        /// Return the exact stored claim, or retry while the durable State
+        /// history marker proves no prior State operation has been accepted.
         #[serde(default)]
         resume_existing: bool,
     },
