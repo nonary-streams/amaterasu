@@ -1134,7 +1134,7 @@ impl Pipeline {
                 Ok(false)
             }
             Step::FeedbackPeek => {
-                let scoped = cfg!(test)
+                let scoped = cfg!(any(test, feature = "feedback-qualification"))
                     && self.settings.observe_feedback_sources
                     && self.settings.feedback_retirement_input_principal.is_some();
                 let owner = scoped.then_some(&mut self.feedback_retirement_inbox);
@@ -1150,7 +1150,7 @@ impl Pipeline {
             Step::FeedbackAck => {
                 let through = record.feedback_ack_through;
                 accept_feedback_ack(record, &payload, now)?;
-                if cfg!(test)
+                if cfg!(any(test, feature = "feedback-qualification"))
                     && self.settings.observe_feedback_sources
                     && self.settings.feedback_retirement_input_principal.is_some()
                     && let Some(through) = through
