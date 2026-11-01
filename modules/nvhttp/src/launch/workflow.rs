@@ -660,11 +660,12 @@ impl Controller {
         {
             payload["application_operation_id"] = json!(record.application_operation);
             payload["app_id"] = json!(app_id(record.request.app_id));
-            payload["catalog_revision"] = json!(
-                record
-                    .application_catalog_revision
-                    .expect("RTSP admission follows application preflight")
-            );
+            let revision = record
+                .application_catalog_revision
+                .expect("RTSP admission follows application preflight");
+            payload["catalog_revision"] = json!(revision);
+            payload["policy_identity"] =
+                json!({"source":"catalog","version":1,"revision":revision});
         }
         let operation = self.next_operation(record, phase.name());
         Call::new(service, payload, operation, timeout_ms)

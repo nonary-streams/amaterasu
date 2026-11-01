@@ -104,6 +104,9 @@ pub enum Operation {
         display_policy_snapshot: Value,
         certificate_id: String,
         catalog_revision: u64,
+        #[serde(default)]
+        policy_identity:
+            Option<amaterasu_module_sdk::application_library::preflight::PolicyIdentity>,
     },
     VerifyFrameLimiterSnapshot {
         application_operation_id: String,
@@ -111,6 +114,9 @@ pub enum Operation {
         rtsp_operation_id: Option<String>,
         app_id: String,
         catalog_revision: u64,
+        #[serde(default)]
+        policy_identity:
+            Option<amaterasu_module_sdk::application_library::preflight::PolicyIdentity>,
         frame_limiter_settings: BTreeMap<String, Value>,
         frame_limiter_executable_path: String,
     },
@@ -243,12 +249,16 @@ impl Operation {
                 display_policy_snapshot,
                 certificate_id,
                 catalog_revision: _,
+                policy_identity,
             } => {
                 if !valid_sha256(token)
                     || !valid_operation_id(application_operation_id)
                     || !valid_operation_id(rtsp_operation_id)
                     || !valid_sha256(request_sha256)
                     || !valid_sha256(certificate_id)
+                    || policy_identity
+                        .as_ref()
+                        .is_some_and(|identity| identity.validate().is_err())
                     || !display_policy_snapshot.is_object()
                     || !serde_json::to_vec(display_policy_snapshot)
                         .is_ok_and(|bytes| bytes.len() <= 32_768)

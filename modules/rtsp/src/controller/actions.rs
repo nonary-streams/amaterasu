@@ -193,7 +193,7 @@ impl Controller {
                 .display_admission_token
                 .as_deref()
                 .expect("validated token");
-            let payload = json!({
+            let mut payload = json!({
                 "action":"verify_display_admission",
                 "token":token,
                 "application_operation_id":config.application_operation_id,
@@ -203,6 +203,9 @@ impl Controller {
                 "certificate_id":snapshot["certificate_id"],
                 "catalog_revision":snapshot["catalog_revision"],
             });
+            if let Some(identity) = &config.policy_identity {
+                payload["policy_identity"] = json!(identity);
+            }
             let call = Call::for_service(
                 "amaterasu.launch/1",
                 payload,

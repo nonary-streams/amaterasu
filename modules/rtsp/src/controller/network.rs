@@ -185,6 +185,9 @@ impl Controller {
             "frame_limiter_settings":record.config.frame_limiter_settings,
             "frame_limiter_executable_path":record.config.frame_limiter_executable_path,
         });
+        if let Some(identity) = &record.config.policy_identity {
+            verification["policy_identity"] = json!(identity);
+        }
         if record.config.lifecycle_session_target.is_some() {
             verification["rtsp_operation_id"] = json!(record.config.operation_id);
         }

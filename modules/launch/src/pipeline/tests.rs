@@ -1358,6 +1358,16 @@ fn rtsp_verifies_only_the_active_preflight_frame_limiter_snapshot() {
         harness.request(&mut pipeline, "other-service", verify.clone())["code"],
         "frame_limiter_snapshot_denied"
     );
+    let mut tagged = verify.clone();
+    tagged["policy_identity"] =
+        json!({"source":"catalog","version":1,"revision":preflight["catalog_revision"]});
+    let tagged_reply = harness.request(&mut pipeline, "amaterasu.rtsp", tagged.clone());
+    assert_eq!(tagged_reply["policy_identity"], tagged["policy_identity"]);
+    tagged["policy_identity"]["revision"] = json!(999);
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.rtsp", tagged)["code"],
+        "frame_limiter_snapshot_denied"
+    );
     let verified = harness.request(&mut pipeline, "amaterasu.rtsp", verify.clone());
     assert_eq!(
         verified,
@@ -1677,6 +1687,18 @@ fn signed_principals_attest_frozen_display_policy_and_reject_changed_or_revoked_
     assert_eq!(
         harness.request(&mut pipeline, "amaterasu.rtsp", verify.clone())["verified"],
         true
+    );
+    let mut tagged = verify.clone();
+    tagged["policy_identity"] =
+        json!({"source":"catalog","version":1,"revision":preflight["catalog_revision"]});
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.rtsp", tagged.clone())["verified"],
+        true
+    );
+    tagged["policy_identity"]["revision"] = json!(999);
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.rtsp", tagged)["code"],
+        "display_admission_denied"
     );
     let mut launch = launch_export("admitted-application");
     launch["preflight_token"] = preflight["preflight_token"].clone();
