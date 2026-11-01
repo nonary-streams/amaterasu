@@ -158,6 +158,8 @@ pub fn decode(
                 Operation::PreflightStreamingLibrary { operation_id, application, revision: entry_revision,
                     certificate_id, global_preparation, legacy_global_preparation }
             },
+            request @ amaterasu_module_sdk::application_library::preflight::Request::CancelStreaming { .. } =>
+                Operation::CancelStreamingLibrary { request },
             request @ amaterasu_module_sdk::application_library::preflight::Request::AdmitStreaming { .. } =>
                 Operation::AdmitStreamingLibrary { request },
             request @ amaterasu_module_sdk::application_library::preflight::Request::AcceptStreaming { .. } =>

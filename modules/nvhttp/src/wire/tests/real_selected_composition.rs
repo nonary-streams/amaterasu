@@ -183,6 +183,8 @@ fn real_selected_composition() {
         (true, "success"),
         (true, "stale"),
         (true, "limiter_unsupported"),
+        (true, "limiter_no_retirement"),
+        (true, "retirement_cancel"),
         (false, "limiter_success"),
         (true, "limiter_success"),
         (true, "limiter_mismatch"),
@@ -237,7 +239,7 @@ fn run_composition(replacement: bool, scenario: &str) {
     ]);
     let config = json!({"principals":{
         "console":{"call": ["amaterasu.pairing/1","amaterasu.state/1"]},
-        "attacker":{"call":["amaterasu.launch/1","amaterasu.launch/3"]},
+        "attacker":{"call":["amaterasu.launch/1","amaterasu.launch/3","example.library.provider/1"]},
         "amaterasu.nvhttp":{"call":services},
         "amaterasu.pairing":{"provide":["amaterasu.pairing/1"],"call":["amaterasu.state/1"],"native_provide":["amaterasu.identity/1"]},
         "amaterasu.launch":{"provide":["amaterasu.launch/1","amaterasu.launch/2","amaterasu.launch/3"],"call":["fixture.library/2","fixture.policy/2","example.library.provider/1","amaterasu.session/1","amaterasu.application/1"]},
@@ -268,7 +270,7 @@ fn run_composition(replacement: bool, scenario: &str) {
             "targets":[{"id":"opaque/game","revision":"entry:opaque","executor":"runner","application_id":"fixture-game"}]},
         "policy":{"service":"fixture.policy/2","callers":{"amaterasu.launch":["amaterasu.nvhttp"]},"rules":[{"certificates":[cert_id],"policy":{"application":{"library":"games","id":"opaque/game"},"entry_revision":"entry:opaque","policy_revision":"policy:one","preparation":[]},"config_overrides":{},"application_display_settings":null}]},
         "executor":{"callers":{"amaterasu.launch":{"initiators":["amaterasu.nvhttp","amaterasu.launch"],"lifecycle":true}}, "limiter_mode":match scenario { "limiter_success" => "supported", "limiter_mismatch" => "mismatch", "limiter_stale" => "stale", _ => "" }},
-        "replacement":{"certificate_id":cert_id,"mode":scenario}
+        "replacement":{"certificate_id":cert_id,"mode":scenario,"limiter_capacity":2}
     }});
     let runtime = Runtime::new(&artifact(&artifacts, "amaterasu_runtime"), config);
     let state = runtime.client("state");
@@ -453,7 +455,9 @@ fn run_composition(replacement: bool, scenario: &str) {
         json!({})
     };
     router.set_global_display_policy(1, display_policy);
-    if scenario.starts_with("limiter_") || scenario == "resume_limiter" {
+    if scenario.starts_with("limiter_")
+        || matches!(scenario, "resume_limiter" | "retirement_cancel")
+    {
         router.set_global_frame_limiter_settings(&crate::frame_limiter::FrameLimiterSettings {
             frame_limiter_enable: Some(true),
             ..Default::default()
@@ -496,6 +500,13 @@ fn run_composition(replacement: bool, scenario: &str) {
         rtsp.tick();
         backends.pump(&session, &stream, &input, &application, &display);
         replies.extend(router.poll_with_trust(&nvhttp, |presented, _| presented == cert));
+        if scenario == "retirement_cancel"
+            && !cancelled
+            && router.launches.selected_preflight_state_for_test() == Some((true, false))
+        {
+            router.cancel(1, &nvhttp);
+            cancelled = true;
+        }
         if scenario == "cancelled"
             && !cancelled
             && backends.calls.iter().any(|(service, payload)| {
@@ -505,7 +516,7 @@ fn run_composition(replacement: bool, scenario: &str) {
             router.cancel(1, &nvhttp);
             cancelled = true;
         }
-        if scenario == "cancelled" {
+        if scenario == "cancelled" || scenario == "retirement_cancel" {
             if backends.calls.iter().any(|(service, payload)| {
                 service == "stream" && payload["action"] == "release_history_activity"
             }) {
@@ -848,7 +859,7 @@ fn run_composition(replacement: bool, scenario: &str) {
                 }
             }
         }
-        "cancelled" => {
+        "cancelled" | "retirement_cancel" => {
             assert!(cancelled);
             assert!(
                 backends
@@ -860,11 +871,161 @@ fn run_composition(replacement: bool, scenario: &str) {
                 backends.calls
             );
             assert!(!prepared);
+            if scenario == "retirement_cancel" {
+                assert_eq!(
+                    router.launches.selected_preflight_state_for_test(),
+                    Some((false, false))
+                );
+                let epoch_request = broker_request(
+                    &nvhttp,
+                    "amaterasu.launch/1",
+                    json!({"action":"operation_epoch"}),
+                    "retire-epoch",
+                );
+                let epoch = await_launch(
+                    &nvhttp,
+                    epoch_request,
+                    &mut launch,
+                    &mut generated,
+                    &mut provider,
+                );
+                let epoch = epoch["operation_epoch"].as_str().unwrap();
+                let application = json!({"library":"games","id":"opaque/game"});
+                let snapshot = json!({"version":1,"settings":{"frame_limiter_enable":true,"frame_limiter_fps_limit_millihz":120000,"frame_limiter_provider":"auto","frame_limiter_disable_vsync":false,"frame_limiter_auto_virtual_framegen":"enabled","rtss_frame_limit_type":"async","rtss_allow_virtual_display_override":false,"rtss_install_path":"","mangohud_limiter_method":"late","mangohud_preset":"custom","mangohud_always_show_graph":false},"requested_stream_fps_millihz":60000,"client_display_mode_override_millihz":null,"lossless_scaling_limit_millihz":null,"virtual_display_active":null,"physical_framegen_capture":null,"game_frame_generation_mode":null,"rtss_frame_limit_type_explicit_override":null});
+                let mut last_policy = None;
+                for index in 0..7 {
+                    let operation = format!("ale1:{epoch}:retirement-{index}");
+                    let pre = broker_request(
+                        &nvhttp,
+                        "amaterasu.launch/3",
+                        json!({"action":"prepare_streaming","operation_id":operation,"application":application,"entry_revision":"entry:opaque","certificate_id":cert_id}),
+                        &format!("retire-prepare-{index}"),
+                    );
+                    let pre =
+                        await_launch(&nvhttp, pre, &mut launch, &mut generated, &mut provider);
+                    assert_eq!(pre["ok"], true, "{pre}");
+                    last_policy = Some(pre["policy_identity"].clone());
+                    let accept = broker_request(
+                        &nvhttp,
+                        "amaterasu.launch/3",
+                        json!({"action":"accept_streaming","operation_id":operation,"application":application,"entry_revision":"entry:opaque","certificate_id":cert_id,"preflight_token":pre["preflight_token"],"policy_identity":pre["policy_identity"],"frame_limiter_settings":snapshot,"client_frame_limiter_overrides":{}}),
+                        &format!("retire-accept-{index}"),
+                    );
+                    let accepted =
+                        await_launch(&nvhttp, accept, &mut launch, &mut generated, &mut provider);
+                    assert_eq!(accepted["accepted"], true, "{accepted}");
+                    let cancel = json!({"action":"cancel_streaming","operation_id":operation,"certificate_id":cert_id,"preflight_token":pre["preflight_token"],"policy_identity":pre["policy_identity"]});
+                    for duplicate in 0..2 {
+                        let request = broker_request(
+                            &nvhttp,
+                            "amaterasu.launch/3",
+                            cancel.clone(),
+                            &format!("retire-cancel-{index}-{duplicate}"),
+                        );
+                        let result = await_launch(
+                            &nvhttp,
+                            request,
+                            &mut launch,
+                            &mut generated,
+                            &mut provider,
+                        );
+                        assert_eq!(result["cancelled"], true, "{result}");
+                    }
+                    let replay = broker_request(
+                        &nvhttp,
+                        "amaterasu.launch/3",
+                        json!({"action":"prepare_streaming","operation_id":operation,"application":application,"entry_revision":"entry:opaque","certificate_id":cert_id}),
+                        &format!("retire-replay-{index}"),
+                    );
+                    let rejected =
+                        await_launch(&nvhttp, replay, &mut launch, &mut generated, &mut provider);
+                    assert_ne!(rejected["ok"], true, "{rejected}");
+                }
+                let coordinator = runtime.client("amaterasu.launch");
+                let identity = broker_request(
+                    &coordinator,
+                    "example.library.provider/1",
+                    json!({"action":"identity"}),
+                    "late-identity",
+                );
+                let identity = await_provider(&coordinator, identity, &mut generated);
+                let incarnation = identity["provider_incarnation"].as_str().unwrap();
+                let policy = last_policy.expect("qualified selected policy");
+                let retirement = json!({"version":1,"operation_id":"late-reservation","application_id":"fixture-game","provider_incarnation":incarnation,"original_initiator":"amaterasu.nvhttp","policy_identity":policy});
+                for index in 0..2 {
+                    let request = broker_request(
+                        &coordinator,
+                        "example.library.provider/1",
+                        json!({"action":"retire_limiter_target_v1","request":retirement}),
+                        &format!("late-retire-{index}"),
+                    );
+                    let proof = await_provider(&coordinator, request, &mut generated);
+                    assert_eq!(proof["retirement"]["retired"], true, "{proof}");
+                }
+                let late = broker_request(
+                    &coordinator,
+                    "example.library.provider/1",
+                    json!({"action":"attest_limiter_target_v1","request":{"version":1,"stage":"reserve","operation_id":"late-reservation","application_id":"fixture-game","provider_incarnation":incarnation,"ticket":null,"policy_identity":policy}}),
+                    "late-reserve",
+                );
+                let late = await_provider(&coordinator, late, &mut generated);
+                assert_ne!(late["ok"], true, "{late}");
+                // Deliver the successful Reserve response only after its fence
+                // is confirmed, modelling an acknowledgement delayed in transit.
+                let held_request = json!({"version":1,"stage":"reserve","operation_id":"held-response","application_id":"fixture-game","provider_incarnation":incarnation,"ticket":null,"policy_identity":policy});
+                let held = broker_request(
+                    &coordinator,
+                    "example.library.provider/1",
+                    json!({"action":"attest_limiter_target_v1","request":held_request}),
+                    "held-reserve",
+                );
+                generated.as_mut().unwrap().tick();
+                let held_retirement = json!({"version":1,"operation_id":"held-response","application_id":"fixture-game","provider_incarnation":incarnation,"original_initiator":"amaterasu.launch","policy_identity":policy});
+                let fence = broker_request(
+                    &coordinator,
+                    "example.library.provider/1",
+                    json!({"action":"retire_limiter_target_v1","request":held_retirement}),
+                    "held-retire",
+                );
+                let fence = await_provider(&coordinator, fence, &mut generated);
+                assert_eq!(fence["retirement"]["retired"], true, "{fence}");
+                let delayed = take(&coordinator, held).expect("delayed reservation response");
+                assert_eq!(delayed["ok"], true, "{delayed}");
+                let replay = broker_request(
+                    &coordinator,
+                    "example.library.provider/1",
+                    json!({"action":"attest_limiter_target_v1","request":held_request}),
+                    "held-replay",
+                );
+                let replay = await_provider(&coordinator, replay, &mut generated);
+                assert_ne!(replay["ok"], true, "{replay}");
+                let attacker = runtime.client("attacker");
+                let foreign = broker_request(
+                    &attacker,
+                    "example.library.provider/1",
+                    json!({"action":"retire_limiter_target_v1","request":retirement}),
+                    "foreign-retire",
+                );
+                let foreign = await_provider(&attacker, foreign, &mut generated);
+                assert_ne!(foreign["ok"], true, "{foreign}");
+                let mut stale = retirement.clone();
+                stale["operation_id"] = json!("stale-reservation");
+                stale["provider_incarnation"] = json!("stale-incarnation");
+                let stale = broker_request(
+                    &coordinator,
+                    "example.library.provider/1",
+                    json!({"action":"retire_limiter_target_v1","request":stale}),
+                    "stale-retire",
+                );
+                let stale = await_provider(&coordinator, stale, &mut generated);
+                assert_ne!(stale["ok"], true, "{stale}");
+            }
         }
         "stale"
         | "display_rejected"
         | "failed_preparation"
         | "limiter_unsupported"
+        | "limiter_no_retirement"
         | "limiter_mismatch"
         | "limiter_stale" => {
             assert_eq!(replies.len(), 1, "hardware requests: {:?}", backends.calls);
@@ -939,6 +1100,42 @@ fn lifecycle_request(
         }
     }
     panic!("lifecycle request stalled: {operation}")
+}
+
+fn await_provider(
+    client: &RuntimeClient,
+    request: u64,
+    generated: &mut Option<LoadedModule>,
+) -> Value {
+    for _ in 0..200 {
+        generated.as_mut().expect("replacement provider").tick();
+        if let Some(result) = take(client, request) {
+            return result;
+        }
+    }
+    panic!("provider request stalled")
+}
+
+fn await_launch(
+    client: &RuntimeClient,
+    request: u64,
+    launch: &mut LoadedModule,
+    generated: &mut Option<LoadedModule>,
+    provider: &mut Option<LoadedModule>,
+) -> Value {
+    for _ in 0..500 {
+        launch.tick();
+        if let Some(module) = generated {
+            module.tick();
+        }
+        if let Some(module) = provider {
+            module.tick();
+        }
+        if let Some(result) = take(client, request) {
+            return result;
+        }
+    }
+    panic!("Launch request stalled")
 }
 struct TestRoot(PathBuf);
 impl Drop for TestRoot {

@@ -19,6 +19,8 @@ struct Settings {
     certificate_id: String,
     #[serde(default)]
     mode: String,
+    #[serde(default)]
+    limiter_capacity: usize,
 }
 struct GeneratedLibrary {
     mode: String,
@@ -146,6 +148,7 @@ impl Provider for GeneratedPolicy {
 struct GeneratedExecutor {
     incarnation: String,
     mode: String,
+    limiter_capacity: usize,
     operations: BTreeMap<
         (String, String),
         (
@@ -157,6 +160,10 @@ struct GeneratedExecutor {
     reservations: BTreeMap<
         (String, String, String),
         amaterasu_module_sdk::application_library::limiter_target::Request,
+    >,
+    retirements: BTreeMap<
+        (String, String),
+        amaterasu_module_sdk::application_library::limiter_target::RetirementRequest,
     >,
 }
 impl amaterasu_module_sdk::application_library::provider_adapter::Provider for GeneratedExecutor {
@@ -196,7 +203,12 @@ impl amaterasu_module_sdk::application_library::provider_adapter::Provider for G
                 | "limiter_stale"
                 | "limiter_stale_recheck"
                 | "resume_limiter"
+                | "limiter_no_retirement"
+                | "retirement_cancel"
         )
+    }
+    fn supports_limiter_retirement_v1(&self) -> bool {
+        self.supports_limiter_target_v1() && self.mode != "limiter_no_retirement"
     }
     fn attest_limiter_target(
         &mut self,
@@ -219,12 +231,15 @@ impl amaterasu_module_sdk::application_library::provider_adapter::Provider for G
         );
         match request.stage {
             Stage::Reserve => {
+                if self.retirements.contains_key(&key) {
+                    return Err("reservation_retired");
+                }
                 if self.operations.contains_key(&key)
                     && !self.reservations.contains_key(&reservation_key)
                 {
                     return Err("operation_already_started");
                 }
-                if self.reservations.len() >= 4096
+                if self.reservations.len() >= self.limiter_capacity
                     && !self.reservations.contains_key(&reservation_key)
                 {
                     return Err("capacity_exhausted");
@@ -282,6 +297,80 @@ impl amaterasu_module_sdk::application_library::provider_adapter::Provider for G
             result.request.provider_incarnation = "stale".into();
         }
         Ok(result)
+    }
+
+    fn retire_limiter_target(
+        &mut self,
+        identity: &Identity<'_>,
+        request: &amaterasu_module_sdk::application_library::limiter_target::RetirementRequest,
+    ) -> Result<amaterasu_module_sdk::application_library::limiter_target::Retirement, &'static str>
+    {
+        use amaterasu_module_sdk::application_library::{
+            limiter_target::{Request, Retirement, Stage},
+            provider_lifecycle::State,
+        };
+        if identity.caller != identity.initiator {
+            return Err("unauthorized");
+        }
+        let key = (identity.caller.to_owned(), request.operation_id.clone());
+        if let Some(previous) = self.retirements.get(&key) {
+            if previous != request {
+                return Err("operation_conflict");
+            }
+            return Ok(Retirement {
+                request: request.clone(),
+                retired: true,
+            });
+        }
+        if self.retirements.len() >= 4096 {
+            return Err("fence_capacity_exhausted");
+        }
+        if self
+            .operations
+            .get(&key)
+            .is_some_and(|entry| entry.2 != State::Stopped && entry.2 != State::LaunchFailed)
+        {
+            return Err("execution_not_retired");
+        }
+        let reservation_key = (
+            identity.caller.to_owned(),
+            request.original_initiator.clone(),
+            request.operation_id.clone(),
+        );
+        let expected = Request {
+            version: request.version,
+            stage: Stage::Reserve,
+            operation_id: request.operation_id.clone(),
+            application_id: request.application_id.clone(),
+            provider_incarnation: request.provider_incarnation.clone(),
+            ticket: None,
+            policy_identity: request.policy_identity.clone(),
+        };
+        if self
+            .reservations
+            .iter()
+            .any(|((caller, _, operation), value)| {
+                caller == identity.caller
+                    && operation == &request.operation_id
+                    && value != &expected
+            })
+            || self
+                .reservations
+                .keys()
+                .any(|(caller, initiator, operation)| {
+                    caller == identity.caller
+                        && operation == &request.operation_id
+                        && initiator != &request.original_initiator
+                })
+        {
+            return Err("operation_conflict");
+        }
+        self.reservations.remove(&reservation_key);
+        self.retirements.insert(key, request.clone());
+        Ok(Retirement {
+            request: request.clone(),
+            retired: true,
+        })
     }
     fn lifecycle(
         &mut self,
@@ -406,7 +495,7 @@ impl ManagedModule for Module {
         getrandom::fill(&mut nonce).map_err(|_| "entropy unavailable")?;
         let incarnation = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
         let executor=amaterasu_module_sdk::application_library::provider_adapter::ProviderAdapter::with_policies(
-            GeneratedExecutor { incarnation,mode:executor_mode,operations:BTreeMap::new(),reservations:BTreeMap::new() },
+            GeneratedExecutor { incarnation, mode:executor_mode, limiter_capacity:if settings.limiter_capacity == 0 { 4096 } else { settings.limiter_capacity.min(4096) }, operations:BTreeMap::new(), reservations:BTreeMap::new(), retirements:BTreeMap::new() },
             "example.library.provider/1".into(), BTreeMap::from([("amaterasu.launch".into(),amaterasu_module_sdk::application_library::provider_adapter::CallerPolicy { initiators:["amaterasu.nvhttp".into(),"amaterasu.launch".into()].into(), lifecycle:true,..Default::default() })])
         ).map_err(str::to_owned)?;
         for service in [

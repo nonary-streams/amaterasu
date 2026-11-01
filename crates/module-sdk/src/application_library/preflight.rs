@@ -29,6 +29,13 @@ pub enum Request {
         #[serde(default)]
         legacy_global_preparation: Vec<LegacyPreparationCommand>,
     },
+    /// Abandon an owner-bound preflight and retire any executor reservation.
+    CancelStreaming {
+        operation_id: String,
+        certificate_id: String,
+        preflight_token: String,
+        policy_identity: PolicyIdentity,
+    },
     AcceptStreaming {
         operation_id: String,
         application: ApplicationReference,
@@ -86,6 +93,24 @@ impl Request {
                 && certificate_id
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
+            {
+                Ok(())
+            }
+            Self::CancelStreaming {
+                operation_id,
+                certificate_id,
+                preflight_token,
+                policy_identity,
+            } if token(operation_id)
+                && certificate_id.len() == 64
+                && certificate_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                && preflight_token.len() == 64
+                && preflight_token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                && policy_identity.validate().is_ok() =>
             {
                 Ok(())
             }
