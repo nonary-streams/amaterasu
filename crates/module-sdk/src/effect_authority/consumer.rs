@@ -5,7 +5,7 @@
 //! outcome or worker loss, keep the authority fenced and recover actual workers
 //! and queues before calling authority `recover`. Never replay an effect merely
 //! because a response was lost. A ticket is a secret and is not logged here.
-use super::{Request, Source};
+use super::{Request, Source, StreamRetirement, StreamScope};
 use crate::transport::control_retirement::Receipt;
 use serde_json::Value;
 
@@ -100,10 +100,16 @@ impl EffectTicket {
     }
     /// Accept only a response from the selected authority's authenticated broker route.
     pub fn accept_admission(&mut self, response: &Value) -> Result<(), &'static str> {
+        if response.get("kind").is_some() {
+            return Err("invalid_effect_response");
+        }
         self.accept_ticket(response, false)
     }
     /// Fenced lookup results may only be completed; they cannot start an effect.
     pub fn accept_lookup(&mut self, response: &Value) -> Result<(), &'static str> {
+        if response.get("kind").is_some() {
+            return Err("invalid_effect_response");
+        }
         self.accept_ticket(response, true)
     }
     fn accept_ticket(&mut self, response: &Value, lookup: bool) -> Result<(), &'static str> {
@@ -236,15 +242,139 @@ impl EffectTicket {
     }
 }
 
+/// Exact stream lease admission and retirement handshake. The response must be
+/// delivered by the selected pairing service; payload fields are not authority.
+#[must_use = "an unresolved stream lease must remain fenced until reconciled"]
+pub struct StreamLeaseTicket {
+    effect: EffectTicket,
+    scope: StreamScope,
+    retirement: Option<StreamRetirement>,
+}
+
+impl StreamLeaseTicket {
+    pub fn new(
+        epoch: String,
+        source: Source,
+        operation_id: String,
+        sequence: u64,
+        scope: StreamScope,
+    ) -> Result<Self, &'static str> {
+        if !scope.valid() || !valid_ticket(&scope.transport_epoch) {
+            return Err("invalid_stream_scope");
+        }
+        Ok(Self {
+            effect: EffectTicket::new(epoch, source, operation_id, sequence)?,
+            scope,
+            retirement: None,
+        })
+    }
+    pub fn state(&self) -> State {
+        self.effect.state
+    }
+    pub fn admit_request(&self) -> Result<Request, &'static str> {
+        if self.effect.state != State::AwaitAdmission {
+            return Err("invalid_effect_state");
+        }
+        Ok(Request::AdmitStreamLease {
+            epoch: self.effect.epoch.clone(),
+            source: self.effect.source.clone(),
+            operation_id: self.effect.operation_id.clone(),
+            sequence: self.effect.sequence,
+            scope: self.scope.clone(),
+        })
+    }
+    pub fn lookup_request(&self) -> Result<Request, &'static str> {
+        if self.effect.state != State::AwaitAdmission {
+            return Err("invalid_effect_state");
+        }
+        Ok(Request::LookupStreamLease {
+            epoch: self.effect.epoch.clone(),
+            source: self.effect.source.clone(),
+            operation_id: self.effect.operation_id.clone(),
+            scope: self.scope.clone(),
+        })
+    }
+    pub fn accept_admission(&mut self, response: &Value) -> Result<(), &'static str> {
+        if response.get("kind").and_then(Value::as_str) != Some("stream_lease") {
+            return Err("invalid_effect_response");
+        }
+        self.effect.accept_ticket(response, false)
+    }
+    pub fn accept_lookup(&mut self, response: &Value) -> Result<(), &'static str> {
+        if response.get("kind").and_then(Value::as_str) != Some("stream_lease")
+            || serde_json::from_value::<Source>(
+                response
+                    .get("source")
+                    .cloned()
+                    .ok_or("invalid_effect_response")?,
+            )
+            .ok()
+            .as_ref()
+                != Some(&self.effect.source)
+            || serde_json::from_value::<StreamScope>(
+                response
+                    .get("scope")
+                    .cloned()
+                    .ok_or("invalid_effect_response")?,
+            )
+            .ok()
+            .as_ref()
+                != Some(&self.scope)
+        {
+            return Err("invalid_effect_response");
+        }
+        self.effect.accept_ticket(response, true)
+    }
+    /// Cancellation still requires retirement, even if admission was uncertain.
+    pub fn cancel(&mut self) {
+        self.effect.cancel();
+    }
+    pub fn completion_request(&self) -> Result<Request, &'static str> {
+        if self.effect.state != State::NeedsCompletion {
+            return Err("invalid_effect_state");
+        }
+        Ok(Request::CompleteStreamLease {
+            epoch: self.effect.epoch.clone(),
+            operation_id: self.effect.operation_id.clone(),
+            ticket: self.effect.ticket.clone().ok_or("invalid_effect_state")?,
+            retirement: self.retirement.clone().ok_or("invalid_effect_state")?,
+        })
+    }
+    pub fn confirm_completion(&mut self, response: &Value) -> Result<(), &'static str> {
+        self.effect.confirm_completion(response)
+    }
+    pub fn acknowledgment_request(&self) -> Result<Request, &'static str> {
+        self.effect.acknowledgment_request()
+    }
+    pub fn confirm_acknowledgment(&mut self, response: &Value) -> Result<(), &'static str> {
+        self.effect.confirm_acknowledgment(response)
+    }
+}
+
+/// Canonical pairing scope identity for a local feedback schema and direction.
+pub fn feedback_capability_identity(
+    capability: &crate::input::extensions::Capability,
+) -> Result<String, &'static str> {
+    if !capability.valid() || capability.direction != crate::input::extensions::Direction::ToClient
+    {
+        return Err("invalid_feedback_capability");
+    }
+    let identity = format!("{}@{}:to_client", capability.schema, capability.version);
+    if !valid_token(&identity) {
+        return Err("invalid_feedback_capability");
+    }
+    Ok(identity)
+}
+
 /// A single admitted source/stream lease with a fixed negotiated capability set.
 ///
 /// The selected owner must derive this immutable scope from authenticated
-/// lifecycle and protocol state, never a client assertion. The current pairing
-/// API does not yet attest capability scope; production composition stays closed
-/// until it can check the exact scope and signal revocation to this owner.
+/// lifecycle and protocol state, never a client assertion. The pairing ledger
+/// matches that scope at admission; the protocol must authenticate the source
+/// join and capability negotiation before production composition opens.
 #[must_use = "dropping a lease leaves its authority ticket unresolved"]
 pub struct FeedbackLease {
-    aggregate: Option<EffectTicket>,
+    aggregate: Option<StreamLeaseTicket>,
     retirement: TransportRetirement,
     capabilities: std::collections::BTreeSet<crate::input::extensions::Capability>,
     controller_slot: u16,
@@ -262,13 +392,22 @@ struct PendingFeedback {
 
 impl FeedbackLease {
     pub fn new(
-        mut aggregate: EffectTicket,
+        mut aggregate: StreamLeaseTicket,
         retirement: TransportRetirement,
         controller_slot: u16,
         capabilities: std::collections::BTreeSet<crate::input::extensions::Capability>,
-    ) -> Result<Self, Box<(EffectTicket, &'static str)>> {
+    ) -> Result<Self, Box<(StreamLeaseTicket, &'static str)>> {
         use crate::input::extensions::{Direction, MAX_CAPABILITIES};
-        if aggregate.state != State::Ready
+        let identities = capabilities
+            .iter()
+            .map(feedback_capability_identity)
+            .collect::<Result<std::collections::BTreeSet<_>, _>>();
+        if !matches!(
+            aggregate.effect.state,
+            State::Ready | State::NeedsCompletion
+        ) || identities.as_ref().ok() != Some(&aggregate.scope.capabilities)
+            || retirement.stream != aggregate.scope.transport_stream
+            || retirement.provider_epoch != aggregate.scope.transport_epoch
             || retirement.stream == 0
             || !valid_token(&retirement.operation_id)
             || !valid_ticket(&retirement.provider_epoch)
@@ -280,13 +419,14 @@ impl FeedbackLease {
         {
             return Err(Box::new((aggregate, "invalid_effect_state")));
         }
-        aggregate.state = State::HoldingTransport;
+        let fenced = aggregate.effect.state == State::NeedsCompletion;
+        aggregate.effect.state = State::HoldingTransport;
         Ok(Self {
             aggregate: Some(aggregate),
             retirement,
             capabilities,
             controller_slot,
-            fenced: false,
+            fenced,
             last_sequence: 0,
             pending_retry: None,
         })
@@ -314,10 +454,15 @@ impl FeedbackLease {
             return Err("invalid_effect_state");
         };
         let current = response.get("ok").and_then(Value::as_bool) == Some(true)
-            && response.get("epoch").and_then(Value::as_str) == Some(aggregate.epoch.as_str())
+            && response.get("epoch").and_then(Value::as_str)
+                == Some(aggregate.effect.epoch.as_str())
             && response.get("owner_epoch").and_then(Value::as_str)
-                == Some(aggregate.source.effect_owner_epoch.as_str())
-            && response.get("drain_required").and_then(Value::as_bool) == Some(false);
+                == Some(aggregate.effect.source.effect_owner_epoch.as_str())
+            && response.get("drain_required").and_then(Value::as_bool) == Some(false)
+            && response
+                .get("startup_recovery_required")
+                .and_then(Value::as_bool)
+                == Some(false);
         if !current || self.fenced {
             self.fenced = true;
             return Err("feedback_lease_fenced");
@@ -339,7 +484,7 @@ impl FeedbackLease {
     ) -> Result<Result<bool, E>, &'static str> {
         let aggregate = self.aggregate.as_ref().ok_or("invalid_effect_state")?;
         if self.fenced
-            || aggregate.state != State::HoldingTransport
+            || aggregate.effect.state != State::HoldingTransport
             || !self.capabilities.contains(capability)
             || sequence == 0
             || !valid_token(operation_id)
@@ -389,7 +534,7 @@ impl FeedbackLease {
 
     /// Call after local workers quiesce and the selected provider confirms whole
     /// stream retirement. Only then can the aggregate ticket be completed.
-    pub fn retire(&mut self, receipt: &Receipt) -> Result<EffectTicket, &'static str> {
+    pub fn retire(&mut self, receipt: &Receipt) -> Result<StreamLeaseTicket, &'static str> {
         if !self.fenced
             || self.pending_retry.is_some()
             || !receipt.matches(
@@ -401,7 +546,16 @@ impl FeedbackLease {
             return Err("invalid_retirement_receipt");
         }
         let mut aggregate = self.aggregate.take().ok_or("invalid_effect_state")?;
-        aggregate.state = State::NeedsCompletion;
+        aggregate.retirement = Some(StreamRetirement {
+            ok: receipt.ok,
+            service: aggregate.scope.transport_service.clone(),
+            stream: receipt.stream,
+            provider_epoch: receipt.provider_epoch.clone(),
+            operation_id: receipt.operation_id.clone(),
+            scope: receipt.scope.clone(),
+            state: receipt.state.clone(),
+        });
+        aggregate.effect.state = State::NeedsCompletion;
         Ok(aggregate)
     }
 }
@@ -536,8 +690,17 @@ mod tests {
             version: 1,
             direction: Direction::ToClient,
         };
-        let mut aggregate = ticket();
-        aggregate.accept_admission(&admission()).unwrap();
+        let scope = StreamScope {
+            capabilities: [feedback_capability_identity(&capability).unwrap()].into(),
+            transport_service: "amaterasu.control-transport/1".into(),
+            transport_stream: 7,
+            transport_epoch: "c".repeat(32),
+        };
+        let mut aggregate =
+            StreamLeaseTicket::new("e".repeat(32), source(), "operation".into(), 1, scope).unwrap();
+        let mut response = admission();
+        response["kind"] = json!("stream_lease");
+        aggregate.accept_admission(&response).unwrap();
         let mut lease = FeedbackLease::new(aggregate, retirement(), 7, [capability.clone()].into())
             .unwrap_or_else(|_| panic!("lease"));
         assert!(

@@ -83,8 +83,8 @@ callbacks, resolves pending busy work, retires the whole stream, reconciles the
 aggregate ticket and acknowledges the matching pairing drain. Already handed-off
 packets cannot be recalled.
 
-The real-ledger/native-callback tests drive 300 feedback enqueues through one
-pairing record, busy stop retry and cancellation, mismatched capability/slot,
+The real-ledger/native-callback tests drive 300 240-frame haptics PCM blocks
+through one pairing record, busy stop retry and cancellation, mismatched capability/slot,
 replay, a stale status, a lost completion response and a blocked native call
 during revocation. Those tests use a synthetic retirement receipt. A separate
 control-provider test combines the real ledger, lease and actual provider
@@ -92,13 +92,25 @@ retirement receipt while staged datagrams and reliable ENet work are discarded.
 The other control-provider tests cover an in-flight local network handoff. These
 tests do not establish the full broker/lifecycle/transport integration.
 
-The current pairing `Admit` does not record or return the capability and stream
-scope. The exact additive request and response needed from the pairing owner are
-in [the authority request](input-feedback-lease-authority-request.md). Until it
-is implemented and the SDK checks its response, the local lease scope is a
-trusted test assertion and source binding stays closed. Production also needs
-the authenticated lifecycle join, the selected owner's revoke/worker-retirement
-handshake, restart recovery and an independent review before activation.
+The selected pairing authority now supplies `bind_stream`,
+`admit_stream_lease`, `lookup_stream_lease`, and `complete_stream_lease`.
+`StreamLeaseTicket` retains the exact source and scope from its submitted request,
+checks the broker response kind, and checks the echoed scope on lookup. Pairing
+accepts completion only with a scoped transport retirement assertion; the SDK
+constructs it after checking the exact selected transport receipt. The ordinary
+one-shot ticket path cannot complete a stream lease. A fenced lookup can only
+retire. Local capability identities use `<schema>@<version>:to_client`; both
+protocol binding and input composition must use this exact representation.
+
+The `bind_stream` production path remains closed. Production needs the
+certificate/lifecycle source join, trusted verification that the source/device
+maps to the selected controller slot and control handle, negotiated capability
+intersection, selected owner's status/revoke and worker-retirement handshake,
+restart recovery, and independent review. The authority scope does not encode a
+controller slot; the local bridge checks its bound slot but authenticated
+composition must establish that binding. Tests compile the actual pairing ledger
+and use an actual control-provider retirement receipt, but do not establish the
+complete authenticated pairing/broker/lifecycle/transport path.
 
 `amaterasu_module_sdk::input::extensions::source_label::observe` parses the
 negotiated lifecycle source label against an expected stream target only. It is
@@ -140,3 +152,23 @@ for the controller lock. Their one observed datagram was handed off before the
 retirement receipt; the test makes no claim that it can be recalled. A selected
 replacement transport must independently implement the same contract and pass
 an unchanged consumer test before it is relied upon.
+
+## Production integration still required
+
+The new `Plane::send_source_feedback` is intentionally not installed by the
+pipeline. `modules/stream-session/src/pipeline/input.rs` currently feeds the
+legacy `enqueue_feedback` queue, while `pipeline.rs` also has a separate
+`send_rumble` call. A future trusted coordinator must route source-scoped items
+through the lease-aware entry point, retaining the exact busy item and a bounded
+queue, and must not change unrelated legacy or HDR paths by accident. It must
+obtain the pairing `bind_stream`/`admit_stream_lease` result for the exact
+lifecycle source and negotiated capabilities, and maintain status polling or
+an authenticated revoke signal for each selected effect owner.
+
+The owner must coordinate the actual in-flight input producer, plane calls,
+control-transport `retire`/`retirement_status`, scoped lease completion,
+acknowledgment, and matching pairing drain. The lifecycle join must establish the
+source/device-to-slot mapping; `StreamScope` alone does not carry the slot.
+None of these callsites is activated by this branch. The production binding
+remains blocked pending that join, host-configuration fencing, combined broker
+and provider tests, owner-restart proof, and independent review.

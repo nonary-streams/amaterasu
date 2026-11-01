@@ -588,20 +588,56 @@ fn scoped_rumble(controller: u16) -> HostFeedback {
     }
 }
 
+fn scoped_pcm(sequence: u32) -> HostFeedback {
+    HostFeedback::HapticsPcm {
+        controller: 7,
+        sequence,
+        frames: 240,
+        samples_s16le: vec![0; 960],
+    }
+}
+
+fn source_feedback_capabilities()
+-> std::collections::BTreeSet<amaterasu_module_sdk::input::extensions::Capability> {
+    [
+        feedback_scope(&scoped_rumble(7)).1,
+        feedback_scope(&scoped_pcm(1)).1,
+    ]
+    .into()
+}
+
+fn source_feedback_scope(
+    stream: u64,
+    provider_epoch: &str,
+) -> amaterasu_module_sdk::effect_authority::StreamScope {
+    use amaterasu_module_sdk::effect_authority::{
+        StreamScope, consumer::feedback_capability_identity,
+    };
+    StreamScope {
+        capabilities: source_feedback_capabilities()
+            .iter()
+            .map(|capability| feedback_capability_identity(capability).unwrap())
+            .collect(),
+        transport_service: "amaterasu.control-transport/1".into(),
+        transport_stream: stream,
+        transport_epoch: provider_epoch.into(),
+    }
+}
+
 #[test]
 fn source_feedback_lease_handles_sustained_traffic_busy_and_revocation() {
     use amaterasu_module_sdk::effect_authority::consumer::{FeedbackLease, TransportRetirement};
     use amaterasu_module_sdk::transport::control_retirement::Receipt;
-    let (mut authority, aggregate) = effect_authority_test::Fixture::admitted();
+    let (mut authority, aggregate) =
+        effect_authority_test::Fixture::stream_admitted(source_feedback_scope(50, &"c".repeat(32)));
     let retirement = TransportRetirement {
         stream: 50,
         operation_id: "retire".into(),
         provider_epoch: "c".repeat(32),
     };
-    let capability = feedback_scope(&scoped_rumble(7)).1;
-    let mut lease = FeedbackLease::new(aggregate, retirement, 7, [capability].into())
+    let mut lease = FeedbackLease::new(aggregate, retirement, 7, source_feedback_capabilities())
         .unwrap_or_else(|_| panic!("lease"));
-    let valid_status = serde_json::json!({"ok":true,"epoch":authority.epoch,"owner_epoch":"owner","drain_required":false});
+    let valid_status = serde_json::json!({"ok":true,"epoch":authority.epoch,"owner_epoch":"owner","drain_required":false,"startup_recovery_required":false});
     lease.observe_status(&valid_status).unwrap();
     let mut host = Host::new();
     let backend = NativeBackend::new(
@@ -617,13 +653,19 @@ fn source_feedback_lease_handles_sustained_traffic_busy_and_revocation() {
                 &mut lease,
                 sequence,
                 &format!("message-{sequence}"),
-                scoped_rumble(7)
+                scoped_pcm(sequence as u32)
             )
             .unwrap()
         );
     }
     assert_eq!(authority.gate.in_flight(), 1);
     assert_eq!(host.provider.sent_control.len(), 300);
+    assert!(
+        host.provider
+            .sent_control
+            .iter()
+            .all(|sent| sent.1 == 0x5601)
+    );
     assert!(
         pump.send_source_feedback(&mut lease, 300, "message-300", scoped_rumble(7))
             .is_err()
@@ -679,7 +721,7 @@ fn source_feedback_lease_handles_sustained_traffic_busy_and_revocation() {
     host.provider.send_busy = false;
     authority.fence();
     assert_eq!(authority.gate.recover("owner"), Err("recovery_required"));
-    let stale_status = serde_json::json!({"ok":true,"epoch":"f".repeat(32),"owner_epoch":"owner","drain_required":false});
+    let stale_status = serde_json::json!({"ok":true,"epoch":"f".repeat(32),"owner_epoch":"owner","drain_required":false,"startup_recovery_required":false});
     assert!(lease.observe_status(&stale_status).is_err());
     assert!(lease.observe_status(&valid_status).is_err());
     let before = host.provider.sent_control.len();
@@ -701,8 +743,7 @@ fn source_feedback_lease_handles_sustained_traffic_busy_and_revocation() {
     let mut aggregate = lease
         .retire(&receipt)
         .unwrap_or_else(|_| panic!("retirement"));
-    authority.lose_completion_reply(&aggregate);
-    authority.complete(&mut aggregate);
+    authority.complete_stream(&mut aggregate);
     authority.drain();
 }
 
@@ -712,19 +753,15 @@ fn source_feedback_lease_holds_authority_during_blocked_native_enqueue() {
     use amaterasu_module_sdk::transport::control_retirement::Receipt;
     use std::sync::mpsc;
     use std::time::Duration;
-    let (mut authority, aggregate) = effect_authority_test::Fixture::admitted();
+    let (mut authority, aggregate) =
+        effect_authority_test::Fixture::stream_admitted(source_feedback_scope(50, &"c".repeat(32)));
     let retirement = TransportRetirement {
         stream: 50,
         operation_id: "retire".into(),
         provider_epoch: "c".repeat(32),
     };
-    let mut lease = FeedbackLease::new(
-        aggregate,
-        retirement,
-        7,
-        [feedback_scope(&scoped_rumble(7)).1].into(),
-    )
-    .unwrap_or_else(|_| panic!("lease"));
+    let mut lease = FeedbackLease::new(aggregate, retirement, 7, source_feedback_capabilities())
+        .unwrap_or_else(|_| panic!("lease"));
     let (entered_tx, entered_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -758,6 +795,6 @@ fn source_feedback_lease_holds_authority_during_blocked_native_enqueue() {
     let mut aggregate = lease
         .retire(&receipt)
         .unwrap_or_else(|_| panic!("retirement"));
-    authority.complete(&mut aggregate);
+    authority.complete_stream(&mut aggregate);
     authority.drain();
 }

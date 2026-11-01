@@ -1,3 +1,5 @@
+> Historical proposal: superseded by pairing commit `43b59432d06129046e5dcdf0f6cf5b50f3d9544e`. Its implemented `StreamScope` uses capability identity strings and does not include a controller slot. See `pairing-effect-authority.md` and `input-effect-boundary-checkpoint.md` for the current contract and remaining integration work.
+
 # Pairing authority request for scoped feedback leases
 
 This is a proposed shared contract for the pairing owner, not an implemented

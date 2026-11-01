@@ -3,7 +3,10 @@
 #[path = "../../../pairing/src/effect_gate.rs"]
 mod pairing_gate;
 
-use amaterasu_module_sdk::effect_authority::{Request, Source, consumer::EffectTicket};
+use amaterasu_module_sdk::effect_authority::{
+    Request, Source, StreamScope,
+    consumer::{EffectTicket, StreamLeaseTicket},
+};
 use serde_json::json;
 
 pub struct Fixture {
@@ -60,16 +63,91 @@ impl Fixture {
             effect,
         )
     }
-    pub fn lose_completion_reply(&mut self, effect: &EffectTicket) {
-        let Request::Complete {
+    pub fn stream_admitted(scope: StreamScope) -> (Self, StreamLeaseTicket) {
+        let mut gate = pairing_gate::EffectGate::new().unwrap();
+        gate.recover("owner").unwrap();
+        let epoch = gate.epoch().to_owned();
+        let source = Source {
+            version: 1,
+            id: "a".repeat(32),
+            generation: 2,
+            host_epoch: "host".into(),
+            session_id: "session".into(),
+            stream_id: "stream".into(),
+            stream_generation: 2,
+            device: "device".into(),
+            device_generation: 3,
+            effect_owner_epoch: "owner".into(),
+        };
+        gate.bind_scoped(source.clone(), Some(scope.clone()))
+            .unwrap();
+        let mut lease =
+            StreamLeaseTicket::new(epoch.clone(), source.clone(), "operation".into(), 1, scope)
+                .unwrap();
+        let Request::AdmitStreamLease {
+            epoch: requested_epoch,
+            source: requested_source,
+            operation_id,
+            sequence,
+            scope,
+        } = lease.admit_request().unwrap()
+        else {
+            panic!("expected stream admission")
+        };
+        gate.require_epoch(&requested_epoch).unwrap();
+        let ticket = gate
+            .admit_stream_lease(&requested_source, &operation_id, sequence, scope)
+            .unwrap()
+            .to_owned();
+        lease.accept_admission(&json!({"ok":true,"epoch":epoch,"operation_id":operation_id,"ticket":ticket,"kind":"stream_lease"})).unwrap();
+        (
+            Self {
+                gate,
+                epoch,
+                source,
+            },
+            lease,
+        )
+    }
+    pub fn complete_stream(&mut self, effect: &mut StreamLeaseTicket) {
+        let Request::CompleteStreamLease {
             epoch,
             operation_id,
             ticket,
+            retirement,
         } = effect.completion_request().unwrap()
         else {
-            panic!("expected completion")
+            panic!("expected stream completion")
         };
-        self.gate.complete(&epoch, &operation_id, &ticket).unwrap();
+        assert_eq!(
+            self.gate
+                .complete_stream_lease("stale", &operation_id, &ticket, &retirement),
+            Err("stale_epoch")
+        );
+        self.gate
+            .complete_stream_lease(&epoch, &operation_id, &ticket, &retirement)
+            .unwrap();
+        // Completion is idempotent after an uncertain reply.
+        self.gate
+            .complete_stream_lease(&epoch, &operation_id, &ticket, &retirement)
+            .unwrap();
+        effect
+            .confirm_completion(&json!({"ok":true,"epoch":epoch,"operation_id":operation_id}))
+            .unwrap();
+        let Request::Acknowledge {
+            epoch,
+            operation_id,
+            ticket,
+        } = effect.acknowledgment_request().unwrap()
+        else {
+            panic!("expected acknowledgment")
+        };
+        self.gate
+            .acknowledge(&epoch, &operation_id, &ticket)
+            .unwrap();
+        effect
+            .confirm_acknowledgment(&json!({"ok":true,"epoch":epoch,"operation_id":operation_id}))
+            .unwrap();
     }
     pub fn fence(&mut self) {
         self.gate.fence();
@@ -161,5 +239,76 @@ fn lost_admission_reconciles_after_fence_without_starting_effect() {
             .is_err()
     );
     authority.complete(&mut recovered);
+    authority.drain();
+}
+
+#[test]
+fn lost_scoped_admission_after_fence_is_retirement_only() {
+    use amaterasu_module_sdk::effect_authority::consumer::{
+        FeedbackLease, TransportRetirement, feedback_capability_identity,
+    };
+    use amaterasu_module_sdk::input::extensions::{Capability, Direction};
+    use amaterasu_module_sdk::transport::control_retirement::Receipt;
+    let capability = Capability {
+        schema: "org.amaterasu.feedback.rumble".into(),
+        version: 1,
+        direction: Direction::ToClient,
+    };
+    let scope = StreamScope {
+        capabilities: [feedback_capability_identity(&capability).unwrap()].into(),
+        transport_service: "amaterasu.control-transport/1".into(),
+        transport_stream: 7,
+        transport_epoch: "c".repeat(32),
+    };
+    let (mut authority, ticket) = Fixture::stream_admitted(scope.clone());
+    drop(ticket);
+    let mut recovered = StreamLeaseTicket::new(
+        authority.epoch.clone(),
+        authority.source.clone(),
+        "operation".into(),
+        1,
+        scope.clone(),
+    )
+    .unwrap();
+    assert!(matches!(
+        recovered.lookup_request().unwrap(),
+        Request::LookupStreamLease { .. }
+    ));
+    authority.fence();
+    let (secret, fenced) = authority
+        .gate
+        .lookup_stream_lease(&authority.source, "operation", &scope)
+        .unwrap();
+    let mut response = json!({"ok":true,"epoch":authority.epoch,"operation_id":"operation","ticket":secret,"kind":"stream_lease","fenced":fenced,"source":authority.source,"scope":scope});
+    response["scope"]["transport_stream"] = json!(8);
+    assert!(recovered.accept_lookup(&response).is_err());
+    response["scope"]["transport_stream"] = json!(7);
+    recovered.accept_lookup(&response).unwrap();
+    let retirement = TransportRetirement {
+        stream: 7,
+        operation_id: "retire".into(),
+        provider_epoch: "c".repeat(32),
+    };
+    let mut lease = FeedbackLease::new(recovered, retirement, 7, [capability.clone()].into())
+        .unwrap_or_else(|_| panic!("lease"));
+    assert!(
+        lease
+            .enqueue(&capability, 1, "effect", b"data", || -> Result<bool, ()> {
+                panic!("fenced")
+            })
+            .is_err()
+    );
+    let receipt = Receipt {
+        ok: true,
+        state: "retired".into(),
+        scope: "whole_control_stream".into(),
+        stream: 7,
+        operation_id: "retire".into(),
+        provider_epoch: "c".repeat(32),
+    };
+    let mut recovered = lease
+        .retire(&receipt)
+        .unwrap_or_else(|_| panic!("retirement"));
+    authority.complete_stream(&mut recovered);
     authority.drain();
 }

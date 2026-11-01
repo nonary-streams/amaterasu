@@ -522,7 +522,10 @@ mod effect_authority_test;
 #[test]
 fn aggregate_feedback_lease_drains_against_actual_control_retirement_receipt() {
     use amaterasu_media::{CONTROL_RELIABLE, ControlMessage, MEDIA_CLOSED};
-    use amaterasu_module_sdk::effect_authority::consumer::{FeedbackLease, TransportRetirement};
+    use amaterasu_module_sdk::effect_authority::{
+        StreamScope,
+        consumer::{FeedbackLease, TransportRetirement, feedback_capability_identity},
+    };
     use amaterasu_module_sdk::input::extensions::{Capability, Direction};
     use amaterasu_module_sdk::transport::control_retirement::Receipt;
     use std::io;
@@ -535,12 +538,18 @@ fn aggregate_feedback_lease_drains_against_actual_control_retirement_receipt() {
         .as_str()
         .unwrap()
         .to_owned();
-    let (mut authority, aggregate) = effect_authority_test::Fixture::admitted();
     let capability = Capability {
         schema: "org.amaterasu.feedback.rumble".into(),
         version: 1,
         direction: Direction::ToClient,
     };
+    let scope = StreamScope {
+        capabilities: [feedback_capability_identity(&capability).unwrap()].into(),
+        transport_service: "amaterasu.control-transport/1".into(),
+        transport_stream: stream,
+        transport_epoch: provider_epoch.clone(),
+    };
+    let (mut authority, aggregate) = effect_authority_test::Fixture::stream_admitted(scope);
     let mut lease = FeedbackLease::new(
         aggregate,
         TransportRetirement {
@@ -581,7 +590,7 @@ fn aggregate_feedback_lease_drains_against_actual_control_retirement_receipt() {
     let mut aggregate = lease
         .retire(&receipt)
         .unwrap_or_else(|_| panic!("retirement"));
-    authority.complete(&mut aggregate);
+    authority.complete_stream(&mut aggregate);
     authority.drain();
     let message = ControlMessage {
         message_type: 1,
