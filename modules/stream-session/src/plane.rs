@@ -1,6 +1,7 @@
 //! Bounded, synchronous native media forwarding. Provider resources belong to the
 //! pipeline; this plane owns only bindings and bounded copied pending output.
 mod native;
+mod ordered_clock;
 mod packets;
 // The authenticated source route is intentionally not installed yet.
 #[allow(dead_code)]
@@ -364,6 +365,7 @@ struct Pump<B> {
     pending_audio: Option<AudioPacket>,
     ordered_audio: bool,
     pending_ordered_pcm: Option<OrderedPcmPacket>,
+    ordered_clock: Option<ordered_clock::OrderedClock>,
     pending_ordered_audio: Option<OrderedAudioPacket>,
     pending_feedback: VecDeque<HostFeedbackMessage>,
     pending_feedback_bytes: usize,
@@ -396,6 +398,7 @@ impl<B: Backend> Pump<B> {
             pending_audio: None,
             ordered_audio: false,
             pending_ordered_pcm: None,
+            ordered_clock: None,
             pending_ordered_audio: None,
             pending_feedback: VecDeque::new(),
             pending_feedback_bytes: 0,
@@ -798,9 +801,12 @@ impl<B: Backend> Pump<B> {
             if packet.header().frame.channels != self.audio_channels {
                 return Err("unsupported_audio_channels");
             }
-            if !self.backend.submit_ordered_pcm(&packet.header())? {
+            let (frame, next_clock) =
+                ordered_clock::OrderedClock::prepare(self.ordered_clock, packet.header())?;
+            if !self.backend.submit_ordered_pcm(&frame)? {
                 return Ok(());
             }
+            self.ordered_clock = Some(next_clock);
             self.pending_ordered_pcm = None;
         }
         if self.stopping && !self.encoder_draining {

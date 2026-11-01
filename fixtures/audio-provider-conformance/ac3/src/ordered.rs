@@ -7,6 +7,11 @@ use std::{ffi::c_void, mem::size_of};
 struct Provider {
     api: OrderedAudioEncoderApiV2,
     channels: u32,
+    generation: u64,
+    fixed_bytes: u32,
+    busy_once: bool,
+    busy_count: u32,
+    pending_discontinuity: bool,
     input: Option<AudioInputSelectionV2>,
     pending_timestamp: Option<u64>,
     buffered_frames: u32,
@@ -38,7 +43,8 @@ unsafe extern "C" fn enumerate(
     if context.is_null() || stream != 19 || generation.is_null() {
         return MEDIA_UNSUPPORTED;
     }
-    let channels = unsafe { (*context.cast::<Provider>()).channels };
+    let provider = unsafe { &*context.cast::<Provider>() };
+    let channels = provider.channels;
     let offer = AudioFormatOfferV2 {
         id: 11,
         format: AudioFormatDescriptorV2 {
@@ -58,12 +64,12 @@ unsafe extern "C" fn enumerate(
                 config: BorrowedBytes::new(&[]),
             },
             layout: layout(channels),
-            fixed_packet_bytes: 4,
+            fixed_packet_bytes: provider.fixed_bytes,
             reserved: 0,
         },
     };
     unsafe {
-        *generation = 101;
+        *generation = provider.generation;
         (sink.write)(sink.context, &offer)
     }
 }
@@ -74,7 +80,10 @@ unsafe extern "C" fn configure(
     id: u64,
     input: *const AudioInputSelectionV2,
 ) -> Status {
-    if context.is_null() || input.is_null() || (stream, generation, id) != (19, 101, 11) {
+    if context.is_null()
+        || input.is_null()
+        || (stream, generation, id) != (19, unsafe { (*context.cast::<Provider>()).generation }, 11)
+    {
         return MEDIA_UNSUPPORTED;
     }
     let input = unsafe { *input };
@@ -94,6 +103,11 @@ unsafe extern "C" fn submit(
         return STATUS_INVALID_ARGUMENT;
     }
     let provider = unsafe { &mut *context.cast::<Provider>() };
+    if provider.busy_once {
+        provider.busy_once = false;
+        provider.busy_count += 1;
+        return MEDIA_BUSY;
+    }
     let frame = unsafe { &*frame };
     if provider
         .input
@@ -105,6 +119,12 @@ unsafe extern "C" fn submit(
     }
     if provider.pending_timestamp.is_some() {
         return MEDIA_BUSY;
+    }
+    if frame.frame.flags & AUDIO_DISCONTINUITY != 0 {
+        if provider.buffered_frames != 0 {
+            return MEDIA_UNSUPPORTED;
+        }
+        provider.pending_discontinuity = true;
     }
     let start = provider
         .buffered_timestamp
@@ -139,7 +159,16 @@ unsafe extern "C" fn receive(
     }
     let provider = unsafe { &mut *context.cast::<Provider>() };
     let (flags, frames, timestamp, bytes): (_, _, _, &[u8]) = match provider.pending_timestamp {
-        Some(timestamp) => (0, 1536, timestamp, &[0xa1, 0x11, 0x33, 0x44]),
+        Some(timestamp) => (
+            if provider.pending_discontinuity {
+                AUDIO_PACKET_DISCONTINUITY
+            } else {
+                0
+            },
+            1536,
+            timestamp,
+            &[0xa1, 0x11, 0x33, 0x44],
+        ),
         None if provider.draining && provider.buffered_frames != 0 => {
             provider.pending_timestamp = provider.buffered_timestamp.take();
             provider.buffered_frames = 0;
@@ -155,7 +184,7 @@ unsafe extern "C" fn receive(
     };
     let packet = NegotiatedAudioPacket {
         stream,
-        generation: 101,
+        generation: provider.generation,
         offer_id: 11,
         flags,
         frames,
@@ -169,6 +198,7 @@ unsafe extern "C" fn receive(
             provider.ended = true;
         } else {
             provider.pending_timestamp = None;
+            provider.pending_discontinuity = false;
             provider.sequence += 1;
         }
     }
@@ -210,6 +240,11 @@ pub extern "C" fn fixture_create_v2_channels(channels: u32) -> *mut OrderedAudio
             drain,
         },
         channels,
+        generation: 101,
+        fixed_bytes: 4,
+        busy_once: false,
+        busy_count: 0,
+        pending_discontinuity: false,
         input: None,
         pending_timestamp: None,
         buffered_frames: 0,
@@ -228,4 +263,32 @@ pub unsafe extern "C" fn fixture_destroy_v2(pointer: *mut OrderedAudioEncoderApi
     if !pointer.is_null() {
         drop(unsafe { Box::from_raw(pointer.cast::<Provider>()) });
     }
+}
+
+/// # Safety
+/// The fixture table must be exclusively owned and not bound during mutation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fixture_set_offer_v2(
+    pointer: *mut OrderedAudioEncoderApiV2,
+    generation: u64,
+    fixed_bytes: u32,
+) {
+    let provider = unsafe { &mut *pointer.cast::<Provider>() };
+    provider.generation = generation;
+    provider.fixed_bytes = fixed_bytes;
+}
+
+/// # Safety
+/// The fixture table is live and no native calls are in progress.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fixture_busy_once_v2(pointer: *mut OrderedAudioEncoderApiV2) {
+    unsafe {
+        (*pointer.cast::<Provider>()).busy_once = true;
+    }
+}
+/// # Safety
+/// The fixture table is live and no native calls are in progress.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fixture_busy_count_v2(pointer: *mut OrderedAudioEncoderApiV2) -> u32 {
+    unsafe { (*pointer.cast::<Provider>()).busy_count }
 }

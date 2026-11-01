@@ -4,6 +4,7 @@ pub(crate) mod harness;
 mod history;
 mod input;
 mod limiter;
+mod managed_audio;
 mod providers;
 mod restart;
 mod virtual_display;

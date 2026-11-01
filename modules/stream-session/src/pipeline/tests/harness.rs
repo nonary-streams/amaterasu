@@ -46,6 +46,7 @@ pub struct Broker {
     allocations: BTreeMap<(String, String), Allocation>,
     cancelled: BTreeSet<u64>,
     next: u64,
+    pub forced_stream_ids: BTreeMap<String, u64>,
     pub replies: BTreeMap<u64, Value>,
     pub calls: Vec<Call>,
     pub timeline: Rc<RefCell<Vec<&'static str>>>,
@@ -629,7 +630,11 @@ impl Broker {
                 self.allocations.insert(
                     (service.into(), key.clone()),
                     Allocation {
-                        id: self.next,
+                        id: self
+                            .forced_stream_ids
+                            .get(service)
+                            .copied()
+                            .unwrap_or(self.next),
                         key: key.clone(),
                         state: if service == "amaterasu.media-transport/1" {
                             "sending".into()
