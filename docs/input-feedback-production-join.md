@@ -157,7 +157,11 @@ only after the registered sources and transport workers settle. A detected
 source-specific fence retires its affected whole control transport.
 
 The source admission, scoped feedback route and authority watch are enabled only
-under unit-test qualification. The following evidence does not open the gate:
+under unit-test qualification. The protocol source-join service is chosen by the
+trusted `feedback_source_protocol_service` startup setting; an unchanged consumer
+was tested through the real broker with a replacement service implementing that
+contract. Its test reply is simulated and does not establish a client protocol
+implementation. The following evidence does not open the gate:
 
 * A real broker, the actual pairing ledger and the selected control provider were
   tested together with two source records, an uncertain admission, a lost reply,

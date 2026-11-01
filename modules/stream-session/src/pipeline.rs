@@ -382,9 +382,14 @@ impl Pipeline {
         self.feedback_retirement_inbox.prune_unstarted(send);
         self.feedback_retirement_inbox.advance(
             &mut self.records,
-            cfg!(test)
+            if cfg!(test)
                 && self.settings.observe_feedback_sources
-                && self.settings.feedback_retirement_input_principal.is_some(),
+                && self.settings.feedback_retirement_input_principal.is_some()
+            {
+                self.settings.feedback_source_protocol_service.as_deref()
+            } else {
+                None
+            },
             send,
         );
         if self.job.is_some() && self.settings.feedback_retirement_input_principal.is_some() {

@@ -138,6 +138,7 @@ enum Phase {
 pub(super) struct Admission {
     candidate: Candidate,
     sequence: u64,
+    protocol_service: String,
     phase: Phase,
     call: Option<Call>,
     join: Option<BindFeedbackSource>,
@@ -149,6 +150,7 @@ impl Admission {
         registry: &Registry,
         sequence: u64,
         retired: &[Binding],
+        protocol_service: &str,
     ) -> Option<Self> {
         if sequence == 0 {
             return None;
@@ -156,6 +158,7 @@ impl Admission {
         Some(Self {
             candidate: Candidate::find(records, registry, retired)?,
             sequence,
+            protocol_service: protocol_service.into(),
             phase: Phase::Status,
             call: None,
             join: None,
@@ -196,7 +199,7 @@ impl Admission {
                         return false;
                     };
                     Call::new(
-                        amaterasu_module_sdk::nvhttp_source::SERVICE,
+                        &self.protocol_service,
                         join.payload(),
                         format!("{}-bind", join.retirement_operation_id()),
                     )
@@ -284,5 +287,129 @@ impl Admission {
             }
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::tests::harness::{Harness, prepare, start};
+    use amaterasu_contracts::{Command, Grants, Response, RuntimeConfig};
+    use amaterasu_runtime::Broker;
+
+    #[test]
+    fn unchanged_consumer_uses_startup_selected_replacement_protocol_through_real_broker() {
+        let mut host = Harness::new();
+        let id = host.response(1, prepare())["session"].as_u64().unwrap();
+        assert_eq!(host.response(2, start(id))["state"], "active");
+        let target = LifecycleTarget::Stream {
+            host_epoch: "host".into(),
+            session_id: "session".into(),
+            stream_id: "stream".into(),
+            generation: 2,
+        };
+        {
+            let record = host.pipeline.records.get_mut(&id).unwrap();
+            record.start.as_mut().unwrap().lifecycle_target = Some(target);
+            record.lifecycle_input_token = Some("binding".into());
+            record.client_haptics_requested = true;
+            record.input_controller_supported = true;
+            record.retain_control_retirement_epoch(&json!({"retirement_epoch":"c".repeat(32)}));
+            record.feedback_source_observations.insert(3,json!({"source":{"version":1,"id":"a".repeat(32),"generation":2},"input_boot_epoch":"b".repeat(32),"device":{"slot":3,"generation":1,"capabilities":0},"scope_capabilities":[{"schema":"org.amaterasu.feedback.rumble","version":1,"direction":"to_client"}]}));
+        }
+        let mut registry = Registry::default();
+        let mut admission = Admission::find(
+            &host.pipeline.records,
+            &registry,
+            1,
+            &[],
+            "vendor.protocol/1",
+        )
+        .unwrap();
+        let mut config = RuntimeConfig::default();
+        config.principals.insert(
+            "effect".into(),
+            Grants {
+                call: [effect_authority::SERVICE.into(), "vendor.protocol/1".into()].into(),
+                ..Default::default()
+            },
+        );
+        config.principals.insert(
+            "pairing".into(),
+            Grants {
+                provide: [effect_authority::SERVICE.into()].into(),
+                ..Default::default()
+            },
+        );
+        config.principals.insert(
+            "vendor".into(),
+            Grants {
+                provide: ["vendor.protocol/1".into()].into(),
+                ..Default::default()
+            },
+        );
+        let mut broker = Broker::new(config).unwrap();
+        for (principal, service) in [
+            ("pairing", effect_authority::SERVICE),
+            ("vendor", "vendor.protocol/1"),
+        ] {
+            assert!(matches!(
+                broker.dispatch(
+                    principal,
+                    Command::Register {
+                        service: service.into()
+                    }
+                ),
+                Response::Ok
+            ));
+        }
+        let mut observed_vendor = false;
+        let mut admitted = false;
+        for _ in 0..100 {
+            if admission.advance(&host.pipeline.records, &mut registry, &mut |cmd| {
+                Ok(broker.dispatch("effect", cmd))
+            }) {
+                admitted = true;
+                break;
+            }
+            for provider in ["pairing", "vendor"] {
+                let Response::Request {
+                    id,
+                    caller,
+                    initiator,
+                    payload,
+                    ..
+                } = broker.dispatch(provider, Command::Poll {})
+                else {
+                    continue;
+                };
+                assert_eq!(caller, "effect");
+                assert_eq!(initiator, "effect");
+                let result = match payload["action"].as_str().unwrap() {
+                    "status" => {
+                        json!({"ok":true,"epoch":"e".repeat(32),"owner_epoch":"owner","fenced":false,"drain_required":false,"startup_recovery_required":false})
+                    }
+                    "bind_feedback_source" => {
+                        observed_vendor = provider == "vendor";
+                        json!({"ok":true,"epoch":payload["authority_epoch"],"source":payload["source"],"scope":payload["scope"]})
+                    }
+                    "admit_stream_lease" => {
+                        json!({"ok":true,"epoch":payload["epoch"],"operation_id":payload["operation_id"],"ticket":"f".repeat(32),"kind":"stream_lease","source":payload["source"],"scope":payload["scope"]})
+                    }
+                    other => panic!("unexpected action {other}"),
+                };
+                assert!(matches!(
+                    broker.dispatch(
+                        provider,
+                        Command::Complete {
+                            request: id,
+                            payload: result
+                        }
+                    ),
+                    Response::Ok
+                ));
+            }
+        }
+        assert!(observed_vendor && admitted);
     }
 }
