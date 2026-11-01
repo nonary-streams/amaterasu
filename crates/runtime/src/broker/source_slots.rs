@@ -47,6 +47,10 @@ impl SourceSlots {
         &self.epoch
     }
 
+    pub fn retired_incarnation(&self, slot: u8) -> Option<u64> {
+        self.slots.get(usize::from(slot)).map(|slot| slot.retired)
+    }
+
     /// The selected authority verifies durable state and prior worker retirement.
     /// A request from a previous broker epoch cannot initialize this broker.
     pub fn recover(&mut self, epoch: &str, retired: Vec<u64>) -> Response {

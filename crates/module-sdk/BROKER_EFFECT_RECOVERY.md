@@ -113,8 +113,13 @@ continues to read the legacy v1 slot arrays during recovery. After restart,
 `HostRecoverHistorical` requires a retained host-namespace State Get containing
 the exact old receipt in addition to the pairing-journal read. The host must
 preserve unresolved records until its lifecycle and pairing cleanup complete.
-Removal after confirmed pairing cleanup and slot close is not yet wired; State
-capacity exhaustion remains fail-closed and the host must not evict by age.
+`AuthorizeHostReceiptCleanup` permits the host to delete one exact v2 receipt
+only after fresh selected-State reads show both that receipt and the authority's
+retired slot floor, and the broker has closed the same slot incarnation. The
+result permits one revision-checked deletion; it is not a cleanup receipt for an
+external effect. The pairing/host coordination that invokes this command is not
+yet wired. State capacity exhaustion remains fail-closed and the host must not
+evict by age.
 
 On shutdown, the host first fences a protected provider and polls its optional
 `amaterasu_module_retirement_v1` capability. Only an explicit successful result
