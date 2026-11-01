@@ -185,6 +185,7 @@ fn real_selected_composition() {
         (true, "limiter_unsupported"),
         (true, "limiter_no_retirement"),
         (true, "retirement_cancel"),
+        (true, "retirement_restart"),
         (false, "limiter_success"),
         (true, "limiter_success"),
         (true, "limiter_mismatch"),
@@ -456,12 +457,18 @@ fn run_composition(replacement: bool, scenario: &str) {
     };
     router.set_global_display_policy(1, display_policy);
     if scenario.starts_with("limiter_")
-        || matches!(scenario, "resume_limiter" | "retirement_cancel")
+        || matches!(
+            scenario,
+            "resume_limiter" | "retirement_cancel" | "retirement_restart"
+        )
     {
         router.set_global_frame_limiter_settings(&crate::frame_limiter::FrameLimiterSettings {
             frame_limiter_enable: Some(true),
             ..Default::default()
         });
+    }
+    if scenario == "retirement_restart" {
+        router.launches.pause_selected_after_accept_for_test();
     }
     let nvhttp = runtime.client("amaterasu.nvhttp");
     let target =
@@ -507,6 +514,19 @@ fn run_composition(replacement: bool, scenario: &str) {
             router.cancel(1, &nvhttp);
             cancelled = true;
         }
+        if scenario == "retirement_restart"
+            && !cancelled
+            && router.launches.selected_preflight_state_for_test() == Some((true, true))
+        {
+            // Restart only Launch. The executor and its reservation stay live.
+            drop(launch);
+            launch = LoadedModule::start(
+                &artifact(&artifacts, "amaterasu_launch"),
+                &runtime.endpoint("amaterasu.launch"),
+            );
+            router.cancel(1, &nvhttp);
+            cancelled = true;
+        }
         if scenario == "cancelled"
             && !cancelled
             && backends.calls.iter().any(|(service, payload)| {
@@ -516,7 +536,13 @@ fn run_composition(replacement: bool, scenario: &str) {
             router.cancel(1, &nvhttp);
             cancelled = true;
         }
-        if scenario == "cancelled" || scenario == "retirement_cancel" {
+        if scenario == "retirement_restart" {
+            if router.launches.selected_preflight_cleanup_for_test()
+                == Some("preflight_retirement_unconfirmed")
+            {
+                break;
+            }
+        } else if scenario == "cancelled" || scenario == "retirement_cancel" {
             if backends.calls.iter().any(|(service, payload)| {
                 service == "stream" && payload["action"] == "release_history_activity"
             }) {
@@ -531,6 +557,24 @@ fn run_composition(replacement: bool, scenario: &str) {
         .iter()
         .any(|(service, payload)| service == "stream" && payload["action"] == "prepare");
     match scenario {
+        "retirement_restart" => {
+            assert!(cancelled);
+            assert_eq!(
+                router.launches.selected_preflight_state_for_test(),
+                Some((true, true))
+            );
+            assert_eq!(
+                router.launches.selected_preflight_cleanup_for_test(),
+                Some("preflight_retirement_unconfirmed")
+            );
+            assert!(
+                !backends
+                    .calls
+                    .iter()
+                    .any(|(service, payload)| service == "stream"
+                        && payload["action"] == "release_history_activity")
+            );
+        }
         "success"
         | "limiter_success"
         | "limiter_stale_recheck"
@@ -911,8 +955,34 @@ fn run_composition(replacement: bool, scenario: &str) {
                         json!({"action":"accept_streaming","operation_id":operation,"application":application,"entry_revision":"entry:opaque","certificate_id":cert_id,"preflight_token":pre["preflight_token"],"policy_identity":pre["policy_identity"],"frame_limiter_settings":snapshot,"client_frame_limiter_overrides":{}}),
                         &format!("retire-accept-{index}"),
                     );
-                    let accepted =
-                        await_launch(&nvhttp, accept, &mut launch, &mut generated, &mut provider);
+                    // Hold the admission response at the broker while a lifecycle
+                    // observer asks whether the now-reserved operation is retired.
+                    for _ in 0..100 {
+                        launch.tick();
+                        if let Some(module) = &mut generated {
+                            module.tick();
+                        }
+                        if let Some(module) = &mut provider {
+                            module.tick();
+                        }
+                    }
+                    let observer = runtime.client("amaterasu.session-lifecycle");
+                    let verify = json!({"action":"verify_retirement","owner":"amaterasu.nvhttp","launch_id":null,"operation_id":operation});
+                    let request = broker_request(
+                        &observer,
+                        "amaterasu.launch/1",
+                        verify.clone(),
+                        &format!("verify-reserved-{index}"),
+                    );
+                    let result = await_launch(
+                        &observer,
+                        request,
+                        &mut launch,
+                        &mut generated,
+                        &mut provider,
+                    );
+                    assert_eq!(result["code"], "retirement_unconfirmed", "{result}");
+                    let accepted = take(&nvhttp, accept).expect("delayed admission response");
                     assert_eq!(accepted["accepted"], true, "{accepted}");
                     let cancel = json!({"action":"cancel_streaming","operation_id":operation,"certificate_id":cert_id,"preflight_token":pre["preflight_token"],"policy_identity":pre["policy_identity"]});
                     for duplicate in 0..2 {
@@ -931,6 +1001,20 @@ fn run_composition(replacement: bool, scenario: &str) {
                         );
                         assert_eq!(result["cancelled"], true, "{result}");
                     }
+                    let request = broker_request(
+                        &observer,
+                        "amaterasu.launch/1",
+                        verify,
+                        &format!("verify-retired-{index}"),
+                    );
+                    let result = await_launch(
+                        &observer,
+                        request,
+                        &mut launch,
+                        &mut generated,
+                        &mut provider,
+                    );
+                    assert_eq!(result["retired"], true, "{result}");
                     let replay = broker_request(
                         &nvhttp,
                         "amaterasu.launch/3",

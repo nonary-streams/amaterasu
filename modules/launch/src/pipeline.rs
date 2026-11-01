@@ -590,6 +590,7 @@ impl Pipeline {
             || !record.state.terminal()
             || record.cleanup_error.is_some()
             || record.outstanding_request.is_some()
+            || record.limiter_reservation_pending
         {
             return error("retirement_unconfirmed");
         }

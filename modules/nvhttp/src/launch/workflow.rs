@@ -75,6 +75,16 @@ pub struct Job {
 
 impl Controller {
     pub(super) fn schedule(&mut self, now: Instant) {
+        #[cfg(test)]
+        if self.pause_selected_after_accept
+            && self.records.values().any(|record| {
+                record.state == State::Starting
+                    && record.selected_preflight_pending
+                    && record.executable_path.is_some()
+            })
+        {
+            return;
+        }
         let Some(id) = self
             .records
             .values()
@@ -1105,10 +1115,9 @@ impl Controller {
                 }
             }
             Phase::CancelPreflight => {
-                if (payload["ok"] == true
+                if payload["ok"] == true
                     && payload["cancelled"] == true
-                    && payload["operation_id"] == record.application_operation)
-                    || payload["code"] == "preflight_not_found"
+                    && payload["operation_id"] == record.application_operation
                 {
                     record.selected_preflight_pending = false;
                 } else if payload["code"] == "workflow_busy" && now < record.deadline {

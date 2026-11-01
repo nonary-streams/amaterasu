@@ -268,6 +268,10 @@ retirement fence even if reservation completion is uncertain. A provider keeps
 bounded replay fences for its incarnation and rejects new work if full; a late
 reserve cannot recreate a retired reservation. Cancelling an admitted preflight
 uses the same cleanup path before NVHTTP releases its history reservation.
+An unknown preflight after a Launch restart is not a retirement proof: NVHTTP
+retains its cleanup obligation until the provider fence can be confirmed. The
+in-memory Launch record cannot currently reconstruct that fence after restart,
+so such cleanup remains failed and requires a recovery mechanism.
 
 A Linux composition test exercises the real NVHTTP router, Launch, RTSP, pairing
 and lifecycle entrypoints with independently built library, policy and executor
