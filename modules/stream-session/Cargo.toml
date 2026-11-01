@@ -23,7 +23,6 @@ sha2.workspace = true
 workspace = true
 
 [dev-dependencies]
-libloading = "0.8"
 amaterasu-rtsp = { path = "../rtsp", features = ["test-support"] }
 amaterasu-runtime = { path = "../../crates/runtime" }
 amaterasu-media-transport = { path = "../media-transport", features = ["test-support"] }

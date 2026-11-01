@@ -282,4 +282,20 @@ fn plan_contract_versions_require_distinct_valid_service_names() {
     )
     .unwrap();
     assert!(settings.validate().is_ok());
+    for duplicate in ["test.plan/1", "test.plan-v2/1"] {
+        let settings: Settings = serde_json::from_value(json!({
+            "plan_service":"test.plan/1",
+            "plan_service_v2":"test.plan-v2/1",
+            "ordered_audio_service":duplicate,
+        }))
+        .unwrap();
+        assert!(settings.validate().is_err());
+    }
+    let settings: Settings = serde_json::from_value(json!({
+        "plan_service":"test.plan/1",
+        "plan_service_v2":"test.plan-v2/1",
+        "ordered_audio_service":"test.audio/1",
+    }))
+    .unwrap();
+    assert!(settings.validate().is_ok());
 }
