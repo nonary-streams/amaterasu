@@ -29,6 +29,7 @@ pub(super) fn matches(
     identity: &GuardedEffectIdentity,
     incarnation: &ProviderIncarnation,
     expected_entry: &Value,
+    current_lease: &SourceSlotLease,
 ) -> bool {
     let Some(slot) = identity.scope.source.slot() else {
         return false;
@@ -75,6 +76,7 @@ pub(super) fn matches(
             .is_none_or(|value| !value.is_null())
         || serde_json::to_vec(journal).map_or(true, |bytes| bytes.len() > 12_000)
         || !incarnation_valid(incarnation)
+        || &lease != current_lease
         || lease.slot != slot
         || slot_retired.checked_add(1) != Some(lease.incarnation)
         || !token(&lease.broker_epoch)
