@@ -85,6 +85,38 @@ fn inject_provider_incarnations<'a>(
     Ok(())
 }
 
+fn inject_durable_state_provider(
+    runtime_config: &mut amaterasu_contracts::RuntimeConfig,
+    components: &[amaterasu_package::ComponentManifest],
+) {
+    const SERVICE: &str = "amaterasu.state/1";
+    const CAPABILITY: &str = "amaterasu.state.durable-cas/1";
+    let selected = runtime_config
+        .service_selections
+        .broker
+        .get(SERVICE)
+        .and_then(Option::as_ref);
+    runtime_config.host_context.durable_cas_provider = selected.and_then(|selection| {
+        if selection.contract != SERVICE {
+            return None;
+        }
+        components
+            .iter()
+            .find(|component| !component.runtime && component.id == selection.provider)
+            .filter(|component| {
+                component.service_provides.iter().any(|offer| {
+                    offer.transport == amaterasu_package::ServiceTransport::Raw
+                        && offer.service == SERVICE
+                        && offer.contract == SERVICE
+                        && offer.method.is_none()
+                        && offer.major == 1
+                        && offer.capabilities.contains(CAPABILITY)
+                })
+            })
+            .map(|component| component.id.clone())
+    });
+}
+
 pub struct LoadedComponents {
     // Fields drop in declaration order: modules must stop before their runtime disappears.
     modules: Vec<FeatureLibrary>,
@@ -150,6 +182,7 @@ impl LoadedComponents {
                 .filter(|component| !component.runtime)
                 .map(|component| component.id.as_str()),
         )?;
+        inject_durable_state_provider(&mut runtime_config, &package.manifest.components);
         #[cfg(target_os = "linux")]
         crate::capture_authority::inject(package, &mut runtime_config.settings)?;
         if package
@@ -697,11 +730,42 @@ fn require_success(status: Status, operation: &str) -> PackageResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        inject_host_configuration_root, inject_package_root, inject_provider_incarnations,
-        inject_running_package_digest, inject_steam_artwork_cache_parent, path_to_unicode_string,
+        inject_durable_state_provider, inject_host_configuration_root, inject_package_root,
+        inject_provider_incarnations, inject_running_package_digest,
+        inject_steam_artwork_cache_parent, path_to_unicode_string,
     };
     use amaterasu_contracts::RuntimeConfig;
     use serde_json::json;
+
+    #[test]
+    fn durable_state_declaration_must_match_selected_verified_offer() {
+        let mut config = RuntimeConfig::default();
+        config.service_selections.broker.insert(
+            "amaterasu.state/1".into(),
+            Some(amaterasu_contracts::SelectedService {
+                provider: "state".into(),
+                contract: "amaterasu.state/1".into(),
+            }),
+        );
+        config.host_context.durable_cas_provider = Some("forged".into());
+        let mut component: amaterasu_package::ComponentManifest = serde_json::from_value(json!({
+            "id":"state", "version":"1", "file":"state.so", "sha256":"a".repeat(64),
+            "size":1, "abi_major":1, "runtime":false, "requested":{},
+            "service_provides":[{"transport":"raw","service":"amaterasu.state/1","contract":"amaterasu.state/1","major":1,"minor":0,"capabilities":["amaterasu.state.durable-cas/1"]}]
+        })).unwrap();
+        inject_durable_state_provider(&mut config, &[component.clone()]);
+        assert_eq!(
+            config.host_context.durable_cas_provider.as_deref(),
+            Some("state")
+        );
+        component.service_provides[0].capabilities.clear();
+        inject_durable_state_provider(&mut config, &[component]);
+        assert!(config.host_context.durable_cas_provider.is_none());
+        config.host_context.durable_cas_provider = Some("forged".into());
+        config.service_selections.broker.clear();
+        inject_durable_state_provider(&mut config, &[]);
+        assert!(config.host_context.durable_cas_provider.is_none());
+    }
 
     #[test]
     fn provider_instances_are_fresh_and_replace_package_values() {

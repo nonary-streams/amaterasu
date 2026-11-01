@@ -221,6 +221,10 @@ pub struct RuntimeHostContext {
     /// package-supplied map before creating the runtime.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub provider_incarnations: BTreeMap<String, effect_fence::ProviderIncarnation>,
+    /// Selected State provider whose verified package offer declares durable
+    /// atomic CAS. Host-owned declaration, not proof of implementation behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_cas_provider: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

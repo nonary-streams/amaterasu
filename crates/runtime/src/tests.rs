@@ -550,6 +550,7 @@ fn host_state_context_is_available_only_to_trusted_state_consumers() {
         package_root: Some(r"C:\\ProgramData\\Amaterasu\\packages".into()),
         running_package_digest: Some("a".repeat(64)),
         provider_incarnations: Default::default(),
+        durable_cas_provider: None,
     };
     let state_root = configuration.host_context.state_root.clone();
     let mut broker = Broker::new(configuration).unwrap();

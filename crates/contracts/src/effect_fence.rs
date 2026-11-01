@@ -220,6 +220,14 @@ pub enum EffectFenceCommand {
     SelectedMethod {
         method: ProtectedMethod,
     },
+    /// Authority-only registered approval for an explicitly protected action.
+    /// This is discovery, not a grant to call the selected method.
+    SelectedActionApproval {
+        method: ProtectedMethod,
+    },
+    /// Authority-only broker-selected State route. The trusted startup
+    /// composition must separately require its durable-CAS capability.
+    SelectedStateProvider {},
     /// Authority-only discovery of an explicitly configured cleanup approval.
     /// This does not grant either principal permission to call it.
     SelectedCleanupMethod {

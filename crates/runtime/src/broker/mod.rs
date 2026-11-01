@@ -916,6 +916,68 @@ impl Broker {
                     None => errors::permission_denied(),
                 }
             }
+            EffectFenceCommand::SelectedActionApproval { method } => {
+                if !self.effect_fences.authority(caller)
+                    || !self.effect_fences.protects(
+                        &method.service,
+                        &method.method,
+                        method.interface_major,
+                    )
+                {
+                    return errors::permission_denied();
+                }
+                let Some(approval) = self.api.registered_approval(
+                    &method.service,
+                    &method.method,
+                    method.interface_major,
+                ) else {
+                    return errors::permission_denied();
+                };
+                let Some(selected) = self.selected_effect_method(&method) else {
+                    return errors::permission_denied();
+                };
+                if approval.provider != selected.provider || approval.method != selected.method {
+                    return errors::permission_denied();
+                }
+                Response::Result {
+                    payload: serde_json::json!({"approval":approval,"provider_incarnation":selected.provider_incarnation}),
+                }
+            }
+            EffectFenceCommand::SelectedStateProvider {} => {
+                if !self.effect_fences.authority(caller) {
+                    return errors::permission_denied();
+                }
+                match self
+                    .configuration
+                    .service_selections
+                    .broker
+                    .get("amaterasu.state/1")
+                    .and_then(Option::as_ref)
+                {
+                    Some(selection)
+                        if selection.contract == "amaterasu.state/1"
+                            && self
+                                .configuration
+                                .host_context
+                                .durable_cas_provider
+                                .as_deref()
+                                == Some(selection.provider.as_str()) =>
+                    {
+                        let Some(instance) = self
+                            .configuration
+                            .host_context
+                            .provider_incarnations
+                            .get(&selection.provider)
+                        else {
+                            return errors::permission_denied();
+                        };
+                        Response::Result {
+                            payload: serde_json::json!({"owner":caller,"provider":selection.provider,"contract":selection.contract,"capability":"amaterasu.state.durable-cas/1","provider_incarnation":instance}),
+                        }
+                    }
+                    _ => errors::permission_denied(),
+                }
+            }
             EffectFenceCommand::SelectedCleanupMethod { method } => {
                 if !self.effect_fences.authority(caller)
                     || !self.effect_fences.protects_cleanup(
