@@ -110,6 +110,8 @@ impl ResumeSnapshot {
         stream.application_display_overrides = retained.application_display_overrides.clone();
         stream.application_display_settings = retained.application_display_settings.clone();
         stream.application_catalog_revision = retained.application_catalog_revision;
+        stream.selected_application = retained.selected_application.clone();
+        stream.policy_identity = retained.policy_identity.clone();
         stream.executable_path = retained.executable_path.clone();
         let application = stream
             .application_preflight_overrides

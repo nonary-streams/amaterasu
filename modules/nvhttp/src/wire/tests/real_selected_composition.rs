@@ -191,6 +191,12 @@ fn real_selected_composition() {
         (true, "display_rejected"),
         (true, "cancelled"),
         (true, "failed_preparation"),
+        (true, "resume_changed"),
+        (true, "resume_limiter"),
+        (true, "resume_stale"),
+        (true, "resume_foreign"),
+        (true, "resume_failed"),
+        (true, "resume_unpaired"),
     ] {
         if filter
             .as_deref()
@@ -238,6 +244,8 @@ fn run_composition(replacement: bool, scenario: &str) {
         "amaterasu.rtsp":{"provide":["amaterasu.rtsp/1"],"call":["amaterasu.launch/1","amaterasu.stream-session/1"],"native_use":["amaterasu.network/1"]},
         "amaterasu.session-lifecycle":{"provide":["amaterasu.session-lifecycle/1"],"call":["amaterasu.launch/1"]},
         "network":{"native_provide":["amaterasu.network/1"]},
+        "capture":{"call":["amaterasu.session-lifecycle/1"]},
+        "foreign":{"call":["amaterasu.session-lifecycle/1"]},
         "state":{"provide":["amaterasu.state/1"]},
         "session":{"provide":["amaterasu.session/1"]},
         "stream":{"provide":["amaterasu.stream-session/1"]},
@@ -254,7 +262,7 @@ fn run_composition(replacement: bool, scenario: &str) {
             "service":"fixture.library/2","callers":["amaterasu.nvhttp"],"executors":{"runner":"example.library.provider/1"},
             "streaming_policy_service":"fixture.policy/2","streaming_policy_source":"test-policy"}}},
         "amaterasu.rtsp":{"enabled":true,"bind":"127.0.0.1:0","allowed_principals":["amaterasu.nvhttp"]},
-        "amaterasu.session-lifecycle":{"journal_path":temp.0.join("journal.json"),"consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["example/1"]},"trusted_callers":["amaterasu.nvhttp"],"operation_grants":{"amaterasu.nvhttp":["prepare","lookup","snapshot","bind_application","end_session","application_retired"]}},
+        "amaterasu.session-lifecycle":{"journal_path":temp.0.join("journal.json"),"consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["example/1"]},"trusted_callers":["amaterasu.nvhttp","capture","foreign"],"session_delegates":["capture"],"consumers":{"capture":["capture"],"input":[]},"operation_grants":{"amaterasu.nvhttp":["prepare","prepare_stream","pause_stream","lookup","snapshot","bind_application","end_session","application_retired"],"capture":["retire_stream"],"foreign":["prepare","lookup","snapshot"]}},
         "library":{"service":"fixture.library/2","callers":{"amaterasu.launch":{"initiators":["amaterasu.nvhttp"],"resolve_launch":true}},"revision":"snapshot:one",
             "entries":[{"id":"opaque/game","revision":"entry:opaque","name":"Game","description":null,"tags":[],"source":null,"portable_ids":[],"installed":"unknown","readiness":"ready","unavailable_reason":null}],
             "targets":[{"id":"opaque/game","revision":"entry:opaque","executor":"runner","application_id":"fixture-game"}]},
@@ -445,7 +453,7 @@ fn run_composition(replacement: bool, scenario: &str) {
         json!({})
     };
     router.set_global_display_policy(1, display_policy);
-    if scenario.starts_with("limiter_") {
+    if scenario.starts_with("limiter_") || scenario == "resume_limiter" {
         router.set_global_frame_limiter_settings(&crate::frame_limiter::FrameLimiterSettings {
             frame_limiter_enable: Some(true),
             ..Default::default()
@@ -512,7 +520,15 @@ fn run_composition(replacement: bool, scenario: &str) {
         .iter()
         .any(|(service, payload)| service == "stream" && payload["action"] == "prepare");
     match scenario {
-        "success" | "limiter_success" | "limiter_stale_recheck" => {
+        "success"
+        | "limiter_success"
+        | "limiter_stale_recheck"
+        | "resume_changed"
+        | "resume_limiter"
+        | "resume_stale"
+        | "resume_foreign"
+        | "resume_failed"
+        | "resume_unpaired" => {
             assert_eq!(replies.len(), 1, "hardware requests: {:?}", backends.calls);
             assert_eq!(
                 replies[0].1.status,
@@ -523,7 +539,244 @@ fn run_composition(replacement: bool, scenario: &str) {
             );
             assert!(prepared, "{:?}", backends.calls);
             assert_eq!(backends.session_state, "active");
-            if matches!(scenario, "limiter_success" | "limiter_stale_recheck") {
+            if scenario.starts_with("resume_") {
+                router.reply_delivered(1);
+                let (old_ticket, session_target) = router
+                    .launches
+                    .selected_session_for_test()
+                    .expect("retained lifecycle target");
+                let session_target = json!(session_target);
+                let prepare = lifecycle_request(
+                    &nvhttp,
+                    &mut lifecycle,
+                    json!({"operation":"prepare_stream","operation_id":"fixture-paused-stream","target":session_target,"requested_video":{"width":1280,"height":720,"refresh_millihz":60000,"hdr":false},"consumer_requirements":["capture"]}),
+                    "fixture-stream-prepare",
+                );
+                assert_eq!(prepare["status"], "pending", "{prepare}");
+                let stream_target = prepare["target"].clone();
+                let paused = lifecycle_request(
+                    &nvhttp,
+                    &mut lifecycle,
+                    json!({"operation":"pause_stream","operation_id":"fixture-pause","target":stream_target}),
+                    "fixture-stream-pause",
+                );
+                assert_eq!(paused["fenced"], true, "{paused}");
+                let capture = runtime.client("capture");
+                let retired = lifecycle_request(
+                    &capture,
+                    &mut lifecycle,
+                    json!({"operation":"retire_stream","operation_id":"fixture-retire","target":stream_target,"consumer":"capture","retirement_receipt":{"response":{"status":"not_found"}}}),
+                    "fixture-stream-retire",
+                );
+                assert!(
+                    retired["status"] == "pending" || retired["reason"] == "stream_not_fenced",
+                    "{retired}"
+                );
+                let mut settled = None;
+                for attempt in 0..100 {
+                    let result = lifecycle_request(
+                        &nvhttp,
+                        &mut lifecycle,
+                        json!({"operation":"lookup","operation_id":"fixture-pause"}),
+                        &format!("fixture-pause-lookup-{attempt}"),
+                    );
+                    if result["status"] != "pending" {
+                        settled = Some(result);
+                        break;
+                    }
+                }
+                let settled = settled.expect("pause settles");
+                assert_eq!(settled["status"], "succeeded", "{settled}");
+                let snapshot = lifecycle_request(
+                    &nvhttp,
+                    &mut lifecycle,
+                    json!({"operation":"snapshot","target":session_target}),
+                    "fixture-paused-snapshot",
+                );
+                assert!(
+                    snapshot["sessions"].as_array().unwrap().iter().any(
+                        |entry| entry["session_id"] == session_target["session_id"]
+                            && entry["generation"] == session_target["generation"]
+                            && entry["phase"] == "paused"
+                    ),
+                    "{snapshot}"
+                );
+                let close = broker_request(
+                    &nvhttp,
+                    "amaterasu.rtsp/1",
+                    json!({"action":"close","ticket":old_ticket}),
+                    "fixture-close",
+                );
+                let mut closed = None;
+                for _ in 0..1000 {
+                    rtsp.tick();
+                    backends.pump(&session, &stream, &input, &application, &display);
+                    if let Some(result) = take(&nvhttp, close) {
+                        closed = Some(result);
+                        break;
+                    }
+                }
+                let closed = closed.expect("real RTSP close");
+                assert_eq!(closed["state"], "closed", "{closed}");
+                let mut target_value = session_target.clone();
+                if scenario == "resume_stale" {
+                    target_value["generation"] =
+                        json!(session_target["generation"].as_u64().unwrap() + 1);
+                }
+                if scenario == "resume_foreign" {
+                    let foreign = runtime.client("foreign");
+                    let foreign_prepare = lifecycle_request(
+                        &foreign,
+                        &mut lifecycle,
+                        json!({"operation":"prepare","operation_id":"foreign-session"}),
+                        "foreign-prepare",
+                    );
+                    assert_eq!(foreign_prepare["status"], "pending", "{foreign_prepare}");
+                    let mut ready = None;
+                    for attempt in 0..100 {
+                        let result = lifecycle_request(
+                            &foreign,
+                            &mut lifecycle,
+                            json!({"operation":"lookup","operation_id":"foreign-session"}),
+                            &format!("foreign-lookup-{attempt}"),
+                        );
+                        if result["status"] != "pending" {
+                            ready = Some(result);
+                            break;
+                        }
+                    }
+                    let ready = ready.expect("foreign session settles");
+                    assert_eq!(ready["status"], "succeeded", "{ready}");
+                    target_value = ready["target"].clone();
+                }
+                let target = serde_json::from_value(target_value).unwrap();
+                assert_eq!(
+                    router.launches.stage_paused_for_resume_test(target),
+                    Some(old_ticket)
+                );
+                if scenario == "resume_failed" {
+                    backends.fail_next_prepare = true;
+                }
+                if scenario == "resume_unpaired" {
+                    let unpair = broker_request(
+                        &nvhttp,
+                        "amaterasu.pairing/1",
+                        json!({"action":"unpair_presented_client","certificate_pem":CLIENT_CERT}),
+                        "fixture-unpair",
+                    );
+                    let mut result = None;
+                    for _ in 0..500 {
+                        pairing.tick();
+                        memory.pump(&state);
+                        if let Some(value) = take(&nvhttp, unpair) {
+                            result = Some(value);
+                            break;
+                        }
+                    }
+                    assert_eq!(
+                        result.as_ref().map(|value| &value["unpaired"]),
+                        Some(&json!(1)),
+                        "{result:?}"
+                    );
+                }
+                let resume_peer = RequestContext {
+                    secure: true,
+                    remote: "127.0.0.1".parse().unwrap(),
+                    peer_certificate: Some(cert.clone()),
+                    peer_trusted: true,
+                    list_allowed: true,
+                    launch_allowed: true,
+                };
+                let resume = "/resume?appid=1&mode=1280x720x60&rikey=10112233445566778899aabbccddeeff&rikeyid=18";
+                assert!(
+                    router
+                        .dispatch(2, request(resume), resume_peer, &nvhttp)
+                        .is_none()
+                );
+                let mut resumed = vec![];
+                for _ in 0..5000 {
+                    pairing.tick();
+                    memory.pump(&state);
+                    launch.tick();
+                    lifecycle.tick();
+                    if let Some(module) = &mut library {
+                        module.tick();
+                    }
+                    if let Some(module) = &mut policy {
+                        module.tick();
+                    }
+                    if let Some(module) = &mut generated {
+                        module.tick();
+                    }
+                    if let Some(module) = &mut provider {
+                        module.tick();
+                    }
+                    rtsp.tick();
+                    backends.pump(&session, &stream, &input, &application, &display);
+                    resumed
+                        .extend(router.poll_with_trust(&nvhttp, |presented, _| presented == cert));
+                    if !resumed.is_empty() {
+                        break;
+                    }
+                }
+                assert_eq!(resumed.len(), 1, "hardware requests: {:?}", backends.calls);
+                if matches!(scenario, "resume_changed" | "resume_limiter") {
+                    assert_eq!(
+                        resumed[0].1.status,
+                        200,
+                        "{}; hardware requests: {:?}",
+                        String::from_utf8_lossy(&resumed[0].1.body),
+                        backends.calls
+                    );
+                    assert_eq!(backends.session_state, "active");
+                    assert_eq!(
+                        backends
+                            .calls
+                            .iter()
+                            .filter(|(service, payload)| service == "stream"
+                                && payload["action"] == "prepare")
+                            .count(),
+                        2
+                    );
+                } else {
+                    assert_ne!(
+                        resumed[0].1.status,
+                        200,
+                        "{}",
+                        String::from_utf8_lossy(&resumed[0].1.body)
+                    );
+                    let prepares = backends
+                        .calls
+                        .iter()
+                        .filter(|(service, payload)| {
+                            service == "stream" && payload["action"] == "prepare"
+                        })
+                        .count();
+                    assert_eq!(
+                        prepares,
+                        if scenario == "resume_failed" { 2 } else { 1 },
+                        "{:?}",
+                        backends.calls
+                    );
+                    if scenario == "resume_failed" {
+                        assert!(
+                            backends
+                                .calls
+                                .iter()
+                                .filter(|(service, payload)| service == "stream"
+                                    && payload["action"] == "stop")
+                                .count()
+                                >= 2,
+                            "{:?}",
+                            backends.calls
+                        );
+                    }
+                }
+            }
+            if matches!(
+                scenario,
+                "limiter_success" | "limiter_stale_recheck" | "resume_limiter"
+            ) {
                 let verify = router
                     .launches
                     .selected_limiter_verification_for_test()
@@ -672,6 +925,21 @@ fn run_composition(replacement: bool, scenario: &str) {
         _ => unreachable!(),
     }
 }
+fn lifecycle_request(
+    client: &RuntimeClient,
+    lifecycle: &mut LoadedModule,
+    payload: Value,
+    operation: &str,
+) -> Value {
+    let request = broker_request(client, "amaterasu.session-lifecycle/1", payload, operation);
+    for _ in 0..200 {
+        lifecycle.tick();
+        if let Some(result) = take(client, request) {
+            return result;
+        }
+    }
+    panic!("lifecycle request stalled: {operation}")
+}
 struct TestRoot(PathBuf);
 impl Drop for TestRoot {
     fn drop(&mut self) {
@@ -700,6 +968,7 @@ struct Hardware {
     session_state: String,
     lease: Option<String>,
     calls: Vec<(String, Value)>,
+    fail_next_prepare: bool,
 }
 impl Hardware {
     fn pump(
@@ -730,6 +999,10 @@ impl Hardware {
                     ("stream", "release_history_activity") => {
                         json!({"ok":true,"released":true,"activity_id":p["activity_id"],"rtsp_operation_id":p["rtsp_operation_id"]})
                     }
+                    ("stream", "prepare") if self.fail_next_prepare => {
+                        self.fail_next_prepare = false;
+                        json!({"ok":false,"session":24,"state":"failed","code":"synthetic_prepare_failure"})
+                    }
                     ("stream", "prepare") => {
                         json!({"ok":true,"session":23,"state":"prepared","audio_local":"127.0.0.1:51000","video_local":"127.0.0.1:51002","control_local":"127.0.0.1:51004","history_activity_id":p["history_activity_id"],"rtsp_operation_id":p["rtsp_operation_id"],"lifecycle_session_target":p["lifecycle_session_target"],"lifecycle_input_required":false,"display_prepare_timeout_ms":p["display_prepare_timeout_ms"],"frame_limiter_settings":p["frame_limiter_settings"],"frame_limiter_executable_path":p["frame_limiter_executable_path"]})
                     }
@@ -738,7 +1011,7 @@ impl Hardware {
                         json!({"ok":true,"preparation":{"operation_id":p["operation_id"],"state":"preparation_failed","preparation":{"completed":0},"cleanup":{"state":"complete"}}})
                     }
                     ("stream", "stop") => {
-                        json!({"ok":true,"session":23,"state":"stopped","cleanup_error":null})
+                        json!({"ok":true,"session":p["session"],"state":"stopped","cleanup_error":null})
                     }
                     ("input", "settings_get") => {
                         json!({"ok":true,"persisted":true,"revision":1,"values":{"proton_dualsense_compatibility":false}})

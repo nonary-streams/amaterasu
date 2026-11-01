@@ -813,6 +813,44 @@ impl Controller {
         })
     }
 
+    /// Fixture staging only: tests first close the real RTSP endpoint and prove
+    /// a paused session through the real lifecycle authority. The production
+    /// resume entrypoint still revalidates this target through the broker.
+    #[cfg(test)]
+    pub(crate) fn stage_paused_for_resume_test(
+        &mut self,
+        target: amaterasu_module_sdk::extension_api::LifecycleTarget,
+    ) -> Option<u64> {
+        let record = self
+            .records
+            .values_mut()
+            .find(|record| record.selected_application.is_some())?;
+        let ticket = record.rtsp_ticket.take()?;
+        record.lifecycle_session_target = Some(target);
+        record.rtsp_requested = false;
+        record.rtsp_url = None;
+        record.history_reserved = false;
+        record.history_release_required = false;
+        record.state = State::Paused;
+        record.stage = Stage::Live;
+        record.adopted = true;
+        Some(ticket)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected_session_for_test(
+        &self,
+    ) -> Option<(u64, amaterasu_module_sdk::extension_api::LifecycleTarget)> {
+        let record = self
+            .records
+            .values()
+            .find(|record| record.selected_application.is_some())?;
+        Some((
+            record.rtsp_ticket?,
+            record.lifecycle_session_target.clone()?,
+        ))
+    }
+
     #[cfg(test)]
     pub(crate) fn selected_limiter_verification_for_test(&self) -> Option<Value> {
         let record = self.records.values().find(|record| {

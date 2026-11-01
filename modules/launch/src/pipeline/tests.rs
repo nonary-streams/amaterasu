@@ -5870,3 +5870,67 @@ fn selected_stream_freezes_global_preparation_and_honors_application_exclusion()
         );
     }
 }
+
+#[test]
+fn selected_resume_rotates_display_admission_without_re_resolving_policy() {
+    let mut harness = Harness::new();
+    let mut pipeline = pipeline();
+    pipeline.set_library_routes(serde_json::from_value(json!({"games":{
+        "service":"selected.library/2","callers":["amaterasu.nvhttp"],"executors":{"runner":"example.provider/1"},
+        "streaming_policy_service":"selected.policy/2","streaming_policy_source":"primary"
+    }})).unwrap());
+    let nonce = "a".repeat(32);
+    let operation = format!(
+        "ale1:{}:nvhttp-{nonce}-0000000000000001-application",
+        pipeline.records.operation_epoch()
+    );
+    let first = format!("nvhttp-{nonce}-0000000000000001-rtsp");
+    let second = format!("nvhttp-{nonce}-0000000000000002-rtsp");
+    let cert = "ab".repeat(32);
+    let service = amaterasu_module_sdk::application_library::preflight::SERVICE;
+    let application = json!({"library":"games","id":"opaque/game"});
+    let preflight=harness.request_service(&mut pipeline,service,"amaterasu.nvhttp","amaterasu.nvhttp",json!({"action":"prepare_streaming","operation_id":operation,"application":application,"entry_revision":"v1","certificate_id":cert}));
+    let mut limiter = frame_limiter_snapshot();
+    limiter["settings"]["frame_limiter_enable"] = json!(false);
+    let accepted=harness.request_service(&mut pipeline,service,"amaterasu.nvhttp","amaterasu.nvhttp",json!({"action":"accept_streaming","operation_id":operation,"application":application,"entry_revision":"v1","certificate_id":cert,"preflight_token":preflight["preflight_token"],"policy_identity":preflight["policy_identity"],"frame_limiter_settings":limiter,"client_frame_limiter_overrides":{}}));
+    assert_eq!(accepted["accepted"], true, "{accepted}");
+    let display_request = |rtsp: &str| json!({"action":"prepare_display_admission","application_operation_id":operation,"global_revision":1,"global_overrides":{},"policy_identity":preflight["policy_identity"],"application_display_overrides":{},"certificate_id":cert,"client_display_overrides":{},"rtsp_operation_id":rtsp,"request_sha256":"aa".repeat(32)});
+    let old = harness.request(&mut pipeline, "amaterasu.nvhttp", display_request(&first));
+    assert_eq!(old["ok"], true, "{old}");
+    let started=harness.request_service(&mut pipeline,service,"amaterasu.nvhttp","amaterasu.nvhttp",json!({"action":"admit_streaming","operation_id":operation,"application":application,"entry_revision":"v1","certificate_id":cert,"preflight_token":preflight["preflight_token"],"policy_identity":preflight["policy_identity"],"display_admission_token":old["display_admission_token"],"application_display_overrides":{},"application_display_settings":null,"virtual_display_intent":null,"frame_limiter_settings":limiter,"client_frame_limiter_overrides":{},"proton_dualsense_compatibility":false,"return_on_admission":false}));
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    // Later provider edits cannot silently replace the accepted application policy.
+    harness.policy_reply = Some(json!({"ok":false,"error":{"code":"changed"}}));
+    let authorize = |rtsp: &str| json!({"action":"authorize_stream_snapshot","launch_id":started["launch"]["launch_id"],"application_operation_id":operation,"rtsp_operation_id":rtsp,"frame_limiter_settings":limiter});
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.nvhttp", authorize(&first))["code"],
+        "stream_snapshot_denied"
+    );
+    assert_ne!(
+        harness.request(&mut pipeline, "foreign", authorize(&second))["ok"],
+        true
+    );
+    let next = harness.request(&mut pipeline, "amaterasu.nvhttp", authorize(&second));
+    assert_eq!(next["ok"], true, "{next}");
+    let verify_old = json!({"action":"verify_display_admission","token":old["display_admission_token"],"application_operation_id":operation,"rtsp_operation_id":first,"request_sha256":"aa".repeat(32),"display_policy_snapshot":old["display_policy_snapshot"],"certificate_id":cert,"policy_identity":preflight["policy_identity"]});
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.rtsp", verify_old)["code"],
+        "display_admission_denied"
+    );
+    let fresh = harness.request(&mut pipeline, "amaterasu.nvhttp", display_request(&second));
+    assert_eq!(fresh["ok"], true, "{fresh}");
+    assert_ne!(
+        fresh["display_admission_token"],
+        old["display_admission_token"]
+    );
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.nvhttp", display_request(&first))["code"],
+        "display_admission_denied"
+    );
+    let mut foreign = display_request(&second);
+    foreign["certificate_id"] = json!("cd".repeat(32));
+    assert_eq!(
+        harness.request(&mut pipeline, "amaterasu.nvhttp", foreign)["code"],
+        "display_admission_denied"
+    );
+}

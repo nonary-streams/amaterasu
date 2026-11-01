@@ -263,7 +263,7 @@ impl Controller {
         }
         if record.resumed && record.lifecycle_session_target.is_some() {
             if !record.desktop
-                && record.executable_path.is_some()
+                && (record.selected_application.is_some() || record.executable_path.is_some())
                 && record.frame_limiter_snapshot.is_some()
             {
                 record.stage = Stage::AuthorizeResumeSnapshot;
@@ -2708,7 +2708,9 @@ fn advance_resume_display(record: &mut Record, now: Instant) {
                 record.stage = Stage::SnapshotDisplay
             }
             None | Some("disabled") => {
-                record.stage = if record.application_display_settings.is_some() {
+                record.stage = if record.application_display_settings.is_some()
+                    || record.selected_application.is_some()
+                {
                     Stage::PrepareDisplayAdmission
                 } else {
                     Stage::OpenRtsp
