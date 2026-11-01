@@ -50,6 +50,17 @@ impl ApiRegistry {
         self.approved.keys().any(|key| key.0 == service)
     }
 
+    pub fn selected_for<'a>(
+        &'a self,
+        caller: &str,
+        grants: &Grants,
+        service: &str,
+        method: &str,
+        major: u32,
+    ) -> Option<&'a ApiMethodApproval> {
+        self.authorized(caller, grants, service, method, major)
+    }
+
     pub fn register(&mut self, caller: &str, grants: &Grants, method: ApiMethod) -> Response {
         let key = key(&method);
         if !grants.provide.contains(&method.service) {
