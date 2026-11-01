@@ -252,7 +252,20 @@ live authority fence/drain adapter and must not be replaced by the ordinary
 snapshot. The selected policy freezes global and application preparation together at
 admission, including per-application exclusion of global steps. It fails closed
 when an effective frame limiter is enabled because there is no generic
-executable-target limiter contract. Real cross-module NVHTTP/Launch/RTSP replacement tests against
-at least two independent selected libraries and policy providers, including
-failure, cancellation and revocation cases, remain required before integration.
+executable-target limiter contract. A Linux composition test exercises the real
+NVHTTP router, Launch, RTSP, pairing and lifecycle entrypoints with independently
+built replacement library
+and policy implementations and synthetic hardware. It covers stale policy,
+foreign-owner tokens, display rejection, cancellation and preparation failure.
+It injects transport trust and does not test live pairing or host-configuration
+revocation; those authority-fence cases remain required before integration.
+The executor lifecycle observation currently reports an opaque application ID,
+provider incarnation and ticket, but no attested limiter target. The existing
+limiter verifier requires a numeric catalog revision and executable path. Selected
+limiting needs an additive executor target-attestation contract bound to the same
+source-qualified policy, operation, incarnation and ticket, plus tagged Launch
+and RTSP verification and replacement-provider coverage. A library ID or a
+client-supplied path cannot establish that target. Until that contract is wired,
+selected launches with an effective limiter are rejected before effects.
+
 No installed grants or live settings are changed by this work.
