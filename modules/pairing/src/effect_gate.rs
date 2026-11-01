@@ -254,6 +254,14 @@ impl EffectGate {
             .sources
             .get(source)
             .is_some_and(|bound| bound.as_ref() != Some(scope))
+            || self
+                .fenced_scoped_sources
+                .get(source)
+                .is_some_and(|bound| bound != scope)
+            || self
+                .configuration_sources
+                .get(source)
+                .is_some_and(|bound| bound != scope)
             || self.operations.values().any(|admission| {
                 admission.source == *source && admission.scope.as_ref() != Some(scope)
             })
@@ -383,22 +391,7 @@ impl EffectGate {
         {
             return Err("retirement_mismatch");
         }
-        if let Some(receipt) = receipt
-            && self.lease_receipts.values().any(|previous| {
-                previous.service == receipt.service
-                    && previous.stream == receipt.stream
-                    && previous.provider_epoch == receipt.provider_epoch
-                    && previous != receipt
-            })
-        {
-            return Err("retirement_mismatch");
-        }
-        if self.lease_receipts.values().any(|previous| {
-            previous.service == scope.transport_service
-                && previous.stream == scope.transport_stream
-                && previous.provider_epoch == scope.transport_epoch
-                && Some(previous) != receipt
-        }) {
+        if self.conflicting_transport_receipt(scope, receipt) {
             return Err("retirement_mismatch");
         }
         let record = self
@@ -571,10 +564,7 @@ impl EffectGate {
         retirement: &StreamRetirement,
     ) -> Result<(), &'static str> {
         self.require_epoch(epoch)?;
-        let admission = self
-            .operations
-            .get_mut(operation)
-            .ok_or("unknown_admission")?;
+        let admission = self.operations.get(operation).ok_or("unknown_admission")?;
         if admission.ticket != ticket
             || admission
                 .scope
@@ -583,17 +573,16 @@ impl EffectGate {
         {
             return Err("retirement_mismatch");
         }
-        if self.lease_receipts.values().any(|previous| {
-            previous.service == retirement.service
-                && previous.stream == retirement.stream
-                && previous.provider_epoch == retirement.provider_epoch
-                && previous != retirement
-        }) {
+        let scope = admission.scope.as_ref().expect("validated scope");
+        if self.conflicting_transport_receipt(scope, Some(retirement)) {
             return Err("retirement_mismatch");
         }
-        self.lease_receipts
-            .insert(admission.source.clone(), retirement.clone());
-        admission.complete = true;
+        let source = admission.source.clone();
+        self.lease_receipts.insert(source, retirement.clone());
+        self.operations
+            .get_mut(operation)
+            .expect("validated admission")
+            .complete = true;
         Ok(())
     }
 
@@ -765,6 +754,7 @@ impl EffectGate {
     ) -> Result<(), &'static str> {
         let (record, _) = self.owner_restart_record(epoch, owner_epoch, operation_id, index)?;
         if !receipt.matches(&record.scope)
+            || self.conflicting_transport_receipt(&record.scope, Some(receipt))
             || record
                 .transport_retirement
                 .as_ref()
@@ -801,6 +791,32 @@ impl EffectGate {
         }
         restart.confirmed.insert(source, receipt.clone());
         Ok(())
+    }
+
+    /// All sources sharing a transport must settle against the same verified
+    /// provider operation, regardless of whether restart confirmation or live
+    /// lease/source completion arrives first.
+    fn conflicting_transport_receipt(
+        &self,
+        scope: &StreamScope,
+        receipt: Option<&StreamRetirement>,
+    ) -> bool {
+        let conflicts = |prior: &StreamRetirement| {
+            prior.service == scope.transport_service
+                && prior.stream == scope.transport_stream
+                && prior.provider_epoch == scope.transport_epoch
+                && Some(prior) != receipt
+        };
+        self.lease_receipts.values().any(conflicts)
+            || self
+                .retired_sources
+                .values()
+                .filter_map(|prior| prior.receipt.as_ref())
+                .any(conflicts)
+            || self
+                .owner_restart
+                .as_ref()
+                .is_some_and(|restart| restart.confirmed.values().any(conflicts))
     }
 
     /// A configuration transaction requires the selected owner's explicit

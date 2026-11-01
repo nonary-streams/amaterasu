@@ -1,5 +1,365 @@
 use super::*;
 
+fn broker_effect_call(
+    broker: &mut amaterasu_runtime::Broker,
+    pipeline: &mut Pipeline,
+    sequence: &mut u64,
+    caller: &str,
+    payload: Value,
+) -> Value {
+    *sequence += 1;
+    let Response::Accepted { id } = broker.dispatch(
+        caller,
+        Command::Request {
+            service: EFFECT_SERVICE.into(),
+            payload,
+            timeout_ms: 30_000,
+            operation_id: format!("restart-review-{sequence}"),
+            parent: None,
+        },
+    ) else {
+        panic!("request rejected")
+    };
+    pipeline
+        .tick_at(now(), |command| Ok(broker.dispatch("pairing", command)))
+        .unwrap();
+    let Response::Result { payload } = broker.dispatch(caller, Command::TakeResult { request: id })
+    else {
+        panic!("response missing")
+    };
+    assert!(matches!(
+        broker.dispatch(caller, Command::ReleaseResult { request: id }),
+        Response::Ok
+    ));
+    payload
+}
+
+#[test]
+fn broker_restart_cannot_replace_a_globally_fenced_transport_scope() {
+    let (mut pipeline, _, _, epoch, source, scope) = authorized_feedback_for_test();
+    let mut broker = authority_broker();
+    let mut sequence = 0;
+    let mut call = |caller, payload| {
+        broker_effect_call(&mut broker, &mut pipeline, &mut sequence, caller, payload)
+    };
+    assert_eq!(
+        call(
+            "nvhttp",
+            json!({"action":"fence_protocol_restart","epoch":epoch,"operation_id":"protocol-fence"})
+        )["state"],
+        "fenced"
+    );
+    let mut substituted_scope = scope.clone();
+    substituted_scope["transport_stream"] = json!(8);
+    assert_eq!(
+        call(
+            "nvhttp",
+            json!({"action":"fence_source","epoch":epoch,"source":source,
+        "scope":substituted_scope,"operation_id":"wrong-scope"})
+        )["code"],
+        "stream_scope_denied"
+    );
+    let fenced = call(
+        "input",
+        json!({"action":"fence_effect_owner_restart","version":1,"epoch":epoch,
+        "owner_epoch":"owner","operation_id":"owner-restart"}),
+    );
+    assert_eq!(fenced["count"], 1);
+    let record = call(
+        "input",
+        json!({"action":"read_effect_owner_restart","version":1,"epoch":epoch,
+        "owner_epoch":"owner","operation_id":"owner-restart","index":0}),
+    );
+    assert_eq!(record["record"]["scope"], scope);
+    let wrong_receipt = json!({"ok":true,"service":"amaterasu.control-transport/1","stream":8,
+        "provider_epoch":"c".repeat(32),"operation_id":"wrong-transport","scope":"whole_control_stream","state":"retired"});
+    assert_eq!(
+        call(
+            "input",
+            json!({"action":"confirm_effect_owner_restart","version":1,"epoch":epoch,
+        "owner_epoch":"owner","operation_id":"owner-restart","index":0,"retirement":wrong_receipt})
+        )["code"],
+        "retirement_mismatch"
+    );
+    assert_eq!(
+        call(
+            "input",
+            json!({"action":"drain","epoch":epoch,"fence_generation":fenced["fence_generation"]})
+        )["code"],
+        "restart_confirmation_pending"
+    );
+}
+
+#[test]
+fn broker_restart_receipt_agrees_with_live_settlement_in_both_orders() {
+    for confirmation_first in [false, true] {
+        let (mut pipeline, _, _, epoch, source, scope) = authorized_feedback_for_test();
+        let mut broker = authority_broker();
+        let mut sequence = 0;
+        let mut call = |caller, payload| {
+            broker_effect_call(&mut broker, &mut pipeline, &mut sequence, caller, payload)
+        };
+        let lease = call(
+            "input",
+            json!({"action":"admit_stream_lease","epoch":epoch,"source":source,
+            "scope":scope,"operation_id":"lease","sequence":1}),
+        );
+        let ticket = lease["ticket"].clone();
+        let fence = call(
+            "input",
+            json!({"action":"fence_effect_owner_restart","version":1,"epoch":epoch,
+            "owner_epoch":"owner","operation_id":"restart"}),
+        );
+        assert_eq!(fence["count"], 1);
+        assert_eq!(
+            call(
+                "input",
+                json!({"action":"fence_source","epoch":epoch,"source":source,
+            "scope":scope,"operation_id":"source-fence"})
+            )["state"],
+            "fenced"
+        );
+        let receipt_a = json!({"ok":true,"service":"amaterasu.control-transport/1","stream":7,
+            "provider_epoch":"c".repeat(32),"operation_id":"receipt-a","scope":"whole_control_stream","state":"retired"});
+        let mut receipt_b = receipt_a.clone();
+        receipt_b["operation_id"] = json!("receipt-b");
+        let confirm = |receipt: &Value| {
+            json!({"action":"confirm_effect_owner_restart","version":1,"epoch":epoch,
+            "owner_epoch":"owner","operation_id":"restart","index":0,"retirement":receipt})
+        };
+        let complete_lease = |receipt: &Value| {
+            json!({"action":"complete_stream_lease","epoch":epoch,
+            "operation_id":"lease","ticket":ticket,"retirement":receipt})
+        };
+        let complete_source = |receipt: &Value| {
+            json!({"action":"complete_source_retirement","epoch":epoch,
+            "source":source,"scope":scope,"operation_id":"source-fence","retirement":receipt})
+        };
+        if confirmation_first {
+            assert_eq!(call("input", confirm(&receipt_b))["ok"], true);
+            assert_eq!(
+                call("input", complete_lease(&receipt_a))["code"],
+                "retirement_mismatch"
+            );
+            assert_eq!(call("input", complete_lease(&receipt_b))["ok"], true);
+        } else {
+            assert_eq!(call("input", complete_lease(&receipt_a))["ok"], true);
+        }
+        assert_eq!(
+            call(
+                "input",
+                json!({"action":"acknowledge","epoch":epoch,
+            "operation_id":"lease","ticket":ticket})
+            )["ok"],
+            true
+        );
+        if confirmation_first {
+            assert_eq!(
+                call("input", complete_source(&receipt_a))["code"],
+                "retirement_mismatch"
+            );
+            assert_eq!(
+                call("input", complete_source(&receipt_b))["state"],
+                "retired"
+            );
+        } else {
+            assert_eq!(
+                call("input", complete_source(&receipt_a))["state"],
+                "retired"
+            );
+            assert_eq!(
+                call("input", confirm(&receipt_b))["code"],
+                "retirement_mismatch"
+            );
+            assert_eq!(
+                call(
+                    "input",
+                    json!({"action":"drain","epoch":epoch,
+                "fence_generation":fence["fence_generation"]})
+                )["code"],
+                "restart_confirmation_pending"
+            );
+            assert_eq!(call("input", confirm(&receipt_a))["ok"], true);
+        }
+        assert_eq!(
+            call(
+                "input",
+                json!({"action":"drain","epoch":epoch,
+            "fence_generation":fence["fence_generation"]})
+            )["ok"],
+            true
+        );
+        assert_eq!(
+            call(
+                "input",
+                json!({"action":"recover","epoch":epoch,"owner_epoch":"next-owner"})
+            )["ok"],
+            true
+        );
+    }
+}
+
+#[test]
+fn broker_restart_receipt_agrees_with_unleased_source_in_both_orders() {
+    for confirmation_first in [false, true] {
+        let (mut pipeline, _, _, epoch, source, scope) = authorized_feedback_for_test();
+        let mut broker = authority_broker();
+        let mut sequence = 0;
+        let mut call = |caller, payload| {
+            broker_effect_call(&mut broker, &mut pipeline, &mut sequence, caller, payload)
+        };
+        let fence = call(
+            "input",
+            json!({"action":"fence_effect_owner_restart","version":1,"epoch":epoch,
+            "owner_epoch":"owner","operation_id":"restart"}),
+        );
+        assert_eq!(
+            call(
+                "input",
+                json!({"action":"fence_source","epoch":epoch,"source":source,
+            "scope":scope,"operation_id":"source-fence"})
+            )["state"],
+            "fenced"
+        );
+        let receipt_a = json!({"ok":true,"service":"amaterasu.control-transport/1","stream":7,
+            "provider_epoch":"c".repeat(32),"operation_id":"receipt-a","scope":"whole_control_stream","state":"retired"});
+        let mut receipt_b = receipt_a.clone();
+        receipt_b["operation_id"] = json!("receipt-b");
+        let confirm = |receipt: &Value| {
+            json!({"action":"confirm_effect_owner_restart","version":1,"epoch":epoch,
+            "owner_epoch":"owner","operation_id":"restart","index":0,"retirement":receipt})
+        };
+        let retire = |receipt: &Value| {
+            json!({"action":"complete_source_retirement","epoch":epoch,
+            "source":source,"scope":scope,"operation_id":"source-fence","retirement":receipt})
+        };
+        if confirmation_first {
+            assert_eq!(call("input", confirm(&receipt_b))["ok"], true);
+            assert_eq!(
+                call("input", retire(&receipt_a))["code"],
+                "retirement_mismatch"
+            );
+            assert_eq!(call("input", retire(&receipt_b))["state"], "retired");
+        } else {
+            assert_eq!(call("input", retire(&receipt_a))["state"], "retired");
+            assert_eq!(
+                call("input", confirm(&receipt_b))["code"],
+                "retirement_mismatch"
+            );
+            assert_eq!(call("input", confirm(&receipt_a))["ok"], true);
+        }
+        assert_eq!(
+            call(
+                "input",
+                json!({"action":"drain","epoch":epoch,
+            "fence_generation":fence["fence_generation"]})
+            )["ok"],
+            true
+        );
+    }
+}
+
+#[test]
+fn broker_restart_confirmed_receipt_binds_other_sources_on_same_transport() {
+    let (mut pipeline, _, _, epoch, first, first_scope) = authorized_feedback_for_test();
+    let mut broker = authority_broker();
+    let mut sequence = 0;
+    let mut call = |caller, payload| {
+        broker_effect_call(&mut broker, &mut pipeline, &mut sequence, caller, payload)
+    };
+    let mut second = first.clone();
+    second["id"] = json!("b".repeat(32));
+    second["device"] = json!("second-controller");
+    let mut second_scope = first_scope.clone();
+    second_scope["controller_slot"] = json!(4);
+    assert_eq!(
+        call(
+            "nvhttp",
+            json!({"action":"bind_stream","epoch":epoch,"certificate_pem":CLIENT_CERT,
+        "source":second,"scope":second_scope})
+        )["ok"],
+        true
+    );
+    let fence = call(
+        "input",
+        json!({"action":"fence_effect_owner_restart","version":1,"epoch":epoch,
+        "owner_epoch":"owner","operation_id":"restart"}),
+    );
+    assert_eq!(fence["count"], 2);
+    for (source, scope, operation_id) in [
+        (&first, &first_scope, "first"),
+        (&second, &second_scope, "second"),
+    ] {
+        assert_eq!(
+            call(
+                "input",
+                json!({"action":"fence_source","epoch":epoch,"source":source,
+            "scope":scope,"operation_id":operation_id})
+            )["state"],
+            "fenced"
+        );
+    }
+    let receipt = json!({"ok":true,"service":"amaterasu.control-transport/1","stream":7,
+        "provider_epoch":"c".repeat(32),"operation_id":"receipt-a","scope":"whole_control_stream","state":"retired"});
+    let mut other = receipt.clone();
+    other["operation_id"] = json!("receipt-b");
+    assert_eq!(
+        call(
+            "input",
+            json!({"action":"confirm_effect_owner_restart","version":1,"epoch":epoch,
+        "owner_epoch":"owner","operation_id":"restart","index":0,"retirement":receipt})
+        )["ok"],
+        true
+    );
+    let first_page = call(
+        "input",
+        json!({"action":"read_effect_owner_restart","version":1,"epoch":epoch,
+        "owner_epoch":"owner","operation_id":"restart","index":0}),
+    );
+    let (other_source, other_scope, other_id) = if first_page["record"]["source"] == first {
+        (&second, &second_scope, "second")
+    } else {
+        (&first, &first_scope, "first")
+    };
+    assert_eq!(
+        call(
+            "input",
+            json!({"action":"complete_source_retirement","epoch":epoch,"source":other_source,
+        "scope":other_scope,"operation_id":other_id,"retirement":other})
+        )["code"],
+        "retirement_mismatch"
+    );
+    for (source, scope, operation_id) in [
+        (&first, &first_scope, "first"),
+        (&second, &second_scope, "second"),
+    ] {
+        assert_eq!(
+            call(
+                "input",
+                json!({"action":"complete_source_retirement","epoch":epoch,"source":source,
+            "scope":scope,"operation_id":operation_id,"retirement":receipt})
+            )["state"],
+            "retired"
+        );
+    }
+    assert_eq!(
+        call(
+            "input",
+            json!({"action":"confirm_effect_owner_restart","version":1,"epoch":epoch,
+        "owner_epoch":"owner","operation_id":"restart","index":1,"retirement":receipt})
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        call(
+            "input",
+            json!({"action":"drain","epoch":epoch,
+        "fence_generation":fence["fence_generation"]})
+        )["ok"],
+        true
+    );
+}
+
 #[test]
 fn broker_owner_restart_enumerates_and_settles_exact_prior_leases() {
     let (mut pipeline, _harness, _, epoch, first, first_scope) = authorized_feedback_for_test();
