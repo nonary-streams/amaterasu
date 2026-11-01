@@ -656,6 +656,78 @@ fn lost_state_write_reply_reconciles_only_the_exact_durable_claim() {
 }
 
 #[test]
+fn default_feedback_recovers_without_selecting_historical_profile() {
+    let settings: crate::protocol::Settings = serde_json::from_value(json!({
+        "administrator_principals": ["console"], "transport_principals": ["nvhttp"],
+        "effect_authority": { "protocol_owner": "nvhttp", "effect_owner": "issuer",
+            "feedback_policies": [{"capability":{"schema":"org.amaterasu.feedback.rgb_led","version":1,"direction":"to_client"},"required_permission":"view"}] }
+    }))
+    .unwrap();
+    settings.validate().unwrap();
+    let mut pairing = super::super::Pipeline::new(settings);
+    assert!(!pairing.protocol_claim_recovery_required);
+    let epoch = pairing.effect_gate.as_ref().unwrap().epoch().to_owned();
+    let recovered = pairing
+        .apply_effect_request(
+            "issuer",
+            "issuer",
+            json!({"action":"recover","epoch":epoch,"owner_epoch":"owner"}),
+            super::super::tests::now(),
+        )
+        .unwrap();
+    assert_eq!(recovered["ok"], true);
+    assert!(!pairing.effect_gate.as_ref().unwrap().fenced());
+}
+
+#[test]
+fn retained_historical_state_quarantines_removed_policies_and_trust_writes() {
+    let settings: crate::protocol::Settings = serde_json::from_value(json!({
+        "administrator_principals": ["console"], "transport_principals": ["nvhttp"],
+        "effect_authority": { "protocol_owner": "nvhttp", "effect_owner": "issuer",
+            "feedback_policies": [], "protocol_policies": [] },
+        "protocol_state": {"owner":"pairing", "provider":"state",
+            "capability":amaterasu_module_sdk::protocol_state::DURABLE_CAS_CAPABILITY}
+    }))
+    .unwrap();
+    settings.validate().unwrap();
+    let mut pairing = super::super::Pipeline::new(settings);
+    assert!(pairing.protocol_claim_recovery_required);
+    assert!(pairing.protocol_recovery_auto);
+    let mut broker = broker();
+    let mut queried = false;
+    pairing.progress_protocol_recovery(&mut |command| {
+        queried |= matches!(&command, Command::EffectFence { command }
+            if matches!(**command, EffectFenceCommand::SlotStatus { .. }));
+        Ok(broker.dispatch("pairing", command))
+    });
+    assert!(
+        queried,
+        "retained history must not be skipped when policies are removed"
+    );
+    let Response::Accepted { id } = broker.dispatch(
+        "console",
+        Command::Request {
+            service: "amaterasu.pairing/1".into(),
+            payload: json!({"action":"set_permission_mode","enabled":true,"expected_revision":0}),
+            timeout_ms: 30_000,
+            operation_id: "retained-history.trust-change".into(),
+            parent: None,
+        },
+    ) else {
+        panic!("trust request")
+    };
+    pairing
+        .tick_at(super::super::tests::now(), |command| {
+            Ok(broker.dispatch("pairing", command))
+        })
+        .unwrap();
+    assert!(
+        matches!(broker.dispatch("console", Command::TakeResult { request:id }),
+        Response::Result { payload } if payload["code"] == "protocol_reconciliation_required")
+    );
+}
+
+#[test]
 fn configured_protocol_authority_starts_closed_until_slot_recovery() {
     let method = json!({"service":"example.effects/1","method":"apply","interface_major":1,"interface_minor":0,"schema_revision":1});
     let cleanup = json!({"service":"example.effects/1","method":"cleanup","interface_major":1,"interface_minor":0,"schema_revision":1});
@@ -1634,21 +1706,17 @@ fn fresh_broker_inventory_retains_durable_claim_without_assuming_old_workers_ret
     }
     drop(old_broker);
     let mut broker = broker_with_recovery('c', false);
-    let (mut pairing, _, _, _, _) = super::super::tests::authorized_protocol_for_test();
-    let method = json!({"service":"example.effects/1","method":"apply","interface_major":1,"interface_minor":0,"schema_revision":1});
-    let cleanup = json!({"service":"example.effects/1","method":"cleanup","interface_major":1,"interface_minor":0,"schema_revision":1});
-    let schema = |method: &Value| {
-        let mut value = method.clone();
-        value.as_object_mut().unwrap().remove("schema_revision");
-        value["request"] = json!({"required":{},"optional":{},"allow_extra":false});
-        value["response"] = json!({"required":{},"optional":{},"allow_extra":false});
-        value["privilege"] = json!("user");
-        value
-    };
-    pairing.effect_authority.as_mut().unwrap().protocol_policies=serde_json::from_value(json!([{"capability":"example.control/1","provider":"provider","message_type":21818,"method":method,"cleanup":cleanup,"method_schema":schema(&method),"cleanup_schema":schema(&cleanup),"max_payload_bytes":64,"required_permission":"view"}])).unwrap();
-    pairing.protocol_state_binding = Some(binding());
-    pairing.protocol_claim_recovery_required = true;
-    pairing.protocol_recovery_auto = true;
+    // Preserve the historical State selection even after removing all generic
+    // policies: its old obligations must still be discovered and quarantined.
+    let settings: crate::protocol::Settings = serde_json::from_value(json!({
+        "administrator_principals":["console"], "transport_principals":["nvhttp"],
+        "effect_authority":{"protocol_owner":"nvhttp","effect_owner":"issuer", "protocol_policies":[]},
+        "protocol_state":{"owner":"pairing","provider":"state",
+            "capability":amaterasu_module_sdk::protocol_state::DURABLE_CAS_CAPABILITY}
+    })).unwrap();
+    settings.validate().unwrap();
+    let mut pairing = super::super::Pipeline::new(settings);
+    assert!(pairing.protocol_claim_recovery_required);
     let mut attempted_recovery = false;
     for _ in 0..200 {
         pairing.tick_at(super::super::tests::now(), |command| {

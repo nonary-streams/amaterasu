@@ -284,6 +284,7 @@ impl super::Pipeline {
                     | super::HostConfigurationState::Ready { .. }
             )
             || (self.retained_protocol_claim.is_none()
+                && self.protocol_state_binding.is_none()
                 && self
                     .effect_authority
                     .as_ref()

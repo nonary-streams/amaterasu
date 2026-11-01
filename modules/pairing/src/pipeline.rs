@@ -176,11 +176,13 @@ impl Pipeline {
             )
             .ok()
         });
-        // A restarted optional protocol authority must reconcile its durable
-        // slots before it can authorize new work or commit trust changes.
-        let protocol_claim_recovery_required = effect_authority
-            .as_ref()
-            .is_some_and(|policy| !policy.protocol_policies.is_empty());
+        // A retained historical State selection may contain old obligations
+        // even after its policies are removed. Trusted composition must retain
+        // that selection until the old profile is conclusively retired.
+        let protocol_claim_recovery_required = protocol_state_binding.is_some()
+            || effect_authority
+                .as_ref()
+                .is_some_and(|policy| !policy.protocol_policies.is_empty());
         Self {
             engine: Engine::new(settings),
             effect_gate: EffectGate::new().ok(),
