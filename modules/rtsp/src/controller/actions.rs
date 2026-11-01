@@ -253,6 +253,8 @@ impl Controller {
             client_feature_flags: None,
             negotiated_color: None,
             negotiated_video: None,
+            audio_offer: None,
+            negotiated_audio: None,
             extension_offer: None,
             extension_announce: None,
             url,

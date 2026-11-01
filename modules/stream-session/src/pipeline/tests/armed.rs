@@ -28,6 +28,15 @@ fn arm(id: u64) -> Value {
     value
 }
 
+#[test]
+fn unoffered_audio_codec_cannot_fall_back_to_opus() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    let mut request = start(id);
+    request["configuration"]["audio_codec"] = json!("AC3");
+    assert_eq!(host.response(2, request)["code"], "audio_codec_not_offered");
+}
+
 fn arm_lifecycle(host: &mut Harness) -> (u64, Value) {
     let session_target =
         json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1});

@@ -1,7 +1,7 @@
 use super::attributes::{Attributes, bounded};
 use super::syntax;
 use super::{
-    Announce, Audio, ColorMode, ControlProtocol, Encryption, Error, Fec,
+    Announce, Audio, AudioCodec, ColorMode, ControlProtocol, Encryption, Error, Fec,
     KNOWN_CLIENT_FEATURE_FLAGS, Video,
 };
 use amaterasu_contracts::encoder::{DynamicRange, VideoCodec, VideoStreamFormat};
@@ -237,6 +237,11 @@ fn audio(attributes: &mut Attributes<'_>) -> Result<Audio, Error> {
         channels,
         channel_mask,
         packet_duration_ms,
+        codec_accept: match attributes.0.remove("x-ss-audio-codec-accept") {
+            Some("AC3") => Some(AudioCodec::Ac3),
+            Some("EAC3") => Some(AudioCodec::Eac3),
+            _ => None,
+        },
     })
 }
 

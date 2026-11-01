@@ -104,6 +104,7 @@ struct Pending {
     ticket: u64,
     cseq: u32,
     success: State,
+    audio_codec: Option<sdp::AudioCodec>,
 }
 
 pub struct Negotiation {
@@ -113,6 +114,7 @@ pub struct Negotiation {
     last_cseq: Option<u32>,
     pending: Option<Pending>,
     profile_offer: Option<VideoProfileSnapshot>,
+    audio_offer: Option<sdp::AudioCodec>,
 }
 
 impl Negotiation {
@@ -125,7 +127,18 @@ impl Negotiation {
             last_cseq: None,
             pending: None,
             profile_offer: None,
+            audio_offer: None,
         })
+    }
+
+    /// Adds one immutable audio offer after trusted composition has probed the
+    /// selected encoder and its downstream framing/transport path.
+    pub fn with_audio_offer(mut self, codec: sdp::AudioCodec) -> Result<Self, Error> {
+        if self.state != State::Options || self.last_cseq.is_some() || self.pending.is_some() {
+            return Err(Error::WrongState);
+        }
+        self.audio_offer = Some(codec);
+        Ok(self)
     }
 
     /// Build an extension-aware negotiation from an immutable provider snapshot
@@ -168,11 +181,17 @@ impl Negotiation {
         self.validate_session(request)?;
         let (step, next) = self.transition(request)?;
         self.last_cseq = Some(request.cseq);
-        if let Step::Action { ticket, .. } = &step {
+        if let Step::Action { ticket, action } = &step {
+            let audio_codec = match action {
+                Action::Announce(announce) => announce.audio.codec_accept,
+                Action::ExtensionAnnounce(announce) => announce.audio.codec_accept,
+                _ => None,
+            };
             self.pending = Some(Pending {
                 ticket: *ticket,
                 cseq: request.cseq,
                 success: next,
+                audio_codec,
             });
         } else {
             self.state = next;
@@ -190,7 +209,14 @@ impl Negotiation {
         if pending.ticket != ticket {
             return Err(Error::WrongTicket);
         }
-        let response = self.response(if success { 200 } else { 503 }, pending.cseq, &[], &[])?;
+        let audio_header = if success { pending.audio_codec } else { None };
+        let headers = audio_header.map(|codec| ("X-SS-Audio-Codec", codec.wire_name()));
+        let response = self.response(
+            if success { 200 } else { 503 },
+            pending.cseq,
+            headers.as_slice(),
+            &[],
+        )?;
         self.state = if success {
             pending.success
         } else {
@@ -254,6 +280,12 @@ impl Negotiation {
                         .collect::<String>();
                     body.insert_str(insertion, &markers);
                 }
+                if let Some(codec) = self.audio_offer {
+                    body.push_str(&format!(
+                        "a=x-ss-audio-codec-offer:{}\r\n",
+                        codec.wire_name()
+                    ));
+                }
                 let reply = self.response(
                     200,
                     request.cseq,
@@ -295,8 +327,9 @@ impl Negotiation {
                     return Err(Error::InvalidHeaders);
                 }
                 if let Some(offer) = &self.profile_offer {
-                    let selected = sdp::parse_profile_announce(&request.body, offer)
+                    let mut selected = sdp::parse_profile_announce(&request.body, offer)
                         .map_err(|_| Error::UnsupportedMedia)?;
+                    self.match_audio_offer(&mut selected.audio)?;
                     if matches!(
                         selected.video.format,
                         sdp::NegotiatedVideoFormat::Extension(_)
@@ -308,10 +341,11 @@ impl Negotiation {
                         ));
                     }
                 }
-                let announce = sdp::parse_announce(&request.body).map_err(|error| {
+                let mut announce = sdp::parse_announce(&request.body).map_err(|error| {
                     eprintln!("amaterasu rtsp announce parse rejection reason={error:?}");
                     Error::UnsupportedMedia
                 })?;
+                self.match_audio_offer(&mut announce.audio)?;
                 validation::media(&announce, &self.capabilities)?;
                 Ok((action(request, Action::Announce(announce)), State::Play))
             }
@@ -321,6 +355,15 @@ impl Negotiation {
             }
             _ => Err(Error::WrongState),
         }
+    }
+
+    fn match_audio_offer(&self, audio: &mut sdp::Audio) -> Result<(), Error> {
+        if audio.codec_accept != self.audio_offer {
+            audio.codec_accept = None;
+        } else if audio.codec_accept.is_some() && !matches!(audio.channels, 2 | 6) {
+            return Err(Error::UnsupportedMedia);
+        }
+        Ok(())
     }
 
     fn setup(

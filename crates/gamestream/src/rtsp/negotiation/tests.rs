@@ -223,6 +223,114 @@ fn announce() -> Request {
 }
 
 #[test]
+fn audio_offer_requires_an_exact_client_acceptance_and_backend_success() {
+    for (offered, accepted, expected) in [
+        (
+            Some(sdp::AudioCodec::Ac3),
+            Some("AC3"),
+            Some(sdp::AudioCodec::Ac3),
+        ),
+        (
+            Some(sdp::AudioCodec::Eac3),
+            Some("EAC3"),
+            Some(sdp::AudioCodec::Eac3),
+        ),
+        (Some(sdp::AudioCodec::Ac3), Some("EAC3"), None),
+        (Some(sdp::AudioCodec::Ac3), None, None),
+        (None, Some("AC3"), None),
+    ] {
+        let mut machine = negotiation();
+        if let Some(codec) = offered {
+            machine = machine.with_audio_offer(codec).unwrap();
+        }
+        setup_to_announce(&mut machine);
+        let mut input = announce();
+        if let Some(value) = accepted {
+            input
+                .body
+                .extend_from_slice(format!("a=x-ss-audio-codec-accept:{value}\r\n").as_bytes());
+        }
+        let Step::Action {
+            ticket,
+            action: Action::Announce(announce),
+        } = machine.handle(7, &input).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(announce.audio.codec_accept, expected);
+        let response = String::from_utf8(machine.complete(7, ticket, true).unwrap()).unwrap();
+        match expected {
+            Some(codec) => {
+                assert!(response.contains(&format!("X-SS-Audio-Codec: {}\r\n", codec.wire_name())))
+            }
+            None => assert!(!response.contains("X-SS-Audio-Codec")),
+        }
+    }
+    let mut machine = negotiation()
+        .with_audio_offer(sdp::AudioCodec::Ac3)
+        .unwrap();
+    setup_to_announce(&mut machine);
+    let mut input = announce();
+    input
+        .body
+        .extend_from_slice(b"a=x-ss-audio-codec-accept:AC3\r\n");
+    let Step::Action { ticket, .. } = machine.handle(7, &input).unwrap() else {
+        panic!()
+    };
+    let failed = String::from_utf8(machine.complete(7, ticket, false).unwrap()).unwrap();
+    assert!(!failed.contains("X-SS-Audio-Codec"));
+
+    let mut machine = negotiation()
+        .with_audio_offer(sdp::AudioCodec::Ac3)
+        .unwrap();
+    setup_to_announce(&mut machine);
+    let mut input = announce();
+    let body = String::from_utf8(input.body)
+        .unwrap()
+        .replace("numChannels:2", "numChannels:8")
+        .replace("channelMask:3", "channelMask:1599")
+        .replace("surround.enable:0", "surround.enable:1");
+    input.body = body.into_bytes();
+    input
+        .body
+        .extend_from_slice(b"a=x-ss-audio-codec-accept:AC3\r\n");
+    assert_eq!(machine.handle(7, &input), Err(Error::UnsupportedMedia));
+}
+
+#[test]
+fn audio_description_only_advertises_a_preflighted_offer() {
+    for codec in [
+        None,
+        Some(sdp::AudioCodec::Ac3),
+        Some(sdp::AudioCodec::Eac3),
+    ] {
+        let mut machine = negotiation();
+        if let Some(codec) = codec {
+            machine = machine.with_audio_offer(codec).unwrap();
+        }
+        let target = machine.launch.rtsp_target.clone();
+        machine
+            .handle(7, &request(Method::Options, &target, 1, false))
+            .unwrap();
+        let mut describe = request(Method::Describe, &target, 2, false);
+        describe
+            .headers
+            .push(("accept".into(), "application/sdp".into()));
+        let Step::Reply(reply) = machine.handle(7, &describe).unwrap() else {
+            panic!()
+        };
+        let description = String::from_utf8(reply).unwrap();
+        match codec {
+            Some(codec) => assert!(description.contains(&format!(
+                "a=x-ss-audio-codec-offer:{}\r\n",
+                codec.wire_name()
+            ))),
+            None => assert!(!description.contains("x-ss-audio-codec-offer")),
+        }
+    }
+}
+
+#[test]
 fn primary_modern_order_requires_backend_acceptance_before_play_success() {
     let mut machine = negotiation();
     setup_to_announce(&mut machine);

@@ -32,6 +32,8 @@ pub(super) struct Record {
     pub client_feature_flags: Option<u32>,
     pub negotiated_color: Option<amaterasu_gamestream::sdp::ColorMode>,
     pub negotiated_video: Option<crate::model::NegotiatedVideo>,
+    pub audio_offer: Option<amaterasu_gamestream::sdp::AudioCodec>,
+    pub negotiated_audio: Option<amaterasu_gamestream::sdp::AudioCodec>,
     pub extension_offer: Option<amaterasu_contracts::media_profile::VideoProfile>,
     pub extension_announce: Option<
         amaterasu_gamestream::sdp::Announce<amaterasu_gamestream::sdp::NegotiatedVideoFormat>,
@@ -73,6 +75,7 @@ impl Record {
         >,
     ) -> bool {
         self.extension_announce = None;
+        self.negotiated_audio = None;
         let amaterasu_gamestream::sdp::NegotiatedVideoFormat::Extension(profile) =
             &announce.video.format
         else {
@@ -80,10 +83,15 @@ impl Record {
         };
         if self.extension_offer.as_ref() != Some(profile)
             || !self.config.accepts_extension_announce(announce)
+            || announce
+                .audio
+                .codec_accept
+                .is_some_and(|codec| Some(codec) != self.audio_offer)
         {
             return false;
         }
         self.extension_announce = Some(announce.clone());
+        self.negotiated_audio = announce.audio.codec_accept;
         true
     }
     pub(super) fn begin_arm(&mut self, now: u64) -> u64 {
@@ -97,7 +105,11 @@ impl Record {
         announce: &amaterasu_gamestream::sdp::Announce,
     ) -> bool {
         let negotiated_video = self.config.negotiate_announce(announce);
-        let accepted = negotiated_video.is_some();
+        let accepted = negotiated_video.is_some()
+            && announce
+                .audio
+                .codec_accept
+                .is_none_or(|codec| Some(codec) == self.audio_offer);
         if !accepted {
             let expected = self.config.effective_profile();
             eprintln!(
@@ -131,7 +143,12 @@ impl Record {
         self.negotiated_video_stream_format = accepted.then_some(announce.video.format);
         self.client_feature_flags = accepted.then_some(announce.client_feature_flags);
         self.negotiated_color = accepted.then_some(announce.video.color);
-        self.negotiated_video = negotiated_video;
+        self.negotiated_video = if accepted { negotiated_video } else { None };
+        self.negotiated_audio = if accepted {
+            announce.audio.codec_accept
+        } else {
+            None
+        };
         accepted
     }
 
@@ -147,6 +164,9 @@ impl Record {
             payload["configuration"]["encrypt_audio"] = json!(announce.encryption.audio);
             payload["configuration"]["client_feature_flags"] = json!(announce.client_feature_flags);
             payload["configuration"]["configuration"]["extension_profile"] = json!(profile);
+            if let Some(codec) = self.negotiated_audio {
+                payload["configuration"]["audio_codec"] = json!(codec.wire_name());
+            }
             return Some(payload);
         }
         let encryption = self.negotiated_encryption?;
@@ -160,6 +180,9 @@ impl Record {
             self.negotiated_video_stream_format?,
             self.client_feature_flags?,
         );
+        if let Some(codec) = self.negotiated_audio {
+            payload["configuration"]["audio_codec"] = json!(codec.wire_name());
+        }
         payload["configuration"]["configuration"]["width"] = serde_json::json!(video.width);
         payload["configuration"]["configuration"]["height"] = serde_json::json!(video.height);
         payload["configuration"]["configuration"]["fps"] = serde_json::json!(video.fps);

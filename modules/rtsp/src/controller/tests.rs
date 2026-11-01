@@ -395,6 +395,8 @@ fn record(state: State) -> Record {
         client_feature_flags: None,
         negotiated_color: None,
         negotiated_video: None,
+        audio_offer: None,
+        negotiated_audio: None,
         extension_offer: None,
         extension_announce: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
@@ -1121,6 +1123,8 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         client_feature_flags: None,
         negotiated_color: None,
         negotiated_video: None,
+        audio_offer: None,
+        negotiated_audio: None,
         extension_offer: None,
         extension_announce: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
@@ -2057,6 +2061,21 @@ fn accepted_announce_encryption_flows_into_authenticated_play_start() {
             .get("encrypt_video")
             .is_none()
     );
+}
+
+#[test]
+fn accepted_audio_codec_requires_the_prepared_offer_and_reaches_start() {
+    use amaterasu_gamestream::sdp::AudioCodec;
+    let (mut record, mut announce) = announced_profile_record();
+    announce.audio.codec_accept = Some(AudioCodec::Ac3);
+    assert!(!record.accept_announce(&announce));
+    assert!(record.authenticated_start_payload(23).is_none());
+    record.audio_offer = Some(AudioCodec::Eac3);
+    assert!(!record.accept_announce(&announce));
+    record.audio_offer = Some(AudioCodec::Ac3);
+    assert!(record.accept_announce(&announce));
+    let payload = record.authenticated_start_payload(23).unwrap();
+    assert_eq!(payload["configuration"]["audio_codec"], "AC3");
 }
 
 #[cfg(target_os = "linux")]

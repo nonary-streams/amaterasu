@@ -71,6 +71,24 @@ pub struct Audio {
     pub channels: u32,
     pub channel_mask: u32,
     pub packet_duration_ms: u32,
+    /// Client's recognized optional codec acceptance. Parsing does not prove
+    /// that this codec was offered or accepted by the host.
+    pub codec_accept: Option<AudioCodec>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AudioCodec {
+    Ac3,
+    Eac3,
+}
+
+impl AudioCodec {
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Ac3 => "AC3",
+            Self::Eac3 => "EAC3",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

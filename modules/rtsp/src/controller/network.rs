@@ -100,6 +100,7 @@ impl Controller {
                     record.client_feature_flags = None;
                     record.negotiated_color = None;
                     record.negotiated_video = None;
+                    record.negotiated_audio = None;
                 }
             }
             Ok(NegotiationStep::Action {
@@ -116,6 +117,7 @@ impl Controller {
                 );
                 if !completed {
                     record.extension_announce = None;
+                    record.negotiated_audio = None;
                 }
             }
             Ok(NegotiationStep::Action {

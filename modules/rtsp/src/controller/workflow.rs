@@ -375,7 +375,7 @@ impl Controller {
             } else {
                 None
             };
-            let negotiation = if let Some(profile) = &profile {
+            let mut negotiation = if let Some(profile) = &profile {
                 let snapshot = amaterasu_contracts::media_profile::VideoProfileSnapshot {
                     profiles: vec![profile.clone()],
                 };
@@ -389,6 +389,20 @@ impl Controller {
                 Negotiation::new(launch, record.capabilities())
             }
             .map_err(|_| "invalid_prepare_response")?;
+            let audio_offer = match payload.get("audio_offer") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(value)) if record.config.stream_audio => match value.as_str() {
+                    "AC3" => Some(amaterasu_gamestream::sdp::AudioCodec::Ac3),
+                    "EAC3" => Some(amaterasu_gamestream::sdp::AudioCodec::Eac3),
+                    _ => return Err("invalid_audio_offer"),
+                },
+                _ => return Err("invalid_audio_offer"),
+            };
+            if let Some(codec) = audio_offer {
+                negotiation = negotiation
+                    .with_audio_offer(codec)
+                    .map_err(|_| "invalid_audio_offer")?;
+            }
             self.transport.as_mut().ok_or("disabled")?.add_ticket(
                 record.id,
                 record.config.peer_ip,
@@ -396,6 +410,7 @@ impl Controller {
             )?;
             record.session = Some(session);
             record.extension_offer = profile;
+            record.audio_offer = audio_offer;
             record.negotiation = Some(negotiation);
             record.needs_lookup = false;
             record.stream_state = Some("prepared".into());

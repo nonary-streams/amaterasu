@@ -966,6 +966,9 @@ pub struct StartConfigData {
     pub client_feature_flags: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuous_audio: Option<bool>,
+    /// Authenticated RTSP audio selection; accepted only against a prepared route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_codec: Option<String>,
     /// Optional PLAY snapshot; when present it must match the immutable
     /// encryption policy accepted during prepare.
     #[serde(default, skip_serializing_if = "Option::is_none")]
