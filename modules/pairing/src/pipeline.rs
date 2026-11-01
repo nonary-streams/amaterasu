@@ -1703,6 +1703,9 @@ impl Pipeline {
             | Operation::UpdateClientFeedbackGrants {
                 expected_revision, ..
             }
+            | Operation::UpdateClientClipboardGrants {
+                expected_revision, ..
+            }
             | Operation::SetPermissionMode {
                 expected_revision, ..
             } => Some(*expected_revision),

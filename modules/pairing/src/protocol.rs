@@ -126,6 +126,12 @@ pub enum Operation {
         grants: BTreeSet<FeedbackCapability>,
         expected_revision: u64,
     },
+    /// Independently opt a paired client into each clipboard direction.
+    UpdateClientClipboardGrants {
+        certificate_id: String,
+        grants: ClipboardGrants,
+        expected_revision: u64,
+    },
     SetPermissionMode {
         enabled: bool,
         expected_revision: u64,
@@ -206,7 +212,10 @@ impl Operation {
                 config_overrides,
                 expected_revision: _,
             } => hex_length(certificate_id, 32) && config_overrides.validate().is_ok(),
-            Self::UpdateClientPermissions { certificate_id, .. } => hex_length(certificate_id, 32),
+            Self::UpdateClientPermissions { certificate_id, .. }
+            | Self::UpdateClientClipboardGrants { certificate_id, .. } => {
+                hex_length(certificate_id, 32)
+            }
             Self::UpdateClientFeedbackGrants {
                 certificate_id,
                 grants,
@@ -238,6 +247,7 @@ impl Operation {
                 | Self::UpdateClientConfigOverrides { .. }
                 | Self::UpdateClientPermissions { .. }
                 | Self::UpdateClientFeedbackGrants { .. }
+                | Self::UpdateClientClipboardGrants { .. }
                 | Self::SetPermissionMode { .. }
         )
     }
@@ -264,6 +274,7 @@ impl Operation {
                 | Self::UpdateClientConfigOverrides { .. }
                 | Self::UpdateClientPermissions { .. }
                 | Self::UpdateClientFeedbackGrants { .. }
+                | Self::UpdateClientClipboardGrants { .. }
                 | Self::SetPermissionMode { .. }
         )
     }
@@ -299,6 +310,23 @@ pub struct Client {
     /// Explicit per-client opt-in; old clients have no extension grants.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub feedback_grants: BTreeSet<FeedbackCapability>,
+    /// Clipboard directions require explicit grant, including for legacy clients.
+    #[serde(default, skip_serializing_if = "ClipboardGrants::is_empty")]
+    pub clipboard_grants: ClipboardGrants,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClipboardGrants {
+    /// Host clipboard may be read by the client.
+    pub read: bool,
+    /// Client may write the host clipboard.
+    pub write: bool,
+}
+impl ClipboardGrants {
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.read && !self.write
+    }
 }
 
 /// Certificate-bound privileges. Missing legacy metadata retains full access.

@@ -4913,14 +4913,16 @@ fn real_broker_rejects_recovery_while_host_configuration_is_unavailable() {
 
 #[test]
 fn feedback_grant_and_controller_revocation_wait_for_lease_retirement() {
-    for change in ["grant", "controller"] {
+    for change in ["grant", "controller", "clipboard"] {
         let (mut pipeline, mut harness, certificate_id, epoch, source, scope) =
             authorized_feedback_for_test();
         let admitted = pipeline.apply_effect_request("input","input",json!({"action":"admit_stream_lease","epoch":epoch,"source":source,"scope":scope,"operation_id":"lease","sequence":1}),now()).unwrap();
         let write = if change == "grant" {
             json!({"action":"update_client_feedback_grants","certificate_id":certificate_id,"expected_revision":harness.revision,"grants":[]})
-        } else {
+        } else if change == "controller" {
             json!({"action":"update_client_config_overrides","certificate_id":certificate_id,"expected_revision":harness.revision,"config_overrides":{"controller":false}})
+        } else {
+            json!({"action":"update_client_clipboard_grants","certificate_id":certificate_id,"expected_revision":harness.revision,"grants":{"read":true,"write":false}})
         };
         let writes = harness.writes;
         harness.enqueue("console", write);
@@ -4968,7 +4970,9 @@ fn feedback_grant_and_controller_revocation_wait_for_lease_retirement() {
             .unwrap()
             .to_owned();
         let denied=pipeline.apply_effect_request("nvhttp","nvhttp",json!({"action":"bind_stream","epoch":next,"certificate_pem":CLIENT_CERT,"source":feedback_source_for_test("next"),"scope":scope}),now());
-        assert_eq!(denied, Err("scope_denied"), "{change}");
+        if change != "clipboard" {
+            assert_eq!(denied, Err("scope_denied"), "{change}");
+        }
     }
 }
 
@@ -5005,6 +5009,53 @@ fn granted_capability_cannot_expand_a_bound_stream_scope() {
     assert_eq!(denied, Err("stream_scope_denied"));
     assert_eq!(pipeline.effect_gate.as_ref().unwrap().in_flight(), 0);
     assert!(pipeline.apply_effect_request("input","input",json!({"action":"admit_stream_lease","epoch":epoch,"source":source,"scope":scope,"operation_id":"exact","sequence":1}),now()).is_ok());
+}
+
+#[test]
+fn clipboard_grants_are_admin_only_revision_checked_and_deny_by_default() {
+    let (mut pipeline, mut harness, certificate_id) = paired_native_client();
+    let listed = harness.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"list_clients"}),
+        now(),
+    );
+    assert!(listed["clients"][0].get("clipboard_grants").is_none());
+    let update = json!({"action":"update_client_clipboard_grants","certificate_id":certificate_id,
+        "expected_revision":harness.revision,"grants":{"read":true,"write":false}});
+    assert_eq!(
+        harness.request(&mut pipeline, "nvhttp", update.clone(), now())["code"],
+        "forbidden"
+    );
+    assert_eq!(
+        harness.request(&mut pipeline, "console", update.clone(), now())["ok"],
+        true
+    );
+    assert_eq!(
+        harness.request(&mut pipeline, "console", update, now())["code"],
+        "revision_conflict"
+    );
+    let listed = harness.request(
+        &mut pipeline,
+        "console",
+        json!({"action":"list_clients"}),
+        now(),
+    );
+    assert_eq!(
+        listed["clients"][0]["clipboard_grants"],
+        json!({"read":true,"write":false})
+    );
+    let mut restarted = Pipeline::new(settings());
+    let listed = harness.request(
+        &mut restarted,
+        "console",
+        json!({"action":"list_clients"}),
+        now(),
+    );
+    assert_eq!(
+        listed["clients"][0]["clipboard_grants"],
+        json!({"read":true,"write":false})
+    );
 }
 
 #[test]

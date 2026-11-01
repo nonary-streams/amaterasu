@@ -13,6 +13,10 @@ pub const INTERFACE_MINOR_PERMISSIONS: u32 = 1;
 pub const PERMISSION_LIST: u32 = 1;
 pub const PERMISSION_LAUNCH: u32 = 2;
 pub const PERMISSION_VIEW: u32 = 3;
+/// Explicit host-to-client clipboard permission; never implied by View or Launch.
+pub const PERMISSION_CLIPBOARD_READ: u32 = 4;
+/// Explicit client-to-host clipboard permission; never implied by View or Launch.
+pub const PERMISSION_CLIPBOARD_WRITE: u32 = 5;
 pub const MAX_MESSAGE_BYTES: usize = 65536;
 pub const MAX_CERTIFICATE_BYTES: usize = 8192;
 pub const MAX_SIGNATURE_BYTES: usize = 512;
@@ -51,7 +55,9 @@ pub struct IdentityApiV1_1 {
     /// policy synchronously. List is allowed by list, view or launch; view by
     /// view or launch. Returns STATUS_OK only when allowed, IDENTITY_UNTRUSTED
     /// for an invalid or unpaired certificate, IDENTITY_FORBIDDEN for a denied
-    /// permission, STATUS_INVALID_ARGUMENT for an unknown selector, and
+    /// permission. Clipboard selectors additionally require explicit per-client
+    /// grants even when general permission mode is disabled. Returns
+    /// STATUS_INVALID_ARGUMENT for an unknown selector, and
     /// IDENTITY_UNAVAILABLE when committed policy cannot be consulted. Callers
     /// must deny on every non-OK status and separately verify TLS possession.
     pub check_permission: unsafe extern "C" fn(*mut c_void, BorrowedBytes, u32) -> Status,

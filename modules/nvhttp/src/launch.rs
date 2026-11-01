@@ -1113,6 +1113,32 @@ impl Controller {
         matches.next().is_none().then_some(found)
     }
 
+    /// Resolve the unique ready launch session for an authenticated TLS peer.
+    /// The caller must separately check current purpose-specific permission and
+    /// obtain current connected-stream evidence and revocation-safe effect admission;
+    /// this borrowed launch evidence is neither a connected stream nor a grant.
+    pub(crate) fn paired_ready_session_for_certificate(
+        &self,
+        certificate: &[u8],
+    ) -> Option<&amaterasu_module_sdk::extension_api::LifecycleTarget> {
+        use amaterasu_module_sdk::extension_api::LifecycleTarget;
+        let mut matches = self.records.values().filter_map(|record| {
+            if !record.peer.paired()
+                || record.lifecycle_end_fenced
+                || record.state != State::Ready
+                || record.peer.certificate() != certificate
+            {
+                return None;
+            }
+            match record.lifecycle_session_target.as_ref()? {
+                target @ LifecycleTarget::Session { .. } => Some(target),
+                _ => None,
+            }
+        });
+        let found = matches.next()?;
+        matches.next().is_none().then_some(found)
+    }
+
     /// Management sees only opaque launch identities and cleanup state. This is
     /// separate from RTSP's ticket and stream-session's owner-bound handles.
     pub fn management_status(&self, reference: Option<&str>) -> Value {

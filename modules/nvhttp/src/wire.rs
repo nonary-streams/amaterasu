@@ -206,6 +206,16 @@ impl Router {
             .paired_lifecycle_session(host_epoch, session_id)
     }
 
+    /// Private TLS-peer-to-ready-launch evidence, never a stream or authorization grant.
+    #[allow(dead_code, reason = "consumed by the clipboard protocol adapter")]
+    pub(crate) fn paired_ready_session_for_certificate(
+        &self,
+        certificate: &[u8],
+    ) -> Option<&amaterasu_module_sdk::extension_api::LifecycleTarget> {
+        self.launches
+            .paired_ready_session_for_certificate(certificate)
+    }
+
     pub fn management_launch_status(&self, reference: Option<&str>) -> Value {
         self.launches.management_status(reference)
     }

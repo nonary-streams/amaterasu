@@ -39,6 +39,7 @@ fn document() -> Document {
             permissions: crate::protocol::ClientPermissions::default(),
             config_overrides: crate::protocol::ClientConfigOverrides::default(),
             feedback_grants: Default::default(),
+            clipboard_grants: Default::default(),
         }],
     }
 }
@@ -678,7 +679,63 @@ fn permission_api_reads_current_committed_certificate_policy() {
         .publish(3, Snapshot::prepare(&document, time()).unwrap())
         .unwrap();
     assert_eq!(check(PERMISSION_LAUNCH), STATUS_OK);
+    assert_eq!(check(PERMISSION_CLIPBOARD_READ), IDENTITY_FORBIDDEN);
+    assert_eq!(check(PERMISSION_CLIPBOARD_WRITE), IDENTITY_FORBIDDEN);
+    document.clients[0].clipboard_grants.read = true;
+    shared
+        .publish(4, Snapshot::prepare(&document, time()).unwrap())
+        .unwrap();
+    assert_eq!(check(PERMISSION_CLIPBOARD_READ), STATUS_OK);
+    assert_eq!(check(PERMISSION_CLIPBOARD_WRITE), IDENTITY_FORBIDDEN);
     shared.invalidate();
+    assert_eq!(check(PERMISSION_CLIPBOARD_READ), IDENTITY_UNAVAILABLE);
     assert_eq!(check(PERMISSION_LAUNCH), IDENTITY_UNAVAILABLE);
     unsafe { (api.v1_0.base.release.unwrap())(context) };
+}
+
+#[test]
+fn clipboard_directions_require_explicit_grants_even_in_legacy_permission_mode() {
+    let mut document = document();
+    let certificate = crypto_certificate_der(CLIENT_CERT);
+    let check = |document: &crate::protocol::Document, permission| {
+        Snapshot::prepare(document, time())
+            .unwrap()
+            .unwrap()
+            .check_permission(&certificate, time(), permission)
+    };
+    assert!(!document.permission_mode_enabled);
+    assert_eq!(check(&document, PERMISSION_VIEW), Ok(()));
+    assert_eq!(
+        check(&document, PERMISSION_CLIPBOARD_READ),
+        Err(IDENTITY_FORBIDDEN)
+    );
+    assert_eq!(
+        check(&document, PERMISSION_CLIPBOARD_WRITE),
+        Err(IDENTITY_FORBIDDEN)
+    );
+    document.clients[0].clipboard_grants.read = true;
+    assert_eq!(check(&document, PERMISSION_CLIPBOARD_READ), Ok(()));
+    assert_eq!(
+        check(&document, PERMISSION_CLIPBOARD_WRITE),
+        Err(IDENTITY_FORBIDDEN)
+    );
+    document.clients[0].clipboard_grants.read = false;
+    document.clients[0].clipboard_grants.write = true;
+    assert_eq!(
+        check(&document, PERMISSION_CLIPBOARD_READ),
+        Err(IDENTITY_FORBIDDEN)
+    );
+    assert_eq!(check(&document, PERMISSION_CLIPBOARD_WRITE), Ok(()));
+    document.permission_mode_enabled = true;
+    document.clients[0].permissions.view_streams = false;
+    document.clients[0].permissions.launch_apps = false;
+    assert_eq!(
+        check(&document, PERMISSION_CLIPBOARD_WRITE),
+        Err(IDENTITY_FORBIDDEN)
+    );
+    document.clients.clear();
+    assert_eq!(
+        check(&document, PERMISSION_CLIPBOARD_WRITE),
+        Err(IDENTITY_UNTRUSTED)
+    );
 }

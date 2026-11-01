@@ -86,6 +86,7 @@ struct CertificateRecord {
     permissions: crate::protocol::ClientPermissions,
     feedback_grants:
         std::collections::BTreeSet<amaterasu_module_sdk::effect_authority::FeedbackCapability>,
+    clipboard_grants: crate::protocol::ClipboardGrants,
     controller: Option<bool>,
 }
 impl CertificateRecord {
@@ -98,6 +99,7 @@ impl CertificateRecord {
             der,
             permissions: crate::protocol::ClientPermissions::default(),
             feedback_grants: Default::default(),
+            clipboard_grants: Default::default(),
             controller: None,
             not_before: certificate
                 .tbs_certificate
@@ -195,6 +197,7 @@ impl Snapshot {
                 )?;
                 record.permissions = client.permissions;
                 record.feedback_grants = client.feedback_grants.clone();
+                record.clipboard_grants = client.clipboard_grants;
                 record.controller = client.config_overrides.controller;
                 Ok(record)
             })
@@ -214,7 +217,11 @@ impl Snapshot {
     pub fn check_permission(&self, der: &[u8], now: u64, permission: u32) -> Result<(), Status> {
         if !matches!(
             permission,
-            PERMISSION_LIST | PERMISSION_LAUNCH | PERMISSION_VIEW
+            PERMISSION_LIST
+                | PERMISSION_LAUNCH
+                | PERMISSION_VIEW
+                | PERMISSION_CLIPBOARD_READ
+                | PERMISSION_CLIPBOARD_WRITE
         ) {
             return Err(amaterasu_module_sdk::abi::STATUS_INVALID_ARGUMENT);
         }
@@ -224,13 +231,20 @@ impl Snapshot {
             .find(|client| client.der == der && client.valid(now))
             .ok_or(IDENTITY_UNTRUSTED)?;
         let p = client.permissions;
-        let allowed = !self.permission_mode_enabled
-            || match permission {
-                PERMISSION_LIST => p.list_apps || p.view_streams || p.launch_apps,
-                PERMISSION_VIEW => p.view_streams || p.launch_apps,
-                PERMISSION_LAUNCH => p.launch_apps,
-                _ => unreachable!(),
-            };
+        let view_allowed = !self.permission_mode_enabled || p.view_streams || p.launch_apps;
+        let allowed = match permission {
+            PERMISSION_CLIPBOARD_READ => view_allowed && client.clipboard_grants.read,
+            PERMISSION_CLIPBOARD_WRITE => view_allowed && client.clipboard_grants.write,
+            _ => {
+                !self.permission_mode_enabled
+                    || match permission {
+                        PERMISSION_LIST => p.list_apps || p.view_streams || p.launch_apps,
+                        PERMISSION_VIEW => p.view_streams || p.launch_apps,
+                        PERMISSION_LAUNCH => p.launch_apps,
+                        _ => unreachable!(),
+                    }
+            }
+        };
         if allowed {
             Ok(())
         } else {

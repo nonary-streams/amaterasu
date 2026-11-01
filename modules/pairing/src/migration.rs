@@ -89,6 +89,7 @@ pub fn import_legacy_pairing(
             permissions: crate::protocol::ClientPermissions::default(),
             config_overrides: crate::protocol::ClientConfigOverrides::default(),
             feedback_grants: Default::default(),
+            clipboard_grants: Default::default(),
         });
     }
 

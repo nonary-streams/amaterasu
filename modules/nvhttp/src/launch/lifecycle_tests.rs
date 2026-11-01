@@ -585,3 +585,35 @@ fn pairing_evidence_separates_peers_and_rejects_ambiguous_sessions() {
     assert_eq!(*certificate, [2; 32]);
     assert_eq!(serde_json::to_value(target).unwrap()["generation"], 5);
 }
+
+#[test]
+fn clipboard_session_evidence_requires_unique_ready_owned_session() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let target = json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":3});
+    let record = controller.records.values_mut().next().unwrap();
+    record.lifecycle_session_target = serde_json::from_value(target.clone()).ok();
+    assert!(controller.paired_ready_session_for_certificate(&[1; 32]).is_none());
+    controller.records.values_mut().next().unwrap().state = State::Ready;
+    assert_eq!(serde_json::to_value(controller.paired_ready_session_for_certificate(&[1;32]).unwrap()).unwrap(), target);
+    assert!(controller.paired_ready_session_for_certificate(&[2;32]).is_none());
+    controller.records.values_mut().next().unwrap().lifecycle_end_fenced = true;
+    assert!(controller.paired_ready_session_for_certificate(&[1;32]).is_none());
+    let first_id = *controller.records.keys().next().unwrap();
+    {
+        let first = controller.records.get_mut(&first_id).unwrap();
+        first.lifecycle_end_fenced = false;
+        first.state = State::Stopped;
+    }
+    let mut second_request = request(1);
+    second_request.remote_input_key = [2; 16];
+    assert!(controller.launch(11, second_request, peer(2), now).is_none());
+    let second_id = *controller.records.keys().find(|id| **id != first_id).unwrap();
+    controller.records.get_mut(&first_id).unwrap().state = State::Ready;
+    let second = controller.records.get_mut(&second_id).unwrap();
+    second.peer.certificate = vec![1; 32];
+    second.state = State::Ready;
+    second.lifecycle_session_target = serde_json::from_value(json!({"kind":"session","host_epoch":"epoch","session_id":"second","generation":4})).ok();
+    assert!(controller.paired_ready_session_for_certificate(&[1; 32]).is_none());
+}

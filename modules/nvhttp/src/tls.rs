@@ -132,6 +132,12 @@ fn permission_revoked(status: Status) -> bool {
     )
 }
 
+#[allow(dead_code, reason = "consumed by the clipboard protocol adapter")]
+pub(crate) enum ClipboardAccess {
+    Read,
+    Write,
+}
+
 pub struct Identity {
     bridge: Arc<Bridge>,
     binding: Option<NativeBinding>,
@@ -180,6 +186,17 @@ impl Identity {
         self.bridge
             .permission_status(certificate, amaterasu_identity::PERMISSION_VIEW)
             == STATUS_OK
+    }
+
+    /// Check an explicit clipboard direction against the current paired client.
+    /// Session ownership and serialized admission remain separate requirements.
+    #[allow(dead_code, reason = "consumed by the clipboard protocol adapter")]
+    pub(crate) fn clipboard_allowed(&self, certificate: &[u8], access: ClipboardAccess) -> bool {
+        let selector = match access {
+            ClipboardAccess::Read => amaterasu_identity::PERMISSION_CLIPBOARD_READ,
+            ClipboardAccess::Write => amaterasu_identity::PERMISSION_CLIPBOARD_WRITE,
+        };
+        self.bridge.permission_status(certificate, selector) == STATUS_OK
     }
 
     pub fn allowed(&self, certificate: &[u8], permission: crate::wire::Permission) -> bool {
