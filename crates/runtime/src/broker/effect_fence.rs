@@ -5,7 +5,8 @@ use amaterasu_contracts::{
     Response, RuntimeConfig,
     effect_fence::{
         EffectFencePolicy, EffectScope, GuardedEffect, GuardedEffectIdentity,
-        HostProviderRetirement, ProtectedMethod, ProviderIncarnation, SourceSlotLease,
+        HostProviderInstanceRetirement, HostProviderRetirement, ProtectedMethod,
+        ProviderIncarnation, SourceSlotLease,
     },
     valid_name,
 };
@@ -154,6 +155,11 @@ impl EffectFences {
     pub fn authority_name(&self) -> Option<&str> {
         self.policy.as_ref().map(|policy| policy.authority.as_str())
     }
+    pub fn requires_handoff(&self) -> bool {
+        self.policy
+            .as_ref()
+            .is_some_and(|policy| policy.require_handoff)
+    }
     pub fn provider_unavailable(&self, provider: &str) -> bool {
         self.joined_providers.contains_key(provider) || self.retiring_providers.contains(provider)
     }
@@ -272,6 +278,27 @@ impl EffectFences {
             receipt.issued_lease.slot,
             receipt.effect.sequence,
         )) == Some(receipt)
+    }
+    pub fn host_provider_instance_receipt(
+        &self,
+        provider: &str,
+        incarnation: &ProviderIncarnation,
+    ) -> Response {
+        if self.joined_providers.get(provider) != Some(incarnation) {
+            return Response::error("effect_pending", "provider worker is not joined");
+        }
+        let Some(slots) = &self.slots else {
+            return Response::error("unsupported", "source slots are not configured");
+        };
+        Response::Result {
+            payload: serde_json::to_value(HostProviderInstanceRetirement {
+                version: 1,
+                broker_epoch: slots.epoch().to_owned(),
+                provider: provider.to_owned(),
+                provider_incarnation: incarnation.clone(),
+            })
+            .expect("instance receipt serializes"),
+        }
     }
     pub fn host_provider_slot_receipts(
         &self,
@@ -690,6 +717,20 @@ impl EffectFences {
             },
         );
         Response::Ok
+    }
+    pub fn contains_effect(&self, effect: &GuardedEffect) -> bool {
+        self.sources
+            .get(&effect.scope)
+            .is_some_and(|source| source.records.contains_key(&effect.sequence))
+    }
+    pub fn rollback_new_arm(&mut self, effect: &GuardedEffect) {
+        if let Some(source) = self.sources.get_mut(&effect.scope)
+            && source.records.get(&effect.sequence).is_some_and(|record| {
+                record.effect.as_ref() == Some(effect) && record.request.is_none() && !record.fenced
+            })
+        {
+            source.records.remove(&effect.sequence);
+        }
     }
     pub fn may_dispatch(
         &mut self,
@@ -1138,6 +1179,7 @@ fn validate_policy(config: &RuntimeConfig, policy: &EffectFencePolicy) -> Result
         || !valid_name(&policy.issuer)
         || policy.authority == policy.issuer
         || (policy.source_slots && !config.host_lifecycle_control)
+        || (policy.require_handoff && !policy.source_slots)
         || !config.principals.contains_key(&policy.authority)
         || !config.principals.contains_key(&policy.issuer)
         || policy.methods.is_empty()
@@ -1145,6 +1187,24 @@ fn validate_policy(config: &RuntimeConfig, policy: &EffectFencePolicy) -> Result
         || policy.cleanup_methods.len() > 64
     {
         return Err("invalid effect fence policy".into());
+    }
+    if policy.require_handoff {
+        let service = "amaterasu.pairing-effects/1";
+        let selected = config
+            .service_selections
+            .broker
+            .get(service)
+            .and_then(Option::as_ref);
+        if !config.principals[&policy.issuer].call.contains(service)
+            || !config.principals[&policy.authority]
+                .provide
+                .contains(service)
+            || !selected.is_some_and(|selection| {
+                selection.provider == policy.authority && selection.contract == service
+            })
+        {
+            return Err("atomic handoff requires the selected pairing authority service".into());
+        }
     }
     let mut keys = BTreeSet::new();
     for ProtectedMethod {

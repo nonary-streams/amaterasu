@@ -10,6 +10,8 @@ amaterasu-abi.workspace = true
 amaterasu-contracts.workspace = true
 getrandom.workspace = true
 serde_json.workspace = true
+base64 = "0.22"
+sha2.workspace = true
 [lints]
 workspace = true
 

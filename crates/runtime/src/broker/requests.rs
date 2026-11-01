@@ -1,5 +1,7 @@
 use amaterasu_contracts::{ApiSchema, Grants, Response, valid_name};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
@@ -33,6 +35,7 @@ struct RequestRecord {
     result: Option<Response>,
     delivered: bool,
     separate_retry: bool,
+    committed_admission: bool,
 }
 
 struct UncertainStateWrite {
@@ -429,6 +432,7 @@ impl RequestRouter {
                 result: None,
                 delivered: false,
                 separate_retry,
+                committed_admission: false,
             },
         );
 
@@ -655,6 +659,125 @@ impl RequestRouter {
         Response::Ok
     }
 
+    pub fn protocol_handoff_request_matches(
+        &self,
+        provider: &str,
+        issuer: &str,
+        id: u64,
+        effect: &amaterasu_contracts::effect_fence::GuardedEffect,
+        selected_provider: &str,
+        expected_entry: &Value,
+    ) -> bool {
+        let Some(request) = self.requests.get(&id) else {
+            return false;
+        };
+        let body = &request.options.payload;
+        let expected_source = serde_json::to_value(&effect.scope.source).ok();
+        let Some(bytes) = body
+            .get("payload")
+            .and_then(|value| serde_json::from_value::<Vec<u8>>(value.clone()).ok())
+            .filter(|bytes| bytes.len() <= 2048)
+        else {
+            return false;
+        };
+        let Some(context) = body.pointer("/effect/context") else {
+            return false;
+        };
+        let source = &effect.scope.source;
+        if context.get("authority_epoch").and_then(Value::as_str)
+            != Some(effect.scope.authority_epoch.as_str())
+            || context.get("effect_owner_epoch").and_then(Value::as_str)
+                != Some(source.effect_owner_epoch.as_str())
+            || context.get("peer_ref").and_then(Value::as_str) != Some(source.id.as_str())
+            || context.pointer("/target/kind").and_then(Value::as_str) != Some("stream")
+            || context
+                .pointer("/target/host_epoch")
+                .and_then(Value::as_str)
+                != Some(source.host_epoch.as_str())
+            || context
+                .pointer("/target/session_id")
+                .and_then(Value::as_str)
+                != Some(source.session_id.as_str())
+            || context.pointer("/target/stream_id").and_then(Value::as_str)
+                != Some(source.stream_id.as_str())
+            || context
+                .pointer("/target/generation")
+                .and_then(Value::as_u64)
+                != Some(source.stream_generation)
+        {
+            return false;
+        }
+        let Some(message_type) = body
+            .pointer("/effect/message_type")
+            .and_then(Value::as_u64)
+            .filter(|value| u16::try_from(*value).is_ok())
+        else {
+            return false;
+        };
+        if format!("{:x}", Sha256::digest(&bytes)) != effect.payload_sha256
+            || effect.payload
+                != serde_json::json!({"context":context,"capability":effect.capability,"message_type":message_type,"payload_base64":STANDARD.encode(bytes)})
+        {
+            return false;
+        }
+        request.provider == provider
+            && request.caller == issuer
+            && request.authority.initiator == issuer
+            && request.options.service == "amaterasu.pairing-effects/1"
+            && request.options.parent.is_none()
+            && request.options.response_schema.is_none()
+            && request.delivered
+            && request.result.is_none()
+            && body.get("action").and_then(Value::as_str) == Some("admit_protocol_effect_v2")
+            && body.get("version").and_then(Value::as_u64) == Some(2)
+            && body.get("epoch").and_then(Value::as_str)
+                == Some(effect.scope.authority_epoch.as_str())
+            && body.get("source") == expected_source.as_ref()
+            && body.get("sequence").and_then(Value::as_u64) == Some(effect.sequence)
+            && body.get("cleanup") == expected_entry.get("cleanup")
+            && body.pointer("/effect/caller").and_then(Value::as_str) == Some(issuer)
+            && body.pointer("/effect/issuer_epoch").and_then(Value::as_str)
+                == Some(effect.scope.issuer_epoch.as_str())
+            && body.pointer("/effect/operation_id").and_then(Value::as_str)
+                == Some(effect.operation_id.as_str())
+            && body.pointer("/effect/capability").and_then(Value::as_str)
+                == Some(effect.capability.as_str())
+            && body.pointer("/effect/provider").and_then(Value::as_str) == Some(selected_provider)
+            && body
+                .pointer("/effect/method/service")
+                .and_then(Value::as_str)
+                == Some(effect.service.as_str())
+            && body
+                .pointer("/effect/method/method")
+                .and_then(Value::as_str)
+                == Some(effect.method.as_str())
+            && body
+                .pointer("/effect/method/interface_major")
+                .and_then(Value::as_u64)
+                == Some(u64::from(effect.interface_major))
+            && body
+                .pointer("/effect/method/interface_minor")
+                .and_then(Value::as_u64)
+                == Some(u64::from(effect.interface_minor))
+            && body
+                .pointer("/effect/method/schema_revision")
+                .and_then(Value::as_u64)
+                == Some(u64::from(effect.schema_revision))
+            && body
+                .pointer("/effect/payload_sha256")
+                .and_then(Value::as_str)
+                == Some(effect.payload_sha256.as_str())
+            && body.pointer("/effect/timeout_ms").and_then(Value::as_u64) == Some(effect.timeout_ms)
+            && body.pointer("/effect/parent") == Some(&serde_json::json!(effect.parent))
+    }
+
+    pub fn mark_committed_admission(&mut self, request_id: u64) {
+        self.requests
+            .get_mut(&request_id)
+            .expect("atomic handoff retains request")
+            .committed_admission = true;
+    }
+
     /// A protected retry may report an existing admission only while the
     /// ordinary request record still exists; it must never enqueue a second call.
     pub fn retained(&self, caller: &str, request_id: u64) -> bool {
@@ -679,6 +802,12 @@ impl RequestRouter {
         };
         if request.caller != caller {
             return permission_denied();
+        }
+        if request.committed_admission {
+            return Response::error(
+                "effect_admission_uncertain",
+                "admission committed; explicit fencing and retirement are required",
+            );
         }
         if request.result.is_none() {
             if request.uncertain_state_mutation() {

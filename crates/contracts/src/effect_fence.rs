@@ -48,6 +48,26 @@ pub struct HostProviderRetirement {
     pub effect: GuardedEffectIdentity,
 }
 
+/// Host-confirmed retirement of all local work in one provider incarnation.
+/// This does not prove issuer retirement or cleanup of external effects.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostProviderInstanceRetirement {
+    pub version: u8,
+    pub broker_epoch: String,
+    pub provider: String,
+    pub provider_incarnation: ProviderIncarnation,
+}
+
+impl HostProviderInstanceRetirement {
+    pub fn state_key(&self) -> String {
+        format!(
+            "host/provider-retirement/v1/{}/{}",
+            self.broker_epoch, self.provider_incarnation.id
+        )
+    }
+}
+
 impl HostProviderRetirement {
     /// Stable per-effect host namespace key; the slot incarnation cannot be
     /// reused before durable retirement and the sequence is source-local.
@@ -73,6 +93,10 @@ pub struct EffectFencePolicy {
     /// and every new broker starts closed until authority recovery.
     #[serde(default, skip_serializing_if = "is_false")]
     pub source_slots: bool,
+    /// Require a broker-atomic authority-request handoff for slotted admission.
+    /// Disabled for legacy compositions; production protocol routes must opt in.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub require_handoff: bool,
     pub methods: Vec<ProtectedMethod>,
     /// Only explicitly selected cleanup methods remain directly callable on a
     /// protected service, and still require normal API approvals and grants.
@@ -250,6 +274,15 @@ pub enum EffectFenceCommand {
         effect: GuardedEffect,
         expected: Box<SelectedEffectMethod>,
     },
+    /// Atomically validate and complete the live issuer authority request while
+    /// arming its exact journaled effect. Must be wrapped in SlotCommand.
+    CommitAdmission {
+        request: u64,
+        effect: GuardedEffect,
+        expected: Box<SelectedEffectMethod>,
+        expected_entry: Value,
+        state_request: u64,
+    },
     Dispatch {
         effect: GuardedEffect,
     },
@@ -319,6 +352,12 @@ pub enum EffectFenceCommand {
         provider: String,
         provider_incarnation: ProviderIncarnation,
     },
+    /// Produce an instance-wide receipt only after the host joined this exact
+    /// provider instance; no per-effect broker record is required.
+    HostProviderInstanceReceipt {
+        provider: String,
+        provider_incarnation: ProviderIncarnation,
+    },
     /// Reserved host endpoint: stop admission and cancel undelivered work
     /// before polling the exact provider's optional retirement capability.
     HostProviderRetiring {
@@ -363,6 +402,17 @@ pub enum EffectFenceCommand {
         expected_entry: Value,
         state_request: u64,
         /// Retained selected-State Get in the reserved host namespace.
+        host_receipt_state_request: u64,
+    },
+    /// Recover a possibly executed journal entry using the exact original
+    /// provider incarnation's durable host retirement record. External cleanup
+    /// must still be independently confirmed before compaction.
+    HostRecoverHistoricalInstance {
+        lease: SourceSlotLease,
+        receipt: Box<HostProviderInstanceRetirement>,
+        identity: Box<GuardedEffectIdentity>,
+        expected_entry: Value,
+        state_request: u64,
         host_receipt_state_request: u64,
     },
     /// After durable source/slot retirement and compaction, release the source

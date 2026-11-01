@@ -160,6 +160,9 @@ pub struct LoadedComponents {
         amaterasu_contracts::effect_fence::ProviderIncarnation,
     )>,
     retirement_state_provider: Option<String>,
+    pending_retirement_persistence:
+        BTreeMap<String, amaterasu_contracts::effect_fence::ProviderIncarnation>,
+    unconfirmed_retirements: BTreeSet<String>,
 }
 
 impl Drop for LoadedComponents {
@@ -347,6 +350,8 @@ impl LoadedComponents {
             runtime,
             retirement_providers: Vec::new(),
             retirement_state_provider: None,
+            pending_retirement_persistence: BTreeMap::new(),
+            unconfirmed_retirements: BTreeSet::new(),
         };
         progress(1)?;
         for (index, component) in components.into_iter().enumerate() {
@@ -373,9 +378,18 @@ impl LoadedComponents {
         &mut self,
         deadline: std::time::Instant,
     ) -> PackageResult<()> {
-        use amaterasu_contracts::effect_fence::EffectFenceCommand;
         let providers = self.retirement_providers.clone();
-        let mut failures = false;
+        let mut failures = !self.unconfirmed_retirements.is_empty();
+        for (provider, incarnation) in self.pending_retirement_persistence.clone() {
+            if self
+                .confirm_and_persist_retirement(&provider, &incarnation, deadline)
+                .is_ok()
+            {
+                self.pending_retirement_persistence.remove(&provider);
+            } else {
+                failures = true;
+            }
+        }
         // Preserve the same reverse dependency order as ordinary destruction.
         // In particular, no consumer can retain a native provider guard when
         // that provider's checked destructor is invoked.
@@ -398,20 +412,24 @@ impl LoadedComponents {
                 || self.retirement_state_provider.as_deref() == Some(&provider)
             {
                 failures = true;
+                self.unconfirmed_retirements.insert(provider.clone());
                 drop(module);
                 continue;
             }
             let command = Command::EffectFence {
-                command: Box::new(EffectFenceCommand::HostProviderRetiring {
-                    provider: provider.clone(),
-                    provider_incarnation: incarnation.clone(),
-                }),
+                command: Box::new(
+                    amaterasu_contracts::effect_fence::EffectFenceCommand::HostProviderRetiring {
+                        provider: provider.clone(),
+                        provider_incarnation: incarnation.clone(),
+                    },
+                ),
             };
             if !matches!(
                 crate::worker::invoke(&self.lifecycle_endpoint, &command),
                 Ok(Response::Ok)
             ) {
                 failures = true;
+                self.unconfirmed_retirements.insert(provider.clone());
                 drop(module);
                 continue;
             }
@@ -437,6 +455,7 @@ impl LoadedComponents {
             if !joined {
                 module.retirement_failed = true;
                 failures = true;
+                self.unconfirmed_retirements.insert(provider.clone());
                 drop(module);
                 continue;
             }
@@ -444,27 +463,18 @@ impl LoadedComponents {
             // panic. Only its explicit success can support a host receipt.
             if module.destroy_retired().is_err() || std::time::Instant::now() >= deadline {
                 failures = true;
+                self.unconfirmed_retirements.insert(provider.clone());
                 drop(module);
                 continue;
             }
-            let command = Command::EffectFence {
-                command: Box::new(EffectFenceCommand::HostProviderJoined {
-                    provider: provider.clone(),
-                    provider_incarnation: incarnation.clone(),
-                }),
-            };
-            if !matches!(
-                crate::worker::invoke(&self.lifecycle_endpoint, &command),
-                Ok(Response::Ok)
-            ) {
-                failures = true;
-                drop(module);
-                continue;
-            }
+            self.pending_retirement_persistence
+                .insert(provider.clone(), incarnation.clone());
             if self
-                .persist_provider_retirements(&provider, &incarnation, deadline)
-                .is_err()
+                .confirm_and_persist_retirement(&provider, &incarnation, deadline)
+                .is_ok()
             {
+                self.pending_retirement_persistence.remove(&provider);
+            } else {
                 failures = true;
             }
             drop(module);
@@ -474,6 +484,29 @@ impl LoadedComponents {
         } else {
             Ok(())
         }
+    }
+
+    fn confirm_and_persist_retirement(
+        &mut self,
+        provider: &str,
+        incarnation: &amaterasu_contracts::effect_fence::ProviderIncarnation,
+        deadline: std::time::Instant,
+    ) -> PackageResult<()> {
+        let command = Command::EffectFence {
+            command: Box::new(
+                amaterasu_contracts::effect_fence::EffectFenceCommand::HostProviderJoined {
+                    provider: provider.into(),
+                    provider_incarnation: incarnation.clone(),
+                },
+            ),
+        };
+        if !matches!(
+            crate::worker::invoke(&self.lifecycle_endpoint, &command),
+            Ok(Response::Ok)
+        ) {
+            return Err("provider join confirmation unavailable".into());
+        }
+        self.persist_provider_retirements(provider, incarnation, deadline)
     }
 
     fn tick_retirement_state_provider(&mut self) -> PackageResult<()> {
@@ -521,6 +554,10 @@ impl LoadedComponents {
                 Response::Pending => std::thread::sleep(crate::timing::TICK_INTERVAL),
                 Response::Result { payload } => {
                     if payload.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+                        let _ = crate::worker::invoke(
+                            &self.lifecycle_endpoint,
+                            &Command::ReleaseResult { request: id },
+                        );
                         return Err("retirement State operation failed".into());
                     }
                     if !retain
@@ -547,7 +584,28 @@ impl LoadedComponents {
         incarnation: &amaterasu_contracts::effect_fence::ProviderIncarnation,
         deadline: std::time::Instant,
     ) -> PackageResult<()> {
-        use amaterasu_contracts::effect_fence::{EffectFenceCommand, HostProviderRetirement};
+        use amaterasu_contracts::effect_fence::{
+            EffectFenceCommand, HostProviderInstanceRetirement, HostProviderRetirement,
+        };
+        let command = Command::EffectFence {
+            command: Box::new(EffectFenceCommand::HostProviderInstanceReceipt {
+                provider: provider.into(),
+                provider_incarnation: incarnation.clone(),
+            }),
+        };
+        let Response::Result {
+            payload: instance_value,
+        } = crate::worker::invoke(&self.lifecycle_endpoint, &command)?
+        else {
+            return Err("provider instance retirement receipt unavailable".into());
+        };
+        let instance: HostProviderInstanceRetirement =
+            serde_json::from_value(instance_value.clone())
+                .map_err(|_| "invalid provider instance retirement receipt")?;
+        if instance.provider != provider || instance.provider_incarnation != *incarnation {
+            return Err("provider instance retirement differs".into());
+        }
+        self.persist_retirement_record(&instance.state_key(), &instance_value, deadline)?;
         for slot in 0..64_u8 {
             let mut after_sequence = None;
             loop {
@@ -586,33 +644,43 @@ impl LoadedComponents {
                     return Err("inconsistent retirement receipt page".into());
                 }
                 after_sequence = Some(receipt.effect.sequence);
-                let key = receipt.state_key();
-                let (lookup, read) = self.retirement_state_request(
-                    json!({"action":"get","key":key}),
-                    deadline,
-                    true,
-                )?;
-                let revision = lookup
-                    .get("revision")
-                    .and_then(serde_json::Value::as_u64)
-                    .ok_or("invalid State revision")?;
-                match lookup.get("found").and_then(serde_json::Value::as_bool) {
-                    Some(false) => {
-                        self.retirement_state_request(json!({"action":"set","key":key,"value":receipt,"expected_revision":revision}), deadline, false)?;
-                    }
-                    Some(true) if lookup.get("value") == Some(value) => {}
-                    _ => return Err("conflicting saved retirement receipt".into()),
-                }
-                if !matches!(
-                    crate::worker::invoke(
-                        &self.lifecycle_endpoint,
-                        &Command::ReleaseResult { request: read }
-                    )?,
-                    Response::Ok
-                ) {
-                    return Err("retirement State read release failed".into());
-                }
+                self.persist_retirement_record(&receipt.state_key(), value, deadline)?;
             }
+        }
+        Ok(())
+    }
+
+    fn persist_retirement_record(
+        &mut self,
+        key: &str,
+        value: &serde_json::Value,
+        deadline: std::time::Instant,
+    ) -> PackageResult<()> {
+        let (lookup, read) =
+            self.retirement_state_request(json!({"action":"get","key":key}), deadline, true)?;
+        let revision = lookup
+            .get("revision")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or("invalid State revision")?;
+        match lookup.get("found").and_then(serde_json::Value::as_bool) {
+            Some(false) => {
+                self.retirement_state_request(
+                    json!({"action":"set","key":key,"value":value,"expected_revision":revision}),
+                    deadline,
+                    false,
+                )?;
+            }
+            Some(true) if lookup.get("value") == Some(value) => {}
+            _ => return Err("conflicting saved retirement receipt".into()),
+        }
+        if !matches!(
+            crate::worker::invoke(
+                &self.lifecycle_endpoint,
+                &Command::ReleaseResult { request: read }
+            )?,
+            Response::Ok
+        ) {
+            return Err("retirement State read release failed".into());
         }
         Ok(())
     }

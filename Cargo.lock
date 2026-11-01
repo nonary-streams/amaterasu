@@ -783,10 +783,12 @@ dependencies = [
  "amaterasu-gamestream",
  "amaterasu-module-sdk",
  "amaterasu-state",
+ "base64 0.22.1",
  "getrandom 0.3.4",
  "libloading",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]

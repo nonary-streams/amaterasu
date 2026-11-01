@@ -44,10 +44,47 @@ const MAX_LOG_MESSAGE_BYTES: usize = 7_500;
 const MAX_LOG_PATH_BYTES: usize = 4096;
 
 fn host_retirement_state_request(payload: &serde_json::Value) -> bool {
-    use amaterasu_contracts::effect_fence::HostProviderRetirement;
+    use amaterasu_contracts::effect_fence::{
+        HostProviderInstanceRetirement, HostProviderRetirement,
+    };
     let Some(key) = payload.get("key").and_then(serde_json::Value::as_str) else {
         return false;
     };
+    if let Some(suffix) = key.strip_prefix("host/provider-retirement/v1/") {
+        let mut parts = suffix.split('/');
+        let hex_id = |value: &str| {
+            value.len() == 32
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        if !parts.next().is_some_and(hex_id)
+            || !parts.next().is_some_and(hex_id)
+            || parts.next().is_some()
+        {
+            return false;
+        }
+        return match payload.get("action").and_then(serde_json::Value::as_str) {
+            Some("get") => true,
+            Some("set") => {
+                payload
+                    .get("expected_revision")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some()
+                    && payload
+                        .get("value")
+                        .and_then(|v| {
+                            serde_json::from_value::<HostProviderInstanceRetirement>(v.clone()).ok()
+                        })
+                        .is_some_and(|receipt| {
+                            receipt.version == 1
+                                && receipt.provider_incarnation.version == 1
+                                && receipt.state_key() == key
+                        })
+            }
+            _ => false,
+        };
+    }
     if let Some(suffix) = key.strip_prefix("host/effect-retirement/v2/") {
         let mut parts = suffix.split('/');
         let Some(slot) = parts
@@ -245,7 +282,7 @@ impl Broker {
                 }
                 Command::TakeResult { request } => self.requests.result(caller, request),
                 Command::ReleaseResult { request } => self.requests.release(caller, request),
-                Command::EffectFence { command } if matches!(&*command, amaterasu_contracts::effect_fence::EffectFenceCommand::BrokerEpoch {} | amaterasu_contracts::effect_fence::EffectFenceCommand::RecoveryRetired { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::SourceRetired { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostProviderJoined { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostProviderRetiring { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostProviderSlotReceipts { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostProviderSlotReceiptsPage { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostRetirementReceipt { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostRecoverHistorical { .. }) => self.handle_effect_fence(caller, *command, now),
+                Command::EffectFence { command } if matches!(&*command, amaterasu_contracts::effect_fence::EffectFenceCommand::BrokerEpoch {} | amaterasu_contracts::effect_fence::EffectFenceCommand::RecoveryRetired { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::SourceRetired { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostProviderJoined { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostProviderInstanceReceipt { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostRecoverHistoricalInstance { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostProviderRetiring { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostProviderSlotReceipts { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostProviderSlotReceiptsPage { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostRetirementReceipt { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostRecoverHistorical { .. }) => self.handle_effect_fence(caller, *command, now),
                 _ => errors::permission_denied(),
             };
         }
@@ -731,6 +768,23 @@ impl Broker {
                     after_sequence,
                 )
             }
+            EffectFenceCommand::HostProviderInstanceReceipt {
+                provider,
+                provider_incarnation,
+            } => {
+                if caller != HOST_LIFECYCLE_CONTROL_PRINCIPAL
+                    || self
+                        .configuration
+                        .host_context
+                        .provider_incarnations
+                        .get(&provider)
+                        != Some(&provider_incarnation)
+                {
+                    return errors::permission_denied();
+                }
+                self.effect_fences
+                    .host_provider_instance_receipt(&provider, &provider_incarnation)
+            }
             EffectFenceCommand::HostProviderJoined {
                 provider,
                 provider_incarnation,
@@ -886,6 +940,82 @@ impl Broker {
                     &expected_entry,
                 )
             }
+            EffectFenceCommand::HostRecoverHistoricalInstance {
+                lease,
+                receipt,
+                identity,
+                expected_entry,
+                state_request,
+                host_receipt_state_request,
+            } => {
+                if caller != HOST_LIFECYCLE_CONTROL_PRINCIPAL {
+                    return errors::permission_denied();
+                }
+                if !self.effect_fences.slot_valid(&lease, &identity.scope)
+                    || !self.effect_fences.recovery_only(&identity.scope)
+                {
+                    return Response::error("stale_source_slot", "source is not in recovery");
+                }
+                if receipt.version != 1
+                    || receipt.provider != identity.provider
+                    || receipt.provider_incarnation.version != 1
+                    || expected_entry
+                        .pointer("/issued_lease/broker_epoch")
+                        .and_then(serde_json::Value::as_str)
+                        != Some(receipt.broker_epoch.as_str())
+                    || serde_json::to_value(&receipt.provider_incarnation)
+                        .ok()
+                        .as_ref()
+                        != expected_entry.get("provider_incarnation")
+                {
+                    return Response::error("effect_conflict", "host instance retirement differs");
+                }
+                let Some(Some(selection)) = self
+                    .configuration
+                    .service_selections
+                    .broker
+                    .get("amaterasu.state/1")
+                else {
+                    return errors::permission_denied();
+                };
+                let Some((host_request, host_result)) = self.requests.selected_state_read(
+                    HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+                    &selection.provider,
+                    host_receipt_state_request,
+                ) else {
+                    return Response::error(
+                        "recovery_required",
+                        "fresh host instance record unavailable",
+                    );
+                };
+                if host_request.get("key").and_then(serde_json::Value::as_str)
+                    != Some(receipt.state_key().as_str())
+                    || host_result.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
+                    || host_result
+                        .get("found")
+                        .and_then(serde_json::Value::as_bool)
+                        != Some(true)
+                    || serde_json::to_value(&receipt).ok().as_ref() != host_result.get("value")
+                {
+                    return Response::error(
+                        "recovery_required",
+                        "host instance retirement record differs",
+                    );
+                }
+                if let Err(error) = self.verify_historical_journal(
+                    &identity,
+                    &receipt.provider_incarnation,
+                    &expected_entry,
+                    state_request,
+                ) {
+                    return error;
+                }
+                self.effect_fences.recover_historical(
+                    *identity,
+                    &receipt.provider_incarnation,
+                    &expected_entry,
+                )
+            }
             EffectFenceCommand::FinishCloseSlot {
                 lease,
                 scope,
@@ -937,6 +1067,7 @@ impl Broker {
                 let scope = match &*command {
                     EffectFenceCommand::Arm { effect }
                     | EffectFenceCommand::ArmSelected { effect, .. }
+                    | EffectFenceCommand::CommitAdmission { effect, .. }
                     | EffectFenceCommand::Dispatch { effect }
                     | EffectFenceCommand::Fence { effect }
                     | EffectFenceCommand::Lookup { effect } => &effect.scope,
@@ -1171,6 +1302,12 @@ impl Broker {
                 if !self.effect_fences.authority(caller) {
                     return errors::permission_denied();
                 }
+                if self.effect_fences.requires_handoff() {
+                    return Response::error(
+                        "handoff_required",
+                        "atomic authority request handoff is required",
+                    );
+                }
                 let method = amaterasu_contracts::effect_fence::ProtectedMethod {
                     service: effect.service.clone(),
                     method: effect.method.clone(),
@@ -1199,6 +1336,115 @@ impl Broker {
                     &selected.provider,
                     selected.provider_incarnation.as_ref(),
                 )
+            }
+            EffectFenceCommand::CommitAdmission {
+                request,
+                effect,
+                expected,
+                expected_entry,
+                state_request,
+            } => {
+                if !self.effect_fences.authority(caller) {
+                    return errors::permission_denied();
+                }
+                if !slotted || !self.effect_fences.requires_handoff() {
+                    return Response::error(
+                        "unsupported",
+                        "atomic slotted handoff is not configured",
+                    );
+                }
+                let method = amaterasu_contracts::effect_fence::ProtectedMethod {
+                    service: effect.service.clone(),
+                    method: effect.method.clone(),
+                    interface_major: effect.interface_major,
+                };
+                let Some(selected) = self.selected_effect_method(&method) else {
+                    return errors::permission_denied();
+                };
+                let Some(instance) = selected.provider_incarnation.as_ref() else {
+                    return Response::error(
+                        "provider_incarnation_required",
+                        "host-issued provider incarnation is required",
+                    );
+                };
+                if *expected != selected
+                    || effect.interface_minor != selected.method.interface_minor
+                {
+                    return Response::error(
+                        "incompatible_api",
+                        "selected provider or API schema differs",
+                    );
+                }
+                let issuer = self.effect_fences.issuer_name().expect("configured issuer");
+                if !self.requests.protocol_handoff_request_matches(
+                    caller,
+                    issuer,
+                    request,
+                    &effect,
+                    &selected.provider,
+                    &expected_entry,
+                ) {
+                    return Response::error(
+                        "request_ended",
+                        "authority request is not active or does not match this effect",
+                    );
+                }
+                let identity = effect.identity(&selected.provider);
+                if let Err(error) = self.verify_historical_journal(
+                    &identity,
+                    instance,
+                    &expected_entry,
+                    state_request,
+                ) {
+                    return error;
+                }
+                if serde_json::to_value(&selected).ok().as_ref()
+                    != expected_entry.get("selected_method")
+                {
+                    return Response::error(
+                        "incompatible_api",
+                        "durable selection does not match current provider schema",
+                    );
+                }
+                if expected_entry
+                    .get("cleanup_confirmed")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(false)
+                {
+                    return Response::error(
+                        "effect_conflict",
+                        "retired journal entry cannot admit work",
+                    );
+                }
+                let Some(lease) = self.effect_fences.current_lease(&effect.scope) else {
+                    return errors::permission_denied();
+                };
+                let reply =
+                    serde_json::json!({"ok":true,"version":1,"lease":lease,"identity":identity});
+                if !errors::payload_fits(&reply) {
+                    return errors::capacity_exhausted();
+                }
+                let existed = self.effect_fences.contains_effect(&effect);
+                let armed = self.effect_fences.arm(
+                    caller,
+                    effect.clone(),
+                    &selected.provider,
+                    Some(instance),
+                );
+                if !matches!(armed, Response::Ok) {
+                    return armed;
+                }
+                // All request completion conditions were checked above, while
+                // this same broker lock excludes cancellation or replacement.
+                let completed = self.requests.complete(caller, request, reply, now);
+                if !matches!(completed, Response::Ok) {
+                    if !existed {
+                        self.effect_fences.rollback_new_arm(&effect);
+                    }
+                    return completed;
+                }
+                self.requests.mark_committed_admission(request);
+                Response::Ok
             }
             EffectFenceCommand::Arm { effect } => {
                 if self.effect_fences.uses_slots() {
@@ -1318,7 +1564,9 @@ impl Broker {
     }
 
     fn host_retirement_write_matches(&self, request: &serde_json::Value) -> bool {
-        use amaterasu_contracts::effect_fence::HostProviderRetirement;
+        use amaterasu_contracts::effect_fence::{
+            HostProviderInstanceRetirement, HostProviderRetirement,
+        };
         if request.get("action").and_then(serde_json::Value::as_str) == Some("get") {
             return true;
         }
@@ -1333,6 +1581,9 @@ impl Broker {
         let Some(key) = request.get("key").and_then(serde_json::Value::as_str) else {
             return false;
         };
+        if key.starts_with("host/provider-retirement/v1/") {
+            return request.get("value").and_then(|value| serde_json::from_value::<HostProviderInstanceRetirement>(value.clone()).ok()).is_some_and(|receipt| receipt.state_key() == key && matches!(self.effect_fences.host_provider_instance_receipt(&receipt.provider, &receipt.provider_incarnation), Response::Result { payload } if serde_json::to_value(receipt).ok().as_ref() == Some(&payload)));
+        }
         if request.get("action").and_then(serde_json::Value::as_str) == Some("delete") {
             return request
                 .get("expected_revision")
