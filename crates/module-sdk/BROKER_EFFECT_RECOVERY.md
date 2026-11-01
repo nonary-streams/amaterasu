@@ -21,6 +21,18 @@ provider, interface or schema fails before a record is armed. Schema revisions
 are authority policy, not inferred from the API schema. Slot mode rejects the
 older unbound `Arm`; unslotted legacy callers retain their existing behavior.
 
+`EffectFencePolicy.require_handoff` opts a slotted route into the atomic pairing
+request handoff. It requires startup selection of `amaterasu.pairing-effects/1`
+for the authority and grants for the issuer. In this mode `ArmSelected` is
+denied: `CommitAdmission`, within `SlotCommand`, verifies a fresh exact canonical
+journal entry, the selected provider and schema, and the live delivered v2
+pairing request including its source, payload digest, and cleanup reference.
+It arms the effect and completes that same request under the broker lock. A
+cancellation that wins first prevents the arm; cancellation after commit returns
+`effect_admission_uncertain` and requires explicit fencing and retirement.
+Releasing an RPC result never retires its effect. This is an opt-in contract;
+the pairing actor and production source route still need to invoke it.
+
 ## Broker startup and recovery
 
 1. The host, selected issuer, each protected provider, explicitly selected State
@@ -44,8 +56,10 @@ older unbound `Arm`; unslotted legacy callers retain their existing behavior.
    workers are verified retired, use `OpenRecoverySlot` for its scope and the
    retained retired and issued sequence watermarks from the same snapshot. It is
    fenced from creation: it cannot arm or dispatch, and cannot close until every
-   sequence through the issued watermark has been reconciled. Within its `SlotCommand`, use `RecoverFence` and `LookupIdentity`
-   with `GuardedEffectIdentity`. The authority must match the source, provider,
+   sequence through the issued watermark has been reconciled. Legacy
+   `RecoverFence` cannot create historical records in a recovery-only slot;
+   use a verified host retirement record and `HostRecoverHistorical` or
+   `HostRecoverHistoricalInstance`. The authority must match the source, provider,
    method, operation, digest and its separate cleanup identity to the durable
    journal. `retired` here does not reconstruct a provider result or prove that
    persistent effects were cleaned up. `retired_sequence` is only a sequence
@@ -126,6 +140,14 @@ On shutdown, the host first fences a protected provider and polls its optional
 before the deadline permits `HostProviderJoined` and receipt persistence. An
 absent capability, failure, panic or timeout leaves recovery fenced. The poll
 must be bounded and nonblocking; native modules are trusted to honor that ABI.
+The host also persists the broker-issued `HostProviderInstanceRetirement` at
+`host/provider-retirement/v1/{broker-epoch}/{provider-incarnation}` after that
+join. `HostRecoverHistoricalInstance` accepts it with a fresh canonical journal
+read for the exact old provider and incarnation, even when the old broker never
+retained an effect record. Treat that entry as possibly executed; this receipt
+does not establish issuer retirement or external cleanup. Old hosts that did not
+write the record remain closed. Incarnation records currently require a future
+coordinated cleanup mechanism and remain bounded by State capacity.
 The generic module destroy call alone is not proof because the SDK catches
 destructor panics without reporting whether joins completed. Startup pairing
 replay and external cleanup remain separate integration work. A missing receipt

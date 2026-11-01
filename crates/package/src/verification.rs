@@ -316,6 +316,7 @@ mod tests {
             }],
             cleanup_methods: vec![],
             source_slots: false,
+            require_handoff: false,
         };
         let bootstrap = BootstrapConfig {
             development: false,

@@ -20,6 +20,7 @@ use amaterasu_state::test_support::TestStateStore;
 use libloading::Library;
 use serde_json::json;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -60,6 +61,8 @@ fn state_ordering_rejects_incompatible_dependency_cycles() {
 struct Harness {
     broker: Mutex<Broker>,
     store: TestStateStore,
+    fail_next_set: AtomicBool,
+    destroyed: AtomicUsize,
 }
 
 unsafe extern "C" fn host_invoke(
@@ -101,7 +104,13 @@ unsafe extern "C" fn state_tick(instance: *mut c_void) -> Status {
             payload,
             ..
         } => {
-            let result = harness.store.handle(&caller, payload);
+            let result = if payload.get("action").and_then(serde_json::Value::as_str) == Some("set")
+                && harness.fail_next_set.swap(false, Ordering::SeqCst)
+            {
+                json!({"ok":false,"error":{"code":"storage_error"}})
+            } else {
+                harness.store.handle(&caller, payload)
+            };
             if matches!(
                 harness.broker.lock().unwrap().dispatch(
                     "state",
@@ -155,6 +164,7 @@ fn executable() -> Library {
 #[derive(Clone, Copy)]
 enum Mode {
     Delayed,
+    StateFailureOnce,
     Panic,
     Timeout,
     Unsupported,
@@ -165,6 +175,7 @@ enum Mode {
 struct WorkerModule {
     mode: Mode,
     worker: Option<std::thread::JoinHandle<()>>,
+    harness: Arc<Harness>,
 }
 impl ManagedModule for WorkerModule {
     fn start(_: RuntimeClient) -> ModuleResult<Self> {
@@ -198,6 +209,7 @@ impl RetirableModule for WorkerModule {
 }
 impl Drop for WorkerModule {
     fn drop(&mut self) {
+        self.harness.destroyed.fetch_add(1, Ordering::SeqCst);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -250,6 +262,14 @@ fn scoped(
     )
 }
 fn setup_broker(instance_digit: &str, count: u64) -> (Broker, ProviderIncarnation) {
+    setup_broker_with_open(instance_digit, count, true)
+}
+fn setup_broker_with_open(
+    instance_digit: &str,
+    count: u64,
+    open: bool,
+) -> (Broker, ProviderIncarnation) {
+    assert!(open || count == 0);
     let service = "example.effects/1";
     let mut config = RuntimeConfig {
         host_lifecycle_control: true,
@@ -327,6 +347,7 @@ fn setup_broker(instance_digit: &str, count: u64) -> (Broker, ProviderIncarnatio
         authority: "authority".into(),
         issuer: "issuer".into(),
         source_slots: true,
+        require_handoff: false,
         methods: vec![ProtectedMethod {
             service: service.into(),
             method: "apply".into(),
@@ -406,18 +427,20 @@ fn setup_broker(instance_digit: &str, count: u64) -> (Broker, ProviderIncarnatio
             effect_owner_epoch: "owner".into(),
         },
     };
-    assert!(matches!(
-        broker_invoke(
-            &mut broker,
-            "authority",
-            EffectFenceCommand::OpenSlot {
-                lease: lease.clone(),
-                scope: scope.clone(),
-                retired_through: 0
-            }
-        ),
-        Response::Ok
-    ));
+    if open {
+        assert!(matches!(
+            broker_invoke(
+                &mut broker,
+                "authority",
+                EffectFenceCommand::OpenSlot {
+                    lease: lease.clone(),
+                    scope: scope.clone(),
+                    retired_through: 0
+                }
+            ),
+            Response::Ok
+        ));
+    }
     let method = ProtectedMethod {
         service: service.into(),
         method: "apply".into(),
@@ -463,21 +486,23 @@ fn setup_broker(instance_digit: &str, count: u64) -> (Broker, ProviderIncarnatio
             Response::Ok
         ));
     }
-    effect.sequence = 1;
-    effect.operation_id = "operation.1".into();
-    assert!(matches!(
-        scoped(
-            &mut broker,
-            "issuer",
-            &lease,
-            EffectFenceCommand::Dispatch { effect }
-        ),
-        Response::Accepted { .. }
-    ));
-    assert!(matches!(
-        broker.dispatch("provider", Command::Poll {}),
-        Response::Request { .. }
-    ));
+    if count > 0 {
+        effect.sequence = 1;
+        effect.operation_id = "operation.1".into();
+        assert!(matches!(
+            scoped(
+                &mut broker,
+                "issuer",
+                &lease,
+                EffectFenceCommand::Dispatch { effect }
+            ),
+            Response::Accepted { .. }
+        ));
+        assert!(matches!(
+            broker.dispatch("provider", Command::Poll {}),
+            Response::Request { .. }
+        ));
+    }
     (broker, instance)
 }
 
@@ -628,10 +653,77 @@ fn exercise(mode: Mode, count: u64) {
             .as_nanos()
     ));
     let store = TestStateStore::open(path.clone()).unwrap();
-    let (broker, incarnation) = setup_broker("a", count);
+    let (mut broker, incarnation) = setup_broker("a", count);
+    let Response::Result { payload: epoch } =
+        broker_invoke(&mut broker, "authority", EffectFenceCommand::BrokerEpoch {})
+    else {
+        panic!("epoch unavailable")
+    };
+    let instance_key = format!(
+        "host/provider-retirement/v1/{}/{}",
+        epoch["broker_epoch"].as_str().unwrap(),
+        incarnation.id
+    );
+    let prearm = if count == 0 {
+        let Response::Result { payload } = broker_invoke(
+            &mut broker,
+            "authority",
+            EffectFenceCommand::SlotStatus { slot: 0 },
+        ) else {
+            panic!("slot missing")
+        };
+        let lease: SourceSlotLease = serde_json::from_value(payload["lease"].clone()).unwrap();
+        let scope: EffectScope = serde_json::from_value(payload["active"].clone()).unwrap();
+        let Response::Result { payload } = broker_invoke(
+            &mut broker,
+            "authority",
+            EffectFenceCommand::SelectedMethod {
+                method: ProtectedMethod {
+                    service: "example.effects/1".into(),
+                    method: "apply".into(),
+                    interface_major: 1,
+                },
+            },
+        ) else {
+            panic!("selection missing")
+        };
+        let selected: amaterasu_contracts::effect_fence::SelectedEffectMethod =
+            serde_json::from_value(payload).unwrap();
+        let effect = GuardedEffect {
+            scope: scope.clone(),
+            sequence: 1,
+            capability: "example.effect".into(),
+            service: "example.effects/1".into(),
+            method: "apply".into(),
+            interface_major: 1,
+            interface_minor: 0,
+            schema_revision: 1,
+            payload_sha256: "d".repeat(64),
+            payload: json!({"value":1}),
+            timeout_ms: 30_000,
+            operation_id: "operation.1".into(),
+            parent: None,
+        };
+        let identity = effect.identity("provider");
+        let mut cleanup_method = selected.method.clone();
+        cleanup_method.method = "cleanup".into();
+        let approval = ApiMethodApproval {
+            provider: "provider".into(),
+            callers: ["issuer".into()].into(),
+            method: cleanup_method,
+        };
+        let entry = json!({"identity":identity,"issued_lease":lease,"provider_incarnation":incarnation,"selected_method":selected,"cleanup_method":{"service":"example.effects/1","method":"cleanup","interface_major":1,"interface_minor":0,"schema_revision":1},"cleanup_approval":approval,"cleanup":{"id":"a".repeat(64)},"cleanup_confirmed":false});
+        let journal = json!({"version":1,"slot":0,"retired_incarnation":0,"pending_close":null,"active":{"lease":lease,"scope":scope,"issuer":"issuer","retired_through":0,"issued_through":1,"entries":[entry]}});
+        assert_eq!(store.handle("authority", json!({"action":"set","key":"pairing/protocol-slot/v1/00","value":journal,"expected_revision":0}))["ok"], true);
+        Some((identity, entry, journal))
+    } else {
+        None
+    };
     let harness = Arc::new(Harness {
         broker: Mutex::new(broker),
         store,
+        fail_next_set: AtomicBool::new(matches!(mode, Mode::StateFailureOnce)),
+        destroyed: AtomicUsize::new(0),
     });
     let endpoint = HostApi {
         header: AbiHeader::of::<HostApi>(),
@@ -699,6 +791,7 @@ fn exercise(mode: Mode, count: u64) {
                 let module = WorkerModule {
                     mode,
                     worker: worker.take(),
+                    harness: harness.clone(),
                 };
                 Ok(feature(
                     name,
@@ -730,7 +823,23 @@ fn exercise(mode: Mode, count: u64) {
     };
     let result = loaded.retire_effect_providers(Instant::now() + limit);
     assert_eq!(result.is_ok(), matches!(mode, Mode::Delayed));
-    if matches!(mode, Mode::Delayed) {
+    if matches!(mode, Mode::StateFailureOnce) {
+        assert_eq!(harness.destroyed.load(Ordering::SeqCst), 1);
+        assert!(
+            loaded
+                .retire_effect_providers(Instant::now() + Duration::from_secs(2))
+                .is_ok()
+        );
+        assert_eq!(harness.destroyed.load(Ordering::SeqCst), 1);
+    } else if !matches!(mode, Mode::Delayed) {
+        assert!(
+            loaded
+                .retire_effect_providers(Instant::now() + Duration::from_millis(5))
+                .is_err()
+        );
+    }
+    let successful = matches!(mode, Mode::Delayed | Mode::StateFailureOnce);
+    if successful {
         // Repeating persistence must replay the same snapshot without growing
         // State or replacing an existing, different receipt.
         loaded
@@ -750,12 +859,107 @@ fn exercise(mode: Mode, count: u64) {
         loaded.retirement_providers.clear();
     }
     drop(loaded);
+    let saved_instance = harness.store.handle(
+        HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+        json!({"action":"get","key":instance_key}),
+    );
+    assert_eq!(saved_instance["found"], successful);
+    if let Some((identity, entry, mut journal)) = prearm {
+        let (mut restarted, _) = setup_broker_with_open("b", 0, false);
+        let Response::Result { payload } = broker_invoke(
+            &mut restarted,
+            "authority",
+            EffectFenceCommand::SlotStatus { slot: 0 },
+        ) else {
+            panic!("recovery slot unavailable")
+        };
+        let lease: SourceSlotLease = serde_json::from_value(payload["lease"].clone()).unwrap();
+        journal["active"]["lease"] = serde_json::to_value(&lease).unwrap();
+        assert_eq!(harness.store.handle("authority", json!({"action":"set","key":"pairing/protocol-slot/v1/00","value":journal,"expected_revision":1}))["ok"], true);
+        assert!(matches!(
+            broker_invoke(
+                &mut restarted,
+                "authority",
+                EffectFenceCommand::OpenRecoverySlot {
+                    lease: lease.clone(),
+                    scope: identity.scope.clone(),
+                    retired_through: 0,
+                    issued_through: 1
+                }
+            ),
+            Response::Ok
+        ));
+        let read = |broker: &mut Broker, caller: &str, key: &str, operation: &str| {
+            let Response::Accepted { id } = broker.dispatch(
+                caller,
+                Command::Request {
+                    service: "amaterasu.state/1".into(),
+                    payload: json!({"action":"get","key":key}),
+                    timeout_ms: 30_000,
+                    operation_id: operation.into(),
+                    parent: None,
+                },
+            ) else {
+                panic!("recovery read denied")
+            };
+            let Response::Request {
+                caller, payload, ..
+            } = broker.dispatch("state", Command::Poll {})
+            else {
+                panic!("recovery read missing")
+            };
+            let result = harness.store.handle(&caller, payload);
+            assert!(matches!(
+                broker.dispatch(
+                    "state",
+                    Command::Complete {
+                        request: id,
+                        payload: result
+                    }
+                ),
+                Response::Ok
+            ));
+            id
+        };
+        let journal_read = read(
+            &mut restarted,
+            "authority",
+            "pairing/protocol-slot/v1/00",
+            "prearm.journal",
+        );
+        let instance_read = read(
+            &mut restarted,
+            HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            &instance_key,
+            "prearm.instance",
+        );
+        let receipt: amaterasu_contracts::effect_fence::HostProviderInstanceRetirement =
+            serde_json::from_value(saved_instance["value"].clone()).unwrap();
+        assert!(matches!(
+            broker_invoke(
+                &mut restarted,
+                HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+                EffectFenceCommand::HostRecoverHistoricalInstance {
+                    lease: lease.clone(),
+                    receipt: Box::new(receipt),
+                    identity: Box::new(identity.clone()),
+                    expected_entry: entry,
+                    state_request: journal_read,
+                    host_receipt_state_request: instance_read
+                }
+            ),
+            Response::Ok
+        ));
+        assert!(
+            matches!(scoped(&mut restarted, "authority", &lease, EffectFenceCommand::Compact { scope: identity.scope, retired_through: 1 }), Response::Error { ref code, .. } if code == "effect_pending")
+        );
+    }
     let saved = harness.store.handle(
         HOST_LIFECYCLE_CONTROL_PRINCIPAL,
         json!({"action":"get","key":"host/effect-retirement/v2/00/1/1"}),
     );
-    assert_eq!(saved["found"], matches!(mode, Mode::Delayed));
-    if matches!(mode, Mode::Delayed) {
+    assert_eq!(saved["found"], successful && count > 0);
+    if successful && count > 0 {
         for sequence in 1..=if count == 32 { 31 } else { count } {
             let record = harness.store.handle(
                 HOST_LIFECYCLE_CONTROL_PRINCIPAL,
@@ -764,7 +968,7 @@ fn exercise(mode: Mode, count: u64) {
             assert_eq!(record["value"]["effect"]["sequence"], sequence);
         }
     }
-    if matches!(mode, Mode::Delayed) {
+    if successful && count > 0 {
         assert_eq!(saved["value"]["effect"]["sequence"], 1);
     }
     drop(harness);
@@ -773,8 +977,8 @@ fn exercise(mode: Mode, count: u64) {
         HOST_LIFECYCLE_CONTROL_PRINCIPAL,
         json!({"action":"get","key":"host/effect-retirement/v2/00/1/1"}),
     );
-    assert_eq!(saved_again["found"], matches!(mode, Mode::Delayed));
-    if matches!(mode, Mode::Delayed) {
+    assert_eq!(saved_again["found"], successful && count > 0);
+    if successful && count > 0 {
         let (mut restarted, replacement_instance) = setup_broker("b", 1);
         assert_ne!(
             saved_again["value"]["provider_incarnation"]["id"],
@@ -824,6 +1028,14 @@ fn exercise(mode: Mode, count: u64) {
 #[test]
 fn delayed_worker_is_joined_before_durable_host_receipt() {
     exercise(Mode::Delayed, 1);
+}
+#[test]
+fn joined_instance_is_recorded_even_without_any_armed_effect() {
+    exercise(Mode::Delayed, 0);
+}
+#[test]
+fn checked_retirement_persistence_is_retried_without_destroying_twice() {
+    exercise(Mode::StateFailureOnce, 1);
 }
 #[test]
 fn full_slot_is_persisted_in_stable_retryable_records() {

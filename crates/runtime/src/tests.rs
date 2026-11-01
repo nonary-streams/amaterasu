@@ -2284,6 +2284,7 @@ fn protected_deadline_expiration_does_not_retire_delivered_work() {
         issuer: "org.example.client".into(),
         cleanup_methods: vec![],
         source_slots: false,
+        require_handoff: false,
         methods: vec![ProtectedMethod {
             service: method.service.clone(),
             method: method.method.clone(),
