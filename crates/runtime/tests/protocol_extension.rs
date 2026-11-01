@@ -1096,6 +1096,19 @@ fn retired_issuer_cannot_dispatch_a_delayed_success_after_reconciliation() {
             }
             Ok(())
         }
+        // This simulated provider has no persistent effect.
+        fn verify_cleanup(
+            &self,
+            issuer: &Source,
+            effect: &PendingEffect,
+            _: &amaterasu_module_sdk::protocol_state::CleanupReference,
+        ) -> Result<(), &'static str> {
+            if issuer == &self.issuer && effect == &self.effect {
+                Ok(())
+            } else {
+                Err("cleanup_unproven")
+            }
+        }
     }
     struct NoEvidence;
     impl IssuerRetirement for NoEvidence {}

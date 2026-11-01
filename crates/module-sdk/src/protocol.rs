@@ -94,6 +94,9 @@ pub struct PendingEffect {
     pub provider: String,
     pub method: MethodRef,
     pub cleanup: MethodRef,
+    /// Fingerprints of exact trusted startup approvals, including their schemas.
+    pub action_approval_sha256: String,
+    pub cleanup_approval_sha256: String,
     /// Digest only; the obligation does not retain the message body.
     pub payload_sha256: String,
     pub timeout_ms: u64,
@@ -233,6 +236,8 @@ impl ProtocolRouter {
             provider: route.approval.provider.clone(),
             method: route.method.clone(),
             cleanup: route.cleanup.clone(),
+            action_approval_sha256: approval_fingerprint(&route.approval),
+            cleanup_approval_sha256: approval_fingerprint(&route.cleanup_approval),
             payload_sha256: format!("{:x}", Sha256::digest(request.payload)),
             timeout_ms: request.timeout_ms,
             parent: request.parent,
@@ -318,6 +323,11 @@ pub fn validate_response(payload: &serde_json::Value) -> Result<(), &'static str
     } else {
         Err("response_too_large")
     }
+}
+
+pub(crate) fn approval_fingerprint(approval: &ApiMethodApproval) -> String {
+    let bytes = serde_json::to_vec(approval).expect("API approvals contain serializable values");
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 fn valid_name(value: &str) -> bool {

@@ -1,7 +1,8 @@
 //! Opt-in v1 sequence journal for one trusted caller and session generation.
 //!
-//! Journal format version 3 binds each issuer to its lifecycle source,
-//! effect-owner and broker-issuer incarnations. Earlier journals fail closed and need safe
+//! Journal format version 4 binds each issuer to its lifecycle source,
+//! effect-owner and broker-issuer incarnations and exact approval fingerprints.
+//! Earlier journals fail closed and need safe
 //! migration; they are never reset. The host allocates a fresh, contiguous
 //! sequence in the same State CAS that records the effect. A sequence is not a
 //! credential: authenticated ingress and the selected shared authority must
@@ -103,7 +104,7 @@ struct Journal {
 impl Journal {
     fn empty(source: &SequencedSource) -> Self {
         Self {
-            version: 3,
+            version: 4,
             source: source.hash.clone(),
             retired: 0,
             issued: 0,
@@ -120,7 +121,7 @@ fn read(source: &SequencedSource, response: &Value) -> Result<(u64, Journal), &'
     } else {
         Journal::empty(source)
     };
-    if journal.version != 3
+    if journal.version != 4
         || journal.source != source.hash
         || journal.retired > journal.issued
         || journal.entries.len() > WINDOW
@@ -276,6 +277,16 @@ pub trait IssuerRetirement {
     ) -> Result<(), &'static str> {
         Err("issuer_retirement_unproven")
     }
+    /// Separately verify the selected provider's persistent cleanup for this
+    /// exact non-secret reference. Broker worker retirement is not cleanup.
+    fn verify_cleanup(
+        &self,
+        _issuer: &Source,
+        _effect: &PendingEffect,
+        _cleanup: &CleanupReference,
+    ) -> Result<(), &'static str> {
+        Err("cleanup_unproven")
+    }
 }
 
 /// The effect must use the candidate operation ID returned by operation_id.
@@ -370,6 +381,7 @@ pub fn prepare_cleanup(
         })
         .ok_or("unknown_obligation")?;
     retirement.verify_retired(&entry.issuer, &entry.effect)?;
+    retirement.verify_cleanup(&entry.issuer, &entry.effect, &entry.cleanup)?;
     entry.cleaned = true;
     while journal.entries.first().is_some_and(|entry| entry.cleaned) {
         journal.entries.remove(0);

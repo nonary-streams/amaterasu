@@ -51,6 +51,8 @@ fn effect(caller: &str, operation: &str) -> PendingEffect {
         provider: "provider".into(),
         method,
         cleanup,
+        action_approval_sha256: "c".repeat(64),
+        cleanup_approval_sha256: "d".repeat(64),
         payload_sha256: "a".repeat(64),
         timeout_ms: 1000,
         parent: None,
@@ -88,6 +90,14 @@ impl amaterasu_module_sdk::protocol_sequence::IssuerRetirement for MockRetired {
         &self,
         _: &amaterasu_module_sdk::effect_authority::Source,
         _: &PendingEffect,
+    ) -> Result<(), &'static str> {
+        Ok(())
+    }
+    fn verify_cleanup(
+        &self,
+        _: &amaterasu_module_sdk::effect_authority::Source,
+        _: &PendingEffect,
+        _: &CleanupReference,
     ) -> Result<(), &'static str> {
         Ok(())
     }
@@ -694,6 +704,35 @@ fn sequenced_version_two_without_broker_incarnation_fails_closed() {
     assert_eq!(
         invoke(&store, &source.read_request())["value"]["version"],
         2
+    );
+    drop(store);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn sequenced_version_three_without_approval_fingerprints_fails_closed() {
+    use amaterasu_module_sdk::protocol_sequence::{self, SequencedSource};
+    let path = directory();
+    let store = TestStateStore::open(path.clone()).unwrap();
+    let template = effect("caller", "unused");
+    let source = SequencedSource::new(&template.caller, &template.context).unwrap();
+    let StateRequest::Get { key } = source.read_request() else {
+        panic!()
+    };
+    let source_hash = key
+        .strip_prefix("protocol-sequence/v1/")
+        .unwrap()
+        .to_string();
+    let legacy = StateRequest::Set {
+        key,
+        value: serde_json::json!({"version":3,"source":source_hash,"retired":0,"issued":0,"entries":[]}),
+        expected_revision: Some(0),
+    };
+    assert_eq!(invoke(&store, &legacy)["ok"], true);
+    let read = invoke(&store, &source.read_request());
+    assert_eq!(
+        protocol_sequence::next_sequence(&source, &read),
+        Err("invalid_journal")
     );
     drop(store);
     std::fs::remove_dir_all(path).unwrap();
