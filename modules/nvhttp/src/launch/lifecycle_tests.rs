@@ -523,3 +523,30 @@ fn connected_resume_history_settlement_uncertainty_preserves_application() {
         assert!(!commands.iter().any(|command| matches!(command, Command::Request { service, .. } if service == "amaterasu.launch/1")));
     }
 }
+
+#[test]
+fn pairing_evidence_requires_the_exact_live_paired_lifecycle_session() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let target = json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":3});
+    controller.records.values_mut().next().unwrap().lifecycle_session_target =
+        serde_json::from_value(target.clone()).ok();
+    let (actual, certificate) = controller.paired_lifecycle_session("epoch", "session").unwrap();
+    assert_eq!(serde_json::to_value(actual).unwrap(), target);
+    assert_eq!(certificate, &[1; 32]);
+    assert!(controller.paired_lifecycle_session("other", "session").is_none());
+    assert!(controller.paired_lifecycle_session("epoch", "other").is_none());
+    for state in [State::Stopping, State::Stopped, State::Failed, State::CleanupFailed] {
+        controller.records.values_mut().next().unwrap().state = state;
+        assert!(controller.paired_lifecycle_session("epoch", "session").is_none());
+    }
+    let record = controller.records.values_mut().next().unwrap();
+    record.state = State::Ready;
+    record.lifecycle_end_fenced = true;
+    assert!(controller.paired_lifecycle_session("epoch", "session").is_none());
+    let record = controller.records.values_mut().next().unwrap();
+    record.lifecycle_end_fenced = false;
+    record.peer.client_id = None;
+    assert!(controller.paired_lifecycle_session("epoch", "session").is_none());
+}
