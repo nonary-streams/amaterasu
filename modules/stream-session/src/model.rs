@@ -17,6 +17,7 @@ pub struct Settings {
     pub prepare_timeout_ms: u64,
     pub drain_timeout_ms: u64,
     pub enable_input: bool,
+    pub observe_feedback_sources: bool,
     pub input_lease_ttl_ms: u64,
 }
 impl Default for Settings {
@@ -30,6 +31,7 @@ impl Default for Settings {
             prepare_timeout_ms: 5000,
             drain_timeout_ms: 5000,
             enable_input: false,
+            observe_feedback_sources: false,
             input_lease_ttl_ms: 30000,
         }
     }
@@ -41,6 +43,7 @@ impl Settings {
             .extension_route
             .as_ref()
             .is_some_and(|route| !route.valid())
+            || (self.observe_feedback_sources && !self.enable_input)
             || self.allowed_principals.len() > 16
             || self
                 .allowed_principals

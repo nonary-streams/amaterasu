@@ -79,6 +79,7 @@ pub struct Broker {
     pub input_terminal: bool,
     pub input_events: Vec<Value>,
     pub input_feedback_events: VecDeque<Value>,
+    pub input_source_observation: Option<Value>,
     pub input_feedback_acks: Vec<u64>,
     pub feedback_ack_failures: usize,
     pub gamepad_feedback: VecDeque<Value>,
@@ -1104,6 +1105,12 @@ impl Broker {
                     reply["operation_id"] = payload["operation_id"].clone();
                 }
                 reply
+            }
+            "observe_feedback_source" => {
+                assert_eq!(payload["lease"], json!(self.input_lease));
+                self.input_source_observation.clone().unwrap_or_else(
+                    || json!({"ok":false,"error":{"code":"source_observation_denied"}}),
+                )
             }
             "feedback_peek" => {
                 assert_eq!(payload["lease"], json!(self.input_lease));

@@ -121,6 +121,12 @@ authentication and session activation, renews the lease conservatively, and
 never accepts a caller-supplied lease or operation identity. Input received before
 the session becomes active is discarded without changing keyboard/button state.
 
+The optional trusted startup setting `observe_feedback_sources` defaults to
+`false` and requires `enable_input`. When enabled it requests a bounded active
+lifecycle/device observation from the selected input provider. The observation
+is not an effect grant, does not install a source route, and does not enable
+pairing admission; see [the feedback join checkpoint](../../docs/input-feedback-production-join.md).
+
 The active path supports the fixed Moonlight virtual-key mapping, relative mouse,
 five mouse buttons, and raw horizontal or vertical wheel units. Absolute input is
 enabled only when the video provider returns a valid `desktop_geometry` snapshot

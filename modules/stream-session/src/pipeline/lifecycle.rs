@@ -149,6 +149,10 @@ impl Pipeline {
                         job.step = Step::NotifyCaptureInvalidated;
                         return true;
                     }
+                    if job.step == Step::ObserveFeedbackSource {
+                        retry_feedback_source_observation(record, now);
+                        return false;
+                    }
                     if matches!(job.step, Step::FeedbackPeek | Step::FeedbackAck) {
                         if job.step == Step::FeedbackPeek {
                             record.feedback_ack_through = None;
@@ -807,6 +811,10 @@ impl Pipeline {
             return true;
         }
         if payload["ok"] != true {
+            if job.step == Step::ObserveFeedbackSource {
+                retry_feedback_source_observation(record, now);
+                return false;
+            }
             if matches!(job.step, Step::FeedbackPeek | Step::FeedbackAck) {
                 if job.step == Step::FeedbackPeek {
                     record.feedback_ack_through = None;
@@ -1064,6 +1072,10 @@ impl Pipeline {
                         .checked_add(1)
                         .ok_or("lifecycle_sequence_exhausted")?;
                 }
+                Ok(false)
+            }
+            Step::ObserveFeedbackSource => {
+                accept_feedback_source_observation(record, &payload)?;
                 Ok(false)
             }
             Step::FeedbackPeek => {

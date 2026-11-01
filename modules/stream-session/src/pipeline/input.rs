@@ -100,9 +100,7 @@ pub(super) fn accept_feedback_peek(
 
         if matches!(&feedback, HostFeedback::HapticsPcm { .. }) && !pcm_enabled {
             if let Some((slot, generation, capabilities)) = device {
-                record
-                    .feedback_device_observations
-                    .insert(slot, (generation, capabilities));
+                note_feedback_device(record, slot, generation, capabilities);
             }
             last_accepted = Some(sequence);
             continue;
@@ -116,9 +114,7 @@ pub(super) fn accept_feedback_peek(
             Ok(crate::plane::FeedbackEnqueueOutcome::Queued)
             | Ok(crate::plane::FeedbackEnqueueOutcome::DroppedBestEffort) => {
                 if let Some((slot, generation, capabilities)) = device {
-                    record
-                        .feedback_device_observations
-                        .insert(slot, (generation, capabilities));
+                    note_feedback_device(record, slot, generation, capabilities);
                 }
                 last_accepted = Some(sequence);
             }
@@ -136,6 +132,71 @@ pub(super) fn accept_feedback_peek(
         record.feedback_poll_at = now.saturating_add(FEEDBACK_POLL_INTERVAL_MS);
         Ok(None)
     }
+}
+
+fn note_feedback_device(record: &mut Record, slot: u16, generation: u64, capabilities: u32) {
+    let observation = (generation, capabilities);
+    if record.feedback_device_observations.get(&slot) != Some(&observation) {
+        record.feedback_source_observations.remove(&slot);
+    }
+    record
+        .feedback_device_observations
+        .insert(slot, observation);
+}
+
+pub(super) fn retry_feedback_source_observation(record: &mut Record, now: u64) {
+    if let Some((slot, generation, capabilities)) = record.feedback_source_candidate.take()
+        && record.feedback_source_attempts.get(&slot) == Some(&(generation, capabilities))
+    {
+        record.feedback_source_attempts.remove(&slot);
+    }
+    record.feedback_source_retry_at = now.saturating_add(1000);
+}
+
+/// Retain a point-in-time observation only for the exact active target and
+/// device; this does not bind pairing or authorize any source effect.
+pub(super) fn accept_feedback_source_observation(
+    record: &mut Record,
+    payload: &Value,
+) -> Result<(), &'static str> {
+    let (slot, generation, capabilities) = record
+        .feedback_source_candidate
+        .take()
+        .ok_or("unexpected_source_observation")?;
+    let target = record
+        .start
+        .as_ref()
+        .and_then(|start| start.lifecycle_target.as_ref())
+        .ok_or("invalid_source_observation")?;
+    let boot = payload
+        .get("input_boot_epoch")
+        .and_then(Value::as_str)
+        .filter(|epoch| {
+            epoch.len() == 32
+                && epoch
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+        .ok_or("invalid_source_observation")?;
+    if payload.as_object().is_none_or(|fields| fields.len() != 6)
+        || payload["ok"] != true
+        || payload["version"] != 1
+        || payload["device"]
+            != json!({"slot":slot,"generation":generation,"capabilities":capabilities})
+        || record.feedback_device_observations.get(&slot) != Some(&(generation, capabilities))
+    {
+        return Err("invalid_source_observation");
+    }
+    let lifecycle = json!({"status":"succeeded","active":true,"target":payload["target"],"source":payload["source"]});
+    let source = amaterasu_module_sdk::input::extensions::source_label::observe(&lifecycle, target)
+        .map_err(|_| "invalid_source_observation")?
+        .ok_or("invalid_source_observation")?;
+    record.feedback_source_observations.insert(
+        slot,
+        json!({"source":{"version":source.version,"id":source.id,"generation":source.generation},
+        "target":payload["target"],"input_boot_epoch":boot,"device":payload["device"]}),
+    );
+    Ok(())
 }
 
 /// This only tracks monotonic input-provider observations. It does not admit a
@@ -539,6 +600,10 @@ pub(super) fn clear_input(record: &mut Record) {
     record.feedback_poll_at = 0;
     record.feedback_ack_through = None;
     record.feedback_device_observations.clear();
+    record.feedback_source_candidate = None;
+    record.feedback_source_retry_at = 0;
+    record.feedback_source_attempts.clear();
+    record.feedback_source_observations.clear();
     record.input_absolute_pointer = false;
     record.input_controller_supported = false;
     record.client_haptics_requested = false;

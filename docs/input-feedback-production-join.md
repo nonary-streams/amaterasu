@@ -53,9 +53,14 @@ state while the request is in flight. A successful selected-provider response
 returns `{ok:true,version:1,target,source,input_boot_epoch,device:{slot,
 generation,capabilities}}`. It contains no certificate. The lifecycle source
 may be unavailable until activation; absent, mismatched, expired, cancelled or
-revoked observations fail closed. The runtime broker test uses a simulated
-lifecycle service; this checkpoint does not yet connect the stream owner to the
-actual lifecycle/NVHTTP/pairing providers.
+revoked observations fail closed. A trusted, default-off stream-session startup
+setting `observe_feedback_sources` enables the owner to request and validate
+these observations against its current stream target, device generation and
+capabilities. This setting does not bind pairing, modify installed grants or
+open a feedback route. Ordinary unavailable responses are retried with a
+bounded delay; unresolved broker work remains fail-closed. The runtime broker test uses a simulated lifecycle service; the stream-owner
+workflow test uses a simulated input provider. These tests do not yet connect
+the real lifecycle/NVHTTP/pairing providers.
 
 The owner must independently verify the selected provider's supported feedback
 schemas, negotiated client protocol and effective global/application/session/

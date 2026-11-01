@@ -531,8 +531,26 @@ impl Pipeline {
     }
 
     fn schedule_control(&mut self, now: u64) -> bool {
+        let observe_sources = self.settings.observe_feedback_sources;
+        let source_due = |record: &Record| {
+            observe_sources
+                && now >= record.feedback_source_retry_at
+                && record.input_lease.is_some()
+                && record.lifecycle_input_token.is_some()
+                && record
+                    .start
+                    .as_ref()
+                    .is_some_and(|start| start.lifecycle_target.is_some())
+                && record
+                    .feedback_device_observations
+                    .iter()
+                    .any(|(slot, observation)| {
+                        record.feedback_source_attempts.get(slot) != Some(observation)
+                    })
+        };
         let has_control_work = |record: &Record| {
             record.force_idr
+                || source_due(record)
                 || (record.input_lease.is_some()
                     && (now >= record.input_renew_at
                         || (record.feedback_ack_through.is_some()
@@ -553,6 +571,7 @@ impl Pipeline {
                         .is_some_and(|start| start.lifecycle_target.is_some())
                         && !record.lifecycle_delivery_permit
                         || record.force_idr
+                        || source_due(record)
                         || (record.input_lease.is_some()
                             && (now >= record.input_renew_at
                                 || (record.feedback_ack_through.is_some()
@@ -619,12 +638,30 @@ impl Pipeline {
                 Step::InputBatch,
                 record.input_expires_at.min(now.saturating_add(5000)),
             )
+        } else if source_due(record) {
+            (Step::ObserveFeedbackSource, now.saturating_add(5000))
         } else if record.input_lease.is_some() && now >= record.feedback_poll_at {
             (Step::FeedbackPeek, now.saturating_add(5000))
         } else {
             (Step::ForceIdr, now + 5000)
         };
         let id = record.id;
+        if step == Step::ObserveFeedbackSource {
+            let record = self.records.get_mut(&id).expect("selected record");
+            let Some((&slot, &(generation, capabilities))) = record
+                .feedback_device_observations
+                .iter()
+                .find(|(slot, observation)| {
+                    record.feedback_source_attempts.get(slot) != Some(*observation)
+                })
+            else {
+                return false;
+            };
+            record.feedback_source_candidate = Some((slot, generation, capabilities));
+            record
+                .feedback_source_attempts
+                .insert(slot, (generation, capabilities));
+        }
         if step == Step::ObserveActiveBinding {
             let record = self.records.get_mut(&id).expect("selected record");
             let Some(next) = record.lifecycle_validation_sequence.checked_add(1) else {

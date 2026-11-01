@@ -315,6 +315,60 @@ mod tests {
         );
     }
     #[test]
+    fn delivered_lifecycle_reply_cannot_revive_a_changed_device() {
+        let mut broker = self::broker();
+        let mut job = start(&mut broker);
+        job.advance(true, &mut |cmd| Ok(broker.dispatch("input", cmd)))
+            .unwrap();
+        let Response::Request { id, .. } = broker.dispatch("lifecycle", Command::Poll {}) else {
+            panic!("lifecycle request")
+        };
+        let reply = json!({"status":"succeeded","active":true,"target":target(),"source":{"version":1,"id":"b".repeat(32),"generation":2}});
+        assert!(matches!(
+            broker.dispatch(
+                "lifecycle",
+                Command::Complete {
+                    request: id,
+                    payload: reply
+                }
+            ),
+            Response::Ok
+        ));
+        assert_eq!(
+            job.advance(false, &mut |cmd| Ok(broker.dispatch("input", cmd))),
+            Err("source_observation_retired")
+        );
+    }
+
+    #[test]
+    fn lifecycle_source_from_another_stream_is_rejected() {
+        let mut broker = self::broker();
+        let mut job = start(&mut broker);
+        job.advance(true, &mut |cmd| Ok(broker.dispatch("input", cmd)))
+            .unwrap();
+        let Response::Request { id, .. } = broker.dispatch("lifecycle", Command::Poll {}) else {
+            panic!("lifecycle request")
+        };
+        let mut wrong = serde_json::to_value(target()).unwrap();
+        wrong["stream_id"] = json!("another-stream");
+        let reply = json!({"status":"succeeded","active":true,"target":wrong,"source":{"version":1,"id":"b".repeat(32),"generation":2}});
+        assert!(matches!(
+            broker.dispatch(
+                "lifecycle",
+                Command::Complete {
+                    request: id,
+                    payload: reply
+                }
+            ),
+            Response::Ok
+        ));
+        assert_eq!(
+            job.advance(true, &mut |cmd| Ok(broker.dispatch("input", cmd))),
+            Err("source_observation_denied")
+        );
+    }
+
+    #[test]
     fn wrong_target_or_unattested_source_is_rejected() {
         for source in [
             Value::Null,

@@ -1629,3 +1629,108 @@ fn feedback_device_incarnations_are_consumed_and_stale_generation_fails_closed()
         Some("stale_feedback_device")
     );
 }
+
+#[test]
+fn selected_stream_owner_requests_and_validates_active_source_observation() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.pipeline.settings.observe_feedback_sources = true;
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    let id = host.response_from(1, "amaterasu.rtsp", prepare())["session"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        host.response_from(2, "amaterasu.rtsp", start(id))["state"],
+        "active"
+    );
+    let target = json!({"kind":"stream","host_epoch":"host","session_id":"session","stream_id":"stream","generation":2});
+    host.broker.input_source_observation = Some(
+        json!({"ok":true,"version":1,"target":target,"source":{"version":1,"id":"b".repeat(32),"generation":2},"input_boot_epoch":"a".repeat(32),"device":{"slot":2,"generation":7,"capabilities":0}}),
+    );
+    {
+        let record = host.pipeline.records.get_mut(&id).unwrap();
+        record.start.as_mut().unwrap().lifecycle_target =
+            Some(serde_json::from_value(target.clone()).unwrap());
+        record.lifecycle_input_token = Some("binding".into());
+        record.lifecycle_delivery_permit = true;
+        record.lifecycle_control_permit = true;
+        record.feedback_device_observations.insert(2, (7, 0));
+    }
+    for _ in 0..60 {
+        host.tick();
+        if host.pipeline.records[&id]
+            .feedback_source_observations
+            .contains_key(&2)
+        {
+            break;
+        }
+    }
+    assert_eq!(
+        host.pipeline.records[&id].feedback_source_observations[&2]["input_boot_epoch"],
+        "a".repeat(32)
+    );
+    assert!(
+        host.broker
+            .calls
+            .iter()
+            .any(|call| call.service == "amaterasu.input/1"
+                && call.payload["action"] == "observe_feedback_source"
+                && call.payload["controller_slot"] == 2
+                && call.payload["input_binding"] == "binding")
+    );
+    // The observation alone does not install a pairing lease or route.
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == "amaterasu.pairing-effects/1"
+                && call.payload["action"] == "admit_stream_lease")
+    );
+}
+
+#[test]
+fn stream_owner_rejects_stale_or_mismatched_feedback_source_observations() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    let target = json!({"kind":"stream","host_epoch":"host","session_id":"session","stream_id":"stream","generation":2});
+    let record = host.pipeline.records.get_mut(&id).unwrap();
+    record.start.as_mut().unwrap().lifecycle_target =
+        Some(serde_json::from_value(target.clone()).unwrap());
+    record.feedback_device_observations.insert(2, (7, 0));
+    let valid = json!({"ok":true,"version":1,"target":target,"source":{"version":1,"id":"b".repeat(32),"generation":2},"input_boot_epoch":"a".repeat(32),"device":{"slot":2,"generation":7,"capabilities":0}});
+    for field in ["generation", "slot", "capabilities"] {
+        record.feedback_source_candidate = Some((2, 7, 0));
+        let mut wrong = valid.clone();
+        wrong["device"][field] = json!(99);
+        assert_eq!(
+            super::super::input::accept_feedback_source_observation(record, &wrong),
+            Err("invalid_source_observation")
+        );
+    }
+    record.feedback_source_candidate = Some((2, 7, 0));
+    let mut wrong = valid.clone();
+    wrong["input_boot_epoch"] = json!("bad");
+    assert_eq!(
+        super::super::input::accept_feedback_source_observation(record, &wrong),
+        Err("invalid_source_observation")
+    );
+    record.feedback_source_candidate = Some((2, 7, 0));
+    let mut wrong = valid.clone();
+    wrong["source"]["generation"] = json!(3);
+    assert_eq!(
+        super::super::input::accept_feedback_source_observation(record, &wrong),
+        Err("invalid_source_observation")
+    );
+    assert!(record.feedback_source_observations.is_empty());
+    record.feedback_source_candidate = Some((2, 7, 0));
+    record.feedback_source_attempts.insert(2, (7, 0));
+    super::super::input::retry_feedback_source_observation(record, 10);
+    assert_eq!(record.feedback_source_retry_at, 1010);
+    assert!(!record.feedback_source_attempts.contains_key(&2));
+}

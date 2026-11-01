@@ -49,6 +49,7 @@ pub(super) enum Step {
     RenewInput,
     InputBatch,
     FeedbackPeek,
+    ObserveFeedbackSource,
     FeedbackAck,
     PollGamepadFeedback,
     RumbleDrain,
@@ -556,6 +557,25 @@ impl Job {
                     .payload(),
                 )
             }
+            Step::ObserveFeedbackSource => (
+                INPUT_SERVICE.into(),
+                InputRequest::ObserveFeedbackSource {
+                    version: 1,
+                    lease: record
+                        .input_lease
+                        .as_deref()
+                        .expect("source observation lease"),
+                    input_binding: record
+                        .lifecycle_input_token
+                        .as_deref()
+                        .expect("source observation binding"),
+                    controller_slot: record
+                        .feedback_source_candidate
+                        .expect("source observation candidate")
+                        .0,
+                }
+                .payload(),
+            ),
             Step::FeedbackPeek => (
                 INPUT_SERVICE.into(),
                 InputRequest::FeedbackPeek {
