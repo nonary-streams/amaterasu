@@ -524,7 +524,7 @@ fn aggregate_feedback_lease_drains_against_actual_control_retirement_receipt() {
     use amaterasu_media::{CONTROL_RELIABLE, ControlMessage, MEDIA_CLOSED};
     use amaterasu_module_sdk::effect_authority::{
         StreamScope,
-        consumer::{FeedbackLease, TransportRetirement, feedback_capability_identity},
+        consumer::{FeedbackLease, TransportRetirement, feedback_capability},
     };
     use amaterasu_module_sdk::input::extensions::{Capability, Direction};
     use amaterasu_module_sdk::transport::control_retirement::Receipt;
@@ -544,7 +544,8 @@ fn aggregate_feedback_lease_drains_against_actual_control_retirement_receipt() {
         direction: Direction::ToClient,
     };
     let scope = StreamScope {
-        capabilities: [feedback_capability_identity(&capability).unwrap()].into(),
+        capabilities: [feedback_capability(&capability).unwrap()].into(),
+        controller_slot: 7,
         transport_service: "amaterasu.control-transport/1".into(),
         transport_stream: stream,
         transport_epoch: provider_epoch.clone(),

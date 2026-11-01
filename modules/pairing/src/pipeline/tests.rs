@@ -4222,3 +4222,5 @@ fn real_broker_stream_lease_returns_exact_selected_source_and_scope() {
     assert_eq!(payload["scope"], scope);
     assert_eq!(payload["kind"], "stream_lease");
 }
+
+mod stream_consumer_broker;

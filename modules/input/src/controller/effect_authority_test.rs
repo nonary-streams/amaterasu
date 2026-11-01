@@ -96,10 +96,10 @@ impl Fixture {
         };
         gate.require_epoch(&requested_epoch).unwrap();
         let ticket = gate
-            .admit_stream_lease(&requested_source, &operation_id, sequence, scope)
+            .admit_stream_lease(&requested_source, &operation_id, sequence, scope.clone())
             .unwrap()
             .to_owned();
-        lease.accept_admission(&json!({"ok":true,"epoch":epoch,"operation_id":operation_id,"ticket":ticket,"kind":"stream_lease"})).unwrap();
+        lease.accept_admission(&json!({"ok":true,"epoch":epoch,"operation_id":operation_id,"ticket":ticket,"kind":"stream_lease","source":requested_source,"scope":scope})).unwrap();
         (
             Self {
                 gate,
@@ -245,7 +245,7 @@ fn lost_admission_reconciles_after_fence_without_starting_effect() {
 #[test]
 fn lost_scoped_admission_after_fence_is_retirement_only() {
     use amaterasu_module_sdk::effect_authority::consumer::{
-        FeedbackLease, TransportRetirement, feedback_capability_identity,
+        FeedbackLease, TransportRetirement, feedback_capability,
     };
     use amaterasu_module_sdk::input::extensions::{Capability, Direction};
     use amaterasu_module_sdk::transport::control_retirement::Receipt;
@@ -255,7 +255,8 @@ fn lost_scoped_admission_after_fence_is_retirement_only() {
         direction: Direction::ToClient,
     };
     let scope = StreamScope {
-        capabilities: [feedback_capability_identity(&capability).unwrap()].into(),
+        capabilities: [feedback_capability(&capability).unwrap()].into(),
+        controller_slot: 7,
         transport_service: "amaterasu.control-transport/1".into(),
         transport_stream: 7,
         transport_epoch: "c".repeat(32),

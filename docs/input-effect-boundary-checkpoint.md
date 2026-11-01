@@ -95,20 +95,20 @@ tests do not establish the full broker/lifecycle/transport integration.
 The selected pairing authority now supplies `bind_stream`,
 `admit_stream_lease`, `lookup_stream_lease`, and `complete_stream_lease`.
 `StreamLeaseTicket` retains the exact source and scope from its submitted request,
-checks the broker response kind, and checks the echoed scope on lookup. Pairing
+checks the broker response kind, and compares the complete echoed source and
+structured scope on both admission and lookup. Pairing
 accepts completion only with a scoped transport retirement assertion; the SDK
 constructs it after checking the exact selected transport receipt. The ordinary
 one-shot ticket path cannot complete a stream lease. A fenced lookup can only
-retire. Local capability identities use `<schema>@<version>:to_client`; both
-protocol binding and input composition must use this exact representation.
+retire. The checked conversion to pairing's structured feedback capability preserves the
+schema and version and rejects non-client-bound directions. The authority scope
+also contains the exact controller slot; the local bridge checks it.
 
 The `bind_stream` production path remains closed. Production needs the
 certificate/lifecycle source join, trusted verification that the source/device
 maps to the selected controller slot and control handle, negotiated capability
 intersection, selected owner's status/revoke and worker-retirement handshake,
-restart recovery, and independent review. The authority scope does not encode a
-controller slot; the local bridge checks its bound slot but authenticated
-composition must establish that binding. Tests compile the actual pairing ledger
+restart recovery, and independent review. Authenticated composition must establish the source/device-to-slot binding. Tests compile the actual pairing ledger
 and use an actual control-provider retirement receipt, but do not establish the
 complete authenticated pairing/broker/lifecycle/transport path.
 

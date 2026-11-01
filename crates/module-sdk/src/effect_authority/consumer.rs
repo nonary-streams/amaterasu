@@ -294,33 +294,23 @@ impl StreamLeaseTicket {
             scope: self.scope.clone(),
         })
     }
+    fn response_scope_matches(&self, response: &Value) -> bool {
+        response.get("kind").and_then(Value::as_str) == Some("stream_lease")
+            && response.get("source").is_some_and(|actual| {
+                serde_json::to_value(&self.effect.source).ok().as_ref() == Some(actual)
+            })
+            && response.get("scope").is_some_and(|actual| {
+                serde_json::to_value(&self.scope).ok().as_ref() == Some(actual)
+            })
+    }
     pub fn accept_admission(&mut self, response: &Value) -> Result<(), &'static str> {
-        if response.get("kind").and_then(Value::as_str) != Some("stream_lease") {
+        if !self.response_scope_matches(response) {
             return Err("invalid_effect_response");
         }
         self.effect.accept_ticket(response, false)
     }
     pub fn accept_lookup(&mut self, response: &Value) -> Result<(), &'static str> {
-        if response.get("kind").and_then(Value::as_str) != Some("stream_lease")
-            || serde_json::from_value::<Source>(
-                response
-                    .get("source")
-                    .cloned()
-                    .ok_or("invalid_effect_response")?,
-            )
-            .ok()
-            .as_ref()
-                != Some(&self.effect.source)
-            || serde_json::from_value::<StreamScope>(
-                response
-                    .get("scope")
-                    .cloned()
-                    .ok_or("invalid_effect_response")?,
-            )
-            .ok()
-            .as_ref()
-                != Some(&self.scope)
-        {
+        if !self.response_scope_matches(response) {
             return Err("invalid_effect_response");
         }
         self.effect.accept_ticket(response, true)
@@ -351,19 +341,24 @@ impl StreamLeaseTicket {
     }
 }
 
-/// Canonical pairing scope identity for a local feedback schema and direction.
-pub fn feedback_capability_identity(
+/// Checked conversion from the general input capability to the pairing-owned
+/// client-feedback profile. Pairing remains the owner of its wire type.
+pub fn feedback_capability(
     capability: &crate::input::extensions::Capability,
-) -> Result<String, &'static str> {
+) -> Result<super::FeedbackCapability, &'static str> {
     if !capability.valid() || capability.direction != crate::input::extensions::Direction::ToClient
     {
         return Err("invalid_feedback_capability");
     }
-    let identity = format!("{}@{}:to_client", capability.schema, capability.version);
-    if !valid_token(&identity) {
+    let result = super::FeedbackCapability {
+        schema: capability.schema.clone(),
+        version: capability.version,
+        direction: super::FeedbackDirection::ToClient,
+    };
+    if !result.valid() {
         return Err("invalid_feedback_capability");
     }
-    Ok(identity)
+    Ok(result)
 }
 
 /// A single admitted source/stream lease with a fixed negotiated capability set.
@@ -400,12 +395,13 @@ impl FeedbackLease {
         use crate::input::extensions::{Direction, MAX_CAPABILITIES};
         let identities = capabilities
             .iter()
-            .map(feedback_capability_identity)
+            .map(feedback_capability)
             .collect::<Result<std::collections::BTreeSet<_>, _>>();
         if !matches!(
             aggregate.effect.state,
             State::Ready | State::NeedsCompletion
         ) || identities.as_ref().ok() != Some(&aggregate.scope.capabilities)
+            || controller_slot != aggregate.scope.controller_slot
             || retirement.stream != aggregate.scope.transport_stream
             || retirement.provider_epoch != aggregate.scope.transport_epoch
             || retirement.stream == 0
@@ -690,8 +686,12 @@ mod tests {
             version: 1,
             direction: Direction::ToClient,
         };
+        let mut wrong_direction = capability.clone();
+        wrong_direction.direction = Direction::ToDevice;
+        assert!(feedback_capability(&wrong_direction).is_err());
         let scope = StreamScope {
-            capabilities: [feedback_capability_identity(&capability).unwrap()].into(),
+            capabilities: [feedback_capability(&capability).unwrap()].into(),
+            controller_slot: 7,
             transport_service: "amaterasu.control-transport/1".into(),
             transport_stream: 7,
             transport_epoch: "c".repeat(32),
@@ -700,7 +700,19 @@ mod tests {
             StreamLeaseTicket::new("e".repeat(32), source(), "operation".into(), 1, scope).unwrap();
         let mut response = admission();
         response["kind"] = json!("stream_lease");
+        response["source"] = serde_json::to_value(source()).unwrap();
+        response["scope"] = serde_json::to_value(aggregate.scope.clone()).unwrap();
         aggregate.accept_admission(&response).unwrap();
+        let aggregate =
+            match FeedbackLease::new(aggregate, retirement(), 8, [capability.clone()].into()) {
+                Err(failure) => failure.0,
+                Ok(_) => panic!("mismatched controller slot must be rejected"),
+            };
+        let aggregate = match FeedbackLease::new(aggregate, retirement(), 7, [other.clone()].into())
+        {
+            Err(failure) => failure.0,
+            Ok(_) => panic!("unnegotiated capability set must be rejected"),
+        };
         let mut lease = FeedbackLease::new(aggregate, retirement(), 7, [capability.clone()].into())
             .unwrap_or_else(|_| panic!("lease"));
         assert!(

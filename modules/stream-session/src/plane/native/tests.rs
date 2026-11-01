@@ -610,14 +610,13 @@ fn source_feedback_scope(
     stream: u64,
     provider_epoch: &str,
 ) -> amaterasu_module_sdk::effect_authority::StreamScope {
-    use amaterasu_module_sdk::effect_authority::{
-        StreamScope, consumer::feedback_capability_identity,
-    };
+    use amaterasu_module_sdk::effect_authority::{StreamScope, consumer::feedback_capability};
     StreamScope {
         capabilities: source_feedback_capabilities()
             .iter()
-            .map(|capability| feedback_capability_identity(capability).unwrap())
+            .map(|capability| feedback_capability(capability).unwrap())
             .collect(),
+        controller_slot: 7,
         transport_service: "amaterasu.control-transport/1".into(),
         transport_stream: stream,
         transport_epoch: provider_epoch.into(),
