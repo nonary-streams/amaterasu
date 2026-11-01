@@ -113,15 +113,15 @@ fn selected_formats_send_real_udp_and_preserve_source_time_at_discontinuity() {
                     unsafe { stream.submit_ordered_audio(&wrong_time) },
                     STATUS_INVALID_ARGUMENT
                 );
-                let second = packet(&bytes, 11, 1_032_000, AUDIO_PACKET_DISCONTINUITY);
+                let second = packet(&bytes, 11, 1_096_000, AUDIO_PACKET_DISCONTINUITY);
                 assert_eq!(unsafe { stream.submit_ordered_audio(&second) }, STATUS_OK);
                 assert_eq!(stream.discarded_audio_fec_shards, 1);
                 stream.delivery.tick();
                 let output = receive(&audio);
                 assert_eq!(&output[2..4], &4u16.to_be_bytes());
-                assert_eq!(&output[4..8], &32u32.to_be_bytes());
+                assert_eq!(&output[4..8], &96u32.to_be_bytes());
                 for index in 0..3 {
-                    let next = packet(&bytes, 12 + index, 1_064_000 + index * 32_000, 0);
+                    let next = packet(&bytes, 12 + index, 1_128_000 + index * 32_000, 0);
                     assert_eq!(unsafe { stream.submit_ordered_audio(&next) }, STATUS_OK);
                 }
                 stream.delivery.tick();
@@ -130,7 +130,7 @@ fn selected_formats_send_real_udp_and_preserve_source_time_at_discontinuity() {
                     assert_eq!(&output[2..4], &(5u16 + index).to_be_bytes());
                     assert_eq!(
                         &output[4..8],
-                        &(64u32 + u32::from(index) * 32).to_be_bytes()
+                        &(128u32 + u32::from(index) * 32).to_be_bytes()
                     );
                 }
                 for parity in 0..2 {
@@ -138,7 +138,7 @@ fn selected_formats_send_real_udp_and_preserve_source_time_at_discontinuity() {
                     assert_eq!(output[1], 127);
                     assert_eq!(output[12], parity);
                     assert_eq!(&output[14..16], &4u16.to_be_bytes());
-                    assert_eq!(&output[16..20], &32u32.to_be_bytes());
+                    assert_eq!(&output[16..20], &96u32.to_be_bytes());
                 }
             }
         }
@@ -174,4 +174,29 @@ fn busy_does_not_consume_the_selected_packet_or_clock() {
     assert_eq!(&output[2..4], &0u16.to_be_bytes());
     assert_eq!(&output[4..8], &0u32.to_be_bytes());
     assert_eq!(&output[12..], &bytes);
+}
+
+#[test]
+fn ordered_discontinuity_wraps_wire_clock_without_resetting_sequence() {
+    let (video, audio) = receivers();
+    let mut stream = Stream::open("owner", &request(&video, &audio, false)).unwrap();
+    stream
+        .prepare_ordered_audio(&selection(AUDIO_CODEC_AC3, AUDIO_FRAMING_AC3_SYNCFRAME, 4))
+        .unwrap();
+    let bytes = [1, 2, 3, 4];
+    let first = packet(&bytes, 1, 1_000_000, 0);
+    let wrapped = packet(
+        &bytes,
+        2,
+        1_000_000 + (u64::from(u32::MAX) + 10) * 1000,
+        AUDIO_PACKET_DISCONTINUITY,
+    );
+    // SAFETY: headers and bytes remain live through synchronous submissions.
+    assert_eq!(unsafe { stream.submit_ordered_audio(&first) }, STATUS_OK);
+    assert_eq!(unsafe { stream.submit_ordered_audio(&wrapped) }, STATUS_OK);
+    stream.delivery.tick();
+    let _ = receive(&audio);
+    let second = receive(&audio);
+    assert_eq!(&second[2..4], &4u16.to_be_bytes());
+    assert_eq!(&second[4..8], &9u32.to_be_bytes());
 }
