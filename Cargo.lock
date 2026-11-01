@@ -61,6 +61,7 @@ dependencies = [
  "amaterasu-logging",
  "amaterasu-package",
  "ed25519-dalek",
+ "getrandom 0.3.4",
  "libc",
  "libloading",
  "serde",

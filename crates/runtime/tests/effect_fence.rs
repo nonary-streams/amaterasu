@@ -2820,6 +2820,55 @@ fn authority_binds_selected_provider_and_complete_schema_at_arm() {
 }
 
 #[test]
+fn selected_method_binds_host_issued_provider_incarnation() {
+    use amaterasu_contracts::effect_fence::ProviderIncarnation;
+    let mut config = configuration();
+    let instance = ProviderIncarnation {
+        version: 1,
+        id: "a".repeat(64),
+    };
+    config
+        .host_context
+        .provider_incarnations
+        .insert("provider".into(), instance.clone());
+    let method = config.api_methods[0].method.clone();
+    let mut broker = Broker::new(config).unwrap();
+    assert!(matches!(
+        broker.dispatch("provider", Command::RegisterApi { method }),
+        Response::Ok
+    ));
+    open(&mut broker, scope(), 0);
+    let Response::Result { payload } = invoke(
+        &mut broker,
+        "authority",
+        EffectFenceCommand::SelectedMethod {
+            method: ProtectedMethod {
+                service: "example.effects/1".into(),
+                method: "apply".into(),
+                interface_major: 1,
+            },
+        },
+    ) else {
+        panic!("selection missing")
+    };
+    let mut selected: amaterasu_contracts::effect_fence::SelectedEffectMethod =
+        serde_json::from_value(payload).unwrap();
+    assert_eq!(selected.provider_incarnation.as_ref(), Some(&instance));
+    selected.provider_incarnation.as_mut().unwrap().id = "b".repeat(64);
+    assert_eq!(
+        code(invoke(
+            &mut broker,
+            "authority",
+            EffectFenceCommand::ArmSelected {
+                effect: effect(1),
+                expected: Box::new(selected)
+            }
+        )),
+        "incompatible_api"
+    );
+}
+
+#[test]
 fn slotted_admission_rejects_the_legacy_unbound_arm() {
     let mut broker = slotted_setup();
     let epoch = broker_epoch(&mut broker, "authority");
