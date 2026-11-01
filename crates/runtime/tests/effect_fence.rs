@@ -2892,6 +2892,13 @@ fn historical_journal_verification_uses_real_selected_state_read() {
     config
         .principals
         .insert("replacement".into(), replacement_grants);
+    config.host_context.provider_incarnations.insert(
+        "replacement".into(),
+        ProviderIncarnation {
+            version: 1,
+            id: "f".repeat(32),
+        },
+    );
     config.api_methods[0].provider = "replacement".into();
     config.api_methods[0].method.interface_minor = 1;
     config
@@ -2938,6 +2945,9 @@ fn historical_journal_verification_uses_real_selected_state_read() {
 
     let mut guarded = effect(1);
     guarded.scope = source_for(0);
+    guarded.operation_id =
+        amaterasu_module_sdk::protocol_slot_state::operation_id("issuer", &guarded.scope, 1)
+            .unwrap();
     let identity = guarded.identity("provider");
     let instance = ProviderIncarnation {
         version: 1,
@@ -3330,6 +3340,30 @@ fn historical_journal_verification_uses_real_selected_state_read() {
         ),
         Response::Ok
     ));
+    let saved_journal = store.handle("authority", StateRequest::Get { key: key.into() }.payload());
+    let adapter = amaterasu_module_sdk::protocol_slot_adapter::HistoricalSlotEffect::from_state(
+        0,
+        1,
+        &saved_journal,
+    )
+    .unwrap();
+    adapter
+        .verify_journal(read, |cmd| Ok(broker.dispatch("authority", cmd)))
+        .unwrap();
+    assert!(
+        adapter
+            .restore_from_host(
+                {
+                    let mut forged = old_receipt.clone();
+                    forged.provider_incarnation.id = "e".repeat(32);
+                    forged
+                },
+                read,
+                host_receipt_read,
+                |cmd| Ok(broker.dispatch(host, cmd))
+            )
+            .is_err()
+    );
     let check =
         |identity: amaterasu_contracts::effect_fence::GuardedEffectIdentity,
          provider_incarnation| EffectFenceCommand::VerifyHistoricalJournal {
@@ -3502,14 +3536,11 @@ fn historical_journal_verification_uses_real_selected_state_read() {
         )),
         "effect_conflict"
     );
-    assert!(matches!(
-        invoke(
-            &mut broker,
-            amaterasu_contracts::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
-            historical(old_receipt)
-        ),
-        Response::Ok
-    ));
+    adapter
+        .restore_from_host(old_receipt, read, host_receipt_read, |cmd| {
+            Ok(broker.dispatch(host, cmd))
+        })
+        .unwrap();
     assert!(
         matches!(slot_invoke(&mut broker, "authority", &recovery_lease, EffectFenceCommand::LookupIdentity { identity: identity.clone() }), Response::Result { payload } if payload["status"] == "retired")
     );
@@ -3668,20 +3699,17 @@ fn historical_journal_verification_uses_real_selected_state_read() {
         StateRequest::Get { key: key.into() },
         "cleanup.read",
     );
-    assert!(matches!(
-        slot_invoke(
-            &mut broker,
-            "authority",
-            &recovery_lease,
-            EffectFenceCommand::ConfirmHistoricalCleanup {
-                identity: Box::new(identity.clone()),
-                provider_incarnation: instance.clone(),
-                expected_entry: cleaned_entry.clone(),
-                state_request: cleanup_read,
-            }
-        ),
-        Response::Ok
-    ));
+    let cleaned_state = store.handle("authority", StateRequest::Get { key: key.into() }.payload());
+    let cleaned_adapter =
+        amaterasu_module_sdk::protocol_slot_adapter::HistoricalSlotEffect::from_state(
+            0,
+            1,
+            &cleaned_state,
+        )
+        .unwrap();
+    cleaned_adapter
+        .confirm_cleanup(cleanup_read, |cmd| Ok(broker.dispatch("authority", cmd)))
+        .unwrap();
     assert!(matches!(
         slot_invoke(
             &mut broker,

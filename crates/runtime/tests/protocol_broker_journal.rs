@@ -843,7 +843,7 @@ fn poll_issuer_ack(
 }
 
 #[test]
-fn digest_only_recovery_retires_workers_and_fences_late_prior_issuer() {
+fn legacy_digest_only_recovery_requires_host_incarnation_and_stays_fenced() {
     use amaterasu_module_sdk::protocol_broker::{IssuerWorkerRetirement, JournaledIdentity};
     let path = directory();
     let store = TestStateStore::open(path.clone()).unwrap();
@@ -1044,100 +1044,31 @@ fn digest_only_recovery_retires_workers_and_fences_late_prior_issuer() {
         recovery_lease.clone(),
     )
     .unwrap();
-    recovered
-        .fence(|cmd| Ok(restarted.dispatch("authority", cmd)))
-        .unwrap();
-    let proof = recovered
-        .retirement(|cmd| Ok(restarted.dispatch("authority", cmd)))
-        .unwrap();
-    // This fixture has no persistent provider effect; a real owner must verify
-    // its selected provider's independent cleanup before marking the journal.
-    // State's revision is caller-wide, so refresh after persisting the slot.
-    let read = state_exchange(&mut restarted, &store, &source.read_request());
-    assert!(matches!(
-        protocol_sequence::prepare_cleanup(
-            &binding(),
-            &source,
-            &read,
-            1,
-            &effect,
-            &reference(),
-            &proof
-        ),
-        Err("cleanup_unproven")
-    ));
-    let cleanup = protocol_sequence::prepare_cleanup(
-        &binding(),
-        &source,
-        &read,
-        1,
-        &effect,
-        &reference(),
-        &TestClean(&proof),
-    )
-    .unwrap();
-    assert_eq!(state_exchange(&mut restarted, &store, &cleanup)["ok"], true);
-    let current = state_exchange(&mut restarted, &store, &source.read_request());
     assert_eq!(
-        protocol_sequence::recovery_watermark(&source, &current).unwrap(),
-        1
+        recovered
+            .fence(|cmd| Ok(restarted.dispatch("authority", cmd)))
+            .unwrap_err(),
+        "historical_host_receipt_required"
     );
-    assert!(matches!(
-        send(
-            &mut restarted,
-            "authority",
-            slot_cmd(
-                &recovery_lease,
-                EffectFenceCommand::Compact {
-                    scope: old_scope.clone(),
-                    retired_through: 1
-                }
-            )
-        ),
-        Response::Ok
-    ));
-    // Source retirement requires the issuer and host; the issuer command is
-    // emitted only after an actual aggregate worker is joined.
-    let close_worker = std::thread::spawn(|| Ok(()));
-    let mut close =
-        IssuerWorkerRetirement::new(recovery_lease.clone(), old_scope.clone(), close_worker)
-            .unwrap();
-    poll_issuer_ack(&mut close, &mut restarted, false);
-    assert!(matches!(
-        send(
-            &mut restarted,
-            amaterasu_contracts::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
-            EffectFenceCommand::SourceRetired {
-                lease: recovery_lease.clone(),
-                scope: old_scope.clone()
-            }
-        ),
-        Response::Ok
-    ));
-    let mut floors = vec![0_u64; 64];
-    floors[slot as usize] = recovery_lease.incarnation;
-    slot_state_write(
-        &mut restarted,
-        &store,
-        "slot-floors",
-        serde_json::json!(floors),
-    );
-    assert!(matches!(
-        send(
-            &mut restarted,
-            "authority",
-            EffectFenceCommand::FinishCloseSlot {
-                lease: recovery_lease,
-                scope: old_scope,
-                retired_through: 1
-            }
-        ),
-        Response::Ok
-    ));
-    let mut delayed_receipt = pending.confirmed(delayed).unwrap();
     assert!(
-        matches!(slotted.dispatch(&mut delayed_receipt,|cmd|Ok(restarted.dispatch("issuer",cmd))).unwrap(),Response::Error{code,..} if code=="stale_source_slot")
+        matches!(recovered.retirement(|cmd| Ok(restarted.dispatch("authority", cmd))), Err(error) if error == "historical_host_receipt_required")
     );
+    // The legacy v4 record has no original provider incarnation, so recovery
+    // cannot fabricate a retirement or advance its unresolved watermark.
+    let read = state_exchange(&mut restarted, &store, &source.read_request());
+    assert_eq!(
+        protocol_sequence::recovery_watermark(&source, &read),
+        Err("reconciliation_required")
+    );
+    let mut delayed_receipt = pending.confirmed(delayed).unwrap();
+    assert!(matches!(
+        slotted
+            .dispatch(&mut delayed_receipt, |cmd| Ok(
+                restarted.dispatch("issuer", cmd)
+            ))
+            .unwrap(),
+        Response::Error { .. }
+    ));
     assert!(matches!(
         restarted.dispatch("provider", Command::Poll {}),
         Response::Pending

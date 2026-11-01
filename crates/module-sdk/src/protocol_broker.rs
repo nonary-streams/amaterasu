@@ -251,12 +251,9 @@ impl SlottedEffect {
 
 /// Payload-free recovery binding obtained from a validated State journal entry.
 /// A broker retired result does not prove persistent provider cleanup.
-pub struct JournaledIdentity {
-    pending: PendingEffect,
-    issuer: Source,
-    identity: GuardedEffectIdentity,
-    lease: SourceSlotLease,
-}
+/// A legacy v4 record lacks a host provider incarnation. It cannot establish
+/// historical worker retirement and is retained for explicit reconciliation.
+pub struct JournaledIdentity;
 impl JournaledIdentity {
     pub fn new(
         entry: &Entry,
@@ -267,39 +264,18 @@ impl JournaledIdentity {
         if scope.source.slot() != Some(lease.slot) {
             return Err("source_slot_mismatch");
         }
-        let identity =
-            journal_identity(&entry.effect, &entry.issuer, &scope, route, entry.sequence)?;
-        Ok(Self {
-            pending: entry.effect.clone(),
-            issuer: entry.issuer.clone(),
-            identity,
-            lease,
-        })
+        journal_identity(&entry.effect, &entry.issuer, &scope, route, entry.sequence)?;
+        Ok(Self)
     }
-    /// The broker permits this only in an appropriate authority-opened slot;
-    /// the authority must have verified old worker retirement before recovery.
-    pub fn fence(&self, mut authority: impl FnMut(Command) -> SendResult) -> Result<(), String> {
-        require_ok(authority(slot_command(
-            &self.lease,
-            EffectFenceCommand::RecoverFence {
-                identity: self.identity.clone(),
-            },
-        ))?)
+    /// Identity-only recovery cannot substitute for the original host receipt.
+    pub fn fence(&self, _authority: impl FnMut(Command) -> SendResult) -> Result<(), String> {
+        Err("historical_host_receipt_required".into())
     }
     pub fn retirement(
         &self,
-        mut authority: impl FnMut(Command) -> SendResult,
+        _authority: impl FnMut(Command) -> SendResult,
     ) -> Result<BrokerRetirement, String> {
-        retired_response(
-            authority(slot_command(
-                &self.lease,
-                EffectFenceCommand::LookupIdentity {
-                    identity: self.identity.clone(),
-                },
-            ))?,
-            &self.issuer,
-            &self.pending,
-        )
+        Err("historical_host_receipt_required".into())
     }
 }
 

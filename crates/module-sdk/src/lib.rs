@@ -22,6 +22,7 @@ pub mod protocol;
 pub mod protocol_authority;
 pub mod protocol_broker;
 pub mod protocol_sequence;
+pub mod protocol_slot_adapter;
 pub mod protocol_slot_state;
 pub mod protocol_state;
 pub mod requests;
