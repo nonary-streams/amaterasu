@@ -8,6 +8,7 @@ use amaterasu_gamestream::{
     },
 };
 use std::{
+    collections::VecDeque,
     io::{Read, Write},
     net::{TcpStream, UdpSocket},
     time::{Duration, Instant},
@@ -22,9 +23,10 @@ pub(super) struct Client {
     pub media: Vec<UdpSocket>,
     opener: ControlOpener,
     next_sequence: u16,
+    pending_messages: VecDeque<ControlMessage>,
 }
 impl Client {
-    fn send_message(&mut self, kind: u16, payload: &[u8]) {
+    fn send_message(&mut self, kind: u16, payload: &[u8]) -> std::io::Result<()> {
         let encrypted = self.sealer.seal(kind, payload).unwrap();
         let datagram = Datagram {
             header: Header {
@@ -42,17 +44,18 @@ impl Client {
         self.next_sequence += 1;
         self.control
             .send(&enet::encode(&datagram, &Limits::default()).unwrap())
-            .unwrap();
+            .map(|_| ())
     }
-    pub fn keep_alive(&mut self) {
-        self.send_message(0x0200, &[4, 0, 0, 0, 0, 0, 0, 0]);
+    pub fn keep_alive(&mut self) -> std::io::Result<()> {
+        self.send_message(0x0200, &[4, 0, 0, 0, 0, 0, 0, 0])?;
+        self.drain_incoming()
     }
     pub fn enable_haptics(&mut self) {
         let mut payload = vec![0; 10];
         payload[..4].copy_from_slice(&6u32.to_be_bytes());
         payload[4..8].copy_from_slice(&0x0du32.to_le_bytes());
         payload[8..10].copy_from_slice(&1u16.to_le_bytes());
-        self.send_message(0x0206, &payload);
+        self.send_message(0x0206, &payload).unwrap();
     }
     pub fn send_controller_arrival(&mut self) {
         let mut payload = vec![0u8; 16];
@@ -61,41 +64,62 @@ impl Client {
         payload[8] = 0;
         payload[9] = 2;
         payload[10..12].copy_from_slice(&1u16.to_le_bytes());
-        self.send_message(0x0206, &payload);
+        self.send_message(0x0206, &payload).unwrap();
         assert_eq!(self.media.len(), 2);
     }
     pub fn receive_feedback(&mut self) -> Option<ControlMessage> {
+        self.drain_incoming()
+            .expect("receive and acknowledge control responses");
+        self.pending_messages.pop_front()
+    }
+    fn drain_incoming(&mut self) -> std::io::Result<()> {
         let mut bytes = [0; 4096];
         loop {
             let size = match self.control.recv(&mut bytes) {
                 Ok(size) => size,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return None,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
                 Err(error) => panic!("control receive: {error}"),
             };
-            let packet = enet::decode(&bytes[..size], &Limits::default()).unwrap();
+            let packet = enet::decode(&bytes[..size], &Limits::default())
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+            let sent_time = packet.header.sent_time.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "ENet packet has no sent time",
+                )
+            })?;
+            let mut acknowledgments = Vec::new();
             for command in packet.commands {
-                if let CommandBody::SendReliable { data } = command.body {
-                    let ack = Datagram {
-                        header: Header {
-                            peer_id: 0,
-                            session_id: 0,
-                            sent_time: Some(10),
+                if command.flags & FLAG_ACKNOWLEDGE != 0 {
+                    acknowledgments.push(Command {
+                        channel_id: command.channel_id,
+                        reliable_sequence: command.reliable_sequence,
+                        flags: 0,
+                        body: CommandBody::Acknowledge {
+                            received_sequence: command.reliable_sequence,
+                            received_sent_time: sent_time,
                         },
-                        commands: vec![Command {
-                            channel_id: command.channel_id,
-                            reliable_sequence: command.reliable_sequence,
-                            flags: 0,
-                            body: CommandBody::Acknowledge {
-                                received_sequence: command.reliable_sequence,
-                                received_sent_time: packet.header.sent_time.unwrap(),
-                            },
-                        }],
-                    };
-                    self.control
-                        .send(&enet::encode(&ack, &Limits::default()).unwrap())
-                        .unwrap();
-                    return Some(self.opener.open(&data).expect("authenticated feedback"));
+                    });
                 }
+                if let CommandBody::SendReliable { data } = command.body {
+                    let message = self
+                        .opener
+                        .open(&data)
+                        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+                    self.pending_messages.push_back(message);
+                }
+            }
+            if !acknowledgments.is_empty() {
+                let acknowledgment = Datagram {
+                    header: Header {
+                        peer_id: 0,
+                        session_id: 0,
+                        sent_time: Some(10),
+                    },
+                    commands: acknowledgments,
+                };
+                self.control
+                    .send(&enet::encode(&acknowledgment, &Limits::default()).unwrap())?;
             }
         }
     }
@@ -272,6 +296,7 @@ pub(super) fn play(url: &str, mut tick: impl FnMut()) -> Client {
             ControlOrdering::MultipleChannels,
         )
         .unwrap(),
+        pending_messages: VecDeque::new(),
     }
 }
 

@@ -1,0 +1,14 @@
+[package]
+name = "amaterasu-host-composition-placeholder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+amaterasu-module-sdk.workspace = true
+
+[lints]
+workspace = true

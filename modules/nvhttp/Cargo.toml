@@ -30,12 +30,16 @@ x509-cert = "0.2.5"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 
 [dev-dependencies]
+amaterasu-abi.workspace = true
+amaterasu-logging.workspace = true
 amaterasu-module-sdk = { workspace = true, features = ["network-test-support"] }
-amaterasu-runtime = { path = "../../crates/runtime" }
 amaterasu-package.workspace = true
+amaterasu-runtime = { path = "../../crates/runtime" }
+ed25519-dalek.workspace = true
+libc = "0.2"
+libloading.workspace = true
 amaterasu-network-api.workspace = true
 amaterasu-network-sockets.workspace = true
-libloading.workspace = true
 
 [lints]
 workspace = true

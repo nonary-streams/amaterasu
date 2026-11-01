@@ -15,8 +15,10 @@ use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 
+#[path = "loading/management_tls.rs"]
 pub(crate) mod management_tls;
 #[cfg(test)]
+#[path = "loading/teardown_tests.rs"]
 mod teardown_tests;
 
 const HOST_CONFIGURATION_COMPONENT: &str = "amaterasu.host-configuration";
@@ -90,6 +92,46 @@ impl LoadedComponents {
         package: &VerifiedPackage,
         state_root: &Path,
         product_logger: Option<ProductLogger>,
+        progress: &mut dyn FnMut(usize) -> PackageResult<()>,
+    ) -> PackageResult<Self> {
+        Self::load_internal(
+            root,
+            directory,
+            package,
+            state_root,
+            product_logger,
+            &mut |_, endpoint| Ok(endpoint),
+            progress,
+        )
+    }
+
+    #[cfg(test)]
+    pub fn load_for_test(
+        root: &Path,
+        directory: &Path,
+        package: &VerifiedPackage,
+        state_root: &Path,
+        endpoint_hook: &mut dyn FnMut(&str, HostApi) -> PackageResult<HostApi>,
+        progress: &mut dyn FnMut(usize) -> PackageResult<()>,
+    ) -> PackageResult<Self> {
+        Self::load_internal(
+            root,
+            directory,
+            package,
+            state_root,
+            None,
+            endpoint_hook,
+            progress,
+        )
+    }
+
+    fn load_internal(
+        root: &Path,
+        directory: &Path,
+        package: &VerifiedPackage,
+        state_root: &Path,
+        product_logger: Option<ProductLogger>,
+        endpoint_hook: &mut dyn FnMut(&str, HostApi) -> PackageResult<HostApi>,
         progress: &mut dyn FnMut(usize) -> PackageResult<()>,
     ) -> PackageResult<Self> {
         crate::privilege::require_user_process()?;
@@ -225,6 +267,7 @@ impl LoadedComponents {
                 .filter(|component| !component.runtime),
             |runtime, component| {
                 let endpoint = runtime.endpoint(&component.id)?;
+                let endpoint = endpoint_hook(&component.id, endpoint)?;
                 let mut feature = FeatureLibrary::load(
                     &directory.join(&component.file),
                     &component.id,
@@ -483,6 +526,11 @@ impl LoadedComponents {
 
     pub fn console_endpoint(&mut self) -> PackageResult<HostApi> {
         self.runtime.endpoint("amaterasu.console")
+    }
+
+    #[cfg(test)]
+    pub fn test_endpoint(&mut self, principal: &str) -> PackageResult<HostApi> {
+        self.runtime.endpoint(principal)
     }
 
     pub fn take_host_lifecycle_action(&self) -> PackageResult<Option<HostLifecycleAction>> {

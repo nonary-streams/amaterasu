@@ -93,6 +93,9 @@ pub(super) struct Inbox {
     scan_call: Option<worker::Call>,
     drain: Option<(String, u64)>,
     drain_call: Option<worker::Call>,
+    selected_transport: String,
+    idle_status_call: Option<worker::Call>,
+    idle_status_next: Option<Instant>,
     restart_required: bool,
     restart: Option<restart::Restart>,
 }
@@ -100,6 +103,8 @@ impl Inbox {
     pub fn new(restart_required: bool, selected_transport: String) -> Self {
         Self {
             restart_required,
+            selected_transport: selected_transport.clone(),
+            idle_status_next: Some(Instant::now()),
             restart: restart_required
                 .then(|| restart::Restart::new(selected_transport))
                 .flatten(),
@@ -393,6 +398,7 @@ impl Inbox {
                     && response["fence_generation"] == generation
                 {
                     self.drain = None;
+                    self.authority_fenced = false;
                 }
             }
             return;
@@ -431,6 +437,14 @@ impl Inbox {
                     self.enqueue_internal(binding, &transport);
                 }
             }
+            return;
+        }
+        if self.registry.first_source().is_none()
+            && !self.entries.iter().any(|entry| entry.worker.is_some())
+            && self.entries.is_empty()
+            && self.admission.is_none()
+        {
+            self.progress_idle_authority(send);
             return;
         }
         if self.watch_call.is_none() {
@@ -481,17 +495,30 @@ impl Inbox {
                 .as_u64()
                 .is_none_or(|n| n > 0);
             if fenced {
-                self.authority_fenced = true;
-                if valid
-                    && let Some(generation) =
-                        response["fence_generation"].as_u64().filter(|n| *n > 0)
-                {
-                    self.drain = Some((epoch, generation));
+                let locally_drained = self.registry.first_source().is_none()
+                    && self.entries.is_empty()
+                    && self.source_scan.is_empty()
+                    && self.scan_call.is_none();
+                if valid && locally_drained && admission::quiescent_fence(&response) {
+                    // A post-mutation fence can be reopened by the selected
+                    // effect owner only after the Pairing authority reports a
+                    // completed drain. A fresh candidate performs that exact
+                    // Recover/readback handshake before it can bind a source.
+                    self.authority_fenced = false;
+                    self.watch_context = None;
+                    self.last_context = None;
+                } else {
+                    self.authority_fenced = true;
+                    if valid
+                        && let Some(generation) =
+                            response["fence_generation"].as_u64().filter(|n| *n > 0)
+                    {
+                        self.drain = Some((epoch, generation));
+                    }
+                    self.enqueue_internal(binding, &transport);
                 }
             }
-            if fenced {
-                self.enqueue_internal(binding, &transport);
-            } else if source_fenced {
+            if !fenced && source_fenced {
                 self.source_scan = self.registry.source_snapshots().into();
             } else if self.registry.first_source().is_none()
                 && !self.entries.iter().any(|entry| entry.worker.is_some())
@@ -499,6 +526,55 @@ impl Inbox {
                 self.last_context = None;
             }
         }
+    }
+
+    /// The NVHTTP startup fence can happen before PLAY creates a candidate
+    /// source. Watch the selected authority while idle so its owner-restart
+    /// barrier can rotate a fully drained epoch before the protocol becomes
+    /// ready to accept a client.
+    fn progress_idle_authority(&mut self, send: &mut Send<'_>) {
+        if self
+            .idle_status_next
+            .is_some_and(|next| Instant::now() < next)
+        {
+            return;
+        }
+        if self.idle_status_call.is_none() {
+            let Some(next) = self.watch_counter.checked_add(1) else {
+                return;
+            };
+            self.watch_counter = next;
+            self.idle_status_call = Some(worker::Call::new(
+                amaterasu_module_sdk::effect_authority::SERVICE,
+                json!({"action":"status"}),
+                format!("feedback-idle-status-{next}"),
+            ));
+        }
+        let Some(response) = self
+            .idle_status_call
+            .as_mut()
+            .and_then(|call| call.poll(send))
+        else {
+            return;
+        };
+        self.idle_status_call = None;
+        self.idle_status_next = Some(Instant::now() + Duration::from_secs(1));
+        if response["ok"] != true
+            || !(response["fenced"] == true
+                || response["drain_required"] == true
+                || response["startup_recovery_required"] == true
+                || response["pending_source_retirements"]
+                    .as_u64()
+                    .is_none_or(|count| count > 0))
+        {
+            return;
+        }
+        let Some(restart) = restart::Restart::new(self.selected_transport.clone()) else {
+            return;
+        };
+        self.authority_fenced = true;
+        self.restart = Some(restart);
+        self.restart_required = true;
     }
     /// Progresses independently of the session workflow. A source is eligible
     /// only when an owner-held registry reservation and the actual record agree.
@@ -516,6 +592,9 @@ impl Inbox {
             {
                 self.restart_required = false;
                 self.restart = None;
+                self.authority_fenced = false;
+                self.drain = None;
+                self.idle_status_next = Some(Instant::now());
             } else {
                 return;
             }

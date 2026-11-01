@@ -20,6 +20,9 @@ pub(super) struct Context<'a> {
     pub generated: &'a mut Option<LoadedModule>,
     pub provider: &'a mut Option<LoadedModule>,
     pub video_fixture: &'a mut Option<fixture_video::Video>,
+    pub observed: std::sync::Arc<
+        std::sync::Mutex<Option<amaterasu_module_sdk::nvhttp_source::BindFeedbackSource>>,
+    >,
     pub configuration: &'a RuntimeClient,
     pub capture_fixture: &'a RuntimeClient,
     pub video_runtime: &'a RuntimeClient,
@@ -44,6 +47,9 @@ fn load_stream(
         std::sync::Mutex<Option<amaterasu_module_sdk::nvhttp_source::BindFeedbackSource>>,
     >,
 ) -> LoadedModule {
+    if let Some(components) = runtime.host_components() {
+        return LoadedModule::host_proxy(components);
+    }
     let artifacts = PathBuf::from(std::env::var_os("AMATERASU_COMPOSITION_ARTIFACT_DIR").unwrap());
     LoadedModule::start_observed(
         &artifact(&artifacts, "amaterasu_stream_session"),
@@ -72,6 +78,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
         generated,
         provider,
         video_fixture,
+        observed,
         configuration,
         capture_fixture,
         video_runtime,
@@ -100,11 +107,11 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
         second_cert_id,
     );
     let artifacts = PathBuf::from(std::env::var_os("AMATERASU_COMPOSITION_ARTIFACT_DIR").unwrap());
-    let mut module = LoadedModule::start(
+    let mut module = super::selected_module(
+        runtime,
         &artifact(&artifacts, "amaterasu_nvhttp"),
-        &runtime.endpoint("amaterasu.nvhttp"),
+        "amaterasu.nvhttp",
     );
-    let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
     *selected_stream = Some(load_stream(runtime, observed.clone()));
     let address = std::net::SocketAddr::from((
         [127, 0, 0, 1],
@@ -112,6 +119,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
     ));
     let mut status = None;
     let mut status_sequence = 0u64;
+    let mut last_status = Value::Null;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         module.tick();
@@ -131,13 +139,14 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
         if let Some(result) = take(&owner, status.unwrap()) {
             status = None;
             assert_eq!(result["https_address"], address.to_string());
+            last_status = result.clone();
             if result["tls_ready"] == true && result["feedback_source_ready"] == true {
                 break;
             }
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "NVHTTP status timed out"
+            "NVHTTP status timed out: {last_status}"
         );
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
@@ -201,6 +210,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
         .and_then(|(_, tail)| tail.split_once("</sessionUrl0>"))
         .map(|(url, _)| url.to_owned())
         .unwrap_or_else(|| panic!("launch rejected: {response}"));
+    let control_started = std::time::Instant::now();
     let mut control_client = rtsp_client::play(&url, || {
         module.tick();
         super::tick_authority_modules(pairing, memory, host_configuration);
@@ -231,7 +241,17 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
     });
     let rtsp_owner = runtime.client("amaterasu.rtsp");
     let mut last = Value::Null;
+    let mut active_status_request = None;
     for n in 0..300 {
+        if n % 5 == 0 {
+            if let Err(error) = control_client.keep_alive() {
+                let diagnostic = control_status(stream, selected_control, "first-control-send");
+                panic!(
+                    "control keepalive failed at activation iteration {n} after {:?}: {error}; status={diagnostic}",
+                    control_started.elapsed()
+                );
+            }
+        }
         for _ in 0..30 {
             module.tick();
             super::tick_authority_modules(pairing, memory, host_configuration);
@@ -246,14 +266,17 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
             video_fixture.as_mut().unwrap().pump(video_runtime);
             backends.pump(session, stream, input, application, display);
         }
-        let pending = broker_request(
-            &rtsp_owner,
-            "amaterasu.stream-session/1",
-            json!({"action":"status"}),
-            &format!("full-active-{n}"),
-        );
+        let pending = *active_status_request.get_or_insert_with(|| {
+            broker_request(
+                &rtsp_owner,
+                "amaterasu.stream-session/1",
+                json!({"action":"status"}),
+                "full-active",
+            )
+        });
         selected_stream.as_mut().unwrap().tick();
         if let Some(value) = take(&rtsp_owner, pending) {
+            active_status_request = None;
             last = value;
         }
         if last["sessions"].as_array().is_some_and(|items| {
@@ -279,7 +302,13 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
     let mut observed_join = None;
     for n in 0..150 {
         if n % 5 == 0 {
-            control_client.keep_alive();
+            if let Err(error) = control_client.keep_alive() {
+                let diagnostic = control_status(stream, selected_control, "feedback-control-send");
+                panic!(
+                    "control keepalive failed at feedback iteration {n} after {:?}: {error}; status={diagnostic}",
+                    control_started.elapsed()
+                );
+            }
         }
         for _ in 0..20 {
             module.tick();
@@ -647,6 +676,12 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
         }
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
+    if runtime.is_host_loaded() {
+        // LoadedComponents owns the selected stream library, so this composition
+        // validates real host-managed retirement and teardown; owner-restart is
+        // covered by the separate direct-owner qualification.
+        return observed_join;
+    }
     drop(selected_stream.take());
     *selected_stream = Some(load_stream(runtime, observed.clone()));
     let mut restart_status = Value::Null;
@@ -691,6 +726,30 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
     assert_eq!(restart_status["in_flight"], 0, "{restart_status}");
     assert_eq!(restart_status["bound_sources"], 0, "{restart_status}");
     observed_join
+}
+
+fn control_status(
+    owner: &RuntimeClient,
+    selected_control: &mut Option<LoadedModule>,
+    operation: &str,
+) -> Value {
+    let request = broker_request(
+        owner,
+        "amaterasu.control-transport/1",
+        json!({"action":"status"}),
+        operation,
+    );
+    for _ in 0..100 {
+        selected_control
+            .as_mut()
+            .expect("selected control provider")
+            .tick();
+        if let Some(value) = take(owner, request) {
+            return value;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    json!({"error":"control status timed out"})
 }
 
 /// Configure only this fresh test authority through its real administrator API.
@@ -858,6 +917,19 @@ fn provision_authority(
     let status = status.expect("post-provision authority status");
     assert_eq!(status["bound_sources"], 0, "{status}");
     if status["fenced"] == true {
+        if pairing.host_components.is_some() {
+            assert_eq!(
+                status["drain_required"], false,
+                "Pairing did not finish its trust-mutation drain: {status}"
+            );
+            assert_eq!(status["in_flight"], 0, "{status}");
+            assert_eq!(status["pending_source_retirements"], 0, "{status}");
+            // No lifecycle source exists until the authenticated PLAY and
+            // controller arrival below. The real selected stream owner will
+            // reopen this already-drained authority after it observes that
+            // candidate, then verify the rotated epoch before source binding.
+            return;
+        }
         assert_eq!(status["drain_required"], false, "{status}");
         let request = broker_request(
             owner,

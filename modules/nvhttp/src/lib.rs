@@ -18,6 +18,19 @@ mod upnp;
 mod upnp_ipv6;
 mod wire;
 
+// Reuse the production package loader in the signed host-composition test. The
+// callback and endpoint inspection APIs remain test-only on LoadedComponents.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../../../crates/host/src/capture_authority.rs"]
+mod capture_authority;
+#[cfg(test)]
+#[path = "../../../crates/host/src/loading.rs"]
+#[allow(dead_code)]
+mod host_loading;
+#[cfg(test)]
+#[path = "../../../crates/host/src/privilege.rs"]
+mod privilege;
+
 pub use product_settings::{default_document, validate_document};
 pub use settings::Settings;
 

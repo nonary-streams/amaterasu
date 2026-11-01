@@ -417,6 +417,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "amaterasu-host-composition-placeholder"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-module-sdk",
+]
+
+[[package]]
 name = "amaterasu-host-configuration"
 version = "0.1.0"
 dependencies = [
@@ -664,10 +671,12 @@ dependencies = [
 name = "amaterasu-nvhttp"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-abi",
  "amaterasu-contracts",
  "amaterasu-gamestream",
  "amaterasu-identity",
  "amaterasu-input-policy",
+ "amaterasu-logging",
  "amaterasu-media",
  "amaterasu-module-sdk",
  "amaterasu-network-api",
@@ -677,8 +686,10 @@ dependencies = [
  "amaterasu-runtime",
  "amaterasu-upnp",
  "base64 0.22.1",
+ "ed25519-dalek",
  "getrandom 0.3.4",
  "httparse",
+ "libc",
  "libloading",
  "pem-rfc7468",
  "rustls",

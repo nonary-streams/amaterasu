@@ -1,7 +1,6 @@
 //! Cross-module selected-library qualification. The protocol modules and broker
 //! run their production entrypoints; only hardware and persistent state are synthetic.
 use super::*;
-use amaterasu_contracts::{HOST_LIFECYCLE_CONTROL_PRINCIPAL, LiveFeedbackHostProof, RuntimeConfig};
 use amaterasu_module_sdk::abi::{self, BorrowedBytes, HostApi, ModuleApi, RuntimeApi, STATUS_OK};
 use amaterasu_module_sdk::{Command, Response, RuntimeClient};
 use serde_json::{Value, json};
@@ -13,6 +12,7 @@ mod authenticated_tls;
 mod fixture_capture;
 mod fixture_video;
 mod full;
+mod host_package;
 mod rtsp_client;
 
 const CLIENT_CERT: &str = include_str!("../../../../pairing/tests/fixtures/client-cert.pem");
@@ -25,10 +25,11 @@ const HOST_KEY: &str = include_str!("../../../../pairing/tests/fixtures/host-key
 static QUALIFICATION_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 
 struct LoadedModule {
-    api: ModuleApi,
+    api: Option<ModuleApi>,
     instance: *mut c_void,
-    _library: libloading::Library,
+    _library: Option<libloading::Library>,
     _observer: Option<Box<ObserveEndpoint>>,
+    host_components: Option<std::rc::Rc<std::cell::RefCell<crate::host_loading::LoadedComponents>>>,
 }
 
 struct ObserveEndpoint {
@@ -92,10 +93,11 @@ impl LoadedModule {
         );
         assert!(!instance.is_null());
         Self {
-            api,
+            api: Some(api),
             instance,
-            _library: library,
+            _library: Some(library),
             _observer: None,
+            host_components: None,
         }
     }
     fn start_observed(
@@ -105,34 +107,68 @@ impl LoadedModule {
             std::sync::Mutex<Option<amaterasu_module_sdk::nvhttp_source::BindFeedbackSource>>,
         >,
     ) -> Self {
-        let mut observer = Box::new(ObserveEndpoint {
-            inner: host,
-            observed,
-        });
-        let proxy = HostApi {
-            header: host.header,
-            context: (&mut *observer as *mut ObserveEndpoint).cast(),
-            invoke: observe_invoke,
-        };
+        let (proxy, observer) = observe_host_api(host, observed);
         let mut module = Self::start(path, &proxy);
         module._observer = Some(observer);
         module
     }
+    fn host_proxy(
+        components: std::rc::Rc<std::cell::RefCell<crate::host_loading::LoadedComponents>>,
+    ) -> Self {
+        Self {
+            api: None,
+            instance: std::ptr::null_mut(),
+            _library: None,
+            _observer: None,
+            host_components: Some(components),
+        }
+    }
     fn tick(&mut self) {
-        // SAFETY: instance is live, belongs to this table, and calls are serialized.
-        assert_eq!(unsafe { (self.api.tick)(self.instance) }, STATUS_OK);
+        if let Some(api) = self.api {
+            // SAFETY: instance is live, belongs to this table, and calls are serialized.
+            assert_eq!(unsafe { (api.tick)(self.instance) }, STATUS_OK);
+        } else if let Some(components) = &self.host_components {
+            components
+                .borrow_mut()
+                .tick()
+                .expect("host components tick");
+        }
     }
 }
 impl Drop for LoadedModule {
     fn drop(&mut self) {
-        // SAFETY: destroy exactly once before releasing the library handle.
-        unsafe { (self.api.destroy)(self.instance) }
+        if let Some(api) = self.api {
+            // SAFETY: destroy exactly once before releasing the library handle.
+            unsafe { (api.destroy)(self.instance) }
+        }
     }
 }
+fn observe_host_api(
+    host: HostApi,
+    observed: std::sync::Arc<
+        std::sync::Mutex<Option<amaterasu_module_sdk::nvhttp_source::BindFeedbackSource>>,
+    >,
+) -> (HostApi, Box<ObserveEndpoint>) {
+    let mut observer = Box::new(ObserveEndpoint {
+        inner: host,
+        observed,
+    });
+    let proxy = HostApi {
+        header: host.header,
+        context: (&mut *observer as *mut ObserveEndpoint).cast(),
+        invoke: observe_invoke,
+    };
+    (proxy, observer)
+}
 struct Runtime {
-    api: RuntimeApi,
+    api: Option<RuntimeApi>,
     handle: *mut c_void,
-    _library: libloading::Library,
+    _library: Option<libloading::Library>,
+    host_components: Option<std::rc::Rc<std::cell::RefCell<crate::host_loading::LoadedComponents>>>,
+    // Boxed addresses are retained in HostApi contexts while this collection
+    // grows; moving the observer values in a Vec would invalidate those pointers.
+    #[allow(clippy::vec_box)]
+    _host_observers: Option<std::rc::Rc<std::cell::RefCell<Vec<Box<ObserveEndpoint>>>>>,
 }
 impl Runtime {
     fn new(path: &Path, configuration: Value) -> Self {
@@ -151,17 +187,39 @@ impl Runtime {
             STATUS_OK
         );
         Self {
-            api,
+            api: Some(api),
             handle,
-            _library: library,
+            _library: Some(library),
+            host_components: None,
+            _host_observers: None,
+        }
+    }
+    #[allow(clippy::vec_box)]
+    fn from_host_components(
+        components: crate::host_loading::LoadedComponents,
+        observers: std::rc::Rc<std::cell::RefCell<Vec<Box<ObserveEndpoint>>>>,
+    ) -> Self {
+        Self {
+            api: None,
+            handle: std::ptr::null_mut(),
+            _library: None,
+            host_components: Some(std::rc::Rc::new(std::cell::RefCell::new(components))),
+            _host_observers: Some(observers),
         }
     }
     fn endpoint(&self, principal: &str) -> HostApi {
+        if let Some(components) = &self.host_components {
+            return components
+                .borrow_mut()
+                .test_endpoint(principal)
+                .unwrap_or_else(|error| panic!("host endpoint {principal}: {error}"));
+        }
+        let api = self.api.expect("direct runtime API");
         let mut host = std::mem::MaybeUninit::uninit();
         // SAFETY: runtime and output are live and principal bytes are borrowed synchronously.
         assert_eq!(
             unsafe {
-                (self.api.endpoint)(
+                (api.endpoint)(
                     self.handle,
                     BorrowedBytes::new(principal.as_bytes()),
                     host.as_mut_ptr(),
@@ -176,15 +234,35 @@ impl Runtime {
         // SAFETY: clients and all module instances are dropped before runtime.
         unsafe { RuntimeClient::from_endpoint(self.endpoint(principal)) }
     }
+    fn host_components(
+        &self,
+    ) -> Option<std::rc::Rc<std::cell::RefCell<crate::host_loading::LoadedComponents>>> {
+        self.host_components.clone()
+    }
+    fn is_host_loaded(&self) -> bool {
+        self.host_components.is_some()
+    }
 }
 impl Drop for Runtime {
     fn drop(&mut self) {
-        // SAFETY: all modules and clients have been retired before runtime teardown.
-        unsafe { (self.api.destroy)(self.handle) }
+        if let Some(api) = self.api {
+            // SAFETY: all modules and clients have been retired before runtime teardown.
+            unsafe { (api.destroy)(self.handle) }
+        }
+        // Host observers wrap endpoints retained by LoadedComponents. Keep them
+        // alive until that owner has destroyed all modules and the runtime.
+        self.host_components.take();
     }
 }
 fn artifact(dir: &Path, name: &str) -> PathBuf {
     dir.join(format!("lib{name}.so"))
+}
+fn selected_module(runtime: &Runtime, path: &Path, principal: &str) -> LoadedModule {
+    if let Some(components) = runtime.host_components() {
+        LoadedModule::host_proxy(components)
+    } else {
+        LoadedModule::start(path, &runtime.endpoint(principal))
+    }
 }
 fn register(client: &RuntimeClient, service: &str) {
     client
@@ -205,7 +283,7 @@ fn broker_request(client: &RuntimeClient, service: &str, payload: Value, operati
         .unwrap()
     {
         Response::Accepted { id } => id,
-        response => panic!("request rejected: {response:?}"),
+        response => panic!("request rejected for {service} ({operation}): {response:?}"),
     }
 }
 fn take(client: &RuntimeClient, id: u64) -> Option<Value> {
@@ -249,67 +327,6 @@ fn prepare_bootstrap_installation(package_root: &Path) -> PathBuf {
 #[cfg(not(target_os = "linux"))]
 fn prepare_bootstrap_installation(_package_root: &Path) -> PathBuf {
     panic!("normal-ABI feedback bootstrap qualification requires Linux")
-}
-
-fn initialize_live_feedback_state(
-    runtime: &Runtime,
-    state: &mut LoadedModule,
-    package_root: &Path,
-    proof: &LiveFeedbackHostProof,
-) {
-    assert_eq!(
-        proof.first_boot_phase,
-        Some(amaterasu_contracts::LiveFeedbackBootstrapPhase::Pending),
-        "normal-ABI composition must start from a fresh trusted witness"
-    );
-    amaterasu_package::live_feedback_bootstrap::begin_state_initialization(package_root, proof)
-        .expect("persist the bootstrap write-ahead phase");
-    let claim = amaterasu_module_sdk::state::FeedbackBootstrapClaim {
-        version: 1,
-        installation_id: proof.installation_id.clone(),
-        claim: proof
-            .first_boot_claim
-            .clone()
-            .expect("fresh package must issue a first-boot claim"),
-        pairing_owner: proof.profile.pairing_owner.clone(),
-        effect_owner: proof.profile.stream_owner.clone(),
-    };
-    let expected_claim = serde_json::to_value(claim).expect("serialize host-issued claim");
-    let host = runtime.client(HOST_LIFECYCLE_CONTROL_PRINCIPAL);
-    let request = match host
-        .send(Command::InitializeLiveFeedback {
-            resume_existing: false,
-        })
-        .unwrap()
-    {
-        Response::Accepted { id } => id,
-        response => panic!("trusted host bootstrap was rejected: {response:?}"),
-    };
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        state.tick();
-        match host
-            .send(Command::FinishLiveFeedbackInitialization { request })
-            .unwrap()
-        {
-            Response::Pending if std::time::Instant::now() < deadline => {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            Response::Result { payload } => {
-                assert_eq!(payload["ok"], true, "{payload}");
-                assert_eq!(payload["revision"], 1, "{payload}");
-                assert_eq!(payload["claim"], expected_claim, "{payload}");
-                assert_eq!(payload["phase"], "prepared", "{payload}");
-                amaterasu_package::live_feedback_bootstrap::mark_state_initialized(
-                    package_root,
-                    proof,
-                )
-                .expect("mark State claim as initialized");
-                return;
-            }
-            response => panic!("trusted State bootstrap failed: {response:?}"),
-        }
-    }
 }
 
 fn tick_authority_modules(
@@ -545,117 +562,150 @@ fn run_composition(
         config["settings"]["policy"]["rules"][0]["certificates"] = json!([cert_id, second_cert_id]);
         configure_full(&mut config, &streaming);
     }
-    let mut bootstrap_proof = None;
-    if normal_abi {
-        let mut runtime_config: RuntimeConfig =
-            serde_json::from_value(config.clone()).expect("normal-ABI runtime config");
-        runtime_config.host_context.schema = 1;
-        runtime_config.host_context.state_root = Some(
-            state_root
-                .canonicalize()
-                .expect("canonical test State root")
-                .to_string_lossy()
-                .into_owned(),
+    let real_input = std::env::var_os("AMATERASU_COMPOSITION_REAL_INPUT").is_some();
+    let real_stream = std::env::var_os("AMATERASU_COMPOSITION_REAL_STREAM").is_some();
+    let observed_feedback_source = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let fixture_video_owner = std::rc::Rc::new(std::cell::RefCell::new(None));
+    #[allow(clippy::vec_box)]
+    let host_observers = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let runtime = if normal_abi {
+        config["settings"]["network"] = json!({"max_handles":1024});
+        let placeholder = PathBuf::from(
+            std::env::var_os("AMATERASU_COMPOSITION_PLACEHOLDER_ARTIFACT")
+                .expect("signed-package placeholder artifact"),
         );
-        runtime_config.host_context.package_root = Some(
-            package_root
-                .canonicalize()
-                .expect("canonical test package root")
-                .to_string_lossy()
-                .into_owned(),
-        );
-        runtime_config
-            .settings
-            .entry("amaterasu.host-configuration".into())
-            .or_default()["host_state_root"] = json!(state_root.to_string_lossy());
-        runtime_config.host_lifecycle_control = true;
-        runtime_config
-            .principals
-            .insert(HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(), Default::default());
-        let proof = amaterasu_package::live_feedback_bootstrap::prepare(
+        let signed = host_package::create_signed_package(
+            &config,
+            replacement,
             &package_root,
+            &artifacts,
+            &placeholder,
+        );
+        let fixture_video_owner = fixture_video_owner.clone();
+        let hook_observers = host_observers.clone();
+        let observed_feedback_source = observed_feedback_source.clone();
+        let mut endpoint_hook = move |principal: &str, endpoint: HostApi| {
+            // These test-only providers are registered at the package-loader
+            // point where their signed principal is created. The production
+            // modules consume the same broker and native endpoints unchanged.
+            let client = unsafe { RuntimeClient::from_endpoint(endpoint) };
+            match principal {
+                "fixture-capture" if play => fixture_capture::register(&client),
+                "fixture-configuration" if real_input => {
+                    register(&client, "amaterasu.configuration/1")
+                }
+                "application" => register(&client, "amaterasu.application/1"),
+                "display" => register(&client, "amaterasu.display/1"),
+                "fixture-video" if play => {
+                    *fixture_video_owner.borrow_mut() = Some(fixture_video::Video::start(&client));
+                }
+                _ => {}
+            }
+            if principal == "stream" {
+                let (observed_endpoint, observer) =
+                    observe_host_api(endpoint, observed_feedback_source.clone());
+                hook_observers.borrow_mut().push(observer);
+                Ok(observed_endpoint)
+            } else {
+                Ok(endpoint)
+            }
+        };
+        let mut progress = |_| Ok(());
+        let loaded = crate::host_loading::LoadedComponents::load_for_test(
+            &package_root,
+            &signed.directory,
+            &signed.verified,
             &state_root,
-            &runtime_config,
+            &mut endpoint_hook,
+            &mut progress,
         )
-        .expect("trusted package bootstrap");
-        let proof = proof.expect("fresh feedback package proof");
-        runtime_config.host_context.live_feedback_bootstrap = Some(proof.clone());
-        bootstrap_proof = Some(proof);
-        config = serde_json::to_value(runtime_config).expect("serialize trusted runtime config");
-        let checked: RuntimeConfig =
-            serde_json::from_value(config.clone()).expect("parse trusted runtime config");
-        amaterasu_runtime::Broker::new(checked).expect("trusted live-feedback topology");
-    }
-    let runtime = Runtime::new(&artifact(&artifacts, "amaterasu_runtime"), config);
+        .unwrap_or_else(|error| panic!("production host package load: {error}"));
+        let _ = signed.bootstrap;
+        Runtime::from_host_components(loaded, host_observers.clone())
+    } else {
+        Runtime::new(&artifact(&artifacts, "amaterasu_runtime"), config)
+    };
     let capture_fixture = runtime.client("fixture-capture");
-    if play {
+    if play && !normal_abi {
         fixture_capture::register(&capture_fixture);
     }
-    let mut memory = LoadedModule::start(
-        &artifact(&artifacts, "amaterasu_state"),
-        &runtime.endpoint("amaterasu.state"),
+    let host_components = runtime.host_components();
+    let mut memory = host_components.as_ref().map_or_else(
+        || {
+            LoadedModule::start(
+                &artifact(&artifacts, "amaterasu_state"),
+                &runtime.endpoint("amaterasu.state"),
+            )
+        },
+        |loaded| LoadedModule::host_proxy(loaded.clone()),
     );
-    if normal_abi {
-        initialize_live_feedback_state(
-            &runtime,
-            &mut memory,
-            &package_root,
-            bootstrap_proof.as_ref().expect("prepared feedback proof"),
-        );
-    }
     let mut selected_host_configuration = normal_abi.then(|| {
-        LoadedModule::start(
-            &artifact(&artifacts, "amaterasu_host_configuration"),
-            &runtime.endpoint("amaterasu.host-configuration"),
+        LoadedModule::host_proxy(
+            host_components
+                .as_ref()
+                .expect("host-loaded package")
+                .clone(),
         )
     });
     let network = runtime.client("network");
-    let factory = amaterasu_network_sockets::Factory::new();
-    // SAFETY: factory lives until after RTSP and its native binding are destroyed.
-    unsafe {
-        network
-            .register_native_typed(
-                amaterasu_network_api::SERVICE,
-                amaterasu_network_api::CONTRACT,
-                &factory.api,
-            )
-            .unwrap()
+    let _factory = if normal_abi {
+        None
+    } else {
+        let factory = amaterasu_network_sockets::Factory::new();
+        // SAFETY: factory lives until after RTSP and its native binding are destroyed.
+        unsafe {
+            network
+                .register_native_typed(
+                    amaterasu_network_api::SERVICE,
+                    amaterasu_network_api::CONTRACT,
+                    &factory.api,
+                )
+                .unwrap()
+        };
+        Some(factory)
     };
     let stream = runtime.client("stream");
-    let real_stream = std::env::var_os("AMATERASU_COMPOSITION_REAL_STREAM").is_some();
     assert!(
         !play || real_stream,
         "PLAY qualification needs the selected stream"
     );
     let video_runtime = runtime.client("fixture-video");
-    let mut video_fixture = play.then(|| fixture_video::Video::start(&video_runtime));
+    let mut video_fixture = if normal_abi {
+        fixture_video_owner.borrow_mut().take()
+    } else {
+        play.then(|| fixture_video::Video::start(&video_runtime))
+    };
     if !real_stream {
         register(&stream, "amaterasu.stream-session/1");
     }
     let mut selected_control = real_stream.then(|| {
-        LoadedModule::start(
+        selected_module(
+            &runtime,
             &artifact(&artifacts, "amaterasu_control_transport"),
-            &runtime.endpoint("control"),
+            "control",
         )
     });
     let mut selected_media = real_stream.then(|| {
-        LoadedModule::start(
+        selected_module(
+            &runtime,
             &artifact(&artifacts, "amaterasu_media_transport"),
-            &runtime.endpoint("media"),
+            "media",
         )
     });
     let mut selected_stream = (real_stream && !full).then(|| {
-        LoadedModule::start(
+        selected_module(
+            &runtime,
             &artifact(&artifacts, "amaterasu_stream_session"),
-            &runtime.endpoint("stream"),
+            "stream",
         )
     });
     let session = runtime.client("session");
     let real_session = full;
     let mut selected_session = if real_session {
-        Some(LoadedModule::start(
+        Some(selected_module(
+            &runtime,
             &artifact(&artifacts, "amaterasu_session"),
-            &runtime.endpoint("session"),
+            "session",
         ))
     } else {
         register(&session, "amaterasu.session/1");
@@ -667,19 +717,21 @@ fn run_composition(
         register(&input, "amaterasu.input/1");
     }
     let configuration = runtime.client("fixture-configuration");
-    if real_input {
+    if real_input && !normal_abi {
         register(&configuration, "amaterasu.configuration/1");
     }
     let mut selected_input = real_input.then(|| {
         let input_artifact = std::env::var_os("AMATERASU_INPUT_QUALIFICATION_ARTIFACT")
             .map(PathBuf::from)
             .unwrap_or_else(|| artifact(&artifacts, "amaterasu_input"));
-        let module = LoadedModule::start(&input_artifact, &runtime.endpoint("input"));
+        let module = selected_module(&runtime, &input_artifact, "input");
         if std::env::var_os("AMATERASU_INPUT_QUALIFICATION_ALTERNATE").is_some() {
-            // SAFETY: this test loads a locally built trusted qualification module
-            // and retains its library for the lifetime of the symbol call.
+            // Inspect the package-selected artifact independently of the host's
+            // module handle so this assertion also covers LoadedComponents.
+            let marker_library = unsafe { libloading::Library::new(&input_artifact) }
+                .expect("open alternate input artifact marker");
             let marker = unsafe {
-                module._library.get::<unsafe extern "C" fn() -> u32>(
+                marker_library.get::<unsafe extern "C" fn() -> u32>(
                     b"amaterasu_input_alternate_qualification_marker",
                 )
             }
@@ -695,14 +747,15 @@ fn run_composition(
         }
     }
     let display = runtime.client("display");
-    register(&display, "amaterasu.display/1");
+    if !normal_abi {
+        register(&display, "amaterasu.display/1");
+    }
     let application = runtime.client("application");
-    register(&application, "amaterasu.application/1");
-    let mut pairing = if full && std::env::var_os("AMATERASU_COMPOSITION_NORMAL_ABI").is_some() {
-        LoadedModule::start(
-            &artifact(&artifacts, "amaterasu_pairing"),
-            &runtime.endpoint("amaterasu.pairing"),
-        )
+    if !normal_abi {
+        register(&application, "amaterasu.application/1");
+    }
+    let mut pairing = if let Some(components) = runtime.host_components() {
+        LoadedModule::host_proxy(components)
     } else if full {
         let qualification = PathBuf::from(
             std::env::var_os("AMATERASU_FEEDBACK_QUALIFICATION_ARTIFACT_DIR")
@@ -725,111 +778,51 @@ fn run_composition(
     };
     if normal_abi {
         let owner = runtime.client("stream");
-        let mut status_request = broker_request(
+        let mut pending = broker_request(
             &owner,
             "amaterasu.pairing-effects/1",
             json!({"action":"status"}),
-            "trusted-first-boot-status-0",
+            "host-loaded-first-boot-status-0",
         );
-        let mut recovered = false;
-        let mut host_bootstrap_finished = false;
-        let mut last_status = None;
-        let mut last_finish_response = None;
-        let host = runtime.client(HOST_LIFECYCLE_CONTROL_PRINCIPAL);
+        let mut recovered = None;
         for attempt in 0..5_000 {
             tick_authority_modules(&mut pairing, &mut memory, &mut selected_host_configuration);
-            if !host_bootstrap_finished {
-                let response = host.send(Command::FinishLiveFeedbackBootstrap {}).unwrap();
-                last_finish_response = Some(format!("{response:?}"));
-                match response {
-                    Response::Pending => {}
-                    Response::Ok => {
-                        amaterasu_package::live_feedback_bootstrap::finish_after_pairing_recovery(
-                            &package_root,
-                            bootstrap_proof.as_ref().expect("prepared feedback proof"),
-                        )
-                        .expect("consume the host claim after Pairing recovery");
-                        host_bootstrap_finished = true;
-                    }
-                    response => panic!("trusted bootstrap finalization failed: {response:?}"),
+            if let Some(status) = take(&owner, pending) {
+                if status["startup_recovery_required"] == false
+                    && status["bound_sources"] == 0
+                    && status["fenced"] == false
+                {
+                    recovered = Some(status);
+                    break;
                 }
-            }
-            if let Some(status) = take(&owner, status_request) {
-                last_status = Some(status.clone());
-                if status["startup_recovery_required"] == false {
-                    assert_eq!(status["bound_sources"], 0, "{status}");
-                    assert_eq!(status["fenced"], false, "{status}");
-                    if host_bootstrap_finished {
-                        recovered = true;
-                        break;
-                    }
-                }
-                status_request = broker_request(
+                pending = broker_request(
                     &owner,
                     "amaterasu.pairing-effects/1",
                     json!({"action":"status"}),
-                    &format!("trusted-first-boot-status-{}", attempt + 1),
+                    &format!("host-loaded-first-boot-status-{}", attempt + 1),
                 );
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        if !recovered {
-            let pairing_client = runtime.client("amaterasu.pairing");
-            let readiness_request = broker_request(
-                &pairing_client,
-                "amaterasu.host-configuration/1",
-                json!({"action":"readiness"}),
-                "trusted-first-boot-diagnostic-readiness",
-            );
-            let transaction_request = broker_request(
-                &pairing_client,
-                "amaterasu.host-configuration/1",
-                json!({"action":"transaction_status"}),
-                "trusted-first-boot-diagnostic-transaction",
-            );
-            let state_request = broker_request(
-                &pairing_client,
-                "amaterasu.state/1",
-                json!({"action":"get","key":amaterasu_module_sdk::state::FEEDBACK_BOOTSTRAP_KEY}),
-                "trusted-first-boot-diagnostic-state",
-            );
-            let mut readiness = None;
-            let mut transaction = None;
-            let mut state = None;
-            for _ in 0..500 {
-                tick_authority_modules(&mut pairing, &mut memory, &mut selected_host_configuration);
-                if readiness.is_none() {
-                    readiness = take(&pairing_client, readiness_request);
-                }
-                if transaction.is_none() {
-                    transaction = take(&pairing_client, transaction_request);
-                }
-                if state.is_none() {
-                    state = take(&pairing_client, state_request);
-                }
-                if readiness.is_some() && transaction.is_some() && state.is_some() {
-                    break;
-                }
-            }
-            last_status = Some(json!({"pairing":last_status,"readiness":readiness,
-                "transaction_status":transaction,"bootstrap_state":state}));
-        }
         assert!(
-            recovered,
-            "Pairing did not recover from the host-issued State claim; last_status={last_status:?}; host_finish={last_finish_response:?}"
+            recovered.is_some(),
+            "normal host-loaded startup did not complete Pairing recovery"
         );
     }
-    let mut launch = LoadedModule::start(
+    let mut launch = selected_module(
+        &runtime,
         &artifact(&artifacts, "amaterasu_launch"),
-        &runtime.endpoint("amaterasu.launch"),
+        "amaterasu.launch",
     );
-    let mut rtsp = LoadedModule::start(
+    let mut rtsp = selected_module(
+        &runtime,
         &artifact(&artifacts, "amaterasu_rtsp"),
-        &runtime.endpoint("amaterasu.rtsp"),
+        "amaterasu.rtsp",
     );
-    let mut lifecycle = LoadedModule::start(
+    let mut lifecycle = selected_module(
+        &runtime,
         &artifact(&artifacts, "amaterasu_session_lifecycle"),
-        &runtime.endpoint("amaterasu.session-lifecycle"),
+        "amaterasu.session-lifecycle",
     );
     let library_artifact = PathBuf::from(
         std::env::var_os("AMATERASU_LIBRARY_ARTIFACT").expect("set library artifact"),
@@ -841,14 +834,12 @@ fn run_composition(
     let replacement_artifact = PathBuf::from(
         std::env::var_os("AMATERASU_REPLACEMENT_ARTIFACT").expect("set replacement artifact"),
     );
-    let mut library = (!replacement)
-        .then(|| LoadedModule::start(&library_artifact, &runtime.endpoint("library")));
-    let mut policy =
-        (!replacement).then(|| LoadedModule::start(&policy_artifact, &runtime.endpoint("policy")));
-    let mut generated = replacement
-        .then(|| LoadedModule::start(&replacement_artifact, &runtime.endpoint("replacement")));
-    let mut provider =
-        (!replacement).then(|| LoadedModule::start(&executor, &runtime.endpoint("executor")));
+    let mut library =
+        (!replacement).then(|| selected_module(&runtime, &library_artifact, "library"));
+    let mut policy = (!replacement).then(|| selected_module(&runtime, &policy_artifact, "policy"));
+    let mut generated =
+        replacement.then(|| selected_module(&runtime, &replacement_artifact, "replacement"));
+    let mut provider = (!replacement).then(|| selected_module(&runtime, &executor, "executor"));
     let console = runtime.client("console");
     if full && !normal_abi {
         // This test owns a fresh runtime, fresh state directory and no prior
@@ -1002,6 +993,7 @@ fn run_composition(
             generated: &mut generated,
             provider: &mut provider,
             video_fixture: &mut video_fixture,
+            observed: observed_feedback_source.clone(),
             configuration: &configuration,
             capture_fixture: &capture_fixture,
             video_runtime: &video_runtime,

@@ -132,15 +132,28 @@ impl Candidate {
 
 enum Phase {
     Status,
+    Recover,
     Bind,
     Admit,
 }
+
+struct Recovery {
+    epoch: String,
+    previous_owner: String,
+    next_owner: String,
+    fence_generation: u64,
+    attempt: u64,
+    retry_after: Option<std::time::Instant>,
+}
+
 pub(super) struct Admission {
     candidate: Candidate,
     sequence: u64,
     protocol_service: String,
     phase: Phase,
     call: Option<Call>,
+    status_attempt: u64,
+    recovery: Option<Recovery>,
     join: Option<BindFeedbackSource>,
     admit: Option<effect_authority::Request>,
 }
@@ -161,6 +174,8 @@ impl Admission {
             protocol_service: protocol_service.into(),
             phase: Phase::Status,
             call: None,
+            status_attempt: 0,
+            recovery: None,
             join: None,
             admit: None,
         })
@@ -181,19 +196,60 @@ impl Admission {
         registry: &mut Registry,
         send: &mut Send<'_>,
     ) -> bool {
+        if self
+            .recovery
+            .as_ref()
+            .and_then(|recovery| recovery.retry_after)
+            .is_some_and(|deadline| std::time::Instant::now() < deadline)
+        {
+            return false;
+        }
         if !self.candidate.current(records) {
             return self.join.is_none() && self.settle(send);
         }
         if self.call.is_none() {
             let call = match self.phase {
-                Phase::Status => Call::new(
-                    effect_authority::SERVICE,
-                    json!({"action":"status"}),
-                    format!(
-                        "feedback-status-{}-{}",
-                        self.candidate.session, self.candidate.slot
-                    ),
-                ),
+                Phase::Status => {
+                    self.status_attempt = match self.status_attempt.checked_add(1) {
+                        Some(attempt) => attempt,
+                        None => return false,
+                    };
+                    Call::new(
+                        effect_authority::SERVICE,
+                        json!({"action":"status"}),
+                        format!(
+                            "feedback-status-{}-{}-{}",
+                            self.candidate.session, self.candidate.slot, self.status_attempt
+                        ),
+                    )
+                }
+                Phase::Recover => {
+                    let Some(recovery) = self.recovery.as_mut() else {
+                        return false;
+                    };
+                    recovery.attempt = match recovery.attempt.checked_add(1) {
+                        Some(attempt) => attempt,
+                        None => return false,
+                    };
+                    let request = effect_authority::Request::Recover {
+                        epoch: recovery.epoch.clone(),
+                        owner_epoch: recovery.next_owner.clone(),
+                    };
+                    let Ok(payload) = serde_json::to_value(request) else {
+                        return false;
+                    };
+                    Call::new(
+                        effect_authority::SERVICE,
+                        payload,
+                        format!(
+                            "feedback-recover-{}-{}-{}-{}",
+                            self.candidate.session,
+                            self.candidate.slot,
+                            recovery.fence_generation,
+                            recovery.attempt
+                        ),
+                    )
+                }
                 Phase::Bind => {
                     let Some(join) = self.join.as_ref() else {
                         return false;
@@ -227,19 +283,72 @@ impl Admission {
         self.call = None;
         match self.phase {
             Phase::Status => {
-                if response["ok"] != true
-                    || response["fenced"] != false
-                    || response["drain_required"] != false
-                    || response["startup_recovery_required"] != false
-                {
+                if response["ok"] != true || response["startup_recovery_required"] != false {
                     return false;
                 }
-                let Some(epoch) = response["epoch"].as_str() else {
+                let Some(epoch) = response["epoch"]
+                    .as_str()
+                    .filter(|epoch| valid_epoch(epoch))
+                else {
                     return false;
                 };
-                let Some(owner) = response["owner_epoch"].as_str() else {
+                let Some(owner) = response["owner_epoch"]
+                    .as_str()
+                    .filter(|owner| valid_owner(owner))
+                else {
                     return false;
                 };
+                if let Some(recovery) = &self.recovery {
+                    if epoch == recovery.epoch && owner == recovery.previous_owner {
+                        if !quiescent_fence(&response) {
+                            return false;
+                        }
+                        if let Some(recovery) = &mut self.recovery {
+                            recovery.retry_after = None;
+                        }
+                        self.phase = Phase::Recover;
+                        return false;
+                    }
+                    if epoch != recovery.epoch
+                        && owner == recovery.next_owner
+                        && response["fenced"] == false
+                        && response["drain_required"] == false
+                        && response["in_flight"] == 0
+                        && response["bound_sources"] == 0
+                        && response["pending_source_retirements"] == 0
+                    {
+                        self.recovery = None;
+                    } else {
+                        return false;
+                    }
+                } else if response["fenced"] == true {
+                    if !quiescent_fence(&response) {
+                        return false;
+                    }
+                    let mut random = [0_u8; 16];
+                    if getrandom::fill(&mut random).is_err() {
+                        return false;
+                    }
+                    let next_owner = random.iter().map(|byte| format!("{byte:02x}")).collect();
+                    let Some(fence_generation) = response["fence_generation"]
+                        .as_u64()
+                        .filter(|generation| *generation > 0)
+                    else {
+                        return false;
+                    };
+                    self.recovery = Some(Recovery {
+                        epoch: epoch.into(),
+                        previous_owner: owner.into(),
+                        next_owner,
+                        fence_generation,
+                        attempt: 0,
+                        retry_after: None,
+                    });
+                    self.phase = Phase::Recover;
+                    return false;
+                } else if response["fenced"] != false || response["drain_required"] != false {
+                    return false;
+                }
                 let Some(source) = self.candidate.source(owner.into()) else {
                     return false;
                 };
@@ -267,6 +376,15 @@ impl Admission {
                 self.admit = Some(admit);
                 self.phase = Phase::Bind;
             }
+            Phase::Recover => {
+                if response["ok"] != true
+                    && let Some(recovery) = &mut self.recovery
+                {
+                    recovery.retry_after =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(1));
+                }
+                self.phase = Phase::Status;
+            }
             Phase::Bind => {
                 if self
                     .join
@@ -288,6 +406,30 @@ impl Admission {
         }
         false
     }
+}
+
+fn valid_epoch(epoch: &str) -> bool {
+    epoch.len() == 32
+        && epoch
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_owner(owner: &str) -> bool {
+    !owner.is_empty() && owner.len() <= 128 && !owner.chars().any(char::is_control)
+}
+
+pub(super) fn quiescent_fence(response: &Value) -> bool {
+    response["ok"] == true
+        && response["fenced"] == true
+        && response["drain_required"] == false
+        && response["startup_recovery_required"] == false
+        && response["fence_generation"]
+            .as_u64()
+            .is_some_and(|generation| generation > 0)
+        && response["in_flight"] == 0
+        && response["bound_sources"] == 0
+        && response["pending_source_retirements"] == 0
 }
 
 #[cfg(test)]
@@ -365,6 +507,9 @@ mod tests {
         }
         let mut observed_vendor = false;
         let mut admitted = false;
+        let mut status_count = 0;
+        let mut recovered_owner = None;
+        let mut recover_count = 0;
         for _ in 0..100 {
             if admission.advance(&host.pipeline.records, &mut registry, &mut |cmd| {
                 Ok(broker.dispatch("effect", cmd))
@@ -387,7 +532,20 @@ mod tests {
                 assert_eq!(initiator, "effect");
                 let result = match payload["action"].as_str().unwrap() {
                     "status" => {
-                        json!({"ok":true,"epoch":"e".repeat(32),"owner_epoch":"owner","fenced":false,"drain_required":false,"startup_recovery_required":false})
+                        status_count += 1;
+                        if status_count == 1 {
+                            json!({"ok":true,"epoch":"e".repeat(32),"owner_epoch":"owner","fence_generation":1,"fenced":true,"drain_required":false,"startup_recovery_required":false,"in_flight":0,"bound_sources":0,"pending_source_retirements":0})
+                        } else {
+                            json!({"ok":true,"epoch":"d".repeat(32),"owner_epoch":recovered_owner,"fence_generation":1,"fenced":false,"drain_required":false,"startup_recovery_required":false,"in_flight":0,"bound_sources":0,"pending_source_retirements":0})
+                        }
+                    }
+                    "recover" => {
+                        recover_count += 1;
+                        assert_eq!(payload["epoch"], "e".repeat(32));
+                        let owner = payload["owner_epoch"].as_str().unwrap();
+                        assert!(valid_owner(owner));
+                        recovered_owner = Some(owner.to_owned());
+                        json!({"ok":true,"epoch":"d".repeat(32)})
                     }
                     "bind_feedback_source" => {
                         observed_vendor = provider == "vendor";
@@ -411,5 +569,28 @@ mod tests {
             }
         }
         assert!(observed_vendor && admitted);
+        assert_eq!(recover_count, 1);
+        assert!(status_count >= 2);
+    }
+
+    #[test]
+    fn recovery_requires_a_fully_drained_non_startup_fence() {
+        let base = json!({"ok":true,"epoch":"e".repeat(32),"owner_epoch":"owner",
+            "fence_generation":1,"fenced":true,"drain_required":false,
+            "startup_recovery_required":false,"in_flight":0,"bound_sources":0,
+            "pending_source_retirements":0});
+        assert!(quiescent_fence(&base));
+        for (field, value) in [
+            ("drain_required", json!(true)),
+            ("startup_recovery_required", json!(true)),
+            ("fence_generation", json!(0)),
+            ("in_flight", json!(1)),
+            ("bound_sources", json!(1)),
+            ("pending_source_retirements", json!(1)),
+        ] {
+            let mut status = base.clone();
+            status[field] = value;
+            assert!(!quiescent_fence(&status), "{field}");
+        }
     }
 }

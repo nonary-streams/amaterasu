@@ -35,6 +35,7 @@ members = [
     "fixtures/capture-source",
     "fixtures/encoder-source",
     "fixtures/input-probe",
+    "fixtures/host-composition-placeholder",
     "modules/state",
     "modules/session",
     "modules/session-lifecycle",
