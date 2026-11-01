@@ -25,6 +25,62 @@ On startup with the optional source join selected, NVHTTP obtains the pairing au
 
 Production NVHTTP and built-in pairing source-binding gates remain closed. The selected stream owner still needs to produce the validated source/device/slot/transport/negotiated scope, connect its final-send and retirement path, and pass combined real-provider race and restart tests. Host-configuration trust changes also require the separate transaction fence.
 
+## Feedback effect-owner restart recovery v1
+
+The selected direct effect owner can synchronously fence its prior live Pairing
+epoch and capture a bounded immutable recovery snapshot. This is a separate
+feedback contract in `effect_owner_recovery`; it does not authorize or retire
+generic protocol effects. Both broker caller and initiator must equal the
+startup-selected effect owner. No certificate or client identity is returned.
+
+1. Read pairing `status`. If it reports an extant `owner_epoch` and no pairing
+   provider startup recovery, submit `fence_effect_owner_restart` with
+   `{version:1,epoch,owner_epoch,operation_id}`. The old owner epoch is the
+   exact epoch reported by Pairing, not a new owner-generated guess. The result
+   is `{ok,version,epoch,owner_epoch,operation_id,fence_generation,count}`.
+   Retry the same tuple after a lost reply; a different restart operation is
+   rejected while this snapshot exists. `count` is at most 4160.
+2. Read each zero-based index below `count` with `read_effect_owner_restart`
+   and the same version, epoch, owner epoch and operation ID. Each page returns
+   `{ok,version,epoch,owner_epoch,operation_id,index,count,record}`. A record
+   contains the exact `source`, `scope`, optional `lease` and optional
+   `source_retirement` (its `operation_id`, completion flag and retained
+   receipt). It includes already retired tombstones. `transport_retirement`
+   retains an admitted lease's receipt after its ticket was acknowledged. A
+   lease has its `operation_id`, `sequence`,
+   ticket, completion flag and, when already completed, the exact retirement
+   assertion retained by Pairing. Fields are required even when null. Pages
+   remain unchanged as settlement proceeds and are discarded only on a
+   successful authority epoch rotation. Validate the fence and every page with
+   the SDK matchers, including count and index; missing pages fail closed.
+3. Stop all old producers. Group the records by full transport service, stream
+   handle and provider epoch, fence every source, and reconcile the actual
+   selected control provider's retirement for each group. A saved Pairing
+   assertion is an operation identity for reconciling that provider, never a
+   substitute for its fresh verified broker reply. Use the exact retained
+   receipt for a lease already completed; complete each other lease using the
+   same actual provider reply, acknowledge every ticket, then complete each
+   source retirement. Submit `confirm_effect_owner_restart` for each index,
+   with the same version, epochs and operation ID plus `index` and the verified
+   `retirement`. Confirmations are idempotent and must agree across the same
+   transport. Even a source with no lease or an already retired source requires
+   a matching whole-control-stream receipt in this restart flow. Pairing checks the
+   selected owner's assertion and matching fields; it cannot independently
+   authenticate that the owner observed the provider response.
+4. Read the current fence generation from `status`, acknowledge `drain` only
+   after all pages and providers have settled, and then use `recover` to rotate
+   to the new owner epoch. A concurrent configuration hold may advance the
+   generation; the snapshot remains valid, but drain must use the latest
+   generation. No timeout or lost reply proves retirement.
+
+If Pairing itself restarted, its volatile ledger and old owner epoch are gone;
+this API refuses to invent an empty snapshot. The existing pairing-provider
+startup recovery requires separate proof that all old owner transports retired.
+Likewise, unscoped effects cannot be enumerated here and cause this restart
+attempt to fail closed; resolving them belongs to their own authority. This
+contract has not been joined to a restarted stream-owner process or real
+control-provider test, so production feedback admission remains closed.
+
 ## Host-configuration transaction holds
 
 When trusted startup composition selects the direct `configuration_owner` and

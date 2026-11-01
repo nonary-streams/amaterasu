@@ -17,6 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use x509_cert::der::Encode;
 
+mod owner_restart;
 mod source_retirement;
 
 const STATE_KEY: &str = "pairing/v1";
@@ -1007,6 +1008,9 @@ impl Pipeline {
                             | "drain"
                             | "recover"
                             | "fence_protocol_restart"
+                            | "fence_effect_owner_restart"
+                            | "read_effect_owner_restart"
+                            | "confirm_effect_owner_restart"
                             | "fence_source"
                             | "complete_source_retirement"
                             | "lookup_source_retirement"
@@ -1093,6 +1097,9 @@ impl Pipeline {
         }
         if source_retirement::is_source_retirement(&payload) {
             return self.apply_source_retirement(caller, payload);
+        }
+        if owner_restart::is_owner_restart(&payload) {
+            return self.apply_owner_restart(caller, payload);
         }
         let request: EffectRequest =
             serde_json::from_value(payload).map_err(|_| "invalid_request")?;

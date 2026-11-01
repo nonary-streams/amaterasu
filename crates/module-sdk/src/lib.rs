@@ -6,6 +6,7 @@ pub mod capture;
 pub mod configuration;
 pub mod data_plane;
 pub mod effect_authority;
+pub mod effect_owner_recovery;
 pub mod effect_source_retirement;
 pub mod encode;
 pub mod events;
