@@ -518,6 +518,41 @@ fn source_observation_requires_owned_active_controller_and_current_incarnation()
 }
 
 #[test]
+fn feedback_pull_accepts_only_the_selected_owner() {
+    let now = Instant::now();
+    for owner in ["amaterasu.stream-session", "alternate.stream"] {
+        let mut controller =
+            Controller::with_feedback_owner(FakeBackend::default(), true, owner.into());
+        let acquired = controller.handle(owner, acquire_operation(), now, &mut || Ok(()));
+        assert_eq!(acquired["ok"], true);
+        let lease = acquired["lease"].as_str().unwrap().to_owned();
+        let producer = controller
+            .feedback
+            .producer(controller.feedback.generation(), 2, 0);
+        assert!(producer.push(HostFeedback::RgbLed {
+            controller: 2,
+            red: 12,
+            green: 34,
+            blue: 56,
+        }));
+        let other = if owner == "alternate.stream" {
+            "amaterasu.stream-session"
+        } else {
+            "alternate.stream"
+        };
+        let peek = || Operation::FeedbackPeek {
+            lease: lease.clone(),
+            limit: 1,
+        };
+        let denied = controller.handle(other, peek(), now, &mut || Ok(()));
+        assert_eq!(denied["error"]["code"], "permission_denied");
+        let response = controller.handle(owner, peek(), now, &mut || Ok(()));
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["events"][0]["feedback"]["type"], "rgb_led");
+    }
+}
+
+#[test]
 fn feedback_pull_is_stream_session_only_lease_bound_and_acknowledged_after_peek() {
     let mut controller = Controller::new(FakeBackend::default(), true);
     let now = Instant::now();

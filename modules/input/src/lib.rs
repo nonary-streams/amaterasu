@@ -48,6 +48,11 @@ struct Settings {
     linux_companion_socket_path: String,
     #[serde(default)]
     windows_backend: Option<String>,
+    #[serde(default = "default_feedback_owner")]
+    feedback_owner: String,
+}
+fn default_feedback_owner() -> String {
+    "amaterasu.stream-session".into()
 }
 fn default_uinput_path() -> String {
     "/dev/uinput".into()
@@ -78,6 +83,7 @@ struct InputModule {
     activation_job: Option<(QueuedRequest, session_binding::BatchActivationJob)>,
     source_observation_job: Option<source_observation::Job>,
     input_boot_epoch: String,
+    feedback_owner: String,
     shortcut_cache: shortcut_cache::ShortcutCache,
     has_consumed_held: bool,
     pending_revoke: Option<(QueuedRequest, session_binding::RevokeRequest)>,
@@ -168,6 +174,9 @@ impl ManagedModule for InputModule {
         };
         let settings: Settings = serde_json::from_value(payload)
             .map_err(|error| format!("invalid input settings: {error}"))?;
+        if !amaterasu_contracts::valid_name(&settings.feedback_owner) {
+            return Err("invalid feedback owner".into());
+        }
         #[cfg(target_os = "linux")]
         if !std::path::Path::new(&settings.linux_companion_socket_path).is_absolute() {
             return Err("linux_companion_socket_path must be absolute".into());
@@ -210,12 +219,18 @@ impl ManagedModule for InputModule {
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
+        let feedback_owner = settings.feedback_owner;
         Ok(Self {
             input_boot_epoch,
+            feedback_owner: feedback_owner.clone(),
             shortcut_cache: shortcut_cache::ShortcutCache::default(),
             has_consumed_held: true,
             runtime,
-            controller: Controller::new(backend, settings.allow_injection),
+            controller: Controller::with_feedback_owner(
+                backend,
+                settings.allow_injection,
+                feedback_owner,
+            ),
             product_settings: ProductSettings::new(),
             queued: VecDeque::new(),
             shortcut_job: None,
@@ -448,7 +463,7 @@ impl InputModule {
                     false,
                 );
             };
-            if !observation.authorized(&request.caller, &request.initiator) {
+            if !observation.authorized(&self.feedback_owner, &request.caller, &request.initiator) {
                 return self.complete(
                     request.id,
                     InputError::new("permission_denied", "source observation denied").payload(),

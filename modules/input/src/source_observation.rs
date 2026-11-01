@@ -18,8 +18,8 @@ pub(crate) struct Request {
     pub controller_slot: u16,
 }
 impl Request {
-    pub fn authorized(&self, caller: &str, initiator: &str) -> bool {
-        caller == "amaterasu.stream-session" && initiator == caller && self.valid()
+    pub fn authorized(&self, selected_owner: &str, caller: &str, initiator: &str) -> bool {
+        caller == selected_owner && initiator == caller && self.valid()
     }
     pub fn valid(&self) -> bool {
         self.action == "observe_feedback_source"
@@ -234,9 +234,28 @@ mod tests {
     #[test]
     fn source_observation_requires_selected_direct_owner() {
         let request = request();
-        assert!(request.authorized("amaterasu.stream-session", "amaterasu.stream-session"));
-        assert!(!request.authorized("amaterasu.stream-session", "attacker"));
-        assert!(!request.authorized("other", "other"));
+        assert!(request.authorized(
+            "amaterasu.stream-session",
+            "amaterasu.stream-session",
+            "amaterasu.stream-session"
+        ));
+        assert!(!request.authorized(
+            "amaterasu.stream-session",
+            "amaterasu.stream-session",
+            "attacker"
+        ));
+        assert!(!request.authorized("amaterasu.stream-session", "other", "other"));
+        assert!(request.authorized("alternate.stream", "alternate.stream", "alternate.stream"));
+        assert!(!request.authorized(
+            "alternate.stream",
+            "amaterasu.stream-session",
+            "amaterasu.stream-session"
+        ));
+        assert!(!request.authorized(
+            "alternate.stream",
+            "alternate.stream",
+            "amaterasu.stream-session"
+        ));
     }
 
     #[test]
