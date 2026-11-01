@@ -81,6 +81,7 @@ impl Stream {
         &mut self,
         destination: SocketAddr,
         connect_data: u32,
+        now: u64,
     ) {
         use amaterasu_gamestream::enet::{
             CONTROL_CHANNEL, Command, CommandBody, Connect, Datagram, FLAG_ACKNOWLEDGE, Header,
@@ -90,7 +91,7 @@ impl Stream {
             header: Header {
                 peer_id: UNCONNECTED_PEER,
                 session_id: 0,
-                sent_time: Some(0),
+                sent_time: Some(now as u16),
             },
             commands: vec![Command {
                 channel_id: CONTROL_CHANNEL,
@@ -114,14 +115,14 @@ impl Stream {
             }],
         };
         self.peer
-            .receive(&encode(&connect, &Limits::default()).unwrap(), 0)
+            .receive(&encode(&connect, &Limits::default()).unwrap(), now)
             .unwrap();
         self.peer.pop_datagram().unwrap();
         let ack = Datagram {
             header: Header {
                 peer_id: 0,
                 session_id: 0,
-                sent_time: Some(1),
+                sent_time: Some(now as u16),
             },
             commands: vec![Command {
                 channel_id: CONTROL_CHANNEL,
@@ -129,15 +130,15 @@ impl Stream {
                 flags: 0,
                 body: CommandBody::Acknowledge {
                     received_sequence: 1,
-                    received_sent_time: 0,
+                    received_sent_time: now as u16,
                 },
             }],
         };
         self.peer
-            .receive(&encode(&ack, &Limits::default()).unwrap(), 1)
+            .receive(&encode(&ack, &Limits::default()).unwrap(), now)
             .unwrap();
         self.peer
-            .send(0, b"queued-reliable-feedback", Delivery::Reliable, 2)
+            .send(0, b"queued-reliable-feedback", Delivery::Reliable, now)
             .unwrap();
         self.remote = Some(destination);
     }
