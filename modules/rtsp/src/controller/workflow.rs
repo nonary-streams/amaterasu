@@ -359,6 +359,18 @@ impl Controller {
                 control_connect_data: record.config.connect_data,
                 udp_discovery: record.udp_discovery.clone(),
             };
+            let metadata_offer = match payload.get("extension_metadata_schema") {
+                None | Some(Value::Null) => None,
+                Some(value) => {
+                    let schema: amaterasu_contracts::media_profile::FormatId =
+                        serde_json::from_value(value.clone())
+                            .map_err(|_| "invalid_metadata_offer")?;
+                    if !schema.is_valid() {
+                        return Err("invalid_metadata_offer");
+                    }
+                    Some(schema)
+                }
+            };
             let profile = if self.settings.extension_enabled
                 && payload
                     .get("extension_metadata_schema")
@@ -392,6 +404,11 @@ impl Controller {
                 Negotiation::new(launch, record.capabilities())
             }
             .map_err(|_| "invalid_prepare_response")?;
+            if let (Some(profile), Some(schema)) = (&profile, metadata_offer) {
+                negotiation = negotiation
+                    .with_metadata_offer(profile.wire_selector, schema)
+                    .map_err(|_| "invalid_metadata_offer")?;
+            }
             let audio_offer = match payload.get("audio_offer") {
                 None | Some(Value::Null) => None,
                 Some(Value::String(value)) if record.config.stream_audio => match value.as_str() {
@@ -413,6 +430,7 @@ impl Controller {
             )?;
             record.session = Some(session);
             record.extension_offer = profile;
+            record.extension_metadata_offer = record.extension_offer.as_ref().and(metadata_offer);
             record.audio_offer = audio_offer;
             record.negotiation = Some(negotiation);
             record.needs_lookup = false;

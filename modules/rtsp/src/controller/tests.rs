@@ -398,6 +398,7 @@ fn record(state: State) -> Record {
         audio_offer: None,
         negotiated_audio: None,
         extension_offer: None,
+        extension_metadata_offer: None,
         extension_announce: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
         session_token: "00112233445566778899aabbccddeeff".into(),
@@ -1126,6 +1127,7 @@ fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
         audio_offer: None,
         negotiated_audio: None,
         extension_offer: None,
+        extension_metadata_offer: None,
         extension_announce: None,
         url: "rtspenc://127.0.0.1:48010/launch-5".into(),
         session_token: "00112233445566778899aabbccddeeff".into(),
@@ -1968,6 +1970,16 @@ fn accepted_extension_announce_preserves_profile_and_rejects_changed_probe_param
     assert_eq!(
         payload["configuration"]["client_feature_flags"],
         announce.client_feature_flags
+    );
+    record.extension_metadata_offer = Some(FormatId {
+        namespace_id: 1,
+        value: 1,
+        schema: 1,
+    });
+    let payload = record.authenticated_start_payload(23).unwrap();
+    assert_eq!(
+        payload["configuration"]["client_metadata_schema"],
+        json!({"namespace_id":1,"value":1,"schema":1})
     );
     announce.video.width += 2;
     assert!(!record.accept_extension_announce(&announce));

@@ -256,6 +256,7 @@ impl Controller {
             audio_offer: None,
             negotiated_audio: None,
             extension_offer: None,
+            extension_metadata_offer: None,
             extension_announce: None,
             url,
             session_token,

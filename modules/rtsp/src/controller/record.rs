@@ -35,6 +35,7 @@ pub(super) struct Record {
     pub audio_offer: Option<amaterasu_gamestream::sdp::AudioCodec>,
     pub negotiated_audio: Option<amaterasu_gamestream::sdp::AudioCodec>,
     pub extension_offer: Option<amaterasu_contracts::media_profile::VideoProfile>,
+    pub extension_metadata_offer: Option<amaterasu_contracts::media_profile::FormatId>,
     pub extension_announce: Option<
         amaterasu_gamestream::sdp::Announce<amaterasu_gamestream::sdp::NegotiatedVideoFormat>,
     >,
@@ -164,6 +165,9 @@ impl Record {
             payload["configuration"]["encrypt_audio"] = json!(announce.encryption.audio);
             payload["configuration"]["client_feature_flags"] = json!(announce.client_feature_flags);
             payload["configuration"]["configuration"]["extension_profile"] = json!(profile);
+            if let Some(schema) = self.extension_metadata_offer {
+                payload["configuration"]["client_metadata_schema"] = json!(schema);
+            }
             if let Some(codec) = self.negotiated_audio {
                 payload["configuration"]["audio_codec"] = json!(codec.wire_name());
             }
