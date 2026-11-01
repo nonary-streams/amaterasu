@@ -4794,6 +4794,8 @@ fn display_and_frame_limiter_open_share_frozen_application_identity() {
         open["catalog_revision"],
         record.application_catalog_revision.unwrap()
     );
+    assert_eq!(open["policy_identity"], json!({"source":"catalog","version":1,
+        "revision":record.application_catalog_revision.unwrap()}));
     assert_eq!(
         open["display_policy_snapshot"]["catalog_revision"],
         open["catalog_revision"]

@@ -629,6 +629,10 @@ pub struct Open {
     pub app_id: Option<String>,
     #[serde(default)]
     pub catalog_revision: Option<u64>,
+    /// Source-qualified identity carried from the authenticated coordinator.
+    #[serde(default)]
+    pub policy_identity:
+        Option<amaterasu_module_sdk::application_library::preflight::PolicyIdentity>,
     /// Full display configuration, admitted only after Launch verifies its
     /// frozen policy source and authenticated operation binding.
     #[serde(default)]
@@ -755,6 +759,15 @@ impl Open {
     }
 
     pub fn validate(&self, allow_remote: bool) -> Result<[u8; 16], &'static str> {
+        if let Some(identity) = &self.policy_identity {
+            use amaterasu_module_sdk::application_library::preflight::PolicyIdentity;
+            if identity.validate().is_err()
+                || !matches!(identity, PolicyIdentity::Catalog { version: 1, revision }
+                    if Some(*revision) == self.catalog_revision)
+            {
+                return Err("invalid_policy_identity");
+            }
+        }
         if self.frame_limiter_settings.is_some() != self.frame_limiter_executable_path.is_some() {
             return Err("invalid_frame_limiter_snapshot");
         }
@@ -1880,8 +1893,27 @@ mod tests {
             "effective_overrides":{}
         });
 
+        input["policy_identity"] = json!({"source":"catalog","version":1,"revision":7});
         let accepted: Open = serde_json::from_value(input.clone()).unwrap();
         accepted.validate(false).unwrap();
+        let mut changed_identity = input.clone();
+        changed_identity["policy_identity"]["revision"] = json!(8);
+        assert_eq!(
+            serde_json::from_value::<Open>(changed_identity)
+                .unwrap()
+                .validate(false),
+            Err("invalid_policy_identity")
+        );
+        let mut wrong_source = input.clone();
+        wrong_source["policy_identity"] = json!({"source":"library","version":1,
+            "application":{"library":"games","id":"opaque"},"entry_revision":"7",
+            "policy_revision":"7","snapshot_id":"id"});
+        assert_eq!(
+            serde_json::from_value::<Open>(wrong_source)
+                .unwrap()
+                .validate(false),
+            Err("invalid_policy_identity")
+        );
         assert!(accepted.display_admission_required());
         let expected_hash =
             Sha256::digest(serde_json::to_vec(&accepted.application_display_settings).unwrap());

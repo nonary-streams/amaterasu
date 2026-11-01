@@ -226,6 +226,11 @@ impl Controller {
                 == record.config.application_operation_id.as_deref()
             && payload["app_id"].as_str() == record.config.app_id.as_deref()
             && payload["catalog_revision"].as_u64() == record.config.catalog_revision
+            && record
+                .config
+                .policy_identity
+                .as_ref()
+                .is_none_or(|identity| payload.get("policy_identity") == Some(&json!(identity)))
             && payload.get("frame_limiter_settings")
                 == record.config.frame_limiter_settings.as_ref()
             && payload["frame_limiter_executable_path"].as_str()

@@ -1207,6 +1207,7 @@ impl Pipeline {
                 display_policy_snapshot,
                 certificate_id,
                 catalog_revision,
+                policy_identity,
             } => {
                 if caller != "amaterasu.rtsp" {
                     return complete(send, request, error("display_admission_denied"));
@@ -1217,6 +1218,11 @@ impl Pipeline {
                         && record.operation_id == application_operation_id
                         && display_admission_eligible(record, now)
                         && record.catalog_revision == Some(catalog_revision)
+                        && policy_identity.as_ref().is_none_or(|identity| {
+                            identity == &amaterasu_module_sdk::application_library::preflight::PolicyIdentity::Catalog {
+                                version: 1, revision: catalog_revision,
+                            }
+                        })
                         && record.display_admission.as_ref().is_some_and(|admission| {
                             admission.token == token
                                 && admission.certificate_id == certificate_id
@@ -1258,6 +1264,7 @@ impl Pipeline {
                 rtsp_operation_id,
                 app_id,
                 catalog_revision,
+                policy_identity,
                 frame_limiter_settings,
                 frame_limiter_executable_path,
             } => {
@@ -1272,6 +1279,11 @@ impl Pipeline {
                             && record.operation_id == application_operation_id
                             && record.app_id == app_id
                             && record.catalog_revision == Some(catalog_revision)
+                            && policy_identity.as_ref().is_none_or(|identity| {
+                                identity == &amaterasu_module_sdk::application_library::preflight::PolicyIdentity::Catalog {
+                                    version: 1, revision: catalog_revision,
+                                }
+                            })
                             && match (&rtsp_operation_id, &record.stream_limiter_snapshot) {
                                 (Some(id), Some(active)) => {
                                     active.rtsp_operation_id == *id
@@ -1299,6 +1311,9 @@ impl Pipeline {
                 });
                 if let Some(rtsp_operation_id) = rtsp_operation_id {
                     response["rtsp_operation_id"] = serde_json::json!(rtsp_operation_id);
+                }
+                if let Some(identity) = policy_identity {
+                    response["policy_identity"] = serde_json::json!(identity);
                 }
                 complete(send, request, response)
             }
