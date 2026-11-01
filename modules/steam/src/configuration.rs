@@ -485,7 +485,11 @@ impl ProductConfiguration {
         settings: ProductSettings,
         revision: u64,
     ) {
+        let needs_initial_scan = settings.enabled && (!self.ready || !provider.enabled);
         provider.set_enabled(settings.enabled);
+        if needs_initial_scan && !provider.scan_in_progress() {
+            provider.start_scan();
+        }
         self.settings = settings;
         self.revision = revision;
         self.ready = true;
@@ -596,5 +600,38 @@ fn complete_request(runtime: &RuntimeClient, request: u64, payload: Value) -> Mo
         response => Err(format!(
             "Steam configuration completion failed: {response:?}"
         )),
+    }
+}
+
+#[cfg(test)]
+mod startup_scan_tests {
+    use super::*;
+
+    #[test]
+    fn enabled_provider_scans_after_settings_load_without_enabling_catalog_sync() {
+        let mut configuration = ProductConfiguration::new();
+        let mut provider = Provider::new(vec![std::path::PathBuf::from("/nonexistent-steam")]);
+        let settings = ProductSettings {
+            enabled: true,
+            auto_sync: false,
+            ..ProductSettings::default()
+        };
+        configuration.apply_settings(&mut provider, settings.clone(), 1);
+        assert!(provider.scan_in_progress());
+        assert!(!configuration.settings().auto_sync);
+
+        provider.scan = None;
+        configuration.apply_settings(&mut provider, settings.clone(), 2);
+        assert!(!provider.scan_in_progress());
+        configuration.apply_settings(
+            &mut provider,
+            ProductSettings {
+                enabled: false,
+                ..settings.clone()
+            },
+            3,
+        );
+        configuration.apply_settings(&mut provider, settings, 4);
+        assert!(provider.scan_in_progress());
     }
 }

@@ -562,8 +562,9 @@ Pairing (`nvpairingmanager.cpp:233-366`): `paired`, `plaincert`, `challengerespo
 `pairingsecret`, then HTTPS `pairchallenge`; the query carries `devicename` and
 `updateState`, both accepted. `/appasset` requires paired TLS and list permission.
 It uses the library broker for exported, revision-pinned provider chunks, with
-a 16 MiB image limit and two concurrent artwork response reservations held
-until delivery or disconnect. Missing or unavailable artwork returns 404,
+a 16 MiB image limit and four concurrent artwork response reservations held
+until delivery or disconnect. Further requests wait within the bounded request
+queue. Missing or unavailable artwork returns 404,
 which the client tolerates (`boxartmanager.cpp:113-115`). Artwork delivery has
 not yet been qualified against a real Moonlight session.
 

@@ -32,7 +32,9 @@ const MAX_REMOTE_CACHE_DIRECTORY_ENTRIES: usize = 1024;
 const REMOTE_TEMP_GRACE: Duration = Duration::from_secs(60 * 60);
 static NEXT_REMOTE_TEMP: AtomicU64 = AtomicU64::new(0);
 const MAX_REMOTE_FAILURES: usize = 64;
-const REMOTE_FETCH_QUEUE_CAPACITY: usize = 1;
+// Covers may arrive concurrently while validation or prefetch is in progress.
+const ARTWORK_QUEUE_CAPACITY: usize = 8;
+const REMOTE_FETCH_QUEUE_CAPACITY: usize = ARTWORK_QUEUE_CAPACITY;
 const LOCAL_VALIDATION_BATCH_TARGETS: usize = 256;
 const REMOTE_FAILURE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 const REMOTE_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
@@ -200,8 +202,9 @@ impl LocalArtworkWorker {
         if self.requests.is_some() {
             return Ok(());
         }
-        let (request_sender, request_receiver) = mpsc::sync_channel(1);
-        let (completion_sender, completion_receiver) = mpsc::sync_channel(2);
+        let (request_sender, request_receiver) = mpsc::sync_channel(ARTWORK_QUEUE_CAPACITY);
+        let (completion_sender, completion_receiver) =
+            mpsc::sync_channel(ARTWORK_QUEUE_CAPACITY + 1);
         let stopped = Arc::clone(&self.stopped);
         let current_generation = Arc::clone(&self.current_generation);
         let validation_batch_targets = Arc::clone(&self.validation_batch_targets);
@@ -2717,18 +2720,27 @@ mod tests {
         started_receiver
             .recv_timeout(Duration::from_secs(1))
             .expect("worker should start the first fetch");
-        worker.enqueue(request(2)).unwrap();
-        assert_eq!(worker.enqueue(request(3)).unwrap_err(), "artwork_busy");
+        for request_id in 2..=(REMOTE_FETCH_QUEUE_CAPACITY as u64 + 1) {
+            worker.enqueue(request(request_id)).unwrap();
+        }
+        assert_eq!(
+            worker
+                .enqueue(request(REMOTE_FETCH_QUEUE_CAPACITY as u64 + 2))
+                .unwrap_err(),
+            "artwork_busy"
+        );
 
-        release_sender.send(()).unwrap();
-        started_receiver
-            .recv_timeout(Duration::from_secs(1))
-            .expect("worker should process its one queued request");
+        for _ in 0..REMOTE_FETCH_QUEUE_CAPACITY {
+            release_sender.send(()).unwrap();
+            started_receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("worker should process its queued request");
+        }
         release_sender.send(()).unwrap();
         let mut completed = 0;
         for _ in 0..100 {
             completed += worker.drain().len();
-            if completed == 2 {
+            if completed == REMOTE_FETCH_QUEUE_CAPACITY + 1 {
                 return;
             }
             thread::sleep(Duration::from_millis(10));

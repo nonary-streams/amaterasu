@@ -73,7 +73,10 @@ ID equals the app ID or its supplied name matches the current game name exactly
 with ASCII case-insensitive comparison. When both are supplied, either match
 excludes the game.
 
-With `auto_sync` enabled, Steam starts discovery when settings are applied.
+When Steam is enabled, it starts discovery after loading settings and when
+re-enabled, even if `auto_sync` is off. This restores the in-memory provider
+snapshot needed to serve artwork for previously imported games without changing
+the catalog. With `auto_sync` enabled, Steam also reconciles the catalog.
 After each completed scan and its catalog attempt finish, it schedules the next
 automatic scan 30 seconds later. It does not start an automatic scan while a
 catalog snapshot transaction is active. Catalog reconciliation runs for the

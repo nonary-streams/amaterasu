@@ -1255,6 +1255,8 @@ fn force_sync_rejects_an_exhausted_discovery_revision() {
     let mut module = start_test_module(&mut host);
     module.tick().unwrap();
     module.tick().unwrap();
+    // Model an exhausted, idle provider after the startup scan has retired.
+    module.provider.scan = None;
     module.provider.revision = u64::MAX;
 
     module

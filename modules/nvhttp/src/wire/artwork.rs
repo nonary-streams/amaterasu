@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 const MAX_BYTES: usize = 16 * 1024 * 1024;
 const CHUNK_BYTES: usize = 8 * 1024;
 const ARTWORK_TIMEOUT: Duration = Duration::from_secs(120);
-const MAX_ACTIVE_ARTWORK: usize = 2;
+// Four images can progress concurrently, with at most 64 MiB of image bodies.
+pub(super) const MAX_ACTIVE_ARTWORK: usize = 4;
 const SERVICE: &str = "amaterasu.library/1";
 
 pub(super) struct Artwork {
@@ -132,9 +133,6 @@ impl Router {
             Some(id) => id,
             None => return Some(xml::error(400, "invalid application ID")),
         };
-        if self.artwork_reservations.len() >= MAX_ACTIVE_ARTWORK {
-            return Some(xml::error(503, "artwork request capacity exhausted"));
-        }
         let id = format!("app-{app_id:016x}");
         let mut random = [0u8; 16];
         if getrandom::fill(&mut random).is_err() {
@@ -153,10 +151,7 @@ impl Router {
             now,
         );
         match queued {
-            Ok(()) => {
-                self.artwork_reservations.insert(connection);
-                None
-            }
+            Ok(()) => None,
             Err(message) => Some(xml::error(503, message)),
         }
     }
@@ -401,37 +396,39 @@ mod tests {
             target: "/appasset?appid=1".into(),
             body: vec![],
         };
-        assert!(
-            router
-                .dispatch_with(2, request(), context(), now, &mut |_| panic!())
-                .is_none()
-        );
-        assert_eq!(
-            router
-                .dispatch_with(3, request(), context(), now, &mut |_| panic!())
-                .unwrap()
-                .status,
-            503
-        );
+        for connection in 2..=5 {
+            assert!(
+                router
+                    .dispatch_with(connection, request(), context(), now, &mut |_| panic!())
+                    .is_none()
+            );
+        }
+        let started = std::cell::Cell::new(0);
+        let mut pending = |command| match command {
+            Command::Request { .. } => {
+                started.set(started.get() + 1);
+                Ok(Response::Accepted { id: started.get() })
+            }
+            Command::TakeResult { .. } => Ok(Response::Pending),
+            _ => panic!(),
+        };
+        router.poll_with_identity(now, &mut pending, |_, _| true);
+        assert_eq!(started.get(), 3);
+        assert_eq!(router.artwork_reservations.len(), MAX_ACTIVE_ARTWORK);
         router.reply_delivered(1);
+        router.poll_with_identity(now, &mut pending, |_, _| true);
+        assert_eq!(started.get(), 4);
+        assert_eq!(router.artwork_reservations.len(), MAX_ACTIVE_ARTWORK);
         assert!(
             router
-                .dispatch_with(3, request(), context(), now, &mut |_| panic!())
+                .dispatch_with(6, request(), context(), now, &mut |_| panic!())
                 .is_none()
         );
-        assert_eq!(
-            router
-                .dispatch_with(4, request(), context(), now, &mut |_| panic!())
-                .unwrap()
-                .status,
-            503
-        );
-        router.cancel_with(2, now, &mut |_| panic!("undispatched work has no child"));
-        assert!(
-            router
-                .dispatch_with(4, request(), context(), now, &mut |_| panic!())
-                .is_none()
-        );
+        router.poll_with_identity(now, &mut pending, |_, _| true);
+        assert_eq!(started.get(), 4);
+        router.cancel_with(6, now, &mut |_| panic!("queued request has no child"));
+        assert!(!router.jobs.values().any(|job| job.connection == Some(6)));
+        assert_eq!(router.artwork_reservations.len(), MAX_ACTIVE_ARTWORK);
     }
     #[test]
     fn route_requires_list_permission_and_rechecks_before_delivery() {

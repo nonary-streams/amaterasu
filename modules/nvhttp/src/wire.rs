@@ -585,6 +585,16 @@ impl Router {
                 }
                 continue;
             }
+            if matches!(job.purpose, Purpose::Artwork { .. }) {
+                let connection = job.connection.expect("artwork job has a connection");
+                if !self.artwork_reservations.contains(&connection) {
+                    if self.artwork_reservations.len() >= artwork::MAX_ACTIVE_ARTWORK {
+                        self.jobs.insert(key, job);
+                        continue;
+                    }
+                    self.artwork_reservations.insert(connection);
+                }
+            }
             let Some(result) = self.advance_call(&mut job, now, send) else {
                 self.jobs.insert(key, job);
                 continue;
@@ -677,7 +687,6 @@ impl Router {
         now: Instant,
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
     ) {
-        self.artwork_reservations.remove(&connection);
         self.launches.connection_closed(connection, now);
         let keys: Vec<_> = self
             .jobs
@@ -687,7 +696,9 @@ impl Router {
             .collect();
         for key in keys {
             let mut job = self.jobs.remove(&key).expect("selected connection job");
-            job.connection = None;
+            if !matches!(job.purpose, Purpose::Artwork { .. }) {
+                job.connection = None;
+            }
             // A begin result contains the only pairing ID. Keep draining it so
             // a committed begin can be cancelled after the socket disappeared.
             if matches!(job.purpose, Purpose::Begin { .. })
@@ -700,6 +711,7 @@ impl Router {
                 }
             }
         }
+        self.artwork_reservations.remove(&connection);
     }
 
     pub fn reply_delivered(&mut self, connection: u64) {
@@ -733,10 +745,14 @@ impl Router {
             replies.push((connection, xml::error(504, "request expired")));
         }
         if matches!(job.purpose, Purpose::Artwork { .. }) {
-            if let Some(connection) = job.connection {
-                self.artwork_reservations.remove(&connection);
+            let started = job
+                .connection
+                .is_some_and(|connection| self.artwork_reservations.remove(&connection));
+            if started {
+                Some(artwork::release_job(job, now))
+            } else {
+                None
             }
-            Some(artwork::release_job(job, now))
         } else {
             if matches!(job.purpose, Purpose::ArtworkRelease { .. }) {
                 eprintln!(
