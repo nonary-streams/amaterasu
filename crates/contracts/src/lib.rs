@@ -217,6 +217,10 @@ pub struct RuntimeHostContext {
     /// Only management may request it; persisted selection can differ.
     #[serde(default)]
     pub running_package_digest: Option<String>,
+    /// Host-generated module-instance identities. The host overwrites any
+    /// package-supplied map before creating the runtime.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub provider_incarnations: BTreeMap<String, effect_fence::ProviderIncarnation>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -11,6 +11,7 @@ use amaterasu_logging::{HostLogService, LoggerError, ProductLogger};
 use amaterasu_package::{PackageResult, VerifiedPackage, ordered_components};
 use libloading::Library;
 use serde_json::json;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::path::Path;
@@ -55,6 +56,32 @@ fn inject_running_package_digest(
     // A signed package may carry host-context fields, so overwrite the value
     // only after package verification with the digest of these loaded bytes.
     runtime_config.host_context.running_package_digest = Some(digest.into());
+    Ok(())
+}
+
+fn inject_provider_incarnations<'a>(
+    runtime_config: &mut amaterasu_contracts::RuntimeConfig,
+    component_ids: impl IntoIterator<Item = &'a str>,
+) -> PackageResult<()> {
+    let mut instances = BTreeMap::new();
+    let mut identifiers = BTreeSet::new();
+    for component in component_ids {
+        let mut bytes = [0_u8; 32];
+        getrandom::fill(&mut bytes).map_err(|error| error.to_string())?;
+        let id: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        if !identifiers.insert(id.clone())
+            || instances
+                .insert(
+                    component.to_owned(),
+                    amaterasu_contracts::effect_fence::ProviderIncarnation { version: 1, id },
+                )
+                .is_some()
+        {
+            return Err("duplicate provider instance identity".into());
+        }
+    }
+    // Never retain package-controlled identities, including on repeated loads.
+    runtime_config.host_context.provider_incarnations = instances;
     Ok(())
 }
 
@@ -114,6 +141,15 @@ impl LoadedComponents {
         );
         inject_package_root(&mut runtime_config, root)?;
         inject_running_package_digest(&mut runtime_config, &package.digest)?;
+        inject_provider_incarnations(
+            &mut runtime_config,
+            package
+                .manifest
+                .components
+                .iter()
+                .filter(|component| !component.runtime)
+                .map(|component| component.id.as_str()),
+        )?;
         #[cfg(target_os = "linux")]
         crate::capture_authority::inject(package, &mut runtime_config.settings)?;
         if package
@@ -661,11 +697,33 @@ fn require_success(status: Status, operation: &str) -> PackageResult<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        inject_host_configuration_root, inject_package_root, inject_running_package_digest,
-        inject_steam_artwork_cache_parent, path_to_unicode_string,
+        inject_host_configuration_root, inject_package_root, inject_provider_incarnations,
+        inject_running_package_digest, inject_steam_artwork_cache_parent, path_to_unicode_string,
     };
     use amaterasu_contracts::RuntimeConfig;
     use serde_json::json;
+
+    #[test]
+    fn provider_instances_are_fresh_and_replace_package_values() {
+        let mut config = RuntimeConfig::default();
+        inject_provider_incarnations(&mut config, ["provider", "other"]).unwrap();
+        let first = config.host_context.provider_incarnations.clone();
+        assert_ne!(first["provider"], first["other"]);
+        assert_eq!(first["provider"].version, 1);
+        assert_eq!(first["provider"].id.len(), 64);
+        inject_provider_incarnations(&mut config, ["provider"]).unwrap();
+        assert_ne!(
+            first["provider"],
+            config.host_context.provider_incarnations["provider"]
+        );
+        assert!(
+            !config
+                .host_context
+                .provider_incarnations
+                .contains_key("other")
+        );
+        assert!(inject_provider_incarnations(&mut config, ["same", "same"]).is_err());
+    }
 
     #[test]
     fn package_root_overrides_package_controlled_host_context() {

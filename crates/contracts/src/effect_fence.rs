@@ -22,6 +22,29 @@ pub struct SelectedEffectMethod {
     pub version: u8,
     pub provider: String,
     pub method: crate::ApiMethod,
+    /// Host-issued identity of this exact provider instance, when supplied by
+    /// the trusted host. Older, unslotted compositions may omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_incarnation: Option<ProviderIncarnation>,
+}
+
+/// Opaque host-issued module-instance identity. It is a selector, not a grant.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderIncarnation {
+    pub version: u8,
+    pub id: String,
+}
+
+/// A host assertion about the exact old effect and provider instance. It proves
+/// only local worker retirement, never cleanup of an external effect.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostProviderRetirement {
+    pub version: u8,
+    pub broker_epoch: String,
+    pub provider_incarnation: ProviderIncarnation,
+    pub effect: GuardedEffectIdentity,
 }
 
 /// Trusted startup policy. The authority must reconcile durable State and retire

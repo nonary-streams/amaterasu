@@ -12,6 +12,21 @@ pub(super) fn validate(configuration: &RuntimeConfig) -> Result<(), String> {
         return Err("too many principals".into());
     }
 
+    let mut instance_ids = BTreeSet::new();
+    for (principal, instance) in &configuration.host_context.provider_incarnations {
+        if !configuration.principals.contains_key(principal)
+            || instance.version != 1
+            || instance.id.len() != 64
+            || !instance
+                .id
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || !instance_ids.insert(&instance.id)
+        {
+            return Err("invalid host provider incarnation".into());
+        }
+    }
+
     for (name, grants) in &configuration.principals {
         if name == HOST_LIFECYCLE_CONTROL_PRINCIPAL {
             if !configuration.host_lifecycle_control || !grants_are_empty(grants) {

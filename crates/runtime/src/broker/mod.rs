@@ -747,6 +747,12 @@ impl Broker {
             version: 1,
             provider: approval.provider.clone(),
             method: approval.method.clone(),
+            provider_incarnation: self
+                .configuration
+                .host_context
+                .provider_incarnations
+                .get(&approval.provider)
+                .cloned(),
         })
     }
 

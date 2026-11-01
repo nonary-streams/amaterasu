@@ -13,6 +13,7 @@ amaterasu-input-companion.workspace = true
 libloading.workspace = true
 serde_json.workspace = true
 serde.workspace = true
+getrandom.workspace = true
 
 [lints]
 workspace = true
