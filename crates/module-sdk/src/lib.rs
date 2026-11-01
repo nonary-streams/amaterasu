@@ -15,6 +15,7 @@ mod native;
 pub mod network;
 #[cfg(feature = "network-http")]
 pub mod network_http;
+pub mod nvhttp_source;
 pub mod protocol;
 pub mod protocol_authority;
 pub mod protocol_sequence;

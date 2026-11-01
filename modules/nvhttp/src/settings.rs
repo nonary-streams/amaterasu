@@ -31,6 +31,21 @@ pub struct Settings {
     pub hostname: String,
     pub streaming: Option<StreamingConfig>,
     pub session_lifecycle_required: bool,
+    /// Optional trusted composition for the feedback-source join.
+    pub effect_source_join: Option<EffectSourceJoinSettings>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectSourceJoinSettings {
+    pub effect_owner: String,
+    pub input_consumer: String,
+}
+
+impl EffectSourceJoinSettings {
+    pub(crate) fn admits(&self, caller: &str, initiator: &str) -> bool {
+        caller == self.effect_owner && initiator == caller
+    }
 }
 
 impl Default for Settings {
@@ -47,12 +62,20 @@ impl Default for Settings {
             hostname: default_hostname(),
             streaming: None,
             session_lifecycle_required: false,
+            effect_source_join: None,
         }
     }
 }
 
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self.effect_source_join.as_ref().is_some_and(|selection| {
+            !self.session_lifecycle_required
+                || !valid_principal(&selection.effect_owner)
+                || !valid_principal(&selection.input_consumer)
+        }) {
+            return Err("invalid_effect_source_join");
+        }
         if !amaterasu_module_sdk::network::valid_provider(&self.network_provider) {
             return Err("invalid_network_provider");
         }
@@ -208,6 +231,14 @@ impl Settings {
     }
 }
 
+fn valid_principal(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+}
+
 impl AddressFamily {
     fn supports(self, address: IpAddr) -> bool {
         matches!(self, Self::Both) || address.is_ipv4()
@@ -322,6 +353,18 @@ pub fn https_port(port: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_join_requires_explicit_principals_and_lifecycle() {
+        let mut settings: Settings = serde_json::from_value(serde_json::json!({
+            "effect_source_join":{"effect_owner":"amaterasu.stream-session","input_consumer":"amaterasu.input"}
+        })).unwrap();
+        assert_eq!(settings.validate(), Err("invalid_effect_source_join"));
+        settings.session_lifecycle_required = true;
+        assert!(settings.validate().is_ok());
+        settings.effect_source_join.as_mut().unwrap().effect_owner = "forged / principal".into();
+        assert_eq!(settings.validate(), Err("invalid_effect_source_join"));
+    }
+
     #[test]
     fn defaults_bind_nothing_and_remote_opt_in_is_explicit() {
         let settings: Settings = serde_json::from_str("{}").unwrap();

@@ -176,6 +176,12 @@ impl Identity {
         self.bridge.trusted(certificate)
     }
 
+    pub(crate) fn view_allowed(&self, certificate: &[u8]) -> bool {
+        self.bridge
+            .permission_status(certificate, amaterasu_identity::PERMISSION_VIEW)
+            == STATUS_OK
+    }
+
     pub fn allowed(&self, certificate: &[u8], permission: crate::wire::Permission) -> bool {
         let selector = match permission {
             crate::wire::Permission::List => amaterasu_identity::PERMISSION_LIST,

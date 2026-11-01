@@ -12,6 +12,7 @@ mod preparation;
 mod product_settings;
 mod server;
 mod settings;
+mod source_join;
 mod tls;
 mod upnp;
 mod upnp_ipv6;
@@ -93,6 +94,12 @@ fn apply_listener_target(
 #[allow(clippy::large_enum_variant)]
 enum Operation {
     Status,
+    BindFeedbackSource {
+        authority_epoch: String,
+        source: amaterasu_module_sdk::effect_authority::Source,
+        scope: amaterasu_module_sdk::effect_authority::StreamScope,
+        input_boot_epoch: String,
+    },
     ManagementLaunchStatus {
         #[serde(default)]
         reference: Option<String>,
@@ -238,6 +245,31 @@ where
     })
 }
 
+fn source_evidence(
+    router: Option<&wire::Router>,
+    identity: Option<&tls::Identity>,
+    source: &amaterasu_module_sdk::effect_authority::Source,
+) -> Option<source_join::Evidence> {
+    if !source.valid() {
+        return None;
+    }
+    let (target, certificate) =
+        router?.paired_lifecycle_session(&source.host_epoch, &source.session_id)?;
+    if !identity?.view_allowed(certificate) {
+        return None;
+    }
+    Some(source_join::Evidence {
+        session_target: serde_json::to_value(target).ok()?,
+        certificate: certificate.to_vec(),
+    })
+}
+
+// A replacement pairing provider must not accidentally open this path before
+// stream-owner negotiation and the live retirement barrier are integrated.
+fn source_join_available() -> bool {
+    cfg!(test)
+}
+
 struct NvhttpModule {
     runtime: RuntimeClient,
     startup_settings: Settings,
@@ -256,6 +288,8 @@ struct NvhttpModule {
     next_listener_rebind: Instant,
     listener_rebind_delay: Duration,
     audio_driver_install: audio_driver_install::AudioDriverInstallSync,
+    source_join: Option<source_join::Join>,
+    source_join_recovery_required: bool,
 }
 
 impl ManagedModule for NvhttpModule {
@@ -344,6 +378,8 @@ impl ManagedModule for NvhttpModule {
             next_listener_rebind: Instant::now(),
             listener_rebind_delay: Duration::from_secs(1),
             audio_driver_install: audio_driver_install::AudioDriverInstallSync::default(),
+            source_join: None,
+            source_join_recovery_required: false,
         })
     }
 
@@ -583,11 +619,47 @@ impl ManagedModule for NvhttpModule {
                 }
             }
         }
+        self.advance_source_join()?;
         self.poll_control()
     }
 }
 
 impl NvhttpModule {
+    fn advance_source_join(&mut self) -> ModuleResult<()> {
+        let Some(mut join) = self.source_join.take() else {
+            return Ok(());
+        };
+        let result = join.advance(
+            |source| source_evidence(self.router.as_ref(), self.identity.as_ref(), source),
+            |command| self.runtime.send(command),
+        )?;
+        match result {
+            source_join::Outcome::Pending => self.source_join = Some(join),
+            source_join::Outcome::Done(payload) => {
+                let binding_succeeded = payload["ok"] == true;
+                match self.runtime.send(Command::Complete {
+                    request: join.request_id(),
+                    payload,
+                }) {
+                    Ok(Response::Ok) => {}
+                    _ if binding_succeeded => self.source_join_recovery_required = true,
+                    Ok(Response::Error { code, .. })
+                        if code == "request_ended" || code == "not_found" => {}
+                    _ => return Err("nvhttp response unavailable".into()),
+                }
+            }
+            source_join::Outcome::RecoveryRequired => {
+                self.source_join_recovery_required = true;
+                complete_control(
+                    &self.runtime,
+                    join.request_id(),
+                    json!({"ok":false,"code":"recovery_required"}),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn update_active_listener_ports(&mut self) {
         let addresses = self
             .server
@@ -658,6 +730,7 @@ impl NvhttpModule {
             Response::Request {
                 id,
                 caller,
+                initiator,
                 service,
                 payload,
                 remaining_ms,
@@ -681,6 +754,82 @@ impl NvhttpModule {
                     }
                 };
                 match operation {
+                    Operation::BindFeedbackSource {
+                        authority_epoch,
+                        source,
+                        scope,
+                        input_boot_epoch,
+                    } => {
+                        let Some(selection) = self.startup_settings.effect_source_join.as_ref()
+                        else {
+                            return complete_control(
+                                &self.runtime,
+                                id,
+                                json!({"ok":false,"code":"permission_denied"}),
+                            );
+                        };
+                        if !selection.admits(&caller, &initiator) {
+                            return complete_control(
+                                &self.runtime,
+                                id,
+                                json!({"ok":false,"code":"permission_denied"}),
+                            );
+                        }
+                        if !source_join_available() {
+                            return complete_control(
+                                &self.runtime,
+                                id,
+                                json!({"ok":false,"code":"source_attestation_unavailable"}),
+                            );
+                        }
+                        if self.source_join_recovery_required || self.source_join.is_some() {
+                            return complete_control(
+                                &self.runtime,
+                                id,
+                                json!({"ok":false,"code":"source_join_unavailable"}),
+                            );
+                        }
+                        if !matches!(
+                            self.runtime.send(Command::CheckRequest { request: id })?,
+                            Response::Ok
+                        ) {
+                            return complete_control(
+                                &self.runtime,
+                                id,
+                                json!({"ok":false,"code":"request_ended"}),
+                            );
+                        }
+                        let Some(evidence) =
+                            source_evidence(self.router.as_ref(), self.identity.as_ref(), &source)
+                        else {
+                            return complete_control(
+                                &self.runtime,
+                                id,
+                                json!({"ok":false,"code":"source_denied"}),
+                            );
+                        };
+                        let request = amaterasu_module_sdk::nvhttp_source::BindFeedbackSource {
+                            authority_epoch,
+                            source,
+                            scope,
+                            input_boot_epoch,
+                        };
+                        match source_join::Join::start(
+                            id,
+                            request,
+                            selection.input_consumer.clone(),
+                            evidence,
+                            remaining_ms,
+                        ) {
+                            Ok(join) => {
+                                self.source_join = Some(join);
+                                Ok(())
+                            }
+                            Err(code) => {
+                                complete_control(&self.runtime, id, json!({"ok":false,"code":code}))
+                            }
+                        }
+                    }
                     Operation::ManagementLaunchStatus { reference } => {
                         if caller != MANAGEMENT_PRINCIPAL {
                             return complete_control(
@@ -918,6 +1067,7 @@ impl NvhttpModule {
                                 }
                             }
                             Operation::Status
+                            | Operation::BindFeedbackSource { .. }
                             | Operation::ManagementLaunchStatus { .. }
                             | Operation::ManagementStopLaunch { .. } => unreachable!(),
                         };

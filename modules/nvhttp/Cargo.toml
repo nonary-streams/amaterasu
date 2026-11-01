@@ -28,6 +28,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 
 [dev-dependencies]
 amaterasu-module-sdk = { workspace = true, features = ["network-test-support"] }
+amaterasu-runtime = { path = "../../crates/runtime" }
 
 [lints]
 workspace = true
