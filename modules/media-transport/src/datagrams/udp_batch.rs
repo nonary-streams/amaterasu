@@ -24,6 +24,12 @@ impl BatchSender {
         }
     }
 
+    /// Limit the proposed group before calling the provider. A provider's
+    /// smaller declared capacity is not a partial write or backpressure.
+    pub(super) fn max_datagrams(&self) -> usize {
+        self.max_datagrams.max(1)
+    }
+
     pub(super) fn send(
         &self,
         socket: &UdpSocket,

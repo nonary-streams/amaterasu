@@ -63,6 +63,7 @@ pub struct VideoSettings {
     pub fec_percentage: u8,
     pub min_parity_shards: u8,
     pub max_fec_blocks: u8,
+    /// Byte limit for each network batch call; shared tick budgets are separate.
     #[serde(default = "default_video_max_batch_size_kb")]
     pub max_batch_size_kb: u8,
 }

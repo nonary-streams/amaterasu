@@ -222,13 +222,13 @@ fn four_streams_receive_equal_tick_budget_and_owner_limits_cannot_be_evicted() {
 }
 
 #[test]
-fn open_reports_batch_size_normalization_and_video_frame_uses_selected_allowance() {
-    for (requested, effective, fallback, expected_sends) in [
-        (0_u8, 64_u8, false, 64_usize),
-        (16, 16, false, 16),
-        (32, 32, false, 32),
-        (64, 64, false, 64),
-        (17, 64, true, 64),
+fn open_normalizes_batch_sizes_without_reducing_the_shared_pass_budget() {
+    for (requested, effective, fallback) in [
+        (0_u8, 64_u8, false),
+        (16, 16, false),
+        (32, 32, false),
+        (64, 64, false),
+        (17, 64, true),
     ] {
         let (video, audio) = receivers();
         let mut request = request(&video, &audio, false);
@@ -251,8 +251,8 @@ fn open_reports_batch_size_normalization_and_video_frame_uses_selected_allowance
         controller.tick();
 
         let stream = &controller.streams[&stream_id];
-        assert_eq!(stream.delivery.sent_datagrams, expected_sends as u64);
-        assert_eq!(stream.delivery.queued(), 72 - expected_sends);
+        assert_eq!(stream.delivery.sent_datagrams, 64);
+        assert_eq!(stream.delivery.queued(), 8);
     }
 }
 

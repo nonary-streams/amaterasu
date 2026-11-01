@@ -329,7 +329,6 @@ impl Delivery {
         }
         let mut sent = 0;
         let mut audio_sent = 0;
-        let mut active_video_batch: Option<(Option<u32>, usize, usize)> = None;
         let send_limit = send_limit.min(MAX_VIDEO_BATCH_PACKETS);
         while sent < send_limit {
             let Some(packet) = self.queue.front() else {
@@ -338,25 +337,19 @@ impl Delivery {
             let (medium, video_frame, packet_bytes) =
                 (packet.medium, packet.video_frame, packet.bytes.len());
             if matches!(medium, Medium::Video) {
-                if active_video_batch.is_none_or(|(active_frame, _, _)| active_frame != video_frame)
-                {
-                    active_video_batch =
-                        Some((video_frame, self.video_batch_packet_limit(packet_bytes), 0));
-                }
-                if active_video_batch
-                    .is_some_and(|(_, batch_limit, batch_sent)| batch_sent >= batch_limit)
-                {
-                    break;
-                }
-                let (_, batch_limit, batch_sent) = active_video_batch.unwrap();
-                let remaining_frame_packets = batch_limit - batch_sent;
+                // This is a per-call byte limit, not a per-frame tick allowance.
+                // Continue with another bounded batch while this stream's shared
+                // pass budget permits; a large frame need not wait for a tick.
+                let batch_packet_limit = self
+                    .video_batch_packet_limit(packet_bytes)
+                    .min(self.video.batch_sender.max_datagrams());
                 let remaining_tick_packets = send_limit - sent;
                 if self.video_batch_support != VideoBatchSupport::Unavailable
                     && packet_bytes > 0
-                    && remaining_frame_packets > 1
+                    && batch_packet_limit > 1
                     && remaining_tick_packets > 1
                 {
-                    let group_limit = remaining_frame_packets.min(remaining_tick_packets);
+                    let group_limit = batch_packet_limit.min(remaining_tick_packets);
                     let group_count = self.video_group_len(video_frame, packet_bytes, group_limit);
                     if group_count > 1 {
                         let payload = self.video_group_payload(group_count, packet_bytes);
@@ -378,9 +371,6 @@ impl Delivery {
                                 }
                                 self.video_batch_support = VideoBatchSupport::Available;
                                 sent += accepted;
-                                if let Some((_, _, batch_sent)) = &mut active_video_batch {
-                                    *batch_sent += accepted;
-                                }
                                 if accepted < group_count {
                                     break;
                                 }
@@ -398,7 +388,6 @@ impl Delivery {
                     }
                 }
             } else {
-                active_video_batch = None;
                 if audio_sent >= SENDS_PER_STREAM {
                     break;
                 }
@@ -412,11 +401,7 @@ impl Delivery {
                 break;
             }
             sent += 1;
-            if matches!(medium, Medium::Video) {
-                if let Some((_, _, batch_sent)) = &mut active_video_batch {
-                    *batch_sent += 1;
-                }
-            } else {
+            if matches!(medium, Medium::Audio) {
                 audio_sent += 1;
             }
         }

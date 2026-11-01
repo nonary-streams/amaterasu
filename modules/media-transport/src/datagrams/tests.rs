@@ -60,28 +60,27 @@ fn reservation_bounds_and_per_stream_send_budget_are_enforced() {
 }
 
 #[test]
-fn configured_video_batch_size_changes_the_per_frame_send_allowance() {
-    for (batch_size_kb, expected_sends) in [(16, 16), (32, 32), (64, 64)] {
-        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
-        peer.set_read_timeout(Some(Duration::from_millis(200)))
-            .unwrap();
-        let local = "127.0.0.1:0".parse().unwrap();
-        let address = peer.local_addr().unwrap();
-        let mut delivery = Delivery::bind(local, local, address, address).unwrap();
+fn configured_video_batch_size_limits_calls_without_deferring_the_frame() {
+    for (batch_size_kb, packet_bytes) in [(16, 1024), (32, 1024), (64, 1024), (64, 1440)] {
+        let mut delivery = delivery();
         delivery.set_video_max_batch_size_kb(batch_size_kb);
-        delivery.push_video(1, vec![vec![0; 1024]; 72]);
+        delivery.push_video(1, vec![vec![0; packet_bytes]; 72]);
+        let mut batches = Vec::new();
 
-        let sent = delivery.tick_with_limit(MAX_VIDEO_BATCH_PACKETS);
+        let sent = delivery.tick_with_batch_sender(64, |_, payload, segment_size| {
+            assert_eq!(segment_size, packet_bytes);
+            assert!(payload.len() <= usize::from(batch_size_kb) * 1024);
+            batches.push(payload.len());
+            Ok(payload.len())
+        });
 
-        assert_eq!(sent, expected_sends);
-        assert_eq!(delivery.sent_datagrams, expected_sends as u64);
-        assert_ne!(delivery.video_batch_support, VideoBatchSupport::Unknown);
-        assert_eq!(delivery.queued(), 72 - expected_sends);
-        for _ in 0..expected_sends {
-            let mut received = [0; 1024];
-            assert_eq!(peer.recv(&mut received).unwrap(), received.len());
-            assert_eq!(received, [0; 1024]);
-        }
+        assert_eq!(sent, 64, "batch size must not reduce the pass allowance");
+        assert_eq!(delivery.sent_datagrams, 64);
+        assert_eq!(delivery.queued(), 8, "the shared pass budget still applies");
+        assert_eq!(
+            batches.len(),
+            64_usize.div_ceil(usize::from(batch_size_kb) * 1024 / packet_bytes)
+        );
     }
 }
 
@@ -179,7 +178,7 @@ fn partial_batch_send_result_fails_without_counting_any_datagrams_as_sent() {
 }
 
 #[test]
-fn video_batch_allowance_resets_at_frame_boundaries() {
+fn video_batches_preserve_frame_boundaries() {
     let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
     let local = "127.0.0.1:0".parse().unwrap();
     let address = peer.local_addr().unwrap();
@@ -419,8 +418,8 @@ fn provider_with_one_datagram_batch_limit_preserves_ordered_delivery() {
         Delivery::bind_with_network(&network, local, local, address, address).unwrap();
     delivery.push_video(1, vec![vec![1; 4], vec![2; 4], vec![3; 4]]);
     let mut buffer = [0; 16];
+    assert_eq!(delivery.tick_with_limit(64), 3);
     for expected in [1, 2, 3] {
-        assert_eq!(delivery.tick_with_limit(64), 1);
         let length = peer.recv(&mut buffer).unwrap();
         assert_eq!(&buffer[..length], &[expected; 4]);
         assert_eq!(delivery.failure, None);
