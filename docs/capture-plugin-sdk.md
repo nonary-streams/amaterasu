@@ -273,17 +273,19 @@ after the consumer's GPU work has completed. Invalid fences must quarantine the
 storage. Acquire fences still apply. The provider's native binding must outlive
 all retained references and pending fences. The additive entries are
 `CaptureApiV1_6.read_dmabuf_frame_leased` and
-`EncoderApiV1_2.submit_dmabuf_leased`. Ama's native encoder waits for its GPU
-reads to complete before returning; a third-party encoder may retain a lease
-until its own reads complete, provided it obeys that lifetime contract.
+`EncoderApiV1_2.submit_dmabuf_leased`. Ama's native encoder retains the lease
+and queues GPU work without blocking the module tick. It releases the reference
+on the module thread when encoded output proves completion, or after worker
+shutdown joins outstanding work. Other encoders must obey the same lifetime
+contract when retaining a lease.
 
 Encoder v1.2 and GPU processor v1.0 must implement
 `cancel_dmabuf_leases(context, stream)`. This is a synchronous lifetime barrier:
 finish pending reads and retire every retained reference and completion fence
 before returning. Video calls encoder cancellation before processor cancellation
 on stream close and shutdown, while the source bindings remain alive. A provider
-must not schedule later callbacks after cancellation. The built-in encoder's
-synchronous source-copy barrier can block the module tick during GPU work.
+must not schedule later callbacks after cancellation. The built-in encoder keeps
+at most one GPU submission in flight and does not queue older frames behind it.
 
 Rust SDK users can retain a validated borrowed lease with
 `RetainedDmaBufFrame::retain_from_borrowed(&lease, &native_binding)`. Its unsafe
@@ -373,5 +375,5 @@ then requires both capture and encoder lease interfaces and refuses borrowed or
 CPU fallback on startup and runtime failures. The plugin independently refuses
 its ordinary borrowed read callback when `require_lease` is set. A missing driver,
 helper, GPU snapshot backend or encoder lease interface is a failure, not a
-silently different delivery mode. The encoder completes GPU source reads before
-returning a synchronous lease submission, and cancellation joins that work.
+silently different delivery mode. The encoder retains accepted lease submissions
+through GPU completion; cancellation joins that work before releasing references.

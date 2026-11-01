@@ -213,6 +213,7 @@ pub(super) fn queue_control_input(
         return Ok(());
     }
     if let Some(event) = controller_payload(&input) {
+        coalesce_controller_sample(&mut record.input_events, record.input_inflight, &event);
         if record.input_events.len() >= MAX_QUEUED_EVENTS {
             return Err("input_queue_overflow");
         }
@@ -259,18 +260,56 @@ pub(super) fn queue_control_input(
             return Ok(());
         }
     };
-    if record
-        .input_events
-        .len()
-        .saturating_add(batch.events().len())
-        > MAX_QUEUED_EVENTS
-    {
-        return Err("input_queue_overflow");
+    for event in batch.into_events().into_iter().map(event_payload) {
+        coalesce_controller_sample(&mut record.input_events, record.input_inflight, &event);
+        if record.input_events.len() >= MAX_QUEUED_EVENTS {
+            return Err("input_queue_overflow");
+        }
+        record.input_events.push_back(event);
     }
-    record
-        .input_events
-        .extend(batch.into_events().into_iter().map(event_payload));
     Ok(())
+}
+
+// Continuous controller samples replace only unsent samples. Button edges,
+// device arrival, touch phases and keyboard/mouse ordering remain barriers.
+fn coalesce_controller_sample(
+    events: &mut std::collections::VecDeque<Value>,
+    inflight: usize,
+    next: &Value,
+) {
+    let kind = next["kind"].as_str();
+    if !matches!(
+        kind,
+        Some("controller" | "controller_motion" | "controller_battery")
+    ) {
+        return;
+    }
+    for index in (inflight..events.len()).rev() {
+        let previous = &events[index];
+        let previous_kind = previous["kind"].as_str();
+        if !matches!(
+            previous_kind,
+            Some("controller" | "controller_motion" | "controller_battery")
+        ) {
+            break;
+        }
+        if previous["number"] != next["number"] {
+            continue;
+        }
+        if previous_kind == Some("controller")
+            && kind == Some("controller")
+            && (previous["buttons"] != next["buttons"]
+                || previous["active_mask"] != next["active_mask"])
+        {
+            break;
+        }
+        if previous_kind == kind
+            && (kind != Some("controller_motion") || previous["motion_type"] == next["motion_type"])
+        {
+            events.remove(index);
+            break;
+        }
+    }
 }
 
 pub(super) fn stop_for_input_failure(record: &mut Record, code: &'static str) {
@@ -929,5 +968,55 @@ mod tests {
                 "right_y":1,
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod coalescing_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    #[test]
+    fn samples_stay_bounded_without_changing_inflight_or_button_edges() {
+        let sample = |buttons, x| json!({"kind":"controller","number":0,"active_mask":1,"buttons":buttons,"left_x":x});
+        let initial = sample(0, 0);
+        let mut queue = VecDeque::from([initial.clone()]);
+        for x in 1..1000 {
+            let next = sample(0, x);
+            coalesce_controller_sample(&mut queue, 1, &next);
+            queue.push_back(next);
+        }
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0], initial);
+        for buttons in [1, 0, 1, 0] {
+            let next = sample(buttons, 1000);
+            coalesce_controller_sample(&mut queue, 1, &next);
+            queue.push_back(next);
+        }
+        assert_eq!(queue.len(), 6);
+        assert_eq!(
+            queue
+                .iter()
+                .map(|e| e["buttons"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            [0, 0, 1, 0, 1, 0]
+        );
+    }
+    #[test]
+    fn motion_types_coalesce_independently_and_do_not_cross_arrival() {
+        let mut queue = VecDeque::new();
+        for x in 0..1000 {
+            for motion_type in ["gyro", "accel"] {
+                let next =
+                    json!({"kind":"controller_motion","number":0,"motion_type":motion_type,"x":x});
+                coalesce_controller_sample(&mut queue, 0, &next);
+                queue.push_back(next);
+            }
+        }
+        assert_eq!(queue.len(), 2);
+        queue.push_back(json!({"kind":"controller_arrival","number":0}));
+        let next = json!({"kind":"controller_motion","number":0,"motion_type":"gyro","x":1001});
+        coalesce_controller_sample(&mut queue, 0, &next);
+        queue.push_back(next);
+        assert_eq!(queue.len(), 4);
     }
 }

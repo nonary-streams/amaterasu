@@ -843,14 +843,14 @@ fn unavailable_virtual_gamepad_is_dropped_without_stopping_the_stream_or_input_l
 
     assert_eq!(host.pipeline.records[&id].state, State::Active);
     assert_eq!(host.pipeline.records[&id].unsupported_controls, 1);
-    assert_eq!(host.pipeline.records[&id].input_events_sent, 1);
+    assert_eq!(host.pipeline.records[&id].input_events_sent, 0);
     assert!(host.pipeline.records[&id].input_lease.is_some());
     assert_eq!(host.broker.tray_vigem_notifications, 1);
 
     host.plane.borrow_mut().controls.push(relative(3));
     host.idle();
     assert_eq!(host.pipeline.records[&id].state, State::Active);
-    assert_eq!(host.pipeline.records[&id].input_events_sent, 2);
+    assert_eq!(host.pipeline.records[&id].input_events_sent, 1);
     assert!(host.pipeline.records[&id].input_lease.is_some());
     assert_eq!(host.broker.tray_vigem_notifications, 1);
 }
