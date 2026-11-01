@@ -482,6 +482,24 @@ fn stream_sequence(application_operation: &str, rtsp_operation: &str) -> Option<
     (application_nonce == stream_nonce && stream_sequence > application_sequence)
         .then_some(stream_sequence)
 }
+fn resumed_stream_follows_admission(
+    record: &crate::records::Record,
+    application_operation: &str,
+    sequence: u64,
+) -> bool {
+    let Some(admission) = &record.display_admission else {
+        return false;
+    };
+    if let Some(previous) = stream_sequence(application_operation, &admission.rtsp_operation_id) {
+        return sequence > previous;
+    }
+    // The initial application and RTSP operation share one NVHTTP record ID.
+    application_operation
+        .rsplit(':')
+        .next()
+        .and_then(|operation| operation.strip_suffix("-application"))
+        .is_some_and(|prefix| admission.rtsp_operation_id == format!("{prefix}-rtsp"))
+}
 struct DeferredLimiterVerification {
     request: u64,
     caller: String,
@@ -1540,8 +1558,15 @@ impl Pipeline {
                     || record.preflight_token.is_none()
                     || !record_policy_matches(record, catalog_revision, policy_identity.as_ref())
                     || (record.catalog_selection == CatalogSelection::Library
-                        && record.streaming_certificate_id.as_deref()
-                            != Some(certificate_id.as_str()))
+                        && (record.streaming_certificate_id.as_deref()
+                            != Some(certificate_id.as_str())
+                            || (record.launch_started
+                                && record
+                                    .stream_limiter_snapshot
+                                    .as_ref()
+                                    .is_none_or(|stream| {
+                                        stream.rtsp_operation_id != rtsp_operation_id
+                                    }))))
                     || record.application_display_overrides != application_display_overrides
                     || record.application_display_settings != application_display_settings
                     || virtual_display_intent.as_ref().is_some_and(|intent| {
@@ -1766,6 +1791,13 @@ impl Pipeline {
                     || record.state != State::Active
                     || record.operation_id != application_operation_id
                     || !valid_resumed_stream_snapshot(record, &frame_limiter_settings)
+                    || (record.catalog_selection == CatalogSelection::Library
+                        && record.stream_limiter_snapshot.is_none()
+                        && !resumed_stream_follows_admission(
+                            record,
+                            &application_operation_id,
+                            sequence,
+                        ))
                     || record
                         .stream_limiter_snapshot
                         .as_ref()
@@ -1783,6 +1815,16 @@ impl Pipeline {
                     .values
                     .get_mut(&launch_id)
                     .expect("verified owned record");
+                if record.catalog_selection == CatalogSelection::Library
+                    && record
+                        .display_admission
+                        .as_ref()
+                        .is_some_and(|admission| admission.rtsp_operation_id != rtsp_operation_id)
+                {
+                    // A later stream supersedes the previous admission. Its token
+                    // cannot authorize the resumed stream or be replayed afterward.
+                    record.display_admission = None;
+                }
                 record.stream_limiter_snapshot = Some(StreamLimiterSnapshot {
                     rtsp_operation_id: rtsp_operation_id.clone(),
                     sequence,

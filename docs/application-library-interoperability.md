@@ -268,7 +268,13 @@ implementations and synthetic hardware. It covers attested limiter replacement,
 stale and mismatched targets, foreign-owner tokens, stale policy, display
 rejection, cancellation and preparation failure. It injects transport trust and
 does not test live pairing or host-configuration revocation; those
-security-fence cases remain required before integration. Selected-library resume
-and its new-stream display admission still require qualification.
+security-fence cases remain required before integration. Resume retains the
+accepted library identity and ordinary-policy snapshot, checks the current
+paired certificate and lifecycle owner, and obtains a fresh display admission
+for the new RTSP operation. The composition test covers changed library and
+policy responses, a supported limiter, stale and foreign lifecycle targets,
+unpairing, and failed stream preparation. It stages the NVHTTP paused record
+after exercising real lifecycle pause and RTSP close; it does not exercise an
+encrypted RTSP PLAY/disconnect or the separate live revocation barrier.
 
 No installed grants or live settings are changed by this work.

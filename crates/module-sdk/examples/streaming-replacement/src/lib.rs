@@ -20,7 +20,10 @@ struct Settings {
     #[serde(default)]
     mode: String,
 }
-struct GeneratedLibrary;
+struct GeneratedLibrary {
+    mode: String,
+    resolutions: u32,
+}
 impl Library for GeneratedLibrary {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
@@ -56,7 +59,11 @@ impl Library for GeneratedLibrary {
         id: &str,
         revision: &str,
     ) -> Result<LaunchTarget, &'static str> {
-        if id != "opaque/game" || revision != "entry:opaque" {
+        self.resolutions += 1;
+        if id != "opaque/game"
+            || revision != "entry:opaque"
+            || (self.mode.starts_with("resume_") && self.resolutions > 2)
+        {
             return Err("revision_conflict");
         }
         Ok(LaunchTarget {
@@ -117,7 +124,9 @@ impl Provider for GeneratedPolicy {
             policy: Snapshot {
                 application: request.application.clone(),
                 entry_revision: request.entry_revision.clone(),
-                policy_revision: if self.mode == "stale" && self.calls > 1 {
+                policy_revision: if (self.mode == "stale" && self.calls > 1)
+                    || (self.mode.starts_with("resume_") && self.calls > 2)
+                {
                     "changed-policy"
                 } else {
                     "generated-policy:two"
@@ -182,7 +191,11 @@ impl amaterasu_module_sdk::application_library::provider_adapter::Provider for G
     fn supports_limiter_target_v1(&self) -> bool {
         matches!(
             self.mode.as_str(),
-            "limiter_success" | "limiter_mismatch" | "limiter_stale" | "limiter_stale_recheck"
+            "limiter_success"
+                | "limiter_mismatch"
+                | "limiter_stale"
+                | "limiter_stale_recheck"
+                | "resume_limiter"
         )
     }
     fn attest_limiter_target(
@@ -363,7 +376,10 @@ impl ManagedModule for Module {
         let caller = "amaterasu.launch".to_owned();
         let initiators = BTreeSet::from(["amaterasu.nvhttp".to_owned()]);
         let library = LibraryAdapter::new(
-            GeneratedLibrary,
+            GeneratedLibrary {
+                mode: settings.mode.clone(),
+                resolutions: 0,
+            },
             "fixture.library/2".into(),
             BTreeMap::from([(
                 caller.clone(),
