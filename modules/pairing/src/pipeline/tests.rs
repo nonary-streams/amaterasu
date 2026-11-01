@@ -21,7 +21,7 @@ const CLIENT_CERT: &str = include_str!("../../tests/fixtures/client-cert.pem");
 const CLIENT_KEY: &str = include_str!("../../tests/fixtures/client-key.pem");
 const HOST_CERT: &str = include_str!("../../tests/fixtures/host-cert.pem");
 const HOST_KEY: &str = include_str!("../../tests/fixtures/host-key.pem");
-fn now() -> u64 {
+pub(super) fn now() -> u64 {
     Certificate::from_pem(HOST_CERT)
         .unwrap()
         .tbs_certificate
@@ -48,7 +48,7 @@ fn settings() -> Settings {
     }
 }
 
-struct Harness {
+pub(super) struct Harness {
     document: Option<Value>,
     revision: u64,
     incoming: Option<Response>,
@@ -4346,7 +4346,7 @@ fn feedback_preserves_view_only_and_explicit_controller_restriction() {
     assert_eq!(restricted.apply_effect_request("nvhttp","nvhttp",json!({"action":"bind_stream","epoch":epoch,"certificate_pem":CLIENT_CERT,"source":feedback_source_for_test("owner"),"scope":feedback_scope_for_test(&["speaker.pcm"])}),now()),Err("scope_denied"));
 }
 
-fn authorized_feedback_for_test() -> (Pipeline, Harness, String, String, Value, Value) {
+pub(super) fn authorized_feedback_for_test() -> (Pipeline, Harness, String, String, Value, Value) {
     let (mut pipeline, mut harness, certificate_id) = paired_native_client();
     grant_feedback_for_test(
         &mut harness,

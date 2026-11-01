@@ -17,8 +17,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 pub(super) struct ProtocolAttestation {
-    capabilities: BTreeSet<ProtocolCapability>,
-    issuer_epoch: String,
+    pub(super) capabilities: BTreeSet<ProtocolCapability>,
+    pub(super) issuer_epoch: String,
 }
 
 impl Pipeline {

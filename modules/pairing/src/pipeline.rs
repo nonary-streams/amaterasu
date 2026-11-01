@@ -15,6 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use x509_cert::der::Encode;
 
 mod protocol_admission;
+mod protocol_claim;
 mod source_retirement;
 
 const STATE_KEY: &str = "pairing/v1";
@@ -78,6 +79,12 @@ pub struct Pipeline {
     effect_authority: Option<EffectAuthoritySettings>,
     effect_bindings: BTreeMap<EffectSource, (Arc<Snapshot>, Vec<u8>)>,
     protocol_capabilities: BTreeMap<EffectSource, protocol_admission::ProtocolAttestation>,
+    pending_protocol_claim: Option<protocol_claim::ClaimJob>,
+    protocol_claim_recovery_required: bool,
+    retained_protocol_claim: Option<(
+        amaterasu_module_sdk::broker_effect_fence::SourceSlotLease,
+        Box<amaterasu_module_sdk::broker_effect_fence::EffectScope>,
+    )>,
     deferred_effect_mutation: Option<(Request, Operation)>,
     identity_generation: Option<IdentityGeneration>,
     #[cfg(test)]
@@ -154,6 +161,9 @@ impl Pipeline {
             effect_authority,
             effect_bindings: BTreeMap::new(),
             protocol_capabilities: BTreeMap::new(),
+            pending_protocol_claim: None,
+            protocol_claim_recovery_required: false,
+            retained_protocol_claim: None,
             deferred_effect_mutation: None,
             identity_generation: None,
             #[cfg(test)]
@@ -802,6 +812,40 @@ impl Pipeline {
     }
 
     fn drive(&mut self, now: u64, mut send: impl FnMut(Command) -> Transport) -> ModuleResult<()> {
+        if let Some(mut claim) = self.pending_protocol_claim.take() {
+            let current = self.protocol_claim_current(&claim, now);
+            let parent = claim.parent();
+            let outcome = match claim.advance(current, &mut send) {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    // An interrupted State request may already have executed.
+                    self.protocol_claim_recovery_required = true;
+                    self.invalidate_identity();
+                    return complete(&mut send, parent, error("protocol_claim_uncertain"));
+                }
+            };
+            return match outcome {
+                protocol_claim::Outcome::Pending => {
+                    self.pending_protocol_claim = Some(claim);
+                    Ok(())
+                }
+                protocol_claim::Outcome::Claimed { lease, scope } => {
+                    // The claim is durable but is not an open slot or grant.
+                    // Keep it fenced until source drain and recovery are bound.
+                    self.retained_protocol_claim = Some((lease, scope));
+                    self.protocol_claim_recovery_required = true;
+                    self.invalidate_identity();
+                    complete(&mut send, parent, error("protocol_reconciliation_required"))
+                }
+                protocol_claim::Outcome::Failed(code) => {
+                    if code == "protocol_claim_uncertain" {
+                        self.protocol_claim_recovery_required = true;
+                        self.invalidate_identity();
+                    }
+                    complete(&mut send, parent, error(code))
+                }
+            };
+        }
         if let Some(pending) = self.pending.take() {
             return self.advance(pending, now, &mut send);
         }
@@ -890,6 +934,11 @@ impl Pipeline {
                 };
                 if let Err(code) = self.engine.admit(&caller, &operation) {
                     return complete(&mut send, id, error(code));
+                }
+                if (self.protocol_claim_recovery_required || self.retained_protocol_claim.is_some())
+                    && operation.may_write()
+                {
+                    return complete(&mut send, id, error("protocol_reconciliation_required"));
                 }
                 if let (
                     Some(configured_identity),
@@ -1042,6 +1091,11 @@ impl Pipeline {
         };
         if !permitted {
             return Err("forbidden");
+        }
+        if matches!(&request, EffectRequest::Recover { .. })
+            && (self.protocol_claim_recovery_required || self.retained_protocol_claim.is_some())
+        {
+            return Err("protocol_reconciliation_required");
         }
         // Recovery reopens admission. While the authoritative host identity is
         // being loaded or refreshed, the old snapshot cannot authorize that
