@@ -121,7 +121,7 @@ impl MediaTransportModule {
         if let (Some(service), Some(factory)) = (plan_service, &plan_factory) {
             // SAFETY: factory is retained for module lifetime and callbacks borrow synchronously.
             unsafe {
-                amaterasu_module_sdk::video_framing::register_plan_transport(
+                amaterasu_module_sdk::video_framing::register_plan_transport_v2(
                     &runtime,
                     &service,
                     &factory.api,

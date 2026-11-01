@@ -441,6 +441,7 @@ impl Pipeline {
             if let Some(route) = &record.extension_route
                 && payload["ok"] == true
                 && payload["source_id"].as_u64() == Some(route.source_id)
+                && payload["encoder"] == json!(route.encoder)
                 && payload["profile"] == json!(route.profile)
                 && let Some(media) = record.resources.get(&Resource::Media)
             {

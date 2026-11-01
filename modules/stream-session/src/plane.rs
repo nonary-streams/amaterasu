@@ -55,6 +55,7 @@ pub struct Handles {
 
 #[derive(Clone)]
 pub(crate) struct NegotiatedRoute {
+    pub profile: amaterasu_contracts::media_profile::VideoProfile,
     pub video_service: String,
     pub framer_service: String,
     pub transport_service: String,

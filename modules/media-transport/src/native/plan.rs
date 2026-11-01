@@ -1,8 +1,8 @@
 //! Owner-scoped plan admission into the production media transport.
 use super::{Shared, guarded};
 use amaterasu_media::{
-    MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_UNSUPPORTED, NegotiatedVideoPlanTransportApi,
-    NegotiatedVideoUnit, VideoFramePlan, VideoFramingLimits, VideoPlanSelection,
+    MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_UNSUPPORTED, NegotiatedVideoPlanTransportApiV2,
+    NegotiatedVideoUnit, VideoFramePlan, VideoFramingLimits, VideoPlanSelectionV2,
 };
 use amaterasu_module_sdk::abi::*;
 use std::{ffi::c_void, sync::TryLockError};
@@ -26,7 +26,7 @@ impl Factory {
     }
 }
 struct Binding {
-    api: NegotiatedVideoPlanTransportApi,
+    api: NegotiatedVideoPlanTransportApiV2,
     shared: Shared,
     owner: String,
 }
@@ -51,9 +51,9 @@ unsafe extern "C" fn bind(
         }
         let query = unsafe { &*query };
         if !query.header.supports::<NativeInterfaceQuery>()
-            || query.interface_major != 1
+            || query.interface_major != 2
             || query.min_minor > 0
-            || query.min_size as usize > size_of::<NegotiatedVideoPlanTransportApi>()
+            || query.min_size as usize > size_of::<NegotiatedVideoPlanTransportApiV2>()
         {
             return MEDIA_UNSUPPORTED;
         }
@@ -67,11 +67,11 @@ unsafe extern "C" fn bind(
         };
         let factory = unsafe { &*context.cast::<Factory>() };
         let mut binding = Box::new(Binding {
-            api: NegotiatedVideoPlanTransportApi {
+            api: NegotiatedVideoPlanTransportApiV2 {
                 base: NativeInterface {
                     header: AbiHeader {
-                        size: size_of::<NegotiatedVideoPlanTransportApi>() as u32,
-                        major: 1,
+                        size: size_of::<NegotiatedVideoPlanTransportApiV2>() as u32,
+                        major: 2,
                         minor: 0,
                     },
                     context: std::ptr::null_mut(),
@@ -125,7 +125,7 @@ unsafe fn with_binding(
 unsafe extern "C" fn probe(
     context: *mut c_void,
     stream: u64,
-    selection: *const VideoPlanSelection,
+    selection: *const VideoPlanSelectionV2,
     limits: *mut VideoFramingLimits,
 ) -> Status {
     plan_limits(context, stream, selection, limits, false)
@@ -133,7 +133,7 @@ unsafe extern "C" fn probe(
 unsafe extern "C" fn prepare(
     context: *mut c_void,
     stream: u64,
-    selection: *const VideoPlanSelection,
+    selection: *const VideoPlanSelectionV2,
     limits: *mut VideoFramingLimits,
 ) -> Status {
     plan_limits(context, stream, selection, limits, true)
@@ -141,14 +141,14 @@ unsafe extern "C" fn prepare(
 fn plan_limits(
     context: *mut c_void,
     stream: u64,
-    selection: *const VideoPlanSelection,
+    selection: *const VideoPlanSelectionV2,
     limits: *mut VideoFramingLimits,
     commit: bool,
 ) -> Status {
     guarded(|| {
         if selection.is_null()
             || limits.is_null()
-            || !(selection as usize).is_multiple_of(align_of::<VideoPlanSelection>())
+            || !(selection as usize).is_multiple_of(align_of::<VideoPlanSelectionV2>())
             || !(limits as usize).is_multiple_of(align_of::<VideoFramingLimits>())
         {
             return STATUS_INVALID_ARGUMENT;
@@ -258,9 +258,9 @@ mod tests {
         let factory = Factory::new(shared.clone());
         let query = NativeInterfaceQuery {
             header: AbiHeader::of::<NativeInterfaceQuery>(),
-            interface_major: 1,
+            interface_major: 2,
             min_minor: 0,
-            min_size: size_of::<NegotiatedVideoPlanTransportApi>() as u32,
+            min_size: size_of::<NegotiatedVideoPlanTransportApiV2>() as u32,
         };
         let bind_owner = |owner: &str| {
             let mut table = std::ptr::null();
@@ -275,22 +275,31 @@ mod tests {
                 },
                 STATUS_OK
             );
-            table.cast::<NegotiatedVideoPlanTransportApi>()
+            table.cast::<NegotiatedVideoPlanTransportApiV2>()
         };
-        let mut selection = VideoPlanSelection {
-            size: size_of::<VideoPlanSelection>() as u32,
-            version: 1,
-            stream: 5,
-            generation: 5,
-            offer_id: 4,
-            source_id: 6,
-            config_generation: 1,
-            codec,
-            framing,
-            clock_epoch: [3; 16],
-            clock_origin_us: host_monotonic_micros().max(1),
-            metadata_required: 0,
-            reserved: 0,
+        let mut selection = VideoPlanSelectionV2 {
+            base: amaterasu_media::VideoPlanSelection {
+                size: size_of::<VideoPlanSelectionV2>() as u32,
+                version: 2,
+                stream: 5,
+                generation: 5,
+                offer_id: 4,
+                source_id: 6,
+                config_generation: 1,
+                codec,
+                framing,
+                clock_epoch: [3; 16],
+                clock_origin_us: host_monotonic_micros().max(1),
+                metadata_required: 0,
+                reserved: 0,
+            },
+            payload_type: 100,
+            encoding_name_len: 7,
+            encoding_name: {
+                let mut name = [0; 32];
+                name[..7].copy_from_slice(b"EXAMPLE");
+                name
+            },
         };
         let mut limits = std::mem::MaybeUninit::<VideoFramingLimits>::uninit();
         let other = bind_owner("other");
@@ -307,7 +316,40 @@ mod tests {
         );
         unsafe { ((*other).base.release.unwrap())((*other).base.context) };
         let table = bind_owner("owner");
-        selection.offer_id = 5;
+        // Both the pure probe and the committing prepare must reject every
+        // mismatch before the stream can acquire transport state.
+        let mut check_rejected = |selection: &VideoPlanSelectionV2| {
+            for operation in [unsafe { (*table).probe }, unsafe { (*table).prepare }] {
+                assert_eq!(
+                    unsafe {
+                        operation(
+                            (*table).base.context,
+                            stream,
+                            selection,
+                            limits.as_mut_ptr(),
+                        )
+                    },
+                    STATUS_INVALID_ARGUMENT
+                );
+            }
+        };
+        let exact = selection;
+        selection.payload_type = 101;
+        check_rejected(&selection);
+        selection = exact;
+        selection.encoding_name[0] = b'Z';
+        check_rejected(&selection);
+        selection = exact;
+        selection.encoding_name[31] = b'X';
+        check_rejected(&selection);
+        selection = exact;
+        selection.encoding_name_len = 33;
+        check_rejected(&selection);
+        selection = exact;
+        selection.base.version = 1;
+        check_rejected(&selection);
+        selection = exact;
+        selection.base.offer_id = 5;
         assert_eq!(
             unsafe {
                 ((*table).prepare)(
@@ -319,8 +361,8 @@ mod tests {
             },
             STATUS_INVALID_ARGUMENT
         );
-        selection.offer_id = 4;
-        selection.metadata_required = 1;
+        selection.base.offer_id = 4;
+        selection.base.metadata_required = 1;
         assert_eq!(
             unsafe {
                 ((*table).prepare)(
@@ -332,7 +374,7 @@ mod tests {
             },
             STATUS_INVALID_ARGUMENT
         );
-        selection.metadata_required = 0;
+        selection.base.metadata_required = 0;
         assert_eq!(
             unsafe {
                 ((*table).prepare)(

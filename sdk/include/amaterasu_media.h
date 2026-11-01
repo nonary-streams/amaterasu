@@ -770,6 +770,19 @@ typedef struct {
     AmaterasuStatus (*submit)(void *, uint64_t, const AmaterasuNegotiatedVideoUnit *, const AmaterasuVideoFramePlan *);
     AmaterasuStatus (*drain)(void *, uint64_t);
 } AmaterasuNegotiatedVideoPlanTransportApi;
+/* V2 carries the exact negotiated payload and encoding name inline. */
+typedef struct {
+    AmaterasuVideoPlanSelection base;
+    uint32_t payload_type, encoding_name_len;
+    uint8_t encoding_name[32];
+} AmaterasuVideoPlanSelectionV2;
+typedef struct {
+    AmaterasuNativeInterface base;
+    AmaterasuStatus (*probe)(void *, uint64_t, const AmaterasuVideoPlanSelectionV2 *, AmaterasuVideoFramingLimits *);
+    AmaterasuStatus (*prepare)(void *, uint64_t, const AmaterasuVideoPlanSelectionV2 *, AmaterasuVideoFramingLimits *);
+    AmaterasuStatus (*submit)(void *, uint64_t, const AmaterasuNegotiatedVideoUnit *, const AmaterasuVideoFramePlan *);
+    AmaterasuStatus (*drain)(void *, uint64_t);
+} AmaterasuNegotiatedVideoPlanTransportApiV2;
 typedef struct {
     void *context;
     AmaterasuStatus (*write)(void *, const AmaterasuVideoFramePlan *);

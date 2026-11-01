@@ -39,6 +39,35 @@ pub unsafe fn bind_plan_transport(
     }
 }
 
+pub const VIDEO_PLAN_TRANSPORT_V2_CONTRACT: &str = "amaterasu.video-plan-transport.native/2";
+
+/// # Safety
+/// Factory implements the v2 plan-transport table and outlives bindings.
+pub unsafe fn register_plan_transport_v2(
+    runtime: &RuntimeClient,
+    service: &str,
+    factory: &NativeServiceFactory,
+) -> ModuleResult<()> {
+    unsafe { runtime.register_native_typed(service, VIDEO_PLAN_TRANSPORT_V2_CONTRACT, factory) }
+}
+
+/// # Safety
+/// Runtime and provider outlive the binding and all synchronous calls.
+pub unsafe fn bind_plan_transport_v2(
+    runtime: &RuntimeClient,
+    service: &str,
+) -> ModuleResult<NativeBinding> {
+    unsafe {
+        runtime.bind_native_typed(
+            service,
+            VIDEO_PLAN_TRANSPORT_V2_CONTRACT,
+            2,
+            0,
+            size_of::<NegotiatedVideoPlanTransportApiV2>() as u32,
+        )
+    }
+}
+
 /// Owned output is borrowed to the host only during the plan callback.
 pub struct OwnedFramePlan {
     pub framed_bytes: Vec<u8>,

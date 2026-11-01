@@ -76,7 +76,7 @@ pub(super) fn submit(
     transport_stream: u64,
     unit: &NegotiatedVideoUnit,
 ) -> PlaneResult<bool> {
-    let transport_api = unsafe { transport.table::<NegotiatedVideoPlanTransportApi>() }
+    let transport_api = unsafe { transport.table::<NegotiatedVideoPlanTransportApiV2>() }
         .map_err(|_| "native_layout_mismatch")?;
     if unit.flags == VIDEO_UNIT_END_OF_STREAM {
         let plan = OwnedPlan {

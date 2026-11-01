@@ -238,6 +238,7 @@ impl Record {
             }
         };
         self.negotiated_route = Some(crate::plane::NegotiatedRoute {
+            profile: route.profile.clone(),
             video_service: route.video_unit_service.clone(),
             framer_service: route.framer_service.clone(),
             transport_service: route.plan_transport_service.clone(),

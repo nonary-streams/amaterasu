@@ -182,6 +182,68 @@ pub struct VideoPlanSelection {
     pub reserved: u32,
 }
 
+/// Version 2 carries the exact bounded negotiated wire identity inline.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VideoPlanSelectionV2 {
+    pub base: VideoPlanSelection,
+    pub payload_type: u32,
+    pub encoding_name_len: u32,
+    pub encoding_name: [u8; 32],
+}
+
+impl VideoPlanSelectionV2 {
+    /// Returns the exact wire name only for canonical, bounded descriptors.
+    pub fn wire_name(&self) -> Option<&[u8]> {
+        let len = usize::try_from(self.encoding_name_len).ok()?;
+        if self.base.size as usize != size_of::<Self>()
+            || self.base.version != 2
+            || !(99..=127).contains(&self.payload_type)
+            || !(1..=32).contains(&len)
+            || self.encoding_name[len..].iter().any(|byte| *byte != 0)
+            || !self.encoding_name[..len]
+                .iter()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'-')
+        {
+            return None;
+        }
+        Some(&self.encoding_name[..len])
+    }
+
+    /// Produce the internal v1 descriptor after validating the v2 wire fields.
+    pub fn base_v1(&self) -> Option<VideoPlanSelection> {
+        self.wire_name()?;
+        let mut base = self.base;
+        base.size = size_of::<VideoPlanSelection>() as u32;
+        base.version = 1;
+        Some(base)
+    }
+}
+
+#[repr(C)]
+pub struct NegotiatedVideoPlanTransportApiV2 {
+    pub base: NativeInterface,
+    pub probe: unsafe extern "C" fn(
+        *mut c_void,
+        u64,
+        *const VideoPlanSelectionV2,
+        *mut VideoFramingLimits,
+    ) -> Status,
+    pub prepare: unsafe extern "C" fn(
+        *mut c_void,
+        u64,
+        *const VideoPlanSelectionV2,
+        *mut VideoFramingLimits,
+    ) -> Status,
+    pub submit: unsafe extern "C" fn(
+        *mut c_void,
+        u64,
+        *const NegotiatedVideoUnit,
+        *const VideoFramePlan,
+    ) -> Status,
+    pub drain: unsafe extern "C" fn(*mut c_void, u64) -> Status,
+}
+
 /// Plan transport is a distinct typed family from unit-only transport. Prepare
 /// outputs host-controlled limits; it never accepts FEC policy from the caller.
 #[repr(C)]
@@ -664,6 +726,16 @@ mod tests {
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn framing_tables_match_public_c_layout() {
+        assert_eq!(size_of::<VideoPlanSelectionV2>(), 168);
+        assert_eq!(
+            std::mem::offset_of!(VideoPlanSelectionV2, payload_type),
+            128
+        );
+        assert_eq!(
+            std::mem::offset_of!(VideoPlanSelectionV2, encoding_name),
+            136
+        );
+        assert_eq!(size_of::<NegotiatedVideoPlanTransportApiV2>(), 64);
         assert_eq!(size_of::<VideoPlanSelection>(), 128);
         assert_eq!(std::mem::offset_of!(VideoPlanSelection, codec), 48);
         assert_eq!(std::mem::offset_of!(VideoPlanSelection, clock_epoch), 96);

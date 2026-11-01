@@ -31,8 +31,12 @@ but a v1 provider cannot be bound as v2 or bypass the policy checks.
 The framer owns neither sockets nor encryption; the transport remains responsible
 for packetization, security, delivery, fairness, cancellation and retirement.
 Production planned delivery uses the separate
-`amaterasu.video-plan-transport.native/1` family. Its probe is read-only; its
-prepare derives FEC and packet limits from the transport's own frozen settings.
+`amaterasu.video-plan-transport.native/2` family. Its selection includes the
+complete bounded wire profile: selector, codec, framing, payload type and
+encoding name. The transport compares all of them with trusted configuration on
+both probe and prepare. The older `/1` ABI remains available to existing SDK
+users but does not establish the full wire identity and is not selected by the
+production extension route. Its probe is read-only; its prepare derives FEC and packet limits from the transport's own frozen settings.
 The stream-session thread calls the selected v2.1 framer probe and copies its
 plan before invoking the transport. A provider cannot mutate transport state by
 calling the plan sink twice or by returning a malformed plan.
@@ -48,8 +52,13 @@ The opt-in production route currently supports one configured source-driven,
 8-bit SDR 4:2:0 extension profile. It requires no reference-frame constraint
 and default QP and thread controls because the source probe cannot currently
 verify those settings. RTSP requests a fixed encoder configuration at prepare
-time. Stream-session asks Video to probe the selected source encoder,
-binds the selected unit/framer/plan interfaces, and probes the framer and actual
+time. Stream-session asks Video to probe the selected source encoder identity.
+Video sends the configured encoder control service a read-only `probe_source`
+request containing the exact source ID, encoder identity and configuration. A
+positive response must echo those fields and set `ok`, `settled` and `usable`
+to true. Unsupported, uncorrelated or unsettled responses fail closed; no
+fallback to a generic sibling probe occurs. Video then probes the native source
+format, and stream-session binds the selected unit/framer/plan interfaces, and probes the framer and actual
 owned transport against host limits before returning an offer. RTSP advertises
 only that preflighted profile and accepts only an ANNOUNCE with its selector and
 the probed geometry, rate, color and transport parameters. Start rechecks the

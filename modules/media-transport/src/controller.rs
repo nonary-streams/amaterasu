@@ -1,7 +1,7 @@
 use crate::{model::*, stream::Stream};
 use amaterasu_media::{
     EncodedAudioPacket, EncodedPacket, MEDIA_CLOSED, NegotiatedVideoUnit, VideoFramePlan,
-    VideoFramingLimits, VideoPlanSelection,
+    VideoFramingLimits, VideoPlanSelectionV2,
 };
 use amaterasu_module_sdk::{
     abi::{STATUS_INVALID_ARGUMENT, Status},
@@ -264,15 +264,20 @@ impl Controller {
             .map_or(MEDIA_CLOSED, Stream::drain)
     }
 
-    fn plan_allowlisted(&self, selection: &VideoPlanSelection) -> bool {
+    fn plan_allowlisted(&self, selection: &VideoPlanSelectionV2) -> bool {
         let same = |a: &amaterasu_contracts::media_profile::FormatId,
                     b: amaterasu_media::EncoderFormatId| {
             a.namespace_id == b.namespace_id && a.value == b.value && a.schema == b.schema
         };
+        let Some(name) = selection.wire_name() else {
+            return false;
+        };
         self.settings.extension_profiles.iter().any(|profile| {
-            u64::from(profile.wire_selector) == selection.offer_id
-                && same(&profile.codec, selection.codec)
-                && same(&profile.framing, selection.framing)
+            u64::from(profile.wire_selector) == selection.base.offer_id
+                && same(&profile.codec, selection.base.codec)
+                && same(&profile.framing, selection.base.framing)
+                && u32::from(profile.payload_type) == selection.payload_type
+                && profile.encoding_name.as_bytes() == name
         })
     }
 
@@ -280,14 +285,14 @@ impl Controller {
         &self,
         owner: &str,
         id: u64,
-        selection: &VideoPlanSelection,
+        selection: &VideoPlanSelectionV2,
     ) -> Result<VideoFramingLimits, Status> {
         if !self.plan_allowlisted(selection) {
             return Err(STATUS_INVALID_ARGUMENT);
         }
         self.owned(owner, id)
             .map_err(|_| MEDIA_CLOSED)?
-            .probe_video_plan(selection)
+            .probe_video_plan(&selection.base_v1().ok_or(STATUS_INVALID_ARGUMENT)?)
             .map_err(|_| STATUS_INVALID_ARGUMENT)
     }
 
@@ -295,14 +300,14 @@ impl Controller {
         &mut self,
         owner: &str,
         id: u64,
-        selection: &VideoPlanSelection,
+        selection: &VideoPlanSelectionV2,
     ) -> Result<VideoFramingLimits, Status> {
         if !self.plan_allowlisted(selection) {
             return Err(STATUS_INVALID_ARGUMENT);
         }
         self.owned_mut(owner, id)
             .ok_or(MEDIA_CLOSED)?
-            .prepare_video_plan(selection)
+            .prepare_video_plan(&selection.base_v1().ok_or(STATUS_INVALID_ARGUMENT)?)
             .map_err(|_| STATUS_INVALID_ARGUMENT)
     }
 

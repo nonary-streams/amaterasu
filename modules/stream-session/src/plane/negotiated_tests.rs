@@ -862,7 +862,7 @@ fn planned_pump_switches_framers_and_delivers_through_the_real_transport() {
             (BAD_FRAMER, video_framing::FRAMING_CONTRACT, "provider"),
             (
                 PLAN,
-                video_framing::VIDEO_PLAN_TRANSPORT_CONTRACT,
+                video_framing::VIDEO_PLAN_TRANSPORT_V2_CONTRACT,
                 "provider",
             ),
             (
@@ -996,10 +996,10 @@ fn planned_pump_switches_framers_and_delivers_through_the_real_transport() {
             let mut video_module =
                 amaterasu_video::test_support::VideoModule::start(endpoint("video")).unwrap();
             let configuration = serde_json::json!({"width":16,"height":16,"fps":60,"bitrate":1000000,"extension_profile":profile});
-            let request = |action: &str, operation_id: &str| Command::Request {
+            let request = |action: &str, operation_id: &str, encoder_id: &str| Command::Request {
                 service: VIDEO_CONTROL.into(),
                 payload: if action == "probe_source" {
-                    serde_json::json!({"action":action,"source_id":6,"encoder_provider":"fixture","configuration":configuration})
+                    serde_json::json!({"action":action,"source_id":6,"encoder_provider":"fixture","encoder":{"clsid":encoder_id,"friendly_name":"Source","hardware_url":null},"configuration":configuration})
                 } else {
                     serde_json::json!({"action":"open","operation_id":operation_id,"source_id":6,"encoder_provider":"fixture",
                         "encoder":{"clsid":"source","friendly_name":"Source","hardware_url":null},"packet_boundaries":true,"configuration":configuration})
@@ -1011,9 +1011,11 @@ fn planned_pump_switches_framers_and_delivers_through_the_real_transport() {
             let invoke_video =
                 |action: &str,
                  operation_id: &str,
+                 encoder_id: &str,
                  video_module: &mut amaterasu_video::test_support::VideoModule| {
-                    let Response::Accepted { id } =
-                        consumer.send(request(action, operation_id)).unwrap()
+                    let Response::Accepted { id } = consumer
+                        .send(request(action, operation_id, encoder_id))
+                        .unwrap()
                     else {
                         panic!("video request rejected")
                     };
@@ -1027,8 +1029,12 @@ fn planned_pump_switches_framers_and_delivers_through_the_real_transport() {
                         } = provider.send(Command::Poll {}).unwrap()
                         {
                             assert_eq!(service, ENCODER_CONTROL);
-                            let response = serde_json::json!({"ok":true,"session_id":77,"packet_boundaries":true,
-                            "max_reference_frames":0,"extension_profile":payload["configuration"]["extension_profile"]});
+                            let response = if payload["action"] == "probe_source" {
+                                serde_json::json!({"ok":true,"settled":true,"usable":payload["encoder"]["clsid"] == "source","source_id":payload["source_id"],"encoder":payload["encoder"],"configuration":payload["configuration"]})
+                            } else {
+                                serde_json::json!({"ok":true,"session_id":77,"packet_boundaries":true,
+                                "max_reference_frames":0,"extension_profile":payload["configuration"]["extension_profile"]})
+                            };
                             provider
                                 .require_success(Command::Complete {
                                     request: id,
@@ -1049,10 +1055,19 @@ fn planned_pump_switches_framers_and_delivers_through_the_real_transport() {
                     panic!("video request did not settle")
                 };
             assert_eq!(
-                invoke_video("probe_source", "probe-1", &mut video_module)["ok"],
+                invoke_video("probe_source", "probe-1", "source", &mut video_module)["ok"],
                 true
             );
-            let video_response = invoke_video("open", "open-1", &mut video_module);
+            assert_ne!(
+                invoke_video(
+                    "probe_source",
+                    "probe-unsupported",
+                    "other",
+                    &mut video_module
+                )["ok"],
+                true
+            );
+            let video_response = invoke_video("open", "open-1", "source", &mut video_module);
             assert_eq!(video_response["ok"], true, "{video_response}");
             let video_stream = video_response["stream"].as_u64().unwrap();
             let unit = &video_response["negotiated_unit"];
@@ -1081,6 +1096,7 @@ fn planned_pump_switches_framers_and_delivers_through_the_real_transport() {
                 metadata_required: false,
             };
             let planned = NegotiatedRoute {
+                profile: route.profile.clone(),
                 video_service: VIDEO.into(),
                 framer_service: FRAMER.into(),
                 transport_service: PLAN.into(),

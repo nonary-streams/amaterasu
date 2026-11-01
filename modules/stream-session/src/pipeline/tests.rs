@@ -36,15 +36,20 @@ fn extension_offer_requires_source_and_downstream_probes_then_selects_the_planne
         fec_policy_flags: 0,
         reserved: 0,
     };
-    for (source_ok, downstream_ok, expected_offer) in [
-        (false, true, false),
-        (true, false, false),
-        (true, true, true),
+    for (source_ok, downstream_ok, wrong_identity, expected_offer) in [
+        (false, true, false, false),
+        (true, false, false, false),
+        (true, true, true, false),
+        (true, true, false, true),
     ] {
         let mut host = Harness::new();
         host.pipeline.settings.allowed_principals = vec!["amaterasu.rtsp".into()];
         host.pipeline.settings.extension_route = Some(route.clone());
         host.broker.extension_probe_supported = source_ok;
+        if wrong_identity {
+            host.broker.extension_probe_encoder_override =
+                Some(json!({"clsid":"sibling","friendly_name":"Source","hardware_url":null}));
+        }
         host.extension_probe_limits = downstream_ok.then_some(limits);
         let mut request = prepare();
         request["stream_audio"] = json!(false);

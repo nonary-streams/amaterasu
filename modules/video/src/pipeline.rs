@@ -8,6 +8,7 @@ mod owned_capture;
 mod pacing;
 mod portal;
 mod presentation;
+mod source_probe;
 
 use crate::{
     model::{
@@ -457,15 +458,8 @@ pub struct Pipeline {
     operations: BTreeMap<(String, String), operations::Record>,
     portal: portal::Control,
     observations: observation::Control,
-    source_probes: VecDeque<SourceProbe>,
+    source_probes: source_probe::Control,
     pub queues: Arc<Mutex<Queues>>,
-}
-
-struct SourceProbe {
-    request: u64,
-    service: String,
-    source_id: u64,
-    configuration: Configuration,
 }
 
 fn initial_stage(provider: CaptureProvider, encoder: &EncoderSelection) -> Stage {
@@ -503,7 +497,7 @@ impl Pipeline {
             operations: BTreeMap::new(),
             portal: portal::Control::default(),
             observations: observation::Control::default(),
-            source_probes: VecDeque::new(),
+            source_probes: source_probe::Control::default(),
             queues,
         }
     }
@@ -519,11 +513,13 @@ impl Pipeline {
             Operation::ProbeSource {
                 source_id,
                 encoder_provider,
+                encoder,
                 configuration,
             } => {
                 let registration = self.source_encoders.get(&encoder_provider);
                 let allowed = self.enabled
                     && self.unit_service_enabled
+                    && encoder.validate().is_ok()
                     && configuration.validate_source()
                     && registration.is_some_and(|registration| {
                         registration.source_ids.contains(&source_id)
@@ -540,18 +536,21 @@ impl Pipeline {
                         request,
                         error("encoder_extension_profile_not_allowed"),
                     );
-                } else if self.source_probes.len() >= 8 {
-                    rpc::complete(send, request, error("encoder_probe_queue_full"));
                 } else {
-                    self.source_probes.push_back(SourceProbe {
+                    self.source_probes.begin(
                         request,
-                        service: registration
-                            .expect("checked registration")
-                            .control_service
-                            .clone(),
-                        source_id,
-                        configuration: *configuration,
-                    });
+                        source_probe::Probe {
+                            service: registration
+                                .expect("checked registration")
+                                .control_service
+                                .clone(),
+                            source_id,
+                            encoder,
+                            configuration: *configuration,
+                        },
+                        &self.epoch,
+                        send,
+                    );
                 }
             }
             Operation::SelectPortalSource {
@@ -1033,26 +1032,7 @@ impl Pipeline {
     pub fn tick(&mut self, plane: &mut dyn Plane, send: &mut Send<'_>) {
         self.portal.tick(send);
         self.observations.tick(&self.streams, send);
-        if let Some(probe) = self.source_probes.pop_front()
-            && matches!(
-                send(Command::CheckRequest {
-                    request: probe.request
-                }),
-                Ok(Response::Ok)
-            )
-        {
-            let payload = match plane.probe_source(
-                &probe.service,
-                probe.source_id,
-                &probe.configuration,
-            ) {
-                Ok(()) => {
-                    json!({"ok":true,"source_id":probe.source_id,"profile":probe.configuration.extension_profile})
-                }
-                Err(code) => error(code),
-            };
-            rpc::complete(send, probe.request, payload);
-        }
+        self.source_probes.tick(plane, send);
         if self.streams.is_empty() {
             return;
         }

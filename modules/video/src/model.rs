@@ -1,7 +1,7 @@
 use amaterasu_media::{ColorMode, VideoCodec};
 #[cfg(test)]
 use amaterasu_module_sdk::EncoderBackend;
-pub use amaterasu_module_sdk::EncoderSelection;
+pub use amaterasu_module_sdk::{EncoderIdentity, EncoderSelection};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -759,6 +759,7 @@ pub enum Operation {
     ProbeSource {
         source_id: u64,
         encoder_provider: String,
+        encoder: EncoderIdentity,
         configuration: Box<Configuration>,
     },
     Lookup {
@@ -798,6 +799,7 @@ enum OperationInput {
     ProbeSource {
         source_id: u64,
         encoder_provider: String,
+        encoder: EncoderIdentity,
         configuration: Box<Configuration>,
     },
     Open {
@@ -919,10 +921,12 @@ impl<'de> Deserialize<'de> for Operation {
             OperationInput::ProbeSource {
                 source_id,
                 encoder_provider,
+                encoder,
                 configuration,
             } => Self::ProbeSource {
                 source_id,
                 encoder_provider,
+                encoder,
                 configuration,
             },
             OperationInput::Open {

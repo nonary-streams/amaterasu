@@ -405,7 +405,7 @@ impl Job {
                 (
                     record.service(Resource::Video),
                     json!({"action":"probe_source", "source_id":route.source_id,
-                    "encoder_provider":route.encoder_provider,"configuration":configuration}),
+                    "encoder_provider":route.encoder_provider,"encoder":route.encoder,"configuration":configuration}),
                 )
             }
             Step::MediaReady => (
