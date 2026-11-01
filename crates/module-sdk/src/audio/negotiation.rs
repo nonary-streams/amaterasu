@@ -64,6 +64,34 @@ pub struct AudioSelection {
     pub offer_id: u64,
     pub format: AudioFormat,
 }
+
+/// An encoder offer copied during read-only discovery. It is not a configured
+/// encoder and does not establish downstream or client support.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioCandidate {
+    stream: u64,
+    generation: u64,
+    offer_id: u64,
+    format: AudioFormat,
+}
+
+impl AudioCandidate {
+    pub fn stream(&self) -> u64 {
+        self.stream
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn offer_id(&self) -> u64 {
+        self.offer_id
+    }
+
+    pub fn format(&self) -> &AudioFormat {
+        &self.format
+    }
+}
 impl AudioSelection {
     /// # Safety
     /// Packet bytes must remain live and immutable during the returned borrow.
@@ -129,19 +157,19 @@ unsafe extern "C" fn collect(context: *mut c_void, offer: *const AudioFormatOffe
     STATUS_OK
 }
 
-/// Enumerate and select the first caller-preferred exact format. There is no
-/// implicit fallback; stale selection returns the provider's status. A provider
-/// may return BUSY without mutation. The selected offer is session-specific.
+/// Discover the first caller-preferred exact format without configuring the
+/// provider. The candidate does not authorize advertisement by itself: trusted
+/// composition must separately prove the downstream path and client agreement.
 ///
 /// # Safety
 /// The table and context obey the native contract, remain live through selection
 /// and stream lifetime, and are called on the binding's owning thread. Offers
 /// and their bytes must be readable and immutable for each synchronous callback.
-pub unsafe fn negotiate(
+pub unsafe fn probe(
     api: &NegotiatedAudioEncoderApi,
     stream: u64,
     preferences: &[AudioFormat],
-) -> Result<AudioSelection, AudioNegotiationError> {
+) -> Result<AudioCandidate, AudioNegotiationError> {
     if stream == 0
         || preferences.is_empty()
         || preferences.len() > AUDIO_FORMAT_MAX_OFFERS
@@ -181,8 +209,41 @@ pub unsafe fn negotiate(
     let Some((id, format)) = selected else {
         return Err(AudioNegotiationError::NoCompatibleFormat);
     };
-    // SAFETY: provider validates id and generation, with selection remaining unchanged on failure.
-    let status = unsafe { (api.configure)(api.base.context, stream, generation, *id) };
+    Ok(AudioCandidate {
+        stream,
+        generation,
+        offer_id: *id,
+        format: format.clone(),
+    })
+}
+
+/// Commit a previously discovered exact offer after downstream and client
+/// agreement. A changed provider generation must be rejected by the provider;
+/// BUSY or an unsupported offer must leave its selection unchanged.
+///
+/// # Safety
+/// The table and context must be the same live binding used to discover the
+/// candidate, and must be used on its owning thread. The stream remains live.
+pub unsafe fn configure(
+    api: &NegotiatedAudioEncoderApi,
+    candidate: AudioCandidate,
+) -> Result<AudioSelection, AudioNegotiationError> {
+    if candidate.stream == 0
+        || candidate.generation == 0
+        || candidate.offer_id == 0
+        || candidate.format.descriptor().validate().is_err()
+    {
+        return Err(AudioNegotiationError::Invalid);
+    }
+    // SAFETY: provider validates id and generation, leaving selection unchanged on failure.
+    let status = unsafe {
+        (api.configure)(
+            api.base.context,
+            candidate.stream,
+            candidate.generation,
+            candidate.offer_id,
+        )
+    };
     if status != STATUS_OK {
         return Err(if status == MEDIA_UNSUPPORTED {
             AudioNegotiationError::Stale
@@ -191,9 +252,31 @@ pub unsafe fn negotiate(
         });
     }
     Ok(AudioSelection {
-        stream,
-        generation,
-        offer_id: *id,
-        format: format.clone(),
+        stream: candidate.stream,
+        generation: candidate.generation,
+        offer_id: candidate.offer_id,
+        format: candidate.format,
     })
 }
+
+/// Immediately discover and select an exact format. There is no implicit
+/// fallback. Use [`probe`] and [`configure`] separately when authorization or
+/// client acceptance occurs between discovery and selection.
+///
+/// # Safety
+/// The table and context obey the native contract, remain live through selection
+/// and stream lifetime, and are called on the binding's owning thread. Offers
+/// and their bytes must be readable and immutable for each synchronous callback.
+pub unsafe fn negotiate(
+    api: &NegotiatedAudioEncoderApi,
+    stream: u64,
+    preferences: &[AudioFormat],
+) -> Result<AudioSelection, AudioNegotiationError> {
+    // SAFETY: the caller provides the required binding and stream lifetime.
+    let candidate = unsafe { probe(api, stream, preferences)? };
+    // SAFETY: the same live binding is used immediately for selection.
+    unsafe { configure(api, candidate) }
+}
+
+#[cfg(test)]
+mod tests;

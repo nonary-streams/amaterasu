@@ -26,6 +26,10 @@ unsafe extern "C" fn receive(context: *mut c_void, packet: *const NegotiatedAudi
     state.result.extend_from_slice(bytes);
     STATUS_OK
 }
+
+unsafe extern "C" fn reject_unselected(_: *mut c_void, _: *const NegotiatedAudioPacket) -> Status {
+    STATUS_INVALID_ARGUMENT
+}
 /// # Safety
 /// `api` must point to a live, trusted negotiated audio encoder table for this call.
 #[unsafe(no_mangle)]
@@ -49,8 +53,21 @@ pub unsafe extern "C" fn fixture_consume(
         frame_samples: 1536,
         config: Vec::new(),
     };
-    let Ok(selection) = (unsafe { audio::negotiate(api, 19, &[format]) }) else {
+    let Ok(candidate) = (unsafe { audio::probe(api, 19, &[format]) }) else {
         return 2;
+    };
+    let unselected = NegotiatedAudioPacketSink {
+        context: std::ptr::null_mut(),
+        write: reject_unselected,
+    };
+    if candidate.stream() != 19
+        || candidate.format().codec != codec
+        || unsafe { (api.receive)(api.base.context, 19, unselected) } != MEDIA_PENDING
+    {
+        return 7;
+    }
+    let Ok(selection) = (unsafe { audio::configure(api, candidate) }) else {
+        return 8;
     };
     let mut state = Sink {
         selection,
