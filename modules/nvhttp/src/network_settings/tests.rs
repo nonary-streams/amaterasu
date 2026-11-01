@@ -51,14 +51,32 @@ unsafe extern "C" fn invoke(
     abi::STATUS_OK
 }
 
-fn runtime(state: Arc<Mutex<EndpointState>>) -> RuntimeClient {
+struct TestRuntime {
+    client: RuntimeClient,
+    _state: Arc<Mutex<EndpointState>>,
+}
+
+impl std::ops::Deref for TestRuntime {
+    type Target = RuntimeClient;
+
+    fn deref(&self) -> &Self::Target {
+        &self.client
+    }
+}
+
+fn runtime(state: Arc<Mutex<EndpointState>>) -> TestRuntime {
     let api = HostApi {
         header: AbiHeader::of::<HostApi>(),
         context: Arc::as_ptr(&state).cast_mut().cast(),
         invoke,
     };
-    // SAFETY: the caller retains the Arc containing the callback context.
-    unsafe { RuntimeClient::from_endpoint(api) }
+    // SAFETY: TestRuntime retains the Arc containing the callback context for
+    // the lifetime of the client and every synchronous callback.
+    let client = unsafe { RuntimeClient::from_endpoint(api) };
+    TestRuntime {
+        client,
+        _state: state,
+    }
 }
 
 fn applied(port: u16) -> Value {
