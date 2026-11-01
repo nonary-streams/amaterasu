@@ -273,6 +273,20 @@ retains its cleanup obligation until the provider fence can be confirmed. The
 in-memory Launch record cannot currently reconstruct that fence after restart,
 so such cleanup remains failed and requires a recovery mechanism.
 
+Durable recovery needs a trusted, bounded journal committed before dispatching
+the reservation. Its minimum cleanup identity is the authenticated coordinator
+and original initiator, Launch operation and owner/certificate binding, trusted
+executor route and application ID, executor operation ID and incarnation, and
+the complete tagged policy identity. It must also retain a preflight token
+digest and whether execution was requested, with any known execution ticket, so
+recovery can fence an uncertain execution before retiring its reservation. A
+restarted coordinator must validate the stored route against trusted startup
+composition, obtain the executor's matching retirement proof, and only then
+remove the obligation; a missing record or a changed incarnation is not that
+proof. Journal writes and completion need crash-safe ordering and bounded replay
+retention. The current Launch composition has no configured durable store or
+grant for this journal; the ordinary snapshot is not a substitute for one.
+
 A Linux composition test exercises the real NVHTTP router, Launch, RTSP, pairing
 and lifecycle entrypoints with independently built library, policy and executor
 implementations and synthetic hardware. It covers attested limiter replacement,
