@@ -502,6 +502,28 @@ mod tests {
     }
 
     #[test]
+    fn retirement_operation_id_distinguishes_controller_incarnations() {
+        let first = request();
+        let mut second = first.clone();
+        second.source.device = "other-controller".into();
+        second.source.device_generation += 1;
+        assert_eq!(first.source.id, second.source.id);
+        assert_eq!(
+            first.retirement_operation_id(),
+            "nvhttp-source-b699c0bc51c41c2adeb6082a39ceeedc701a72fc5b25bf0ddfee1cd4904f9513"
+        );
+        assert_ne!(
+            first.retirement_operation_id(),
+            second.retirement_operation_id()
+        );
+        assert_eq!(
+            first.retirement_operation_id(),
+            first.clone().retirement_operation_id()
+        );
+        assert!(first.retirement_operation_id().len() <= 128);
+    }
+
+    #[test]
     fn revoked_peer_before_binding_never_sends_a_pairing_request() {
         let (mut broker, id) = broker();
         let mut join = Join::start(id, request(), "input".into(), evidence(), 30000).unwrap();
