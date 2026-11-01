@@ -2201,6 +2201,115 @@ fn slot_watermarks_survive_real_state_and_broker_restart() {
     let mut restored: Vec<u64> = serde_json::from_value(saved.value["floors"].clone()).unwrap();
     let identity: amaterasu_contracts::effect_fence::GuardedEffectIdentity =
         serde_json::from_value(saved.value["unresolved"][0].clone()).unwrap();
+    // The persisted identity belongs to the old selection. A new broker must
+    // not pretend that the newly selected provider retired its work. These
+    // cases document the remaining fail-closed recovery gap until historical
+    // journal evidence and retirement are independently authenticated.
+    for (provider, minor) in [("replacement", 0), ("provider", 1)] {
+        let mut config = configuration();
+        config.effect_fence.as_mut().unwrap().source_slots = true;
+        config.host_lifecycle_control = true;
+        config.principals.insert(
+            amaterasu_contracts::HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(),
+            Grants::default(),
+        );
+        if provider == "replacement" {
+            config
+                .principals
+                .insert(provider.into(), config.principals["provider"].clone());
+        }
+        config.api_methods[0].provider = provider.into();
+        config.api_methods[0].method.interface_minor = minor;
+        let method = config.api_methods[0].method.clone();
+        let mut switched = Broker::new(config).unwrap();
+        assert!(matches!(
+            switched.dispatch(provider, Command::RegisterApi { method }),
+            Response::Ok
+        ));
+        let epoch = broker_epoch(&mut switched, "authority");
+        for principal in [
+            "issuer",
+            provider,
+            amaterasu_contracts::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+        ] {
+            assert!(matches!(
+                invoke(
+                    &mut switched,
+                    principal,
+                    EffectFenceCommand::RecoveryRetired {
+                        broker_epoch: epoch.clone()
+                    }
+                ),
+                Response::Ok
+            ));
+        }
+        assert!(matches!(
+            invoke(
+                &mut switched,
+                "authority",
+                EffectFenceCommand::RecoverSlots {
+                    broker_epoch: epoch,
+                    retired_incarnations: restored.clone()
+                }
+            ),
+            Response::Ok
+        ));
+        let switched_lease = slot_lease(&mut switched, 0);
+        assert!(matches!(
+            invoke(
+                &mut switched,
+                "authority",
+                EffectFenceCommand::OpenRecoverySlot {
+                    lease: switched_lease.clone(),
+                    scope: next_scope.clone(),
+                    retired_through: 0,
+                    issued_through: 1
+                }
+            ),
+            Response::Ok
+        ));
+        for command in [
+            EffectFenceCommand::RecoverFence {
+                identity: identity.clone(),
+            },
+            EffectFenceCommand::LookupIdentity {
+                identity: identity.clone(),
+            },
+        ] {
+            assert_eq!(
+                code(slot_invoke(
+                    &mut switched,
+                    "authority",
+                    &switched_lease,
+                    command
+                )),
+                "permission_denied"
+            );
+        }
+        assert_eq!(
+            code(slot_invoke(
+                &mut switched,
+                "authority",
+                &switched_lease,
+                EffectFenceCommand::Compact {
+                    scope: next_scope.clone(),
+                    retired_through: 1,
+                }
+            )),
+            "effect_pending"
+        );
+        assert_eq!(
+            code(slot_invoke(
+                &mut switched,
+                "issuer",
+                &switched_lease,
+                EffectFenceCommand::Dispatch {
+                    effect: next_effect.clone()
+                }
+            )),
+            "effect_fenced"
+        );
+    }
     assert_eq!(
         code(invoke(
             &mut broker,
