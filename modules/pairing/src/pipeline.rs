@@ -846,8 +846,8 @@ impl Pipeline {
                     Ok(())
                 }
                 _ => {
-                    // A durable claim and perhaps an effect entry exist. No
-                    // broker arm has occurred; retain both for reconciliation.
+                    // A durable claim and perhaps an effect entry exist. Retain
+                    // both as possibly admitted until independently retired.
                     self.protocol_claim_recovery_required = true;
                     self.invalidate_identity();
                     complete(&mut send, parent, error("protocol_reconciliation_required"))
@@ -1017,6 +1017,7 @@ impl Pipeline {
                     && operation.may_write()
                     && !is_client_configuration_update(&operation)
                 {
+                    self.fence_retained_protocol_claim(&mut send);
                     return complete(&mut send, id, error("protocol_reconciliation_required"));
                 }
                 if let (
@@ -1095,6 +1096,7 @@ impl Pipeline {
                             | "drain"
                             | "recover"
                             | "fence_protocol_restart"
+                            | "fence_protocol_source"
                             | "fence_source"
                             | "complete_source_retirement"
                             | "lookup_source_retirement"
@@ -1141,9 +1143,55 @@ impl Pipeline {
                     send,
                 )
             }
+            Response::Request {
+                id,
+                caller,
+                service,
+                payload,
+                ..
+            } if service == SERVICE
+                && (self.protocol_claim_recovery_required
+                    || self.retained_protocol_claim.is_some()) =>
+            {
+                if !matches!(send(Command::CheckRequest { request: id })?, Response::Ok) {
+                    return complete(send, id, error("request_ended"));
+                }
+                if !serde_json::to_vec(&payload).is_ok_and(|bytes| bytes.len() <= 12_000) {
+                    return complete(send, id, error("invalid_request"));
+                }
+                let Ok(operation) = serde_json::from_value::<Operation>(payload) else {
+                    return complete(send, id, error("invalid_request"));
+                };
+                if let Err(code) = self.engine.admit(&caller, &operation) {
+                    return complete(send, id, error(code));
+                }
+                if operation.may_write() {
+                    self.fence_retained_protocol_claim(send);
+                    complete(send, id, error("protocol_reconciliation_required"))
+                } else {
+                    complete(send, id, error("authority_draining"))
+                }
+            }
             Response::Request { id, .. } => complete(send, id, error("authority_draining")),
             _ => Err("pairing poll failure".into()),
         }
+    }
+
+    /// Stop new broker admission for the exact retained source before a trust
+    /// mutation can proceed. A fence error is never a retirement receipt; the
+    /// reconciliation latch continues to block the mutation in every case.
+    fn fence_retained_protocol_claim(&self, send: &mut impl FnMut(Command) -> Transport) {
+        let Some((lease, scope)) = &self.retained_protocol_claim else {
+            return;
+        };
+        let _ = send(Command::EffectFence {
+            command: Box::new(
+                amaterasu_module_sdk::broker_effect_fence::EffectFenceCommand::BeginCloseSlot {
+                    lease: lease.clone(),
+                    scope: (**scope).clone(),
+                },
+            ),
+        });
     }
 
     fn handle_effect_request(
@@ -1163,6 +1211,9 @@ impl Pipeline {
             Some("admit_protocol_effect" | "admit_protocol_effect_v2")
         ) {
             return self.handle_protocol_admission(id, caller, initiator, payload, now, send);
+        }
+        if payload["action"] == "fence_protocol_source" {
+            return self.handle_protocol_source_fence(id, caller, initiator, payload, send);
         }
         let response = self.apply_effect_request(caller, initiator, payload, now);
         complete(
@@ -1262,6 +1313,9 @@ impl Pipeline {
             EffectRequest::AdmitProtocolEffectV2 { .. } => {
                 return Err("protocol_authority_unavailable");
             }
+            EffectRequest::FenceProtocolSource { .. } => {
+                return Err("protocol_authority_unavailable");
+            }
             _ => {}
         }
         let gate = self.effect_gate.as_mut().ok_or("authority_unavailable")?;
@@ -1277,7 +1331,8 @@ impl Pipeline {
             | EffectRequest::BindStream { .. }
             | EffectRequest::AttestProtocolCapabilities { .. }
             | EffectRequest::AdmitProtocolEffect { .. }
-            | EffectRequest::AdmitProtocolEffectV2 { .. } => {
+            | EffectRequest::AdmitProtocolEffectV2 { .. }
+            | EffectRequest::FenceProtocolSource { .. } => {
                 unreachable!("handled above")
             }
             EffectRequest::AdmitStreamLease {
@@ -1718,6 +1773,18 @@ impl Pipeline {
         let held_tuning =
             protocol_reconciliation && is_snapshot_tuning_update(&operation, &document);
         if protocol_reconciliation && is_client_configuration_update(&operation) && !held_tuning {
+            if let Operation::UpdateClientConfigOverrides {
+                expected_revision, ..
+            } = &operation
+                && *expected_revision != revision
+            {
+                return complete(
+                    send,
+                    request.id,
+                    json!({"ok":false,"code":"revision_conflict","current_revision":revision}),
+                );
+            }
+            self.fence_retained_protocol_claim(send);
             return complete(send, request.id, error("protocol_reconciliation_required"));
         }
         let configuration_only = is_client_configuration_update(&operation)

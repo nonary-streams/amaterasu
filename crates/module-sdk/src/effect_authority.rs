@@ -411,6 +411,14 @@ pub enum Request {
         payload: Vec<u8>,
         cleanup: crate::protocol_state::CleanupReference,
     },
+    /// Fence one exact protocol source. Success is only a broker admission
+    /// fence; selected workers and external cleanup must still retire.
+    FenceProtocolSource {
+        version: u8,
+        epoch: String,
+        issuer_epoch: String,
+        source: Source,
+    },
     AdmitStreamLease {
         epoch: String,
         source: Source,

@@ -22,6 +22,87 @@ pub(super) struct ProtocolAttestation {
 }
 
 impl Pipeline {
+    /// Explicitly fence an exact protocol source. A successful response means
+    /// only broker admission is closed; workers and cleanup remain pending.
+    pub(super) fn handle_protocol_source_fence(
+        &mut self,
+        request_id: u64,
+        caller: &str,
+        initiator: &str,
+        payload: Value,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<()> {
+        let result = (|| {
+            let policy = self
+                .effect_authority
+                .as_ref()
+                .ok_or("authority_unavailable")?;
+            if caller != initiator
+                || (caller != policy.effect_owner && caller != policy.protocol_owner)
+                || !serde_json::to_vec(&payload).is_ok_and(|bytes| bytes.len() <= 12_000)
+            {
+                return Err("forbidden");
+            }
+            let amaterasu_module_sdk::effect_authority::Request::FenceProtocolSource {
+                version,
+                epoch,
+                issuer_epoch,
+                source,
+            } = serde_json::from_value(payload).map_err(|_| "invalid_request")?
+            else {
+                return Err("invalid_request");
+            };
+            if version != 1 || !source.valid() {
+                return Err("invalid_request");
+            }
+            self.effect_gate
+                .as_ref()
+                .ok_or("authority_unavailable")?
+                .require_epoch(&epoch)?;
+            let (lease, scope) = self
+                .retained_protocol_claim
+                .as_ref()
+                .ok_or("protocol_reconciliation_required")?;
+            if scope.authority_epoch != epoch
+                || scope.issuer_epoch != issuer_epoch
+                || amaterasu_module_sdk::broker_effect_fence::source(&source)
+                    .ok()
+                    .as_ref()
+                    != Some(&scope.source)
+            {
+                return Err("source_denied");
+            }
+            if !matches!(
+                send(Command::CheckRequest {
+                    request: request_id
+                }),
+                Ok(Response::Ok)
+            ) {
+                return Err("request_ended");
+            }
+            let lease = lease.clone();
+            let scope = (**scope).clone();
+            self.protocol_capabilities.remove(&source);
+            self.protocol_claim_recovery_required = true;
+            match send(Command::EffectFence {
+                command: Box::new(EffectFenceCommand::BeginCloseSlot { lease, scope }),
+            }) {
+                Ok(Response::Ok) => Ok(
+                    json!({"ok":true,"version":1,"epoch":epoch,"source":source,"state":"fenced"}),
+                ),
+                _ => Err("protocol_reconciliation_required"),
+            }
+        })();
+        complete(
+            send,
+            request_id,
+            match result {
+                Ok(value) => value,
+                Err(code) => super::error(code),
+            },
+        )
+    }
+
     /// Check the real broker selection after source and client policy. An
     /// absent or invalid host incarnation cannot be armed.
     pub(super) fn handle_protocol_admission(

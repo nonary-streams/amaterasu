@@ -57,6 +57,17 @@ fn broker_with_state_instance(state_instance: char) -> Broker {
         },
     );
     config.principals.insert(
+        "untrusted".into(),
+        Grants {
+            call: [
+                "amaterasu.pairing/1".into(),
+                "amaterasu.pairing-effects/1".into(),
+            ]
+            .into(),
+            ..Default::default()
+        },
+    );
+    config.principals.insert(
         "issuer".into(),
         Grants {
             call: [
@@ -498,7 +509,7 @@ fn pairing_actor_drives_real_state_claim_and_fences_future_trust_changes() {
     else {
         panic!("trust response")
     };
-    assert_eq!(payload["code"], "authority_draining");
+    assert_eq!(payload["code"], "protocol_reconciliation_required");
     assert!(matches!(
         broker.dispatch("state", Command::Poll {}),
         Response::Pending
@@ -1025,4 +1036,323 @@ fn broker_selection_discovery_is_authority_only_and_does_not_grant_calls() {
     assert!(
         matches!(broker.dispatch("pairing", Command::QueryApiApproval { service:"example.effects/1".into(), method:"apply".into(), interface_major:1, min_minor:0 }), Response::Error { code, .. } if code == "permission_denied")
     );
+}
+
+#[test]
+fn trust_mutation_fences_real_broker_effect_and_waits_for_retirement() {
+    run_real_broker_fence(false);
+}
+
+#[test]
+fn explicit_protocol_source_fence_checks_owner_and_waits_for_retirement() {
+    run_real_broker_fence(true);
+}
+
+fn run_real_broker_fence(explicit_source: bool) {
+    use amaterasu_module_sdk::broker_effect_fence::{GuardedEffect, SelectedEffectMethod};
+    let path = directory();
+    let store = TestStateStore::open(path.clone()).unwrap();
+    let mut broker = broker();
+    let (mut pairing, _, _, epoch, _) = super::super::tests::authorized_protocol_for_test();
+    let mut retained_scope = scope();
+    retained_scope.authority_epoch = epoch;
+    let parent = open_parent(&mut broker);
+    let mut claim =
+        ClaimJob::new(parent, retained_scope.clone(), "issuer".into(), binding()).unwrap();
+    let lease = loop {
+        match claim
+            .advance(true, |command| Ok(broker.dispatch("pairing", command)))
+            .unwrap()
+        {
+            Outcome::Pending => {}
+            Outcome::Claimed { lease, .. } => break lease,
+            Outcome::Failed(code) => panic!("{code}"),
+        }
+        if let Some(state) = service_one(&mut broker, &store) {
+            finish_state(&mut broker, state);
+        }
+    };
+    assert!(matches!(
+        broker.dispatch(
+            "pairing",
+            Command::EffectFence {
+                command: Box::new(EffectFenceCommand::OpenSlot {
+                    lease: lease.clone(),
+                    scope: retained_scope.clone(),
+                    retired_through: 0
+                })
+            }
+        ),
+        Response::Ok
+    ));
+    let Response::Result { payload } = broker.dispatch(
+        "pairing",
+        Command::EffectFence {
+            command: Box::new(EffectFenceCommand::SelectedMethod {
+                method: ProtectedMethod {
+                    service: "example.effects/1".into(),
+                    method: "apply".into(),
+                    interface_major: 1,
+                },
+            }),
+        },
+    ) else {
+        panic!("action selection")
+    };
+    let selected: SelectedEffectMethod = serde_json::from_value(payload).unwrap();
+    let effect = GuardedEffect {
+        scope: retained_scope.clone(),
+        sequence: 1,
+        capability: "example.control/1".into(),
+        service: "example.effects/1".into(),
+        method: "apply".into(),
+        interface_major: 1,
+        interface_minor: 0,
+        schema_revision: 1,
+        payload_sha256: "a".repeat(64),
+        payload: json!({}),
+        timeout_ms: 5_000,
+        operation_id: protocol_slot_state::operation_id("issuer", &retained_scope, 1).unwrap(),
+        parent: None,
+    };
+    let Response::Result { payload } = broker.dispatch(
+        "pairing",
+        Command::EffectFence {
+            command: Box::new(EffectFenceCommand::SelectedCleanupMethod {
+                method: ProtectedMethod {
+                    service: "example.effects/1".into(),
+                    method: "cleanup".into(),
+                    interface_major: 1,
+                },
+            }),
+        },
+    ) else {
+        panic!("cleanup selection")
+    };
+    let entry = protocol_slot_state::Entry {
+        identity: effect.identity("provider"),
+        issued_lease: lease.clone(),
+        provider_incarnation: selected.provider_incarnation.clone().unwrap(),
+        selected_method: selected.clone(),
+        cleanup_method: amaterasu_module_sdk::extension_api::MethodRef {
+            service: "example.effects/1".into(),
+            method: "cleanup".into(),
+            interface_major: 1,
+            interface_minor: 0,
+            schema_revision: 1,
+        },
+        cleanup_approval: serde_json::from_value(payload["approval"].clone()).unwrap(),
+        cleanup: amaterasu_module_sdk::protocol_state::CleanupReference::new("b".repeat(64))
+            .unwrap(),
+        cleanup_confirmed: false,
+    };
+    let slot_read = store.handle(
+        "pairing",
+        protocol_slot_state::read_request(lease.slot)
+            .unwrap()
+            .payload(),
+    );
+    let issue = protocol_slot_state::prepare_issue(&slot_read, lease.slot, &lease, entry).unwrap();
+    let Response::Accepted { id: write_id } = broker.dispatch(
+        "pairing",
+        Command::Request {
+            service: STATE_SERVICE.into(),
+            payload: issue.request().payload(),
+            timeout_ms: 5_000,
+            operation_id: issue.state_operation_id().into(),
+            parent: None,
+        },
+    ) else {
+        panic!("journal write denied")
+    };
+    let saved = service_one(&mut broker, &store).unwrap();
+    assert_eq!(saved.0, write_id);
+    finish_state(&mut broker, saved);
+    let Response::Result { payload } =
+        broker.dispatch("pairing", Command::TakeResult { request: write_id })
+    else {
+        panic!("journal write pending")
+    };
+    issue.confirmed(payload).unwrap();
+    assert!(matches!(
+        broker.dispatch("pairing", Command::ReleaseResult { request: write_id }),
+        Response::Ok
+    ));
+    assert!(matches!(
+        broker.dispatch(
+            "pairing",
+            Command::EffectFence {
+                command: Box::new(EffectFenceCommand::SlotCommand {
+                    lease: lease.clone(),
+                    command: Box::new(EffectFenceCommand::ArmSelected {
+                        effect: effect.clone(),
+                        expected: Box::new(selected)
+                    })
+                })
+            }
+        ),
+        Response::Ok
+    ));
+    let Response::Accepted { id: effect_id } = broker.dispatch(
+        "issuer",
+        Command::EffectFence {
+            command: Box::new(EffectFenceCommand::SlotCommand {
+                lease: lease.clone(),
+                command: Box::new(EffectFenceCommand::Dispatch {
+                    effect: effect.clone(),
+                }),
+            }),
+        },
+    ) else {
+        panic!("effect admission")
+    };
+    assert!(
+        matches!(broker.dispatch("provider", Command::Poll {}), Response::Request { id, .. } if id == effect_id)
+    );
+    pairing.retained_protocol_claim = Some((lease.clone(), Box::new(retained_scope.clone())));
+    pairing.protocol_claim_recovery_required = true;
+    let caller = if explicit_source { "issuer" } else { "console" };
+    let request = |operation: &str| Command::Request {
+        service: if explicit_source {
+            "amaterasu.pairing-effects/1"
+        } else {
+            "amaterasu.pairing/1"
+        }
+        .into(),
+        payload: if explicit_source {
+            json!({"action":"fence_protocol_source","version":1,"epoch":retained_scope.authority_epoch,"issuer_epoch":retained_scope.issuer_epoch,"source":retained_scope.source})
+        } else {
+            json!({"action":"set_permission_mode","enabled":true,"expected_revision":0})
+        },
+        timeout_ms: 30_000,
+        operation_id: operation.into(),
+        parent: None,
+    };
+    let Response::Accepted { id: denied_id } =
+        broker.dispatch("untrusted", request("trust.denied"))
+    else {
+        panic!("untrusted request not delivered")
+    };
+    pairing
+        .tick_at(super::super::tests::now(), |command| {
+            Ok(broker.dispatch("pairing", command))
+        })
+        .unwrap();
+    assert!(
+        matches!(broker.dispatch("untrusted", Command::TakeResult { request:denied_id }), Response::Result { payload } if payload["code"] == "forbidden")
+    );
+    if explicit_source {
+        let Command::Request {
+            service,
+            mut payload,
+            timeout_ms,
+            parent,
+            ..
+        } = request("ignored")
+        else {
+            unreachable!()
+        };
+        payload["issuer_epoch"] = json!("forged");
+        let Response::Accepted { id } = broker.dispatch(
+            caller,
+            Command::Request {
+                service,
+                payload,
+                timeout_ms,
+                operation_id: "fence.forged".into(),
+                parent,
+            },
+        ) else {
+            panic!("forged request denied too early")
+        };
+        pairing
+            .tick_at(super::super::tests::now(), |command| {
+                Ok(broker.dispatch("pairing", command))
+            })
+            .unwrap();
+        assert!(
+            matches!(broker.dispatch(caller, Command::TakeResult { request:id }), Response::Result { payload } if payload["code"] == "source_denied")
+        );
+    }
+    let Response::Accepted { id: canceled_id } = broker.dispatch(caller, request("trust.canceled"))
+    else {
+        panic!("trust request")
+    };
+    pairing
+        .tick_at(super::super::tests::now(), |command| {
+            let result = broker.dispatch("pairing", command);
+            if matches!(&result, Response::Request { id, .. } if *id == canceled_id) {
+                assert!(matches!(
+                    broker.dispatch(
+                        caller,
+                        Command::Cancel {
+                            request: canceled_id
+                        }
+                    ),
+                    Response::Ok
+                ));
+            }
+            Ok(result)
+        })
+        .unwrap();
+    let lookup = |broker: &mut Broker| {
+        broker.dispatch(
+            "pairing",
+            Command::EffectFence {
+                command: Box::new(EffectFenceCommand::SlotCommand {
+                    lease: lease.clone(),
+                    command: Box::new(EffectFenceCommand::Lookup {
+                        effect: effect.clone(),
+                    }),
+                }),
+            },
+        )
+    };
+    assert!(
+        matches!(lookup(&mut broker), Response::Result { payload } if payload["status"] == "admitted")
+    );
+    let Response::Accepted { id } = broker.dispatch(caller, request("trust.active")) else {
+        panic!("trust request")
+    };
+    pairing
+        .tick_at(super::super::tests::now(), |command| {
+            Ok(broker.dispatch("pairing", command))
+        })
+        .unwrap();
+    let Response::Result { payload } = broker.dispatch(caller, Command::TakeResult { request: id })
+    else {
+        panic!("fence response")
+    };
+    if explicit_source {
+        assert_eq!(payload["state"], "fenced");
+        let Response::Accepted { id: retry_id } = broker.dispatch(caller, request("fence.retry"))
+        else {
+            panic!("fence retry")
+        };
+        pairing
+            .tick_at(super::super::tests::now(), |command| {
+                Ok(broker.dispatch("pairing", command))
+            })
+            .unwrap();
+        assert!(
+            matches!(broker.dispatch(caller, Command::TakeResult { request:retry_id }), Response::Result { payload } if payload["state"] == "fenced")
+        );
+    } else {
+        assert_eq!(payload["code"], "protocol_reconciliation_required");
+    }
+    assert!(
+        matches!(lookup(&mut broker), Response::Result { payload } if payload["status"] == "fenced")
+    );
+    assert!(
+        matches!(broker.dispatch("pairing", Command::EffectFence { command:Box::new(EffectFenceCommand::CloseReady { lease:lease.clone(), scope:retained_scope, retired_through:0 }) }), Response::Error { code, .. } if code == "effect_pending")
+    );
+    assert!(
+        matches!(broker.dispatch("issuer", Command::EffectFence { command:Box::new(EffectFenceCommand::SlotCommand { lease:lease.clone(), command:Box::new(EffectFenceCommand::Dispatch { effect }) }) }), Response::Error { code, .. } if code == "effect_fenced")
+    );
+    assert!(matches!(
+        broker.dispatch("state", Command::Poll {}),
+        Response::Pending
+    ));
+    drop(store);
+    std::fs::remove_dir_all(path).unwrap();
 }
