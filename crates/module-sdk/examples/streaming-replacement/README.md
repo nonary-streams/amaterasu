@@ -11,10 +11,12 @@ It installs no service grants and does not execute applications.
 The Linux NVHTTP composition test loads locally built protocol and fixture
 artifacts. It invokes the production NVHTTP router, pairing authority, Launch,
 RTSP, lifecycle and runtime; persistent state and hardware backends are synthetic.
-Its only listener is RTSP on an ephemeral loopback port. The test also needs
-TLS transport trust injected by the fixture; it is not a TLS handshake or live
-security-revocation qualification. Build each standalone Cargo workspace in its
-own target directory to avoid artifact collisions. For example, from the repo
+By default its only listener is RTSP on an ephemeral loopback port, and TLS
+transport trust is injected. Setting `AMATERASU_COMPOSITION_USE_TLS=1` also
+uses an ephemeral loopback NVHTTP listener and performs a client-certificate TLS
+handshake with the actual pairing identity. Hardware, input and stream services
+remain synthetic; this is not a feedback-retirement qualification. Build each
+standalone Cargo workspace in its own target directory to avoid artifact collisions. For example, from the repo
 root with `out` pointing to task-owned scratch space:
 
 ```sh

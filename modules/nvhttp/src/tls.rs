@@ -342,6 +342,25 @@ impl ClientCertVerifier for PossessionVerifier {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn verify_test_server_signature(
+    message: &[u8],
+    certificate: &CertificateDer<'_>,
+    signature: &DigitallySignedStruct,
+    tls13: bool,
+) -> Result<HandshakeSignatureValid, Error> {
+    let verifier = PossessionVerifier {
+        provider: Arc::new(rustls::crypto::ring::default_provider()),
+    };
+    verifier.verify_possession(
+        message,
+        certificate,
+        signature.scheme,
+        signature.signature(),
+        tls13,
+    )
+}
+
 impl PossessionVerifier {
     fn verify_possession(
         &self,
