@@ -23,6 +23,83 @@ fn group(sender: &mut AudioPacketizer) -> Vec<Vec<u8>> {
 }
 
 #[test]
+fn selected_surround_units_keep_32ms_wire_clock_and_fec_boundaries() {
+    for channels in [2, 6] {
+        let mut sender = AudioPacketizer::new_surround(AudioConfig {
+            channels,
+            frames_per_packet: 1536,
+            wire_payload_bytes: 2560,
+            ..config(2560)
+        })
+        .unwrap();
+        let mut packets = Vec::new();
+        for index in 0..4 {
+            let payload = vec![index + 1; 2560];
+            packets.extend(sender.packetize(&payload, 1536).unwrap());
+            assert_eq!(&packets[index as usize][12..], &payload);
+            assert_eq!(
+                u32::from_be_bytes(packets[index as usize][4..8].try_into().unwrap()),
+                u32::from(index) * 32
+            );
+        }
+        assert_eq!(packets.len(), 6);
+        assert_eq!(packets[4][1], 127);
+        assert_eq!(&packets[4][14..16], &0u16.to_be_bytes());
+        assert_eq!(&packets[4][16..20], &0u32.to_be_bytes());
+        assert_eq!(sender.next_sequence(), 4);
+    }
+}
+
+#[test]
+fn selected_surround_rejects_invalid_units_before_sealing_or_advancing() {
+    let mut sender = AudioPacketizer::new_surround(AudioConfig {
+        frames_per_packet: 1536,
+        wire_payload_bytes: 4112,
+        ..config(4112)
+    })
+    .unwrap();
+    for (payload, frames) in [(vec![], 1536), (vec![0; 4097], 1536), (vec![0; 4096], 480)] {
+        assert!(
+            sender
+                .packetize_sealed(&payload, frames, |_, _| panic!("invalid input sealed"))
+                .is_err()
+        );
+        assert_eq!(sender.next_sequence(), 0);
+    }
+    let packets = sender
+        .packetize_sealed(&vec![0; 4096], 1536, |sequence, _| {
+            assert_eq!(sequence, 0);
+            Ok(vec![9; 4112])
+        })
+        .unwrap();
+    assert_eq!(packets[0].len(), 12 + 4112);
+    assert_eq!(sender.reset_discontinuity().timestamp_ms, 128);
+    assert!(
+        AudioPacketizer::new_surround(AudioConfig {
+            channels: 8,
+            frames_per_packet: 1536,
+            ..config(4)
+        })
+        .is_err()
+    );
+    assert!(
+        AudioPacketizer::new_surround(AudioConfig {
+            frames_per_packet: 480,
+            ..config(4)
+        })
+        .is_err()
+    );
+    assert!(
+        AudioPacketizer::new_surround(AudioConfig {
+            frames_per_packet: 1536,
+            wire_payload_bytes: 4113,
+            ..config(4)
+        })
+        .is_err()
+    );
+}
+
+#[test]
 fn explicit_rtp_and_fixed_matrix_fixtures_match_client_wire_format() {
     let packets = group(&mut AudioPacketizer::new(config(4)).unwrap());
     assert_eq!(

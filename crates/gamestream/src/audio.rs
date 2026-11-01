@@ -1,4 +1,4 @@
-//! Fixed-duration GameStream Opus RTP with four data and two audio FEC shards.
+//! Fixed-duration GameStream audio RTP with four data and two audio FEC shards.
 mod opus;
 
 use crate::video::linear_combination;
@@ -7,6 +7,9 @@ const RTP_BYTES: usize = 12;
 const FEC_BYTES: usize = 12;
 const MAX_WIRE_PAYLOAD: usize = 1280; // Maximum AES-CBC padded Opus shard.
 const MAX_OPUS_BYTES: usize = 1275;
+/// Maximum plaintext size of a selected AC-3 or E-AC-3 access unit.
+pub const MAX_SURROUND_AUDIO_BYTES: usize = 4096;
+const MAX_SURROUND_WIRE_PAYLOAD: usize = MAX_SURROUND_AUDIO_BYTES + 16;
 const AUDIO_MATRIX: [[u8; 4]; 2] = [[0x77, 0x40, 0x38, 0x0e], [0xc7, 0xa7, 0x0d, 0x6c]];
 
 #[derive(Clone, Copy, Debug)]
@@ -50,10 +53,19 @@ pub struct Discontinuity {
 
 pub struct AudioPacketizer {
     config: AudioConfig,
+    payload: AudioPayload,
     sequence: u16,
     timestamp_ms: u32,
     group_timestamp_ms: u32,
     pending: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Copy)]
+enum AudioPayload {
+    Opus,
+    /// Complete units from the selected framing provider. This does not prove
+    /// the codec, client support, or that the bytes form a valid syncframe.
+    Surround,
 }
 
 impl AudioPacketizer {
@@ -67,13 +79,35 @@ impl AudioPacketizer {
         if !(1..=MAX_WIRE_PAYLOAD).contains(&config.wire_payload_bytes) {
             return Err(AudioError::InvalidPayloadSize);
         }
-        Ok(Self {
+        Ok(Self::with_payload(config, AudioPayload::Opus))
+    }
+
+    /// Packetize already-framed 32 ms access units for a trusted selected audio
+    /// route. The caller must first establish encoder, framer, transport and
+    /// client agreement; this constructor does not negotiate a codec or parse
+    /// a syncframe. All units in a FEC group have the configured wire length.
+    pub fn new_surround(config: AudioConfig) -> Result<Self, AudioError> {
+        if config.sample_rate != 48_000
+            || !matches!(config.channels, 2 | 6)
+            || config.frames_per_packet != 1536
+        {
+            return Err(AudioError::UnsupportedFormat);
+        }
+        if !(1..=MAX_SURROUND_WIRE_PAYLOAD).contains(&config.wire_payload_bytes) {
+            return Err(AudioError::InvalidPayloadSize);
+        }
+        Ok(Self::with_payload(config, AudioPayload::Surround))
+    }
+
+    fn with_payload(config: AudioConfig, payload: AudioPayload) -> Self {
+        Self {
             config,
+            payload,
             sequence: 0,
             timestamp_ms: 0,
             group_timestamp_ms: 0,
             pending: Vec::with_capacity(4),
-        })
+        }
     }
 
     pub fn next_sequence(&self) -> u16 {
@@ -90,7 +124,7 @@ impl AudioPacketizer {
         RTP_BYTES + FEC_BYTES + self.config.wire_payload_bytes
     }
 
-    /// Plaintext Opus must have a constant encoded length, normally using CBR.
+    /// Plaintext must have a constant encoded length, normally using CBR.
     pub fn packetize(
         &mut self,
         opus: &[u8],
@@ -149,13 +183,17 @@ impl AudioPacketizer {
 
     /// Validate encoded framing and negotiated duration without consuming state.
     pub fn validate_input(&self, bytes: &[u8], frames: u32) -> Result<(), AudioError> {
-        if bytes.is_empty() || bytes.len() > MAX_OPUS_BYTES {
+        let max = match self.payload {
+            AudioPayload::Opus => MAX_OPUS_BYTES,
+            AudioPayload::Surround => MAX_SURROUND_AUDIO_BYTES,
+        };
+        if bytes.is_empty() || bytes.len() > max {
             return Err(AudioError::InvalidPayloadSize);
         }
         if frames != self.config.frames_per_packet {
             return Err(AudioError::FrameCountMismatch);
         }
-        if opus::decoded_frames(bytes)? != frames {
+        if matches!(self.payload, AudioPayload::Opus) && opus::decoded_frames(bytes)? != frames {
             return Err(AudioError::FrameCountMismatch);
         }
         Ok(())
