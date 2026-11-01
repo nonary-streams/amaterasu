@@ -205,6 +205,7 @@ impl amaterasu_module_sdk::application_library::provider_adapter::Provider for G
                 | "resume_limiter"
                 | "limiter_no_retirement"
                 | "retirement_cancel"
+                | "retirement_restart"
         )
     }
     fn supports_limiter_retirement_v1(&self) -> bool {

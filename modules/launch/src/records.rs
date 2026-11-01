@@ -487,6 +487,7 @@ impl Records {
             || record.preflight_token.is_none()
             || record.cleanup_error.is_some()
             || record.outstanding_request.is_some()
+            || record.limiter_reservation_pending
             || record.session_requested
             || record.process_requested
             || record.preparation_requested

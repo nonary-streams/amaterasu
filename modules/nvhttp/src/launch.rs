@@ -766,6 +766,8 @@ pub struct Controller {
     nonce: [u8; 16],
     next_id: u64,
     sequence: u64,
+    #[cfg(test)]
+    pause_selected_after_accept: bool,
 }
 
 impl Controller {
@@ -810,6 +812,8 @@ impl Controller {
             nonce,
             next_id: 0,
             sequence: 0,
+            #[cfg(test)]
+            pause_selected_after_accept: false,
         })
     }
 
@@ -861,6 +865,19 @@ impl Controller {
             record.selected_preflight_pending,
             record.executable_path.is_some(),
         ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_selected_after_accept_for_test(&mut self) {
+        self.pause_selected_after_accept = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected_preflight_cleanup_for_test(&self) -> Option<&'static str> {
+        self.records
+            .values()
+            .find(|record| record.selected_application.is_some())?
+            .cleanup_error
     }
 
     #[cfg(test)]
