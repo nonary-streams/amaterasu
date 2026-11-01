@@ -86,6 +86,9 @@ impl Backend for LinuxBackendRouter {
     fn feedback_device_active(&self, controller: u16) -> bool {
         self.selected().feedback_device_active(controller)
     }
+    fn feedback_device_offer(&self, controller: u16) -> &'static [&'static str] {
+        self.selected().feedback_device_offer(controller)
+    }
     fn effective_gamepad_profile(&self) -> Option<&'static str> {
         self.selected().effective_gamepad_profile()
     }

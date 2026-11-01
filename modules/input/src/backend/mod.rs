@@ -31,6 +31,10 @@ pub trait Backend {
     fn feedback_device_active(&self, _controller: u16) -> bool {
         false
     }
+    /// Feedback schemas actually emitted by this live device implementation.
+    fn feedback_device_offer(&self, _controller: u16) -> &'static [&'static str] {
+        &[]
+    }
     fn supported_gamepad_profiles(&self) -> &'static [&'static str] {
         GamepadProfile::implemented_profiles()
     }

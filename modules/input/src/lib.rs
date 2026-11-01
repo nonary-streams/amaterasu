@@ -18,6 +18,7 @@ mod shortcut_journal;
 mod shortcut_reservation;
 mod shortcut_store;
 pub use model::{Key as ShortcutKey, KeyState as ShortcutKeyState};
+mod feedback_retirement;
 mod product_settings;
 mod session_binding;
 mod source_observation;
@@ -50,6 +51,8 @@ struct Settings {
     windows_backend: Option<String>,
     #[serde(default = "default_feedback_owner")]
     feedback_owner: String,
+    #[serde(default)]
+    feedback_retirement_service: Option<String>,
 }
 fn default_feedback_owner() -> String {
     "amaterasu.stream-session".into()
@@ -84,6 +87,8 @@ struct InputModule {
     source_observation_job: Option<source_observation::Job>,
     input_boot_epoch: String,
     feedback_owner: String,
+    feedback_retirement_service: Option<String>,
+    feedback_retirement_job: Option<feedback_retirement::Job>,
     shortcut_cache: shortcut_cache::ShortcutCache,
     has_consumed_held: bool,
     pending_revoke: Option<(QueuedRequest, session_binding::RevokeRequest)>,
@@ -177,6 +182,15 @@ impl ManagedModule for InputModule {
         if !amaterasu_contracts::valid_name(&settings.feedback_owner) {
             return Err("invalid feedback owner".into());
         }
+        if settings
+            .feedback_retirement_service
+            .as_deref()
+            .is_some_and(|service| {
+                !amaterasu_contracts::valid_name(service) || !service.ends_with("/1")
+            })
+        {
+            return Err("invalid feedback retirement service".into());
+        }
         #[cfg(target_os = "linux")]
         if !std::path::Path::new(&settings.linux_companion_socket_path).is_absolute() {
             return Err("linux_companion_socket_path must be absolute".into());
@@ -223,6 +237,8 @@ impl ManagedModule for InputModule {
         Ok(Self {
             input_boot_epoch,
             feedback_owner: feedback_owner.clone(),
+            feedback_retirement_service: settings.feedback_retirement_service,
+            feedback_retirement_job: None,
             shortcut_cache: shortcut_cache::ShortcutCache::default(),
             has_consumed_held: true,
             runtime,
@@ -486,13 +502,22 @@ impl InputModule {
                 &observation.lease,
                 observation.controller_slot,
             );
-            if let (Ok(true), Ok(target), Ok(device)) = (active, target, device) {
+            let offer = self.controller.feedback_offer_observation(
+                &request.caller,
+                &observation.lease,
+                observation.controller_slot,
+            );
+            if let (Ok(true), Ok(target), Ok(device), Ok(offer)) = (active, target, device, offer) {
                 match source_observation::Job::new(
                     request.id,
                     request.caller.clone(),
                     observation,
                     target,
-                    device,
+                    source_observation::DeviceObservation {
+                        device,
+                        offer,
+                        immutable_controller_policy: self.controller.feedback_policy_is_immutable(),
+                    },
                     self.input_boot_epoch.clone(),
                     request.deadline,
                 ) {
@@ -595,6 +620,25 @@ impl InputModule {
                 .map_err(str::to_owned)?;
             if let Some(lease) = lease {
                 let _ = self.controller.cancel_bound_lease(&owner, &lease);
+            }
+            if let Some(service) = self.feedback_retirement_service.clone() {
+                match feedback_retirement::Job::new(
+                    service,
+                    revoke.token.clone(),
+                    revoke.target.clone(),
+                    self.input_boot_epoch.clone(),
+                    revoke.operation_id.clone(),
+                ) {
+                    Ok(job) => self.feedback_retirement_job = Some(job),
+                    Err(code) => {
+                        return self.complete(
+                            request.id,
+                            InputError::new(code, "feedback retirement unavailable").payload(),
+                            &request.caller,
+                            false,
+                        );
+                    }
+                }
             }
             self.pending_revoke = Some((request, revoke));
             return self.advance_revoke();
@@ -1104,6 +1148,12 @@ impl InputModule {
         if self.controller.cleanup_required() {
             return Ok(());
         }
+        if let Some(job) = self.feedback_retirement_job.as_mut() {
+            if !job.advance(&mut |command| self.runtime.send(command)) {
+                return Ok(());
+            }
+            self.feedback_retirement_job = None;
+        }
         let Some((request, revoke)) = self.pending_revoke.take() else {
             return Ok(());
         };
@@ -1129,8 +1179,17 @@ impl InputModule {
             .controller
             .feedback_device_observation(&job.caller, &request.lease, request.controller_slot)
             .ok()
-            == Some(job.device);
-        let current = binding_active && target_matches && device_matches;
+            == Some(job.observation.device);
+        let offer_matches = self
+            .controller
+            .feedback_offer_observation(&job.caller, &request.lease, request.controller_slot)
+            .ok()
+            .as_ref()
+            == Some(&job.observation.offer);
+        let policy_matches = self.controller.feedback_policy_is_immutable()
+            == job.observation.immutable_controller_policy;
+        let current =
+            binding_active && target_matches && device_matches && offer_matches && policy_matches;
         match job.advance(current, &mut |command| self.runtime.send(command)) {
             Ok(None) => {
                 self.source_observation_job = Some(job);

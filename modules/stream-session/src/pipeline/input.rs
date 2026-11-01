@@ -178,7 +178,7 @@ pub(super) fn accept_feedback_source_observation(
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         })
         .ok_or("invalid_source_observation")?;
-    if payload.as_object().is_none_or(|fields| fields.len() != 6)
+    if payload.as_object().is_none_or(|fields| fields.len() != 8)
         || payload["ok"] != true
         || payload["version"] != 1
         || payload["device"]
@@ -187,6 +187,38 @@ pub(super) fn accept_feedback_source_observation(
     {
         return Err("invalid_source_observation");
     }
+    let offer = payload
+        .get("provider_offer")
+        .and_then(Value::as_array)
+        .filter(|items| items.len() <= 32)
+        .ok_or("invalid_source_observation")?;
+    let mut unique = std::collections::BTreeSet::new();
+    for item in offer {
+        let name = item
+            .as_str()
+            .filter(|name| {
+                matches!(
+                    *name,
+                    "org.amaterasu.feedback.rumble"
+                        | "org.amaterasu.feedback.rgb_led"
+                        | "org.amaterasu.feedback.adaptive_triggers"
+                        | "org.amaterasu.feedback.haptics_pcm"
+                )
+            })
+            .ok_or("unsupported_feedback_offer")?;
+        if !unique.insert(name) {
+            return Err("invalid_source_observation");
+        }
+    }
+    if !payload["immutable_controller_policy"].is_boolean() {
+        return Err("invalid_source_observation");
+    }
+    let scoped_capabilities = feedback_capability_snapshot(
+        record,
+        &unique,
+        capabilities,
+        payload["immutable_controller_policy"] == true,
+    );
     let lifecycle = json!({"status":"succeeded","active":true,"target":payload["target"],"source":payload["source"]});
     let source = amaterasu_module_sdk::input::extensions::source_label::observe(&lifecycle, target)
         .map_err(|_| "invalid_source_observation")?
@@ -194,9 +226,42 @@ pub(super) fn accept_feedback_source_observation(
     record.feedback_source_observations.insert(
         slot,
         json!({"source":{"version":source.version,"id":source.id,"generation":source.generation},
-        "target":payload["target"],"input_boot_epoch":boot,"device":payload["device"]}),
+        "target":payload["target"],"input_boot_epoch":boot,"device":payload["device"],"provider_offer":payload["provider_offer"],"scope_capabilities":scoped_capabilities}),
     );
     Ok(())
+}
+
+/// Build only the built-in GameStream intersection. An empty set is never a grant.
+fn feedback_capability_snapshot(
+    record: &Record,
+    provider: &std::collections::BTreeSet<&str>,
+    arrival: u32,
+    policy_immutable: bool,
+) -> Vec<amaterasu_module_sdk::effect_authority::FeedbackCapability> {
+    use amaterasu_module_sdk::effect_authority::{FeedbackCapability, FeedbackDirection};
+    if !policy_immutable || !record.input_controller_supported || !record.client_haptics_requested {
+        return Vec::new();
+    }
+    let Some(flags) = record
+        .start
+        .as_ref()
+        .and_then(|start| start.client_feature_flags)
+    else {
+        return Vec::new();
+    };
+    provider
+        .iter()
+        .filter(|name| {
+            **name != "org.amaterasu.feedback.haptics_pcm"
+                || (arrival & 0x8000 != 0
+                    && flags & amaterasu_gamestream::sdp::CLIENT_FEATURE_HAPTICS_PCM != 0)
+        })
+        .map(|name| FeedbackCapability {
+            schema: (*name).into(),
+            version: 1,
+            direction: FeedbackDirection::ToClient,
+        })
+        .collect()
 }
 
 /// This only tracks monotonic input-provider observations. It does not admit a
