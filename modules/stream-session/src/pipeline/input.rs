@@ -221,7 +221,7 @@ pub(super) fn queue_control_input(
     if let Some(event) = controller_payload(&input) {
         coalesce_controller_sample(&mut record.input_events, record.input_inflight, &event);
         if record.input_events.len() >= MAX_QUEUED_EVENTS {
-            return Err("input_queue_overflow");
+            return Err(report_input_queue_overflow(record, &event));
         }
         record.input_events.push_back(event);
         return Ok(());
@@ -241,7 +241,7 @@ pub(super) fn queue_control_input(
         };
         let event = pen_touch_payload(packet, port, geometry)?;
         if record.input_events.len() >= MAX_QUEUED_EVENTS {
-            return Err("input_queue_overflow");
+            return Err(report_input_queue_overflow(record, &event));
         }
         record.input_events.push_back(event);
         return Ok(());
@@ -269,11 +269,44 @@ pub(super) fn queue_control_input(
     for event in batch.into_events().into_iter().map(event_payload) {
         coalesce_controller_sample(&mut record.input_events, record.input_inflight, &event);
         if record.input_events.len() >= MAX_QUEUED_EVENTS {
-            return Err("input_queue_overflow");
+            return Err(report_input_queue_overflow(record, &event));
         }
         record.input_events.push_back(event);
     }
     Ok(())
+}
+
+/// Summarize event classes without logging input values or device identities.
+fn report_input_queue_overflow(record: &Record, incoming: &Value) -> &'static str {
+    let mut counts = std::collections::BTreeMap::<&'static str, usize>::new();
+    for event in &record.input_events {
+        *counts.entry(input_event_kind(event)).or_default() += 1;
+    }
+    eprintln!(
+        "amaterasu input queue overflow queued={} inflight={} incoming={} kinds={counts:?}",
+        record.input_events.len(),
+        record.input_inflight,
+        input_event_kind(incoming),
+    );
+    "input_queue_overflow"
+}
+
+fn input_event_kind(event: &Value) -> &'static str {
+    match event["kind"].as_str() {
+        Some("key") => "key",
+        Some("button") => "button",
+        Some("relative") => "relative",
+        Some("absolute") => "absolute",
+        Some("scroll") => "scroll",
+        Some("scroll_units") => "scroll_units",
+        Some("pen_touch") => "pen_touch",
+        Some("controller") => "controller",
+        Some("controller_arrival") => "controller_arrival",
+        Some("controller_touch") => "controller_touch",
+        Some("controller_motion") => "controller_motion",
+        Some("controller_battery") => "controller_battery",
+        _ => "unknown",
+    }
 }
 
 // Continuous controller samples replace only unsent samples. Button edges,
