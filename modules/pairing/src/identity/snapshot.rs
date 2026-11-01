@@ -203,6 +203,11 @@ impl Snapshot {
         }))
     }
 
+    #[cfg(test)]
+    pub(super) fn set_client_expiry_for_test(&mut self, expiry: u64) {
+        self.clients[0].not_after = expiry;
+    }
+
     pub fn certificate(&self) -> &[u8] {
         &self.host.der
     }

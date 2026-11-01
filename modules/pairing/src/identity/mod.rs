@@ -217,13 +217,26 @@ unsafe extern "C" fn check_entitlement(
             std::str::from_utf8(unsafe { name.read() }?).map_err(|_| STATUS_INVALID_ARGUMENT)?;
         let binding = unsafe { binding(context) }?;
         let now = binding.shared.now()?;
-        let snapshot = binding.shared.get(now)?;
-        let result = snapshot.check_entitlement(certificate, now, name);
-        if !binding.shared.current(&snapshot, binding.shared.now()?) {
-            return Err(IDENTITY_UNAVAILABLE);
-        }
-        result
+        check_entitlement_current(&binding.shared, certificate, name, now, || {
+            binding.shared.now()
+        })
     })
+}
+
+fn check_entitlement_current(
+    shared: &Shared,
+    certificate: &[u8],
+    name: &str,
+    initial_time: u64,
+    final_time: impl FnOnce() -> Result<u64, Status>,
+) -> Result<(), Status> {
+    let snapshot = shared.get(initial_time)?;
+    let now = final_time()?;
+    let result = snapshot.check_entitlement(certificate, now, name);
+    if !shared.current(&snapshot, now) {
+        return Err(IDENTITY_UNAVAILABLE);
+    }
+    result
 }
 unsafe fn binding<'a>(context: *mut c_void) -> Result<&'a Binding, Status> {
     if context.is_null() {
