@@ -123,7 +123,32 @@ impl Pipeline {
             };
             transaction.settled = true;
         }
-        if !document_fits(&previous) || !document_fits(&committed) || !document_fits(&rolled_back) {
+        let mut terminal = committed.clone();
+        let transaction = terminal
+            .transaction
+            .take()
+            .expect("constructed transaction");
+        terminal.terminal_receipt = Some(crate::settings::ConfigurationTerminalReceipt {
+            transaction,
+            terminal_state_revision: expected_state_revision + 3,
+            identity_fingerprint: terminal.identity_fingerprint()?,
+        });
+        let mut terminal_rollback = rolled_back.clone();
+        let transaction = terminal_rollback
+            .transaction
+            .take()
+            .expect("constructed transaction");
+        terminal_rollback.terminal_receipt = Some(crate::settings::ConfigurationTerminalReceipt {
+            transaction,
+            terminal_state_revision: expected_state_revision + 4,
+            identity_fingerprint: terminal_rollback.identity_fingerprint()?,
+        });
+        if !document_fits(&previous)
+            || !document_fits(&committed)
+            || !document_fits(&rolled_back)
+            || !document_fits(&terminal)
+            || !document_fits(&terminal_rollback)
+        {
             return complete(
                 send,
                 update.request_id,
@@ -324,6 +349,7 @@ impl Pipeline {
             document,
             response,
             current_authority_epoch,
+            reconcile_change,
         } = completion;
         if !matches!(
             send(Command::CheckRequest {
@@ -340,7 +366,26 @@ impl Pipeline {
                 ),
             );
         }
-        let Some(transaction) = &document.transaction else {
+        let transaction = document
+            .transaction
+            .as_ref()
+            .filter(|transaction| {
+                reconcile_change
+                    .as_ref()
+                    .is_none_or(|change| change == &transaction.change)
+            })
+            .or_else(|| {
+                document
+                    .terminal_receipt
+                    .as_ref()
+                    .map(|receipt| &receipt.transaction)
+                    .filter(|transaction| {
+                        reconcile_change
+                            .as_ref()
+                            .is_some_and(|change| change == &transaction.change)
+                    })
+            });
+        let Some(transaction) = transaction else {
             return complete(
                 send,
                 request_id,
@@ -387,6 +432,7 @@ impl Pipeline {
                 document,
                 expected_state_revision,
                 current_authority_epoch,
+                reconcile_change,
             },
             phase: PendingPhase::Waiting,
         });
@@ -417,7 +463,57 @@ impl Pipeline {
                 ),
             );
         }
-        document.transaction = None;
+        let Some(transaction) = document.transaction.take() else {
+            return complete(
+                send,
+                request_id,
+                error(
+                    "configuration_transaction_unconfirmed",
+                    "transaction marker is missing",
+                ),
+            );
+        };
+        let Some(terminal_state_revision) = expected_state_revision.checked_add(1) else {
+            return complete(
+                send,
+                request_id,
+                error(
+                    "revision_exhausted",
+                    "terminal receipt revision is exhausted",
+                ),
+            );
+        };
+        let identity_fingerprint = document.identity_fingerprint()?;
+        let receipt = crate::settings::ConfigurationTerminalReceipt {
+            transaction,
+            terminal_state_revision,
+            identity_fingerprint,
+        };
+        if !receipt.valid_for(
+            document.revision,
+            terminal_state_revision,
+            &document.identity_fingerprint()?,
+        ) {
+            return complete(
+                send,
+                request_id,
+                error(
+                    "configuration_transaction_unconfirmed",
+                    "terminal receipt is invalid",
+                ),
+            );
+        }
+        document.terminal_receipt = Some(receipt);
+        if !document_fits(&document) {
+            return complete(
+                send,
+                request_id,
+                error(
+                    "resource_exhausted",
+                    "terminal receipt exceeds the state limit",
+                ),
+            );
+        }
         let payload = state_set(&document, expected_state_revision)?;
         let Some(child) = self.submit_detached(crate::STATE_SERVICE, payload, send)? else {
             return complete(
@@ -463,6 +559,25 @@ impl Pipeline {
                 error("request_ended", "reconciliation request ended"),
             );
         }
+        let active_matches = document
+            .transaction
+            .as_ref()
+            .is_some_and(|transaction| transaction.change == change);
+        if !active_matches
+            && document
+                .terminal_receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.transaction.change == change)
+        {
+            return self.select_reconcile_authority(
+                request_id,
+                deadline,
+                state_revision,
+                document,
+                change,
+                send,
+            );
+        }
         let Some(transaction) = &mut document.transaction else {
             return complete(
                 send,
@@ -492,6 +607,7 @@ impl Pipeline {
                 deadline,
                 state_revision,
                 document,
+                change,
                 send,
             );
         }
@@ -534,6 +650,7 @@ impl Pipeline {
         deadline: Instant,
         state_revision: u64,
         document: Document,
+        change: ConfigurationChange,
         send: &mut impl FnMut(Command) -> TransportResult,
     ) -> ModuleResult<()> {
         let Some(child) = self.submit_detached(
@@ -558,6 +675,7 @@ impl Pipeline {
             stage: Stage::SelectingReconcile {
                 document,
                 state_revision,
+                change,
             },
             phase: PendingPhase::Waiting,
         });

@@ -319,6 +319,59 @@ pub enum ConfigurationTransactionState {
     Aborted { configuration_revision: u64 },
 }
 
+/// Latest confirmed terminal transaction, retained atomically with marker
+/// removal so delayed status replies remain reconcilable after restart.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigurationTerminalReceipt {
+    pub transaction: ConfigurationTransaction,
+    pub terminal_state_revision: u64,
+    pub identity_fingerprint: String,
+}
+
+/// Fingerprints the ordered stored identity-path fields: file state, legacy
+/// state, credentials file, private key, and certificate. No file is opened.
+pub fn configuration_identity_fingerprint(fields: [&str; 5]) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(&fields).map_err(|error| error.to_string())?;
+    Ok(Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+impl ConfigurationTerminalReceipt {
+    pub fn valid_for(
+        &self,
+        configuration_revision: u64,
+        state_revision: u64,
+        identity_fingerprint: &str,
+    ) -> bool {
+        let (outcome_revision, minimum_steps) = match self.transaction.state {
+            ConfigurationTransactionState::Prepared {} => return false,
+            ConfigurationTransactionState::Committed {
+                configuration_revision,
+            } => (configuration_revision, 3),
+            ConfigurationTransactionState::Aborted {
+                configuration_revision,
+            } => (configuration_revision, 2),
+        };
+        self.transaction.settled
+            && self
+                .transaction
+                .valid_for_configuration_revision(outcome_revision)
+            && outcome_revision <= configuration_revision
+            && self
+                .transaction
+                .expected_state_revision
+                .checked_add(minimum_steps)
+                .is_some_and(|minimum| self.terminal_state_revision >= minimum)
+            && self.terminal_state_revision <= state_revision
+            && hex(&self.identity_fingerprint, 64)
+            && self.identity_fingerprint == identity_fingerprint
+    }
+}
+
 impl ConfigurationTransaction {
     pub fn valid_for_configuration_revision(&self, revision: u64) -> bool {
         self.change.valid()
@@ -351,8 +404,21 @@ impl ConfigurationTransaction {
 pub struct HostConfigurationTransactionStatus {
     pub ok: bool,
     pub configuration_revision: u64,
+    pub state_revision: u64,
+    pub identity_fingerprint: String,
     #[serde(deserialize_with = "required_transaction")]
     pub transaction: Option<ConfigurationTransaction>,
+    #[serde(deserialize_with = "required_terminal_receipt")]
+    pub terminal_receipt: Option<ConfigurationTerminalReceipt>,
+}
+
+fn required_terminal_receipt<'de, D>(
+    deserializer: D,
+) -> Result<Option<ConfigurationTerminalReceipt>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::deserialize(deserializer)
 }
 
 fn required_transaction<'de, D>(
@@ -367,8 +433,19 @@ where
 impl HostConfigurationTransactionStatus {
     pub fn valid(&self) -> bool {
         self.ok
+            && hex(&self.identity_fingerprint, 64)
             && self.transaction.as_ref().is_none_or(|transaction| {
                 transaction.valid_for_configuration_revision(self.configuration_revision)
+                    && transaction.expected_state_revision <= self.state_revision
+                    && (!transaction.settled
+                        || transaction.expected_state_revision < self.state_revision)
+            })
+            && self.terminal_receipt.as_ref().is_none_or(|receipt| {
+                receipt.valid_for(
+                    self.configuration_revision,
+                    self.state_revision,
+                    &self.identity_fingerprint,
+                )
             })
     }
 }
@@ -738,12 +815,15 @@ mod tests {
             )
             .is_err()
         );
+        assert!(serde_json::from_value::<HostConfigurationTransactionStatus>(
+            json!({"ok":true,"configuration_revision":0,"state_revision":0,"identity_fingerprint":"a".repeat(64),"transaction":null})
+        ).is_err());
         let empty: HostConfigurationTransactionStatus = serde_json::from_value(
-            json!({"ok":true,"configuration_revision":0,"transaction":null}),
+            json!({"ok":true,"configuration_revision":0,"state_revision":0,"identity_fingerprint":"a".repeat(64),"transaction":null,"terminal_receipt":null}),
         )
         .unwrap();
         assert!(empty.valid());
-        let marker = json!({"ok":true,"configuration_revision":4,"transaction":{
+        let marker = json!({"ok":true,"configuration_revision":4,"state_revision":9,"identity_fingerprint":"a".repeat(64),"terminal_receipt":null,"transaction":{
             "change":{"version":1,"authority_epoch":"a".repeat(32),"operation_id":"operation",
                 "expected_configuration_revision":3,"expected_trust_revision":7},
             "state":{"phase":"committed","configuration_revision":4},
@@ -761,6 +841,38 @@ mod tests {
                 .unwrap()
                 .valid()
         );
+    }
+
+    #[test]
+    fn terminal_receipt_requires_the_settlement_revision_and_identity() {
+        let fingerprint =
+            configuration_identity_fingerprint(["state", "legacy", "", "key", "cert"]).unwrap();
+        let receipt = ConfigurationTerminalReceipt {
+            transaction: ConfigurationTransaction {
+                change: ConfigurationChange {
+                    version: 1,
+                    authority_epoch: "a".repeat(32),
+                    operation_id: "operation".into(),
+                    expected_configuration_revision: 3,
+                    expected_trust_revision: 7,
+                },
+                state: ConfigurationTransactionState::Committed {
+                    configuration_revision: 4,
+                },
+                expected_state_revision: 8,
+                settled: true,
+            },
+            terminal_state_revision: 11,
+            identity_fingerprint: fingerprint.clone(),
+        };
+        assert!(receipt.valid_for(4, 11, &fingerprint));
+        assert!(receipt.valid_for(5, 12, &fingerprint));
+        assert!(!receipt.valid_for(4, 10, &fingerprint));
+        assert!(!receipt.valid_for(3, 11, &fingerprint));
+        assert!(!receipt.valid_for(4, 11, &"b".repeat(64)));
+        let mut unsettled = receipt;
+        unsettled.transaction.settled = false;
+        assert!(!unsettled.valid_for(4, 11, &fingerprint));
     }
 
     #[test]

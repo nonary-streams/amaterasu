@@ -1,5 +1,5 @@
 pub use amaterasu_module_sdk::effect_authority::{
-    ConfigurationTransaction, ConfigurationTransactionState,
+    ConfigurationTerminalReceipt, ConfigurationTransaction, ConfigurationTransactionState,
 };
 use serde::{Deserialize, Serialize};
 
@@ -139,6 +139,8 @@ pub struct Document {
     pub min_log_level: MinLogLevel,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transaction: Option<ConfigurationTransaction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_receipt: Option<ConfigurationTerminalReceipt>,
 }
 
 impl Default for Document {
@@ -160,6 +162,7 @@ impl Document {
             log_path: settings.log_path,
             min_log_level: settings.min_log_level,
             transaction: None,
+            terminal_receipt: None,
         }
     }
 
@@ -175,6 +178,16 @@ impl Document {
         }
     }
 
+    pub fn identity_fingerprint(&self) -> Result<String, String> {
+        amaterasu_module_sdk::effect_authority::configuration_identity_fingerprint([
+            &self.file_state,
+            &self.vibeshine_file_state,
+            &self.credentials_file,
+            &self.pkey,
+            &self.cert,
+        ])
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.version != DOCUMENT_VERSION {
             return Err(format!("unsupported document version {}", self.version));
@@ -185,6 +198,12 @@ impl Document {
             .is_some_and(|transaction| !transaction.valid_for_configuration_revision(self.revision))
         {
             return Err("invalid configuration transaction".into());
+        }
+        if let Some(receipt) = &self.terminal_receipt {
+            let fingerprint = self.identity_fingerprint()?;
+            if !receipt.valid_for(self.revision, u64::MAX, &fingerprint) {
+                return Err("invalid configuration terminal receipt".into());
+            }
         }
         self.settings().validate()
     }

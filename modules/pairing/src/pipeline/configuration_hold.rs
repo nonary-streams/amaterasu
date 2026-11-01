@@ -239,7 +239,16 @@ impl Pipeline {
                     error("host_configuration_unavailable"),
                 );
             }
-            let Some(transaction) = status.transaction else {
+            let transaction = status
+                .transaction
+                .filter(|transaction| transaction.change == confirmation.change)
+                .or_else(|| {
+                    status
+                        .terminal_receipt
+                        .map(|receipt| receipt.transaction)
+                        .filter(|transaction| transaction.change == confirmation.change)
+                });
+            let Some(transaction) = transaction else {
                 return complete(
                     send,
                     confirmation.request_id,

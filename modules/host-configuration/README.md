@@ -63,11 +63,11 @@ the status; reconciliation requires direct management. An abort is confirmed onl
 after a successful CAS advances the same State namespace revision, so a late
 write at the old revision conflicts. Reconciliation reports logging as
 `unconfirmed` because settling identity does not prove logging application.
-If pairing receives an older status containing a marker after host configuration
-has cleared that marker, pairing can retain a hold that the current
-`reconcile_transaction` operation reports as unknown. That case stays fenced;
-there is not yet a durable terminal receipt that proves the cleared outcome to
-the restarted pairing provider.
+The same CAS that clears an active marker retains one bounded terminal receipt
+for that exact operation. It includes the settlement revision and an identity
+fingerprint, so a delayed pre-clear status can be reconciled after pairing
+restarts. Ordinary tuning updates preserve the receipt while the identity
+fingerprint remains unchanged; mismatched or superseded receipts fail closed.
 
 The input/control join remains closed until the selected owner can fence local
 producers, join workers, obtain the selected control provider's exact

@@ -41,6 +41,7 @@ struct HoldCompletion {
     document: Document,
     response: Value,
     current_authority_epoch: Option<String>,
+    reconcile_change: Option<ConfigurationChange>,
 }
 
 struct Pending {
@@ -73,6 +74,7 @@ enum Stage {
         document: Document,
         expected_state_revision: u64,
         current_authority_epoch: Option<String>,
+        reconcile_change: Option<ConfigurationChange>,
     },
     ClearingHold {
         response: Value,
@@ -85,6 +87,7 @@ enum Stage {
     SelectingReconcile {
         document: Document,
         state_revision: u64,
+        change: ConfigurationChange,
     },
     Saving {
         expected_state_revision: u64,
@@ -738,6 +741,7 @@ impl Pipeline {
                             document,
                             response,
                             current_authority_epoch: None,
+                            reconcile_change: None,
                         },
                         send,
                     );
@@ -747,9 +751,29 @@ impl Pipeline {
                     document,
                     expected_state_revision,
                     current_authority_epoch,
+                    reconcile_change,
                 } = pending.stage
                 {
-                    let Some(transaction) = document.transaction.as_ref() else {
+                    let transaction = document
+                        .transaction
+                        .as_ref()
+                        .filter(|transaction| {
+                            reconcile_change
+                                .as_ref()
+                                .is_none_or(|change| change == &transaction.change)
+                        })
+                        .or_else(|| {
+                            document
+                                .terminal_receipt
+                                .as_ref()
+                                .map(|receipt| &receipt.transaction)
+                                .filter(|transaction| {
+                                    reconcile_change
+                                        .as_ref()
+                                        .is_some_and(|change| change == &transaction.change)
+                                })
+                        });
+                    let Some(transaction) = transaction else {
                         return complete(
                             send,
                             pending.request_id,
@@ -771,6 +795,7 @@ impl Pipeline {
                                 document,
                                 response,
                                 current_authority_epoch,
+                                reconcile_change,
                             },
                             send,
                         );
@@ -787,6 +812,13 @@ impl Pipeline {
                                 "pairing did not confirm the committed identity",
                             ),
                         );
+                    }
+                    if document
+                        .transaction
+                        .as_ref()
+                        .is_none_or(|active| active.change != transaction.change)
+                    {
+                        return complete(send, pending.request_id, response);
                     }
                     return self.clear_hold(
                         pending.request_id,
@@ -829,17 +861,33 @@ impl Pipeline {
                             ),
                         );
                     }
+                    let Some(change) = document
+                        .transaction
+                        .as_ref()
+                        .map(|transaction| transaction.change.clone())
+                    else {
+                        return complete(
+                            send,
+                            pending.request_id,
+                            error(
+                                "configuration_transaction_unconfirmed",
+                                "transaction marker is missing",
+                            ),
+                        );
+                    };
                     return self.select_reconcile_authority(
                         pending.request_id,
                         pending.deadline,
                         expected_state_revision + 1,
                         document,
+                        change,
                         send,
                     );
                 }
                 if let Stage::SelectingReconcile {
                     document,
                     state_revision,
+                    change,
                 } = pending.stage
                 {
                     let Some(epoch) = payload["epoch"].as_str() else {
@@ -861,6 +909,7 @@ impl Pipeline {
                             document,
                             response,
                             current_authority_epoch: Some(epoch.to_owned()),
+                            reconcile_change: Some(change),
                         },
                         send,
                     );
@@ -1054,11 +1103,15 @@ impl Pipeline {
         };
         match operation {
             Operation::TransactionStatus {} => {
+                let identity_fingerprint = document.identity_fingerprint()?;
                 let status =
                     amaterasu_module_sdk::effect_authority::HostConfigurationTransactionStatus {
                         ok: true,
                         configuration_revision: document.revision,
+                        state_revision,
+                        identity_fingerprint,
                         transaction: document.transaction,
+                        terminal_receipt: document.terminal_receipt,
                     };
                 let payload = serde_json::to_value(status)
                     .map_err(|_| "transaction status serialization failed")?;
@@ -1130,7 +1183,10 @@ impl Pipeline {
                 let Some(settings) = update_settings else {
                     unreachable!("update contains settings")
                 };
-                let next = Document::from_settings(revision, settings);
+                let mut next = Document::from_settings(revision, settings);
+                if !identity_settings_changed(&document, &next) {
+                    next.terminal_receipt = document.terminal_receipt.clone();
+                }
                 if let Err(message) = next.validate() {
                     return complete(send, request_id, error("invalid_settings", message));
                 }
@@ -1624,6 +1680,19 @@ fn read_document(payload: &Value) -> Result<Document, Value> {
                 {
                     return Err(unavailable(
                         "configuration transaction revision is inconsistent",
+                    ));
+                }
+            }
+            if let Some(receipt) = &document.terminal_receipt {
+                let Some(state_revision) = payload.get("revision").and_then(Value::as_u64) else {
+                    return Err(unavailable(
+                        "state lookup omitted the terminal receipt revision",
+                    ));
+                };
+                let fingerprint = document.identity_fingerprint().map_err(unavailable)?;
+                if !receipt.valid_for(document.revision, state_revision, &fingerprint) {
+                    return Err(unavailable(
+                        "configuration terminal receipt revision is inconsistent",
                     ));
                 }
             }

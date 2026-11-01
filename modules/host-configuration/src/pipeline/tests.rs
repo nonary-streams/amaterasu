@@ -1211,7 +1211,7 @@ fn real_broker_reads_authoritative_configuration_while_update_waits() {
         |request: amaterasu_module_sdk::effect_authority::HostConfigurationTransactionRequest| {
             match request {
             amaterasu_module_sdk::effect_authority::HostConfigurationTransactionRequest::TransactionStatus {} => {
-                json!({"ok":true,"configuration_revision":0,"transaction":null})
+                json!({"ok":true,"configuration_revision":0,"state_revision":0,"identity_fingerprint":Document::default().identity_fingerprint().unwrap(),"transaction":null,"terminal_receipt":null})
             }
             _ => panic!("unexpected replacement request"),
         }
@@ -1258,5 +1258,105 @@ fn concurrent_read_transport_failure_preserves_pending_update() {
     );
     assert_eq!(pipeline.pending.as_ref().unwrap().request_id, 7);
     assert_eq!(pipeline.concurrent_read.as_ref().unwrap().request_id, 8);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn reconciling_terminal_receipt_does_not_clear_a_newer_active_marker() {
+    let root = test_root();
+    let mut pipeline = Pipeline::new(Ok(root.clone()));
+    let old = ConfigurationChange {
+        version: 1,
+        authority_epoch: "a".repeat(32),
+        operation_id: "old-operation".into(),
+        expected_configuration_revision: 0,
+        expected_trust_revision: 4,
+    };
+    let newer = ConfigurationChange {
+        version: 1,
+        authority_epoch: "b".repeat(32),
+        operation_id: "new-operation".into(),
+        expected_configuration_revision: 1,
+        expected_trust_revision: 4,
+    };
+    let mut document = Document::from_settings(1, crate::settings::Settings::default());
+    let fingerprint = document.identity_fingerprint().unwrap();
+    document.terminal_receipt = Some(crate::settings::ConfigurationTerminalReceipt {
+        transaction: ConfigurationTransaction {
+            change: old.clone(),
+            state: ConfigurationTransactionState::Committed {
+                configuration_revision: 1,
+            },
+            expected_state_revision: 1,
+            settled: true,
+        },
+        terminal_state_revision: 4,
+        identity_fingerprint: fingerprint,
+    });
+    document.transaction = Some(ConfigurationTransaction {
+        change: newer.clone(),
+        state: ConfigurationTransactionState::Prepared {},
+        expected_state_revision: 5,
+        settled: false,
+    });
+    document.validate().unwrap();
+    let mut outgoing = Vec::new();
+    pipeline
+        .reconcile_transaction(
+            7,
+            Instant::now() + Duration::from_secs(30),
+            5,
+            document,
+            old.clone(),
+            &mut |command| {
+                outgoing.push(command.clone());
+                Ok(match command {
+                    Command::CheckRequest { .. } => Response::Ok,
+                    Command::Request { .. } => Response::Accepted { id: 22 },
+                    command => panic!("unexpected command: {command:?}"),
+                })
+            },
+        )
+        .unwrap();
+    assert!(
+        matches!(&outgoing[1], Command::Request { payload, .. } if payload["action"] == "status")
+    );
+    let pending = pipeline.pending.take().unwrap();
+    pipeline
+        .advance(pending, &mut |command| {
+            Ok(match command {
+                Command::TakeResult { request: 22 } => Response::Result {
+                    payload: json!({"ok":true,"epoch":"c".repeat(32)}),
+                },
+                Command::ReleaseResult { request: 22 } | Command::CheckRequest { request: 7 } => {
+                    Response::Ok
+                }
+                Command::Request { payload, .. } => {
+                    assert_eq!(payload["change"]["operation_id"], old.operation_id);
+                    Response::Accepted { id: 23 }
+                }
+                command => panic!("unexpected command: {command:?}"),
+            })
+        })
+        .unwrap();
+    let pending = pipeline.pending.take().unwrap();
+    let mut response = None;
+    pipeline
+        .advance(pending, &mut |command| {
+            Ok(match command {
+                Command::TakeResult { request: 23 } => Response::Result {
+                    payload: json!({"ok":true,"state":"released","operation_id":old.operation_id}),
+                },
+                Command::ReleaseResult { request: 23 } => Response::Ok,
+                Command::Complete { payload, .. } => {
+                    response = Some(payload);
+                    Response::Ok
+                }
+                command => panic!("new active marker must not be written: {command:?}"),
+            })
+        })
+        .unwrap();
+    assert_eq!(response.unwrap()["ok"], true);
+    assert!(pipeline.pending.is_none());
     std::fs::remove_dir_all(root).unwrap();
 }

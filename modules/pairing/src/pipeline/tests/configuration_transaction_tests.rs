@@ -336,6 +336,34 @@ fn real_providers_hold_host_identity_write_until_owner_retires_stream() {
         ),
         Response::Pending
     ));
+    let stale_change = pending["value"]["transaction"]["change"].clone();
+    let Response::Accepted { id: delayed_status } = broker.dispatch(
+        "amaterasu.pairing",
+        Command::Request {
+            service: HOST_CONFIGURATION_SERVICE.into(),
+            timeout_ms: 30_000,
+            operation_id: "delayed-pre-clear-status".into(),
+            parent: None,
+            payload: json!({"action":"transaction_status"}),
+        },
+    ) else {
+        panic!("status request rejected")
+    };
+    let mut received_stale_status = false;
+    for _ in 0..100 {
+        pump_configuration_fence(&mut pairing, &mut configuration, &state, &mut broker);
+        if let Response::Result { payload } = broker.dispatch(
+            "amaterasu.pairing",
+            Command::TakeResult {
+                request: delayed_status,
+            },
+        ) {
+            assert_eq!(payload["transaction"]["change"], stale_change);
+            received_stale_status = true;
+            break;
+        }
+    }
+    assert!(received_stale_status);
     let retirement = json!({"ok":true,"service":"amaterasu.control-transport/1","stream":7,"provider_epoch":"c".repeat(32),"operation_id":"retire","scope":"whole_control_stream","state":"retired"});
     let fenced = broker_input_effect(
         json!({"action":"fence_source","epoch":epoch,"source":source,"scope":scope,"operation_id":"config-source-retirement"}),
@@ -416,11 +444,74 @@ fn real_providers_hold_host_identity_write_until_owner_retires_stream() {
     assert_eq!(committed["value"]["revision"], 1);
     assert_eq!(committed["value"]["cert"], "credentials/new-cert.pem");
     assert!(committed["value"].get("transaction").is_none());
+    assert_eq!(
+        committed["value"]["terminal_receipt"]["transaction"]["change"],
+        stale_change
+    );
+    // Deliver the authentic pre-clear broker response after restarting pairing.
+    // The retained request ID models delayed delivery across that boundary.
+    let mut restarted_settings = settings();
+    let mut policy = policy_for_feedback(
+        &["speaker.pcm"],
+        crate::protocol::FeedbackPermission::Launch,
+    );
+    policy.configuration_owner = Some("amaterasu.host-configuration".into());
+    restarted_settings.effect_authority = Some(policy);
+    pairing =
+        Pipeline::with_host_configuration(restarted_settings, Arc::new(Shared::default()), true);
+    pairing.configuration_status_request = Some(delayed_status);
+    let restart_epoch = pairing.effect_gate.as_ref().unwrap().epoch().to_owned();
+    pump_configuration_fence(&mut pairing, &mut configuration, &state, &mut broker);
+    assert!(pairing.configuration_hold.is_some());
+    let held = pairing
+        .apply_effect_request(
+            "input",
+            "input",
+            json!({"action":"recover","epoch":restart_epoch,"owner_epoch":"stale-status-owner"}),
+            now(),
+        )
+        .unwrap();
+    assert_eq!(held["held"], true);
+    let reconciled_epoch = held["epoch"].as_str().unwrap().to_owned();
+    let Response::Accepted {
+        id: stale_reconcile,
+    } = broker.dispatch(
+        "amaterasu.management",
+        Command::Request {
+            service: HOST_CONFIGURATION_SERVICE.into(),
+            timeout_ms: 30_000,
+            operation_id: "reconcile-delayed-pre-clear-status".into(),
+            parent: None,
+            payload: json!({"action":"reconcile_transaction","change":stale_change}),
+        },
+    )
+    else {
+        panic!("stale status reconciliation rejected")
+    };
+    let mut stale_result = None;
+    for _ in 0..1000 {
+        pump_configuration_fence(&mut pairing, &mut configuration, &state, &mut broker);
+        if let Response::Result { payload } = broker.dispatch(
+            "amaterasu.management",
+            Command::TakeResult {
+                request: stale_reconcile,
+            },
+        ) {
+            stale_result = Some(payload);
+            break;
+        }
+    }
+    assert_eq!(
+        stale_result.as_ref().map(|value| &value["ok"]),
+        Some(&json!(true)),
+        "{stale_result:?}"
+    );
+    assert!(pairing.configuration_hold.is_none());
     let next_epoch = pairing
         .apply_effect_request(
             "input",
             "input",
-            json!({"action":"recover","epoch":epoch,"owner_epoch":"owner-2"}),
+            json!({"action":"recover","epoch":reconciled_epoch,"owner_epoch":"owner-2"}),
             now(),
         )
         .unwrap()["epoch"]
@@ -1116,6 +1207,23 @@ fn real_providers_hold_host_identity_write_until_owner_retires_stream() {
     );
     assert_eq!(after_success["value"]["revision"], 4);
     assert!(after_success["value"].get("transaction").is_none());
+    let terminal = after_success["value"]["terminal_receipt"].clone();
+    let replay = broker_configuration_call(
+        "amaterasu.management",
+        json!({"action":"reconcile_transaction","change":stale_change}),
+        &mut pairing,
+        &mut configuration,
+        &state,
+        &mut broker,
+    );
+    assert_eq!(replay["error"]["code"], "configuration_change_unknown");
+    assert_eq!(
+        state.handle(
+            "amaterasu.host-configuration",
+            json!({"action":"get","key":"global/amaterasu.host-configuration"})
+        )["value"]["terminal_receipt"],
+        terminal
+    );
     drop(state);
     fs::remove_dir_all(root).unwrap();
 }
