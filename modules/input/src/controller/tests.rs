@@ -503,6 +503,8 @@ fn feedback_pull_is_stream_session_only_lease_bound_and_acknowledged_after_peek(
     );
     assert_eq!(peeked["ok"], true);
     assert_eq!(peeked["events"][0]["sequence"], 1);
+    assert_eq!(peeked["events"][0]["device_generation"], 1);
+    assert_eq!(peeked["events"][0]["device_capabilities"], 0);
     assert_eq!(
         peeked["events"][0]["feedback"],
         json!({"type":"rgb_led","controller":2,"red":12,"green":34,"blue":56})

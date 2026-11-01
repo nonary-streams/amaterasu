@@ -927,6 +927,7 @@ impl LinuxBackend {
                 "controller number must be in the range 0..16",
             ));
         }
+        self.feedback_queue.retire_controller(number);
         self.gamepads.remove(number)?;
         let profile = self.route_profile_for_arrival(controller_type, capabilities);
         self.controller_routes[route_index] = Some(profile);
@@ -1307,6 +1308,7 @@ impl Backend for LinuxBackend {
         {
             for slot in 0..self.controller_routes.len() {
                 if active_mask & (1 << slot) == 0 {
+                    self.feedback_queue.retire_controller(slot as u16);
                     self.controller_routes[slot] = None;
                     self.controller_capabilities[slot] = 0;
                 }
@@ -1326,7 +1328,9 @@ impl Backend for LinuxBackend {
             };
             let back_as_touchpad_click = self.ds4_back_as_touchpad_click;
             let ds5_randomize_mac = self.ds5_inputtino_randomize_mac;
-            let feedback = self.feedback_producer(*number);
+            let feedback_queue = self.feedback_queue.clone();
+            let feedback_generation = self.feedback_generation;
+            let feedback_capabilities = self.controller_capabilities[usize::from(*number)];
             let (path, gamepads) = (&self.path, &mut self.gamepads);
             return gamepads
                 .apply(
@@ -1342,7 +1346,11 @@ impl Backend for LinuxBackend {
                             profile,
                             back_as_touchpad_click,
                             ds5_randomize_mac,
-                            feedback.clone(),
+                            feedback_queue.producer(
+                                feedback_generation,
+                                u16::from(slot),
+                                feedback_capabilities,
+                            ),
                         )
                     },
                 )
@@ -2069,6 +2077,56 @@ mod profile_tests {
 
         backend.stop().unwrap();
         assert!(uhid_adapter.borrow().destroyed.contains(&2));
+    }
+
+    #[test]
+    fn controller_arrival_and_active_mask_retire_old_feedback_producers() {
+        let _input_guard = FakeInputGuard;
+        let _adapter = FakeInputGuard::install();
+        let mut backend = LinuxBackend::new("/dev/uinput".into());
+        let queue = FeedbackQueue::default();
+        let generation = queue.begin_lease();
+        backend.set_feedback_queue(queue.clone());
+        backend.set_feedback_generation(generation);
+        backend.start().unwrap();
+        let arrival = Event::ControllerArrival {
+            number: 0,
+            controller_type: CONTROLLER_TYPE_XBOX,
+            capabilities: 0,
+            supported_buttons: u32::MAX,
+        };
+        backend.inject(&arrival).unwrap();
+        let old = backend.feedback_producer(0);
+        let rumble = || HostFeedback::Rumble {
+            controller: 0,
+            low_frequency: 1,
+            high_frequency: 2,
+        };
+        assert!(old.push(rumble()));
+        backend.inject(&arrival).unwrap();
+        assert!(!old.push(rumble()));
+        let previous = queue.peek(8);
+        assert_eq!(previous.len(), 1);
+        assert!(queue.acknowledge(previous[0].sequence));
+        let current = backend.feedback_producer(0);
+        assert!(current.push(rumble()));
+        assert!(queue.peek(8)[0].device_generation > 1);
+        backend
+            .inject(&Event::Controller {
+                number: 0,
+                active_mask: 0,
+                buttons: 0,
+                left_trigger: 0,
+                right_trigger: 0,
+                left_x: 0,
+                left_y: 0,
+                right_x: 0,
+                right_y: 0,
+            })
+            .unwrap();
+        assert!(!current.push(rumble()));
+        assert_eq!(queue.peek(8).len(), 1);
+        backend.stop().unwrap();
     }
 
     #[test]

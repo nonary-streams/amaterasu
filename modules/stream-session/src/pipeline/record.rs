@@ -195,6 +195,7 @@ pub(super) struct Record {
     pub audio_encoder_layout: Option<Value>,
     pub wire_audio_bytes: usize,
     pub control_local: Option<String>,
+    control_retirement_epoch: Option<String>,
     pub video_local: Option<String>,
     pub audio_local: Option<String>,
 }
@@ -258,6 +259,31 @@ impl Record {
         });
         Ok(())
     }
+
+    /// The selected control stream's provider incarnation is useful only while
+    /// that exact owned stream remains in this record. It is not authority.
+    #[allow(dead_code)]
+    pub fn control_retirement(&self) -> Option<(u64, &str, &str)> {
+        Some((
+            *self.resources.get(&Resource::Control)?,
+            self.providers.control_transport.as_str(),
+            self.control_retirement_epoch.as_deref()?,
+        ))
+    }
+
+    pub fn retain_control_retirement_epoch(&mut self, payload: &Value) {
+        self.control_retirement_epoch = payload
+            .get("retirement_epoch")
+            .and_then(Value::as_str)
+            .filter(|epoch| {
+                epoch.len() == 32
+                    && epoch
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+            .map(str::to_owned);
+    }
+
     pub fn required_native_contract(&self, resource: Resource) -> Option<&'static str> {
         resource
             .native_contract()
@@ -393,6 +419,7 @@ impl Record {
             audio_encoder_layout: None,
             wire_audio_bytes: 0,
             control_local: None,
+            control_retirement_epoch: None,
             video_local: None,
             audio_local: None,
         }

@@ -1233,6 +1233,7 @@ impl Pipeline {
             }
             Resource::Control => {
                 record.control_local = Some(local_address(payload, "local")?);
+                record.retain_control_retirement_epoch(payload);
                 if let Some(intent) = &record.config.virtual_display_intent {
                     if intent.active() {
                         if !intent.dd_use_sunshine_virtual_display_driver {

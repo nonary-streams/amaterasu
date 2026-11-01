@@ -9,16 +9,45 @@ const HAPTICS_PCM_CAPABILITY: u32 = 0x8000;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct QueuedFeedback {
     pub sequence: u64,
+    pub device_generation: u64,
+    pub device_capabilities: u32,
     pub feedback: HostFeedback,
 }
 
-#[derive(Default)]
 struct FeedbackState {
     generation: u64,
     active: bool,
     next_sequence: u64,
     last_peeked_sequence: u64,
+    device_generation: [u64; 16],
+    device_active: [bool; 16],
     events: VecDeque<QueuedFeedback>,
+}
+
+impl Default for FeedbackState {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            active: false,
+            next_sequence: 0,
+            last_peeked_sequence: 0,
+            device_generation: [1; 16],
+            device_active: [false; 16],
+            events: VecDeque::new(),
+        }
+    }
+}
+
+impl FeedbackState {
+    fn retire_active_devices(&mut self) {
+        for slot in 0..self.device_active.len() {
+            if self.device_active[slot] {
+                self.device_active[slot] = false;
+                self.device_generation[slot] =
+                    self.device_generation[slot].checked_add(1).unwrap_or(0);
+            }
+        }
+    }
 }
 
 /// Shared between the input controller and native callback threads. Every
@@ -30,6 +59,7 @@ pub(crate) struct FeedbackQueue(Arc<Mutex<FeedbackState>>);
 impl FeedbackQueue {
     pub(crate) fn begin_lease(&self) -> u64 {
         let mut state = self.lock();
+        state.retire_active_devices();
         state.generation = state.generation.wrapping_add(1).max(1);
         state.active = true;
         state.next_sequence = 0;
@@ -40,11 +70,25 @@ impl FeedbackQueue {
 
     pub(crate) fn end_lease(&self) {
         let mut state = self.lock();
+        state.retire_active_devices();
         state.generation = state.generation.wrapping_add(1).max(1);
         state.active = false;
         state.next_sequence = 0;
         state.last_peeked_sequence = 0;
         state.events.clear();
+    }
+
+    /// Fence callbacks before detaching or reusing a slot. Previously queued
+    /// feedback remains tagged with its old incarnation until acknowledged.
+    /// A zero incarnation is permanently exhausted for this provider process.
+    pub(crate) fn retire_controller(&self, controller: u16) {
+        let mut state = self.lock();
+        let slot = usize::from(controller);
+        if slot >= state.device_active.len() || !state.device_active[slot] {
+            return;
+        }
+        state.device_active[slot] = false;
+        state.device_generation[slot] = state.device_generation[slot].checked_add(1).unwrap_or(0);
     }
 
     #[cfg(test)]
@@ -58,9 +102,22 @@ impl FeedbackQueue {
         controller: u16,
         capabilities: u32,
     ) -> FeedbackProducer {
+        let mut state = self.lock();
+        let slot = usize::from(controller);
+        let device_generation = if state.active
+            && state.generation == generation
+            && slot < state.device_active.len()
+            && state.device_generation[slot] != 0
+        {
+            state.device_active[slot] = true;
+            state.device_generation[slot]
+        } else {
+            0
+        };
         FeedbackProducer {
             queue: self.clone(),
             generation,
+            device_generation,
             controller,
             capabilities,
         }
@@ -93,20 +150,33 @@ impl FeedbackQueue {
         true
     }
 
-    fn push(&self, generation: u64, feedback: HostFeedback) -> bool {
+    fn push(
+        &self,
+        generation: u64,
+        device_generation: u64,
+        capabilities: u32,
+        feedback: HostFeedback,
+    ) -> bool {
         if encode_host_feedback(feedback.clone()).is_err() {
             return false;
         }
         let mut state = self.lock();
-        if !state.active || state.generation != generation {
+        let slot = usize::from(feedback.controller());
+        if !state.active
+            || state.generation != generation
+            || device_generation == 0
+            || slot >= state.device_active.len()
+            || !state.device_active[slot]
+            || state.device_generation[slot] != device_generation
+        {
             return false;
         }
 
         if let Some(key) = feedback.coalescing_key()
-            && let Some(index) = state
-                .events
-                .iter()
-                .position(|event| event.feedback.coalescing_key() == Some(key))
+            && let Some(index) = state.events.iter().position(|event| {
+                event.device_generation == device_generation
+                    && event.feedback.coalescing_key() == Some(key)
+            })
         {
             state.events.remove(index);
         }
@@ -130,9 +200,12 @@ impl FeedbackQueue {
             None => return false,
         };
         let sequence = state.next_sequence;
-        state
-            .events
-            .push_back(QueuedFeedback { sequence, feedback });
+        state.events.push_back(QueuedFeedback {
+            sequence,
+            device_generation,
+            device_capabilities: capabilities,
+            feedback,
+        });
         true
     }
 
@@ -147,6 +220,7 @@ impl FeedbackQueue {
 pub(crate) struct FeedbackProducer {
     queue: FeedbackQueue,
     generation: u64,
+    device_generation: u64,
     controller: u16,
     capabilities: u32,
 }
@@ -166,7 +240,12 @@ impl FeedbackProducer {
         {
             return false;
         }
-        self.queue.push(self.generation, feedback)
+        self.queue.push(
+            self.generation,
+            self.device_generation,
+            self.capabilities,
+            feedback,
+        )
     }
 }
 
@@ -285,6 +364,77 @@ mod tests {
         assert_ne!(old_generation, new_generation);
         assert!(!stale.push(rumble(1, 1, 2)));
         assert!(queue.peek(1).is_empty());
+        let current = queue.producer(new_generation, 1, 0);
+        assert!(current.push(rumble(1, 3, 4)));
+        assert_eq!(queue.peek(1)[0].device_generation, 2);
+    }
+
+    #[test]
+    fn controller_reuse_fences_old_callbacks_and_preserves_tagged_pending_feedback() {
+        let queue = FeedbackQueue::default();
+        let generation = queue.begin_lease();
+        let old = queue.producer(generation, 1, HAPTICS_PCM_CAPABILITY);
+        let other = queue.producer(generation, 2, 0);
+        assert!(old.push(rumble(1, 0, 0)));
+        assert!(other.push(rumble(2, 3, 4)));
+        let original = queue.peek(8);
+        assert_eq!(original[0].device_generation, 1);
+        assert_eq!(original[0].device_capabilities, HAPTICS_PCM_CAPABILITY);
+        queue.retire_controller(1);
+        assert!(!old.push(rumble(1, 5, 6)));
+        let replacement = queue.producer(generation, 1, 0);
+        assert!(replacement.push(rumble(1, 7, 8)));
+        let events = queue.peek(8);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].feedback, rumble(1, 0, 0));
+        assert_eq!(events[0].device_generation, 1);
+        assert_eq!(events[1].feedback, rumble(2, 3, 4));
+        assert_eq!(events[2].feedback, rumble(1, 7, 8));
+        assert_eq!(events[2].device_generation, 2);
+        assert_eq!(events[2].device_capabilities, 0);
+        assert!(!old.push(pcm(1, 1)));
+    }
+
+    #[test]
+    fn delayed_callback_cannot_enter_reused_controller_slot() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let queue = FeedbackQueue::default();
+        let generation = queue.begin_lease();
+        let old = queue.producer(generation, 3, 0);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            old.push(rumble(3, 1, 2))
+        });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        queue.retire_controller(3);
+        let current = queue.producer(generation, 3, 0);
+        assert!(current.push(rumble(3, 3, 4)));
+        resume_tx.send(()).unwrap();
+        assert!(!worker.join().unwrap());
+        let events = queue.peek(8);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].device_generation, 2);
+        assert_eq!(events[0].feedback, rumble(3, 3, 4));
+    }
+
+    #[test]
+    fn exhausted_controller_generation_fails_closed_until_provider_restart() {
+        let queue = FeedbackQueue::default();
+        let generation = queue.begin_lease();
+        let producer = queue.producer(generation, 0, 0);
+        queue.lock().device_generation[0] = u64::MAX;
+        queue.retire_controller(0);
+        assert!(!producer.push(rumble(0, 1, 2)));
+        assert!(!queue.producer(generation, 0, 0).push(rumble(0, 1, 2)));
+        let next = queue.begin_lease();
+        assert!(!queue.producer(next, 0, 0).push(rumble(0, 1, 2)));
+        let restarted = FeedbackQueue::default();
+        let new_epoch = restarted.begin_lease();
+        assert!(restarted.producer(new_epoch, 0, 0).push(rumble(0, 1, 2)));
     }
 
     #[test]

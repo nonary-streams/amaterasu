@@ -624,3 +624,14 @@ References: [Windows SendInput](https://learn.microsoft.com/en-us/windows/win32/
 [Linux uinput guide](https://kernel.org/doc/html/latest/input/uinput.html),
 [Linux v6.12 uinput UAPI](https://github.com/torvalds/linux/blob/v6.12/include/uapi/linux/uinput.h),
 [Linux v6.12 event codes](https://github.com/torvalds/linux/blob/v6.12/include/uapi/linux/input-event-codes.h).
+
+Feedback peek records include the input provider's per-slot `device_generation`
+and the producer's observed `device_capabilities`. A Linux controller arrival
+or inactive mask fences earlier callbacks for that slot. Previously queued
+feedback remains tagged with its prior generation until acknowledged or the
+input lease ends. Generations are
+process-local and must be combined with the selected input-provider boot epoch,
+input lease, lifecycle source and slot. Client-advertised capability bits are
+not authorization or proof of client, hardware or driver support. Already
+handed-off feedback still needs the source and transport retirement barrier
+outlined in [the feedback join checkpoint](../../docs/input-feedback-production-join.md).

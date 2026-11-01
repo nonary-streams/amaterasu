@@ -62,6 +62,7 @@ pub struct Broker {
     pub authenticated: bool,
     pub control_failure: Option<String>,
     pub control_status_wrong_stream: bool,
+    pub control_retirement_epoch: Option<Value>,
     pub video_close_polls: u8,
     pub video_remaining: u8,
     pub format_rate: u32,
@@ -1222,7 +1223,11 @@ impl Broker {
                 metadata
             }
             "amaterasu.control-transport/1" => {
-                json!({"ok":true,"stream":id,"local":"127.0.0.1:50003"})
+                let mut reply = json!({"ok":true,"stream":id,"local":"127.0.0.1:50003"});
+                if let Some(epoch) = &self.control_retirement_epoch {
+                    reply["retirement_epoch"] = epoch.clone();
+                }
+                reply
             }
             "amaterasu.video/1" => {
                 let mut reply = json!({"ok":true,"stream":id,"state":if allocation.state=="closing" {"closing"} else {"running"},"packet_boundaries":true});

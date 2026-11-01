@@ -1110,6 +1110,8 @@ impl<B: Backend> Controller<B> {
             .map(|event| {
                 Ok(json!({
                     "sequence": event.sequence,
+                    "device_generation": event.device_generation,
+                    "device_capabilities": event.device_capabilities,
                     "feedback": serde_json::to_value(event.feedback).map_err(|_| {
                         InputError::new("runtime_error", "feedback serialization failed")
                     })?,

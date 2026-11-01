@@ -89,6 +89,35 @@ fn extension_offer_requires_source_and_downstream_probes_then_selects_the_planne
 }
 
 #[test]
+fn selected_control_retirement_epoch_is_retained_only_with_the_owned_stream() {
+    for (offered, valid) in [
+        (json!("c".repeat(32)), true),
+        (json!("c".repeat(31)), false),
+        (json!("C".repeat(32)), false),
+        (Value::Null, false),
+    ] {
+        let mut host = Harness::new();
+        host.broker.control_retirement_epoch = Some(offered);
+        let id = host.response(1, prepare())["session"].as_u64().unwrap();
+        let record = &host.pipeline.records[&id];
+        let authority = record.control_retirement();
+        assert_eq!(authority.is_some(), valid);
+        if let Some((stream, service, epoch)) = authority {
+            assert_eq!(Some(&stream), record.resources.get(&Resource::Control));
+            assert_eq!(service, "amaterasu.control-transport/1");
+            assert_eq!(epoch, "c".repeat(32));
+        }
+        host.pipeline
+            .records
+            .get_mut(&id)
+            .unwrap()
+            .resources
+            .remove(&Resource::Control);
+        assert!(host.pipeline.records[&id].control_retirement().is_none());
+    }
+}
+
+#[test]
 fn authenticated_control_disconnect_is_confirmed_on_exact_owned_stream() {
     for (reason, expected, wrong_stream, plane_error) in [
         (
