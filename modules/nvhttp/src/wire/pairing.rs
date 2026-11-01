@@ -34,6 +34,11 @@ pub(super) struct Transcript {
     pub deadline: Instant,
 }
 
+// Moonlight abandons the exchange after checking the server proof when the PIN
+// differs. Its plaintext /unpair cannot safely identify a transcript to cancel.
+// Bound this final phase so a retry does not wait for the full approval window.
+const CLIENT_PROOF_TIMEOUT: Duration = Duration::from_secs(10);
+
 struct BeginRequest {
     pem: String,
     der: Vec<u8>,
@@ -177,7 +182,14 @@ impl Router {
         // Neither a new remote nor a replacement certificate may cancel a
         // pending client's transcript by merely copying its uniqueid.
         if self.transcripts.contains_key(client) {
-            return Some(xml::error(409, "client already has a pairing transcript"));
+            // Moonlight shows the entire request URL for an HTTP error, including
+            // the certificate. Report the conflict through the protocol XML instead.
+            let mut reply = xml::error(
+                409,
+                "A pairing attempt is still in progress. Wait a few seconds and try again.",
+            );
+            reply.status = 200;
+            return Some(reply);
         }
         if self.transcripts.len() >= 8 {
             return Some(xml::error(503, "pairing capacity exhausted"));
@@ -539,6 +551,9 @@ impl Router {
         if let Some(transcript) = self.transcripts.get_mut(client) {
             transcript.stage = next_stage;
             transcript.active = false;
+            if next_stage == Stage::ClientSecret {
+                transcript.deadline = transcript.deadline.min(now + CLIENT_PROOF_TIMEOUT);
+            }
         }
     }
 }

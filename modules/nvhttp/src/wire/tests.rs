@@ -667,11 +667,12 @@ fn foreign_peer_duplicate_begin_and_unpair_cannot_consume_a_victim_transcript() 
         )
         .unwrap();
     assert_eq!(foreign.status, 403);
-    assert_eq!(
-        dispatch(&mut router, &mut broker, 3, &begin_target(), now)
+    let duplicate = dispatch(&mut router, &mut broker, 3, &begin_target(), now).unwrap();
+    assert_eq!(duplicate.status, 200);
+    assert!(
+        String::from_utf8(duplicate.body)
             .unwrap()
-            .status,
-        409
+            .contains("status_code=\"409\"")
     );
     // Plaintext unpair is inert: it neither names a victim nor ends a transcript.
     let plaintext = dispatch(
@@ -786,6 +787,40 @@ fn timeout_closes_held_pin_request_and_cancels_the_transcript() {
             .iter()
             .any(|payload| payload["action"] == "cancel")
     );
+}
+
+#[test]
+fn abandoned_client_proof_expires_promptly_and_allows_a_new_pairing() {
+    let mut router = router();
+    let mut broker = Broker::default();
+    let now = Instant::now();
+    ready(&mut router, &mut broker, now);
+    for (field, length) in [("clientchallenge", 16), ("serverchallengeresp", 32)] {
+        let target = format!("/pair?uniqueid=client-1&{field}={}", "00".repeat(length));
+        assert!(dispatch(&mut router, &mut broker, 2, &target, now).is_none());
+        poll(&mut router, &mut broker, now);
+        assert_eq!(poll(&mut router, &mut broker, now)[0].1.status, 200);
+    }
+    let before_expiry = now + Duration::from_secs(9);
+    let duplicate = dispatch(&mut router, &mut broker, 3, &begin_target(), before_expiry).unwrap();
+    assert_eq!(duplicate.status, 200);
+    assert!(
+        String::from_utf8(duplicate.body)
+            .unwrap()
+            .contains("status_code=\"409\"")
+    );
+    let expiry = now + Duration::from_secs(10);
+    poll(&mut router, &mut broker, expiry);
+    assert!(router.transcripts.is_empty());
+    poll(&mut router, &mut broker, expiry);
+    poll(&mut router, &mut broker, expiry);
+    assert!(
+        broker
+            .accepted
+            .iter()
+            .any(|payload| payload["action"] == "cancel")
+    );
+    assert!(dispatch(&mut router, &mut broker, 4, &begin_target(), expiry).is_none());
 }
 
 #[test]
@@ -920,11 +955,12 @@ fn conflicting_phase_selectors_and_foreign_certificate_do_not_advance() {
     let replacement =
         pem_rfc7468::encode_string("CERTIFICATE", pem_rfc7468::LineEnding::LF, &[9, 9, 9]).unwrap();
     let duplicate = begin_target().replace(&hex(pem().as_bytes()), &hex(replacement.as_bytes()));
-    assert_eq!(
-        dispatch(&mut router, &mut broker, 3, &duplicate, now)
+    let duplicate_reply = dispatch(&mut router, &mut broker, 3, &duplicate, now).unwrap();
+    assert_eq!(duplicate_reply.status, 200);
+    assert!(
+        String::from_utf8(duplicate_reply.body)
             .unwrap()
-            .status,
-        409
+            .contains("status_code=\"409\"")
     );
     let phase = format!(
         "/pair?uniqueid=client-1&clientchallenge={}&clientcert={}",

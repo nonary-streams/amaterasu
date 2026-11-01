@@ -437,7 +437,7 @@ BMP noncharacters U+FFFE/U+FFFF and controls.
   An untrusted TLS peer gets 401. Query fields other than `uniqueid` and `uuid` are
   rejected. moonlight-qt calls only the plaintext form, to clean up failed pairings
   (`nvpairingmanager.cpp:248-366`); a pairing transcript that the client abandoned
-  therefore expires on its own after 120 seconds.
+  therefore expires on its own. The PIN approval window is up to 120 seconds; after the server proof is sent, the client has at most 10 seconds to finish its proof, allowing a prompt retry after an incorrect PIN.
 - `/resume` requires trusted paired TLS and complete launch metadata. It resumes
   an enabled Desktop session owned by that certificate by retiring its RTSP session
   and opening a fresh encrypted ticket. Catalog application resume remains unsupported.
