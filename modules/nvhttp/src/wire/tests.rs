@@ -1295,3 +1295,5 @@ fn denied_launch_permission_blocks_known_ids_and_resume_before_work() {
     }
     assert!(broker.accepted.is_empty());
 }
+
+mod real_selected_composition;
