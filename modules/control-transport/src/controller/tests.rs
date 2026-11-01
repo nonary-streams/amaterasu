@@ -322,7 +322,7 @@ fn whole_stream_retirement_waits_for_inflight_socket_handoff() {
         .as_str()
         .unwrap()
         .to_owned();
-    let (entered_tx, entered_rx) = mpsc::channel();
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
     let (resume_tx, resume_rx) = mpsc::channel();
     let stream = controller.streams.get_mut(&id).unwrap();
     stream

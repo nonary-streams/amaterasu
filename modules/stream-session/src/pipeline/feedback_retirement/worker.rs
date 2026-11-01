@@ -559,6 +559,7 @@ mod tests {
         Cancel,
         GlobalBefore,
         GlobalDuring,
+        Concurrent,
     }
 
     /// The pairing ledger, broker and control provider are real. Lifecycle and
@@ -580,6 +581,21 @@ mod tests {
         control
             .stage_feedback("effect", stream, receiver.local_addr().unwrap())
             .unwrap();
+        let mut blocked_send = if scenario == CombinedScenario::Concurrent {
+            let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+            let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+            control
+                .pause_local_send("effect", stream, entered_tx, resume_rx)
+                .unwrap();
+            let mut ticking = control.clone();
+            let thread = std::thread::spawn(move || ticking.tick());
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            Some((resume_tx, thread))
+        } else {
+            None
+        };
         let selected_scope = |slot| {
             let mut selected = scope(slot);
             selected.transport_service = "amaterasu.control-transport/1".into();
@@ -765,7 +781,45 @@ mod tests {
                 let action = payload["action"].as_str().unwrap();
                 let result = if action == "retire" {
                     provider_receipts += 1;
-                    control.handle("effect", payload.clone())
+                    if scenario == CombinedScenario::Concurrent {
+                        assert_eq!(gate.pending_source_retirements(), 2);
+                        let mut retiring = control.clone();
+                        let request = payload.clone();
+                        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+                        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+                        let retire_thread = std::thread::spawn(move || {
+                            started_tx.send(()).unwrap();
+                            finished_tx
+                                .send(retiring.handle("effect", request))
+                                .unwrap();
+                        });
+                        started_rx
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .unwrap();
+                        assert!(
+                            finished_rx.try_recv().is_err(),
+                            "retirement cannot pass the blocked send"
+                        );
+                        assert!(matches!(
+                            broker.dispatch(
+                                "input",
+                                Command::TakeResult {
+                                    request: input_request
+                                }
+                            ),
+                            Response::Pending
+                        ));
+                        let (resume, thread) = blocked_send.take().expect("blocked local send");
+                        resume.send(()).unwrap();
+                        thread.join().unwrap();
+                        let receipt = finished_rx
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .unwrap();
+                        retire_thread.join().unwrap();
+                        receipt
+                    } else {
+                        control.handle("effect", payload.clone())
+                    }
                 } else {
                     apply_pairing(&mut gate, &payload)
                 };
@@ -884,7 +938,18 @@ mod tests {
             assert!(!gate.drain_required());
         }
         control.tick();
-        let mut buffer = [0u8; 64];
+        let mut buffer = [0u8; 2048];
+        if scenario == CombinedScenario::Concurrent {
+            let mut before_ack = 0;
+            while receiver.recv_from(&mut buffer).is_ok() {
+                before_ack += 1;
+            }
+            assert!(
+                before_ack > 0,
+                "the blocked send completed before retirement"
+            );
+            control.tick();
+        }
         assert_eq!(
             receiver.recv_from(&mut buffer).unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
@@ -913,6 +978,12 @@ mod tests {
         if scenario == CombinedScenario::GlobalBefore {
             gate.recover("replacement-owner").unwrap();
             assert!(gate.require_epoch(&epoch).is_err());
+        }
+    }
+    #[test]
+    fn concurrent_feedback_send_and_retirement_are_bounded_and_ordered() {
+        for _ in 0..8 {
+            run_combined(CombinedScenario::Concurrent);
         }
     }
     #[test]

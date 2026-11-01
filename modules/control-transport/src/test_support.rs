@@ -7,8 +7,9 @@ use amaterasu_module_sdk::network::Network;
 use serde_json::{Value, json};
 use std::net::SocketAddr;
 
+#[derive(Clone)]
 pub struct ControlFixture {
-    controller: Controller,
+    controller: std::sync::Arc<std::sync::Mutex<Controller>>,
 }
 impl ControlFixture {
     pub fn new(owner: &str) -> Self {
@@ -19,7 +20,10 @@ impl ControlFixture {
             allowed_principals: vec![owner.into()],
         };
         Self {
-            controller: Controller::with_network(settings, Network::test_provider()),
+            controller: std::sync::Arc::new(std::sync::Mutex::new(Controller::with_network(
+                settings,
+                Network::test_provider(),
+            ))),
         }
     }
     pub fn open(&mut self, owner: &str) -> Result<Value, &'static str> {
@@ -29,6 +33,8 @@ impl ControlFixture {
         let operation: Operation =
             serde_json::from_value(payload).map_err(|_| "invalid_request")?;
         self.controller
+            .lock()
+            .map_err(|_| "control_state_unavailable")?
             .handle(owner, operation)
             .map(|reply| reply.payload)
     }
@@ -39,10 +45,24 @@ impl ControlFixture {
         destination: SocketAddr,
     ) -> Result<(), &'static str> {
         self.controller
+            .lock()
+            .map_err(|_| "control_state_unavailable")?
             .stage_feedback_for_test(owner, stream, destination)
     }
+    pub fn pause_local_send(
+        &mut self,
+        owner: &str,
+        stream: u64,
+        entered: std::sync::mpsc::SyncSender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) -> Result<(), &'static str> {
+        self.controller
+            .lock()
+            .map_err(|_| "control_state_unavailable")?
+            .pause_local_send_for_test(owner, stream, entered, resume)
+    }
     pub fn tick(&mut self) {
-        self.controller.tick();
+        self.controller.lock().expect("test controller").tick();
     }
 }
 

@@ -72,6 +72,23 @@ impl Controller {
         Ok(())
     }
 
+    #[cfg(feature = "test-support")]
+    pub(crate) fn pause_local_send_for_test(
+        &mut self,
+        owner: &str,
+        id: u64,
+        entered: std::sync::mpsc::SyncSender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) -> ControlResult<()> {
+        let stream = self
+            .streams
+            .get_mut(&id)
+            .filter(|stream| stream.owner == owner)
+            .ok_or("stream_not_found")?;
+        stream.pause_local_send_for_test(entered, resume);
+        Ok(())
+    }
+
     pub fn handle(&mut self, owner: &str, operation: Operation) -> ControlResult<Reply> {
         let (payload, created) = match operation {
             Operation::Open(request) => return self.open(owner, request),
