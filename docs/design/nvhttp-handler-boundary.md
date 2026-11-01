@@ -33,3 +33,39 @@ area is defining named entitlement checks; integration must use its final
 interface and preserve compatibility rather than treating pairing or an
 unrelated List/Launch permission as authorization. Stream ownership checks
 remain a separate service concern and are not claimed by this boundary.
+
+## Shared participant invocation for protocol and launch
+
+Use the existing installed `ApiMethodApproval` and `Command::CallApi` for each
+participant: the runtime binds the exact service, provider principal, method,
+interface major/minor, callers, and coarse schemas, and enforces call grants.
+The protocol owner's trusted startup configuration binds a wire operation to
+that approved method and its required entitlement. The remote client never
+selects a service, method, entitlement, recipient, or schema. Duplicate
+method/path claims and built-in route collisions fail startup. Unknown requests
+remain denied. A typed broker approval is not an entitlement and is not a
+native-code sandbox.
+
+Launch can invoke multiple independently approved methods through this same
+boundary. Trusted composition additionally binds each participant's output
+namespace and version to the already selected consumer. Launch must check
+those bindings and validate all replies before effects; the HTTP response
+envelope is not a launch-option schema. No separate hook or router is needed.
+The existing selected-consumer contract and launch snapshot own projection and
+lifetime; defining or implementing that projection is outside this change.
+
+The earlier single-service wording above is refined here: the `CallApi` method
+is the selected participant, as authorized by the broker approval, rather than
+an untyped service call. The existing hook registry is not suitable for this
+request path without further changes: ordinary hooks have no lost-acceptance
+lookup, and idempotent `RunHookOperation` identities are retained for the
+broker lifetime with a limit of 512. The request broker instead retains normal
+operation identities temporarily; retries must use identical operation data,
+recover the accepted ID, and cancel/release it on timeout or disconnect. A
+cancel request cannot undo a handler effect that has already begun.
+
+Identity commit `d8d955b5` adds ABI 1.2 `check_entitlement(certificate, name)`.
+Only an OK status authorizes; the caller independently verifies TLS possession
+and binds each operation to the entitlement. NVHTTP must recheck at admission,
+while pending, and at reply delivery. This branch is based on the original
+baseline and requires integration with that commit before using the new table.
