@@ -17,7 +17,7 @@ use source_feedback::{Progress as SourceFeedbackProgress, SourceFeedbackPending}
 
 use amaterasu_gamestream::control::{
     FeedbackEncodeError, HostFeedback, HostFeedbackDelivery, HostFeedbackMessage,
-    encode_host_feedback,
+    PhaseOffsetFeedback, encode_host_feedback,
 };
 use amaterasu_media::*;
 use amaterasu_module_sdk::RuntimeClient;
@@ -232,6 +232,38 @@ impl Plane {
         self.pump.backend.send_rumble(command)
     }
 
+    /// Routes an authenticated phase observation only through this session's
+    /// selected negotiated-video provider and clock epoch.
+    pub fn submit_phase_offset(
+        &mut self,
+        control_sequence: u64,
+        feedback: PhaseOffsetFeedback,
+    ) -> PlaneResult<bool> {
+        if self.pump.stopping || self.pump.failure.is_some() {
+            return Ok(false);
+        }
+        let Some(selection) = self.pump.negotiated_video else {
+            return Ok(false);
+        };
+        if self
+            .pump
+            .last_phase_control_sequence
+            .is_some_and(|previous| control_sequence <= previous)
+            || feedback.offset_us.unsigned_abs() > MAX_VIDEO_PHASE_OFFSET_US as u32
+        {
+            return Ok(false);
+        }
+        let accepted = self.pump.backend.submit_phase_offset(
+            &selection,
+            control_sequence,
+            feedback.offset_us,
+        )?;
+        if accepted {
+            self.pump.last_phase_control_sequence = Some(control_sequence);
+        }
+        Ok(accepted)
+    }
+
     /// Transfers one event into this session's bounded queue. `Queued` means the
     /// plane owns it; it does not mean the transport or client accepted it.
     #[allow(dead_code)] // The coordinator-owned Input poll call site is landing separately.
@@ -322,6 +354,14 @@ trait Backend {
     }
     fn control(&mut self) -> PlaneResult<Option<ControlRecord>>;
     fn send_feedback(&mut self, message: &HostFeedbackMessage) -> PlaneResult<bool>;
+    fn submit_phase_offset(
+        &mut self,
+        _selection: &VideoUnitSelection,
+        _control_sequence: u64,
+        _offset_us: i32,
+    ) -> PlaneResult<bool> {
+        Ok(false)
+    }
     fn feedback_stream(&self) -> Option<u64> {
         None
     }
@@ -387,6 +427,7 @@ struct Pump<B> {
     audio_recovery_needed: bool,
     last_accepted_video_sequence: Option<u64>,
     last_video_unit_timestamp: Option<u64>,
+    last_phase_control_sequence: Option<u64>,
 }
 
 impl<B: Backend> Pump<B> {
@@ -420,6 +461,7 @@ impl<B: Backend> Pump<B> {
             audio_recovery_needed: false,
             last_accepted_video_sequence: None,
             last_video_unit_timestamp: None,
+            last_phase_control_sequence: None,
         }
     }
 

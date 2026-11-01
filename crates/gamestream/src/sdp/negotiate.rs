@@ -5,7 +5,10 @@ use super::{
     KNOWN_CLIENT_FEATURE_FLAGS, Video,
 };
 use amaterasu_contracts::encoder::{DynamicRange, VideoCodec, VideoStreamFormat};
-use amaterasu_contracts::media_profile::{FormatId, VideoProfile, VideoProfileSnapshot};
+use amaterasu_contracts::media_profile::{
+    ChromaSampling, FormatId, VideoMediaFormat, VideoProfile, VideoProfileAttributePhase,
+    VideoProfileSnapshot,
+};
 
 /// Parse an explicit peer acceptance of one metadata schema and selector.
 /// It is never inferred from a codec marker or a host-side provider claim.
@@ -73,21 +76,91 @@ pub fn parse_profile_announce(
             .ok_or(Error::Invalid("video codec"))?;
         if selector < 3 {
             let format = video_format(attributes)?;
+            if chroma_sampling(attributes)? != ChromaSampling::Yuv420 {
+                return Err(Error::Unsupported("YUV444 video"));
+            }
             return Ok((
                 NegotiatedVideoFormat::Standard(format),
                 format.codec == VideoCodec::Hevc,
             ));
         }
+        attributes.required("x-nv-vqos[0].bitStreamFormat")?;
+        let dynamic_range_mode = bounded(
+            attributes.required("x-nv-video[0].dynamicRangeMode")?,
+            0,
+            1,
+            "video dynamic range",
+        )?;
+        let chroma = chroma_sampling(attributes)?;
+        let expected = profile.media_format.unwrap_or_default();
+        let dynamic_range = if dynamic_range_mode == 1 {
+            DynamicRange::Hdr
+        } else {
+            DynamicRange::Sdr
+        };
+        let media_format = VideoMediaFormat {
+            bit_depth: if dynamic_range == DynamicRange::Hdr {
+                10
+            } else {
+                8
+            },
+            dynamic_range,
+            chroma_sampling: chroma,
+        };
         let profile = offer
             .profiles
             .iter()
-            .find(|profile| profile.wire_selector == selector)
-            .ok_or(Error::Unsupported("video codec"))?
+            .find(|profile| {
+                profile.wire_selector == selector
+                    && profile.media_format.unwrap_or_default() == media_format
+                    && profile.wire_attributes.iter().all(|attribute| {
+                        if attribute.phase != VideoProfileAttributePhase::Announce {
+                            return true;
+                        }
+                        attributes
+                            .0
+                            .get(attribute.name.as_str())
+                            .is_some_and(|actual| {
+                                attribute
+                                    .value
+                                    .as_deref()
+                                    .is_none_or(|expected| expected == *actual)
+                            })
+                    })
+            })
+            .ok_or(Error::Unsupported("video profile format"))?
             .clone();
-        attributes.required("x-nv-vqos[0].bitStreamFormat")?;
-        attributes.require_value("x-nv-video[0].dynamicRangeMode", 0)?;
+        for attribute in profile
+            .wire_attributes
+            .iter()
+            .filter(|attribute| attribute.phase == VideoProfileAttributePhase::Announce)
+        {
+            let Some(actual) = attributes.0.remove(attribute.name.as_str()) else {
+                return Err(Error::Missing("video profile attribute"));
+            };
+            if attribute
+                .value
+                .as_deref()
+                .is_some_and(|expected| expected != actual)
+            {
+                return Err(Error::Unsupported("video profile attribute"));
+            }
+        }
         Ok((NegotiatedVideoFormat::Extension(profile), false))
     })
+}
+
+fn chroma_sampling(attributes: &mut Attributes<'_>) -> Result<ChromaSampling, Error> {
+    match bounded(
+        attributes.default("x-ss-video[0].chromaSamplingType", 0)?,
+        0,
+        1,
+        "chroma sampling",
+    )? {
+        0 => Ok(ChromaSampling::Yuv420),
+        1 => Ok(ChromaSampling::Yuv444),
+        _ => unreachable!("bounded chroma sampling has two values"),
+    }
 }
 
 fn parse_with<T>(
@@ -145,7 +218,7 @@ fn video<T>(attributes: &mut Attributes<'_>, format: T, is_hevc: bool) -> Result
     if is_hevc && client_hevc != 1 {
         return Err(Error::Unsupported("HEVC support"));
     }
-    attributes.default_value("x-ss-video[0].chromaSamplingType", 0)?;
+    let _ = chroma_sampling(attributes)?;
     attributes.default_value("x-ss-video[0].intraRefresh", 0)?;
     const SLICES_PER_FRAME: &str = "x-nv-video[0].videoEncoderSlicesPerFrame";
     let slices_per_frame = bounded(

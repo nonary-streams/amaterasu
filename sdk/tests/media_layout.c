@@ -7,6 +7,11 @@ _Static_assert(offsetof(AmaterasuFrameMetadataCapabilitiesApiV1_2, pin_generatio
 _Static_assert(sizeof(AmaterasuVideoMetadataAdmissionSinkV1) == 16, "admission sink layout");
 _Static_assert(sizeof(AmaterasuNegotiatedVideoApiV1_2) == 80, "video admission table layout");
 _Static_assert(offsetof(AmaterasuNegotiatedVideoApiV1_2, admit_metadata) == sizeof(AmaterasuNegotiatedVideoApiV1_1), "video table prefix");
+_Static_assert(sizeof(AmaterasuVideoPhaseOffsetFeedbackV1) == 48, "video phase feedback layout");
+_Static_assert(offsetof(AmaterasuVideoPhaseOffsetFeedbackV1, clock_epoch) == 16, "video phase epoch offset");
+_Static_assert(offsetof(AmaterasuVideoPhaseOffsetFeedbackV1, control_sequence) == 32, "video phase sequence offset");
+_Static_assert(sizeof(AmaterasuNegotiatedVideoApiV1_3) == 88, "video phase feedback table layout");
+_Static_assert(offsetof(AmaterasuNegotiatedVideoApiV1_3, submit_phase_offset) == sizeof(AmaterasuNegotiatedVideoApiV1_2), "video phase feedback tail");
 _Static_assert(sizeof(AmaterasuCaptureSwapRequest) == 56, "capture swap request layout");
 _Static_assert(sizeof(AmaterasuCaptureEventSink) == 32, "capture notification sink layout");
 _Static_assert(sizeof(AmaterasuCaptureApiV1_7) == 112, "capture event table layout");

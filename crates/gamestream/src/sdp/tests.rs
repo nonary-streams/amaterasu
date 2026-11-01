@@ -1,5 +1,9 @@
 use super::*;
 use amaterasu_contracts::encoder::{DynamicRange, VideoCodec, VideoStreamFormat};
+use amaterasu_contracts::media_profile::{
+    ChromaSampling, FormatId, VideoMediaFormat, VideoProfile, VideoProfileAttribute,
+    VideoProfileAttributePhase, VideoProfileSnapshot,
+};
 const FIXTURE: &str = include_str!("fixtures/moonlight-h264.sdp");
 
 fn changed(name: &str, value: &str) -> String {
@@ -29,6 +33,183 @@ fn all_support() -> TransportSupport {
         encrypted_audio: true,
         fec: true,
     }
+}
+
+fn pyrowave_profile(media_format: VideoMediaFormat) -> VideoProfile {
+    VideoProfile {
+        codec: FormatId {
+            namespace_id: 42,
+            value: 3,
+            schema: 1,
+        },
+        framing: FormatId {
+            namespace_id: 42,
+            value: 4,
+            schema: 1,
+        },
+        wire_selector: 3,
+        payload_type: 99,
+        encoding_name: "PYROWAVE".into(),
+        media_format: Some(media_format),
+        wire_attributes: vec![
+            VideoProfileAttribute {
+                phase: VideoProfileAttributePhase::Describe,
+                name: "x-ss-pyrowave.bitstream".into(),
+                value: Some("186f0393".into()),
+            },
+            VideoProfileAttribute {
+                phase: VideoProfileAttributePhase::Announce,
+                name: "x-ss-video[0].pyrowaveFeatures".into(),
+                value: Some("1".into()),
+            },
+            VideoProfileAttribute {
+                phase: VideoProfileAttributePhase::Announce,
+                name: "x-ss-video[0].pyrowaveAdaptiveFec".into(),
+                value: None,
+            },
+        ],
+    }
+}
+
+fn pyrowave_announce(dynamic_range_mode: u32, chroma_sampling: u32) -> String {
+    let mut announce = changed("x-nv-vqos[0].bitStreamFormat", "3")
+        .replace(
+            "a=x-nv-video[0].dynamicRangeMode:0 ",
+            &format!("a=x-nv-video[0].dynamicRangeMode:{dynamic_range_mode} "),
+        )
+        .replace(
+            "a=x-ss-video[0].chromaSamplingType:0 ",
+            &format!("a=x-ss-video[0].chromaSamplingType:{chroma_sampling} "),
+        );
+    announce.push_str("a=x-ss-video[0].pyrowaveFeatures:1\r\n");
+    announce.push_str("a=x-ss-video[0].pyrowaveAdaptiveFec:1\r\n");
+    announce
+}
+
+#[test]
+fn pyrowave_profile_vectors_negotiate_exact_depth_range_and_chroma() {
+    let vectors = [
+        (VideoMediaFormat::default(), 0, 0),
+        (
+            VideoMediaFormat {
+                bit_depth: 8,
+                dynamic_range: DynamicRange::Sdr,
+                chroma_sampling: ChromaSampling::Yuv444,
+            },
+            0,
+            1,
+        ),
+        (
+            VideoMediaFormat {
+                bit_depth: 10,
+                dynamic_range: DynamicRange::Hdr,
+                chroma_sampling: ChromaSampling::Yuv420,
+            },
+            1,
+            0,
+        ),
+        (
+            VideoMediaFormat {
+                bit_depth: 10,
+                dynamic_range: DynamicRange::Hdr,
+                chroma_sampling: ChromaSampling::Yuv444,
+            },
+            1,
+            1,
+        ),
+    ];
+
+    let offer = VideoProfileSnapshot {
+        profiles: vectors
+            .iter()
+            .map(|(media_format, _, _)| pyrowave_profile(*media_format))
+            .collect(),
+    };
+    assert!(offer.validate());
+
+    for (media_format, dynamic_range, chroma) in vectors {
+        let profile = pyrowave_profile(media_format);
+        let announce = pyrowave_announce(dynamic_range, chroma);
+        let parsed = parse_profile_announce(announce.as_bytes(), &offer).unwrap();
+        assert_eq!(
+            parsed.video.format,
+            NegotiatedVideoFormat::Extension(profile)
+        );
+        assert_eq!(parsed.video.color, ColorMode::Bt709Limited);
+        assert_eq!(
+            parse_announce(announce.as_bytes()),
+            Err(Error::Unsupported("video codec")),
+            "standard clients cannot select extension selector 3"
+        );
+    }
+}
+
+#[test]
+fn profile_negotiation_rejects_unoffered_media_modes_and_malformed_values() {
+    let profile = pyrowave_profile(VideoMediaFormat::default());
+    let offer = VideoProfileSnapshot {
+        profiles: vec![profile],
+    };
+    for announce in [
+        pyrowave_announce(0, 1),
+        pyrowave_announce(1, 0),
+        pyrowave_announce(2, 0),
+        pyrowave_announce(0, 2),
+        changed("x-nv-vqos[0].bitStreamFormat", "4"),
+    ] {
+        assert!(parse_profile_announce(announce.as_bytes(), &offer).is_err());
+    }
+
+    let invalid_media = pyrowave_profile(VideoMediaFormat {
+        bit_depth: 10,
+        dynamic_range: DynamicRange::Sdr,
+        chroma_sampling: ChromaSampling::Yuv420,
+    });
+    assert!(
+        !VideoProfileSnapshot {
+            profiles: vec![invalid_media],
+        }
+        .validate()
+    );
+}
+
+#[test]
+fn profile_negotiation_requires_its_announced_framing_features() {
+    let offer = VideoProfileSnapshot {
+        profiles: vec![pyrowave_profile(VideoMediaFormat::default())],
+    };
+    let exact = pyrowave_announce(0, 0);
+    for announce in [
+        exact.replace("a=x-ss-video[0].pyrowaveAdaptiveFec:1\r\n", ""),
+        exact.replace(
+            "a=x-ss-video[0].pyrowaveFeatures:1\r\n",
+            "a=x-ss-video[0].pyrowaveFeatures:0\r\n",
+        ),
+    ] {
+        assert!(parse_profile_announce(announce.as_bytes(), &offer).is_err());
+    }
+    assert!(parse_profile_announce(exact.as_bytes(), &offer).is_ok());
+}
+
+#[test]
+fn profile_snapshot_rejects_unbounded_or_reserved_wire_attributes() {
+    let mut profile = pyrowave_profile(VideoMediaFormat::default());
+    profile.wire_attributes[0].value = Some("186f0393\r\na=rtpmap:98 AV1/90000".into());
+    assert!(
+        !VideoProfileSnapshot {
+            profiles: vec![profile.clone()],
+        }
+        .validate()
+    );
+
+    profile.wire_attributes[0].value = Some("186f0393".into());
+    profile.wire_attributes[0].name = "x-nv-vqos[0].bitStreamFormat".into();
+    assert!(
+        !VideoProfileSnapshot {
+            profiles: vec![profile],
+        }
+        .validate()
+    );
 }
 
 #[test]

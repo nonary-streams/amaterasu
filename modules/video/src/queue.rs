@@ -6,7 +6,7 @@ use amaterasu_media::{
     FRAME_CLOCK_STREAM_RELATIVE, FrameClockMetadata, MAX_PACKET_BYTES, MAX_VIDEO_ACCESS_UNIT_BYTES,
     MAX_VIDEO_ACCESS_UNIT_FRAGMENTS, MEDIA_BUSY, MEDIA_CLOSED, MEDIA_PENDING, NegotiatedVideoUnit,
     NegotiatedVideoUnitSink, PacketSink, VIDEO_UNIT_END_OF_STREAM, VIDEO_UNIT_KEYFRAME,
-    VIDEO_UNIT_VERSION,
+    VIDEO_UNIT_VERSION, VideoPhaseOffsetFeedbackV1,
 };
 use amaterasu_module_sdk::abi::{BorrowedBytes, STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
 use amaterasu_module_sdk::media::metadata::{
@@ -77,6 +77,8 @@ struct UnitMetadata {
 
 struct UnitQueue {
     selection: UnitSelection,
+    last_phase_control_sequence: Option<u64>,
+    pending_phase_offset: Option<VideoPhaseOffsetFeedbackV1>,
     current: Option<Unit>,
     ready: VecDeque<Unit>,
     bytes: usize,
@@ -235,6 +237,8 @@ impl Queues {
         }
         stream.negotiated = Some(UnitQueue {
             selection,
+            last_phase_control_sequence: None,
+            pending_phase_offset: None,
             current: None,
             ready: VecDeque::new(),
             bytes: 0,
@@ -244,6 +248,55 @@ impl Queues {
             failed: false,
         });
         Ok(())
+    }
+
+    /// Accepts one authenticated client pacing hint into bounded per-stream
+    /// storage. Replacing the pending hint keeps control bursts from growing a
+    /// queue and the epoch check prevents cross-session policy changes.
+    pub fn submit_phase_offset(
+        &mut self,
+        owner: &str,
+        id: u64,
+        feedback: VideoPhaseOffsetFeedbackV1,
+    ) -> Result<(), Status> {
+        let stream = self
+            .streams
+            .get_mut(&id)
+            .filter(|stream| stream.owner == owner)
+            .ok_or(MEDIA_CLOSED)?;
+        let queue = stream.negotiated.as_mut().ok_or(MEDIA_UNSUPPORTED)?;
+        feedback.validate(queue.selection.generation, queue.selection.clock_epoch)?;
+        if queue
+            .last_phase_control_sequence
+            .is_some_and(|previous| feedback.control_sequence <= previous)
+        {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        queue.last_phase_control_sequence = Some(feedback.control_sequence);
+        queue.pending_phase_offset = Some(feedback);
+        Ok(())
+    }
+
+    /// Delivers only feedback matching the stream's currently selected route.
+    pub fn take_phase_offset(
+        &mut self,
+        owner: &str,
+        id: u64,
+        generation: u64,
+        clock_epoch: [u8; 16],
+    ) -> Option<VideoPhaseOffsetFeedbackV1> {
+        let stream = self
+            .streams
+            .get_mut(&id)
+            .filter(|stream| stream.owner == owner)?;
+        let queue = stream.negotiated.as_mut()?;
+        if queue.selection.stream != id
+            || queue.selection.generation != generation
+            || queue.selection.clock_epoch != clock_epoch
+        {
+            return None;
+        }
+        queue.pending_phase_offset.take()
     }
 
     pub(crate) fn configure_metadata(
@@ -751,6 +804,102 @@ mod tests {
     use super::*;
     use amaterasu_media::CODEC_H264;
     use std::ffi::c_void;
+
+    fn phase_selection(stream: u64, generation: u64, clock_epoch: [u8; 16]) -> UnitSelection {
+        UnitSelection {
+            stream,
+            generation,
+            offer_id: 3,
+            source_id: 4,
+            config_generation: 5,
+            codec: EncoderFormatId {
+                namespace_id: 42,
+                value: 6,
+                schema: 1,
+            },
+            framing: EncoderFormatId {
+                namespace_id: 42,
+                value: 7,
+                schema: 1,
+            },
+            clock_epoch,
+        }
+    }
+
+    fn phase_feedback(
+        generation: u64,
+        clock_epoch: [u8; 16],
+        control_sequence: u64,
+        offset_us: i32,
+    ) -> VideoPhaseOffsetFeedbackV1 {
+        VideoPhaseOffsetFeedbackV1 {
+            size: std::mem::size_of::<VideoPhaseOffsetFeedbackV1>() as u32,
+            version: 1,
+            generation,
+            clock_epoch,
+            control_sequence,
+            offset_us,
+            reserved: 0,
+        }
+    }
+
+    #[test]
+    fn phase_feedback_is_bounded_to_the_active_owner_generation_and_epoch() {
+        let mut queues = Queues::default();
+        queues.open(1, "alice", 0);
+        queues.open(2, "alice", 0);
+        queues
+            .configure_units(1, phase_selection(1, 7, [1; 16]))
+            .unwrap();
+        queues
+            .configure_units(2, phase_selection(2, 8, [2; 16]))
+            .unwrap();
+
+        assert_eq!(
+            queues.submit_phase_offset("bob", 1, phase_feedback(7, [1; 16], 1, 500)),
+            Err(MEDIA_CLOSED)
+        );
+        assert_eq!(
+            queues.submit_phase_offset("alice", 1, phase_feedback(8, [1; 16], 1, 500)),
+            Err(STATUS_INVALID_ARGUMENT)
+        );
+        assert_eq!(
+            queues.submit_phase_offset("alice", 1, phase_feedback(7, [2; 16], 1, 500)),
+            Err(STATUS_INVALID_ARGUMENT)
+        );
+        assert_eq!(
+            queues.submit_phase_offset(
+                "alice",
+                1,
+                phase_feedback(7, [1; 16], 1, MAX_VIDEO_PHASE_OFFSET_US + 1),
+            ),
+            Err(STATUS_INVALID_ARGUMENT)
+        );
+        assert_eq!(
+            queues.submit_phase_offset("alice", 1, phase_feedback(7, [1; 16], 0, 500)),
+            Err(STATUS_INVALID_ARGUMENT)
+        );
+
+        let accepted = phase_feedback(7, [1; 16], 1, 500);
+        assert_eq!(queues.submit_phase_offset("alice", 1, accepted), Ok(()));
+        assert!(queues.take_phase_offset("alice", 1, 8, [1; 16]).is_none());
+        assert!(queues.take_phase_offset("alice", 1, 7, [2; 16]).is_none());
+        assert_eq!(
+            queues.take_phase_offset("alice", 1, 7, [1; 16]),
+            Some(accepted)
+        );
+        assert_eq!(
+            queues.submit_phase_offset("alice", 1, accepted),
+            Err(STATUS_INVALID_ARGUMENT)
+        );
+
+        let foreign_stream_feedback = phase_feedback(7, [1; 16], 2, -250);
+        assert_eq!(
+            queues.submit_phase_offset("alice", 2, foreign_stream_feedback),
+            Err(STATUS_INVALID_ARGUMENT)
+        );
+    }
+
     unsafe extern "C" fn reject(_: *mut c_void, _: *const EncodedPacket) -> Status {
         MEDIA_BUSY
     }

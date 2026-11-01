@@ -480,6 +480,8 @@ fn exercise_managed_plane(external_framer: *const NativeServiceFactory, marker: 
             wire_selector: 9,
             payload_type: 99,
             encoding_name: "TEST9".into(),
+            media_format: None,
+            wire_attributes: Vec::new(),
         },
         video_service: "test.units/1".into(),
         framer_service: "test.framer/1".into(),

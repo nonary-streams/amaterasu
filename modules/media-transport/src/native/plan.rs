@@ -295,6 +295,8 @@ mod tests {
             wire_selector: 4,
             payload_type: 100,
             encoding_name: "EXAMPLE".into(),
+            media_format: None,
+            wire_attributes: Vec::new(),
         };
         let settings = Settings {
             enabled: true,
@@ -524,6 +526,8 @@ mod tests {
             wire_selector: 4,
             payload_type: 100,
             encoding_name: "EXAMPLE".into(),
+            media_format: None,
+            wire_attributes: Vec::new(),
         };
         let schema = FormatId {
             namespace_id: 1,

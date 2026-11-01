@@ -26,7 +26,7 @@ use crate::{
         TickFailure as PlaneFailure,
     },
 };
-use amaterasu_gamestream::control::HostFeedback;
+use amaterasu_gamestream::control::{HostFeedback, PhaseOffsetFeedback};
 use amaterasu_module_sdk::{Command, ModuleResult, Response, RuntimeClient};
 use record::{Record, Resource, State, error};
 use rpc::Send;
@@ -40,6 +40,13 @@ use workflow::{Job, Step};
 trait Drive {
     fn tick(&mut self, media_active: bool) -> Result<PlaneProgress, PlaneFailure>;
     fn send_rumble(&mut self, command: crate::plane::RumbleCommand) -> Result<bool, &'static str>;
+    fn submit_phase_offset(
+        &mut self,
+        _control_sequence: u64,
+        _feedback: PhaseOffsetFeedback,
+    ) -> Result<bool, &'static str> {
+        Ok(false)
+    }
     fn stop(&mut self);
     fn is_drained(&self) -> bool;
     fn recover_audio(&mut self);
@@ -61,6 +68,13 @@ impl Drive for Plane {
     }
     fn send_rumble(&mut self, command: crate::plane::RumbleCommand) -> Result<bool, &'static str> {
         Plane::send_rumble(self, command)
+    }
+    fn submit_phase_offset(
+        &mut self,
+        control_sequence: u64,
+        feedback: PhaseOffsetFeedback,
+    ) -> Result<bool, &'static str> {
+        Plane::submit_phase_offset(self, control_sequence, feedback)
     }
     fn stop(&mut self) {
         Plane::stop(self);
@@ -1057,6 +1071,19 @@ impl Pipeline {
                                     now,
                                 ) {
                                     input::stop_for_input_failure(record, code);
+                                }
+                            }
+                            Message::PhaseOffset(feedback) => {
+                                let accepted = record
+                                    .plane
+                                    .as_mut()
+                                    .and_then(|plane| {
+                                        plane.submit_phase_offset(event.sequence, feedback).ok()
+                                    })
+                                    .unwrap_or(false);
+                                if !accepted {
+                                    record.unsupported_controls =
+                                        record.unsupported_controls.saturating_add(1);
                                 }
                             }
                             Message::Ping { .. } | Message::Start => {}

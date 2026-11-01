@@ -4641,6 +4641,8 @@ fn extension_source_requires_trusted_profile_and_configured_unit_service() {
         wire_selector: 4,
         payload_type: 100,
         encoding_name: "EXAMPLE".into(),
+        media_format: None,
+        wire_attributes: Vec::new(),
     };
     let (mut pipeline, mut runtime, mut plane) = setup();
     pipeline.source_encoders.insert(
@@ -4729,6 +4731,8 @@ fn submitted_extension_requires_selected_registered_chain_before_open() {
         wire_selector: 4,
         payload_type: 100,
         encoding_name: "EXAMPLE".into(),
+        media_format: None,
+        wire_attributes: Vec::new(),
     };
     let (mut pipeline, mut runtime, mut plane) = setup();
     pipeline

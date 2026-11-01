@@ -326,7 +326,13 @@ fn fixture_with_metadata(
     metadata: bool,
 ) -> Fixture {
     let profile = json!({"codec":{"namespace_id":42,"value":9,"schema":1},
-        "framing":{"namespace_id":42,"value":10,"schema":1},"wire_selector":9,"payload_type":99,"encoding_name":"TEST9"});
+    "framing":{"namespace_id":42,"value":10,"schema":1},"wire_selector":3,"payload_type":99,
+    "encoding_name":"PYROWAVE","media_format":{"bit_depth":8,"dynamic_range":"sdr","chroma_sampling":"yuv420"},
+    "wire_attributes":[
+        {"phase":"describe","name":"x-ss-pyrowave.bitstream","value":"186f0393"},
+        {"phase":"announce","name":"x-ss-video[0].pyrowaveFeatures","value":"1"},
+        {"phase":"announce","name":"x-ss-video[0].pyrowaveAdaptiveFec"}
+    ]});
     let mut transport_profile = profile.clone();
     if transport_name == "PAYLOAD" {
         transport_profile["payload_type"] = json!(100);
@@ -723,16 +729,23 @@ fn announcement() -> String {
         )
         .replace(
             "x-nv-vqos[0].bitStreamFormat:0",
-            "x-nv-vqos[0].bitStreamFormat:9",
+            "x-nv-vqos[0].bitStreamFormat:3",
         )
         .replace(
             "x-nv-video[0].maxNumReferenceFrames:1",
             "x-nv-video[0].maxNumReferenceFrames:0",
         )
+        + "a=x-ss-video[0].pyrowaveFeatures:1\r\na=x-ss-video[0].pyrowaveAdaptiveFec:1\r\n"
 }
 fn profile() -> VideoProfile {
     serde_json::from_value(json!({"codec":{"namespace_id":42,"value":9,"schema":1},
-        "framing":{"namespace_id":42,"value":10,"schema":1},"wire_selector":9,"payload_type":99,"encoding_name":"TEST9"})).unwrap()
+        "framing":{"namespace_id":42,"value":10,"schema":1},"wire_selector":3,"payload_type":99,
+        "encoding_name":"PYROWAVE","media_format":{"bit_depth":8,"dynamic_range":"sdr","chroma_sampling":"yuv420"},
+        "wire_attributes":[
+            {"phase":"describe","name":"x-ss-pyrowave.bitstream","value":"186f0393"},
+            {"phase":"announce","name":"x-ss-video[0].pyrowaveFeatures","value":"1"},
+            {"phase":"announce","name":"x-ss-video[0].pyrowaveAdaptiveFec"}
+        ]})).unwrap()
 }
 fn prepare(fixture: &mut Fixture, video_port: u16, audio_port: u16, hdr: bool) -> Value {
     let parsed = amaterasu_gamestream::sdp::parse_profile_announce(
@@ -807,7 +820,12 @@ fn exchange(
         format!("DESCRIBE {url} RTSP/1.0\r\nCSeq: 2\r\nAccept: application/sdp\r\n\r\n"),
     );
     assert_eq!(
-        describe.contains("a=rtpmap:99 TEST9/90000"),
+        describe.contains("a=rtpmap:99 PYROWAVE/90000"),
+        offer_expected,
+        "{describe}"
+    );
+    assert_eq!(
+        describe.contains("a=x-ss-pyrowave.bitstream:186f0393"),
         offer_expected,
         "{describe}"
     );
@@ -855,14 +873,14 @@ fn exchange(
         )
     } else if wrong_selector {
         announcement().replace(
-            "x-nv-vqos[0].bitStreamFormat:9",
-            "x-nv-vqos[0].bitStreamFormat:10",
+            "x-nv-vqos[0].bitStreamFormat:3",
+            "x-nv-vqos[0].bitStreamFormat:4",
         )
     } else {
         announcement()
     };
     if fixture.metadata {
-        body.push_str("a=x-amaterasu-video-metadata:9 1 1 1\r\n");
+        body.push_str("a=x-amaterasu-video-metadata:3 1 1 1\r\n");
     }
     let announce_request = format!(
         "ANNOUNCE streamid=control/13/0 RTSP/1.0\r\nCSeq: 6\r\nSession: {token}\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{body}",
@@ -928,7 +946,7 @@ fn exchange(
     let selected = &status["streams"][0]["negotiated_unit"];
     let stream = selected["stream"].as_u64().unwrap();
     assert_eq!(selected["generation"], stream);
-    assert_eq!(selected["offer_id"], 9);
+    assert_eq!(selected["offer_id"], 3);
     assert_eq!(selected["codec"], json!(profile().codec));
     assert_eq!(selected["framing"], json!(profile().framing));
     let binding = unsafe { video_framing::bind_video(&fixture.consumer, VIDEO) }.unwrap();
@@ -963,7 +981,7 @@ fn exchange(
 #[ignore = "requires two separately built submitted metadata providers and loopback"]
 fn managed_rtsp_negotiates_submitted_metadata_route() {
     for marker in [1, 2] {
-        let mut host = fixture_with_metadata(marker, "source", "TEST9", true);
+        let mut host = fixture_with_metadata(marker, "source", "PYROWAVE", true);
         exchange(&mut host, true, true, false, false);
     }
 }
@@ -972,15 +990,15 @@ fn managed_rtsp_negotiates_submitted_metadata_route() {
 #[ignore = "requires two separately built native fixture provider artifacts"]
 fn managed_rtsp_negotiates_the_real_session_route() {
     for marker in [1, 2] {
-        let mut host = fixture(marker, "source", "TEST9");
+        let mut host = fixture(marker, "source", "PYROWAVE");
         exchange(&mut host, true, true, false, false);
     }
     {
-        let mut host = fixture(1, "source", "TEST9");
+        let mut host = fixture(1, "source", "PYROWAVE");
         exchange(&mut host, true, true, true, false);
     }
     for (encoder, wire_name) in [
-        ("sibling", "TEST9"),
+        ("sibling", "PYROWAVE"),
         ("source", "MISMATCH"),
         ("source", "PAYLOAD"),
     ] {
@@ -995,7 +1013,7 @@ fn managed_rtsp_negotiates_the_real_session_route() {
 #[ignore = "requires two separately built native fixture provider artifacts"]
 fn managed_rtsp_withholds_unsupported_hdr_metadata_route() {
     for marker in [1, 2] {
-        let mut host = fixture(marker, "source", "TEST9");
+        let mut host = fixture(marker, "source", "PYROWAVE");
         exchange(&mut host, false, false, false, true);
         // The session never probes or opens the source, because this profile
         // cannot negotiate or carry frame-associated HDR metadata yet.
@@ -1007,7 +1025,7 @@ fn managed_rtsp_withholds_unsupported_hdr_metadata_route() {
 #[test]
 #[ignore = "requires the separately built native fixture provider and ephemeral loopback ports"]
 fn managed_rtsp_and_stream_preserve_actual_display_preparation_timeout() {
-    let mut host = fixture(1, "source", "TEST9");
+    let mut host = fixture(1, "source", "PYROWAVE");
     for _ in 0..100 {
         host.tick();
         std::thread::sleep(Duration::from_millis(1));

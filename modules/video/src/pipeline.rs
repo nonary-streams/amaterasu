@@ -1133,6 +1133,14 @@ impl Pipeline {
         let stream = self.streams.get_mut(&id).unwrap();
         plane.select_encoder(&stream.encoder_service);
         plane.set_stream_clock(id, stream.clock_origin_us, stream.clock_epoch);
+        if stream.provider == CaptureProvider::Wgc
+            && !stream.constant_rate
+            && let Ok(mut queues) = self.queues.try_lock()
+            && let Some(feedback) =
+                queues.take_phase_offset(&stream.owner, id, id, stream.clock_epoch)
+        {
+            stream.wgc_pacing.observe_phase_offset(feedback.offset_us);
+        }
         if let Some(parent) = stream.parent
             && !matches!(
                 send(Command::CheckRequest { request: parent }),

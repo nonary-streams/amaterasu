@@ -296,13 +296,28 @@ impl Negotiation {
                 let mut body = validation::description(&self.capabilities);
                 if let Some(offer) = &self.profile_offer {
                     let insertion = body.find("m=audio ").ok_or(Error::Serialization)?;
-                    let markers = offer
-                        .profiles
-                        .iter()
-                        .map(|p| {
-                            format!("a=rtpmap:{} {}/90000\r\n", p.payload_type, p.encoding_name)
-                        })
-                        .collect::<String>();
+                    let mut marker_lines = Vec::new();
+                    for profile in &offer.profiles {
+                        let rtpmap = format!(
+                            "a=rtpmap:{} {}/90000\r\n",
+                            profile.payload_type, profile.encoding_name
+                        );
+                        if !marker_lines.contains(&rtpmap) {
+                            marker_lines.push(rtpmap);
+                        }
+                        for attribute in profile.wire_attributes.iter().filter(|attribute| {
+                            attribute.phase
+                                == amaterasu_contracts::media_profile::VideoProfileAttributePhase::Describe
+                        }) {
+                            if let Some(value) = &attribute.value {
+                                let line = format!("a={}:{}\r\n", attribute.name, value);
+                                if !marker_lines.contains(&line) {
+                                    marker_lines.push(line);
+                                }
+                            }
+                        }
+                    }
+                    let markers = marker_lines.concat();
                     body.insert_str(insertion, &markers);
                 }
                 if let Some((selector, schema)) = self.metadata_offer {

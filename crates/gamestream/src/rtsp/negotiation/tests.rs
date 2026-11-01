@@ -239,6 +239,8 @@ fn metadata_profile_requires_exact_explicit_client_acceptance() {
         wire_selector: 9,
         payload_type: 99,
         encoding_name: "TEST9".into(),
+        media_format: None,
+        wire_attributes: Vec::new(),
     };
     let schema = FormatId {
         namespace_id: 1,
@@ -300,6 +302,57 @@ fn metadata_profile_requires_exact_explicit_client_acceptance() {
             assert_eq!(machine.state(), State::Announce);
         }
     }
+}
+
+#[test]
+fn extension_profile_describe_emits_its_versioned_wire_marker() {
+    use amaterasu_contracts::media_profile::{
+        FormatId, VideoProfile, VideoProfileAttribute, VideoProfileAttributePhase,
+        VideoProfileSnapshot,
+    };
+    let profile = VideoProfile {
+        codec: FormatId {
+            namespace_id: 42,
+            value: 3,
+            schema: 1,
+        },
+        framing: FormatId {
+            namespace_id: 42,
+            value: 4,
+            schema: 1,
+        },
+        wire_selector: 3,
+        payload_type: 99,
+        encoding_name: "PYROWAVE".into(),
+        media_format: Some(amaterasu_contracts::media_profile::VideoMediaFormat {
+            bit_depth: 8,
+            dynamic_range: amaterasu_contracts::encoder::DynamicRange::Sdr,
+            chroma_sampling: amaterasu_contracts::media_profile::ChromaSampling::Yuv420,
+        }),
+        wire_attributes: vec![VideoProfileAttribute {
+            phase: VideoProfileAttributePhase::Describe,
+            name: "x-ss-pyrowave.bitstream".into(),
+            value: Some("186f0393".into()),
+        }],
+    };
+    let mut machine = negotiation();
+    machine.profile_offer = Some(VideoProfileSnapshot {
+        profiles: vec![profile],
+    });
+    let target = machine.launch.rtsp_target.clone();
+    machine
+        .handle(7, &request(Method::Options, &target, 1, false))
+        .unwrap();
+    let mut describe = request(Method::Describe, &target, 2, false);
+    describe
+        .headers
+        .push(("accept".into(), "application/sdp".into()));
+    let Step::Reply(reply) = machine.handle(7, &describe).unwrap() else {
+        panic!()
+    };
+    let body = String::from_utf8(reply).unwrap();
+    assert!(body.contains("a=rtpmap:99 PYROWAVE/90000\r\n"));
+    assert!(body.contains("a=x-ss-pyrowave.bitstream:186f0393\r\n"));
 }
 
 #[test]

@@ -580,6 +580,24 @@ pub unsafe fn bind_video_metadata_admission(
         )
     }
 }
+
+/// # Safety
+/// The provider implements the epoch-bound v1.3 phase feedback tail and
+/// outlives the binding and all synchronous calls.
+pub unsafe fn bind_video_phase_feedback(
+    runtime: &RuntimeClient,
+    service: &str,
+) -> ModuleResult<NativeBinding> {
+    unsafe {
+        runtime.bind_native_typed(
+            service,
+            VIDEO_UNIT_CONTRACT,
+            1,
+            NEGOTIATED_VIDEO_PHASE_FEEDBACK_INTERFACE_MINOR,
+            size_of::<NegotiatedVideoApiV1_3>() as u32,
+        )
+    }
+}
 /// # Safety
 /// The registered factory implements `NegotiatedVideoTransportApi` and outlives its bindings.
 pub unsafe fn register_transport(

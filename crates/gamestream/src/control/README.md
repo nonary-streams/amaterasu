@@ -24,6 +24,7 @@ Unknown message kinds and input magic values retain borrowed bytes in
 | `0x0301` | Reference invalidation: LE32 first/last, reserved zero words | 24 |
 | `0x0350` | Long-term reference acknowledgement: LE32 frame, reserved zero | 8 |
 | `0x5502` | Big-endian frame/FEC feedback | 21 |
+| `0x5510` | Signed little-endian phase offset in microseconds | 4 |
 | `0x0206` | Input packet | Variable, <=65,511 |
 
 The primary ping producer writes only six of its eight bytes; the decoder
@@ -54,6 +55,14 @@ PCM uses version 1, format 1 (48 kHz signed 16-bit little-endian stereo),
 1–240 frames, and an exact `12 + 4 * frames` payload size. The caller must also
 enforce negotiated global PCM support and the target controller slot's advertised
 capability before enqueueing it; encoding alone does not authorize playback.
+
+`0x5510` accepts exactly one signed little-endian `i32` in the range ±100,000 μs.
+The control transport authenticates and sequence-checks the enclosing message;
+the stream-session consumer then binds the value to the negotiated video
+generation and clock epoch before delivering it to a video pacing provider.
+Providers may keep only the latest pending value and must reject repeated or
+out-of-order authenticated sequence numbers. A profile or client message alone
+does not grant cross-stream pacing authority.
 
 Input packets begin with BE32 length excluding that length word and LE32 magic.
 Supported input includes key down/up (flags, LE key code, modifiers), relative

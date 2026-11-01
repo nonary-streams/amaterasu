@@ -6,7 +6,9 @@ pub(crate) mod metadata_tests;
 mod ordered_audio;
 mod planned;
 use amaterasu_gamestream::control::{RUMBLE_MESSAGE_TYPE, RumbleFeedback, encode_rumble_feedback};
-use amaterasu_media::{CONTROL_RELIABLE, ControlMessage};
+use amaterasu_media::{
+    CONTROL_RELIABLE, ControlMessage, NegotiatedVideoApiV1_3, VideoPhaseOffsetFeedbackV1,
+};
 use amaterasu_module_sdk::{NativeBinding, abi::*};
 use ordered_audio::OrderedBindings;
 use std::{
@@ -807,6 +809,52 @@ impl Backend for NativeBackend {
             )
         };
         accepted(status, "native_rumble_failed")
+    }
+
+    fn submit_phase_offset(
+        &mut self,
+        selection: &VideoUnitSelection,
+        control_sequence: u64,
+        offset_us: i32,
+    ) -> PlaneResult<bool> {
+        let Some(binding) = self.video_unit.as_ref() else {
+            return Ok(false);
+        };
+        if selection.stream != self.handles.video {
+            return Ok(false);
+        }
+        let interface =
+            unsafe { binding.table::<NativeInterface>() }.map_err(|_| "native_layout_mismatch")?;
+        if interface.header.major != 1
+            || interface.header.minor < 3
+            || (interface.header.size as usize) < size_of::<NegotiatedVideoApiV1_3>()
+        {
+            return Ok(false);
+        }
+        let api = unsafe { binding.table::<NegotiatedVideoApiV1_3>() }
+            .map_err(|_| "native_layout_mismatch")?;
+        let feedback = VideoPhaseOffsetFeedbackV1 {
+            size: size_of::<VideoPhaseOffsetFeedbackV1>() as u32,
+            version: 1,
+            generation: selection.generation,
+            clock_epoch: selection.clock_epoch,
+            control_sequence,
+            offset_us,
+            reserved: 0,
+        };
+        // SAFETY: the provider binding and stack value remain live for this
+        // synchronous, stream-scoped advisory call.
+        let status =
+            unsafe { (api.submit_phase_offset)(binding.context(), self.handles.video, &feedback) };
+        match status {
+            STATUS_OK => Ok(true),
+            MEDIA_BUSY
+            | MEDIA_PENDING
+            | MEDIA_UNSUPPORTED
+            | MEDIA_CLOSED
+            | STATUS_INVALID_ARGUMENT => Ok(false),
+            _ => Err("video_phase_feedback_failed"),
+        }
     }
 
     fn control(&mut self) -> PlaneResult<Option<ControlRecord>> {

@@ -518,6 +518,8 @@ fn exercise<P: FramingProvider>(framer: P, selector: u32, marker: u8) {
             wire_selector: selector,
             payload_type: 99,
             encoding_name: format!("TEST{selector}"),
+            media_format: None,
+            wire_attributes: Vec::new(),
         };
         let profile_factory = media_profile::Factory::new(Profile(profile.clone()));
         unsafe { media_profile::register(&provider, PROFILE, &profile_factory.api) }.unwrap();

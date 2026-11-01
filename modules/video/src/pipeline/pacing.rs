@@ -1,3 +1,4 @@
+use amaterasu_media::MAX_VIDEO_PHASE_OFFSET_US;
 use std::time::Duration;
 
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
@@ -20,6 +21,7 @@ pub(super) struct WgcPacing {
     pub(super) group_frames: u64,
     last_missed_slot: Option<Duration>,
     source_clock: Option<SourceClock>,
+    phase_offset_us: i32,
 }
 
 impl WgcPacing {
@@ -31,7 +33,16 @@ impl WgcPacing {
             group_frames: 0,
             last_missed_slot: None,
             source_clock: None,
+            phase_offset_us: 0,
         }
+    }
+
+    /// Smooths authenticated client phase observations before adjusting this
+    /// stream's next capture slot. Positive values advance the target.
+    pub(super) fn observe_phase_offset(&mut self, offset_us: i32) {
+        let bounded = offset_us.clamp(-MAX_VIDEO_PHASE_OFFSET_US, MAX_VIDEO_PHASE_OFFSET_US);
+        self.phase_offset_us =
+            ((i64::from(self.phase_offset_us) * 7 + i64::from(bounded)) / 8) as i32;
     }
 
     pub(super) fn capture_arrived(
@@ -121,7 +132,18 @@ impl WgcPacing {
         }
         let frames = u128::from(self.group_frames);
         let frame_offset_ns = frames.checked_mul(NANOS_PER_SECOND)? / u128::from(self.fps);
-        duration_from_nanos(anchor.as_nanos().checked_add(frame_offset_ns)?)
+        let target_ns = anchor.as_nanos().checked_add(frame_offset_ns)?;
+        let max_adjustment_ns = NANOS_PER_SECOND / u128::from(self.fps) / 4;
+        let offset_ns = i128::from(self.phase_offset_us) * 1_000;
+        let offset_ns = offset_ns.clamp(
+            -(i128::try_from(max_adjustment_ns).ok()?),
+            i128::try_from(max_adjustment_ns).ok()?,
+        );
+        let adjusted_ns = i128::try_from(target_ns).ok()?.checked_sub(offset_ns)?;
+        if adjusted_ns < 0 {
+            return None;
+        }
+        duration_from_nanos(u128::try_from(adjusted_ns).ok()?)
     }
 }
 
@@ -191,6 +213,33 @@ mod tests {
 
     fn duration(nanoseconds: u64) -> Duration {
         Duration::from_nanos(nanoseconds)
+    }
+
+    #[test]
+    fn phase_feedback_smoothly_nudges_only_the_selected_stream_grid() {
+        let mut adjusted = WgcPacing::new(true, 60);
+        let mut unchanged = WgcPacing::new(true, 60);
+        adjusted.observe_phase_offset(8_000);
+        assert_eq!(
+            adjusted.capture_arrived(100_000, duration(0)),
+            Some(duration(15_666_666))
+        );
+        assert_eq!(
+            unchanged.capture_arrived(100_000, duration(0)),
+            Some(duration(16_666_666))
+        );
+        adjusted.observe_phase_offset(-8_000);
+        assert!(adjusted.phase_offset_us < 0);
+    }
+
+    #[test]
+    fn direct_phase_offsets_are_clamped_to_a_fraction_of_one_frame() {
+        let mut pacing = WgcPacing::new(true, 60);
+        pacing.observe_phase_offset(1_000_000);
+        assert_eq!(
+            pacing.capture_arrived(100_000, duration(0)),
+            Some(duration(12_500_000))
+        );
     }
 
     #[test]

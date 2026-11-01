@@ -285,6 +285,47 @@ fn primary_shaped_control_vectors_decode_with_mixed_byte_orders() {
 }
 
 #[test]
+fn authenticated_phase_feedback_requires_exact_bounded_signed_little_endian_offset() {
+    let positive = 500i32.to_le_bytes();
+    let negative = (-250i32).to_le_bytes();
+    assert_eq!(
+        client(0x5510, &positive),
+        Ok(Message::PhaseOffset(PhaseOffsetFeedback { offset_us: 500 }))
+    );
+    assert_eq!(
+        client(0x5510, &negative),
+        Ok(Message::PhaseOffset(PhaseOffsetFeedback {
+            offset_us: -250
+        }))
+    );
+    assert_eq!(client(0x5510, &[]), Err(DecodeError::InvalidLength));
+    assert_eq!(
+        client(0x5510, &[0, 0, 0, 0, 0]),
+        Err(DecodeError::InvalidLength)
+    );
+    assert_eq!(
+        client(0x5510, &(MAX_VIDEO_PHASE_OFFSET_US + 1).to_le_bytes()),
+        Err(DecodeError::InvalidValue)
+    );
+    assert_eq!(
+        decode(
+            Profile::SunshineModern,
+            Direction::HostToClient,
+            0x5510,
+            &positive,
+        ),
+        Ok(Message::Unsupported {
+            kind: 0x5510,
+            payload: &positive
+        })
+    );
+    assert_eq!(
+        decode(Profile::Legacy, Direction::ClientToHost, 0x5510, &positive,),
+        Err(DecodeError::UnsupportedProfile)
+    );
+}
+
+#[test]
 fn every_supported_fixture_rejects_truncation_and_trailing_bytes() {
     for name in [
         "ping",

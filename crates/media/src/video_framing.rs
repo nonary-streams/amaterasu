@@ -15,6 +15,9 @@ pub const VIDEO_FRAMING_LIMITS_VERSION: u32 = 2;
 pub const VIDEO_FRAMING_INTERFACE_MAJOR: u32 = 2;
 pub const VIDEO_FRAMING_INTERFACE_MINOR: u32 = 1;
 pub const VIDEO_FRAMING_METADATA_INTERFACE_MINOR: u32 = 2;
+pub const VIDEO_PHASE_FEEDBACK_INTERFACE_MINOR: u32 = 3;
+pub const NEGOTIATED_VIDEO_PHASE_FEEDBACK_INTERFACE_MINOR: u32 = 3;
+pub const MAX_VIDEO_PHASE_OFFSET_US: i32 = 100_000;
 pub const VIDEO_UNIT_KEYFRAME: u32 = 1;
 pub const VIDEO_UNIT_DISCONTINUITY: u32 = 2;
 pub const VIDEO_UNIT_END_OF_STREAM: u32 = 4;
@@ -174,6 +177,49 @@ pub struct NegotiatedVideoApiV1_2 {
     pub base: NegotiatedVideoApiV1_1,
     pub admit_metadata:
         unsafe extern "C" fn(*mut c_void, u64, u64, VideoMetadataAdmissionSinkV1) -> Status,
+}
+
+/// Authenticated client phase feedback bound to one negotiated stream clock.
+/// The stream-session consumer fills generation and epoch from its immutable
+/// selected route; providers must reject stale or foreign selections.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoPhaseOffsetFeedbackV1 {
+    pub size: u32,
+    pub version: u32,
+    pub generation: u64,
+    pub clock_epoch: [u8; 16],
+    pub control_sequence: u64,
+    /// Positive means the client observed frames later than their target phase.
+    pub offset_us: i32,
+    pub reserved: u32,
+}
+
+impl VideoPhaseOffsetFeedbackV1 {
+    pub fn validate(&self, generation: u64, clock_epoch: [u8; 16]) -> Result<(), Status> {
+        if self.size as usize != size_of::<Self>()
+            || self.version != 1
+            || generation == 0
+            || self.generation != generation
+            || clock_epoch == [0; 16]
+            || self.clock_epoch != clock_epoch
+            || self.control_sequence == 0
+            || self.offset_us.unsigned_abs() > MAX_VIDEO_PHASE_OFFSET_US as u32
+            || self.reserved != 0
+        {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        Ok(())
+    }
+}
+
+/// Additive negotiated-video v1.3 tail. Feedback is advisory, stream-scoped,
+/// sequence-bound to authenticated control input, and consumed synchronously.
+#[repr(C)]
+pub struct NegotiatedVideoApiV1_3 {
+    pub base: NegotiatedVideoApiV1_2,
+    pub submit_phase_offset:
+        unsafe extern "C" fn(*mut c_void, u64, *const VideoPhaseOffsetFeedbackV1) -> Status,
 }
 
 #[repr(C)]
@@ -801,6 +847,48 @@ mod tests {
     }
 
     #[test]
+    fn critical_prefix_only_fec_matches_packet_boundary_but_respects_host_minimums() {
+        // PyroWave's 1024-byte framing boundary leaves 1008 shard bytes after
+        // its 16-byte packet overhead. The 8-byte frame header makes this
+        // access unit exactly two shards, with the first shard critical.
+        let framed = vec![1; 1001];
+        let starts = [1, 0];
+        let mut plan = plan(&framed, &starts);
+        plan.critical_prefix_shards = 1;
+        plan.block_count = 2;
+        plan.blocks = [
+            VideoFecBlock {
+                first_data_shard: 0,
+                data_shards: 1,
+                parity_shards: 2,
+                percentage: 200,
+            },
+            VideoFecBlock {
+                first_data_shard: 1,
+                data_shards: 1,
+                parity_shards: 0,
+                percentage: 0,
+            },
+            VideoFecBlock::default(),
+            VideoFecBlock::default(),
+        ];
+        let mut no_minimum = limits();
+        no_minimum.min_fec_percentage = 0;
+        no_minimum.min_parity_shards = 0;
+        no_minimum.max_fec_percentage = 255;
+        let reservation = unsafe { plan.validate(&no_minimum) }.unwrap();
+        assert_eq!(reservation.data_shards, 2);
+        assert_eq!(reservation.datagrams, 4);
+        assert_eq!(reservation.queue_bytes, 4 * 1072);
+        assert_eq!(reservation.wire_bytes, 4 * 1100);
+
+        // The current host policy applies its configured FEC minimum to the
+        // full frame and has no trusted critical-prefix-only policy flag.
+        // Keep the request closed when that policy is active.
+        assert!(unsafe { plan.validate(&limits()) }.is_err());
+    }
+
+    #[test]
     fn only_explicit_large_frame_fallback_can_omit_parity() {
         let small = vec![1; 1200];
         let large = vec![1; 899 * 1008 - 7];
@@ -905,6 +993,20 @@ mod tests {
         assert_eq!(
             std::mem::offset_of!(NegotiatedVideoApiV1_2, admit_metadata),
             72
+        );
+        assert_eq!(size_of::<VideoPhaseOffsetFeedbackV1>(), 48);
+        assert_eq!(
+            std::mem::offset_of!(VideoPhaseOffsetFeedbackV1, clock_epoch),
+            16
+        );
+        assert_eq!(
+            std::mem::offset_of!(VideoPhaseOffsetFeedbackV1, control_sequence),
+            32
+        );
+        assert_eq!(size_of::<NegotiatedVideoApiV1_3>(), 88);
+        assert_eq!(
+            std::mem::offset_of!(NegotiatedVideoApiV1_3, submit_phase_offset),
+            80
         );
         assert_eq!(size_of::<crate::FrameMetadataGenerationPinV1>(), 88);
         assert_eq!(size_of::<crate::FrameMetadataCapabilitiesApiV1_2>(), 64);

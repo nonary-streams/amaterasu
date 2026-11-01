@@ -7,6 +7,7 @@ mod tests;
 mod translate;
 
 use crate::crypto::{Direction, MAX_CONTROL_PAYLOAD_BYTES};
+use amaterasu_media::MAX_VIDEO_PHASE_OFFSET_US;
 pub use feedback::{
     FeedbackEncodeError, HostFeedback, HostFeedbackDelivery, HostFeedbackMessage,
     encode_host_feedback,
@@ -60,6 +61,7 @@ pub enum Message<'a> {
         reason: u32,
     },
     FecFeedback(FecFeedback),
+    PhaseOffset(PhaseOffsetFeedback),
     Input(Input<'a>),
     Unsupported {
         kind: u16,
@@ -80,6 +82,12 @@ pub struct FecFeedback {
     pub percentage: u8,
     pub block_index: u8,
     pub block_count: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PhaseOffsetFeedback {
+    /// Signed little-endian microseconds from the client's target display phase.
+    pub offset_us: i32,
 }
 
 /// `direction` comes from the authenticated session, never an ENet channel.
@@ -127,6 +135,7 @@ pub fn decode(
             })
         }
         0x5502 => feedback(payload).map(Message::FecFeedback),
+        0x5510 => phase_offset(payload).map(Message::PhaseOffset),
         0x0206 => input::decode(payload).map(Message::Input),
         _ => Ok(Message::Unsupported { kind, payload }),
     }
@@ -177,6 +186,15 @@ fn feedback(bytes: &[u8]) -> Result<FecFeedback, DecodeError> {
         return Err(DecodeError::InvalidValue);
     }
     Ok(value)
+}
+
+fn phase_offset(bytes: &[u8]) -> Result<PhaseOffsetFeedback, DecodeError> {
+    exact(bytes, 4)?;
+    let offset_us = i32::from_le_bytes(bytes.try_into().unwrap());
+    if offset_us.unsigned_abs() > MAX_VIDEO_PHASE_OFFSET_US as u32 {
+        return Err(DecodeError::InvalidValue);
+    }
+    Ok(PhaseOffsetFeedback { offset_us })
 }
 
 fn exact(bytes: &[u8], length: usize) -> Result<(), DecodeError> {

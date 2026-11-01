@@ -818,6 +818,8 @@ typedef struct {
 #define AMATERASU_VIDEO_FRAMING_INTERFACE_MINOR 1u
 #define AMATERASU_VIDEO_FRAMING_METADATA_INTERFACE_MINOR 2u
 #define AMATERASU_NEGOTIATED_VIDEO_METADATA_INTERFACE_MINOR 2u
+#define AMATERASU_NEGOTIATED_VIDEO_PHASE_FEEDBACK_INTERFACE_MINOR 3u
+#define AMATERASU_VIDEO_PHASE_OFFSET_MAX_US 100000
 #define AMATERASU_VIDEO_PLAN_TRANSPORT_METADATA_INTERFACE_MINOR 1u
 typedef struct { uint64_t namespace_id, value, schema; } AmaterasuVideoFormatId;
 typedef struct {
@@ -860,6 +862,20 @@ typedef struct {
     AmaterasuNegotiatedVideoApiV1_1 base;
     AmaterasuStatus (*admit_metadata)(void *, uint64_t, uint64_t, AmaterasuVideoMetadataAdmissionSinkV1);
 } AmaterasuNegotiatedVideoApiV1_2;
+/* Authenticated client phase hints are bound by the host to the selected
+ * generation and clock epoch before reaching this provider callback. */
+typedef struct {
+    uint32_t size, version;
+    uint64_t generation;
+    uint8_t clock_epoch[16];
+    uint64_t control_sequence;
+    int32_t offset_us;
+    uint32_t reserved;
+} AmaterasuVideoPhaseOffsetFeedbackV1;
+typedef struct {
+    AmaterasuNegotiatedVideoApiV1_2 base;
+    AmaterasuStatus (*submit_phase_offset)(void *, uint64_t, const AmaterasuVideoPhaseOffsetFeedbackV1 *);
+} AmaterasuNegotiatedVideoApiV1_3;
 typedef struct {
     AmaterasuNativeInterface base;
     AmaterasuStatus (*submit)(void *, uint64_t, const AmaterasuNegotiatedVideoUnit *);
