@@ -176,13 +176,31 @@ impl MemoryState {
 #[test]
 #[ignore = "requires independently built protocol and fixture artifacts plus an ephemeral loopback listener"]
 fn real_selected_composition() {
-    run_composition(false, "success");
-    run_composition(true, "success");
-    run_composition(true, "stale");
-    run_composition(true, "limiter_unsupported");
-    run_composition(true, "display_rejected");
-    run_composition(true, "cancelled");
-    run_composition(true, "failed_preparation");
+    let filter = std::env::var("AMATERASU_COMPOSITION_CASE").ok();
+    let mut executed = false;
+    for (replacement, scenario) in [
+        (false, "success"),
+        (true, "success"),
+        (true, "stale"),
+        (true, "limiter_unsupported"),
+        (false, "limiter_success"),
+        (true, "limiter_success"),
+        (true, "limiter_mismatch"),
+        (true, "limiter_stale"),
+        (true, "limiter_stale_recheck"),
+        (true, "display_rejected"),
+        (true, "cancelled"),
+        (true, "failed_preparation"),
+    ] {
+        if filter
+            .as_deref()
+            .is_none_or(|selected| selected == scenario)
+        {
+            executed = true;
+            run_composition(replacement, scenario);
+        }
+    }
+    assert!(executed, "unknown AMATERASU_COMPOSITION_CASE");
 }
 
 fn run_composition(replacement: bool, scenario: &str) {
@@ -213,7 +231,7 @@ fn run_composition(replacement: bool, scenario: &str) {
     ]);
     let config = json!({"principals":{
         "console":{"call": ["amaterasu.pairing/1","amaterasu.state/1"]},
-        "attacker":{"call":["amaterasu.launch/3"]},
+        "attacker":{"call":["amaterasu.launch/1","amaterasu.launch/3"]},
         "amaterasu.nvhttp":{"call":services},
         "amaterasu.pairing":{"provide":["amaterasu.pairing/1"],"call":["amaterasu.state/1"],"native_provide":["amaterasu.identity/1"]},
         "amaterasu.launch":{"provide":["amaterasu.launch/1","amaterasu.launch/2","amaterasu.launch/3"],"call":["fixture.library/2","fixture.policy/2","example.library.provider/1","amaterasu.session/1","amaterasu.application/1"]},
@@ -229,7 +247,7 @@ fn run_composition(replacement: bool, scenario: &str) {
         "library":{"provide":["fixture.library/2"]},
         "policy":{"provide":["fixture.policy/2"]},
         "executor":{"provide":["example.library.provider/1"]},
-        "replacement":{"provide":["fixture.library/2","fixture.policy/2"]}
+        "replacement":{"provide":["fixture.library/2","fixture.policy/2","example.library.provider/1"]}
     },"settings":{
         "amaterasu.pairing":{"administrator_principals":["console"],"transport_principals":["amaterasu.nvhttp"]},
         "amaterasu.launch":{"enable_library_preflight":true,"retirement_observers":["amaterasu.session-lifecycle"],"library_routes":{"games":{
@@ -241,7 +259,7 @@ fn run_composition(replacement: bool, scenario: &str) {
             "entries":[{"id":"opaque/game","revision":"entry:opaque","name":"Game","description":null,"tags":[],"source":null,"portable_ids":[],"installed":"unknown","readiness":"ready","unavailable_reason":null}],
             "targets":[{"id":"opaque/game","revision":"entry:opaque","executor":"runner","application_id":"fixture-game"}]},
         "policy":{"service":"fixture.policy/2","callers":{"amaterasu.launch":["amaterasu.nvhttp"]},"rules":[{"certificates":[cert_id],"policy":{"application":{"library":"games","id":"opaque/game"},"entry_revision":"entry:opaque","policy_revision":"policy:one","preparation":[]},"config_overrides":{},"application_display_settings":null}]},
-        "executor":{"callers":{"amaterasu.launch":{"initiators":["amaterasu.nvhttp","amaterasu.launch"],"lifecycle":true}}},
+        "executor":{"callers":{"amaterasu.launch":{"initiators":["amaterasu.nvhttp","amaterasu.launch"],"lifecycle":true}}, "limiter_mode":match scenario { "limiter_success" => "supported", "limiter_mismatch" => "mismatch", "limiter_stale" => "stale", _ => "" }},
         "replacement":{"certificate_id":cert_id,"mode":scenario}
     }});
     let runtime = Runtime::new(&artifact(&artifacts, "amaterasu_runtime"), config);
@@ -301,7 +319,8 @@ fn run_composition(replacement: bool, scenario: &str) {
         (!replacement).then(|| LoadedModule::start(&policy_artifact, &runtime.endpoint("policy")));
     let mut generated = replacement
         .then(|| LoadedModule::start(&replacement_artifact, &runtime.endpoint("replacement")));
-    let mut provider = LoadedModule::start(&executor, &runtime.endpoint("executor"));
+    let mut provider =
+        (!replacement).then(|| LoadedModule::start(&executor, &runtime.endpoint("executor")));
     let console = runtime.client("console");
     let mut memory = MemoryState::default();
     for (sequence, payload) in [json!({"action":"import_identity","certificate_pem":HOST_CERT,"private_key_pem":HOST_KEY}), json!({"action":"import_client","client_id":"test-client","name":"Client","certificate_pem":CLIENT_CERT})].into_iter().enumerate() {
@@ -426,7 +445,7 @@ fn run_composition(replacement: bool, scenario: &str) {
         json!({})
     };
     router.set_global_display_policy(1, display_policy);
-    if scenario == "limiter_unsupported" {
+    if scenario.starts_with("limiter_") {
         router.set_global_frame_limiter_settings(&crate::frame_limiter::FrameLimiterSettings {
             frame_limiter_enable: Some(true),
             ..Default::default()
@@ -463,7 +482,9 @@ fn run_composition(replacement: bool, scenario: &str) {
         if let Some(module) = &mut generated {
             module.tick();
         }
-        provider.tick();
+        if let Some(module) = &mut provider {
+            module.tick();
+        }
         rtsp.tick();
         backends.pump(&session, &stream, &input, &application, &display);
         replies.extend(router.poll_with_trust(&nvhttp, |presented, _| presented == cert));
@@ -491,7 +512,7 @@ fn run_composition(replacement: bool, scenario: &str) {
         .iter()
         .any(|(service, payload)| service == "stream" && payload["action"] == "prepare");
     match scenario {
-        "success" => {
+        "success" | "limiter_success" | "limiter_stale_recheck" => {
             assert_eq!(replies.len(), 1, "hardware requests: {:?}", backends.calls);
             assert_eq!(
                 replies[0].1.status,
@@ -502,6 +523,77 @@ fn run_composition(replacement: bool, scenario: &str) {
             );
             assert!(prepared, "{:?}", backends.calls);
             assert_eq!(backends.session_state, "active");
+            if matches!(scenario, "limiter_success" | "limiter_stale_recheck") {
+                let verify = router
+                    .launches
+                    .selected_limiter_verification_for_test()
+                    .expect("real admitted limiter target");
+                assert_eq!(
+                    verify["frame_limiter_executable_path"],
+                    if replacement {
+                        "/synthetic/replacement-game"
+                    } else {
+                        "/synthetic/game"
+                    }
+                );
+                let rtsp_client = runtime.client("amaterasu.rtsp");
+                let attacker = runtime.client("attacker");
+                for (index, (client, payload, expected)) in [
+                    (
+                        &rtsp_client,
+                        verify.clone(),
+                        scenario != "limiter_stale_recheck",
+                    ),
+                    (
+                        &rtsp_client,
+                        {
+                            let mut altered = verify.clone();
+                            altered["frame_limiter_executable_path"] = json!("/synthetic/other");
+                            altered
+                        },
+                        false,
+                    ),
+                    (
+                        &rtsp_client,
+                        {
+                            let mut altered = verify.clone();
+                            altered["policy_identity"]["snapshot_id"] = json!("foreign-snapshot");
+                            altered
+                        },
+                        false,
+                    ),
+                    (&attacker, verify, false),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let pending = broker_request(
+                        client,
+                        "amaterasu.launch/1",
+                        payload,
+                        &format!("limiter-verify-{index}"),
+                    );
+                    let mut reply = None;
+                    for _ in 0..200 {
+                        launch.tick();
+                        if let Some(module) = &mut generated {
+                            module.tick();
+                        }
+                        if let Some(module) = &mut provider {
+                            module.tick();
+                        }
+                        if let Some(value) = take(client, pending) {
+                            reply = Some(value);
+                            break;
+                        }
+                    }
+                    let reply = reply.expect("Launch limiter verification");
+                    assert_eq!(reply["verified"] == true, expected, "{reply}");
+                    if !expected {
+                        assert_eq!(reply["code"], "frame_limiter_snapshot_denied", "{reply}");
+                    }
+                }
+            }
         }
         "cancelled" => {
             assert!(cancelled);
@@ -516,7 +608,12 @@ fn run_composition(replacement: bool, scenario: &str) {
             );
             assert!(!prepared);
         }
-        "stale" | "display_rejected" | "failed_preparation" | "limiter_unsupported" => {
+        "stale"
+        | "display_rejected"
+        | "failed_preparation"
+        | "limiter_unsupported"
+        | "limiter_mismatch"
+        | "limiter_stale" => {
             assert_eq!(replies.len(), 1, "hardware requests: {:?}", backends.calls);
             assert_ne!(
                 replies[0].1.status,
@@ -524,7 +621,10 @@ fn run_composition(replacement: bool, scenario: &str) {
                 "{}",
                 String::from_utf8_lossy(&replies[0].1.body)
             );
-            if scenario != "failed_preparation" {
+            if !matches!(
+                scenario,
+                "failed_preparation" | "limiter_mismatch" | "limiter_stale"
+            ) {
                 assert!(!prepared, "{:?}", backends.calls);
                 assert!(backends.session_state.is_empty());
             }
@@ -539,14 +639,22 @@ fn run_composition(replacement: bool, scenario: &str) {
                     backends.calls
                 );
             }
-            if scenario == "failed_preparation" {
-                for (service, action) in [
-                    ("application", "prepare"),
-                    ("application", "preparation_stop"),
+            if matches!(
+                scenario,
+                "failed_preparation" | "limiter_mismatch" | "limiter_stale"
+            ) {
+                let mut expected = vec![
                     ("session", "fail"),
                     ("stream", "stop"),
                     ("stream", "release_history_activity"),
-                ] {
+                ];
+                if scenario == "failed_preparation" {
+                    expected.extend([
+                        ("application", "prepare"),
+                        ("application", "preparation_stop"),
+                    ]);
+                }
+                for (service, action) in expected {
                     assert!(
                         backends
                             .calls
@@ -623,7 +731,7 @@ impl Hardware {
                         json!({"ok":true,"released":true,"activity_id":p["activity_id"],"rtsp_operation_id":p["rtsp_operation_id"]})
                     }
                     ("stream", "prepare") => {
-                        json!({"ok":true,"session":23,"state":"prepared","audio_local":"127.0.0.1:51000","video_local":"127.0.0.1:51002","control_local":"127.0.0.1:51004","history_activity_id":p["history_activity_id"],"rtsp_operation_id":p["rtsp_operation_id"],"lifecycle_session_target":p["lifecycle_session_target"],"lifecycle_input_required":false,"display_prepare_timeout_ms":p["display_prepare_timeout_ms"]})
+                        json!({"ok":true,"session":23,"state":"prepared","audio_local":"127.0.0.1:51000","video_local":"127.0.0.1:51002","control_local":"127.0.0.1:51004","history_activity_id":p["history_activity_id"],"rtsp_operation_id":p["rtsp_operation_id"],"lifecycle_session_target":p["lifecycle_session_target"],"lifecycle_input_required":false,"display_prepare_timeout_ms":p["display_prepare_timeout_ms"],"frame_limiter_settings":p["frame_limiter_settings"],"frame_limiter_executable_path":p["frame_limiter_executable_path"]})
                     }
                     ("display", _) => json!({"ok":false,"code":"synthetic_display_rejection"}),
                     ("application", "prepare" | "preparation_status" | "preparation_stop") => {

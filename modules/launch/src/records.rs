@@ -91,6 +91,10 @@ pub struct Record {
         Option<amaterasu_module_sdk::application_library::preflight::PolicyIdentity>,
     #[serde(skip)]
     pub generic_provider_incarnation: Option<String>,
+    #[serde(skip)]
+    pub limiter_target_verified: bool,
+    #[serde(skip)]
+    pub pending_limiter_verification: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_overrides: Option<ApplicationConfigOverrides>,
     /// Sparse per-application output/virtual-screen controls frozen from the
@@ -375,6 +379,8 @@ impl Records {
                 streaming_policy_accepted: false,
                 library_policy_identity: None,
                 generic_provider_incarnation: None,
+                limiter_target_verified: false,
+                pending_limiter_verification: None,
                 config_overrides: None,
                 application_display_settings: None,
                 executable_path: None,

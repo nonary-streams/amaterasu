@@ -1,9 +1,11 @@
 # Streaming replacement qualification fixture
 
-This independently built native fixture implements both the library `/2` and
-streaming-policy `/2` contracts using generated records and an exact certificate
-check. It is separate from the snapshot-library and static-policy examples. Its
-`stale` and `failed_preparation` modes are test fixtures, not product settings.
+This independently built native fixture implements library `/2`, streaming-policy
+`/2` and executor `/1` contracts using generated records and an exact certificate
+check. Its executor advertises versioned limiter-target attestation only in the
+limiter test modes and checks reservation identity against the running ticket. It
+is separate from the snapshot library, static policy and other executor examples.
+Its failure and mismatch modes are test fixtures, not product settings.
 It installs no service grants and does not execute applications.
 
 The Linux NVHTTP composition test loads locally built protocol and fixture

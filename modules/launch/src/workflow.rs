@@ -16,6 +16,11 @@ pub enum Step {
     StreamingPolicy,
     RevalidateLibrary,
     RevalidateStreamingPolicy,
+    IdentifyLimiterProvider,
+    CheckLimiterCapability,
+    ReserveLimiterTarget,
+    VerifyLimiterTarget,
+    VerifyActiveLimiterTarget,
     LutrisStatus,
     LutrisPreSpawn,
     CreateSession,
@@ -98,7 +103,11 @@ impl Workflow {
         self.step = first_cleanup_step(record);
     }
     pub fn parent(&self) -> Option<u64> {
-        if self.cleanup { None } else { self.request }
+        if self.cleanup || self.step == Step::VerifyActiveLimiterTarget {
+            None
+        } else {
+            self.request
+        }
     }
     pub fn command<'a>(
         &self,
@@ -169,6 +178,38 @@ impl Workflow {
                     service,
                     json!({"action":"admit", "application":selection.application,
                     "entry_revision":selection.revision, "certificate_id":certificate_id}),
+                )
+            }
+            Step::IdentifyLimiterProvider => (
+                record
+                    .generic_provider_service
+                    .as_deref()
+                    .ok_or("invalid_workflow")?,
+                json!({"action":"identity"}),
+            ),
+            Step::CheckLimiterCapability => (
+                record
+                    .generic_provider_service
+                    .as_deref()
+                    .ok_or("invalid_workflow")?,
+                json!({"action":"limiter_target_capabilities_v1"}),
+            ),
+            Step::ReserveLimiterTarget
+            | Step::VerifyLimiterTarget
+            | Step::VerifyActiveLimiterTarget => {
+                let stage = if self.step == Step::ReserveLimiterTarget {
+                    amaterasu_module_sdk::application_library::limiter_target::Stage::Reserve
+                } else if self.step == Step::VerifyActiveLimiterTarget {
+                    amaterasu_module_sdk::application_library::limiter_target::Stage::Verify
+                } else {
+                    amaterasu_module_sdk::application_library::limiter_target::Stage::Running
+                };
+                (
+                    record
+                        .generic_provider_service
+                        .as_deref()
+                        .ok_or("invalid_workflow")?,
+                    json!({"action":"attest_limiter_target_v1","request":limiter_target_request(record,stage)?}),
                 )
             }
             Step::LutrisStatus | Step::LutrisPreSpawn => (LUTRIS, json!({"action":"status"})),
@@ -489,6 +530,39 @@ pub fn first_cleanup_step(record: &Record) -> Step {
     } else {
         Step::Finish
     }
+}
+
+pub fn limiter_target_request(
+    record: &Record,
+    stage: amaterasu_module_sdk::application_library::limiter_target::Stage,
+) -> Result<amaterasu_module_sdk::application_library::limiter_target::Request, &'static str> {
+    use amaterasu_module_sdk::application_library::limiter_target::{Request, Stage};
+    let Some(LaunchTarget::Provider { application_id, .. }) = &record.target else {
+        return Err("invalid_workflow");
+    };
+    let ticket = match stage {
+        Stage::Reserve => None,
+        Stage::Running | Stage::Verify => {
+            Some(record.provider_ticket.clone().ok_or("invalid_workflow")?)
+        }
+    };
+    let request = Request {
+        version: 1,
+        stage,
+        operation_id: record.process_operation.clone(),
+        application_id: application_id.clone(),
+        provider_incarnation: record
+            .generic_provider_incarnation
+            .clone()
+            .ok_or("invalid_workflow")?,
+        ticket,
+        policy_identity: record
+            .library_policy_identity
+            .clone()
+            .ok_or("invalid_workflow")?,
+    };
+    request.validate()?;
+    Ok(request)
 }
 
 #[cfg(test)]

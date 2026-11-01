@@ -129,6 +129,7 @@ name = "example-streaming-replacement"
 version = "0.1.0"
 dependencies = [
  "amaterasu-module-sdk",
+ "getrandom",
  "serde",
  "serde_json",
 ]

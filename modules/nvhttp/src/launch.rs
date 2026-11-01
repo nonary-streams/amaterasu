@@ -813,6 +813,20 @@ impl Controller {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn selected_limiter_verification_for_test(&self) -> Option<Value> {
+        let record = self.records.values().find(|record| {
+            record.selected_application.is_some() && record.executable_path.is_some()
+        })?;
+        let selected = record.selected_application.as_ref()?;
+        Some(
+            json!({"action":"verify_frame_limiter_snapshot", "application_operation_id":record.application_operation,
+            "rtsp_operation_id":record.rtsp_operation, "app_id":amaterasu_module_sdk::application_library::preflight::application_scope_id(&selected.application).ok()?,
+            "policy_identity":record.policy_identity,"frame_limiter_settings":record.frame_limiter_snapshot,
+            "frame_limiter_executable_path":record.executable_path}),
+        )
+    }
+
     pub fn supported(&self) -> bool {
         self.config.is_some()
     }
