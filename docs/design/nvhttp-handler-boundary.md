@@ -59,13 +59,38 @@ is the selected participant, as authorized by the broker approval, rather than
 an untyped service call. The existing hook registry is not suitable for this
 request path without further changes: ordinary hooks have no lost-acceptance
 lookup, and idempotent `RunHookOperation` identities are retained for the
-broker lifetime with a limit of 512. The request broker instead retains normal
-operation identities temporarily; retries must use identical operation data,
-recover the accepted ID, and cancel/release it on timeout or disconnect. A
-cancel request cannot undo a handler effect that has already begun.
+broker lifetime with a limit of 512. The request broker instead retains normal operation identities temporarily.
+While a connection is still authorized, a retry with identical operation data
+can recover an accepted ID. After disconnect, retrying an unacknowledged call
+could initiate new work if it was never accepted, so this does not by itself
+provide reliable cancellation of a lost admission reply. An accepted handler
+effect cannot be undone by cancellation; this unresolved lifetime limit must
+be addressed before treating the consumer integration as complete.
 
-Identity commit `d8d955b5` adds ABI 1.2 `check_entitlement(certificate, name)`.
+The reviewed entitlement candidate `80c4da0f` provides ABI 1.2 `check_entitlement(certificate, name)`.
 Only an OK status authorizes; the caller independently verifies TLS possession
 and binds each operation to the entitlement. NVHTTP must recheck at admission,
 while pending, and at reply delivery. This branch is based on the original
-baseline and requires integration with that commit before using the new table.
+baseline and this branch incorporates the accepted entitlement commits before using the new table.
+
+Launch requests can contain session keys in their query. A launch participant
+must receive only explicitly permitted, bounded option input and the minimum
+verified context it needs; never forward the raw launch target or secrets via
+the generic HTTP request envelope. The result must be scoped to the selected
+consumer and must not itself choose that consumer. Validation must check the
+participant-to-namespace/version binding as well as consumer support, so one
+participant cannot claim another participant's namespace.
+
+The entitlement check is point-in-time. Rechecking at admission, before an
+independent participant effect, and before response delivery narrows the
+window but does not make a concurrent revocation atomic with that effect. A
+stronger guarantee would require an authority-owned effect fence; this work
+neither assumes nor introduces one. Handler side effects therefore cannot be
+reported as cancelled or revoked merely because a broker cancellation or a
+later entitlement check succeeds.
+
+The proposed inline HTTP envelope permits up to 4 KiB of body data; the
+16 KiB broker JSON limit and base64 expansion constrain combinations of body,
+certificate, and target. This is not evidence of parity for larger fork
+transfers. Large-body support would require a separately justified use of the
+existing binary-transfer primitives, not silently raising broker limits.
