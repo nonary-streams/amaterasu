@@ -27,6 +27,8 @@ pub(super) struct Entry {
         skip_serializing_if = "crate::providers::ProviderServices::is_default"
     )]
     pub providers: crate::providers::ProviderServices,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ordered_audio_control: Option<String>,
     pub record_id: u64,
     pub owner: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -118,6 +120,11 @@ impl Entry {
     pub fn from_record(record: &Record) -> Self {
         Self {
             providers: record.providers.clone(),
+            ordered_audio_control: record
+                .attempted
+                .contains(&super::record::Resource::OrderedAudioEncoder)
+                .then(|| record.ordered_audio_control.clone())
+                .flatten(),
             record_id: record.id,
             owner: record.owner.clone(),
             lifecycle_recovery: record.config.lifecycle_session_target.clone().map(
@@ -182,12 +189,19 @@ impl Entry {
             && self.limiter_executable_path.as_ref().is_none_or(|path| {
                 !path.trim().is_empty() && path.len() <= 4096 && !path.chars().any(char::is_control)
             })
-            && self.attempted_resources.len() <= 6
+            && self.attempted_resources.contains("ordered-audio-encode")
+                == self.ordered_audio_control.is_some()
+            && self
+                .ordered_audio_control
+                .as_ref()
+                .is_none_or(|name| amaterasu_contracts::valid_name(name))
+            && self.attempted_resources.len() <= 7
             && self.attempted_resources.iter().all(|resource| {
                 matches!(
                     resource.as_str(),
                     "session"
                         | "audio-encode"
+                        | "ordered-audio-encode"
                         | "media-transport"
                         | "control-transport"
                         | "video"
@@ -215,6 +229,7 @@ impl Entry {
         .map_err(|_| "invalid_lifecycle_journal_entry")?;
         let mut record = Record::new(self.record_id, self.owner.clone(), config, 30_000);
         record.providers = self.providers.clone();
+        record.ordered_audio_control = self.ordered_audio_control.clone();
         record.attempted = self
             .attempted_resources
             .iter()
@@ -243,6 +258,7 @@ fn resource_from_name(name: &str) -> Option<super::record::Resource> {
     match name {
         "session" => Some(Resource::Session),
         "audio-encode" => Some(Resource::AudioEncoder),
+        "ordered-audio-encode" => Some(Resource::OrderedAudioEncoder),
         "media-transport" => Some(Resource::Media),
         "control-transport" => Some(Resource::Control),
         "video" => Some(Resource::Video),
@@ -608,9 +624,13 @@ mod provider_recovery_tests {
         let mut record = Record::new(7, "owner".into(), config, 30_000);
         record.providers.media_transport = "original.media/1".into();
         record.providers.control_transport = "original.control/1".into();
+        record.ordered_audio_control = Some("original.ordered-audio/1".into());
         record
             .attempted
             .insert(super::super::record::Resource::Media);
+        record
+            .attempted
+            .insert(super::super::record::Resource::OrderedAudioEncoder);
         let entry = Entry::from_record(&record);
         let value = serde_json::to_value(&entry).unwrap();
         let recovered = serde_json::from_value::<Entry>(value)
@@ -624,6 +644,10 @@ mod provider_recovery_tests {
         assert_eq!(
             recovered.service(super::super::record::Resource::Control),
             "original.control/1"
+        );
+        assert_eq!(
+            recovered.service(super::super::record::Resource::OrderedAudioEncoder),
+            "original.ordered-audio/1"
         );
     }
 }

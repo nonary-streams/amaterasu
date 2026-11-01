@@ -41,7 +41,7 @@ impl AudioFormat {
     /// # Safety
     /// The descriptor and any pointed-to configuration must be valid and
     /// immutable for this synchronous copy.
-    unsafe fn copy(format: &AudioFormatDescriptor) -> Result<Self, Status> {
+    pub(super) unsafe fn copy(format: &AudioFormatDescriptor) -> Result<Self, Status> {
         // SAFETY: the caller guarantees provider-owned config lifetime.
         let config = unsafe { format.config_bytes()? }.to_vec();
         Ok(Self {

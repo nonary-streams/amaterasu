@@ -1414,6 +1414,7 @@ impl Harness {
                     Ok(Box::new(FakePlane(state.clone())))
                 },
                 &mut |_, _, _| probe_limits.ok_or("unsupported"),
+                &mut |_, _, _, _, _| Err("unsupported"),
             )
             .unwrap();
     }

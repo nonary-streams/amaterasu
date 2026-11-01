@@ -84,10 +84,19 @@ type Probe<'a> = dyn FnMut(
         &crate::model::PrepareConfig,
     ) -> Result<amaterasu_media::VideoFramingLimits, &'static str>
     + 'a;
+type AudioProbe<'a> = dyn FnMut(
+        &crate::model::AudioExtensionRoute,
+        u64,
+        u64,
+        &crate::model::PrepareConfig,
+        [u8; 16],
+    ) -> Result<amaterasu_module_sdk::audio::OrderedAudioCandidate, &'static str>
+    + 'a;
 
 struct NativeOperations<'a, 'b> {
     factory: &'a mut Factory<'b>,
     probe: &'a mut Probe<'b>,
+    audio_probe: &'a mut AudioProbe<'b>,
 }
 
 pub struct Pipeline {
@@ -297,6 +306,11 @@ impl Pipeline {
             &mut |route, media, config| {
                 crate::plane::probe_extension_chain(runtime, route, media, config)
             },
+            &mut |route, encoder, media, config, epoch| {
+                crate::plane::probe_ordered_audio_chain(
+                    runtime, route, encoder, media, config, epoch,
+                )
+            },
         )
     }
 
@@ -306,6 +320,7 @@ impl Pipeline {
         send: &mut Send<'_>,
         factory: &mut Factory<'_>,
         probe: &mut Probe<'_>,
+        audio_probe: &mut AudioProbe<'_>,
     ) -> ModuleResult<()> {
         if !self.journal.loaded {
             match self.journal.progress_load(send, now) {
@@ -340,7 +355,11 @@ impl Pipeline {
                 .records
                 .remove(&job.session)
                 .expect("owned workflow record");
-            let mut operations = NativeOperations { factory, probe };
+            let mut operations = NativeOperations {
+                factory,
+                probe,
+                audio_probe,
+            };
             let retain = self.advance(&mut record, &mut job, now, send, &mut operations);
             self.records.insert(record.id, record);
             if retain {

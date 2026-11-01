@@ -3,9 +3,11 @@
 //! These identifiers describe the interface family independently of a service
 //! alias. Signed composition still controls provider selection and authorization.
 mod negotiation;
+mod ordered;
 pub use negotiation::{
     AudioCandidate, AudioFormat, AudioNegotiationError, AudioSelection, configure, negotiate, probe,
 };
+pub use ordered::{OrderedAudioCandidate, OrderedAudioFormat, configure_ordered, probe_ordered};
 
 use crate::{ModuleResult, NativeBinding, RuntimeClient, abi::NativeServiceFactory};
 use amaterasu_media::{

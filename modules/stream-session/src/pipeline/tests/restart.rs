@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 fn journal_with_owned_session(record_id: u64) -> Value {
     let entry = Entry {
         providers: Default::default(),
+        ordered_audio_control: None,
         lifecycle_recovery: None,
         record_id,
         owner: "owner".into(),

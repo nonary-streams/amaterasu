@@ -50,6 +50,7 @@ impl State {
 pub(super) enum Resource {
     Session,
     AudioEncoder,
+    OrderedAudioEncoder,
     Media,
     Control,
     Video,
@@ -57,11 +58,12 @@ pub(super) enum Resource {
 }
 
 impl Resource {
-    pub const CLEANUP: [Self; 5] = [
+    pub const CLEANUP: [Self; 6] = [
         Self::AudioCapture,
         Self::Video,
         Self::Control,
         Self::Media,
+        Self::OrderedAudioEncoder,
         Self::AudioEncoder,
     ];
 
@@ -69,6 +71,7 @@ impl Resource {
         match self {
             Self::Session => "session",
             Self::AudioEncoder => "audio-encode",
+            Self::OrderedAudioEncoder => "ordered-audio-encode",
             Self::Media => "media-transport",
             Self::Control => "control-transport",
             Self::Video => "video",
@@ -87,6 +90,9 @@ impl Resource {
             Self::Video => Some("amaterasu.video/1"),
             Self::AudioCapture => Some("amaterasu.audio/1"),
             Self::AudioEncoder => Some("amaterasu.audio-encode/1"),
+            Self::OrderedAudioEncoder => {
+                Some(amaterasu_module_sdk::audio::ORDERED_ENCODER_CONTRACT)
+            }
             Self::Media => Some("amaterasu.media-transport/1"),
             Self::Control => Some("amaterasu.control-transport/1"),
         }
@@ -99,6 +105,11 @@ pub(super) struct Record {
     pub extension_checked: bool,
     pub extension_limits: Option<amaterasu_media::VideoFramingLimits>,
     pub negotiated_route: Option<crate::plane::NegotiatedRoute>,
+    pub audio_extension_route: Option<crate::model::AudioExtensionRoute>,
+    pub ordered_audio_control: Option<String>,
+    pub ordered_audio_candidate: Option<amaterasu_module_sdk::audio::OrderedAudioCandidate>,
+    pub ordered_audio_checked: bool,
+    pub ordered_audio_epoch: [u8; 16],
     pub id: u64,
     pub history: super::history::SessionHistory,
     pub host_metrics: super::host_metrics_activity::HostMetricsActivity,
@@ -314,6 +325,10 @@ impl Record {
             Resource::Video => &self.providers.video,
             Resource::AudioCapture => &self.providers.audio_capture,
             Resource::AudioEncoder => &self.providers.audio_encoder,
+            Resource::OrderedAudioEncoder => self
+                .ordered_audio_control
+                .as_ref()
+                .expect("ordered encoder has a retained control service"),
             Resource::Media => &self.providers.media_transport,
             Resource::Control => &self.providers.control_transport,
         }
@@ -328,6 +343,11 @@ impl Record {
             extension_checked: false,
             extension_limits: None,
             negotiated_route: None,
+            audio_extension_route: None,
+            ordered_audio_control: None,
+            ordered_audio_candidate: None,
+            ordered_audio_checked: false,
+            ordered_audio_epoch: [0; 16],
             id,
             history: super::history::SessionHistory::new(id, config.history_activity_id.clone()),
             host_metrics: super::host_metrics_activity::HostMetricsActivity::new(id),
@@ -597,6 +617,14 @@ impl Record {
             Resource::Session => return json!({"action":"create","key":self.operation(resource)}),
             Resource::AudioEncoder => json!({"action":"open","channels":config.audio.channels,
                 "packet_ms":config.audio.packet_ms,"bitrate":config.audio.bitrate}),
+            Resource::OrderedAudioEncoder => {
+                let route = self
+                    .audio_extension_route
+                    .as_ref()
+                    .expect("selected ordered audio route");
+                json!({"action":"open","codec":route.codec,"channels":config.audio.channels,
+                    "channel_mask":config.audio.channel_mask,"sample_rate":48000,"frame_samples":1536})
+            }
             Resource::Media => {
                 let audio_encrypted = config.stream_audio && config.encrypt_audio;
                 let permit_legacy_audio_iv_wrap =

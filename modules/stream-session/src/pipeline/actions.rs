@@ -200,6 +200,24 @@ impl Pipeline {
             .map(|_| self.settings.enable_input);
         let mut record = Record::new(id, owner, config, self.settings.input_lease_ttl_ms);
         record.providers = self.settings.providers.clone();
+        if record.owner == "amaterasu.rtsp"
+            && record.config.stream_audio
+            && matches!(
+                (
+                    record.config.audio.channels,
+                    record.config.audio.channel_mask
+                ),
+                (2, 3) | (6, 63)
+            )
+            && let Some(route) = self.settings.audio_extension_route.clone()
+        {
+            let mut epoch = [0u8; 16];
+            if getrandom::fill(&mut epoch).is_ok() && epoch != [0; 16] {
+                record.ordered_audio_control = Some(route.encoder_control_service.clone());
+                record.audio_extension_route = Some(route);
+                record.ordered_audio_epoch = epoch;
+            }
+        }
         if record.config.extension_probe.is_some()
             && record.config.display_request.is_none()
             && record.config.virtual_display_intent.is_none()

@@ -82,6 +82,17 @@ pub(crate) fn probe_extension_chain(
     native::probe_chain(runtime, route, media, config)
 }
 
+pub(crate) fn probe_ordered_audio_chain(
+    runtime: &RuntimeClient,
+    route: &crate::model::AudioExtensionRoute,
+    encoder: u64,
+    media: u64,
+    config: &crate::model::PrepareConfig,
+    epoch: [u8; 16],
+) -> PlaneResult<amaterasu_module_sdk::audio::OrderedAudioCandidate> {
+    native::probe_ordered_audio_chain(runtime, route, encoder, media, config, epoch)
+}
+
 #[derive(Debug)]
 pub struct ControlRecord {
     pub message_type: u16,

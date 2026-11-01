@@ -134,6 +134,12 @@ impl Pipeline {
                     return self.consume(record, job, payload, now, send, operations);
                 }
                 rpc::Progress::Failed => {
+                    if job.step == Step::Open(Resource::OrderedAudioEncoder)
+                        && pending.admission_rejected()
+                    {
+                        record.attempted.remove(&Resource::OrderedAudioEncoder);
+                        return self.deliver_success(record, job, now, send);
+                    }
                     if job.step == Step::ProbeExtensionSource {
                         record.extension_checked = true;
                         return self.deliver_success(record, job, now, send);
@@ -450,6 +456,31 @@ impl Pipeline {
                 && let Some(media) = record.resources.get(&Resource::Media)
             {
                 record.extension_limits = (operations.probe)(route, *media, &record.config).ok();
+            }
+            return self.deliver_success(record, job, now, send);
+        }
+        if job.step == Step::Open(Resource::OrderedAudioEncoder) {
+            if let Some(id) = allocation_id(record, Resource::OrderedAudioEncoder, &payload) {
+                // Retain every allocated handle before checking the provider's
+                // declaration or native interface so cleanup always owns it.
+                record.resources.insert(Resource::OrderedAudioEncoder, id);
+                if record
+                    .validate_native_contract(Resource::OrderedAudioEncoder, &payload)
+                    .is_ok()
+                    && let (Some(route), Some(media)) = (
+                        &record.audio_extension_route,
+                        record.resources.get(&Resource::Media),
+                    )
+                {
+                    record.ordered_audio_candidate = (operations.audio_probe)(
+                        route,
+                        id,
+                        *media,
+                        &record.config,
+                        record.ordered_audio_epoch,
+                    )
+                    .ok();
+                }
             }
             return self.deliver_success(record, job, now, send);
         }
@@ -1233,6 +1264,7 @@ impl Pipeline {
                 }
                 job.step = Step::Open(Resource::Media);
             }
+            Resource::OrderedAudioEncoder => return Err("invalid_workflow"),
             Resource::Media => {
                 record.video_local = Some(local_address(payload, "video_local")?);
                 record.audio_local = Some(local_address(payload, "audio_local")?);
@@ -1317,6 +1349,14 @@ impl Pipeline {
         now: u64,
         send: &mut Send<'_>,
     ) -> bool {
+        if record.state == State::Prepared
+            && !record.ordered_audio_checked
+            && record.audio_extension_route.is_some()
+        {
+            record.ordered_audio_checked = true;
+            job.step = Step::Open(Resource::OrderedAudioEncoder);
+            return true;
+        }
         if record.state == State::Prepared
             && !record.extension_checked
             && record.extension_route.is_some()

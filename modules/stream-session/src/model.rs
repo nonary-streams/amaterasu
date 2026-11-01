@@ -11,6 +11,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 pub struct Settings {
     pub providers: crate::providers::ProviderServices,
     pub extension_route: Option<ExtensionRoute>,
+    pub audio_extension_route: Option<AudioExtensionRoute>,
     pub enabled: bool,
     pub allow_remote: bool,
     pub allowed_principals: Vec<String>,
@@ -25,6 +26,7 @@ impl Default for Settings {
         Self {
             providers: Default::default(),
             extension_route: None,
+            audio_extension_route: None,
             enabled: false,
             allow_remote: false,
             allowed_principals: Vec::new(),
@@ -44,6 +46,10 @@ impl Settings {
             .as_ref()
             .is_some_and(|route| !route.valid())
             || (self.observe_feedback_sources && !self.enable_input)
+            || self
+                .audio_extension_route
+                .as_ref()
+                .is_some_and(|route| !route.valid())
             || self.allowed_principals.len() > 16
             || self
                 .allowed_principals
@@ -56,6 +62,37 @@ impl Settings {
             return Err("invalid_settings");
         }
         Ok(())
+    }
+}
+
+/// Trusted service selection. Discovery and downstream probes still decide
+/// whether this route can be offered for any particular session.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AudioExtensionRoute {
+    pub codec: String,
+    pub encoder_control_service: String,
+    pub encoder_service: String,
+    pub capture_service: String,
+    pub transport_service: String,
+}
+
+impl AudioExtensionRoute {
+    fn valid(&self) -> bool {
+        let services = [
+            &self.encoder_service,
+            &self.capture_service,
+            &self.transport_service,
+        ];
+        matches!(self.codec.as_str(), "AC3" | "EAC3")
+            && amaterasu_contracts::valid_name(&self.encoder_control_service)
+            && services
+                .iter()
+                .all(|service| amaterasu_contracts::valid_name(service))
+            && services
+                .iter()
+                .enumerate()
+                .all(|(index, service)| !services[..index].contains(service))
     }
 }
 

@@ -120,6 +120,66 @@ pub(super) fn probe_chain(
     Ok(limits)
 }
 
+/// Probe an encoder offer, ordered capture interface, and actual downstream
+/// audio transport before exposing any codec marker to the client.
+pub(super) fn probe_ordered_audio_chain(
+    runtime: &RuntimeClient,
+    route: &crate::model::AudioExtensionRoute,
+    encoder_stream: u64,
+    media_stream: u64,
+    config: &crate::model::PrepareConfig,
+    epoch: [u8; 16],
+) -> PlaneResult<amaterasu_module_sdk::audio::OrderedAudioCandidate> {
+    use amaterasu_module_sdk::audio::{self, AudioFormat};
+    let encoder = unsafe { audio::bind_ordered_encoder(runtime, &route.encoder_service) }
+        .map_err(|_| "ordered_encoder_unavailable")?;
+    let _capture = unsafe { audio::bind_ordered_capture(runtime, &route.capture_service) }
+        .map_err(|_| "ordered_capture_unavailable")?;
+    let transport = unsafe { audio::bind_ordered_transport(runtime, &route.transport_service) }
+        .map_err(|_| "ordered_transport_unavailable")?;
+    let (codec, framing) = match route.codec.as_str() {
+        "AC3" => (AUDIO_CODEC_AC3, AUDIO_FRAMING_AC3_SYNCFRAME),
+        "EAC3" => (AUDIO_CODEC_EAC3, AUDIO_FRAMING_EAC3_SYNCFRAME),
+        _ => return Err("unsupported_audio_codec"),
+    };
+    let lanes = match (config.audio.channels, config.audio.channel_mask) {
+        (2, 3) => [1, 2, 0, 0, 0, 0, 0, 0],
+        (6, 63) => [1, 2, 4, 8, 16, 32, 0, 0],
+        _ => return Err("unsupported_audio_layout"),
+    };
+    let layout = AudioChannelLayoutV2 {
+        size: size_of::<AudioChannelLayoutV2>() as u32,
+        version: AUDIO_ORDERED_VERSION,
+        channels: config.audio.channels,
+        reserved: 0,
+        mask: u64::from(config.audio.channel_mask),
+        lanes,
+    };
+    let format = AudioFormat {
+        namespace: [0; 16],
+        codec,
+        framing,
+        sample_rate: 48_000,
+        channels: config.audio.channels,
+        channel_mask: u64::from(config.audio.channel_mask),
+        frame_samples: 1536,
+        config: Vec::new(),
+    };
+    // SAFETY: retained bindings and table implement their typed native contracts.
+    let api = unsafe { encoder.table::<OrderedAudioEncoderApiV2>() }
+        .map_err(|_| "native_layout_mismatch")?;
+    let candidate = unsafe { audio::probe_ordered(api, encoder_stream, &[(format, layout)]) }
+        .map_err(|_| "ordered_encoder_probe_failed")?;
+    let selection = candidate.transport_selection(epoch);
+    let api = unsafe { transport.table::<OrderedAudioTransportApiV2>() }
+        .map_err(|_| "native_layout_mismatch")?;
+    // SAFETY: selection and nested config remain live for this synchronous probe.
+    if unsafe { (api.probe)(transport.context(), media_stream, &selection) } != STATUS_OK {
+        return Err("ordered_transport_probe_failed");
+    }
+    Ok(candidate)
+}
+
 pub(super) struct NativeBackend {
     video: Option<NativeBinding>,
     video_unit: Option<NativeBinding>,

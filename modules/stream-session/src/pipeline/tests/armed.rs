@@ -37,6 +37,53 @@ fn unoffered_audio_codec_cannot_fall_back_to_opus() {
     assert_eq!(host.response(2, request)["code"], "audio_codec_not_offered");
 }
 
+#[test]
+fn unavailable_ordered_encoder_preserves_opus_and_reconciles_its_attempt() {
+    let mut host = Harness::new();
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    host.pipeline.settings.audio_extension_route = Some(
+        serde_json::from_value(json!({
+            "codec":"AC3",
+            "encoder_control_service":"example.ordered-encoder/1",
+            "encoder_service":"example.ordered-encoder/1",
+            "capture_service":"example.ordered-capture/1",
+            "transport_service":"example.ordered-transport/1"
+        }))
+        .unwrap(),
+    );
+    host.broker.fail_open = Some("example.ordered-encoder/1".into());
+    let prepared = host.response_from(1, "amaterasu.rtsp", prepare());
+    assert_eq!(prepared["state"], "prepared");
+    assert!(prepared["audio_offer"].is_null());
+    let session = prepared["session"].as_u64().unwrap();
+    assert!(
+        host.broker
+            .calls
+            .iter()
+            .any(|call| call.service == "amaterasu.audio-encode/1"
+                && call.payload["action"] == "open")
+    );
+    assert!(host.broker.calls.iter().any(
+        |call| call.service == "example.ordered-encoder/1" && call.payload["action"] == "open"
+    ));
+    let stopped = host.response_from(
+        2,
+        "amaterasu.rtsp",
+        json!({"action":"stop","session":session}),
+    );
+    assert_eq!(stopped["state"], "stopped");
+    assert!(
+        host.broker
+            .calls
+            .iter()
+            .any(|call| call.service == "example.ordered-encoder/1"
+                && call.payload["action"] == "lookup")
+    );
+}
+
 fn arm_lifecycle(host: &mut Harness) -> (u64, Value) {
     let session_target =
         json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1});
