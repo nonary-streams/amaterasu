@@ -4883,3 +4883,168 @@ fn canceled_authority_request_does_not_fence_legacy_arm_selected() {
         Response::Accepted { .. }
     ));
 }
+
+#[test]
+fn saturated_state_ledger_allows_fenced_recovery_without_cross_caller_blocking() {
+    use amaterasu_state::test_support::TestStateStore;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let directory = std::env::temp_dir().join(format!(
+        "state-saturation-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let store = TestStateStore::open(directory.clone()).unwrap();
+    let mut config = RuntimeConfig::default();
+    config.principals.insert(
+        "state".into(),
+        Grants {
+            provide: ["amaterasu.state/1".into()].into(),
+            ..Default::default()
+        },
+    );
+    for owner in (0..8)
+        .map(|index| format!("owner.{index}"))
+        .chain(["other".into()])
+    {
+        config.principals.insert(
+            owner,
+            Grants {
+                call: ["amaterasu.state/1".into()].into(),
+                ..Default::default()
+            },
+        );
+    }
+    let mut broker = Broker::new(config).unwrap();
+    assert!(matches!(
+        broker.dispatch(
+            "state",
+            Command::Register {
+                service: "amaterasu.state/1".into()
+            }
+        ),
+        Response::Ok
+    ));
+    let submit = |broker: &mut Broker, owner: &str, operation: String, revision: u64| {
+        let Response::Accepted { id } = broker.dispatch(owner, Command::Request {
+            service: "amaterasu.state/1".into(),
+            payload: json!({"action":"set","key":"key","value":{},"expected_revision":revision}),
+            timeout_ms: 30_000, operation_id: operation, parent: None,
+        }) else { panic!("request denied for {owner}") };
+        let Response::Request {
+            caller, payload, ..
+        } = broker.dispatch("state", Command::Poll {})
+        else {
+            panic!("State request not delivered")
+        };
+        (id, caller, payload)
+    };
+    for owner in 0..8 {
+        let owner = format!("owner.{owner}");
+        for sequence in 0..64 {
+            let (id, _, _) = submit(&mut broker, &owner, format!("abandon.{sequence}"), 0);
+            assert!(matches!(
+                broker.dispatch(&owner, Command::Cancel { request: id }),
+                Response::Ok
+            ));
+            assert!(matches!(
+                broker.dispatch(&owner, Command::ReleaseResult { request: id }),
+                Response::Ok
+            ));
+        }
+    }
+    // Saturated owners may issue one bounded recovery attempt. Losing that
+    // reply must not erase uncertainty or consume another ledger entry.
+    let (lost_id, lost_caller, lost_payload) =
+        submit(&mut broker, "owner.0", "recovery.lost".into(), 0);
+    assert!(matches!(
+        broker.dispatch("owner.0", Command::Cancel { request: lost_id }),
+        Response::Ok
+    ));
+    assert!(matches!(
+        broker.dispatch("owner.0", Command::ReleaseResult { request: lost_id }),
+        Response::Ok
+    ));
+    let (other_id, other_caller, other_payload) =
+        submit(&mut broker, "other", "other.write".into(), 0);
+    let result = store.handle(&other_caller, other_payload);
+    assert_eq!(result["ok"], true);
+    assert!(matches!(
+        broker.dispatch(
+            "state",
+            Command::Complete {
+                request: other_id,
+                payload: result
+            }
+        ),
+        Response::Ok
+    ));
+    assert!(matches!(
+        broker.dispatch("other", Command::ReleaseResult { request: other_id }),
+        Response::Ok
+    ));
+    let (recovery_id, caller, payload) = submit(&mut broker, "owner.0", "recovery.good".into(), 0);
+    let result = store.handle(&caller, payload);
+    assert_eq!(result["ok"], true);
+    assert!(matches!(
+        broker.dispatch(
+            "state",
+            Command::Complete {
+                request: recovery_id,
+                payload: result
+            }
+        ),
+        Response::Ok
+    ));
+    assert!(matches!(
+        broker.dispatch(
+            "owner.0",
+            Command::ReleaseResult {
+                request: recovery_id
+            }
+        ),
+        Response::Ok
+    ));
+    let delayed = store.handle(&lost_caller, lost_payload);
+    assert_eq!(delayed["error"]["code"], "revision_conflict");
+    assert_eq!(
+        code(broker.dispatch(
+            "state",
+            Command::Complete {
+                request: lost_id,
+                payload: delayed
+            }
+        )),
+        "not_found"
+    );
+    // The completed fence frees this namespace, without clearing another.
+    let (id, caller, payload) = submit(&mut broker, "owner.0", "after.fence".into(), 1);
+    let result = store.handle(&caller, payload);
+    assert_eq!(result["ok"], true);
+    assert!(matches!(
+        broker.dispatch(
+            "state",
+            Command::Complete {
+                request: id,
+                payload: result
+            }
+        ),
+        Response::Ok
+    ));
+    let unrelated = broker.dispatch(
+        "owner.1",
+        Command::Request {
+            service: "amaterasu.state/1".into(),
+            payload: json!({"action":"set","key":"key","value":{},"expected_revision":1}),
+            timeout_ms: 30_000,
+            operation_id: "still.saturated".into(),
+            parent: None,
+        },
+    );
+    assert_eq!(code(unrelated), "resource_exhausted");
+    drop(store);
+    std::fs::remove_dir_all(directory).unwrap();
+}

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use super::errors::{capacity_exhausted, not_found, payload_fits, permission_denied};
 
 const MAX_RETAINED_REQUESTS: usize = 512;
+const MAX_UNCERTAIN_STATE_PER_CALLER: usize = 64;
 const RESULT_RETENTION: Duration = Duration::from_secs(300);
 
 pub(super) struct RequestOptions {
@@ -38,6 +39,7 @@ struct UncertainStateWrite {
     caller: String,
     provider: String,
     expected_revision: Option<u64>,
+    coalesced: bool,
 }
 
 impl RequestRecord {
@@ -63,6 +65,7 @@ impl RequestRecord {
             caller: self.caller.clone(),
             provider: self.provider.clone(),
             expected_revision,
+            coalesced: false,
         }
     }
     fn finish(&mut self, result: Response, now: Instant) {
@@ -88,6 +91,30 @@ pub(super) struct RequestRouter {
 }
 
 impl RequestRouter {
+    fn retain_uncertain_write(
+        writes: &mut BTreeMap<u64, UncertainStateWrite>,
+        id: u64,
+        write: UncertainStateWrite,
+    ) {
+        let caller_count = writes
+            .values()
+            .filter(|entry| entry.caller == write.caller)
+            .count();
+        if caller_count >= MAX_UNCERTAIN_STATE_PER_CALLER
+            && write.expected_revision.is_some()
+            && let Some(entry) = writes.values_mut().find(|entry| {
+                entry.caller == write.caller
+                    && entry.provider == write.provider
+                    && entry.expected_revision == write.expected_revision
+            })
+        {
+            // Identical CAS revisions can be resolved as a group only by a
+            // result proving that revision is no longer writable.
+            entry.coalesced = true;
+        } else {
+            writes.insert(id, write);
+        }
+    }
     /// Host retirement closes the whole provider, including cleanup aliases.
     /// Never leave queued work deliverable after the host starts joining it.
     pub fn cancel_undelivered_to_provider(&mut self, provider: &str, now: Instant) {
@@ -254,22 +281,6 @@ impl RequestRouter {
         if !separate_retry && let Some(previous_response) = self.find_retry(caller, &options) {
             return previous_response;
         }
-        if options.service == "amaterasu.state/1"
-            && !state_read_only(&options.payload)
-            && self.uncertain_state_writes.len()
-                + self
-                    .requests
-                    .values()
-                    .filter(|request| {
-                        request.options.service == "amaterasu.state/1"
-                            && request.result.is_none()
-                            && !request.state_read_only()
-                    })
-                    .count()
-                >= MAX_RETAINED_REQUESTS
-        {
-            return capacity_exhausted();
-        }
         let authority = match self.resolve_authority(caller, grants, &options, now) {
             Ok(authority) => authority,
             Err(error) => return error,
@@ -278,6 +289,53 @@ impl RequestRouter {
         let Some(provider) = self.providers.get(&options.service).cloned() else {
             return Response::error("unavailable", "service is not registered");
         };
+        if options.service == "amaterasu.state/1" && !state_read_only(&options.payload) {
+            let active: Vec<_> = self
+                .requests
+                .values()
+                .filter(|request| {
+                    request.options.service == "amaterasu.state/1"
+                        && request.result.is_none()
+                        && !request.state_read_only()
+                })
+                .collect();
+            let caller_active = active
+                .iter()
+                .filter(|request| request.caller == caller)
+                .count();
+            let caller_uncertain = self
+                .uncertain_state_writes
+                .values()
+                .filter(|write| write.caller == caller)
+                .count();
+            // The set of callers is fixed by trusted startup configuration;
+            // a per-caller quota bounds the ledger without allowing one
+            // namespace to prevent another namespace from recovering.
+            let at_limit = caller_active + caller_uncertain >= MAX_UNCERTAIN_STATE_PER_CALLER;
+            let revision = if matches!(
+                options.payload.get("action").and_then(Value::as_str),
+                Some("set" | "delete")
+            ) {
+                options
+                    .payload
+                    .get("expected_revision")
+                    .and_then(Value::as_u64)
+            } else {
+                None
+            };
+            // A single extra CAS can retry an already tracked revision. If it
+            // is abandoned, both attempts remain represented by that entry.
+            let recovery = caller_active == 0
+                && revision.is_some()
+                && self.uncertain_state_writes.values().any(|write| {
+                    write.caller == caller
+                        && write.provider == provider
+                        && write.expected_revision == revision
+                });
+            if at_limit && !recovery {
+                return capacity_exhausted();
+            }
+        }
         self.enqueue(caller, provider, options, authority, separate_retry)
     }
 
@@ -503,8 +561,11 @@ impl RequestRouter {
             None
         };
         if request.uncertain_state_mutation() && state_revision.is_none() && !definitive_conflict {
-            self.uncertain_state_writes
-                .insert(request_id, request.uncertain_state_write());
+            Self::retain_uncertain_write(
+                &mut self.uncertain_state_writes,
+                request_id,
+                request.uncertain_state_write(),
+            );
         }
         request.finish(Response::Result { payload }, now);
         if let Some((caller, revision)) = state_revision {
@@ -512,6 +573,17 @@ impl RequestRouter {
             *observed = (*observed).max(revision);
         }
         if let Some((caller, revision)) = conflict_revision {
+            let provider = self
+                .requests
+                .get(&request_id)
+                .expect("completed request")
+                .provider
+                .clone();
+            self.uncertain_state_writes.retain(|_, write| {
+                write.caller != caller
+                    || write.provider != provider
+                    || write.expected_revision.is_none_or(|old| old >= revision)
+            });
             let observed = self.state_revisions.entry(caller).or_default();
             *observed = (*observed).max(revision);
         }
@@ -553,6 +625,17 @@ impl RequestRouter {
             _ => None,
         };
         let Some(revision) = revision else { return };
+        if write.coalesced
+            && write.expected_revision.is_none_or(|expected| {
+                match payload.get("ok").and_then(Value::as_bool) {
+                    Some(true) => expected.checked_add(1) != Some(revision),
+                    Some(false) => revision <= expected,
+                    _ => true,
+                }
+            })
+        {
+            return;
+        }
         let caller = write.caller.clone();
         self.uncertain_state_writes.remove(&request_id);
         let observed = self.state_revisions.entry(caller).or_default();
@@ -599,8 +682,11 @@ impl RequestRouter {
         }
         if request.result.is_none() {
             if request.uncertain_state_mutation() {
-                self.uncertain_state_writes
-                    .insert(request_id, request.uncertain_state_write());
+                Self::retain_uncertain_write(
+                    &mut self.uncertain_state_writes,
+                    request_id,
+                    request.uncertain_state_write(),
+                );
             }
             request.finish(
                 Response::error("cancelled", "cancelled by the request owner"),
@@ -640,8 +726,11 @@ impl RequestRouter {
         for (request_id, request) in &mut self.requests {
             if request.result.is_none() && now >= request.authority.deadline {
                 if request.uncertain_state_mutation() {
-                    self.uncertain_state_writes
-                        .insert(*request_id, request.uncertain_state_write());
+                    Self::retain_uncertain_write(
+                        &mut self.uncertain_state_writes,
+                        *request_id,
+                        request.uncertain_state_write(),
+                    );
                 }
                 request.finish(
                     Response::error("deadline_exceeded", "request deadline elapsed"),
@@ -670,8 +759,11 @@ impl RequestRouter {
                     .is_some_and(|id| finished.contains(&id));
                 if request.result.is_none() && parent_ended {
                     if request.uncertain_state_mutation() {
-                        self.uncertain_state_writes
-                            .insert(*request_id, request.uncertain_state_write());
+                        Self::retain_uncertain_write(
+                            &mut self.uncertain_state_writes,
+                            *request_id,
+                            request.uncertain_state_write(),
+                        );
                     }
                     request.finish(Response::error("cancelled", "parent request ended"), now);
                     cancelled_any = true;
