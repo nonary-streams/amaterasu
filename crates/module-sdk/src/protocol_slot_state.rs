@@ -18,10 +18,36 @@ const SLOT_COUNT: u8 = 64;
 const WINDOW: usize = 8;
 const MAX_VALUE_BYTES: usize = 12_000;
 
+/// Issued by the trusted host lifecycle for one concrete provider instance.
+/// This identifier is a selector, not a provider's self-asserted credential.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderIncarnation {
+    pub version: u8,
+    pub id: String,
+}
+
+impl ProviderIncarnation {
+    pub fn valid(&self) -> bool {
+        self.version == 1
+            && self.id.len() == 32
+            && self
+                .id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
     pub identity: GuardedEffectIdentity,
+    /// Exact broker incarnation in which this effect was issued. A recovery
+    /// lease may change, but old provider/host retirement must use this lease.
+    pub issued_lease: SourceSlotLease,
+    /// Must be retrieved from the selected host lifecycle, never inferred
+    /// from the provider name or copied from client input.
+    pub provider_incarnation: ProviderIncarnation,
     pub selected_method: SelectedEffectMethod,
     pub cleanup_method: crate::extension_api::MethodRef,
     pub cleanup_approval: amaterasu_contracts::ApiMethodApproval,
@@ -103,6 +129,11 @@ fn valid_claim(slot: u8, retired: u64, claim: &Claim) -> bool {
         let effect = &entry.identity;
         !(unconfirmed && entry.cleanup_confirmed)
             && effect.scope == claim.scope
+            && entry.issued_lease.slot == slot
+            && entry.issued_lease.incarnation == claim.lease.incarnation
+            && entry.provider_incarnation.valid()
+            && token(&entry.issued_lease.broker_epoch)
+            && token(&entry.issued_lease.token)
             && claim.retired_through.checked_add(index as u64 + 1) == Some(effect.sequence)
             && digest(&effect.payload_sha256)
             && crate::protocol_state::CleanupReference::new(entry.cleanup.id.clone()).is_ok()
@@ -265,7 +296,11 @@ pub fn prepare_issue(
 ) -> Result<PendingWrite, &'static str> {
     let (revision, mut slot) = read(slot_number, response)?;
     let claim = slot.active.as_mut().ok_or("unknown_claim")?;
-    if &claim.lease != lease || entry.identity.scope != claim.scope {
+    if &claim.lease != lease
+        || &entry.issued_lease != lease
+        || entry.identity.scope != claim.scope
+        || entry.cleanup_confirmed
+    {
         return Err("claim_mismatch");
     }
     if claim.entries.len() >= WINDOW {
@@ -276,6 +311,39 @@ pub fn prepare_issue(
     }
     claim.issued_through = entry.identity.sequence;
     claim.entries.push(entry);
+    write(revision, slot)
+}
+
+/// Only actual retirement of the old broker's issuer, providers and host
+/// workers permits a recovery lease. A new broker epoch alone is not proof.
+pub trait OldWorkersRetired {
+    fn verify(&self, _claim: &Claim, _new_lease: &SourceSlotLease) -> Result<(), &'static str> {
+        Err("old_workers_retirement_unproven")
+    }
+}
+
+/// Persist the new broker's exact recovery lease before OpenRecoverySlot. The
+/// old effect leases remain in the entries for historical retirement checks.
+pub fn prepare_recovery_lease(
+    response: &Value,
+    slot_number: u8,
+    old_lease: &SourceSlotLease,
+    new_lease: SourceSlotLease,
+    retirement: &impl OldWorkersRetired,
+) -> Result<PendingWrite, &'static str> {
+    let (revision, mut slot) = read(slot_number, response)?;
+    let claim = slot.active.as_mut().ok_or("unknown_claim")?;
+    if &claim.lease != old_lease
+        || old_lease.slot != new_lease.slot
+        || old_lease.incarnation != new_lease.incarnation
+        || old_lease.broker_epoch == new_lease.broker_epoch
+        || !token(&new_lease.broker_epoch)
+        || !token(&new_lease.token)
+    {
+        return Err("recovery_lease_mismatch");
+    }
+    retirement.verify(claim, &new_lease)?;
+    claim.lease = new_lease;
     write(revision, slot)
 }
 

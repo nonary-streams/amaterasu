@@ -5,7 +5,7 @@ use amaterasu_module_sdk::{
         EffectScope, EffectSource, GuardedEffectIdentity, SelectedEffectMethod, SourceSlotLease,
     },
     extension_api::MethodRef,
-    protocol_slot_state::{self, Entry},
+    protocol_slot_state::{self, Entry, ProviderIncarnation},
     protocol_state::CleanupReference,
     state::StateRequest,
 };
@@ -40,6 +40,16 @@ impl protocol_slot_state::EffectRetirement for NoProof {}
 impl protocol_slot_state::SourceRetirement for NoProof {}
 impl protocol_slot_state::BrokerClose for NoProof {}
 impl protocol_slot_state::BrokerCompaction for NoProof {}
+impl protocol_slot_state::OldWorkersRetired for NoProof {}
+impl protocol_slot_state::OldWorkersRetired for TestRetired {
+    fn verify(
+        &self,
+        _: &protocol_slot_state::Claim,
+        _: &SourceSlotLease,
+    ) -> Result<(), &'static str> {
+        Ok(())
+    }
+}
 impl protocol_slot_state::EffectRetirement for TestRetired {
     fn verify(&self, _: &SourceSlotLease, _: &Entry) -> Result<(), &'static str> {
         Ok(())
@@ -60,7 +70,7 @@ impl protocol_slot_state::BrokerCompaction for TestRetired {
         Ok(())
     }
 }
-fn entry(scope: &EffectScope, sequence: u64) -> Entry {
+fn entry(scope: &EffectScope, sequence: u64, lease: &SourceSlotLease) -> Entry {
     let method = ApiMethod {
         service: "example.effects/1".into(),
         method: "apply".into(),
@@ -81,6 +91,11 @@ fn entry(scope: &EffectScope, sequence: u64) -> Entry {
     let mut cleanup = method.clone();
     cleanup.method = "cleanup".into();
     Entry {
+        issued_lease: lease.clone(),
+        provider_incarnation: ProviderIncarnation {
+            version: 1,
+            id: "e".repeat(32),
+        },
         identity: GuardedEffectIdentity {
             scope: scope.clone(),
             sequence,
@@ -130,12 +145,13 @@ fn durable_slot_claim_and_issue_survive_lost_replies_and_restart() {
     let store = TestStateStore::open(path.clone()).unwrap();
     let scope = scope();
     let slot = scope.source.slot().unwrap();
-    let lease = SourceSlotLease {
+    let mut lease = SourceSlotLease {
         slot,
         incarnation: 1,
         broker_epoch: "broker".into(),
         token: "opaque".into(),
     };
+    let original_lease = lease.clone();
     let lookup = protocol_slot_state::read_request(slot).unwrap();
     let initial = invoke(&store, &lookup);
     let claim =
@@ -154,8 +170,13 @@ fn durable_slot_claim_and_issue_survive_lost_replies_and_restart() {
         protocol_slot_state::prepare_claim(&current, lease.clone(), scope.clone(), "issuer".into())
             .is_err()
     );
-    let first =
-        protocol_slot_state::prepare_issue(&current, slot, &lease, entry(&scope, 1)).unwrap();
+    let first = protocol_slot_state::prepare_issue(
+        &current,
+        slot,
+        &lease,
+        entry(&scope, 1, &original_lease),
+    )
+    .unwrap();
     assert_eq!(invoke(&store, first.request())["ok"], true);
     // Deliberately lose the write reply; a reread discovers the identity but is
     // not itself a broker arm, dispatch or worker-retirement receipt.
@@ -166,26 +187,87 @@ fn durable_slot_claim_and_issue_survive_lost_replies_and_restart() {
     let (_, slot_state) = protocol_slot_state::read(slot, &current).unwrap();
     let active = slot_state.active.unwrap();
     assert_eq!(active.issued_through, 1);
-    assert_eq!(active.entries, vec![entry(&scope, 1)]);
+    assert_eq!(active.entries, vec![entry(&scope, 1, &original_lease)]);
     assert_eq!(active.entries[0].selected_method.provider, "provider");
     assert_eq!(active.entries[0].cleanup_approval.provider, "provider");
-    assert!(protocol_slot_state::prepare_issue(&current, slot, &lease, entry(&scope, 1)).is_err());
+    let mut legacy = current.clone();
+    legacy["value"]["active"]["entries"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("provider_incarnation");
+    assert!(protocol_slot_state::read(slot, &legacy).is_err());
+    let mut unknown_version = current.clone();
+    unknown_version["value"]["active"]["entries"][0]["provider_incarnation"]["version"] =
+        serde_json::json!(2);
+    assert!(protocol_slot_state::read(slot, &unknown_version).is_err());
+    assert!(
+        protocol_slot_state::prepare_issue(
+            &current,
+            slot,
+            &lease,
+            entry(&scope, 1, &original_lease)
+        )
+        .is_err()
+    );
     let mut wrong = scope.clone();
     wrong.issuer_epoch = "other".into();
-    assert!(protocol_slot_state::prepare_issue(&current, slot, &lease, entry(&wrong, 2)).is_err());
-    let mut wrong_provider = entry(&scope, 2);
+    assert!(
+        protocol_slot_state::prepare_issue(
+            &current,
+            slot,
+            &lease,
+            entry(&wrong, 2, &original_lease)
+        )
+        .is_err()
+    );
+    let mut wrong_provider = entry(&scope, 2, &original_lease);
     wrong_provider.selected_method.provider = "other".into();
     assert!(protocol_slot_state::prepare_issue(&current, slot, &lease, wrong_provider).is_err());
-    let mut wrong_cleanup = entry(&scope, 2);
+    let mut wrong_cleanup = entry(&scope, 2, &original_lease);
     wrong_cleanup.cleanup_approval.callers.clear();
     assert!(protocol_slot_state::prepare_issue(&current, slot, &lease, wrong_cleanup).is_err());
+    let mut already_cleaned = entry(&scope, 2, &original_lease);
+    already_cleaned.cleanup_confirmed = true;
+    assert!(protocol_slot_state::prepare_issue(&current, slot, &lease, already_cleaned).is_err());
     assert!(!current.to_string().contains("payload_base64"));
+    let new_lease = SourceSlotLease {
+        broker_epoch: "new-broker".into(),
+        token: "new-token".into(),
+        ..lease.clone()
+    };
+    assert!(
+        protocol_slot_state::prepare_recovery_lease(
+            &current,
+            slot,
+            &lease,
+            new_lease.clone(),
+            &NoProof
+        )
+        .is_err()
+    );
+    let recovery = protocol_slot_state::prepare_recovery_lease(
+        &current,
+        slot,
+        &lease,
+        new_lease.clone(),
+        &TestRetired,
+    )
+    .unwrap();
+    let result = invoke(&store, recovery.request());
+    recovery.confirmed(result).unwrap();
+    lease = new_lease;
+    let current = invoke(&store, &lookup);
+    let (_, slot_state) = protocol_slot_state::read(slot, &current).unwrap();
+    assert_eq!(
+        slot_state.active.unwrap().entries[0].issued_lease,
+        original_lease
+    );
     assert!(
         protocol_slot_state::prepare_retire_effect(
             &current,
             slot,
             &lease,
-            &entry(&scope, 1),
+            &entry(&scope, 1, &original_lease),
             &NoProof
         )
         .is_err()
@@ -194,7 +276,7 @@ fn durable_slot_claim_and_issue_survive_lost_replies_and_restart() {
         &current,
         slot,
         &lease,
-        &entry(&scope, 1),
+        &entry(&scope, 1, &original_lease),
         &TestRetired,
     )
     .unwrap();
