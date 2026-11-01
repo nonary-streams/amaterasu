@@ -16,6 +16,7 @@ use x509_cert::der::Encode;
 
 mod protocol_admission;
 mod protocol_claim;
+mod protocol_issue;
 mod source_retirement;
 
 const STATE_KEY: &str = "pairing/v1";
@@ -81,6 +82,10 @@ pub struct Pipeline {
     effect_bindings: BTreeMap<EffectSource, (Arc<Snapshot>, Vec<u8>)>,
     protocol_capabilities: BTreeMap<EffectSource, protocol_admission::ProtocolAttestation>,
     pending_protocol_claim: Option<protocol_claim::ClaimJob>,
+    pending_protocol_issue: Option<protocol_issue::IssueJob>,
+    protocol_issue_draft: Option<protocol_issue::IssueDraft>,
+    protocol_state_binding: Option<amaterasu_module_sdk::protocol_state::DurableStateBinding>,
+    protocol_state_instance: Option<amaterasu_module_sdk::broker_effect_fence::ProviderIncarnation>,
     protocol_claim_recovery_required: bool,
     retained_protocol_claim: Option<(
         amaterasu_module_sdk::broker_effect_fence::SourceSlotLease,
@@ -156,6 +161,14 @@ impl Pipeline {
             HostConfigurationState::Disabled
         };
         let effect_authority = settings.effect_authority.clone();
+        let protocol_state_binding = settings.protocol_state.as_ref().and_then(|selection| {
+            amaterasu_module_sdk::protocol_state::DurableStateBinding::new(
+                &selection.owner,
+                &selection.provider,
+                &selection.capability,
+            )
+            .ok()
+        });
         // A restarted optional protocol authority must reconcile its durable
         // slots before it can authorize new work or commit trust changes.
         let protocol_claim_recovery_required = effect_authority
@@ -168,6 +181,10 @@ impl Pipeline {
             effect_bindings: BTreeMap::new(),
             protocol_capabilities: BTreeMap::new(),
             pending_protocol_claim: None,
+            pending_protocol_issue: None,
+            protocol_issue_draft: None,
+            protocol_state_binding,
+            protocol_state_instance: None,
             protocol_claim_recovery_required,
             retained_protocol_claim: None,
             deferred_effect_mutation: None,
@@ -818,14 +835,39 @@ impl Pipeline {
     }
 
     fn drive(&mut self, now: u64, mut send: impl FnMut(Command) -> Transport) -> ModuleResult<()> {
+        if let Some(mut issue) = self.pending_protocol_issue.take() {
+            let current = self.protocol_draft_current(&issue.draft, now)
+                && self.protocol_state_current(&mut send);
+            let parent = issue.parent;
+            let outcome = issue.advance(current, &mut send);
+            return match outcome {
+                Ok(protocol_issue::Outcome::Pending) => {
+                    self.pending_protocol_issue = Some(issue);
+                    Ok(())
+                }
+                _ => {
+                    // A durable claim and perhaps an effect entry exist. No
+                    // broker arm has occurred; retain both for reconciliation.
+                    self.protocol_claim_recovery_required = true;
+                    self.invalidate_identity();
+                    complete(&mut send, parent, error("protocol_reconciliation_required"))
+                }
+            };
+        }
         if let Some(mut claim) = self.pending_protocol_claim.take() {
-            let current = self.protocol_claim_current(&claim, now);
+            let current = self.protocol_claim_current(&claim, now)
+                && self
+                    .protocol_issue_draft
+                    .as_ref()
+                    .is_none_or(|draft| self.protocol_draft_current(draft, now))
+                && (self.protocol_issue_draft.is_none() || self.protocol_state_current(&mut send));
             let parent = claim.parent();
             let outcome = match claim.advance(current, &mut send) {
                 Ok(outcome) => outcome,
                 Err(_) => {
                     // An interrupted State request may already have executed.
                     self.protocol_claim_recovery_required = true;
+                    self.protocol_issue_draft = None;
                     self.invalidate_identity();
                     return complete(&mut send, parent, error("protocol_claim_uncertain"));
                 }
@@ -838,12 +880,40 @@ impl Pipeline {
                 protocol_claim::Outcome::Claimed { lease, scope } => {
                     // The claim is durable but is not an open slot or grant.
                     // Keep it fenced until source drain and recovery are bound.
-                    self.retained_protocol_claim = Some((lease, scope));
+                    self.retained_protocol_claim = Some((lease.clone(), scope));
+                    if let Some(draft) = self.protocol_issue_draft.take() {
+                        let Some(state) = self.protocol_state_binding.clone() else {
+                            self.protocol_claim_recovery_required = true;
+                            self.invalidate_identity();
+                            return complete(
+                                &mut send,
+                                parent,
+                                error("protocol_reconciliation_required"),
+                            );
+                        };
+                        match protocol_issue::IssueJob::new(parent, draft, lease, state, &mut send)
+                        {
+                            Ok(issue) => {
+                                self.pending_protocol_issue = Some(issue);
+                                return Ok(());
+                            }
+                            Err(_) => {
+                                self.protocol_claim_recovery_required = true;
+                                self.invalidate_identity();
+                                return complete(
+                                    &mut send,
+                                    parent,
+                                    error("protocol_reconciliation_required"),
+                                );
+                            }
+                        }
+                    }
                     self.protocol_claim_recovery_required = true;
                     self.invalidate_identity();
                     complete(&mut send, parent, error("protocol_reconciliation_required"))
                 }
                 protocol_claim::Outcome::Failed(code) => {
+                    self.protocol_issue_draft = None;
                     if code == "protocol_claim_uncertain" {
                         self.protocol_claim_recovery_required = true;
                         self.invalidate_identity();

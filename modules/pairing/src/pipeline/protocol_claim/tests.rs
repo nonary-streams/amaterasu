@@ -27,6 +27,9 @@ fn scope() -> EffectScope {
     }
 }
 fn broker() -> Broker {
+    broker_with_state_instance('b')
+}
+fn broker_with_state_instance(state_instance: char) -> Broker {
     let mut config = RuntimeConfig {
         host_lifecycle_control: true,
         ..Default::default()
@@ -85,6 +88,14 @@ fn broker() -> Broker {
             contract: STATE_SERVICE.into(),
         }),
     );
+    config.host_context.durable_cas_provider = Some("state".into());
+    config.host_context.provider_incarnations.insert(
+        "state".into(),
+        amaterasu_contracts::effect_fence::ProviderIncarnation {
+            version: 1,
+            id: state_instance.to_string().repeat(32),
+        },
+    );
     let method = ApiMethod {
         service: "example.effects/1".into(),
         method: "apply".into(),
@@ -102,10 +113,24 @@ fn broker() -> Broker {
         },
         privilege: ApiPrivilege::User,
     };
+    let mut cleanup_method = method.clone();
+    cleanup_method.method = "cleanup".into();
+    config.host_context.provider_incarnations.insert(
+        "provider".into(),
+        amaterasu_contracts::effect_fence::ProviderIncarnation {
+            version: 1,
+            id: "a".repeat(32),
+        },
+    );
     config.api_methods.push(ApiMethodApproval {
         provider: "provider".into(),
         callers: ["issuer".into()].into(),
         method: method.clone(),
+    });
+    config.api_methods.push(ApiMethodApproval {
+        provider: "provider".into(),
+        callers: ["issuer".into()].into(),
+        method: cleanup_method.clone(),
     });
     config.effect_fence = Some(EffectFencePolicy {
         authority: "pairing".into(),
@@ -116,7 +141,11 @@ fn broker() -> Broker {
             method: "apply".into(),
             interface_major: 1,
         }],
-        cleanup_methods: vec![],
+        cleanup_methods: vec![ProtectedMethod {
+            service: "example.effects/1".into(),
+            method: "cleanup".into(),
+            interface_major: 1,
+        }],
     });
     let mut broker = Broker::new(config).unwrap();
     for (caller, service) in [
@@ -136,6 +165,15 @@ fn broker() -> Broker {
     }
     assert!(matches!(
         broker.dispatch("provider", Command::RegisterApi { method }),
+        Response::Ok
+    ));
+    assert!(matches!(
+        broker.dispatch(
+            "provider",
+            Command::RegisterApi {
+                method: cleanup_method
+            }
+        ),
         Response::Ok
     ));
     // Test fixture only: production participants must independently retire real workers.
@@ -641,4 +679,313 @@ fn configured_protocol_authority_starts_closed_until_slot_recovery() {
         broker.dispatch("state", Command::Poll {}),
         Response::Pending
     ));
+}
+
+#[test]
+fn real_pairing_request_persists_selected_effect_before_any_arm() {
+    run_real_protocol_issue(false, false);
+}
+
+#[test]
+fn canceled_request_after_issue_write_keeps_durable_obligation_fenced() {
+    run_real_protocol_issue(true, false);
+}
+
+#[test]
+fn state_provider_replacement_mid_claim_leaves_claim_fenced() {
+    run_real_protocol_issue(false, true);
+}
+
+fn run_real_protocol_issue(cancel_after_write: bool, replace_after_claim: bool) {
+    use amaterasu_module_sdk::{
+        effect_authority::{Request as EffectRequest, Source},
+        extension_api::{LifecycleTarget, MethodRef},
+        protocol::{DispatchRequest, ProtocolRouter, Route, SessionContext},
+        protocol_state::CleanupReference,
+    };
+    let path = directory();
+    let store = TestStateStore::open(path.clone()).unwrap();
+    let mut broker = broker();
+    let (mut pairing, fixture, _certificate, epoch, source_json) =
+        super::super::tests::authorized_protocol_for_test();
+    assert_eq!(store.handle("pairing", json!({"action":"set","key":"pairing/v1","value":fixture.document.unwrap(),"expected_revision":0}))["revision"], 1);
+    let source: Source = serde_json::from_value(source_json).unwrap();
+    let method = MethodRef {
+        service: "example.effects/1".into(),
+        method: "apply".into(),
+        interface_major: 1,
+        interface_minor: 0,
+        schema_revision: 1,
+    };
+    let cleanup = MethodRef {
+        method: "cleanup".into(),
+        ..method.clone()
+    };
+    let schema = ApiMethod {
+        service: method.service.clone(),
+        method: method.method.clone(),
+        interface_major: 1,
+        interface_minor: 0,
+        request: ApiSchema {
+            required: Default::default(),
+            optional: Default::default(),
+            allow_extra: false,
+        },
+        response: ApiSchema {
+            required: Default::default(),
+            optional: Default::default(),
+            allow_extra: false,
+        },
+        privilege: ApiPrivilege::User,
+    };
+    let mut cleanup_schema = schema.clone();
+    cleanup_schema.method = "cleanup".into();
+    let route = Route {
+        message_type: 21818,
+        capability: "example.control/1".into(),
+        approval: ApiMethodApproval {
+            provider: "provider".into(),
+            callers: ["issuer".into()].into(),
+            method: schema.clone(),
+        },
+        method: method.clone(),
+        cleanup: cleanup.clone(),
+        cleanup_approval: ApiMethodApproval {
+            provider: "provider".into(),
+            callers: ["issuer".into()].into(),
+            method: cleanup_schema.clone(),
+        },
+        max_payload_bytes: 64,
+    };
+    pairing.effect_authority.as_mut().unwrap().protocol_policies = serde_json::from_value(json!([{"capability":"example.control/1","provider":"provider","message_type":21818,"method":method,"cleanup":cleanup,"method_schema":schema,"cleanup_schema":cleanup_schema,"max_payload_bytes":64,"required_permission":"view"}])).unwrap();
+    pairing.protocol_state_binding = Some(binding());
+    let attested = pairing.apply_effect_request("nvhttp", "nvhttp", json!({"action":"attest_protocol_capabilities","version":1,"epoch":epoch,"source":source,"capabilities":["example.control/1"]}), super::super::tests::now()).unwrap();
+    let issuer_epoch = attested["issuer_epoch"].as_str().unwrap().to_owned();
+    let scope = EffectScope {
+        authority_epoch: epoch.clone(),
+        issuer_epoch: issuer_epoch.clone(),
+        source: amaterasu_module_sdk::broker_effect_fence::source(&source).unwrap(),
+    };
+    let context = SessionContext {
+        authority_epoch: epoch.clone(),
+        effect_owner_epoch: source.effect_owner_epoch.clone(),
+        target: LifecycleTarget::Stream {
+            host_epoch: source.host_epoch.clone(),
+            session_id: source.session_id.clone(),
+            stream_id: source.stream_id.clone(),
+            generation: source.stream_generation,
+        },
+        peer_ref: source.id.clone(),
+    };
+    let operation_id = protocol_slot_state::operation_id("issuer", &scope, 1).unwrap();
+    let bytes = vec![1, 2, 3];
+    let effect = ProtocolRouter::new(vec![route])
+        .unwrap()
+        .prepare_effect(
+            "issuer",
+            &DispatchRequest {
+                context: &context,
+                message_type: 21818,
+                payload: &bytes,
+                operation_id: &operation_id,
+                issuer_epoch: &issuer_epoch,
+                timeout_ms: 5_000,
+                parent: None,
+            },
+        )
+        .unwrap();
+    let request = EffectRequest::AdmitProtocolEffectV2 {
+        version: 2,
+        epoch,
+        source,
+        effect: Box::new(effect),
+        sequence: 1,
+        payload: bytes,
+        cleanup: CleanupReference::new("b".repeat(64)).unwrap(),
+    };
+    let payload = serde_json::to_value(request).unwrap();
+    let original_instance = pairing
+        .selected_protocol_state(&mut |command| Ok(broker.dispatch("pairing", command)))
+        .unwrap();
+    pairing.protocol_state_instance = Some(original_instance);
+    let mut replacement = broker_with_state_instance('c');
+    assert!(
+        !pairing
+            .protocol_state_current(&mut |command| Ok(replacement.dispatch("pairing", command)))
+    );
+    pairing.protocol_state_binding = Some(
+        DurableStateBinding::new(
+            "pairing",
+            "wrong-state",
+            amaterasu_module_sdk::protocol_state::DURABLE_CAS_CAPABILITY,
+        )
+        .unwrap(),
+    );
+    let Response::Accepted { id: mismatched_id } = broker.dispatch(
+        "issuer",
+        Command::Request {
+            service: "amaterasu.pairing-effects/1".into(),
+            payload: payload.clone(),
+            timeout_ms: 30_000,
+            operation_id: "admit.wrong-state".into(),
+            parent: None,
+        },
+    ) else {
+        panic!("mismatch request denied too early")
+    };
+    pairing
+        .tick_at(super::super::tests::now(), |command| {
+            Ok(broker.dispatch("pairing", command))
+        })
+        .unwrap();
+    assert!(
+        matches!(broker.dispatch("issuer", Command::TakeResult { request:mismatched_id }), Response::Result { payload } if payload["code"] == "protocol_authority_unavailable")
+    );
+    assert!(matches!(
+        broker.dispatch("state", Command::Poll {}),
+        Response::Pending
+    ));
+    pairing.protocol_state_binding = Some(binding());
+    let mut forged = payload.clone();
+    forged["effect"]["action_approval_sha256"] = json!("c".repeat(64));
+    let Response::Accepted { id: forged_id } = broker.dispatch(
+        "issuer",
+        Command::Request {
+            service: "amaterasu.pairing-effects/1".into(),
+            payload: forged,
+            timeout_ms: 30_000,
+            operation_id: "admit.forged".into(),
+            parent: None,
+        },
+    ) else {
+        panic!("forged request denied too early")
+    };
+    pairing
+        .tick_at(super::super::tests::now(), |command| {
+            Ok(broker.dispatch("pairing", command))
+        })
+        .unwrap();
+    assert!(
+        matches!(broker.dispatch("issuer", Command::TakeResult { request:forged_id }), Response::Result { payload } if payload["code"] == "scope_denied")
+    );
+    assert!(matches!(
+        broker.dispatch("state", Command::Poll {}),
+        Response::Pending
+    ));
+    let Response::Accepted { id } = broker.dispatch(
+        "issuer",
+        Command::Request {
+            service: "amaterasu.pairing-effects/1".into(),
+            payload,
+            timeout_ms: 30_000,
+            operation_id: "admit.test".into(),
+            parent: None,
+        },
+    ) else {
+        panic!("admission request denied")
+    };
+    let mut result = None;
+    let mut canceled = false;
+    let mut replaced = false;
+    for _ in 0..50 {
+        pairing
+            .tick_at(super::super::tests::now(), |command| {
+                if replaced && matches!(&command, Command::EffectFence { command } if matches!(**command, EffectFenceCommand::SelectedStateProvider {})) {
+                    Ok(replacement.dispatch("pairing", command))
+                } else {
+                    Ok(broker.dispatch("pairing", command))
+                }
+            })
+            .unwrap();
+        if let Some(state) = service_one(&mut broker, &store) {
+            if cancel_after_write && state.1["revision"] == 3 && state.1["ok"] == true {
+                assert!(matches!(
+                    broker.dispatch("issuer", Command::Cancel { request: id }),
+                    Response::Ok
+                ));
+                canceled = true;
+            }
+            if replace_after_claim && state.1["revision"] == 2 && state.1["ok"] == true {
+                replaced = true;
+            }
+            finish_state(&mut broker, state);
+        }
+        if let Response::Result { payload } =
+            broker.dispatch("issuer", Command::TakeResult { request: id })
+        {
+            result = Some(payload);
+            break;
+        }
+        if (canceled || replaced) && pairing.protocol_claim_recovery_required {
+            break;
+        }
+    }
+    if cancel_after_write {
+        assert!(canceled && pairing.protocol_claim_recovery_required);
+        assert!(result.is_none());
+    } else if replace_after_claim {
+        assert!(replaced && pairing.protocol_claim_recovery_required);
+    } else {
+        assert_eq!(result.unwrap()["code"], "protocol_reconciliation_required");
+    }
+    let saved = store.handle(
+        "pairing",
+        protocol_slot_state::read_request(scope.source.slot().unwrap())
+            .unwrap()
+            .payload(),
+    );
+    let claim = protocol_slot_state::read(scope.source.slot().unwrap(), &saved)
+        .unwrap()
+        .1
+        .active
+        .unwrap();
+    assert_eq!(claim.scope, scope);
+    if replace_after_claim {
+        assert!(claim.entries.is_empty());
+    } else {
+        assert_eq!(claim.entries.len(), 1);
+        assert_eq!(claim.entries[0].identity.operation_id, operation_id);
+        assert_eq!(claim.entries[0].provider_incarnation.id, "a".repeat(32));
+    }
+    let Response::Result { payload } = broker.dispatch(
+        "pairing",
+        Command::EffectFence {
+            command: Box::new(EffectFenceCommand::SlotStatus {
+                slot: scope.source.slot().unwrap(),
+            }),
+        },
+    ) else {
+        panic!("slot status")
+    };
+    assert!(payload["active"].is_null());
+    drop(store);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn broker_selection_discovery_is_authority_only_and_does_not_grant_calls() {
+    let mut broker = broker();
+    let query = || Command::EffectFence {
+        command: Box::new(EffectFenceCommand::SelectedActionApproval {
+            method: ProtectedMethod {
+                service: "example.effects/1".into(),
+                method: "apply".into(),
+                interface_major: 1,
+            },
+        }),
+    };
+    assert!(
+        matches!(broker.dispatch("issuer", query()), Response::Error { code, .. } if code == "permission_denied")
+    );
+    assert!(
+        matches!(broker.dispatch("console", Command::EffectFence { command:Box::new(EffectFenceCommand::SelectedStateProvider {}) }), Response::Error { code, .. } if code == "permission_denied")
+    );
+    let Response::Result { payload } = broker.dispatch("pairing", query()) else {
+        panic!("selected action")
+    };
+    assert_eq!(payload["approval"]["provider"], "provider");
+    assert_eq!(payload["provider_incarnation"]["id"], "a".repeat(32));
+    assert!(
+        matches!(broker.dispatch("pairing", Command::QueryApiApproval { service:"example.effects/1".into(), method:"apply".into(), interface_major:1, min_minor:0 }), Response::Error { code, .. } if code == "permission_denied")
+    );
 }

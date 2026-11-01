@@ -25,7 +25,7 @@ impl Pipeline {
     /// Check the real broker selection after source and client policy. An
     /// absent or invalid host incarnation cannot be armed.
     pub(super) fn handle_protocol_admission(
-        &self,
+        &mut self,
         request_id: u64,
         caller: &str,
         initiator: &str,
@@ -33,7 +33,7 @@ impl Pipeline {
         now: u64,
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
-        let response = (|| {
+        let response: Result<Option<Value>, &'static str> = (|| {
             let policy = self
                 .effect_authority
                 .as_ref()
@@ -47,6 +47,7 @@ impl Pipeline {
             let request: amaterasu_module_sdk::effect_authority::Request =
                 serde_json::from_value(payload).map_err(|_| "invalid_request")?;
             use amaterasu_module_sdk::effect_authority::Request;
+            let mut pending_v2 = None;
             let selected = match request {
                 Request::AdmitProtocolEffect {
                     version,
@@ -65,8 +66,10 @@ impl Pipeline {
                 } => {
                     if version != 2
                         || payload.len() > amaterasu_module_sdk::protocol::MAX_MESSAGE_BYTES
-                        || amaterasu_module_sdk::protocol_state::CleanupReference::new(cleanup.id)
-                            .is_err()
+                        || amaterasu_module_sdk::protocol_state::CleanupReference::new(
+                            cleanup.id.clone(),
+                        )
+                        .is_err()
                         || format!("{:x}", Sha256::digest(&payload)) != effect.payload_sha256
                     {
                         return Err("invalid_protocol_effect");
@@ -88,11 +91,19 @@ impl Pipeline {
                     {
                         return Err("invalid_protocol_effect");
                     }
-                    let selected =
-                        self.admit_protocol_effect(1, epoch, source, *effect, caller, now)?;
+                    let effect = *effect;
+                    let selected = self.admit_protocol_effect(
+                        1,
+                        epoch,
+                        source.clone(),
+                        effect.clone(),
+                        caller,
+                        now,
+                    )?;
                     if payload.len() > selected.max_payload_bytes {
                         return Err("invalid_protocol_effect");
                     }
+                    pending_v2 = Some((source, effect, sequence, payload, cleanup, scope));
                     selected
                 }
                 _ => return Err("invalid_request"),
@@ -155,18 +166,96 @@ impl Pipeline {
             {
                 return Err("scope_denied");
             }
-            // The durable source claim and the selected issuer/host drain
-            // still need reconciliation before a claim or effect can open.
-            Err("protocol_authority_unavailable")
+            let Some((source, effect, sequence, bytes, cleanup, scope)) = pending_v2 else {
+                return Err("protocol_authority_unavailable");
+            };
+            if self.protocol_claim_recovery_required || self.retained_protocol_claim.is_some() {
+                return Err("protocol_reconciliation_required");
+            }
+            let state = self
+                .protocol_state_binding
+                .clone()
+                .ok_or("protocol_authority_unavailable")?;
+            let state_instance = self
+                .selected_protocol_state(send)
+                .ok_or("protocol_authority_unavailable")?;
+            let Ok(Response::Result { payload }) = send(Command::EffectFence {
+                command: Box::new(EffectFenceCommand::SelectedActionApproval {
+                    method: ProtectedMethod {
+                        service: selected.method.service.clone(),
+                        method: selected.method.method.clone(),
+                        interface_major: selected.method.interface_major,
+                    },
+                }),
+            }) else {
+                return Err("protocol_authority_unavailable");
+            };
+            let action_approval: amaterasu_module_sdk::ApiMethodApproval =
+                serde_json::from_value(payload["approval"].clone())
+                    .map_err(|_| "protocol_authority_unavailable")?;
+            let action_instance: amaterasu_module_sdk::broker_effect_fence::ProviderIncarnation =
+                serde_json::from_value(payload["provider_incarnation"].clone())
+                    .map_err(|_| "protocol_authority_unavailable")?;
+            if action_approval.provider != actual.provider
+                || action_approval.method != selected.method_schema
+                || !action_approval.callers.contains(caller)
+                || &action_instance != instance
+            {
+                return Err("scope_denied");
+            }
+            let route = amaterasu_module_sdk::protocol::Route {
+                message_type: selected.message_type,
+                capability: selected.capability.0.clone(),
+                approval: action_approval,
+                method: selected.method.clone(),
+                cleanup: selected.cleanup.clone(),
+                cleanup_approval: approval,
+                max_payload_bytes: selected.max_payload_bytes,
+            };
+            let router = amaterasu_module_sdk::protocol::ProtocolRouter::new(vec![route.clone()])
+                .map_err(|_| "scope_denied")?;
+            let dispatch = amaterasu_module_sdk::protocol::DispatchRequest {
+                context: &effect.context,
+                message_type: effect.message_type,
+                payload: &bytes,
+                operation_id: &effect.operation_id,
+                issuer_epoch: &effect.issuer_epoch,
+                timeout_ms: effect.timeout_ms,
+                parent: effect.parent,
+            };
+            if router
+                .prepare_effect(caller, &dispatch)
+                .map_err(|_| "invalid_protocol_effect")?
+                != effect
+            {
+                return Err("scope_denied");
+            }
+            let claim = super::protocol_claim::ClaimJob::new(
+                request_id,
+                scope.clone(),
+                caller.into(),
+                state,
+            )
+            .map_err(|_| "protocol_authority_unavailable")?;
+            self.protocol_state_instance = Some(state_instance);
+            self.protocol_issue_draft = Some(super::protocol_issue::IssueDraft {
+                source,
+                effect,
+                policy: selected,
+                scope,
+                route,
+                sequence,
+                payload: bytes,
+                cleanup,
+            });
+            self.pending_protocol_claim = Some(claim);
+            Ok(None)
         })();
-        complete(
-            send,
-            request_id,
-            match response {
-                Ok(value) => value,
-                Err(code) => super::error(code),
-            },
-        )
+        match response {
+            Ok(Some(value)) => complete(send, request_id, value),
+            Ok(None) => Ok(()),
+            Err(code) => complete(send, request_id, super::error(code)),
+        }
     }
 
     pub(super) fn attest_protocol_capabilities(

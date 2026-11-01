@@ -211,6 +211,11 @@ pub struct PendingSlotIssue {
     entry: protocol_slot_state::Entry,
 }
 impl PendingSlotIssue {
+    /// Exact payload-free identity to compare with a fresh State read if the
+    /// CAS result is lost. This is not a persistence or admission receipt.
+    pub fn entry(&self) -> &protocol_slot_state::Entry {
+        &self.entry
+    }
     pub fn request(&self) -> &StateRequest {
         self.write.request()
     }

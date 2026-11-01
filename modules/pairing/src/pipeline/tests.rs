@@ -45,6 +45,7 @@ fn settings() -> Settings {
         administrator_principals: BTreeSet::from(["console".into()]),
         transport_principals: BTreeSet::from(["nvhttp".into()]),
         effect_authority: None,
+        protocol_state: None,
     }
 }
 
@@ -4375,6 +4376,43 @@ pub(super) fn authorized_feedback_for_test() -> (Pipeline, Harness, String, Stri
     let bound = pipeline.apply_effect_request("nvhttp", "nvhttp", json!({"action":"bind_stream","epoch":epoch,"certificate_pem":CLIENT_CERT,"source":source,"scope":scope}), now()).unwrap();
     assert_eq!(bound["ok"], true);
     (pipeline, harness, certificate_id, epoch, source, scope)
+}
+
+pub(super) fn authorized_protocol_for_test() -> (Pipeline, Harness, String, String, Value) {
+    let (mut pipeline, mut harness, certificate_id) = paired_native_client();
+    let revision = harness.revision;
+    assert_eq!(
+        harness.request(
+            &mut pipeline,
+            "console",
+            json!({
+                "action":"update_client_protocol_grants", "certificate_id":certificate_id,
+                "expected_revision":revision, "grants":["example.control/1"]
+            }),
+            now()
+        )["ok"],
+        true
+    );
+    pipeline.effect_authority = Some(policy_for_feedback(
+        &[],
+        crate::protocol::FeedbackPermission::View,
+    ));
+    pipeline.effect_authority.as_mut().unwrap().effect_owner = "issuer".into();
+    let initial = pipeline.effect_gate.as_ref().unwrap().epoch().to_owned();
+    let epoch = pipeline
+        .apply_effect_request(
+            "issuer",
+            "issuer",
+            json!({"action":"recover","epoch":initial,"owner_epoch":"owner"}),
+            now(),
+        )
+        .unwrap()["epoch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let source = feedback_source_for_test("owner");
+    assert_eq!(pipeline.apply_effect_request("nvhttp", "nvhttp", json!({"action":"bind","epoch":epoch,"certificate_pem":CLIENT_CERT,"source":source}), now()).unwrap()["ok"], true);
+    (pipeline, harness, certificate_id, epoch, source)
 }
 fn authority_configuration() -> amaterasu_contracts::RuntimeConfig {
     use amaterasu_contracts::{Grants, RuntimeConfig};

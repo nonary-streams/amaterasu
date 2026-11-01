@@ -58,10 +58,6 @@ impl ClaimJob {
     }
     /// `state` is selected by trusted composition and must actually implement
     /// durable CAS. The issuer is the selected broker principal, not client data.
-    #[allow(
-        dead_code,
-        reason = "broker cleanup selection and retirement binding is pending"
-    )]
     pub(super) fn new(
         parent: u64,
         scope: EffectScope,

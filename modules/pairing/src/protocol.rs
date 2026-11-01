@@ -16,6 +16,16 @@ pub struct Settings {
     pub administrator_principals: BTreeSet<String>,
     pub transport_principals: BTreeSet<String>,
     pub effect_authority: Option<EffectAuthoritySettings>,
+    /// Selected by trusted startup composition from a declared State offer.
+    /// Broker selection is checked again before any protocol journal access.
+    pub protocol_state: Option<ProtocolStateSelection>,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProtocolStateSelection {
+    pub owner: String,
+    pub provider: String,
+    pub capability: String,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,6 +39,14 @@ pub struct EffectAuthoritySettings {
 }
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if let Some(state) = &self.protocol_state {
+            amaterasu_module_sdk::protocol_state::DurableStateBinding::new(
+                &state.owner,
+                &state.provider,
+                &state.capability,
+            )
+            .map_err(|_| "invalid_settings")?;
+        }
         for principals in [&self.administrator_principals, &self.transport_principals] {
             if principals.len() > 16 || principals.iter().any(|value| !identifier(value, 128)) {
                 return Err("invalid_settings");
