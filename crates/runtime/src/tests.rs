@@ -2267,3 +2267,138 @@ fn selected_api_approval_reserves_service_from_raw_registration_and_requests() {
         matches!(broker.dispatch("org.example.client", Command::TakeResult { request: id }), Response::Result { payload } if payload == json!({"done": true}))
     );
 }
+
+#[test]
+fn protected_deadline_expiration_does_not_retire_delivered_work() {
+    use amaterasu_contracts::effect_fence::{
+        EffectFenceCommand, EffectFencePolicy, EffectScope, EffectSource, GuardedEffect,
+        ProtectedMethod,
+    };
+    let (mut config, method) = synthetic_api(ApiPrivilege::User);
+    config
+        .principals
+        .insert("authority".into(), Grants::default());
+    config.effect_fence = Some(EffectFencePolicy {
+        authority: "authority".into(),
+        issuer: "org.example.client".into(),
+        cleanup_methods: vec![],
+        methods: vec![ProtectedMethod {
+            service: method.service.clone(),
+            method: method.method.clone(),
+            interface_major: method.interface_major,
+        }],
+    });
+    let mut broker = Broker::new(config).unwrap();
+    let start = Instant::now();
+    assert!(matches!(
+        broker.dispatch_at(
+            "org.example.provider",
+            Command::RegisterApi {
+                method: method.clone()
+            },
+            start
+        ),
+        Response::Ok
+    ));
+    let scope = EffectScope {
+        authority_epoch: "authority".into(),
+        issuer_epoch: "issuer".into(),
+        source: EffectSource {
+            version: 1,
+            id: "a".repeat(32),
+            generation: 1,
+            host_epoch: "host".into(),
+            session_id: "session".into(),
+            stream_id: "stream".into(),
+            stream_generation: 1,
+            device: "device".into(),
+            device_generation: 1,
+            effect_owner_epoch: "owner".into(),
+        },
+    };
+    let effect = GuardedEffect {
+        scope: scope.clone(),
+        sequence: 1,
+        capability: "example.paint".into(),
+        service: method.service,
+        method: method.method,
+        interface_major: 1,
+        interface_minor: 2,
+        schema_revision: 1,
+        payload_sha256: "d".repeat(64),
+        payload: json!({"size":4}),
+        timeout_ms: 10,
+        operation_id: "effect.1".into(),
+        parent: None,
+    };
+    let cmd = |command| Command::EffectFence {
+        command: Box::new(command),
+    };
+    assert!(matches!(
+        broker.dispatch_at(
+            "authority",
+            cmd(EffectFenceCommand::OpenSource {
+                scope,
+                retired_through: 0
+            }),
+            start
+        ),
+        Response::Ok
+    ));
+    assert!(matches!(
+        broker.dispatch_at(
+            "authority",
+            cmd(EffectFenceCommand::Arm {
+                effect: effect.clone()
+            }),
+            start
+        ),
+        Response::Ok
+    ));
+    let Response::Accepted { id } = broker.dispatch_at(
+        "org.example.client",
+        cmd(EffectFenceCommand::Dispatch {
+            effect: effect.clone(),
+        }),
+        start,
+    ) else {
+        panic!()
+    };
+    assert!(matches!(
+        broker.dispatch_at("org.example.provider", Command::Poll {}, start),
+        Response::Request { .. }
+    ));
+    let expired = start + Duration::from_millis(11);
+    assert_error_code(
+        broker.dispatch_at(
+            "org.example.client",
+            Command::TakeResult { request: id },
+            expired,
+        ),
+        "deadline_exceeded",
+    );
+    assert!(matches!(
+        broker.dispatch_at(
+            "authority",
+            cmd(EffectFenceCommand::Fence {
+                effect: effect.clone()
+            }),
+            expired
+        ),
+        Response::Ok
+    ));
+    assert!(
+        matches!(broker.dispatch_at("authority", cmd(EffectFenceCommand::Lookup { effect:effect.clone() }), expired), Response::Result { payload } if payload["status"] == "fenced")
+    );
+    assert!(matches!(
+        broker.dispatch_at(
+            "org.example.provider",
+            cmd(EffectFenceCommand::ProviderRetired { request: id }),
+            expired
+        ),
+        Response::Ok
+    ));
+    assert!(
+        matches!(broker.dispatch_at("authority", cmd(EffectFenceCommand::Lookup { effect }), expired), Response::Result { payload } if payload["status"] == "retired")
+    );
+}

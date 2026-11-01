@@ -31,7 +31,7 @@ struct RequestRecord {
     completed_at: Option<Instant>,
     result: Option<Response>,
     delivered: bool,
-    internal_hook: bool,
+    separate_retry: bool,
 }
 
 impl RequestRecord {
@@ -113,6 +113,29 @@ impl RequestRouter {
         options: RequestOptions,
         now: Instant,
     ) -> Response {
+        self.submit_inner(caller, grants, options, now, false)
+    }
+
+    /// The protected-effect ledger owns retry identity and retains it beyond
+    /// ordinary broker result eviction. Never merge these calls by operation ID.
+    pub fn submit_guarded(
+        &mut self,
+        caller: &str,
+        grants: &Grants,
+        options: RequestOptions,
+        now: Instant,
+    ) -> Response {
+        self.submit_inner(caller, grants, options, now, true)
+    }
+
+    fn submit_inner(
+        &mut self,
+        caller: &str,
+        grants: &Grants,
+        options: RequestOptions,
+        now: Instant,
+        separate_retry: bool,
+    ) -> Response {
         if !grants.call.contains(&options.service) {
             return permission_denied();
         }
@@ -121,7 +144,7 @@ impl RequestRouter {
         }
 
         // A retry observes an already authorized request, even after its parent ends.
-        if let Some(previous_response) = self.find_retry(caller, &options) {
+        if !separate_retry && let Some(previous_response) = self.find_retry(caller, &options) {
             return previous_response;
         }
         let authority = match self.resolve_authority(caller, grants, &options, now) {
@@ -132,7 +155,7 @@ impl RequestRouter {
         let Some(provider) = self.providers.get(&options.service).cloned() else {
             return Response::error("unavailable", "service is not registered");
         };
-        self.enqueue(caller, provider, options, authority, false)
+        self.enqueue(caller, provider, options, authority, separate_retry)
     }
 
     fn resolve_authority(
@@ -178,7 +201,7 @@ impl RequestRouter {
 
     fn find_retry(&self, caller: &str, options: &RequestOptions) -> Option<Response> {
         let previous = self.requests.iter().find(|(_, request)| {
-            !request.internal_hook
+            !request.separate_retry
                 && request.caller == caller
                 && request.options.operation_id == options.operation_id
         });
@@ -200,7 +223,7 @@ impl RequestRouter {
         provider: String,
         options: RequestOptions,
         authority: CallAuthority,
-        internal_hook: bool,
+        separate_retry: bool,
     ) -> Response {
         if self.requests.len() >= MAX_RETAINED_REQUESTS {
             return capacity_exhausted();
@@ -224,7 +247,7 @@ impl RequestRouter {
                 completed_at: None,
                 result: None,
                 delivered: false,
-                internal_hook,
+                separate_retry,
             },
         );
 
@@ -309,6 +332,14 @@ impl RequestRouter {
             return Response::error("request_ended", "request is no longer active");
         }
         Response::Ok
+    }
+
+    /// A protected retry may report an existing admission only while the
+    /// ordinary request record still exists; it must never enqueue a second call.
+    pub fn retained(&self, caller: &str, request_id: u64) -> bool {
+        self.requests
+            .get(&request_id)
+            .is_some_and(|request| request.caller == caller)
     }
 
     pub fn result(&self, caller: &str, request_id: u64) -> Response {

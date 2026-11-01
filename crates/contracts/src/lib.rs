@@ -1,4 +1,5 @@
 //! Version 1 control-plane messages. These types are independent of the bootstrap ABI.
+pub mod effect_fence;
 pub mod encoder;
 pub mod media_profile;
 pub mod virtual_display;
@@ -81,6 +82,9 @@ pub struct RuntimeConfig {
     /// Nonempty selections require a runtime that understands this field.
     #[serde(default, skip_serializing_if = "ServiceSelections::is_empty")]
     pub service_selections: ServiceSelections,
+    /// Optional protected API routes; absent preserves legacy behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_fence: Option<effect_fence::EffectFencePolicy>,
     /// Trusted composition approvals for legacy untyped native factories, keyed
     /// by provider principal and exact service. This does not grant native access.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -267,6 +271,10 @@ pub enum Command {
     HostLifecycleDrain {},
     /// Reserved for the host endpoint; returns pending product log events.
     DrainLogEvents {},
+    /// Broker-serialized opt-in exact-effect admission and retirement.
+    EffectFence {
+        command: Box<effect_fence::EffectFenceCommand>,
+    },
     GetSettings {},
     /// Returns host-owned context to the state service, and to the Linux audio
     /// module for its restart-safe cleanup journal. This prevents a module
