@@ -958,7 +958,44 @@ fn run_real_protocol_issue(cancel_after_write: bool, replace_after_claim: bool) 
         panic!("slot status")
     };
     assert!(payload["active"].is_null());
+    let settings = crate::protocol::Settings {
+        administrator_principals: ["console".into()].into(),
+        transport_principals: ["nvhttp".into()].into(),
+        effect_authority: pairing.effect_authority.clone(),
+        protocol_state: Some(crate::protocol::ProtocolStateSelection {
+            owner: "pairing".into(),
+            provider: "state".into(),
+            capability: amaterasu_module_sdk::protocol_state::DURABLE_CAS_CAPABILITY.into(),
+        }),
+    };
+    settings.validate().unwrap();
+    drop(pairing);
     drop(store);
+    let reopened = TestStateStore::open(path.clone()).unwrap();
+    let saved = reopened.handle(
+        "pairing",
+        protocol_slot_state::read_request(scope.source.slot().unwrap())
+            .unwrap()
+            .payload(),
+    );
+    let recovered = protocol_slot_state::read(scope.source.slot().unwrap(), &saved)
+        .unwrap()
+        .1
+        .active
+        .unwrap();
+    assert_eq!(recovered.scope, scope);
+    let mut restarted = super::super::Pipeline::new(settings);
+    let epoch = restarted.effect_gate.as_ref().unwrap().epoch().to_owned();
+    assert_eq!(
+        restarted.apply_effect_request(
+            "issuer",
+            "issuer",
+            json!({"action":"recover","epoch":epoch,"owner_epoch":"owner"}),
+            super::super::tests::now()
+        ),
+        Err("protocol_reconciliation_required")
+    );
+    drop(reopened);
     std::fs::remove_dir_all(path).unwrap();
 }
 
