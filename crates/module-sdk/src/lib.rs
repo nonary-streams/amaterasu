@@ -22,6 +22,7 @@ pub mod protocol;
 pub mod protocol_authority;
 pub mod protocol_broker;
 pub mod protocol_sequence;
+pub mod protocol_slot_state;
 pub mod protocol_state;
 pub mod requests;
 pub mod service;
@@ -41,8 +42,8 @@ pub use amaterasu_contracts::encoder::{
     validate_software_options,
 };
 pub use amaterasu_contracts::{
-    ApiFieldKind, ApiMethod, ApiPrivilege, ApiSchema, Command, HostLifecycleAction, Response,
-    RuntimeHostContext,
+    ApiFieldKind, ApiMethod, ApiMethodApproval, ApiPrivilege, ApiSchema, Command,
+    HostLifecycleAction, Response, RuntimeHostContext,
 };
 pub use amaterasu_extension_api as extension_api;
 pub use amaterasu_media as media_abi;
