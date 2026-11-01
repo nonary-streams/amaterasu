@@ -313,17 +313,16 @@ fn real_providers_hold_host_identity_write_until_owner_retires_stream() {
         &mut broker,
     );
     assert_eq!(denied["error"]["code"], "permission_denied");
-    let mut stale_change = pending["value"]["transaction"]["change"].clone();
-    stale_change["operation_id"] = json!("another-operation");
-    let stale = broker_configuration_call(
+    let concurrent_change = pending["value"]["transaction"]["change"].clone();
+    let concurrent_reconcile = broker_configuration_call(
         "amaterasu.management",
-        json!({"action":"reconcile_transaction","change":stale_change}),
+        json!({"action":"reconcile_transaction","change":concurrent_change}),
         &mut pairing,
         &mut configuration,
         &state,
         &mut broker,
     );
-    assert_eq!(stale["error"]["code"], "configuration_change_unknown");
+    assert_eq!(concurrent_reconcile["error"]["code"], "busy");
     assert_eq!(
         state.handle(
             "amaterasu.host-configuration",
@@ -704,9 +703,14 @@ fn real_providers_hold_host_identity_write_until_owner_retires_stream() {
         panic!("reconciliation rejected")
     };
     let mut late_checked = false;
+    let mut saw_pairing_status = false;
     let mut reconciled = None;
     for _ in 0..1000 {
         pump_configuration_fence(&mut pairing, &mut configuration, &state, &mut broker);
+        saw_pairing_status |= pairing
+            .hold_confirmation
+            .as_ref()
+            .is_some_and(|confirmation| confirmation.status_request.is_some());
         let current = state.handle(
             "amaterasu.host-configuration",
             json!({"action":"get","key":"global/amaterasu.host-configuration"}),
@@ -738,6 +742,10 @@ fn real_providers_hold_host_identity_write_until_owner_retires_stream() {
         }
     }
     assert!(late_checked);
+    assert!(
+        saw_pairing_status,
+        "pairing must verify status while reconciliation is pending"
+    );
     assert_eq!(
         reconciled.as_ref().map(|value| &value["ok"]),
         Some(&json!(true)),
