@@ -247,17 +247,49 @@ pub struct LiveFeedbackHostProof {
     pub installation_id: String,
     pub profile: LiveFeedbackProfile,
     pub state_owner: String,
-    /// Present once, only for the first trusted startup of a fresh root.
+    /// The exact first-boot claim is retained until Pairing finishes recovery.
     pub first_boot_claim: Option<String>,
+    #[serde(default)]
+    pub first_boot_phase: Option<LiveFeedbackBootstrapPhase>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeedbackBootstrapClaim {
+    pub version: u8,
+    pub installation_id: String,
+    pub claim: String,
+    pub pairing_owner: String,
+    pub effect_owner: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveFeedbackBootstrapPhase {
+    Pending,
+    Initializing,
+    StateInitialized,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Command {
     /// Reserved host endpoint: queue and confirm the first State claim.
-    InitializeLiveFeedback {},
+    InitializeLiveFeedback {
+        resume_existing: bool,
+    },
     FinishLiveFeedbackInitialization {
         request: u64,
+    },
+    /// Pairing reports success only after its claim and gate transition commit.
+    CompleteLiveFeedbackBootstrap {
+        claim: FeedbackBootstrapClaim,
+    },
+    /// The trusted host consumes the claim after Pairing confirms recovery.
+    FinishLiveFeedbackBootstrap {},
+    /// The trusted host quarantines an interrupted or already-active transition.
+    QuarantineLiveFeedbackBootstrap {
+        claim: FeedbackBootstrapClaim,
     },
     NativeRegister {
         service: String,

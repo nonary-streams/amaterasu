@@ -6,6 +6,7 @@ pub(super) struct Context<'a> {
     pub console: &'a RuntimeClient,
     pub pairing: &'a mut LoadedModule,
     pub memory: &'a mut LoadedModule,
+    pub host_configuration: &'a mut Option<LoadedModule>,
     pub launch: &'a mut LoadedModule,
     pub lifecycle: &'a mut LoadedModule,
     pub rtsp: &'a mut LoadedModule,
@@ -57,6 +58,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
         console,
         pairing,
         memory,
+        host_configuration,
         launch,
         lifecycle,
         rtsp,
@@ -88,7 +90,15 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
         previous,
     } = context;
     let owner = runtime.client("stream");
-    provision_authority(pairing, memory, console, &owner, cert_id, second_cert_id);
+    provision_authority(
+        pairing,
+        memory,
+        host_configuration,
+        console,
+        &owner,
+        cert_id,
+        second_cert_id,
+    );
     let artifacts = PathBuf::from(std::env::var_os("AMATERASU_COMPOSITION_ARTIFACT_DIR").unwrap());
     let mut module = LoadedModule::start(
         &artifact(&artifacts, "amaterasu_nvhttp"),
@@ -105,8 +115,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         module.tick();
-        pairing.tick();
-        memory.tick();
+        super::tick_authority_modules(pairing, memory, host_configuration);
         selected_stream.as_mut().unwrap().tick();
         selected_control.as_mut().unwrap().tick();
         pump_input_configuration(configuration);
@@ -149,8 +158,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
     loop {
         client.tick();
         module.tick();
-        pairing.tick();
-        memory.tick();
+        super::tick_authority_modules(pairing, memory, host_configuration);
         launch.tick();
         lifecycle.tick();
         rtsp.tick();
@@ -195,8 +203,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
         .unwrap_or_else(|| panic!("launch rejected: {response}"));
     let mut control_client = rtsp_client::play(&url, || {
         module.tick();
-        pairing.tick();
-        memory.tick();
+        super::tick_authority_modules(pairing, memory, host_configuration);
         launch.tick();
         lifecycle.tick();
         rtsp.tick();
@@ -227,8 +234,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
     for n in 0..300 {
         for _ in 0..30 {
             module.tick();
-            pairing.tick();
-            memory.tick();
+            super::tick_authority_modules(pairing, memory, host_configuration);
             lifecycle.tick();
             selected_session.as_mut().unwrap().tick();
             selected_stream.as_mut().unwrap().tick();
@@ -280,8 +286,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
             if let Ok(last) = observed.lock() {
                 observed_join = last.clone();
             }
-            pairing.tick();
-            memory.tick();
+            super::tick_authority_modules(pairing, memory, host_configuration);
             lifecycle.tick();
             selected_session.as_mut().unwrap().tick();
             selected_stream.as_mut().unwrap().tick();
@@ -306,7 +311,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
                 &format!("full-authority-{n}"),
             ));
         }
-        pairing.tick();
+        super::tick_authority_modules(pairing, memory, host_configuration);
         if let Some(value) = take(&owner, authority_pending.unwrap()) {
             authority = value;
             authority_pending = None;
@@ -351,8 +356,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
     loop {
         second.tick();
         module.tick();
-        pairing.tick();
-        memory.tick();
+        super::tick_authority_modules(pairing, memory, host_configuration);
         launch.tick();
         lifecycle.tick();
         rtsp.tick();
@@ -405,8 +409,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
     );
     let mut crossed_response = None;
     for _ in 0..500 {
-        pairing.tick();
-        memory.tick();
+        super::tick_authority_modules(pairing, memory, host_configuration);
         if let Some(value) = take(&protocol, crossed) {
             crossed_response = Some(value);
             break;
@@ -465,8 +468,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
         for _ in 0..1000 {
             module.tick();
             lifecycle.tick();
-            pairing.tick();
-            memory.tick();
+            super::tick_authority_modules(pairing, memory, host_configuration);
             if let Some(value) = take(&owner, pending) {
                 result = Some(value);
                 break;
@@ -500,8 +502,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
         for _ in 0..1000 {
             module.tick();
             lifecycle.tick();
-            pairing.tick();
-            memory.tick();
+            super::tick_authority_modules(pairing, memory, host_configuration);
             if let Some(value) = take(&owner, pending) {
                 denied = Some(value);
                 break;
@@ -550,8 +551,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
     );
     let mut fence = None;
     for n in 0..500 {
-        pairing.tick();
-        memory.tick();
+        super::tick_authority_modules(pairing, memory, host_configuration);
         selected_stream.as_mut().unwrap().tick();
         selected_input.as_mut().unwrap().tick();
         lifecycle.tick();
@@ -564,7 +564,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
                 &format!("full-fence-{n}"),
             );
             for _ in 0..30 {
-                pairing.tick();
+                super::tick_authority_modules(pairing, memory, host_configuration);
                 if let Some(value) = take(&owner, query) {
                     if value["fenced"] == true {
                         fence = Some(value);
@@ -592,8 +592,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
         module.tick();
-        pairing.tick();
-        memory.tick();
+        super::tick_authority_modules(pairing, memory, host_configuration);
         launch.tick();
         lifecycle.tick();
         rtsp.tick();
@@ -655,8 +654,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
         module.tick();
-        pairing.tick();
-        memory.tick();
+        super::tick_authority_modules(pairing, memory, host_configuration);
         selected_stream.as_mut().unwrap().tick();
         selected_control.as_mut().unwrap().tick();
         if pending.is_none() {
@@ -699,6 +697,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
 fn provision_authority(
     pairing: &mut LoadedModule,
     memory: &mut LoadedModule,
+    host_configuration: &mut Option<LoadedModule>,
     console: &RuntimeClient,
     owner: &RuntimeClient,
     cert_id: &str,
@@ -712,8 +711,7 @@ fn provision_authority(
     );
     let mut listed = None;
     for _ in 0..500 {
-        pairing.tick();
-        memory.tick();
+        super::tick_authority_modules(pairing, memory, host_configuration);
         if let Some(value) = take(console, list) {
             listed = Some(value);
             break;
@@ -730,8 +728,7 @@ fn provision_authority(
     );
     let mut granted = None;
     for _ in 0..1000 {
-        pairing.tick();
-        memory.tick();
+        super::tick_authority_modules(pairing, memory, host_configuration);
         if let Some(value) = take(console, grants) {
             granted = Some(value);
             break;
@@ -750,8 +747,7 @@ fn provision_authority(
     );
     let mut listed = None;
     for _ in 0..500 {
-        pairing.tick();
-        memory.tick();
+        super::tick_authority_modules(pairing, memory, host_configuration);
         if let Some(value) = take(console, list) {
             listed = Some(value);
             break;
@@ -766,8 +762,7 @@ fn provision_authority(
     );
     let mut result = None;
     for _ in 0..500 {
-        pairing.tick();
-        memory.tick();
+        super::tick_authority_modules(pairing, memory, host_configuration);
         if let Some(value) = take(console, grant) {
             result = Some(value);
             break;
@@ -786,8 +781,7 @@ fn provision_authority(
     );
     let mut listed = None;
     for _ in 0..500 {
-        pairing.tick();
-        memory.tick();
+        super::tick_authority_modules(pairing, memory, host_configuration);
         if let Some(value) = take(console, list) {
             listed = Some(value);
             break;
@@ -802,8 +796,7 @@ fn provision_authority(
     );
     let mut updated = None;
     for _ in 0..500 {
-        pairing.tick();
-        memory.tick();
+        super::tick_authority_modules(pairing, memory, host_configuration);
         if let Some(value) = take(console, update) {
             updated = Some(value);
             break;
@@ -822,8 +815,7 @@ fn provision_authority(
     );
     let mut listed = None;
     for _ in 0..500 {
-        pairing.tick();
-        memory.tick();
+        super::tick_authority_modules(pairing, memory, host_configuration);
         if let Some(value) = take(console, list) {
             listed = Some(value);
             break;
@@ -838,8 +830,7 @@ fn provision_authority(
     );
     let mut changed = None;
     for _ in 0..500 {
-        pairing.tick();
-        memory.tick();
+        super::tick_authority_modules(pairing, memory, host_configuration);
         if let Some(value) = take(console, mode) {
             changed = Some(value);
             break;
@@ -858,8 +849,7 @@ fn provision_authority(
     );
     let mut status = None;
     for _ in 0..500 {
-        pairing.tick();
-        memory.tick();
+        super::tick_authority_modules(pairing, memory, host_configuration);
         if let Some(value) = take(owner, query) {
             status = Some(value);
             break;
@@ -877,8 +867,7 @@ fn provision_authority(
         );
         let mut result = None;
         for _ in 0..500 {
-            pairing.tick();
-            memory.tick();
+            super::tick_authority_modules(pairing, memory, host_configuration);
             if let Some(value) = take(owner, request) {
                 result = Some(value);
                 break;

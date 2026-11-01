@@ -7,12 +7,19 @@ use sha2::{Digest, Sha256};
 enum Stage {
     Start,
     Loading(u64),
-    Saving {
+    MarkingRecovery {
         request: u64,
+        previous_state_revision: u64,
         configuration_revision: u64,
         certificate_hash: String,
     },
     Checking {
+        request: u64,
+        recovery_state_revision: u64,
+        configuration_revision: u64,
+        certificate_hash: String,
+    },
+    Activating {
         request: u64,
         configuration_revision: u64,
         certificate_hash: String,
@@ -112,22 +119,112 @@ impl Pipeline {
                 None => Stage::Loading(request),
                 Some(Ok(payload))
                     if payload["ok"] == true
-                        && payload["revision"] == 1
+                        && payload["revision"]
+                            .as_u64()
+                            .is_some_and(|revision| revision > 0)
                         && payload["found"] == true
                         && payload["value"]["phase"] == "prepared"
                         && payload["value"]["claim"] == json!(bootstrap.claim) =>
                 {
                     if let Some((configuration_revision, certificate_hash)) = identity(self) {
-                        let value = json!({"claim":bootstrap.claim,"phase":"active",
-                                "configuration_revision":configuration_revision,"certificate_sha256":certificate_hash});
+                        let previous_state_revision = payload["revision"].as_u64().unwrap();
+                        let value = json!({"claim":bootstrap.claim,"phase":"recovery_started",
+                            "configuration_revision":configuration_revision,
+                            "certificate_sha256":certificate_hash});
                         match submit(
                             send,
                             STATE_SERVICE,
                             json!({"action":"set","key":FEEDBACK_BOOTSTRAP_KEY,
-                                "value":value,"expected_revision":1}),
-                            "feedback-bootstrap-commit",
+                                "value":value,"expected_revision":previous_state_revision}),
+                            "feedback-bootstrap-recovery-started",
                         ) {
-                            Some(request) => Stage::Saving {
+                            Some(request) => Stage::MarkingRecovery {
+                                request,
+                                previous_state_revision,
+                                configuration_revision,
+                                certificate_hash,
+                            },
+                            None => Stage::Failed,
+                        }
+                    } else {
+                        Stage::Failed
+                    }
+                }
+                _ => Stage::Failed,
+            },
+            Stage::MarkingRecovery {
+                request,
+                previous_state_revision,
+                configuration_revision,
+                certificate_hash,
+            } => match take(send, request) {
+                None => Stage::MarkingRecovery {
+                    request,
+                    previous_state_revision,
+                    configuration_revision,
+                    certificate_hash,
+                },
+                Some(Ok(payload))
+                    if payload["ok"] == true
+                        && payload["revision"].as_u64()
+                            == previous_state_revision.checked_add(1) =>
+                {
+                    match submit(
+                        send,
+                        HOST_CONFIGURATION_SERVICE,
+                        json!({"action":"transaction_status"}),
+                        "feedback-bootstrap-status",
+                    ) {
+                        Some(request) => Stage::Checking {
+                            request,
+                            recovery_state_revision: previous_state_revision + 1,
+                            configuration_revision,
+                            certificate_hash,
+                        },
+                        None => Stage::Failed,
+                    }
+                }
+                _ => Stage::Failed,
+            },
+            Stage::Checking {
+                request,
+                recovery_state_revision,
+                configuration_revision,
+                certificate_hash,
+            } => match take(send, request) {
+                None => Stage::Checking {
+                    request,
+                    recovery_state_revision,
+                    configuration_revision,
+                    certificate_hash,
+                },
+                Some(Ok(payload)) => {
+                    let status =
+                        serde_json::from_value::<HostConfigurationTransactionStatus>(payload);
+                    let stable = identity(self).as_ref().is_some_and(|(revision, hash)| {
+                        *revision == configuration_revision && hash == &certificate_hash
+                    }) && self.configuration_reconciled
+                        && self.configuration_hold.is_none()
+                        && status.is_ok_and(|status| {
+                            status.valid()
+                                && status.configuration_revision == configuration_revision
+                                && status.configuration_revision == 0
+                                && status.state_revision == 0
+                                && status.transaction.is_none()
+                                && status.terminal_receipt.is_none()
+                        });
+                    if stable {
+                        let value = json!({"claim":bootstrap.claim,"phase":"active",
+                            "configuration_revision":configuration_revision,
+                            "certificate_sha256":certificate_hash});
+                        match submit(
+                            send,
+                            STATE_SERVICE,
+                            json!({"action":"set","key":FEEDBACK_BOOTSTRAP_KEY,
+                                "value":value,"expected_revision":recovery_state_revision}),
+                            "feedback-bootstrap-active",
+                        ) {
+                            Some(request) => Stage::Activating {
                                 request,
                                 configuration_revision,
                                 certificate_hash,
@@ -140,65 +237,41 @@ impl Pipeline {
                 }
                 _ => Stage::Failed,
             },
-            Stage::Saving {
+            Stage::Activating {
                 request,
                 configuration_revision,
                 certificate_hash,
             } => match take(send, request) {
-                None => Stage::Saving {
+                None => Stage::Activating {
                     request,
                     configuration_revision,
                     certificate_hash,
                 },
-                Some(Ok(payload)) if payload["ok"] == true && payload["revision"] == 2 => {
-                    match submit(
-                        send,
-                        HOST_CONFIGURATION_SERVICE,
-                        json!({"action":"transaction_status"}),
-                        "feedback-bootstrap-status",
-                    ) {
-                        Some(request) => Stage::Checking {
-                            request,
-                            configuration_revision,
-                            certificate_hash,
-                        },
-                        None => Stage::Failed,
-                    }
-                }
-                _ => Stage::Failed,
-            },
-            Stage::Checking {
-                request,
-                configuration_revision,
-                certificate_hash,
-            } => match take(send, request) {
-                None => Stage::Checking {
-                    request,
-                    configuration_revision,
-                    certificate_hash,
-                },
-                Some(Ok(payload)) => {
-                    let status =
-                        serde_json::from_value::<HostConfigurationTransactionStatus>(payload);
-                    let stable = identity(self) == Some((configuration_revision, certificate_hash))
-                        && self.configuration_reconciled
-                        && self.configuration_hold.is_none()
-                        && status.is_ok_and(|status| {
-                            status.valid()
-                                && status.configuration_revision == 0
-                                && status.state_revision == 0
-                                && status.configuration_revision == configuration_revision
-                                && status.transaction.is_none()
-                                && status.terminal_receipt.is_none()
-                        });
-                    if stable
-                        && self.effect_gate.as_mut().is_some_and(|gate| {
-                            gate.startup_recovery_required()
-                                && gate.recover(&bootstrap.claim.claim).is_ok()
-                        })
+                Some(Ok(payload))
+                    if payload["ok"] == true
+                        && payload["revision"]
+                            .as_u64()
+                            .is_some_and(|revision| revision > 0)
+                        && identity(self) == Some((configuration_revision, certificate_hash)) =>
+                {
+                    let recovered = self.effect_gate.as_mut().is_some_and(|gate| {
+                        gate.startup_recovery_required()
+                            && gate.recover(&bootstrap.claim.claim).is_ok()
+                    });
+                    if recovered
+                        && matches!(
+                            send(Command::CompleteLiveFeedbackBootstrap {
+                                claim: bootstrap.claim.clone(),
+                            }),
+                            Ok(Response::Ok)
+                        )
                     {
                         Stage::Done
                     } else {
+                        if let Some(gate) = self.effect_gate.as_mut() {
+                            gate.fence();
+                        }
+                        self.effect_bindings.clear();
                         Stage::Failed
                     }
                 }

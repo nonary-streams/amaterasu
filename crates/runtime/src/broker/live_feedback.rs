@@ -44,6 +44,7 @@ pub(super) fn validate(config: &RuntimeConfig) -> Result<(), String> {
                 .first_boot_claim
                 .as_deref()
                 .is_some_and(|claim| !valid_id(claim))
+            || proof.first_boot_claim.is_some() != proof.first_boot_phase.is_some()
         {
             return Err("invalid trusted live feedback bootstrap evidence".into());
         }
@@ -261,23 +262,38 @@ fn validate_topology(config: &RuntimeConfig) -> Result<(), String> {
                 .get(HOST_CONFIG)
                 .and_then(Option::as_ref)
                 .ok_or("live feedback host configuration not selected")?;
-            if roles.contains(&owner)
-                || selected.provider != *owner
-                || selected.contract != HOST_CONFIG
-                || pairing["host_configuration"] != true
-                || pairing["effect_authority"]["configuration_owner"] != *owner
-                || settings(config, owner)?["pairing_effect_authority"]["principal"]
-                    != p.pairing_owner
-                || !config
-                    .principals
-                    .get(owner)
-                    .is_some_and(|g| g.call.contains(PAIRING))
-                || !config
-                    .principals
-                    .get(&p.pairing_owner)
-                    .is_some_and(|g| g.call.contains(HOST_CONFIG))
+            let owner_settings = settings(config, owner)?;
+            let mismatch = if roles.contains(&owner) {
+                Some("configuration owner overlaps a live-feedback role")
+            } else if selected.provider != *owner {
+                Some("selected host-configuration provider differs from profile")
+            } else if selected.contract != HOST_CONFIG {
+                Some("selected host-configuration contract is invalid")
+            } else if pairing["host_configuration"] != true {
+                Some("Pairing host-configuration mode is disabled")
+            } else if pairing["effect_authority"]["configuration_owner"] != *owner {
+                Some("Pairing effect authority names a different configuration owner")
+            } else if owner_settings["pairing_effect_authority"]["principal"] != p.pairing_owner {
+                Some("host configuration selects a different Pairing principal")
+            } else if !config
+                .principals
+                .get(owner)
+                .is_some_and(|g| g.call.contains(PAIRING))
             {
-                return Err("live feedback host configuration mismatch".into());
+                Some("configuration owner lacks the Pairing call grant")
+            } else if !config
+                .principals
+                .get(&p.pairing_owner)
+                .is_some_and(|g| g.call.contains(HOST_CONFIG))
+            {
+                Some("Pairing lacks the host-configuration call grant")
+            } else {
+                None
+            };
+            if let Some(mismatch) = mismatch {
+                return Err(format!(
+                    "live feedback host configuration mismatch: {mismatch}"
+                ));
             }
         }
         None => {
@@ -420,6 +436,8 @@ mod tests {
                 profile: selected_profile,
                 state_owner: "state".into(),
                 first_boot_claim: claim.map(str::to_owned),
+                first_boot_phase: claim
+                    .map(|_| amaterasu_contracts::LiveFeedbackBootstrapPhase::Pending),
             }),
             ..Default::default()
         };
@@ -460,7 +478,9 @@ mod tests {
     ) -> u64 {
         let Response::Accepted { id } = broker.dispatch(
             HOST_LIFECYCLE_CONTROL_PRINCIPAL,
-            Command::InitializeLiveFeedback {},
+            Command::InitializeLiveFeedback {
+                resume_existing: false,
+            },
         ) else {
             panic!("trusted host bootstrap was not accepted");
         };
@@ -547,12 +567,81 @@ mod tests {
     }
 
     #[test]
+    fn pairing_acknowledgment_is_exact_owner_scoped_and_consumes_the_host_claim() {
+        let directory = test_state_directory();
+        let store = amaterasu_state::test_support::TestStateStore::open(directory.clone()).unwrap();
+        let mut broker = Broker::new(host_bootstrap_profile(Some(&"b".repeat(32)))).unwrap();
+        register_state_provider(&mut broker);
+        let request = complete_real_state_bootstrap(&mut broker, &store);
+        assert!(matches!(
+            broker.dispatch(
+                HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+                Command::FinishLiveFeedbackInitialization { request }
+            ),
+            Response::Result { payload } if payload["ok"] == true && payload["phase"] == "prepared"
+        ));
+
+        let claim = amaterasu_contracts::FeedbackBootstrapClaim {
+            version: 1,
+            installation_id: "a".repeat(32),
+            claim: "b".repeat(32),
+            pairing_owner: "pairing".into(),
+            effect_owner: "stream".into(),
+        };
+        assert_error_code(
+            broker.dispatch(
+                "foreign",
+                Command::CompleteLiveFeedbackBootstrap {
+                    claim: claim.clone(),
+                },
+            ),
+            "permission_denied",
+        );
+        let mut mismatched_claim = claim.clone();
+        mismatched_claim.claim = "d".repeat(32);
+        assert_error_code(
+            broker.dispatch(
+                "pairing",
+                Command::CompleteLiveFeedbackBootstrap {
+                    claim: mismatched_claim,
+                },
+            ),
+            "permission_denied",
+        );
+        assert!(matches!(
+            broker.dispatch(
+                "pairing",
+                Command::CompleteLiveFeedbackBootstrap {
+                    claim: claim.clone(),
+                }
+            ),
+            Response::Ok
+        ));
+        assert!(matches!(
+            broker.dispatch(
+                HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+                Command::FinishLiveFeedbackBootstrap {}
+            ),
+            Response::Ok
+        ));
+        assert_error_code(
+            broker.dispatch("pairing", Command::CompleteLiveFeedbackBootstrap { claim }),
+            "permission_denied",
+        );
+
+        drop(store);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn mismatched_provider_result_fails_closed_and_keeps_state_gated() {
         let mut broker = Broker::new(host_bootstrap_profile(Some(&"b".repeat(32)))).unwrap();
         register_state_provider(&mut broker);
         let Response::Accepted { id: request } = broker.dispatch(
             HOST_LIFECYCLE_CONTROL_PRINCIPAL,
-            Command::InitializeLiveFeedback {},
+            Command::InitializeLiveFeedback {
+                resume_existing: false,
+            },
         ) else {
             panic!("trusted host bootstrap was not accepted");
         };
@@ -616,7 +705,9 @@ mod tests {
         assert_error_code(
             restarted.dispatch(
                 HOST_LIFECYCLE_CONTROL_PRINCIPAL,
-                Command::InitializeLiveFeedback {},
+                Command::InitializeLiveFeedback {
+                    resume_existing: false,
+                },
             ),
             "permission_denied",
         );
@@ -659,7 +750,9 @@ mod tests {
         assert_error_code(
             restarted.dispatch(
                 HOST_LIFECYCLE_CONTROL_PRINCIPAL,
-                Command::InitializeLiveFeedback {},
+                Command::InitializeLiveFeedback {
+                    resume_existing: false,
+                },
             ),
             "permission_denied",
         );

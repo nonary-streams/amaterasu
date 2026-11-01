@@ -6,6 +6,8 @@ use serde_json::{Value, json};
 pub enum Operation {
     InitializeFeedbackHost {
         claim: amaterasu_module_sdk::state::FeedbackBootstrapClaim,
+        #[serde(default)]
+        resume_existing: bool,
     },
     CollectionGet {
         collection: String,

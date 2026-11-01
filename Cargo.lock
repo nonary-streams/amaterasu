@@ -673,6 +673,7 @@ dependencies = [
  "amaterasu-network-api",
  "amaterasu-network-policy",
  "amaterasu-network-sockets",
+ "amaterasu-package",
  "amaterasu-runtime",
  "amaterasu-upnp",
  "base64 0.22.1",

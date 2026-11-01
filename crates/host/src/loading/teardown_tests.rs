@@ -110,7 +110,7 @@ fn later_module_failure_destroys_loaded_consumers_before_providers_and_runtime()
             if name == "unavailable-listener" {
                 Err("tcp_bind_failed".into())
             } else {
-                Ok(feature(name, &trace))
+                Ok((feature(name, &trace), None))
             }
         },
         &mut |_| Ok(()),
@@ -128,7 +128,7 @@ fn progress_failure_destroys_just_created_module_before_its_dependencies() {
         lifecycle_endpoint(),
         false,
         ["provider", "consumer"],
-        |_, name| Ok(feature(name, &trace)),
+        |_, name| Ok((feature(name, &trace), None)),
         &mut |count| {
             if count == 3 {
                 Err("progress transport closed".into())
@@ -167,7 +167,7 @@ fn completed_load_retains_features_until_reverse_dependency_shutdown() {
         lifecycle_endpoint(),
         false,
         ["provider", "consumer"],
-        |_, name| Ok(feature(name, &trace)),
+        |_, name| Ok((feature(name, &trace), None)),
         &mut |count| {
             progress.push(count);
             Ok(())

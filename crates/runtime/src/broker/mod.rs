@@ -35,6 +35,8 @@ pub struct Broker {
     effect_fences: effect_fence::EffectFences,
     feedback_bootstrap_pending: bool,
     feedback_bootstrap_request: Option<u64>,
+    feedback_bootstrap_claim_available: bool,
+    feedback_bootstrap_recovered: bool,
 }
 
 const HOST_LIFECYCLE_QUEUE_CAPACITY: usize = 8;
@@ -65,6 +67,7 @@ impl Broker {
             }
         }
         let feedback_bootstrap_pending = live_feedback::claim_payload(&configuration).is_some();
+        let feedback_bootstrap_claim_available = feedback_bootstrap_pending;
         Ok(Self {
             hooks: HookRegistry::new(configuration.hooks.clone()),
             api: ApiRegistry::new(&configuration),
@@ -79,6 +82,8 @@ impl Broker {
             logging_policy_received: false,
             feedback_bootstrap_pending,
             feedback_bootstrap_request: None,
+            feedback_bootstrap_claim_available,
+            feedback_bootstrap_recovered: false,
         })
     }
 
@@ -117,11 +122,11 @@ impl Broker {
                 return errors::permission_denied();
             }
             return match command {
-                Command::InitializeLiveFeedback {} if self.feedback_bootstrap_pending && self.feedback_bootstrap_request.is_none() => {
+                Command::InitializeLiveFeedback { resume_existing } if self.feedback_bootstrap_pending && self.feedback_bootstrap_request.is_none() => {
                     let Some(claim) = live_feedback::claim_payload(&self.configuration) else { return errors::permission_denied(); };
                     let grants = Grants { call: ["amaterasu.state/1".into()].into(), ..Default::default() };
                     let response = self.requests.submit(caller, &grants, RequestOptions {
-                        service: "amaterasu.state/1".into(), payload: serde_json::json!({"action":"initialize_feedback_host","claim":claim}),
+                        service: "amaterasu.state/1".into(), payload: serde_json::json!({"action":"initialize_feedback_host","claim":claim,"resume_existing":resume_existing}),
                         timeout_ms: 30_000, operation_id: "host.feedback-bootstrap".into(), parent: None, response_schema: None,
                     }, now);
                     if let Response::Accepted { id } = response { self.feedback_bootstrap_request = Some(id); }
@@ -131,7 +136,12 @@ impl Broker {
                     let result = self.requests.result(caller, request);
                     if let Response::Result { payload } = &result {
                         let expected = live_feedback::claim_payload(&self.configuration);
-                        if payload["ok"] != true || payload["revision"] != 1 || Some(&payload["claim"]) != expected.as_ref() {
+                        let phase = payload["phase"].as_str().unwrap_or_default();
+                        if payload["ok"] != true
+                            || payload["revision"].as_u64().is_none_or(|revision| revision == 0)
+                            || !matches!(phase, "prepared" | "recovery_started" | "active")
+                            || Some(&payload["claim"]) != expected.as_ref()
+                        {
                             return Response::error(
                                 "bootstrap_claim_mismatch",
                                 "State did not confirm the exact host bootstrap claim",
@@ -143,6 +153,25 @@ impl Broker {
                     }
                     result
                 }
+                Command::QuarantineLiveFeedbackBootstrap { claim }
+                    if self.feedback_bootstrap_claim_available
+                        && !self.feedback_bootstrap_pending
+                        && live_feedback::claim_payload(&self.configuration).as_ref()
+                            == serde_json::to_value(&claim).ok().as_ref() =>
+                {
+                    self.feedback_bootstrap_claim_available = false;
+                    self.feedback_bootstrap_recovered = false;
+                    Response::Ok
+                }
+                Command::FinishLiveFeedbackBootstrap {}
+                    if self.feedback_bootstrap_recovered
+                        && self.feedback_bootstrap_claim_available =>
+                {
+                    self.feedback_bootstrap_claim_available = false;
+                    self.feedback_bootstrap_recovered = false;
+                    Response::Ok
+                }
+                Command::FinishLiveFeedbackBootstrap {} => Response::Pending,
                 Command::Poll {} => self.requests.poll(caller, now),
                 Command::CheckRequest { request } => self.requests.check_active(caller, request),
                 Command::Complete { request, payload } => {
@@ -151,6 +180,25 @@ impl Broker {
                 Command::EffectFence { command } if matches!(&*command, amaterasu_contracts::effect_fence::EffectFenceCommand::BrokerEpoch {} | amaterasu_contracts::effect_fence::EffectFenceCommand::RecoveryRetired { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::SourceRetired { .. }) => self.handle_effect_fence(caller, *command, now),
                 _ => errors::permission_denied(),
             };
+        }
+
+        if let Command::CompleteLiveFeedbackBootstrap { claim } = &command {
+            let expected = live_feedback::claim_payload(&self.configuration);
+            let supplied = serde_json::to_value(claim).ok();
+            let authorized_pairing = self
+                .configuration
+                .live_feedback
+                .as_ref()
+                .is_some_and(|profile| profile.pairing_owner == caller);
+            if authorized_pairing
+                && self.feedback_bootstrap_claim_available
+                && !self.feedback_bootstrap_pending
+                && expected == supplied
+            {
+                self.feedback_bootstrap_recovered = true;
+                return Response::Ok;
+            }
+            return errors::permission_denied();
         }
 
         let Some(grants) = self.configuration.principals.get(caller) else {
@@ -207,6 +255,7 @@ impl Broker {
                         .live_feedback
                         .as_ref()
                         .is_some_and(|profile| caller == profile.pairing_owner)
+                        && self.feedback_bootstrap_claim_available
                         && let Some(claim) = live_feedback::claim_payload(&self.configuration)
                         && let Some(object) = payload.as_object_mut()
                     {
@@ -435,8 +484,11 @@ impl Broker {
             Command::TakeResult { request } => self.requests.result(caller, request),
             Command::ReleaseResult { request } => self.requests.release(caller, request),
             Command::Cancel { request } => self.requests.cancel(caller, request, now),
-            Command::InitializeLiveFeedback {}
-            | Command::FinishLiveFeedbackInitialization { .. } => errors::permission_denied(),
+            Command::InitializeLiveFeedback { .. }
+            | Command::FinishLiveFeedbackInitialization { .. }
+            | Command::CompleteLiveFeedbackBootstrap { .. }
+            | Command::FinishLiveFeedbackBootstrap {}
+            | Command::QuarantineLiveFeedbackBootstrap { .. } => errors::permission_denied(),
             Command::Subscribe {
                 topic,
                 capacity,

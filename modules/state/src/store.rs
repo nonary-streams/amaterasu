@@ -62,8 +62,12 @@ impl StateStore {
         let operation: Operation = serde_json::from_value(payload)
             .map_err(|error| StateError::new("invalid_request", error.to_string()))?;
         validate_operation(&operation)?;
-        if let Operation::InitializeFeedbackHost { claim } = &operation {
-            return self.initialize_feedback_host(caller, claim.clone());
+        if let Operation::InitializeFeedbackHost {
+            claim,
+            resume_existing,
+        } = &operation
+        {
+            return self.initialize_feedback_host(caller, claim.clone(), *resume_existing);
         }
         let path = self.namespace_path(caller)?;
         match operation {
@@ -203,6 +207,7 @@ impl StateStore {
         &self,
         caller: &str,
         claim: amaterasu_module_sdk::state::FeedbackBootstrapClaim,
+        resume_existing: bool,
     ) -> Result<Value, StateError> {
         if caller != amaterasu_module_sdk::HOST_LIFECYCLE_CONTROL_PRINCIPAL {
             return Err(StateError::new(
@@ -221,7 +226,46 @@ impl StateStore {
                 "invalid feedback bootstrap claim",
             ));
         }
-        match std::fs::symlink_metadata(self.directory.join("namespaces")) {
+        let namespace_directory = self.directory.join("namespaces");
+        if resume_existing {
+            match std::fs::symlink_metadata(&namespace_directory) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(StateError::new(
+                        "bootstrap_history_lost",
+                        "resumable feedback State claim is missing",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) => return Err(storage_error(error)),
+            }
+            let path = self.namespace_path(&claim.pairing_owner)?;
+            let namespace = load_namespace(&path)?;
+            let Some(record) = namespace
+                .values
+                .get(amaterasu_module_sdk::state::FEEDBACK_BOOTSTRAP_KEY)
+            else {
+                return Err(StateError::new(
+                    "bootstrap_history_lost",
+                    "resumable feedback State claim is missing",
+                ));
+            };
+            let phase = record["phase"].as_str().unwrap_or_default();
+            if record["claim"] != json!(claim)
+                || !matches!(phase, "prepared" | "recovery_started" | "active")
+            {
+                return Err(StateError::new(
+                    "bootstrap_claim_mismatch",
+                    "stored feedback State claim does not match the trusted host",
+                ));
+            }
+            return Ok(json!({
+                "ok":true,
+                "revision":namespace.revision,
+                "claim":claim,
+                "phase":phase
+            }));
+        }
+        match std::fs::symlink_metadata(&namespace_directory) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Ok(_) => {
                 return Err(StateError::new(
@@ -238,7 +282,12 @@ impl StateStore {
             json!({"claim":claim,"phase":"prepared"}),
         );
         persist_mutation(&self.directory, &path, &mut namespace)?;
-        Ok(json!({"ok":true,"revision":namespace.revision,"claim":claim}))
+        Ok(json!({
+            "ok":true,
+            "revision":namespace.revision,
+            "claim":claim,
+            "phase":"prepared"
+        }))
     }
 }
 

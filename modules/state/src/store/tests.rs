@@ -191,7 +191,16 @@ fn feedback_bootstrap_is_host_only_durable_and_one_use() {
         amaterasu_module_sdk::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
         json!({"action":"initialize_feedback_host","claim":claim}),
     );
-    assert_eq!(initialized, json!({"ok":true,"revision":1,"claim":claim}));
+    assert_eq!(
+        initialized,
+        json!({"ok":true,"revision":1,"claim":claim,"phase":"prepared"})
+    );
+
+    let resumed = store.handle(
+        amaterasu_module_sdk::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+        json!({"action":"initialize_feedback_host","claim":claim,"resume_existing":true}),
+    );
+    assert_eq!(resumed, initialized);
 
     let replay = store.handle(
         amaterasu_module_sdk::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
@@ -213,6 +222,54 @@ fn feedback_bootstrap_is_host_only_durable_and_one_use() {
             "value":{"claim":claim,"phase":"prepared"}
         })
     );
+}
+
+#[test]
+fn feedback_bootstrap_resume_requires_the_exact_persisted_claim() {
+    let directory = TestDirectory::new();
+    let claim = feedback_bootstrap_claim();
+    let store = directory.open();
+    let initialized = store.handle(
+        amaterasu_module_sdk::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+        json!({"action":"initialize_feedback_host","claim":claim}),
+    );
+    assert_eq!(initialized["phase"], "prepared");
+
+    let mut different_installation = claim.clone();
+    different_installation["installation_id"] = json!("c".repeat(32));
+    assert_eq!(
+        store.handle(
+            amaterasu_module_sdk::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            json!({"action":"initialize_feedback_host","claim":different_installation,"resume_existing":true}),
+        )["error"]["code"],
+        "bootstrap_claim_mismatch"
+    );
+}
+
+#[test]
+fn feedback_bootstrap_resume_does_not_recreate_lost_state_history() {
+    let directory = TestDirectory::new();
+    let claim = feedback_bootstrap_claim();
+    {
+        let store = directory.open();
+        assert_eq!(
+            store.handle(
+                amaterasu_module_sdk::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+                json!({"action":"initialize_feedback_host","claim":claim}),
+            )["phase"],
+            "prepared"
+        );
+    }
+    std::fs::remove_dir_all(directory.0.join("namespaces")).unwrap();
+    let store = directory.open();
+    assert_eq!(
+        store.handle(
+            amaterasu_module_sdk::HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            json!({"action":"initialize_feedback_host","claim":claim,"resume_existing":true}),
+        )["error"]["code"],
+        "bootstrap_history_lost"
+    );
+    assert!(!directory.0.join("namespaces").exists());
 }
 
 #[test]

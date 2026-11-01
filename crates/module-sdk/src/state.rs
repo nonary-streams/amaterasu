@@ -3,22 +3,12 @@
 //! The broker supplies the immediate caller; these requests cannot select a
 //! namespace. A delegated child request remains subject to the initiator's
 //! grants and deadline. Cancellation does not undo a completed write.
+pub use amaterasu_contracts::FeedbackBootstrapClaim;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const STATE_SERVICE: &str = "amaterasu.state/1";
 pub const FEEDBACK_BOOTSTRAP_KEY: &str = "host/feedback-bootstrap/v1";
-
-/// One-use host-principal request, handled before other State callers run.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct FeedbackBootstrapClaim {
-    pub version: u8,
-    pub installation_id: String,
-    pub claim: String,
-    pub pairing_owner: String,
-    pub effect_owner: String,
-}
 
 /// The key/value subset of the State v1 contract. Collection and snapshot
 /// operations remain available through the ordinary broker protocol.
@@ -27,6 +17,8 @@ pub struct FeedbackBootstrapClaim {
 pub enum StateRequest {
     InitializeFeedbackHost {
         claim: FeedbackBootstrapClaim,
+        #[serde(default)]
+        resume_existing: bool,
     },
     Get {
         key: String,

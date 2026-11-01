@@ -5,7 +5,7 @@ use amaterasu_abi::{
 };
 use amaterasu_contracts::{
     Command, HOST_LIFECYCLE_CONTROL_PRINCIPAL, HOST_LOG_SERVICE, HostLifecycleAction, HostLogEvent,
-    Response,
+    LiveFeedbackHostProof, Response,
 };
 use amaterasu_logging::{HostLogService, LoggerError, ProductLogger};
 use amaterasu_package::{PackageResult, VerifiedPackage, ordered_components};
@@ -13,7 +13,7 @@ use libloading::Library;
 use serde_json::json;
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub(crate) mod management_tls;
 #[cfg(test)]
@@ -66,7 +66,13 @@ pub struct LoadedComponents {
     host_logs_enabled: bool,
     pending_log_policy: Option<HostLogEvent>,
     lifecycle_endpoint: HostApi,
+    pending_feedback_bootstrap: Option<PendingFeedbackBootstrap>,
     runtime: RuntimeLibrary,
+}
+
+struct PendingFeedbackBootstrap {
+    root: PathBuf,
+    proof: LiveFeedbackHostProof,
 }
 
 impl Drop for LoadedComponents {
@@ -162,6 +168,11 @@ impl LoadedComponents {
             .as_ref()
             .filter(|proof| proof.first_boot_claim.is_some())
             .map(|proof| proof.state_owner.clone());
+        let bootstrap_proof = runtime_config
+            .host_context
+            .live_feedback_bootstrap
+            .clone()
+            .filter(|proof| proof.first_boot_claim.is_some());
         let bootstrap_claim = if bootstrap_state_owner.is_some() {
             let proof = runtime_config
                 .host_context
@@ -219,12 +230,23 @@ impl LoadedComponents {
                     &component.id,
                     &endpoint,
                 )?;
+                let mut pending_feedback_bootstrap = None;
                 if bootstrap_state_owner.as_deref() == Some(&component.id)
-                    && let Some(claim) = &bootstrap_claim
+                    && let (Some(claim), Some(proof)) = (&bootstrap_claim, &bootstrap_proof)
+                    && initialize_feedback_state(
+                        &mut feature,
+                        &lifecycle_endpoint,
+                        root,
+                        proof,
+                        claim,
+                    )?
                 {
-                    initialize_feedback_state(&mut feature, &lifecycle_endpoint, claim)?;
+                    pending_feedback_bootstrap = Some(PendingFeedbackBootstrap {
+                        root: root.to_path_buf(),
+                        proof: proof.clone(),
+                    });
                 }
-                Ok(feature)
+                Ok((feature, pending_feedback_bootstrap))
             },
             progress,
         )
@@ -236,7 +258,11 @@ impl LoadedComponents {
         lifecycle_endpoint: HostApi,
         host_logs_enabled: bool,
         components: impl IntoIterator<Item = Component>,
-        mut load: impl FnMut(&mut RuntimeLibrary, Component) -> PackageResult<FeatureLibrary>,
+        mut load: impl FnMut(
+            &mut RuntimeLibrary,
+            Component,
+        )
+            -> PackageResult<(FeatureLibrary, Option<PendingFeedbackBootstrap>)>,
         progress: &mut dyn FnMut(usize) -> PackageResult<()>,
     ) -> PackageResult<Self> {
         // Own partial initialization immediately so every error path stops consumers
@@ -248,24 +274,50 @@ impl LoadedComponents {
             host_logs_enabled,
             pending_log_policy: None,
             lifecycle_endpoint,
+            pending_feedback_bootstrap: None,
             runtime,
         };
         progress(1)?;
         for (index, component) in components.into_iter().enumerate() {
-            let module = load(&mut loaded.runtime, component)?;
+            let (module, pending_feedback_bootstrap) = load(&mut loaded.runtime, component)?;
             loaded.modules.push(module);
+            if pending_feedback_bootstrap.is_some() {
+                loaded.pending_feedback_bootstrap = pending_feedback_bootstrap;
+            }
             progress(index + 2)?;
         }
         Ok(loaded)
     }
 
     pub fn tick(&mut self) -> PackageResult<()> {
-        for module in &mut self.modules {
-            module.tick()?;
+        for index in 0..self.modules.len() {
+            self.modules[index].tick()?;
+            self.finish_feedback_bootstrap_if_ready()?;
         }
         self.drain_log_events();
         self.service_host_logs();
         Ok(())
+    }
+
+    fn finish_feedback_bootstrap_if_ready(&mut self) -> PackageResult<()> {
+        let Some(pending) = self.pending_feedback_bootstrap.as_ref() else {
+            return Ok(());
+        };
+        match self.host_control(Command::FinishLiveFeedbackBootstrap {}) {
+            Some(Response::Pending) => Ok(()),
+            Some(Response::Ok) => {
+                amaterasu_package::live_feedback_bootstrap::finish_after_pairing_recovery(
+                    &pending.root,
+                    &pending.proof,
+                )?;
+                self.pending_feedback_bootstrap = None;
+                Ok(())
+            }
+            Some(Response::Error { code, message }) => {
+                Err(format!("feedback bootstrap finalization {code}: {message}"))
+            }
+            _ => Err("feedback bootstrap finalization transport failed".into()),
+        }
     }
 
     /// Pulls a bounded batch through the generic host transport. File I/O and
@@ -451,8 +503,17 @@ impl LoadedComponents {
 fn initialize_feedback_state(
     state: &mut FeatureLibrary,
     endpoint: &HostApi,
+    root: &Path,
+    proof: &LiveFeedbackHostProof,
     expected_claim: &amaterasu_module_sdk::state::FeedbackBootstrapClaim,
-) -> PackageResult<()> {
+) -> PackageResult<bool> {
+    let phase = proof
+        .first_boot_phase
+        .ok_or("feedback bootstrap claim lacks a durable phase")?;
+    let resume_existing = phase != amaterasu_contracts::LiveFeedbackBootstrapPhase::Pending;
+    if !resume_existing {
+        amaterasu_package::live_feedback_bootstrap::begin_state_initialization(root, proof)?;
+    }
     let expected_claim = serde_json::to_value(expected_claim).map_err(|error| error.to_string())?;
     let send = |command: &Command| -> PackageResult<Response> {
         let input = serde_json::to_vec(command).map_err(|error| error.to_string())?;
@@ -461,7 +522,8 @@ fn initialize_feedback_state(
             .map_err(|status| format!("host bootstrap transport: {status}"))?;
         serde_json::from_slice(&output).map_err(|error| error.to_string())
     };
-    let Response::Accepted { id } = send(&Command::InitializeLiveFeedback {})? else {
+    let Response::Accepted { id } = send(&Command::InitializeLiveFeedback { resume_existing })?
+    else {
         return Err("feedback State bootstrap was not accepted".into());
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -473,10 +535,37 @@ fn initialize_feedback_state(
             }
             Response::Result { payload }
                 if payload["ok"] == true
-                    && payload["revision"] == 1
+                    && payload["revision"]
+                        .as_u64()
+                        .is_some_and(|revision| revision > 0)
                     && payload["claim"] == expected_claim =>
             {
-                return Ok(());
+                match payload["phase"].as_str() {
+                    Some("prepared") => {
+                        amaterasu_package::live_feedback_bootstrap::mark_state_initialized(
+                            root, proof,
+                        )?;
+                        return Ok(true);
+                    }
+                    Some("recovery_started") | Some("active") => {
+                        let state_phase = if payload["phase"] == "recovery_started" {
+                            amaterasu_package::live_feedback_bootstrap::ConfirmedFeedbackBootstrapStatePhase::RecoveryStarted
+                        } else {
+                            amaterasu_package::live_feedback_bootstrap::ConfirmedFeedbackBootstrapStatePhase::Active
+                        };
+                        amaterasu_package::live_feedback_bootstrap::quarantine_after_state_recovery(
+                            root, proof, state_phase,
+                        )?;
+                        match send(&Command::QuarantineLiveFeedbackBootstrap {
+                            claim: serde_json::from_value(expected_claim)
+                                .map_err(|error| error.to_string())?,
+                        })? {
+                            Response::Ok => return Ok(false),
+                            _ => return Err("could not quarantine a resumed feedback claim".into()),
+                        }
+                    }
+                    _ => return Err("State returned an unknown feedback bootstrap phase".into()),
+                }
             }
             _ => return Err("feedback State bootstrap did not commit".into()),
         }

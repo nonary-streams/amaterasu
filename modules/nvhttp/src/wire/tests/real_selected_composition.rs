@@ -1,6 +1,7 @@
 //! Cross-module selected-library qualification. The protocol modules and broker
 //! run their production entrypoints; only hardware and persistent state are synthetic.
 use super::*;
+use amaterasu_contracts::{HOST_LIFECYCLE_CONTROL_PRINCIPAL, LiveFeedbackHostProof, RuntimeConfig};
 use amaterasu_module_sdk::abi::{self, BorrowedBytes, HostApi, ModuleApi, RuntimeApi, STATUS_OK};
 use amaterasu_module_sdk::{Command, Response, RuntimeClient};
 use serde_json::{Value, json};
@@ -220,6 +221,109 @@ fn take(client: &RuntimeClient, id: u64) -> Option<Value> {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn prepare_bootstrap_installation(package_root: &Path) -> PathBuf {
+    amaterasu_package::live_feedback_bootstrap::create_new_root(package_root)
+        .expect("create fresh package provenance");
+    let state_root = package_root.join("data/state");
+    let credentials = state_root.join("credentials");
+    std::fs::create_dir_all(&credentials).expect("create test credentials directory");
+    std::fs::write(credentials.join("cacert.pem"), HOST_CERT).expect("write test host certificate");
+    std::fs::write(credentials.join("cakey.pem"), HOST_KEY).expect("write test host key");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&credentials, std::fs::Permissions::from_mode(0o700))
+            .expect("restrict test credentials directory");
+        std::fs::set_permissions(
+            credentials.join("cakey.pem"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .expect("restrict test host key");
+    }
+    state_root
+        .canonicalize()
+        .expect("canonical test State root")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn prepare_bootstrap_installation(_package_root: &Path) -> PathBuf {
+    panic!("normal-ABI feedback bootstrap qualification requires Linux")
+}
+
+fn initialize_live_feedback_state(
+    runtime: &Runtime,
+    state: &mut LoadedModule,
+    package_root: &Path,
+    proof: &LiveFeedbackHostProof,
+) {
+    assert_eq!(
+        proof.first_boot_phase,
+        Some(amaterasu_contracts::LiveFeedbackBootstrapPhase::Pending),
+        "normal-ABI composition must start from a fresh trusted witness"
+    );
+    amaterasu_package::live_feedback_bootstrap::begin_state_initialization(package_root, proof)
+        .expect("persist the bootstrap write-ahead phase");
+    let claim = amaterasu_module_sdk::state::FeedbackBootstrapClaim {
+        version: 1,
+        installation_id: proof.installation_id.clone(),
+        claim: proof
+            .first_boot_claim
+            .clone()
+            .expect("fresh package must issue a first-boot claim"),
+        pairing_owner: proof.profile.pairing_owner.clone(),
+        effect_owner: proof.profile.stream_owner.clone(),
+    };
+    let expected_claim = serde_json::to_value(claim).expect("serialize host-issued claim");
+    let host = runtime.client(HOST_LIFECYCLE_CONTROL_PRINCIPAL);
+    let request = match host
+        .send(Command::InitializeLiveFeedback {
+            resume_existing: false,
+        })
+        .unwrap()
+    {
+        Response::Accepted { id } => id,
+        response => panic!("trusted host bootstrap was rejected: {response:?}"),
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        state.tick();
+        match host
+            .send(Command::FinishLiveFeedbackInitialization { request })
+            .unwrap()
+        {
+            Response::Pending if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Response::Result { payload } => {
+                assert_eq!(payload["ok"], true, "{payload}");
+                assert_eq!(payload["revision"], 1, "{payload}");
+                assert_eq!(payload["claim"], expected_claim, "{payload}");
+                assert_eq!(payload["phase"], "prepared", "{payload}");
+                amaterasu_package::live_feedback_bootstrap::mark_state_initialized(
+                    package_root,
+                    proof,
+                )
+                .expect("mark State claim as initialized");
+                return;
+            }
+            response => panic!("trusted State bootstrap failed: {response:?}"),
+        }
+    }
+}
+
+fn tick_authority_modules(
+    pairing: &mut LoadedModule,
+    state: &mut LoadedModule,
+    host_configuration: &mut Option<LoadedModule>,
+) {
+    pairing.tick();
+    state.tick();
+    if let Some(configuration) = host_configuration {
+        configuration.tick();
+    }
+}
+
 #[test]
 #[ignore = "requires independently built protocol and fixture artifacts plus an ephemeral loopback listener"]
 fn real_selected_composition() {
@@ -311,6 +415,13 @@ fn run_composition(
     let second_cert_id = hex(&Sha256::digest(&second_cert));
     let play = std::env::var_os("AMATERASU_COMPOSITION_PLAY").is_some();
     let full = std::env::var_os("AMATERASU_COMPOSITION_FULL").is_some();
+    let normal_abi = full && std::env::var_os("AMATERASU_COMPOSITION_NORMAL_ABI").is_some();
+    let package_root = temp.0.join("package");
+    let state_root = if normal_abi {
+        prepare_bootstrap_installation(&package_root)
+    } else {
+        temp.0.join("state")
+    };
     let streaming = crate::launch::StreamingConfig {
         capture: CaptureConfig {
             capture_provider: if play {
@@ -359,6 +470,7 @@ fn run_composition(
     let services = json!([
         "amaterasu.pairing/1",
         "amaterasu.state/1",
+        "amaterasu.host-configuration/1",
         "amaterasu.launch/1",
         "amaterasu.launch/3",
         "amaterasu.rtsp/1",
@@ -393,6 +505,7 @@ fn run_composition(
         "control":{"provide":["amaterasu.control-transport/1"],"native_provide":["amaterasu.control-transport/1"],"native_use":["amaterasu.network/1"]},
         "media":{"provide":["amaterasu.media-transport/1"],"native_provide":["amaterasu.media-transport/1"],"native_use":["amaterasu.network/1"]},
         "input":{"provide":["amaterasu.input/1"],"call":["amaterasu.configuration/1"]},
+        "amaterasu.host-configuration":{"provide":["amaterasu.host-configuration/1"],"call":["amaterasu.pairing/1"]},
         "fixture-configuration":{"provide":["amaterasu.configuration/1"]},
         "display":{"provide":["amaterasu.display/1"]},
         "application":{"provide":["amaterasu.application/1"]},
@@ -417,7 +530,7 @@ fn run_composition(
         "policy":{"service":"fixture.policy/2","callers":{"amaterasu.launch":["amaterasu.nvhttp"]},"rules":[{"certificates":[cert_id],"policy":{"application":{"library":"games","id":"opaque/game"},"entry_revision":"entry:opaque","policy_revision":"policy:one","preparation":[]},"config_overrides":{},"application_display_settings":null}]},
         "executor":{"callers":{"amaterasu.launch":{"initiators":["amaterasu.nvhttp","amaterasu.launch"],"lifecycle":true}}, "limiter_mode":match scenario { "limiter_success" => "supported", "limiter_mismatch" => "mismatch", "limiter_stale" => "stale", _ => "" }},
         "replacement":{"certificate_id":cert_id,"mode":scenario,"limiter_capacity":2}
-    },"host_context":{"schema":1,"state_root":temp.0.join("state")}});
+    },"host_context":{"schema":1,"state_root":state_root}});
     if play {
         fixture_capture::configure(&mut config);
     } else {
@@ -432,6 +545,47 @@ fn run_composition(
         config["settings"]["policy"]["rules"][0]["certificates"] = json!([cert_id, second_cert_id]);
         configure_full(&mut config, &streaming);
     }
+    let mut bootstrap_proof = None;
+    if normal_abi {
+        let mut runtime_config: RuntimeConfig =
+            serde_json::from_value(config.clone()).expect("normal-ABI runtime config");
+        runtime_config.host_context.schema = 1;
+        runtime_config.host_context.state_root = Some(
+            state_root
+                .canonicalize()
+                .expect("canonical test State root")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        runtime_config.host_context.package_root = Some(
+            package_root
+                .canonicalize()
+                .expect("canonical test package root")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        runtime_config
+            .settings
+            .entry("amaterasu.host-configuration".into())
+            .or_default()["host_state_root"] = json!(state_root.to_string_lossy());
+        runtime_config.host_lifecycle_control = true;
+        runtime_config
+            .principals
+            .insert(HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(), Default::default());
+        let proof = amaterasu_package::live_feedback_bootstrap::prepare(
+            &package_root,
+            &state_root,
+            &runtime_config,
+        )
+        .expect("trusted package bootstrap");
+        let proof = proof.expect("fresh feedback package proof");
+        runtime_config.host_context.live_feedback_bootstrap = Some(proof.clone());
+        bootstrap_proof = Some(proof);
+        config = serde_json::to_value(runtime_config).expect("serialize trusted runtime config");
+        let checked: RuntimeConfig =
+            serde_json::from_value(config.clone()).expect("parse trusted runtime config");
+        amaterasu_runtime::Broker::new(checked).expect("trusted live-feedback topology");
+    }
     let runtime = Runtime::new(&artifact(&artifacts, "amaterasu_runtime"), config);
     let capture_fixture = runtime.client("fixture-capture");
     if play {
@@ -441,6 +595,20 @@ fn run_composition(
         &artifact(&artifacts, "amaterasu_state"),
         &runtime.endpoint("amaterasu.state"),
     );
+    if normal_abi {
+        initialize_live_feedback_state(
+            &runtime,
+            &mut memory,
+            &package_root,
+            bootstrap_proof.as_ref().expect("prepared feedback proof"),
+        );
+    }
+    let mut selected_host_configuration = normal_abi.then(|| {
+        LoadedModule::start(
+            &artifact(&artifacts, "amaterasu_host_configuration"),
+            &runtime.endpoint("amaterasu.host-configuration"),
+        )
+    });
     let network = runtime.client("network");
     let factory = amaterasu_network_sockets::Factory::new();
     // SAFETY: factory lives until after RTSP and its native binding are destroyed.
@@ -555,6 +723,102 @@ fn run_composition(
             &runtime.endpoint("amaterasu.pairing"),
         )
     };
+    if normal_abi {
+        let owner = runtime.client("stream");
+        let mut status_request = broker_request(
+            &owner,
+            "amaterasu.pairing-effects/1",
+            json!({"action":"status"}),
+            "trusted-first-boot-status-0",
+        );
+        let mut recovered = false;
+        let mut host_bootstrap_finished = false;
+        let mut last_status = None;
+        let mut last_finish_response = None;
+        let host = runtime.client(HOST_LIFECYCLE_CONTROL_PRINCIPAL);
+        for attempt in 0..5_000 {
+            tick_authority_modules(&mut pairing, &mut memory, &mut selected_host_configuration);
+            if !host_bootstrap_finished {
+                let response = host.send(Command::FinishLiveFeedbackBootstrap {}).unwrap();
+                last_finish_response = Some(format!("{response:?}"));
+                match response {
+                    Response::Pending => {}
+                    Response::Ok => {
+                        amaterasu_package::live_feedback_bootstrap::finish_after_pairing_recovery(
+                            &package_root,
+                            bootstrap_proof.as_ref().expect("prepared feedback proof"),
+                        )
+                        .expect("consume the host claim after Pairing recovery");
+                        host_bootstrap_finished = true;
+                    }
+                    response => panic!("trusted bootstrap finalization failed: {response:?}"),
+                }
+            }
+            if let Some(status) = take(&owner, status_request) {
+                last_status = Some(status.clone());
+                if status["startup_recovery_required"] == false {
+                    assert_eq!(status["bound_sources"], 0, "{status}");
+                    assert_eq!(status["fenced"], false, "{status}");
+                    if host_bootstrap_finished {
+                        recovered = true;
+                        break;
+                    }
+                }
+                status_request = broker_request(
+                    &owner,
+                    "amaterasu.pairing-effects/1",
+                    json!({"action":"status"}),
+                    &format!("trusted-first-boot-status-{}", attempt + 1),
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        if !recovered {
+            let pairing_client = runtime.client("amaterasu.pairing");
+            let readiness_request = broker_request(
+                &pairing_client,
+                "amaterasu.host-configuration/1",
+                json!({"action":"readiness"}),
+                "trusted-first-boot-diagnostic-readiness",
+            );
+            let transaction_request = broker_request(
+                &pairing_client,
+                "amaterasu.host-configuration/1",
+                json!({"action":"transaction_status"}),
+                "trusted-first-boot-diagnostic-transaction",
+            );
+            let state_request = broker_request(
+                &pairing_client,
+                "amaterasu.state/1",
+                json!({"action":"get","key":amaterasu_module_sdk::state::FEEDBACK_BOOTSTRAP_KEY}),
+                "trusted-first-boot-diagnostic-state",
+            );
+            let mut readiness = None;
+            let mut transaction = None;
+            let mut state = None;
+            for _ in 0..500 {
+                tick_authority_modules(&mut pairing, &mut memory, &mut selected_host_configuration);
+                if readiness.is_none() {
+                    readiness = take(&pairing_client, readiness_request);
+                }
+                if transaction.is_none() {
+                    transaction = take(&pairing_client, transaction_request);
+                }
+                if state.is_none() {
+                    state = take(&pairing_client, state_request);
+                }
+                if readiness.is_some() && transaction.is_some() && state.is_some() {
+                    break;
+                }
+            }
+            last_status = Some(json!({"pairing":last_status,"readiness":readiness,
+                "transaction_status":transaction,"bootstrap_state":state}));
+        }
+        assert!(
+            recovered,
+            "Pairing did not recover from the host-issued State claim; last_status={last_status:?}; host_finish={last_finish_response:?}"
+        );
+    }
     let mut launch = LoadedModule::start(
         &artifact(&artifacts, "amaterasu_launch"),
         &runtime.endpoint("amaterasu.launch"),
@@ -586,7 +850,7 @@ fn run_composition(
     let mut provider =
         (!replacement).then(|| LoadedModule::start(&executor, &runtime.endpoint("executor")));
     let console = runtime.client("console");
-    if full {
+    if full && !normal_abi {
         // This test owns a fresh runtime, fresh state directory and no prior
         // transports. Recover the initial empty authority before provisioning.
         let owner = runtime.client("stream");
@@ -598,8 +862,7 @@ fn run_composition(
         );
         let mut status = None;
         for _ in 0..500 {
-            pairing.tick();
-            memory.tick();
+            tick_authority_modules(&mut pairing, &mut memory, &mut selected_host_configuration);
             if let Some(value) = take(&owner, pending) {
                 status = Some(value);
                 break;
@@ -616,8 +879,7 @@ fn run_composition(
         );
         let mut recovered = None;
         for _ in 0..500 {
-            pairing.tick();
-            memory.tick();
+            tick_authority_modules(&mut pairing, &mut memory, &mut selected_host_configuration);
             if let Some(value) = take(&owner, pending) {
                 recovered = Some(value);
                 break;
@@ -645,8 +907,7 @@ fn run_composition(
         );
         let mut result = None;
         for _ in 0..500 {
-            pairing.tick();
-            memory.tick();
+            tick_authority_modules(&mut pairing, &mut memory, &mut selected_host_configuration);
             if let Some(value) = take(&console, pending) {
                 result = Some(value);
                 break;
@@ -727,6 +988,7 @@ fn run_composition(
             console: &console,
             pairing: &mut pairing,
             memory: &mut memory,
+            host_configuration: &mut selected_host_configuration,
             launch: &mut launch,
             lifecycle: &mut lifecycle,
             rtsp: &mut rtsp,
@@ -898,8 +1160,7 @@ fn run_composition(
                 "TLS connection closed before launch response"
             );
         }
-        pairing.tick();
-        memory.tick();
+        tick_authority_modules(&mut pairing, &mut memory, &mut selected_host_configuration);
         if scenario == "retirement_uncertain_write"
             && !cancelled
             && router.launches.selected_preflight_state_for_test() == Some((true, false))
@@ -1165,8 +1426,7 @@ fn run_composition(
             if let Some(video) = &mut video_fixture {
                 video.pump(&video_runtime);
             }
-            pairing.tick();
-            memory.tick();
+            tick_authority_modules(&mut pairing, &mut memory, &mut selected_host_configuration);
             launch.tick();
             lifecycle.tick();
             rtsp.tick();
@@ -1494,8 +1754,11 @@ fn run_composition(
                     );
                     let mut result = None;
                     for _ in 0..500 {
-                        pairing.tick();
-                        memory.tick();
+                        tick_authority_modules(
+                            &mut pairing,
+                            &mut memory,
+                            &mut selected_host_configuration,
+                        );
                         if let Some(value) = take(&nvhttp, unpair) {
                             result = Some(value);
                             break;
@@ -1523,8 +1786,11 @@ fn run_composition(
                 );
                 let mut resumed = vec![];
                 for _ in 0..5000 {
-                    pairing.tick();
-                    memory.tick();
+                    tick_authority_modules(
+                        &mut pairing,
+                        &mut memory,
+                        &mut selected_host_configuration,
+                    );
                     launch.tick();
                     lifecycle.tick();
                     if let Some(module) = &mut library {
@@ -2206,12 +2472,16 @@ impl Hardware {
 
 fn configure_full(config: &mut Value, streaming: &crate::launch::StreamingConfig) {
     if std::env::var_os("AMATERASU_COMPOSITION_NORMAL_ABI").is_some() {
-        config["live_feedback"] = json!({"protocol_owner":"amaterasu.nvhttp","pairing_owner":"amaterasu.pairing","stream_owner":"stream","input_owner":"input","lifecycle_owner":"amaterasu.session-lifecycle","control_owner":"control"});
+        config["live_feedback"] = json!({"protocol_owner":"amaterasu.nvhttp","pairing_owner":"amaterasu.pairing","stream_owner":"stream","input_owner":"input","lifecycle_owner":"amaterasu.session-lifecycle","control_owner":"control","host_configuration_owner":"amaterasu.host-configuration"});
         for (service, owner) in [
             ("amaterasu.nvhttp/1", "amaterasu.nvhttp"),
             ("amaterasu.pairing-effects/1", "amaterasu.pairing"),
             ("amaterasu.pairing/1", "amaterasu.pairing"),
             ("amaterasu.state/1", "amaterasu.state"),
+            (
+                "amaterasu.host-configuration/1",
+                "amaterasu.host-configuration",
+            ),
             ("amaterasu.stream-session/1", "stream"),
             ("amaterasu.input/1", "input"),
             (
@@ -2246,6 +2516,24 @@ fn configure_full(config: &mut Value, streaming: &crate::launch::StreamingConfig
         .as_array_mut()
         .unwrap()
         .push(json!("amaterasu.pairing-effects/1"));
+    if std::env::var_os("AMATERASU_COMPOSITION_NORMAL_ABI").is_some() {
+        config["principals"]["amaterasu.host-configuration"]["call"]
+            .as_array_mut()
+            .unwrap()
+            .extend([
+                json!("amaterasu.pairing-effects/1"),
+                json!("amaterasu.state/1"),
+            ]);
+        config["principals"]["amaterasu.pairing"]["call"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("amaterasu.host-configuration/1"));
+        config["settings"]["amaterasu.host-configuration"] =
+            json!({"pairing_effect_authority":{"principal":"amaterasu.pairing"}});
+        config["settings"]["amaterasu.pairing"]["host_configuration"] = json!(true);
+        config["settings"]["amaterasu.pairing"]["effect_authority"]["configuration_owner"] =
+            json!("amaterasu.host-configuration");
+    }
     config["principals"]["stream"]["call"]
         .as_array_mut()
         .unwrap()
@@ -2271,7 +2559,7 @@ fn configure_full(config: &mut Value, streaming: &crate::launch::StreamingConfig
     };
     QUALIFICATION_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
     config["settings"]["amaterasu.nvhttp"] = json!({"enabled":true,"http_bind":format!("127.0.0.1:{port}"),"https_bind":format!("127.0.0.1:{}",port+5),"session_lifecycle_required":true,"effect_source_join":{"effect_owner":"stream","input_consumer":"input"},"streaming":streaming});
-    config["settings"]["amaterasu.pairing"]["effect_authority"] = json!({"protocol_owner":"amaterasu.nvhttp","effect_owner":"stream","feedback_policies":[{"capability":{"schema":"org.amaterasu.feedback.rgb_led","version":1,"direction":"to_client"},"required_permission":"view"}]});
+    config["settings"]["amaterasu.pairing"]["effect_authority"] = json!({"protocol_owner":"amaterasu.nvhttp","effect_owner":"stream","configuration_owner":if std::env::var_os("AMATERASU_COMPOSITION_NORMAL_ABI").is_some() { json!("amaterasu.host-configuration") } else { Value::Null },"feedback_policies":[{"capability":{"schema":"org.amaterasu.feedback.rgb_led","version":1,"direction":"to_client"},"required_permission":"view"}]});
     config["settings"]["stream"]["feedback_retirement_input_principal"] = json!("input");
     config["settings"]["stream"]["feedback_source_protocol_service"] = json!("amaterasu.nvhttp/1");
     config["settings"]["stream"]["feedback_owner_restart_recovery"] = json!(true);

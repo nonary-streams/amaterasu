@@ -5687,6 +5687,7 @@ fn trusted_bootstrap_persists_exact_claim_before_recovering_effect_gate() {
     let mut results = BTreeMap::new();
     let mut next_request = 100;
     let mut actions = Vec::new();
+    let mut completed_claim = None;
     let mut send = |command: Command| -> Transport {
         Ok(match command {
             Command::Request {
@@ -5700,8 +5701,17 @@ fn trusted_bootstrap_persists_exact_claim_before_recovering_effect_gate() {
                         "value":{"claim":expected_claim,"phase":"prepared"}})
                 } else if service == STATE_SERVICE && payload["action"] == "set" {
                     actions.push("state:set");
-                    assert_eq!(payload["expected_revision"], 1);
-                    json!({"ok":true,"revision":2})
+                    match payload["value"]["phase"].as_str() {
+                        Some("recovery_started") => {
+                            assert_eq!(payload["expected_revision"], 1);
+                            json!({"ok":true,"revision":2})
+                        }
+                        Some("active") => {
+                            assert_eq!(payload["expected_revision"], 2);
+                            json!({"ok":true,"revision":3})
+                        }
+                        phase => panic!("unexpected bootstrap State phase: {phase:?}"),
+                    }
                 } else if service == HOST_CONFIGURATION_SERVICE {
                     actions.push("configuration:transaction_status");
                     json!({"ok":true,"configuration_revision":0,"state_revision":0,
@@ -5711,6 +5721,10 @@ fn trusted_bootstrap_persists_exact_claim_before_recovering_effect_gate() {
                 };
                 results.insert(request, result);
                 Response::Accepted { id: request }
+            }
+            Command::CompleteLiveFeedbackBootstrap { claim } => {
+                completed_claim = Some(serde_json::to_value(claim).unwrap());
+                Response::Ok
             }
             Command::TakeResult { request } => results
                 .remove(&request)
@@ -5727,13 +5741,19 @@ fn trusted_bootstrap_persists_exact_claim_before_recovering_effect_gate() {
             .unwrap()
             .startup_recovery_required()
     );
-    for _ in 0..4 {
+    for _ in 0..5 {
         pipeline.progress_feedback_bootstrap(&mut send).unwrap();
     }
     assert_eq!(
         actions,
-        ["state:get", "state:set", "configuration:transaction_status"]
+        [
+            "state:get",
+            "state:set",
+            "configuration:transaction_status",
+            "state:set"
+        ]
     );
+    assert_eq!(completed_claim, Some(expected_claim));
     assert!(
         !pipeline
             .effect_gate
@@ -5742,6 +5762,71 @@ fn trusted_bootstrap_persists_exact_claim_before_recovering_effect_gate() {
             .startup_recovery_required()
     );
     assert!(pipeline.feedback_bootstrap.as_ref().is_some());
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn lost_pairing_recovery_ack_refences_the_gate_after_local_recovery() {
+    let claim = feedback_bootstrap_test_claim();
+    let expected_claim = serde_json::to_value(&claim).unwrap();
+    let (directory, mut pipeline) = feedback_bootstrap_test_pipeline(claim);
+    let mut results = BTreeMap::new();
+    let mut next_request = 300;
+    let mut completion_attempted = false;
+    let mut send = |command: Command| -> Transport {
+        match command {
+            Command::Request {
+                service, payload, ..
+            } => {
+                let request = next_request;
+                next_request += 1;
+                let result = if service == STATE_SERVICE && payload["action"] == "get" {
+                    json!({"ok":true,"revision":1,"found":true,
+                        "value":{"claim":expected_claim,"phase":"prepared"}})
+                } else if service == STATE_SERVICE && payload["action"] == "set" {
+                    match payload["value"]["phase"].as_str() {
+                        Some("recovery_started") if payload["expected_revision"] == 1 => {
+                            json!({"ok":true,"revision":2})
+                        }
+                        Some("active") if payload["expected_revision"] == 2 => {
+                            json!({"ok":true,"revision":3})
+                        }
+                        phase => panic!("unexpected bootstrap State write: {phase:?} {payload}"),
+                    }
+                } else if service == HOST_CONFIGURATION_SERVICE {
+                    json!({"ok":true,"configuration_revision":0,"state_revision":0,
+                        "identity_fingerprint":"c".repeat(64),"transaction":null,"terminal_receipt":null})
+                } else {
+                    panic!("unexpected bootstrap service request: {service} {payload}");
+                };
+                results.insert(request, result);
+                Ok(Response::Accepted { id: request })
+            }
+            Command::TakeResult { request } => Ok(results
+                .remove(&request)
+                .map_or(Response::Pending, |payload| Response::Result { payload })),
+            Command::ReleaseResult { .. } => Ok(Response::Ok),
+            Command::CompleteLiveFeedbackBootstrap { claim } => {
+                assert_eq!(serde_json::to_value(claim).unwrap(), expected_claim);
+                completion_attempted = true;
+                Err("Pairing completion reply was lost".into())
+            }
+            other => panic!("unexpected bootstrap command: {other:?}"),
+        }
+    };
+
+    for _ in 0..5 {
+        pipeline.progress_feedback_bootstrap(&mut send).unwrap();
+    }
+    assert!(completion_attempted);
+    assert!(
+        pipeline
+            .effect_gate
+            .as_ref()
+            .unwrap()
+            .startup_recovery_required(),
+        "a lost acknowledgment must leave the local effect gate fenced"
+    );
     std::fs::remove_dir_all(directory).unwrap();
 }
 
@@ -5827,6 +5912,10 @@ fn trusted_bootstrap_recovers_through_real_broker_and_state_without_fixture_reco
             Command::ReleaseResult { request } => {
                 Ok(broker.dispatch("pairing", Command::ReleaseResult { request }))
             }
+            Command::CompleteLiveFeedbackBootstrap { claim } => {
+                assert_eq!(serde_json::to_value(&claim).unwrap(), claim_value);
+                Ok(Response::Ok)
+            }
             other => panic!("unexpected bootstrap command: {other:?}"),
         }
     };
@@ -5844,6 +5933,7 @@ fn trusted_bootstrap_recovers_through_real_broker_and_state_without_fixture_reco
                 HOST_CONFIGURATION_SERVICE.into(),
                 "transaction_status".into()
             ),
+            (STATE_SERVICE.into(), "set".into()),
         ]
     );
     assert!(
@@ -5858,7 +5948,7 @@ fn trusted_bootstrap_recovers_through_real_broker_and_state_without_fixture_reco
         "pairing",
         json!({"action":"get","key":amaterasu_module_sdk::state::FEEDBACK_BOOTSTRAP_KEY}),
     );
-    assert_eq!(persisted["revision"], 2);
+    assert_eq!(persisted["revision"], 3);
     assert_eq!(persisted["value"]["phase"], "active");
     assert_eq!(persisted["value"]["claim"], claim_value);
     drop(store);
