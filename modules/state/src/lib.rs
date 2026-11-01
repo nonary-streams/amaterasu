@@ -86,6 +86,24 @@ fn complete_result(response: Response) -> ModuleResult<()> {
     }
 }
 
+#[cfg(not(feature = "test-support"))]
+amaterasu_module_sdk::export_module!(StateModule);
+
+/// Provide the lifecycle table without a duplicate native entrypoint when
+/// linking State into another module's in-process tests.
+#[cfg(feature = "test-support")]
+pub fn test_module_api() -> *const amaterasu_module_sdk::abi::ModuleApi {
+    use amaterasu_module_sdk::{abi, exports};
+    static API: abi::ModuleApi = abi::ModuleApi {
+        header: abi::AbiHeader::of::<abi::ModuleApi>(),
+        create: exports::create::<StateModule>,
+        tick: exports::tick::<StateModule>,
+        health: exports::health::<StateModule>,
+        destroy: exports::destroy::<StateModule>,
+    };
+    &API
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,5 +142,3 @@ mod tests {
         assert!(complete_result(Response::error("invalid_payload", "too large")).is_err());
     }
 }
-
-amaterasu_module_sdk::export_module!(StateModule);
