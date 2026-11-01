@@ -47,6 +47,7 @@ pub enum Phase {
     ReadProtonPolicy,
     PreflightApplication,
     AcceptPolicy,
+    CancelPreflight,
     SnapshotDisplay,
     EnumerateDisplay,
     ConfirmDisplay,
@@ -282,6 +283,11 @@ impl Controller {
                         self.finish_or_retain(job.record, now, replies);
                         return;
                     }
+                    Phase::CancelPreflight => {
+                        record.fail_cleanup("preflight_retirement_unconfirmed");
+                        reply_failure(record, replies);
+                        return;
+                    }
                     Phase::ReserveHistory | Phase::ReleaseHistory => {}
                     Phase::OpenRtsp | Phase::StopRtsp | Phase::LookupRtsp => {
                         record.rtsp_cleanup_blocked = true;
@@ -498,6 +504,12 @@ impl Controller {
                     10_000,
                 )
             }
+            Phase::CancelPreflight => (
+                amaterasu_module_sdk::application_library::preflight::SERVICE,
+                json!({"action":"cancel_streaming","operation_id":record.application_operation,"certificate_id":record.peer.certificate_id,
+                    "preflight_token":record.application_preflight_token,"policy_identity":record.policy_identity}),
+                30_000,
+            ),
             Phase::SnapshotDisplay | Phase::ConfirmDisplay => {
                 (DISPLAY_SERVICE, json!({"action":"snapshot"}), 5_000)
             }
@@ -1041,6 +1053,7 @@ impl Controller {
                         .or(application_overrides.capture)
                         .unwrap_or(record.global_capture_mode);
                     record.application_preflight_token = Some(token);
+                    record.selected_preflight_pending = record.selected_application.is_some();
                     record.application_catalog_revision = catalog_revision;
                     record.policy_identity = policy_identity;
                     record.application_cleanup_budget_ms = Some(cleanup_budget_ms);
@@ -1149,6 +1162,21 @@ impl Controller {
                     fail_record(record, "application_policy_changed", now);
                 }
             }
+            Phase::CancelPreflight => {
+                if (payload["ok"] == true
+                    && payload["cancelled"] == true
+                    && payload["operation_id"] == record.application_operation)
+                    || payload["code"] == "preflight_not_found"
+                {
+                    record.selected_preflight_pending = false;
+                } else if payload["code"] == "workflow_busy" && now < record.deadline {
+                    // The cancelled admission may itself be retiring the reservation.
+                    // Retry until that cleanup has finished or this cleanup expires.
+                } else {
+                    record.fail_cleanup("preflight_retirement_unconfirmed");
+                    reply_failure(record, replies);
+                }
+            }
             Phase::SnapshotDisplay => match display_snapshot(&payload) {
                 Ok((revision, configuration, ids)) if record.state == State::Starting => {
                     record.display_topology_revision = Some(revision);
@@ -1207,6 +1235,7 @@ impl Controller {
             Phase::LaunchApplication | Phase::LookupApplication => {
                 match application_response(record, &payload) {
                     Ok((launch_id, "starting", true)) if record.state == State::Starting => {
+                        record.selected_preflight_pending = false;
                         record.application_launch = Some(launch_id);
                         if let Err(code) = validate_application_launch_snapshot(record, &payload) {
                             fail_record(record, code, now);
@@ -1217,6 +1246,7 @@ impl Controller {
                         record.next_monitor = now + MONITOR_INTERVAL;
                     }
                     Ok((launch_id, "active", true)) if record.state == State::Starting => {
+                        record.selected_preflight_pending = false;
                         record.application_launch = Some(launch_id);
                         if let Err(code) = validate_application_launch_snapshot(record, &payload) {
                             fail_record(record, code, now);
@@ -1226,10 +1256,12 @@ impl Controller {
                         advance_after_application_ready(record, now, replies);
                     }
                     Ok((launch_id, "active", _)) => {
+                        record.selected_preflight_pending = false;
                         record.application_launch = Some(launch_id);
                         record.request_cleanup(Some("application_launch_unhealthy"), now);
                     }
                     Ok((launch_id, _, _)) => {
+                        record.selected_preflight_pending = false;
                         record.application_launch = Some(launch_id);
                         record.failure.get_or_insert("application_ended");
                         record.request_cleanup(None, now);
@@ -1486,6 +1518,10 @@ impl Controller {
                 record.rtsp_cleanup_blocked = true;
                 record.stage = Stage::Cleanup;
             }
+            Phase::CancelPreflight => {
+                record.fail_cleanup("preflight_retirement_unconfirmed");
+                reply_failure(record, replies);
+            }
             Phase::StopApplication | Phase::VerifyApplicationStopped => {
                 record.cleanup_error = Some("application_cleanup_failed");
                 record.application_cleanup_blocked = true;
@@ -1559,6 +1595,10 @@ impl Controller {
             | Phase::ReportApplicationRetired
             | Phase::AwaitLifecycleEnd => {
                 record.fail_cleanup("lifecycle_prepare_unconfirmed");
+                reply_failure(record, replies);
+            }
+            Phase::CancelPreflight => {
+                record.fail_cleanup("preflight_retirement_unconfirmed");
                 reply_failure(record, replies);
             }
             Phase::ReserveHistory => {
@@ -1656,11 +1696,16 @@ impl Controller {
                 }
                 return;
             }
-            if now >= record.deadline && (record.rtsp_requested || record.application_requested) {
+            if now >= record.deadline
+                && (record.rtsp_requested
+                    || record.application_requested
+                    || record.selected_preflight_pending)
+            {
                 record.fail_cleanup("cleanup_deadline_exceeded");
                 reply_failure(record, replies);
             } else if !record.rtsp_requested
                 && !record.application_requested
+                && !record.selected_preflight_pending
                 && record.uncertain.is_empty()
                 && record.rtsp_reconcile.is_none()
                 && record.application_reconcile.is_none()
@@ -1681,6 +1726,7 @@ impl Controller {
                 record.cancel_connection = None;
                 reply_failure(record, replies);
             } else if !record.retrying_uncertainty
+                && (!record.selected_preflight_pending || record.application_cleanup_blocked)
                 && (!record.rtsp_requested || record.rtsp_cleanup_blocked)
                 && (!record.application_requested || record.application_cleanup_blocked)
             {
@@ -1766,6 +1812,7 @@ impl Phase {
             Self::ReadProtonPolicy => "read-proton-policy",
             Self::PreflightApplication => "preflight-launch",
             Self::AcceptPolicy => "accept-policy",
+            Self::CancelPreflight => "cancel-preflight",
             Self::SnapshotDisplay => "snapshot-display",
             Self::EnumerateDisplay => "enumerate-display",
             Self::ConfirmDisplay => "confirm-display",
@@ -1908,6 +1955,9 @@ pub(super) fn next_phase(record: &Record) -> Phase {
             return Phase::EndLifecycle;
         }
         if !record.rtsp_requested && !record.application_requested {
+            if record.selected_preflight_pending {
+                return Phase::CancelPreflight;
+            }
             if !record.lifecycle_application_retired {
                 return Phase::ReportApplicationRetired;
             }
@@ -1951,6 +2001,9 @@ pub(super) fn next_phase(record: &Record) -> Phase {
         }
         Stage::Cleanup if !record.rtsp_cleanup_blocked && record.rtsp_ticket.is_some() => {
             Phase::StopRtsp
+        }
+        Stage::Cleanup if record.selected_preflight_pending && !record.application_requested => {
+            Phase::CancelPreflight
         }
         Stage::Cleanup
             if record.application_requested

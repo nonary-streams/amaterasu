@@ -852,6 +852,18 @@ impl Controller {
     }
 
     #[cfg(test)]
+    pub(crate) fn selected_preflight_state_for_test(&self) -> Option<(bool, bool)> {
+        let record = self
+            .records
+            .values()
+            .find(|record| record.selected_application.is_some())?;
+        Some((
+            record.selected_preflight_pending,
+            record.executable_path.is_some(),
+        ))
+    }
+
+    #[cfg(test)]
     pub(crate) fn selected_limiter_verification_for_test(&self) -> Option<Value> {
         let record = self.records.values().find(|record| {
             record.selected_application.is_some() && record.executable_path.is_some()

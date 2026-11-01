@@ -21,6 +21,7 @@ pub enum Step {
     ReserveLimiterTarget,
     VerifyLimiterTarget,
     VerifyActiveLimiterTarget,
+    RetireLimiterTarget,
     LutrisStatus,
     LutrisPreSpawn,
     CreateSession,
@@ -212,6 +213,13 @@ impl Workflow {
                     json!({"action":"attest_limiter_target_v1","request":limiter_target_request(record,stage)?}),
                 )
             }
+            Step::RetireLimiterTarget => (
+                record
+                    .generic_provider_service
+                    .as_deref()
+                    .ok_or("invalid_workflow")?,
+                json!({"action":"retire_limiter_target_v1","request":limiter_retirement_request(record)?}),
+            ),
             Step::LutrisStatus | Step::LutrisPreSpawn => (LUTRIS, json!({"action":"status"})),
             Step::CreateSession => (SESSION, json!({"action":"create","key":record.session_key})),
             Step::Acquire => (
@@ -519,6 +527,8 @@ pub fn first_cleanup_step(record: &Record) -> Step {
         Step::FindPlaynite
     } else if record.provider_ticket.is_some() && !record.provider_stopped {
         Step::StopPlaynite
+    } else if record.limiter_reservation_pending {
+        Step::RetireLimiterTarget
     } else if record.preparation_requested && !record.preparation_stopped {
         Step::StopPreparation
     } else if record.process_requested && record.process_id.is_none() {
@@ -530,6 +540,34 @@ pub fn first_cleanup_step(record: &Record) -> Step {
     } else {
         Step::Finish
     }
+}
+
+pub fn limiter_retirement_request(
+    record: &Record,
+) -> Result<
+    amaterasu_module_sdk::application_library::limiter_target::RetirementRequest,
+    &'static str,
+> {
+    use amaterasu_module_sdk::application_library::limiter_target::RetirementRequest;
+    let Some(LaunchTarget::Provider { application_id, .. }) = &record.target else {
+        return Err("invalid_workflow");
+    };
+    let request = RetirementRequest {
+        version: 1,
+        operation_id: record.process_operation.clone(),
+        application_id: application_id.clone(),
+        provider_incarnation: record
+            .generic_provider_incarnation
+            .clone()
+            .ok_or("invalid_workflow")?,
+        original_initiator: record.catalog_initiator.clone(),
+        policy_identity: record
+            .library_policy_identity
+            .clone()
+            .ok_or("invalid_workflow")?,
+    };
+    request.validate()?;
+    Ok(request)
 }
 
 pub fn limiter_target_request(

@@ -15,6 +15,12 @@
 //! reservation and running confirmation retain the authenticated transport
 //! initiator. The later Verify call is self-initiated by the same trusted
 //! coordinator, and must match the previously reserved identity and ticket.
+//! `retire_limiter_target_v1` is an idempotent coordinator-self-initiated fence:
+//! it must reject any delayed Reserve for the retired owner and operation.
+//! Providers must serialize reservation and retirement for each operation so
+//! an in-flight reservation cannot become live after retirement is acknowledged.
+//! The bounded replay fence must remain until the provider incarnation ends;
+//! providers must fail closed when it is full, rather than evicting live fences.
 use super::preflight::PolicyIdentity;
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +49,52 @@ pub struct Request {
 pub struct Attestation {
     pub request: Request,
     pub executable_path: String,
+}
+/// Coordinator-owned retirement fences this reservation, including delayed
+/// Reserve requests, until the provider incarnation is retired. Providers may
+/// reject new reservations when their bounded replay-fence journal is full.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RetirementRequest {
+    pub version: u8,
+    pub operation_id: String,
+    pub application_id: String,
+    pub provider_incarnation: String,
+    pub original_initiator: String,
+    pub policy_identity: PolicyIdentity,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Retirement {
+    pub request: RetirementRequest,
+    pub retired: bool,
+}
+impl RetirementRequest {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        let request = Request {
+            version: self.version,
+            stage: Stage::Reserve,
+            operation_id: self.operation_id.clone(),
+            application_id: self.application_id.clone(),
+            provider_incarnation: self.provider_incarnation.clone(),
+            ticket: None,
+            policy_identity: self.policy_identity.clone(),
+        };
+        request.validate()?;
+        if !super::v2::key(&self.original_initiator) {
+            return Err("invalid_limiter_retirement");
+        }
+        Ok(())
+    }
+}
+impl Retirement {
+    pub fn validate_for(&self, request: &RetirementRequest) -> Result<(), &'static str> {
+        request.validate()?;
+        if !self.retired || &self.request != request {
+            return Err("invalid_limiter_retirement");
+        }
+        Ok(())
+    }
 }
 fn valid_token(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && value.bytes().all(|byte| byte.is_ascii_graphic())

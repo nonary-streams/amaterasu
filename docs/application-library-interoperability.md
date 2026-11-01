@@ -262,6 +262,13 @@ coordinator for this contract. Executors that do not implement the capability
 fail closed; native provider assertions remain trusted component assertions,
 not a sandbox.
 
+Selected limiter admission also requires the executor to advertise reservation
+retirement. Cleanup must confirm an idempotent, owner- and incarnation-bound
+retirement fence even if reservation completion is uncertain. A provider keeps
+bounded replay fences for its incarnation and rejects new work if full; a late
+reserve cannot recreate a retired reservation. Cancelling an admitted preflight
+uses the same cleanup path before NVHTTP releases its history reservation.
+
 A Linux composition test exercises the real NVHTTP router, Launch, RTSP, pairing
 and lifecycle entrypoints with independently built library, policy and executor
 implementations and synthetic hardware. It covers attested limiter replacement,
