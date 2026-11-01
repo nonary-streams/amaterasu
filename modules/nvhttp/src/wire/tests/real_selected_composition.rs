@@ -230,7 +230,8 @@ fn run_composition(replacement: bool, scenario: &str) {
         "amaterasu.state":{"provide":["amaterasu.state/1"]},
         "session":{"provide":["amaterasu.session/1"]},
         "stream":{"provide":["amaterasu.stream-session/1"]},
-        "input":{"provide":["amaterasu.input/1"]},
+        "input":{"provide":["amaterasu.input/1"],"call":["amaterasu.configuration/1"]},
+        "fixture-configuration":{"provide":["amaterasu.configuration/1"]},
         "display":{"provide":["amaterasu.display/1"]},
         "application":{"provide":["amaterasu.application/1"]},
         "library":{"provide":["fixture.library/2"]},
@@ -238,6 +239,7 @@ fn run_composition(replacement: bool, scenario: &str) {
         "executor":{"provide":["example.library.provider/1"]},
         "replacement":{"provide":["fixture.library/2","fixture.policy/2","example.library.provider/1"]}
     },"settings":{
+        "input":{"allow_injection":true},
         "amaterasu.pairing":{"administrator_principals":["console"],"transport_principals":["amaterasu.nvhttp"]},
         "amaterasu.launch":{"enable_library_preflight":true,"limiter_journal_service":if scenario == "limiter_unconfigured" { Value::Null } else { json!("amaterasu.state/1") },"retirement_observers":["amaterasu.session-lifecycle"],"library_routes":{"games":{
             "service":"fixture.library/2","callers":["amaterasu.nvhttp"],"executors":{"runner":"example.library.provider/1"},
@@ -273,7 +275,26 @@ fn run_composition(replacement: bool, scenario: &str) {
     let session = runtime.client("session");
     register(&session, "amaterasu.session/1");
     let input = runtime.client("input");
-    register(&input, "amaterasu.input/1");
+    let real_input = std::env::var_os("AMATERASU_COMPOSITION_REAL_INPUT").is_some();
+    if !real_input {
+        register(&input, "amaterasu.input/1");
+    }
+    let configuration = runtime.client("fixture-configuration");
+    if real_input {
+        register(&configuration, "amaterasu.configuration/1");
+    }
+    let mut selected_input = real_input.then(|| {
+        LoadedModule::start(
+            &artifact(&artifacts, "amaterasu_input"),
+            &runtime.endpoint("input"),
+        )
+    });
+    if let Some(module) = &mut selected_input {
+        for _ in 0..20 {
+            module.tick();
+            pump_input_configuration(&configuration);
+        }
+    }
     let display = runtime.client("display");
     register(&display, "amaterasu.display/1");
     let application = runtime.client("application");
@@ -522,10 +543,17 @@ fn run_composition(replacement: bool, scenario: &str) {
             .dispatch(request_id, actual_request, peer, &nvhttp)
             .is_none()
     );
-    let mut backends = Hardware::default();
+    let mut backends = Hardware {
+        real_input,
+        ..Hardware::default()
+    };
     let mut replies = vec![];
     let mut cancelled = false;
     for turn in 0..5000 {
+        if let Some(module) = &mut selected_input {
+            module.tick();
+            pump_input_configuration(&configuration);
+        }
         if let (Some(tls), Some(identity)) = (&mut tls, &identity) {
             let events = tls.tick(identity);
             assert!(events.requests.is_empty());
@@ -1543,6 +1571,19 @@ fn run_composition(replacement: bool, scenario: &str) {
         _ => unreachable!(),
     }
 }
+fn pump_input_configuration(configuration: &RuntimeClient) {
+    while let Some(request) = configuration.poll_serialized().unwrap() {
+        assert_eq!(request.payload["action"], "product_get");
+        configuration
+            .require_success(Command::Complete {
+                request: request.id,
+                payload: json!({"ok":true,"found":true,"revision":1,"version":14,
+                "values":{"proton_dualsense_compatibility":false}}),
+            })
+            .unwrap();
+    }
+}
+
 fn lifecycle_request(
     client: &RuntimeClient,
     lifecycle: &mut LoadedModule,
@@ -1620,6 +1661,7 @@ fn tempfile_dir() -> TestRoot {
 
 #[derive(Default)]
 struct Hardware {
+    real_input: bool,
     session_key: String,
     session_state: String,
     lease: Option<String>,
@@ -1642,6 +1684,9 @@ impl Hardware {
             ("application", application),
             ("display", display),
         ] {
+            if name == "input" && self.real_input {
+                continue;
+            }
             while let Some(request) = runtime.poll_serialized().unwrap() {
                 let p = &request.payload;
                 self.calls.push((name.into(), p.clone()));
