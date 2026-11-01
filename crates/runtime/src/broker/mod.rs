@@ -5,6 +5,7 @@ mod errors;
 mod events;
 mod hooks;
 mod requests;
+mod source_slots;
 
 use amaterasu_contracts::{
     Command, DIAGNOSTICS_COMPONENT, Grants, HOST_LIFECYCLE_CONTROL_PRINCIPAL,
@@ -114,6 +115,7 @@ impl Broker {
                 Command::Complete { request, payload } => {
                     self.requests.complete(caller, request, payload, now)
                 }
+                Command::EffectFence { command } if matches!(&*command, amaterasu_contracts::effect_fence::EffectFenceCommand::BrokerEpoch {} | amaterasu_contracts::effect_fence::EffectFenceCommand::RecoveryRetired { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::SourceRetired { .. }) => self.handle_effect_fence(caller, *command, now),
                 _ => errors::permission_denied(),
             };
         }
@@ -431,8 +433,160 @@ impl Broker {
         command: amaterasu_contracts::effect_fence::EffectFenceCommand,
         now: Instant,
     ) -> Response {
+        self.handle_effect_fence_inner(caller, command, now, false)
+    }
+
+    fn handle_effect_fence_inner(
+        &mut self,
+        caller: &str,
+        command: amaterasu_contracts::effect_fence::EffectFenceCommand,
+        now: Instant,
+        slotted: bool,
+    ) -> Response {
         use amaterasu_contracts::effect_fence::EffectFenceCommand;
+        if self.effect_fences.uses_slots()
+            && !slotted
+            && matches!(
+                &command,
+                EffectFenceCommand::OpenSource { .. }
+                    | EffectFenceCommand::Arm { .. }
+                    | EffectFenceCommand::ArmSelected { .. }
+                    | EffectFenceCommand::Dispatch { .. }
+                    | EffectFenceCommand::Fence { .. }
+                    | EffectFenceCommand::Lookup { .. }
+                    | EffectFenceCommand::Compact { .. }
+                    | EffectFenceCommand::ProviderRetired { .. }
+                    | EffectFenceCommand::RecoverFence { .. }
+                    | EffectFenceCommand::LookupIdentity { .. }
+            )
+        {
+            return Response::error("slot_required", "source slot lease is required");
+        }
+        if !self.effect_fences.uses_slots()
+            && matches!(
+                &command,
+                EffectFenceCommand::RecoverFence { .. } | EffectFenceCommand::LookupIdentity { .. }
+            )
+        {
+            return Response::error(
+                "slot_required",
+                "payload-free recovery requires source slots",
+            );
+        }
         match command {
+            EffectFenceCommand::BrokerEpoch {} => self.effect_fences.broker_epoch(),
+            EffectFenceCommand::SlotStatus { slot } => self.effect_fences.slot_status(caller, slot),
+            EffectFenceCommand::RecoveryRetired { broker_epoch } => {
+                self.effect_fences.recovery_retired(caller, &broker_epoch)
+            }
+            EffectFenceCommand::RecoverSlots {
+                broker_epoch,
+                retired_incarnations,
+            } => self
+                .effect_fences
+                .recover_slots(caller, &broker_epoch, retired_incarnations),
+            EffectFenceCommand::OpenSlot {
+                lease,
+                scope,
+                retired_through,
+            } => self
+                .effect_fences
+                .open_slot(caller, lease, scope, retired_through, None),
+            EffectFenceCommand::OpenRecoverySlot {
+                lease,
+                scope,
+                retired_through,
+                issued_through,
+            } => self.effect_fences.open_slot(
+                caller,
+                lease,
+                scope,
+                retired_through,
+                Some(issued_through),
+            ),
+            EffectFenceCommand::BeginCloseSlot { lease, scope } => {
+                match self.effect_fences.begin_close(caller, &lease, &scope) {
+                    Ok(requests) => {
+                        let issuer = self
+                            .effect_fences
+                            .issuer_name()
+                            .expect("configured authority");
+                        for request in requests {
+                            let _ = self.requests.cancel(issuer, request, now);
+                        }
+                        Response::Ok
+                    }
+                    Err(error) => error,
+                }
+            }
+            EffectFenceCommand::SourceRetired { lease, scope } => {
+                self.effect_fences.source_retired(caller, &lease, &scope)
+            }
+            EffectFenceCommand::FinishCloseSlot {
+                lease,
+                scope,
+                retired_through,
+            } => self
+                .effect_fences
+                .finish_close(caller, &lease, &scope, retired_through),
+            EffectFenceCommand::ProviderRetiredInEpoch {
+                broker_epoch,
+                request,
+            } => {
+                if !self.effect_fences.valid_epoch(&broker_epoch) {
+                    Response::error("stale_source_slot", "broker epoch is stale")
+                } else {
+                    self.effect_fences.provider_retired(caller, request)
+                }
+            }
+            EffectFenceCommand::SlotCommand { lease, command } => {
+                let scope = match &*command {
+                    EffectFenceCommand::Arm { effect }
+                    | EffectFenceCommand::ArmSelected { effect, .. }
+                    | EffectFenceCommand::Dispatch { effect }
+                    | EffectFenceCommand::Fence { effect }
+                    | EffectFenceCommand::Lookup { effect } => &effect.scope,
+                    EffectFenceCommand::Compact { scope, .. } => scope,
+                    EffectFenceCommand::RecoverFence { identity }
+                    | EffectFenceCommand::LookupIdentity { identity } => &identity.scope,
+                    _ => {
+                        return Response::error(
+                            "invalid_request",
+                            "invalid slotted effect command",
+                        );
+                    }
+                };
+                if !self.effect_fences.slot_valid(&lease, scope) {
+                    return Response::error(
+                        "stale_source_slot",
+                        "source slot incarnation is stale",
+                    );
+                }
+                self.handle_effect_fence_inner(caller, *command, now, true)
+            }
+            EffectFenceCommand::RecoverFence { identity } => {
+                if !self.recovery_provider_matches(&identity) {
+                    return errors::permission_denied();
+                }
+                match self.effect_fences.recover_fence(caller, identity) {
+                    Ok(Some(request)) => {
+                        let issuer = self
+                            .effect_fences
+                            .issuer_name()
+                            .expect("configured authority");
+                        let _ = self.requests.cancel(issuer, request, now);
+                        Response::Ok
+                    }
+                    Ok(None) => Response::Ok,
+                    Err(error) => error,
+                }
+            }
+            EffectFenceCommand::LookupIdentity { identity } => {
+                if !self.recovery_provider_matches(&identity) {
+                    return errors::permission_denied();
+                }
+                self.effect_fences.lookup_identity(caller, &identity)
+            }
             EffectFenceCommand::OpenSource {
                 scope,
                 retired_through,
@@ -445,7 +599,46 @@ impl Broker {
                 self.effect_fences.provider_retired(caller, request)
             }
             EffectFenceCommand::Lookup { effect } => self.effect_fences.lookup(caller, &effect),
+            EffectFenceCommand::SelectedMethod { method } => {
+                if !self.effect_fences.authority(caller) {
+                    return errors::permission_denied();
+                }
+                match self.selected_effect_method(&method) {
+                    Some(selected) => Response::Result {
+                        payload: serde_json::to_value(selected).expect("selection is serializable"),
+                    },
+                    None => errors::permission_denied(),
+                }
+            }
+            EffectFenceCommand::ArmSelected { effect, expected } => {
+                if !self.effect_fences.authority(caller) {
+                    return errors::permission_denied();
+                }
+                let method = amaterasu_contracts::effect_fence::ProtectedMethod {
+                    service: effect.service.clone(),
+                    method: effect.method.clone(),
+                    interface_major: effect.interface_major,
+                };
+                let Some(selected) = self.selected_effect_method(&method) else {
+                    return errors::permission_denied();
+                };
+                if *expected != selected
+                    || effect.interface_minor != selected.method.interface_minor
+                {
+                    return Response::error(
+                        "incompatible_api",
+                        "selected provider or API schema differs",
+                    );
+                }
+                self.effect_fences.arm(caller, effect, &selected.provider)
+            }
             EffectFenceCommand::Arm { effect } => {
+                if self.effect_fences.uses_slots() {
+                    return Response::error(
+                        "expected_provider_required",
+                        "source slots require provider-bound admission",
+                    );
+                }
                 let Some(provider) = self.effect_provider(&effect) else {
                     return errors::permission_denied();
                 };
@@ -529,6 +722,45 @@ impl Broker {
                 response
             }
         }
+    }
+
+    fn selected_effect_method(
+        &self,
+        method: &amaterasu_contracts::effect_fence::ProtectedMethod,
+    ) -> Option<amaterasu_contracts::effect_fence::SelectedEffectMethod> {
+        if !self
+            .effect_fences
+            .protects(&method.service, &method.method, method.interface_major)
+        {
+            return None;
+        }
+        let issuer = self.effect_fences.issuer_name()?;
+        let grants = self.configuration.principals.get(issuer)?;
+        let approval = self.api.selected_for(
+            issuer,
+            grants,
+            &method.service,
+            &method.method,
+            method.interface_major,
+        )?;
+        Some(amaterasu_contracts::effect_fence::SelectedEffectMethod {
+            version: 1,
+            provider: approval.provider.clone(),
+            method: approval.method.clone(),
+        })
+    }
+
+    fn recovery_provider_matches(
+        &self,
+        identity: &amaterasu_contracts::effect_fence::GuardedEffectIdentity,
+    ) -> bool {
+        self.configuration.api_methods.iter().any(|approval| {
+            approval.provider == identity.provider
+                && approval.method.service == identity.service
+                && approval.method.method == identity.method
+                && approval.method.interface_major == identity.interface_major
+                && approval.method.interface_minor == identity.interface_minor
+        })
     }
 
     fn effect_provider(

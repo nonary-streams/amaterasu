@@ -315,6 +315,7 @@ mod tests {
                 interface_major: 1,
             }],
             cleanup_methods: vec![],
+            source_slots: false,
         };
         let bootstrap = BootstrapConfig {
             development: false,

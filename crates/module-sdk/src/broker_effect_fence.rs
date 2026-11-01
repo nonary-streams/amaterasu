@@ -6,7 +6,8 @@
 use crate::effect_authority::Source;
 pub use amaterasu_contracts::effect_fence::{
     EffectFenceCommand, EffectFencePolicy, EffectScope, EffectSource, GuardedEffect,
-    ProtectedMethod,
+    GuardedEffectIdentity, ProtectedMethod, SOURCE_SLOT_COUNT, SelectedEffectMethod,
+    SourceSlotLease,
 };
 
 /// Preserve the exact pairing source identity in the broker fence contract.
