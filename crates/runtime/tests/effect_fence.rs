@@ -4673,3 +4673,135 @@ fn legacy_unslotted_arm_does_not_pin_the_selected_provider() {
         Response::Request { .. }
     ));
 }
+
+#[test]
+fn canceled_authority_request_does_not_fence_legacy_arm_selected() {
+    // Reproduces the missing atomic handoff; this is not a safe ingress pattern.
+    let mut config = configuration();
+    config.effect_fence.as_mut().unwrap().source_slots = true;
+    config.host_lifecycle_control = true;
+    config.principals.insert(
+        amaterasu_contracts::HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(),
+        Grants::default(),
+    );
+    config
+        .principals
+        .get_mut("authority")
+        .unwrap()
+        .provide
+        .insert("example.authority/1".into());
+    config
+        .principals
+        .get_mut("issuer")
+        .unwrap()
+        .call
+        .insert("example.authority/1".into());
+    let method = config.api_methods[0].method.clone();
+    let mut broker = Broker::new(config).unwrap();
+    assert!(matches!(
+        broker.dispatch(
+            "authority",
+            Command::Register {
+                service: "example.authority/1".into()
+            }
+        ),
+        Response::Ok
+    ));
+    assert!(matches!(
+        broker.dispatch("provider", Command::RegisterApi { method }),
+        Response::Ok
+    ));
+    let epoch = broker_epoch(&mut broker, "authority");
+    recover_slots(&mut broker, &epoch, vec![0; 64]);
+    let lease = slot_lease(&mut broker, 0);
+    let scope = source_for(0);
+    open_slot(&mut broker, &lease, &scope);
+    let Response::Accepted { id } = broker.dispatch(
+        "issuer",
+        Command::Request {
+            service: "example.authority/1".into(),
+            payload: json!({}),
+            timeout_ms: 30_000,
+            operation_id: "authority.request".into(),
+            parent: None,
+        },
+    ) else {
+        panic!("authority request denied")
+    };
+    assert!(matches!(
+        broker.dispatch("authority", Command::Poll {}),
+        Response::Request { .. }
+    ));
+    assert!(matches!(
+        broker.dispatch("authority", Command::CheckRequest { request: id }),
+        Response::Ok
+    ));
+    assert!(matches!(
+        broker.dispatch("issuer", Command::Cancel { request: id }),
+        Response::Ok
+    ));
+    let mut guarded = effect(1);
+    guarded.scope = scope.clone();
+    assert!(matches!(
+        slot_invoke(
+            &mut broker,
+            "authority",
+            &lease,
+            EffectFenceCommand::Arm {
+                effect: guarded.clone()
+            }
+        ),
+        Response::Ok
+    ));
+    assert!(matches!(
+        slot_invoke(
+            &mut broker,
+            "issuer",
+            &lease,
+            EffectFenceCommand::Dispatch { effect: guarded }
+        ),
+        Response::Accepted { .. }
+    ));
+    let Response::Accepted { id } = broker.dispatch(
+        "issuer",
+        Command::Request {
+            service: "example.authority/1".into(),
+            payload: json!({}),
+            timeout_ms: 30_000,
+            operation_id: "authority.request.2".into(),
+            parent: None,
+        },
+    ) else {
+        panic!("second authority request denied")
+    };
+    assert!(matches!(
+        broker.dispatch("authority", Command::Poll {}),
+        Response::Request { .. }
+    ));
+    let mut guarded = effect(2);
+    guarded.scope = scope;
+    assert!(matches!(
+        slot_invoke(
+            &mut broker,
+            "authority",
+            &lease,
+            EffectFenceCommand::Arm {
+                effect: guarded.clone()
+            }
+        ),
+        Response::Ok
+    ));
+    assert!(matches!(
+        broker.dispatch("issuer", Command::Cancel { request: id }),
+        Response::Ok
+    ));
+    assert!(matches!(
+        slot_invoke(
+            &mut broker,
+            "issuer",
+            &lease,
+            EffectFenceCommand::Dispatch { effect: guarded }
+        ),
+        Response::Accepted { .. }
+    ));
+}
