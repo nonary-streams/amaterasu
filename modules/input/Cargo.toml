@@ -10,6 +10,8 @@ crate-type = ["cdylib", "rlib"]
 [features]
 # Produces an isolated qualification artifact with no native input backend.
 qualification-fake-backend = []
+# A second independently implemented, device-free qualification backend.
+qualification-alternate-backend = []
 
 [dependencies]
 amaterasu-contracts.workspace = true

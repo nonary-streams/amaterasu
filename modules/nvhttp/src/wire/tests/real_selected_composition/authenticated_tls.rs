@@ -12,7 +12,8 @@ use std::{
     sync::Arc,
 };
 
-const CLIENT_KEY: &str = include_str!("../../../../../pairing/tests/fixtures/client-key.pem");
+pub(super) const CLIENT_KEY: &str =
+    include_str!("../../../../../pairing/tests/fixtures/client-key.pem");
 
 #[derive(Debug)]
 struct PinnedHost(Vec<u8>);
@@ -148,13 +149,14 @@ pub(super) struct ModuleConnection {
     tls: rustls::ClientConnection,
 }
 impl ModuleConnection {
-    pub fn connect(
+    pub fn connect_with_key(
         address: std::net::SocketAddr,
         host_cert: &[u8],
         client_cert: &[u8],
+        key_pem: &str,
         target: &str,
     ) -> Self {
-        let (_, key) = pem_rfc7468::decode_vec(CLIENT_KEY.as_bytes()).unwrap();
+        let (_, key) = pem_rfc7468::decode_vec(key_pem.as_bytes()).unwrap();
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key));
         let signing_key = rustls::crypto::ring::sign::any_supported_type(&key).unwrap();
         let client = rustls::sign::CertifiedKey::new(

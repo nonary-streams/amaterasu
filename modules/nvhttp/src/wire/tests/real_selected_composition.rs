@@ -15,6 +15,10 @@ mod full;
 mod rtsp_client;
 
 const CLIENT_CERT: &str = include_str!("../../../../pairing/tests/fixtures/client-cert.pem");
+const SECOND_CLIENT_CERT: &str =
+    include_str!("../../../../management/tests/fixtures/browser-cert.pem");
+const SECOND_CLIENT_KEY: &str =
+    include_str!("../../../../management/tests/fixtures/browser-key.pem");
 const HOST_CERT: &str = include_str!("../../../../pairing/tests/fixtures/host-cert.pem");
 const HOST_KEY: &str = include_str!("../../../../pairing/tests/fixtures/host-key.pem");
 static QUALIFICATION_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
@@ -159,6 +163,7 @@ fn take(client: &RuntimeClient, id: u64) -> Option<Value> {
 #[ignore = "requires independently built protocol and fixture artifacts plus an ephemeral loopback listener"]
 fn real_selected_composition() {
     let filter = std::env::var("AMATERASU_COMPOSITION_CASE").ok();
+    let selected_library = std::env::var("AMATERASU_COMPOSITION_LIBRARY").ok();
     let mut executed = false;
     for (replacement, scenario) in [
         (false, "success"),
@@ -190,15 +195,33 @@ fn real_selected_composition() {
         if filter
             .as_deref()
             .is_none_or(|selected| selected == scenario)
+            && selected_library
+                .as_deref()
+                .is_none_or(|selected| match selected {
+                    "first" => !replacement,
+                    "replacement" => replacement,
+                    _ => false,
+                })
         {
             executed = true;
-            run_composition(replacement, scenario);
+            let first = run_composition(replacement, scenario, false, None);
+            if std::env::var_os("AMATERASU_COMPOSITION_FULL").is_some()
+                && std::env::var_os("AMATERASU_COMPOSITION_ONE_CLIENT").is_none()
+            {
+                let second = run_composition(replacement, scenario, true, first.as_ref());
+                assert!(second.is_some());
+            }
         }
     }
     assert!(executed, "unknown AMATERASU_COMPOSITION_CASE");
 }
 
-fn run_composition(replacement: bool, scenario: &str) {
+fn run_composition(
+    replacement: bool,
+    scenario: &str,
+    swap_clients: bool,
+    previous: Option<&amaterasu_module_sdk::nvhttp_source::BindFeedbackSource>,
+) -> Option<amaterasu_module_sdk::nvhttp_source::BindFeedbackSource> {
     let artifacts = PathBuf::from(
         std::env::var_os("AMATERASU_COMPOSITION_ARTIFACT_DIR").expect("set artifact directory"),
     );
@@ -206,8 +229,25 @@ fn run_composition(replacement: bool, scenario: &str) {
         std::env::var_os("AMATERASU_EXECUTOR_ARTIFACT").expect("set executor artifact"),
     );
     let temp = tempfile_dir();
-    let (_, cert) = pem_rfc7468::decode_vec(CLIENT_CERT.as_bytes()).unwrap();
+    let (first_pem, first_key, second_pem, second_key) = if swap_clients {
+        (
+            SECOND_CLIENT_CERT,
+            SECOND_CLIENT_KEY,
+            CLIENT_CERT,
+            authenticated_tls::CLIENT_KEY,
+        )
+    } else {
+        (
+            CLIENT_CERT,
+            authenticated_tls::CLIENT_KEY,
+            SECOND_CLIENT_CERT,
+            SECOND_CLIENT_KEY,
+        )
+    };
+    let (_, cert) = pem_rfc7468::decode_vec(first_pem.as_bytes()).unwrap();
     let cert_id = hex(&Sha256::digest(&cert));
+    let (_, second_cert) = pem_rfc7468::decode_vec(second_pem.as_bytes()).unwrap();
+    let second_cert_id = hex(&Sha256::digest(&second_cert));
     let play = std::env::var_os("AMATERASU_COMPOSITION_PLAY").is_some();
     let full = std::env::var_os("AMATERASU_COMPOSITION_FULL").is_some();
     let streaming = crate::launch::StreamingConfig {
@@ -230,7 +270,11 @@ fn run_composition(replacement: bool, scenario: &str) {
                 id: "opaque/game".into(),
             },
             entry_revision: "entry:opaque".into(),
-            certificates: [cert_id.clone()].into(),
+            certificates: if full {
+                [cert_id.clone(), second_cert_id.clone()].into()
+            } else {
+                [cert_id.clone()].into()
+            },
         }],
         profile: StreamProfile {
             codec: amaterasu_media::VideoCodec::H264,
@@ -320,6 +364,7 @@ fn run_composition(replacement: bool, scenario: &str) {
         fixture_capture::configure_input(&mut config);
     }
     if full {
+        config["settings"]["policy"]["rules"][0]["certificates"] = json!([cert_id, second_cert_id]);
         configure_full(&mut config, &streaming);
     }
     let runtime = Runtime::new(&artifact(&artifacts, "amaterasu_runtime"), config);
@@ -393,10 +438,22 @@ fn run_composition(replacement: bool, scenario: &str) {
         register(&configuration, "amaterasu.configuration/1");
     }
     let mut selected_input = real_input.then(|| {
-        LoadedModule::start(
-            &artifact(&artifacts, "amaterasu_input"),
-            &runtime.endpoint("input"),
-        )
+        let input_artifact = std::env::var_os("AMATERASU_INPUT_QUALIFICATION_ARTIFACT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| artifact(&artifacts, "amaterasu_input"));
+        let module = LoadedModule::start(&input_artifact, &runtime.endpoint("input"));
+        if std::env::var_os("AMATERASU_INPUT_QUALIFICATION_ALTERNATE").is_some() {
+            // SAFETY: this test loads a locally built trusted qualification module
+            // and retains its library for the lifetime of the symbol call.
+            let marker = unsafe {
+                module._library.get::<unsafe extern "C" fn() -> u32>(
+                    b"amaterasu_input_alternate_qualification_marker",
+                )
+            }
+            .expect("alternate backend marker");
+            assert_eq!(unsafe { marker() }, 0xa17e_0001);
+        }
+        module
     });
     if let Some(module) = &mut selected_input {
         for _ in 0..20 {
@@ -418,11 +475,15 @@ fn run_composition(replacement: bool, scenario: &str) {
             std::env::var_os("AMATERASU_FEEDBACK_QUALIFICATION_ARTIFACT_DIR")
                 .expect("set qualification artifact directory"),
         );
-        LoadedModule::start_entry(
-            &artifact(&qualification, "amaterasu_pairing"),
-            &runtime.endpoint("amaterasu.pairing"),
-            b"amaterasu_qualification_module_v1",
-        )
+        if let Some(path) = std::env::var_os("AMATERASU_PAIRING_NORMAL_ARTIFACT") {
+            LoadedModule::start(&PathBuf::from(path), &runtime.endpoint("amaterasu.pairing"))
+        } else {
+            LoadedModule::start_entry(
+                &artifact(&qualification, "amaterasu_pairing"),
+                &runtime.endpoint("amaterasu.pairing"),
+                b"amaterasu_qualification_module_v1",
+            )
+        }
     } else {
         LoadedModule::start(
             &artifact(&artifacts, "amaterasu_pairing"),
@@ -503,14 +564,34 @@ fn run_composition(replacement: bool, scenario: &str) {
             "{recovered:?}"
         );
     }
-    for (sequence, payload) in [json!({"action":"import_identity","certificate_pem":HOST_CERT,"private_key_pem":HOST_KEY}), json!({"action":"import_client","client_id":"test-client","name":"Client","certificate_pem":CLIENT_CERT})].into_iter().enumerate() {
-        let pending = broker_request(&console, "amaterasu.pairing/1", payload, &format!("pairing-{sequence}"));
+    let mut identities = vec![
+        json!({"action":"import_identity","certificate_pem":HOST_CERT,"private_key_pem":HOST_KEY}),
+        json!({"action":"import_client","client_id":"test-client","name":"Client","certificate_pem":first_pem}),
+    ];
+    if full {
+        identities.push(json!({"action":"import_client","client_id":"second-client","name":"Second","certificate_pem":second_pem}));
+    }
+    for (sequence, payload) in identities.into_iter().enumerate() {
+        let pending = broker_request(
+            &console,
+            "amaterasu.pairing/1",
+            payload,
+            &format!("pairing-{sequence}"),
+        );
         let mut result = None;
         for _ in 0..500 {
-            pairing.tick(); memory.tick();
-            if let Some(value) = take(&console, pending) { result = Some(value); break; }
+            pairing.tick();
+            memory.tick();
+            if let Some(value) = take(&console, pending) {
+                result = Some(value);
+                break;
+            }
         }
-        assert_eq!(result.as_ref().map(|value| &value["ok"]), Some(&json!(true)), "{result:?}");
+        assert_eq!(
+            result.as_ref().map(|value| &value["ok"]),
+            Some(&json!(true)),
+            "{result:?}"
+        );
     }
     if !replacement {
         // Obtain a real owner-bound token, then present it from another broker
@@ -576,7 +657,7 @@ fn run_composition(replacement: bool, scenario: &str) {
         assert_eq!(rejected["code"], "permission_denied", "{rejected}");
     }
     if full {
-        full::run(full::Context {
+        let source = full::run(full::Context {
             runtime: &runtime,
             console: &console,
             pairing: &mut pairing,
@@ -604,8 +685,14 @@ fn run_composition(replacement: bool, scenario: &str) {
             display: &display,
             cert_id: &cert_id,
             cert: &cert,
+            second_cert: &second_cert,
+            second_cert_id: &second_cert_id,
+            second_pem,
+            first_key,
+            second_key,
+            previous,
         });
-        return;
+        return Some(source);
     }
     let mut controller = LaunchController::new(Some(streaming)).unwrap();
     controller.set_session_lifecycle_required(true);
@@ -1862,6 +1949,7 @@ fn run_composition(replacement: bool, scenario: &str) {
         }
         _ => unreachable!(),
     }
+    None
 }
 fn pump_input_configuration(configuration: &RuntimeClient) {
     while let Some(request) = configuration.poll_serialized().unwrap() {
@@ -2075,6 +2163,10 @@ fn configure_full(config: &mut Value, streaming: &crate::launch::StreamingConfig
         config["service_selections"]["native"]["amaterasu.control-transport/1"] =
             json!({"provider":"control","contract":"amaterasu.control-transport.native/1"});
     }
+    config["principals"]["attacker"]["call"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!("amaterasu.nvhttp/1"));
     let nvhttp = &mut config["principals"]["amaterasu.nvhttp"];
     nvhttp["provide"] = json!(["amaterasu.nvhttp/1"]);
     nvhttp["call"].as_array_mut().unwrap().extend([

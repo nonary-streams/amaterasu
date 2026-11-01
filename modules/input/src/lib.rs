@@ -1,5 +1,16 @@
 //! Caller-owned keyboard, mouse, and capability-gated gamepad input with leases.
-#[cfg_attr(feature = "qualification-fake-backend", allow(dead_code))]
+#[cfg(all(
+    feature = "qualification-fake-backend",
+    feature = "qualification-alternate-backend"
+))]
+compile_error!("choose exactly one qualification backend");
+#[cfg_attr(
+    any(
+        feature = "qualification-fake-backend",
+        feature = "qualification-alternate-backend"
+    ),
+    allow(dead_code)
+)]
 mod backend;
 pub mod companion_client;
 mod controller;
@@ -195,20 +206,35 @@ impl ManagedModule for InputModule {
         if !std::path::Path::new(&settings.linux_companion_socket_path).is_absolute() {
             return Err("linux_companion_socket_path must be absolute".into());
         }
-        #[cfg(feature = "qualification-fake-backend")]
+        #[cfg(any(
+            feature = "qualification-fake-backend",
+            feature = "qualification-alternate-backend"
+        ))]
         let backend = {
             // Keep settings parsing and path checks intact in the qualification
             // artifact while never constructing a native backend.
             let _ = (&settings.uinput_path, &settings.windows_backend);
             NativeBackend::new()
         };
-        #[cfg(all(windows, not(feature = "qualification-fake-backend")))]
+        #[cfg(all(
+            windows,
+            not(any(
+                feature = "qualification-fake-backend",
+                feature = "qualification-alternate-backend"
+            ))
+        ))]
         let backend = match settings.windows_backend.as_deref() {
             None | Some("native") => NativeBackend::new(settings.uinput_path),
             Some("vhf_companion") => NativeBackend::new_with_companion(true),
             Some(_) => return Err("unknown Windows input backend".into()),
         };
-        #[cfg(all(not(windows), not(feature = "qualification-fake-backend")))]
+        #[cfg(all(
+            not(windows),
+            not(any(
+                feature = "qualification-fake-backend",
+                feature = "qualification-alternate-backend"
+            ))
+        ))]
         let backend = {
             if settings.windows_backend.is_some() {
                 return Err(

@@ -29,6 +29,12 @@ pub(super) struct Context<'a> {
     pub display: &'a RuntimeClient,
     pub cert_id: &'a str,
     pub cert: &'a [u8],
+    pub second_cert: &'a [u8],
+    pub second_cert_id: &'a str,
+    pub second_pem: &'a str,
+    pub first_key: &'a str,
+    pub second_key: &'a str,
+    pub previous: Option<&'a amaterasu_module_sdk::nvhttp_source::BindFeedbackSource>,
 }
 
 fn load_stream(runtime: &Runtime) -> LoadedModule {
@@ -51,7 +57,7 @@ fn load_stream(runtime: &Runtime) -> LoadedModule {
     }
 }
 
-pub(super) fn run(context: Context<'_>) {
+pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::BindFeedbackSource {
     let Context {
         runtime,
         console,
@@ -80,10 +86,16 @@ pub(super) fn run(context: Context<'_>) {
         display,
         cert_id,
         cert,
+        second_cert,
+        second_cert_id,
+        second_pem,
+        first_key,
+        second_key,
+        previous,
     } = context;
     use amaterasu_module_sdk::ManagedModule;
     let owner = runtime.client("stream");
-    provision_authority(pairing, memory, console, &owner, cert_id);
+    provision_authority(pairing, memory, console, &owner, cert_id, second_cert_id);
     let mut module =
         crate::NvhttpModule::start(runtime.client("amaterasu.nvhttp")).expect("real NVHTTP module");
     if std::env::var_os("AMATERASU_COMPOSITION_NORMAL_ABI").is_some() {
@@ -126,7 +138,9 @@ pub(super) fn run(context: Context<'_>) {
     let address = module.server.as_ref().unwrap().https_address();
     let target =
         "/launch?appid=1&mode=1280x720x60&rikey=00112233445566778899aabbccddeeff&rikeyid=17";
-    let mut client = authenticated_tls::ModuleConnection::connect(address, &host_der, cert, target);
+    let mut client = authenticated_tls::ModuleConnection::connect_with_key(
+        address, &host_der, cert, first_key, target,
+    );
     let mut backends = Hardware {
         real_input: true,
         real_stream: true,
@@ -259,12 +273,16 @@ pub(super) fn run(context: Context<'_>) {
     let mut received = None;
     let mut authority = Value::Null;
     let mut authority_pending = None;
+    let mut observed_join = None;
     for n in 0..150 {
         if n % 5 == 0 {
             control_client.keep_alive();
         }
         for _ in 0..20 {
             module.tick().unwrap();
+            if let Some(join) = module.source_join.as_ref() {
+                observed_join = Some(join.request_for_test());
+            }
             pairing.tick();
             memory.tick();
             lifecycle.tick();
@@ -309,11 +327,196 @@ pub(super) fn run(context: Context<'_>) {
         authority["in_flight"], 1,
         "stream lease missing: {authority}"
     );
+    let expected = if std::env::var_os("AMATERASU_INPUT_QUALIFICATION_ALTERNATE").is_some() {
+        vec![0, 0, 4, 5, 6]
+    } else {
+        vec![0, 0, 1, 2, 3]
+    };
     assert_eq!(
         received,
-        Some(vec![0, 0, 1, 2, 3]),
-        "feedback was not delivered"
+        Some(expected),
+        "selected input backend feedback was not delivered"
     );
+    let observed_join = observed_join.expect("real source join was observed");
+    assert_eq!(observed_join.scope.controller_slot, 0);
+    assert_ne!(cert, second_cert);
+    assert!(module.identity.as_ref().unwrap().view_allowed(second_cert));
+    let second_target =
+        "/launch?appid=1&mode=1280x720x60&rikey=10112233445566778899aabbccddeeff&rikeyid=18";
+    let mut second = authenticated_tls::ModuleConnection::connect_with_key(
+        address,
+        &host_der,
+        second_cert,
+        second_key,
+        second_target,
+    );
+    let mut second_response = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        second.tick();
+        module.tick().unwrap();
+        pairing.tick();
+        memory.tick();
+        launch.tick();
+        lifecycle.tick();
+        rtsp.tick();
+        selected_session.as_mut().unwrap().tick();
+        selected_stream.as_mut().unwrap().tick();
+        selected_control.as_mut().unwrap().tick();
+        selected_media.as_mut().unwrap().tick();
+        selected_input.as_mut().unwrap().tick();
+        pump_input_configuration(configuration);
+        fixture_capture::pump(capture_fixture);
+        video_fixture.as_mut().unwrap().pump(video_runtime);
+        backends.pump(session, stream, input, application, display);
+        if let Some(p) = &mut *library {
+            p.tick();
+        }
+        if let Some(p) = &mut *policy {
+            p.tick();
+        }
+        if let Some(p) = &mut *generated {
+            p.tick();
+        }
+        if let Some(p) = &mut *provider {
+            p.tick();
+        }
+        second.tick();
+        second.read_plaintext(&mut second_response);
+        if second_response.windows(7).any(|bytes| bytes == b"</root>") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "second TLS client timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let second_response = String::from_utf8(second_response).unwrap();
+    assert!(
+        second_response.contains("status_code=\"503\"")
+            && second_response.contains("another stream is active"),
+        "{second_response}"
+    );
+    // Negative service-boundary test: the second certificate completed TLS and
+    // has the same feedback grant, but Pairing must retain source ownership.
+    let protocol = runtime.client("amaterasu.nvhttp");
+    let crossed = broker_request(
+        &protocol,
+        "amaterasu.pairing-effects/1",
+        json!({"action":"bind_stream","epoch":observed_join.authority_epoch,"certificate_pem":second_pem,"source":observed_join.source,"scope":observed_join.scope}),
+        "cross-certificate-source",
+    );
+    let mut crossed_response = None;
+    for _ in 0..500 {
+        pairing.tick();
+        memory.tick();
+        if let Some(value) = take(&protocol, crossed) {
+            crossed_response = Some(value);
+            break;
+        }
+    }
+    assert_eq!(
+        crossed_response.as_ref().map(|v| &v["code"]),
+        Some(&json!("source_owner_conflict")),
+        "{crossed_response:?}"
+    );
+    let attacker = runtime.client("attacker");
+    let denied = broker_request(
+        &attacker,
+        "amaterasu.nvhttp/1",
+        observed_join.payload(),
+        "source-foreign-owner",
+    );
+    let mut denied_response = None;
+    for _ in 0..500 {
+        module.tick().unwrap();
+        if let Some(value) = take(&attacker, denied) {
+            denied_response = Some(value);
+            break;
+        }
+    }
+    assert_eq!(
+        denied_response.as_ref().map(|v| &v["code"]),
+        Some(&json!("permission_denied")),
+        "{denied_response:?}"
+    );
+    for (name, forged) in [
+        ("stale-generation", {
+            let mut request = observed_join.clone();
+            request.source.generation += 1;
+            request.source.stream_generation += 1;
+            request
+        }),
+        ("foreign-source", {
+            let mut request = observed_join.clone();
+            request.source.id = "f".repeat(32);
+            request
+        }),
+        ("foreign-boot", {
+            let mut request = observed_join.clone();
+            request.input_boot_epoch = "e".repeat(32);
+            request
+        }),
+    ] {
+        let pending = broker_request(
+            &owner,
+            "amaterasu.nvhttp/1",
+            forged.payload(),
+            &format!("source-deny-{name}"),
+        );
+        let mut result = None;
+        for _ in 0..1000 {
+            module.tick().unwrap();
+            lifecycle.tick();
+            pairing.tick();
+            memory.tick();
+            if let Some(value) = take(&owner, pending) {
+                result = Some(value);
+                break;
+            }
+        }
+        assert_eq!(
+            result.as_ref().map(|v| &v["code"]),
+            Some(&json!("source_denied")),
+            "{name}: {result:?}"
+        );
+    }
+    if let Some(previous) = previous {
+        assert_eq!(
+            previous.scope.controller_slot,
+            observed_join.scope.controller_slot
+        );
+        assert_ne!(previous.source.id, observed_join.source.id);
+        assert_ne!(previous.source.session_id, observed_join.source.session_id);
+        let mut crossed = previous.clone();
+        crossed.authority_epoch = observed_join.authority_epoch.clone();
+        crossed.source.effect_owner_epoch = observed_join.source.effect_owner_epoch.clone();
+        crossed.scope = observed_join.scope.clone();
+        crossed.input_boot_epoch = observed_join.input_boot_epoch.clone();
+        let pending = broker_request(
+            &owner,
+            "amaterasu.nvhttp/1",
+            crossed.payload(),
+            "cross-client-prior-source",
+        );
+        let mut denied = None;
+        for _ in 0..1000 {
+            module.tick().unwrap();
+            lifecycle.tick();
+            pairing.tick();
+            memory.tick();
+            if let Some(value) = take(&owner, pending) {
+                denied = Some(value);
+                break;
+            }
+        }
+        assert_eq!(
+            denied.as_ref().map(|v| &v["code"]),
+            Some(&json!("source_denied")),
+            "cross-client source was accepted: {denied:?}"
+        );
+    }
     let old_epoch = authority["epoch"].as_str().unwrap().to_owned();
     let old_owner = authority["owner_epoch"].as_str().unwrap().to_owned();
     let control_query = broker_request(
@@ -493,6 +696,7 @@ pub(super) fn run(context: Context<'_>) {
     assert_eq!(restart_status["fenced"], false, "{restart_status}");
     assert_eq!(restart_status["in_flight"], 0, "{restart_status}");
     assert_eq!(restart_status["bound_sources"], 0, "{restart_status}");
+    observed_join
 }
 
 /// Configure only this fresh test authority through its real administrator API.
@@ -502,6 +706,7 @@ fn provision_authority(
     console: &RuntimeClient,
     owner: &RuntimeClient,
     cert_id: &str,
+    second_cert_id: &str,
 ) {
     let list = broker_request(
         console,
@@ -540,6 +745,42 @@ fn provision_authority(
         granted.as_ref().map(|v| &v["ok"]),
         Some(&json!(true)),
         "{granted:?}"
+    );
+    let list = broker_request(
+        console,
+        "amaterasu.pairing/1",
+        json!({"action":"list_clients"}),
+        "full-list-second-grant",
+    );
+    let mut listed = None;
+    for _ in 0..500 {
+        pairing.tick();
+        memory.tick();
+        if let Some(value) = take(console, list) {
+            listed = Some(value);
+            break;
+        }
+    }
+    let listed = listed.expect("second grant revision");
+    let grant = broker_request(
+        console,
+        "amaterasu.pairing/1",
+        json!({"action":"update_client_feedback_grants","certificate_id":second_cert_id,"expected_revision":listed["revision"],"grants":[{"schema":"org.amaterasu.feedback.rgb_led","version":1,"direction":"to_client"}]}),
+        "full-grant-second-feedback",
+    );
+    let mut result = None;
+    for _ in 0..500 {
+        pairing.tick();
+        memory.tick();
+        if let Some(value) = take(console, grant) {
+            result = Some(value);
+            break;
+        }
+    }
+    assert_eq!(
+        result.as_ref().map(|v| &v["ok"]),
+        Some(&json!(true)),
+        "{result:?}"
     );
     let list = broker_request(
         console,
