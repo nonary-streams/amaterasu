@@ -63,7 +63,8 @@ startup-selected effect owner. No certificate or client identity is returned.
    source retirement. Submit `confirm_effect_owner_restart` for each index,
    with the same version, epochs and operation ID plus `index` and the verified
    `retirement`. Confirmations are idempotent and must agree across the same
-   transport. Even a source with no lease or an already retired source requires
+   transport, including live lease and source completions regardless of their
+   ordering. Even a source with no lease or an already retired source requires
    a matching whole-control-stream receipt in this restart flow. Pairing checks the
    selected owner's assertion and matching fields; it cannot independently
    authenticate that the owner observed the provider response.
