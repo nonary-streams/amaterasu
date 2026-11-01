@@ -3773,6 +3773,7 @@ fn historical_journal_verification_uses_real_selected_state_read() {
         "permission_denied"
     );
     let late_result = store.handle(&caller, payload);
+    assert_eq!(late_result["ok"], true);
     assert_eq!(
         code(broker.dispatch(
             "state",
@@ -3864,7 +3865,7 @@ fn historical_journal_verification_uses_real_selected_state_read() {
         StateRequest::Set {
             key: key.into(),
             value: restart_journal,
-            expected_revision: Some(7),
+            expected_revision: Some(8),
         }
         .payload(),
     );
