@@ -1,3 +1,4 @@
+mod clipboard_reclaim;
 mod configuration_hold;
 
 use crate::effect_gate::{EffectGate, Request as EffectRequest, Source as EffectSource};
@@ -93,6 +94,13 @@ struct HoldConfirmation {
     verified_revision: Option<u64>,
 }
 
+struct ClipboardReclaim {
+    request_id: u64,
+    lifecycle_request: u64,
+    epoch: String,
+    stream: amaterasu_module_sdk::effect_authority::ClipboardStream,
+}
+
 pub struct Pipeline {
     engine: Engine,
     effect_gate: Option<EffectGate>,
@@ -101,6 +109,7 @@ pub struct Pipeline {
     configuration_reconciled: bool,
     configuration_status_request: Option<u64>,
     hold_confirmation: Option<HoldConfirmation>,
+    clipboard_reclaim: Option<ClipboardReclaim>,
     completed_configuration_hold: Option<(String, ConfigurationChange, ConfigurationChangeOutcome)>,
     effect_bindings: BTreeMap<EffectSource, (Arc<Snapshot>, Vec<u8>)>,
     deferred_effect_mutation: Option<(Request, Operation)>,
@@ -184,6 +193,7 @@ impl Pipeline {
             configuration_reconciled,
             configuration_status_request: None,
             hold_confirmation: None,
+            clipboard_reclaim: None,
             completed_configuration_hold: None,
             effect_bindings: BTreeMap::new(),
             deferred_effect_mutation: None,
@@ -275,6 +285,7 @@ impl Pipeline {
         self.progress_pairing_notice(&mut send);
         self.progress_configuration_reconciliation(&mut send)?;
         self.progress_hold_confirmation(&mut send)?;
+        self.progress_clipboard_reclaim(&mut send)?;
         if self.identity_generation.is_some() {
             let result = self.advance_identity_generation(now, &mut send);
             if result.is_err() {
@@ -1005,6 +1016,7 @@ impl Pipeline {
                             | "complete_clipboard"
                             | "acknowledge_clipboard"
                             | "fence_clipboard_stream"
+                            | "reclaim_clipboard_stream"
                             | "lookup_stream_lease"
                             | "lookup"
                             | "acknowledge"
@@ -1046,6 +1058,10 @@ impl Pipeline {
         }
         if let Ok(request) = serde_json::from_value::<EffectRequest>(payload.clone()) {
             match request {
+                EffectRequest::ReclaimClipboardStream { epoch, stream } => {
+                    return self
+                        .start_clipboard_reclaim(id, caller, initiator, epoch, stream, send);
+                }
                 EffectRequest::FinishConfigurationChange { change, result } => {
                     return self.start_hold_confirmation(
                         id,
@@ -1119,6 +1135,7 @@ impl Pipeline {
             | EffectRequest::LookupClipboard { .. }
             | EffectRequest::CompleteClipboard { .. }
             | EffectRequest::AcknowledgeClipboard { .. } => caller == policy.protocol_owner,
+            EffectRequest::ReclaimClipboardStream { .. } => caller == policy.protocol_owner,
             EffectRequest::FenceClipboardStream { .. } => {
                 caller == policy.protocol_owner || caller == policy.effect_owner
             }
@@ -1296,14 +1313,16 @@ impl Pipeline {
                 unreachable!("handled above")
             }
             EffectRequest::AdmitClipboard { .. } => unreachable!("handled above"),
+            EffectRequest::ReclaimClipboardStream { .. } => Err("lifecycle_verification_required"),
             EffectRequest::LookupClipboard {
                 epoch,
                 operation_id,
             } => {
                 gate.require_epoch(&epoch)?;
-                let (ticket, stream, fenced) = gate.lookup_clipboard(&operation_id)?;
+                let (ticket, stream, direction, client_fingerprint, fenced) =
+                    gate.lookup_clipboard(&operation_id)?;
                 Ok(
-                    json!({"ok":true,"epoch":epoch,"operation_id":operation_id,"ticket":ticket,"stream":stream,"fenced":fenced}),
+                    json!({"version":1,"ok":true,"epoch":epoch,"operation_id":operation_id,"ticket":ticket,"stream":stream,"direction":direction,"client_fingerprint":client_fingerprint,"fenced":fenced}),
                 )
             }
             EffectRequest::CompleteClipboard {

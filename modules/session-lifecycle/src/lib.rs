@@ -1,5 +1,6 @@
 //! Durable, broker-admitted session lifecycle authority.
 pub mod action_authority;
+#[cfg_attr(feature = "clipboard-qualification", allow(dead_code))]
 mod adapter;
 mod coordinator;
 pub mod input_authority;
@@ -14,7 +15,10 @@ pub mod receipts;
 mod store;
 pub mod transitions;
 
+#[cfg(feature = "clipboard-qualification")]
+use adapter::LifecycleHandler;
 pub use adapter::{ConsumerSettings, LifecycleSettings, MethodSettings, ParticipantSettings};
+#[cfg(not(feature = "clipboard-qualification"))]
 use adapter::{LifecycleAdapter, LifecycleHandler};
 use amaterasu_module_sdk::ModuleResult;
 pub use coordinator::Coordinator;
@@ -39,7 +43,11 @@ impl LifecycleHandler for Coordinator {
     }
 }
 
+#[cfg(not(feature = "clipboard-qualification"))]
 type SessionLifecycleModule = LifecycleAdapter<Coordinator>;
+#[cfg(all(feature = "clipboard-qualification", not(debug_assertions)))]
+compile_error!("clipboard-qualification is a debug-only test artifact");
+#[cfg(not(feature = "clipboard-qualification"))]
 amaterasu_module_sdk::export_module!(SessionLifecycleModule);
 
 #[cfg(test)]

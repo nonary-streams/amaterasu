@@ -1230,6 +1230,7 @@ impl Coordinator {
         if matches!(
             operation,
             "clipboard_stream_status"
+                | "verify_clipboard_stream_closed"
                 | "reserve_clipboard_stream"
                 | "lookup_clipboard_stream"
                 | "complete_clipboard_stream"

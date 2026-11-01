@@ -5680,6 +5680,7 @@ fn broker_lost_lease_lookup_reports_shared_transport_retirement() {
     );
 }
 
+mod clipboard_reclaim;
 mod owner_restart_tests;
 
 #[test]
@@ -5778,6 +5779,19 @@ fn real_broker_clipboard_admission_respects_grants_and_holds_revocation_until_se
         )
         .unwrap();
     assert_eq!(lookup["fenced"], true);
+    let permit: amaterasu_module_sdk::effect_authority::ClipboardPermit =
+        serde_json::from_value(lookup.clone()).unwrap();
+    let fingerprint = crate::crypto::parse_certificate(CLIENT_CERT, Some(now()))
+        .unwrap()
+        .fingerprint;
+    assert!(permit.matches(
+        &epoch,
+        &first_operation,
+        &typed_stream,
+        amaterasu_module_sdk::effect_authority::ClipboardDirection::Read,
+        &fingerprint,
+    ));
+    assert!(permit.fenced);
     assert!(
         pipeline
             .apply_effect_request("nvhttp", "nvhttp", request("read", "after-fence", 2), now())
@@ -5834,9 +5848,17 @@ fn canceled_delivered_clipboard_admission_cannot_create_a_permit() {
         .as_str()
         .unwrap()
         .to_owned();
+    let stream = amaterasu_module_sdk::effect_authority::ClipboardStream {
+        version: 1,
+        host_epoch: "host".into(),
+        session_id: "session".into(),
+        stream_id: "stream".into(),
+        generation: 1,
+    };
+    let operation_id = stream.operation_id(1).unwrap();
     let mut broker = authority_broker();
     let Response::Accepted { id } = broker.dispatch("nvhttp",Command::Request {service:EFFECT_SERVICE.into(),
-        payload:json!({"action":"admit_clipboard","epoch":epoch,"certificate_pem":CLIENT_CERT,"stream":{"version":1,"host_epoch":"host","session_id":"session","stream_id":"stream","generation":1},"direction":"read","operation_id":"cancelled","sequence":1}),
+        payload:json!({"action":"admit_clipboard","epoch":epoch,"certificate_pem":CLIENT_CERT,"stream":stream,"direction":"read","operation_id":operation_id,"sequence":1}),
         timeout_ms:30_000,operation_id:"cancelled-outer".into(),parent:None}) else { panic!("request") };
     let Response::Request {
         caller,
@@ -5862,7 +5884,24 @@ fn canceled_delivered_clipboard_admission_cannot_create_a_permit() {
             .effect_gate
             .as_ref()
             .unwrap()
-            .lookup_clipboard("cancelled"),
+            .lookup_clipboard(&operation_id),
         Err("unknown_admission")
     );
+    let Response::Accepted { id } = broker.dispatch("nvhttp",Command::Request {service:EFFECT_SERVICE.into(),
+        payload:json!({"action":"admit_clipboard","epoch":epoch,"certificate_pem":CLIENT_CERT,"stream":stream,"direction":"read","operation_id":operation_id,"sequence":1}),
+        timeout_ms:30_000,operation_id:"valid-after-cancel".into(),parent:None}) else { panic!("request") };
+    pipeline
+        .tick_at(now(), |command| Ok(broker.dispatch("pairing", command)))
+        .unwrap();
+    let Response::Result { payload } =
+        broker.dispatch("nvhttp", Command::TakeResult { request: id })
+    else {
+        panic!("valid admission must succeed")
+    };
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["ticket"].as_str().unwrap().len(), 32);
+    assert!(matches!(
+        broker.dispatch("nvhttp", Command::ReleaseResult { request: id }),
+        Response::Ok
+    ));
 }

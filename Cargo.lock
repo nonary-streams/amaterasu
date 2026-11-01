@@ -712,6 +712,7 @@ dependencies = [
  "amaterasu-module-sdk",
  "amaterasu-nvhttp",
  "amaterasu-runtime",
+ "amaterasu-session-lifecycle",
  "amaterasu-state",
  "amaterasu-storage",
  "getrandom 0.3.4",

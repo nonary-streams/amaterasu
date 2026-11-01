@@ -1,4 +1,8 @@
 //! Cross-module tests run the production lifecycle ABI against the actual broker.
+// The qualification feature is active only when linked into pairing's broker
+// test binary, which exports the same native entry point.
+#![cfg(not(feature = "clipboard-qualification"))]
+
 use amaterasu_module_sdk::{Command, Response, abi};
 use amaterasu_runtime::Broker;
 use serde_json::{Value, json};

@@ -506,6 +506,47 @@ pub struct ClipboardStream {
     pub stream_id: String,
     pub generation: u64,
 }
+
+/// Reconciled pairing admission. Callers must compare every identity field
+/// before resuming provider work after a lost reply.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ClipboardPermit {
+    pub version: u8,
+    pub ok: bool,
+    pub epoch: String,
+    pub operation_id: String,
+    pub stream: ClipboardStream,
+    pub direction: ClipboardDirection,
+    pub client_fingerprint: String,
+    pub ticket: String,
+    pub fenced: bool,
+}
+
+impl ClipboardPermit {
+    pub fn matches(
+        &self,
+        epoch: &str,
+        operation_id: &str,
+        stream: &ClipboardStream,
+        direction: ClipboardDirection,
+        client_fingerprint: &str,
+    ) -> bool {
+        self.version == 1
+            && self.ok
+            && self.epoch == epoch
+            && self.operation_id == operation_id
+            && self.stream == *stream
+            && self.direction == direction
+            && self.client_fingerprint == client_fingerprint
+            && stream.valid()
+            && self.ticket.len() == 32
+            && self
+                .ticket
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+}
 impl ClipboardStream {
     pub fn valid(&self) -> bool {
         self.version == 1
@@ -592,6 +633,11 @@ pub enum Request {
         ticket: String,
     },
     FenceClipboardStream {
+        epoch: String,
+        stream: ClipboardStream,
+    },
+    /// Verify closure with selected lifecycle before reclaiming a stream fence.
+    ReclaimClipboardStream {
         epoch: String,
         stream: ClipboardStream,
     },
@@ -726,6 +772,57 @@ mod tests {
         let mut invalid_source = source;
         invalid_source.stream_generation += 1;
         assert!(invalid_source.to_lifecycle().is_err());
+    }
+
+    #[test]
+    fn clipboard_permit_reconciliation_binds_client_direction_and_stream() {
+        let stream = ClipboardStream {
+            version: 1,
+            host_epoch: "host".into(),
+            session_id: "session".into(),
+            stream_id: "stream".into(),
+            generation: 4,
+        };
+        let permit = ClipboardPermit {
+            version: 1,
+            ok: true,
+            epoch: "pairing-epoch".into(),
+            operation_id: stream.operation_id(7).unwrap(),
+            stream: stream.clone(),
+            direction: ClipboardDirection::Write,
+            client_fingerprint: "a".repeat(64),
+            ticket: "b".repeat(32),
+            fenced: false,
+        };
+        let operation = stream.operation_id(7).unwrap();
+        assert!(permit.matches(
+            "pairing-epoch",
+            &operation,
+            &stream,
+            ClipboardDirection::Write,
+            &"a".repeat(64)
+        ));
+        assert!(!permit.matches(
+            "pairing-epoch",
+            &operation,
+            &stream,
+            ClipboardDirection::Read,
+            &"a".repeat(64)
+        ));
+        assert!(!permit.matches(
+            "pairing-epoch",
+            &operation,
+            &stream,
+            ClipboardDirection::Write,
+            &"c".repeat(64)
+        ));
+        assert!(!permit.matches(
+            "old-epoch",
+            &operation,
+            &stream,
+            ClipboardDirection::Write,
+            &"a".repeat(64)
+        ));
     }
 
     #[test]

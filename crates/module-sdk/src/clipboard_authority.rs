@@ -8,6 +8,11 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LifecycleRequest {
     ClipboardStreamStatus {},
+    /// Called by the selected pairing authority as a child of the protocol
+    /// owner's reclaim request. The broker supplies both principals.
+    VerifyClipboardStreamClosed {
+        source: ClipboardStream,
+    },
     ReserveClipboardStream {
         operation_id: String,
         source: ClipboardStream,
@@ -24,6 +29,32 @@ pub enum LifecycleRequest {
         operation_id: String,
         ticket: String,
     },
+}
+
+/// Lifecycle's monotonic cutoff after this exact stream has stopped issuing
+/// reservations and every reservation for it has been acknowledged.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ClosedStream {
+    pub version: u8,
+    pub status: ClosedStreamState,
+    pub source: ClipboardStream,
+    pub highwater: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClosedStreamState {
+    Closed,
+}
+
+impl ClosedStream {
+    pub fn matches(&self, source: &ClipboardStream) -> bool {
+        self.version == 1
+            && self.status == ClosedStreamState::Closed
+            && self.source == *source
+            && source.valid()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]

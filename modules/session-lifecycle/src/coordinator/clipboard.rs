@@ -76,6 +76,103 @@ impl ClipboardReservations {
 }
 
 impl Coordinator {
+    /// Debug-only fixture that supplies a connected stream to the real
+    /// coordinator. The broker, reservation and pause paths remain in use.
+    #[cfg(feature = "clipboard-qualification")]
+    pub fn qualification_clipboard_stream(&mut self) -> ClipboardStream {
+        let session = self.handle(
+            "amaterasu.nvhttp",
+            "amaterasu.nvhttp",
+            json!({
+                "operation":"prepare", "operation_id":"clipboard-qualification",
+                "source_attestation":{"version":1,"kind":"paired_tls"}
+            }),
+        );
+        let source = ClipboardStream {
+            version: 1,
+            host_epoch: session["host_epoch"].as_str().unwrap().into(),
+            session_id: session["session_id"].as_str().unwrap().into(),
+            stream_id: "qualification-stream".into(),
+            generation: 1,
+        };
+        let mut shared = self.shared.borrow_mut();
+        let session = shared.value.sessions.get_mut(&source.session_id).unwrap();
+        session.phase = SessionPhase::Ready;
+        session.streams.insert(
+            source.stream_id.clone(),
+            StreamRecord {
+                provider_graph: None,
+                generation: source.generation,
+                phase: StreamPhase::Active,
+                candidate: None,
+                required: BTreeSet::new(),
+                acknowledgements: BTreeSet::new(),
+                retirements: BTreeSet::new(),
+                binding_owner: String::new(),
+                preparation_transition: String::new(),
+                provider_settings: Default::default(),
+            },
+        );
+        source
+    }
+
+    #[cfg(feature = "clipboard-qualification")]
+    pub fn qualification_add_clipboard_stream(
+        &mut self,
+        session_id: &str,
+        stream_id: String,
+        generation: u64,
+    ) -> ClipboardStream {
+        let mut shared = self.shared.borrow_mut();
+        let session = shared.value.sessions.get_mut(session_id).unwrap();
+        let source = ClipboardStream {
+            version: 1,
+            host_epoch: session.host_epoch.clone(),
+            session_id: session.id.clone(),
+            stream_id,
+            generation,
+        };
+        session.streams.insert(
+            source.stream_id.clone(),
+            StreamRecord {
+                provider_graph: None,
+                generation,
+                phase: StreamPhase::Active,
+                candidate: None,
+                required: BTreeSet::new(),
+                acknowledgements: BTreeSet::new(),
+                retirements: BTreeSet::new(),
+                binding_owner: String::new(),
+                preparation_transition: String::new(),
+                provider_settings: Default::default(),
+            },
+        );
+        source
+    }
+
+    #[cfg(feature = "clipboard-qualification")]
+    pub fn qualification_quiesce_clipboard_stream(&mut self, source: &ClipboardStream) {
+        let mut shared = self.shared.borrow_mut();
+        let session = shared.value.sessions.get_mut(&source.session_id).unwrap();
+        let stream = session.streams.get_mut(&source.stream_id).unwrap();
+        assert_eq!(stream.generation, source.generation);
+        stream.phase = StreamPhase::Quiescing;
+    }
+
+    #[cfg(feature = "clipboard-qualification")]
+    pub fn qualification_remove_clipboard_stream(&mut self, source: &ClipboardStream) {
+        let mut shared = self.shared.borrow_mut();
+        let stream = shared
+            .value
+            .sessions
+            .get_mut(&source.session_id)
+            .and_then(|session| session.streams.remove(&source.stream_id));
+        assert!(
+            stream.is_some_and(|stream| stream.phase == StreamPhase::Quiescing
+                && stream.generation == source.generation)
+        );
+    }
+
     pub(super) fn clipboard_reservation(
         &mut self,
         caller: &str,
@@ -83,7 +180,7 @@ impl Coordinator {
         payload: &Value,
     ) -> Value {
         // The provider, NVHTTP and pairing joins are not yet wired end to end.
-        if !cfg!(test) {
+        if !cfg!(any(test, feature = "clipboard-qualification")) {
             return rejection("clipboard_authority_unavailable");
         }
         let Some(op) = payload["operation"].as_str() else {
@@ -99,6 +196,48 @@ impl Coordinator {
             let journal = &self.shared.borrow().value;
             return json!({"version":1,"status":"ok","highwater":journal.clipboard_reservations.highwater,
                 "recovery_required":journal.clipboard_reservations.live.values().any(|record| record.uncertain)});
+        }
+        if op == "verify_clipboard_stream_closed" {
+            // The adapter's trusted-caller operation grant selects the pairing
+            // authority. The broker supplies the protocol owner as initiator
+            // of its nested request; payload fields cannot name either owner.
+            if caller == initiator
+                || !valid_id(initiator)
+                || payload
+                    .as_object()
+                    .is_none_or(|object| object.len() != 2 || !object.contains_key("source"))
+            {
+                return rejection("source_denied");
+            }
+            let Ok(source) = serde_json::from_value::<ClipboardStream>(payload["source"].clone())
+            else {
+                return rejection("invalid_source");
+            };
+            let target = LifecycleTarget::Stream {
+                host_epoch: source.host_epoch.clone(),
+                session_id: source.session_id.clone(),
+                stream_id: source.stream_id.clone(),
+                generation: source.generation,
+            };
+            let journal = &self.shared.borrow().value;
+            let Ok((session, Some(stream_id))) =
+                operations::checked_target(journal, &target, initiator, initiator)
+            else {
+                return rejection("source_denied");
+            };
+            if !source.valid()
+                || !session.paired_source_attested
+                || session.streams.get(&stream_id).is_none_or(|stream| {
+                    !matches!(stream.phase, StreamPhase::Quiescing | StreamPhase::Retired)
+                })
+                // The cutoff is global and monotonic. Prove that no older
+                // reservation on any stream can still arrive at pairing.
+                || !journal.clipboard_reservations.live.is_empty()
+            {
+                return rejection("stream_not_closed");
+            }
+            return json!({"version":1,"status":"closed","source":source,
+                "highwater":journal.clipboard_reservations.highwater});
         }
         let expected: &[&str] = match op {
             "reserve_clipboard_stream" => &["operation", "operation_id", "source", "sequence"],

@@ -998,6 +998,10 @@ fn clipboard_stream_reservation_fences_shutdown_until_effect_settles() {
         serde_json::from_value(source.clone()).unwrap();
     let first_operation = typed_source.operation_id(1).unwrap();
     let next_operation = typed_source.operation_id(2).unwrap();
+    let other_source = json!({"version":1,"host_epoch":epoch,"session_id":session_id,"stream_id":"other-stream","generation":5});
+    let other_typed: amaterasu_module_sdk::effect_authority::ClipboardStream =
+        serde_json::from_value(other_source.clone()).unwrap();
+    let other_operation = other_typed.operation_id(2).unwrap();
     let candidate: CaptureBinding = serde_json::from_value(json!({"capture_provider":"capture", "selector_schema":"selector/1", "selector":{}, "resource":{"provider":"display","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":null},"mode":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false},"plan_revision":1,"geometry_revision":7,"generation":4})).unwrap();
     {
         let mut shared = coordinator.shared.borrow_mut();
@@ -1010,6 +1014,21 @@ fn clipboard_stream_reservation_fences_shutdown_until_effect_settles() {
                 generation: 4,
                 phase: StreamPhase::Active,
                 candidate: Some(candidate),
+                required: BTreeSet::new(),
+                acknowledgements: BTreeSet::new(),
+                retirements: BTreeSet::new(),
+                binding_owner: String::new(),
+                preparation_transition: String::new(),
+                provider_settings: Default::default(),
+            },
+        );
+        session.streams.insert(
+            "other-stream".into(),
+            StreamRecord {
+                provider_graph: None,
+                generation: 5,
+                phase: StreamPhase::Active,
+                candidate: None,
                 required: BTreeSet::new(),
                 acknowledgements: BTreeSet::new(),
                 retirements: BTreeSet::new(),
@@ -1037,6 +1056,16 @@ fn clipboard_stream_reservation_fences_shutdown_until_effect_settles() {
         receipt
     );
     let ticket = receipt["ticket"].as_str().unwrap().to_owned();
+    let other_receipt = coordinator.handle(
+        "amaterasu.nvhttp",
+        "amaterasu.nvhttp",
+        json!({
+            "operation":"reserve_clipboard_stream","operation_id":other_operation,
+            "source":other_source,"sequence":2
+        }),
+    );
+    assert_eq!(other_receipt["status"], "reserved", "{other_receipt}");
+    let other_ticket = other_receipt["ticket"].as_str().unwrap().to_owned();
     let restart_dir = TestDirectory::new();
     std::fs::copy(dir.journal(), restart_dir.journal()).unwrap();
     let mut restarted = Coordinator::open(&restart_dir.journal()).unwrap();
@@ -1053,7 +1082,7 @@ fn clipboard_stream_reservation_fences_shutdown_until_effect_settles() {
         "amaterasu.nvhttp",
         json!({"operation":"clipboard_stream_status"}),
     );
-    assert_eq!(status["highwater"], 1);
+    assert_eq!(status["highwater"], 2);
     assert_eq!(status["recovery_required"], true);
     drop(restarted);
     let paused = coordinator.handle(
@@ -1063,6 +1092,15 @@ fn clipboard_stream_reservation_fences_shutdown_until_effect_settles() {
     );
     assert_eq!(paused["status"], "pending", "{paused}");
     assert_eq!(coordinator.handle("amaterasu.nvhttp","amaterasu.nvhttp",json!({"operation":"reserve_clipboard_stream","operation_id":next_operation,"source":source,"sequence":2}))["reason"],"source_denied");
+    let verify = json!({"operation":"verify_clipboard_stream_closed","source":source});
+    assert_eq!(
+        coordinator.handle("pairing", "amaterasu.nvhttp", verify.clone())["reason"],
+        "stream_not_closed"
+    );
+    assert_eq!(
+        coordinator.handle("pairing", "foreign", verify.clone())["reason"],
+        "source_denied"
+    );
     let work = coordinator
         .shared
         .borrow()
@@ -1078,5 +1116,19 @@ fn clipboard_stream_reservation_fences_shutdown_until_effect_settles() {
     assert!(!coordinator.retirement_ready(&work).unwrap());
     assert_eq!(coordinator.handle("foreign","foreign",json!({"operation":"complete_clipboard_stream","operation_id":first_operation,"ticket":ticket}))["reason"],"source_denied");
     assert_eq!(coordinator.handle("amaterasu.nvhttp","amaterasu.nvhttp",json!({"operation":"complete_clipboard_stream","operation_id":first_operation,"ticket":ticket}))["status"],"completed");
+    assert_eq!(
+        coordinator.handle("pairing", "amaterasu.nvhttp", verify.clone())["reason"],
+        "stream_not_closed"
+    );
+    assert_eq!(coordinator.handle("amaterasu.nvhttp","amaterasu.nvhttp",json!({"operation":"acknowledge_clipboard_stream","operation_id":first_operation,"ticket":ticket}))["status"],"completed");
+    assert_eq!(
+        coordinator.handle("pairing", "amaterasu.nvhttp", verify.clone())["reason"],
+        "stream_not_closed"
+    );
+    assert_eq!(coordinator.handle("amaterasu.nvhttp","amaterasu.nvhttp",json!({"operation":"complete_clipboard_stream","operation_id":other_operation,"ticket":other_ticket}))["status"],"completed");
+    assert_eq!(coordinator.handle("amaterasu.nvhttp","amaterasu.nvhttp",json!({"operation":"acknowledge_clipboard_stream","operation_id":other_operation,"ticket":other_ticket}))["status"],"completed");
+    let closed = coordinator.handle("pairing", "amaterasu.nvhttp", verify);
+    assert_eq!(closed["status"], "closed");
+    assert_eq!(closed["highwater"], 2);
     assert!(coordinator.retirement_ready(&work).unwrap());
 }
