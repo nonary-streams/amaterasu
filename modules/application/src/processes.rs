@@ -330,12 +330,24 @@ impl ProcessRecord {
     fn reap_detached_commands(&mut self) {
         self.detached_children
             .retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
-        if self
+        if let Some(status) = self
             .steam_launcher
             .as_mut()
-            .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))))
+            .and_then(|child| child.try_wait().ok())
+            .flatten()
         {
             self.steam_launcher = None;
+            if !status.success()
+                && !self.steam_tracker.as_mut().is_some_and(|tracker| {
+                    tracker.observe(Instant::now());
+                    tracker.was_associated()
+                })
+            {
+                self.complete_or_clean(Completion::Exited {
+                    exit_code: status.code(),
+                    success: false,
+                });
+            }
         }
     }
 

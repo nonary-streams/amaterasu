@@ -2135,12 +2135,35 @@ pub struct ProviderRoute {
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
+    /// Trusted startup composition chooses which desktop-session variables
+    /// children may inherit. Explicit values below take precedence.
+    pub inherit_environment: BTreeSet<String>,
     pub environment: BTreeMap<String, String>,
     pub retirement_observers: BTreeSet<String>,
     pub provider_routes: BTreeMap<String, ProviderRoute>,
     pub library_routes: BTreeMap<String, crate::library::Route>,
 }
 impl Settings {
+    pub fn resolved_environment(
+        &self,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> Result<BTreeMap<String, String>, &'static str> {
+        self.validate()?;
+        let mut environment = BTreeMap::new();
+        for name in &self.inherit_environment {
+            if let Some(value) = lookup(name) {
+                environment.insert(name.clone(), value);
+            }
+        }
+        environment.extend(self.environment.clone());
+        let resolved = Settings {
+            environment: environment.clone(),
+            ..Settings::default()
+        };
+        resolved.validate()?;
+        Ok(environment)
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         crate::library::validate_routes(&self.library_routes)?;
         if self.retirement_observers.len() > 32
@@ -2169,6 +2192,15 @@ impl Settings {
             .provider_routes
             .values()
             .any(|route| !importers.insert(&route.importer) || !services.insert(&route.service))
+        {
+            return Err("invalid_launch_settings");
+        }
+        let mut inherited_keys = BTreeSet::new();
+        if self.inherit_environment.len() > 32
+            || self.inherit_environment.iter().any(|key| {
+                !valid_environment_binding(key, "")
+                    || !inherited_keys.insert(key.to_ascii_uppercase())
+            })
         {
             return Err("invalid_launch_settings");
         }
@@ -2291,6 +2323,44 @@ fn valid_configured_command(command: &ConfiguredCommand) -> bool {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn launch_environment_inherits_only_selected_names_and_applies_overrides() {
+        let settings: Settings = serde_json::from_value(json!({
+            "inherit_environment":["HOME","DISPLAY","OPTIONAL"],
+            "environment":{"DISPLAY":":2","CUSTOM":"explicit"}
+        }))
+        .unwrap();
+        let environment = settings
+            .resolved_environment(|name| match name {
+                "HOME" => Some("/home/player".into()),
+                "DISPLAY" => Some(":1".into()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            environment,
+            BTreeMap::from([
+                ("HOME".into(), "/home/player".into()),
+                ("DISPLAY".into(), ":2".into()),
+                ("CUSTOM".into(), "explicit".into())
+            ])
+        );
+        assert!(
+            Settings::default()
+                .resolved_environment(|_| Some("secret".into()))
+                .unwrap()
+                .is_empty()
+        );
+        let invalid: Settings =
+            serde_json::from_value(json!({"inherit_environment":["HOME","home"]})).unwrap();
+        assert!(invalid.validate().is_err());
+        assert!(
+            settings
+                .resolved_environment(|_| Some("x".repeat(1025)))
+                .is_err()
+        );
+    }
 
     #[test]
     fn display_remapping_rejects_rules_that_cannot_resolve() {

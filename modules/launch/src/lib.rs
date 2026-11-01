@@ -24,7 +24,10 @@ impl ManagedModule for LaunchModule {
             serde_json::from_value(payload).map_err(|_| "invalid launch settings")?;
         settings.validate().map_err(str::to_owned)?;
         let enable_library_launch = !settings.library_routes.is_empty();
-        let mut pipeline = Pipeline::new(settings.environment).map_err(str::to_owned)?;
+        let environment = settings
+            .resolved_environment(|name| std::env::var(name).ok())
+            .map_err(str::to_owned)?;
+        let mut pipeline = Pipeline::new(environment).map_err(str::to_owned)?;
         pipeline.set_retirement_observers(settings.retirement_observers);
         pipeline.set_provider_routes(settings.provider_routes);
         pipeline.set_library_routes(settings.library_routes);

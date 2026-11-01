@@ -125,7 +125,9 @@ mod windows;
 
 #[cfg(target_os = "linux")]
 mod linux {
+    mod scanner;
     use super::{Instant, SteamGameLiveness};
+    use scanner::ProcessScanner;
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::c_void;
     use std::fs;
@@ -160,6 +162,9 @@ mod linux {
         baseline: BTreeMap<u32, u64>,
         tracked: BTreeMap<u32, Identity>,
         started_at: Instant,
+        next_scan_at: Instant,
+        scanner: ProcessScanner,
+        scan_failed: bool,
         associated: bool,
         stopping_at: Option<Instant>,
     }
@@ -182,20 +187,32 @@ mod linux {
                 baseline,
                 tracked: BTreeMap::new(),
                 started_at: Instant::now(),
+                next_scan_at: Instant::now(),
+                scanner: ProcessScanner::start()?,
+                scan_failed: false,
                 associated: false,
                 stopping_at: None,
             })
         }
 
         pub(super) fn observe(&mut self, now: Instant) -> SteamGameLiveness {
-            let Some(processes) = scan_processes() else {
+            if let Some(snapshot) = self.scanner.poll() {
+                self.scan_failed = snapshot.is_none();
+                if let Some(processes) = snapshot {
+                    self.refresh_tracking(&processes);
+                }
+            }
+            if now >= self.next_scan_at {
+                self.scan_failed |= !self.scanner.request();
+                self.next_scan_at = now + Duration::from_millis(250);
+            }
+            if self.scan_failed {
                 return if self.associated {
                     SteamGameLiveness::Associated
                 } else {
                     SteamGameLiveness::Unknown
                 };
-            };
-            self.refresh_tracking(&processes);
+            }
             if self.stopping_at.is_some() {
                 SteamGameLiveness::Stopping
             } else if !self.tracked.is_empty() {
@@ -552,6 +569,9 @@ mod linux {
                 baseline: BTreeMap::from([(10, 100), (11, 200)]),
                 tracked: BTreeMap::new(),
                 started_at: Instant::now(),
+                next_scan_at: Instant::now(),
+                scanner: ProcessScanner::start().unwrap(),
+                scan_failed: false,
                 associated: false,
                 stopping_at: None,
             }

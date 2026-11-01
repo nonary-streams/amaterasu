@@ -2,6 +2,34 @@ use super::*;
 use crate::profiles::PackageProfile;
 
 #[test]
+fn linux_launch_environment_is_an_explicit_desktop_allowlist() {
+    let options = LinuxSessionOptions::default();
+    let directories = PrivateStateDirectories {
+        state: "/tmp/amaterasu-state".into(),
+        session_history_database: "/tmp/amaterasu-state/history.db".into(),
+    };
+    let configured = settings(&options, &directories);
+    let names = configured["amaterasu.launch"]["inherit_environment"]
+        .as_array()
+        .unwrap();
+    for required in [
+        "HOME",
+        "PATH",
+        "DISPLAY",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+    ] {
+        assert!(names.iter().any(|name| name == required));
+    }
+    assert!(
+        !names
+            .iter()
+            .any(|name| name == "LD_PRELOAD" || name == "LD_LIBRARY_PATH")
+    );
+    assert!(configured["amaterasu.launch"].get("environment").is_none());
+}
+
+#[test]
 fn profile_uses_owner_selected_pipewire_capture_alongside_kms_metrics_and_library_integrations() {
     let capture = COMPONENTS
         .iter()

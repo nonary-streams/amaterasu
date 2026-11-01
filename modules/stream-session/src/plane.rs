@@ -14,6 +14,10 @@ use std::collections::VecDeque;
 
 pub type PlaneResult<T> = Result<T, &'static str>;
 const READ_BUDGET: usize = 4;
+// High-rate mouse/controller traffic must not share the four-packet media
+// budget. Drain a bounded burst before media work so input cannot accumulate
+// seconds of latency and overflow the transport's 256-message queue.
+const CONTROL_READ_BUDGET: usize = 64;
 const FEEDBACK_SEND_BUDGET: usize = 4;
 const MAX_PENDING_FEEDBACK_MESSAGES: usize = 64;
 const MAX_PENDING_FEEDBACK_BYTES: usize = 16 * 1024;
@@ -232,7 +236,7 @@ impl<B: Backend> Pump<B> {
                     code,
                     progress: Progress::default(),
                 })?;
-        for _ in 0..READ_BUDGET {
+        for _ in 0..CONTROL_READ_BUDGET {
             let message = match self.backend.control() {
                 Ok(message) => message,
                 Err(code) => {

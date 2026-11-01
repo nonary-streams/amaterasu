@@ -530,6 +530,14 @@ fn settings(
         }),
     );
     insert("amaterasu.catalog", catalog_settings(options));
+    insert(
+        "amaterasu.launch",
+        json!({"inherit_environment":[
+            "HOME", "USER", "LOGNAME", "PATH", "DISPLAY", "WAYLAND_DISPLAY",
+            "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "XAUTHORITY",
+            "XDG_SESSION_TYPE", "LANG", "LC_ALL"
+        ]}),
+    );
 
     insert("amaterasu.nvhttp", nvhttp_settings(options));
     insert(

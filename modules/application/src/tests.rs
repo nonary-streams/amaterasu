@@ -103,6 +103,7 @@ fn controlled_child() {
             let marker = std::env::var("AMATERASU_TEST_MARKER").unwrap();
             std::fs::write(marker, b"detached").unwrap();
         }
+        "steam-launch-failure" => std::process::exit(23),
         "detached-output" => {
             use std::io::Write;
             let value = std::env::var("AMATERASU_TEST_VALUE").unwrap();
@@ -151,6 +152,26 @@ fn controlled_child() {
             assert_eq!(actual, expected);
         }
         _ => {}
+    }
+}
+
+#[test]
+fn failed_steam_launcher_is_not_reported_as_a_running_game() {
+    let mut request = launch("steam-failure", "steam-launch-failure");
+    request["steam_id"] = json!("42");
+    let mut manager = ProcessManager::default();
+    let launched = manager.handle("alice", request);
+    let id = launched["process"]["process_id"].as_u64().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let observed = status(&mut manager, "alice", id);
+        if observed["process"]["state"] == "exited" {
+            assert_eq!(observed["process"]["exit_code"], 23);
+            assert_eq!(observed["process"]["success"], false);
+            break;
+        }
+        assert!(Instant::now() < deadline, "{observed}");
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 

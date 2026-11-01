@@ -72,7 +72,7 @@ impl Layout {
     pub fn next_priority(&self) -> u32 {
         self.outputs.iter().filter(|output| output.enabled).count() as u32 + 1
     }
-    fn normalized_outputs(&self, current: &Value) -> Vec<Output> {
+    fn normalized_outputs(&self, current: &Value) -> Result<Vec<Output>, String> {
         let mut outputs: Vec<_> = self
             .outputs
             .iter()
@@ -85,6 +85,24 @@ impl Layout {
             })
             .cloned()
             .collect();
+        // Another display owner may have unplugged every originally active
+        // output. Keep the currently active fallback desktop in that case;
+        // disabling the last physical output cannot restore the missing one.
+        if !outputs.iter().any(|output| output.enabled) {
+            for actual in current["outputs"]
+                .as_array()
+                .ok_or("missing current outputs")?
+                .iter()
+                .filter(|output| output["connected"] == true && output["enabled"] == true)
+            {
+                let fallback = Output::capture(actual)?;
+                if let Some(saved) = outputs.iter_mut().find(|saved| saved.name == fallback.name) {
+                    *saved = fallback;
+                } else {
+                    outputs.push(fallback);
+                }
+            }
+        }
         outputs.sort_by(|left, right| {
             (!left.enabled, left.priority, &left.name).cmp(&(
                 !right.enabled,
@@ -101,14 +119,14 @@ impl Layout {
         {
             output.priority = index as u32 + 1;
         }
-        outputs
+        Ok(outputs)
     }
     pub fn arguments(&self, current: &Value) -> Result<Vec<String>, String> {
         let outputs = current["outputs"]
             .as_array()
             .ok_or("missing current outputs")?;
         let mut arguments = Vec::new();
-        for expected in self.normalized_outputs(current) {
+        for expected in self.normalized_outputs(current)? {
             if let Some(actual) = outputs
                 .iter()
                 .find(|o| o["connected"] == true && o["name"] == expected.name)
@@ -120,7 +138,10 @@ impl Layout {
         Ok(arguments)
     }
     pub fn matches(&self, current: &Value) -> bool {
-        self.normalized_outputs(current).iter().all(|expected| {
+        let Ok(outputs) = self.normalized_outputs(current) else {
+            return false;
+        };
+        outputs.iter().all(|expected| {
             // An independently unplugged monitor is never reconnected by us.
             current["outputs"]
                 .as_array()
@@ -269,6 +290,26 @@ mod tests {
     fn desktop() -> Value {
         json!({"outputs":[{"name":"Virtual-1","connected":true,"enabled":true,"currentModeId":"1","modes":[{"id":"1","size":{"width":2560,"height":1440},"refreshRate":120}],"pos":{"x":0,"y":0},"scale":2.5,"rotation":1,"hdr":false,"wcg":true,"priority":1}]})
     }
+    #[test]
+    fn disappearing_original_display_preserves_the_active_physical_fallback() {
+        let mut before = desktop();
+        let mut physical = before["outputs"][0].clone();
+        physical["name"] = json!("HDMI-A-1");
+        physical["enabled"] = json!(false);
+        physical["priority"] = json!(0);
+        before["outputs"]
+            .as_array_mut()
+            .unwrap()
+            .push(physical.clone());
+        let layout = Layout::capture(&before, "Virtual-2").unwrap();
+        physical["enabled"] = json!(true);
+        physical["priority"] = json!(1);
+        physical["scale"] = json!(2.0);
+        let after = json!({"outputs":[physical]});
+        assert!(layout.arguments(&after).unwrap().is_empty());
+        assert!(layout.matches(&after));
+    }
+
     #[test]
     fn removing_a_middle_output_preserves_relative_priority_without_an_unrestorable_gap() {
         let mut before = desktop();

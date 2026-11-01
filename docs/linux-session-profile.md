@@ -339,3 +339,12 @@ a driver upgrade. It does not promise immutable retained pixels.
 The experimental `driver-read-leases` build feature must be enabled on both
 plugin and helper to use the new driver lease ABI; only that mode requires a
 matching driver upgrade and delays buffer retirement while a frame is held.
+
+The Linux launch profile explicitly inherits the desktop identity and session
+variables (`HOME`, `USER`, `LOGNAME`, `PATH`, `DISPLAY`, `WAYLAND_DISPLAY`,
+`XDG_RUNTIME_DIR`, `DBUS_SESSION_BUS_ADDRESS`, `XAUTHORITY`, `XDG_SESSION_TYPE`,
+`LANG`, `LC_ALL`). The launch plugin snapshots only this startup allowlist;
+configured `environment` values take precedence. Loader overrides and unrelated
+host credentials are not implicitly inherited. Steam needs this context to
+forward a launch to the logged-in client. A failed Steam launcher is reported as
+an unsuccessful exit rather than a running game.

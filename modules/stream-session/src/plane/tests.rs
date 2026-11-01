@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 
 #[derive(Default)]
 struct Fake {
+    controls: VecDeque<ControlRecord>,
     videos: VecDeque<VideoPacket>,
     pcms: VecDeque<PcmPacket>,
     audios: VecDeque<AudioPacket>,
@@ -30,7 +31,7 @@ impl Backend for Fake {
         if self.control_failed {
             Err("control_failed")
         } else {
-            Ok(None)
+            Ok(self.controls.pop_front())
         }
     }
     fn send_feedback(&mut self, message: &HostFeedbackMessage) -> PlaneResult<bool> {
@@ -163,6 +164,25 @@ fn haptics_pcm(sequence: u32) -> HostFeedback {
         frames: 240,
         samples_s16le: vec![0; 240 * 4],
     }
+}
+
+#[test]
+fn control_bursts_drain_promptly_without_starving_video() {
+    let mut backend = Fake::default();
+    backend
+        .controls
+        .extend((0..65).map(|sequence| ControlRecord {
+            message_type: 1,
+            payload: Vec::new(),
+            sequence,
+        }));
+    let mut pump = Pump::with_media(backend, true, 2, CODEC_H264);
+    let first = pump.tick(true).unwrap();
+    assert_eq!(first.controls.len(), 64);
+    assert!(pump.backend.video_reads > 0);
+    let second = pump.tick(true).unwrap();
+    assert_eq!(second.controls.len(), 1);
+    assert_eq!(second.controls[0].sequence, 64);
 }
 
 #[test]
