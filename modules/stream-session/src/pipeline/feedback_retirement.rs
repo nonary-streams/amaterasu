@@ -2,6 +2,7 @@
 //! they remain pending until the paired source registry and transport are drained.
 mod admission;
 mod registry;
+mod restart;
 mod worker;
 
 use super::{Send, record::Record, rpc};
@@ -92,8 +93,19 @@ pub(super) struct Inbox {
     scan_call: Option<worker::Call>,
     drain: Option<(String, u64)>,
     drain_call: Option<worker::Call>,
+    restart_required: bool,
+    restart: Option<restart::Restart>,
 }
 impl Inbox {
+    pub fn new(restart_required: bool, selected_transport: String) -> Self {
+        Self {
+            restart_required,
+            restart: restart_required
+                .then(|| restart::Restart::new(selected_transport))
+                .flatten(),
+            ..Default::default()
+        }
+    }
     #[cfg(test)]
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -496,6 +508,23 @@ impl Inbox {
         selected_protocol: Option<&str>,
         send: &mut Send<'_>,
     ) {
+        if self.restart_required {
+            // The restart consumer remains qualification-only until reviewed
+            // with the real selected providers and full authenticated session.
+            if !cfg!(test) {
+                return;
+            }
+            if self
+                .restart
+                .as_mut()
+                .is_some_and(|restart| restart.advance(send))
+            {
+                self.restart_required = false;
+                self.restart = None;
+            } else {
+                return;
+            }
+        }
         let allow_admission = selected_protocol.is_some();
         if allow_admission && let Some((binding, transport)) = self.registry.first_stale(records) {
             self.enqueue_internal(binding, &transport);

@@ -79,8 +79,13 @@ this API refuses to invent an empty snapshot. The existing pairing-provider
 startup recovery requires separate proof that all old owner transports retired.
 Likewise, unscoped effects cannot be enumerated here and cause this restart
 attempt to fail closed; resolving them belongs to their own authority. This
-contract has not been joined to a restarted stream-owner process or real
-control-provider test, so production feedback admission remains closed.
+The stream owner has a qualification-only startup consumer that fences and
+enumerates the old owner, reconciles each selected control-provider receipt,
+settles leases and sources, and verifies the new unfenced authority epoch. Its
+broker/real-control tests use fixture-seeded pairing source state; the full
+certificate, NVHTTP, lifecycle, input and stream join and process-restart proof
+remain outstanding. Production feedback admission and this startup consumer
+remain closed pending combined proof and independent review.
 
 ## Host-configuration transaction holds
 
