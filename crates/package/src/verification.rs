@@ -224,6 +224,9 @@ fn resolve_runtime_grants(
     let mut runtime = RuntimeConfig {
         principals: BTreeMap::new(),
         service_selections: Default::default(),
+        // Preserve trusted host policy so the broker can reject an incomplete
+        // or unauthorized profile rather than silently dropping its fence.
+        live_feedback: bootstrap.policy.live_feedback.clone(),
         // The broker validates this trusted policy against effective grants.
         // Never silently discard a requested protection.
         effect_fence: bootstrap.policy.effect_fence.clone(),
@@ -332,6 +335,32 @@ mod tests {
         );
         // Missing effective principals and approvals are rejected by Broker::new,
         // rather than falling back to an unprotected route.
+    }
+
+    #[test]
+    fn explicitly_selected_live_feedback_is_not_silently_discarded() {
+        let profile = amaterasu_contracts::LiveFeedbackProfile {
+            protocol_owner: "protocol".into(),
+            pairing_owner: "pairing".into(),
+            stream_owner: "stream".into(),
+            input_owner: "input".into(),
+            lifecycle_owner: "lifecycle".into(),
+            control_owner: "control".into(),
+            host_configuration_owner: Some("configuration".into()),
+        };
+        let bootstrap = BootstrapConfig {
+            development: false,
+            allow_unsigned: false,
+            trusted_keys: BTreeMap::new(),
+            policy: RuntimeConfig {
+                live_feedback: Some(profile.clone()),
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            resolve_runtime_grants(&bootstrap, &[]).live_feedback,
+            Some(profile)
+        );
     }
 
     #[test]
