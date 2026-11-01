@@ -550,3 +550,38 @@ fn pairing_evidence_requires_the_exact_live_paired_lifecycle_session() {
     record.peer.client_id = None;
     assert!(controller.paired_lifecycle_session("epoch", "session").is_none());
 }
+
+#[test]
+fn pairing_evidence_separates_peers_and_rejects_ambiguous_sessions() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let first_id = *controller.records.keys().next().unwrap();
+    {
+        let first = controller.records.get_mut(&first_id).unwrap();
+        first.lifecycle_session_target = serde_json::from_value(json!({
+            "kind":"session","host_epoch":"epoch","session_id":"first","generation":3
+        })).ok();
+        first.state = State::Stopped;
+    }
+    let mut second_request = request(1);
+    second_request.remote_input_key = [2; 16];
+    assert!(controller.launch(11, second_request, peer(2), now).is_none());
+    let second_id = *controller.records.keys().find(|id| **id != first_id).unwrap();
+    controller.records.get_mut(&first_id).unwrap().state = State::Ready;
+    controller.records.get_mut(&second_id).unwrap().lifecycle_session_target =
+        serde_json::from_value(json!({
+            "kind":"session","host_epoch":"epoch","session_id":"second","generation":4
+        })).ok();
+    assert_eq!(controller.paired_lifecycle_session("epoch", "first").unwrap().1, &[1; 32]);
+    assert_eq!(controller.paired_lifecycle_session("epoch", "second").unwrap().1, &[2; 32]);
+    controller.records.get_mut(&second_id).unwrap().lifecycle_session_target =
+        serde_json::from_value(json!({
+            "kind":"session","host_epoch":"epoch","session_id":"first","generation":5
+        })).ok();
+    assert!(controller.paired_lifecycle_session("epoch", "first").is_none());
+    controller.records.get_mut(&first_id).unwrap().lifecycle_end_fenced = true;
+    let (target, certificate) = controller.paired_lifecycle_session("epoch", "first").unwrap();
+    assert_eq!(*certificate, [2; 32]);
+    assert_eq!(serde_json::to_value(target).unwrap()["generation"], 5);
+}
