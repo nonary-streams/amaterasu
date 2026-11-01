@@ -47,6 +47,59 @@ fn host_retirement_state_request(payload: &serde_json::Value) -> bool {
     let Some(key) = payload.get("key").and_then(serde_json::Value::as_str) else {
         return false;
     };
+    if let Some(suffix) = key.strip_prefix("host/effect-retirement/v2/") {
+        let mut parts = suffix.split('/');
+        let Some(slot) = parts
+            .next()
+            .filter(|s| s.len() == 2)
+            .and_then(|s| s.parse::<u8>().ok())
+            .filter(|s| *s < 64)
+        else {
+            return false;
+        };
+        let Some(incarnation) = parts
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+        else {
+            return false;
+        };
+        let Some(sequence) = parts
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|n| *n > 0)
+        else {
+            return false;
+        };
+        if parts.next().is_some()
+            || key != format!("host/effect-retirement/v2/{slot:02}/{incarnation}/{sequence}")
+        {
+            return false;
+        }
+        return match payload.get("action").and_then(serde_json::Value::as_str) {
+            Some("get") => true,
+            Some("set") => {
+                payload
+                    .get("expected_revision")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some()
+                    && payload
+                        .get("value")
+                        .and_then(|v| {
+                            serde_json::from_value::<HostProviderRetirement>(v.clone()).ok()
+                        })
+                        .is_some_and(|receipt| {
+                            receipt.version == 1
+                                && receipt.issued_lease.slot == slot
+                                && receipt.issued_lease.incarnation == incarnation
+                                && receipt.effect.sequence == sequence
+                                && receipt.effect.scope.source.slot() == Some(slot)
+                                && receipt.state_key() == key
+                        })
+            }
+            _ => false,
+        };
+    }
     let Some(suffix) = key.strip_prefix("host/effect-retirement/v1/") else {
         return false;
     };
@@ -183,7 +236,7 @@ impl Broker {
                 }
                 Command::TakeResult { request } => self.requests.result(caller, request),
                 Command::ReleaseResult { request } => self.requests.release(caller, request),
-                Command::EffectFence { command } if matches!(&*command, amaterasu_contracts::effect_fence::EffectFenceCommand::BrokerEpoch {} | amaterasu_contracts::effect_fence::EffectFenceCommand::RecoveryRetired { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::SourceRetired { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostProviderJoined { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostProviderRetiring { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostProviderSlotReceipts { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostRetirementReceipt { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostRecoverHistorical { .. }) => self.handle_effect_fence(caller, *command, now),
+                Command::EffectFence { command } if matches!(&*command, amaterasu_contracts::effect_fence::EffectFenceCommand::BrokerEpoch {} | amaterasu_contracts::effect_fence::EffectFenceCommand::RecoveryRetired { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::SourceRetired { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostProviderJoined { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostProviderRetiring { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostProviderSlotReceipts { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostProviderSlotReceiptsPage { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostRetirementReceipt { .. } | amaterasu_contracts::effect_fence::EffectFenceCommand::HostRecoverHistorical { .. }) => self.handle_effect_fence(caller, *command, now),
                 _ => errors::permission_denied(),
             };
         }
@@ -644,6 +697,29 @@ impl Broker {
                     &provider,
                     &provider_incarnation,
                     slot,
+                )
+            }
+            EffectFenceCommand::HostProviderSlotReceiptsPage {
+                provider,
+                provider_incarnation,
+                slot,
+                after_sequence,
+            } => {
+                if caller != HOST_LIFECYCLE_CONTROL_PRINCIPAL
+                    || self
+                        .configuration
+                        .host_context
+                        .provider_incarnations
+                        .get(&provider)
+                        != Some(&provider_incarnation)
+                {
+                    return errors::permission_denied();
+                }
+                self.effect_fences.host_provider_slot_receipts_page(
+                    &provider,
+                    &provider_incarnation,
+                    slot,
+                    after_sequence,
                 )
             }
             EffectFenceCommand::HostProviderJoined {
@@ -1108,6 +1184,16 @@ impl Broker {
         let Some(key) = request.get("key").and_then(serde_json::Value::as_str) else {
             return false;
         };
+        if key.starts_with("host/effect-retirement/v2/") {
+            return request
+                .get("value")
+                .and_then(|value| {
+                    serde_json::from_value::<HostProviderRetirement>(value.clone()).ok()
+                })
+                .is_some_and(|receipt| {
+                    receipt.state_key() == key && self.effect_fences.captured_host_receipt(&receipt)
+                });
+        }
         let Some(revision) = request
             .get("expected_revision")
             .and_then(serde_json::Value::as_u64)
@@ -1151,7 +1237,13 @@ impl Broker {
             return false;
         };
         let key = format!("host/effect-retirement/v1/{:02}", receipt.issued_lease.slot);
-        if request.get("key").and_then(serde_json::Value::as_str) != Some(&key)
+        let request_key = request.get("key").and_then(serde_json::Value::as_str);
+        if request_key == Some(receipt.state_key().as_str()) {
+            return result.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
+                && result.get("found").and_then(serde_json::Value::as_bool) == Some(true)
+                && serde_json::to_value(receipt).ok().as_ref() == result.get("value");
+        }
+        if request_key != Some(&key)
             || result.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
             || result.get("found").and_then(serde_json::Value::as_bool) != Some(true)
             || result

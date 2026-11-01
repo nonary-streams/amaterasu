@@ -48,6 +48,17 @@ pub struct HostProviderRetirement {
     pub effect: GuardedEffectIdentity,
 }
 
+impl HostProviderRetirement {
+    /// Stable per-effect host namespace key; the slot incarnation cannot be
+    /// reused before durable retirement and the sequence is source-local.
+    pub fn state_key(&self) -> String {
+        format!(
+            "host/effect-retirement/v2/{:02}/{}/{}",
+            self.issued_lease.slot, self.issued_lease.incarnation, self.effect.sequence
+        )
+    }
+}
+
 /// Trusted startup policy. The authority must reconcile durable State and retire
 /// old issuer/provider workers before opening a source after broker restart.
 /// Authority, issuer and selected provider must be distinct principals. All
@@ -312,6 +323,15 @@ pub enum EffectFenceCommand {
         provider: String,
         provider_incarnation: ProviderIncarnation,
         slot: u8,
+    },
+    /// A stable snapshot page, captured when the exact provider joined. A
+    /// cursor is an exclusive sequence number; each page contains at most one
+    /// receipt to leave room for the normal broker response envelope.
+    HostProviderSlotReceiptsPage {
+        provider: String,
+        provider_incarnation: ProviderIncarnation,
+        slot: u8,
+        after_sequence: Option<u64>,
     },
     /// Reserved host endpoint: build a local-worker retirement record for an
     /// exact retained effect after the original provider instance has joined.

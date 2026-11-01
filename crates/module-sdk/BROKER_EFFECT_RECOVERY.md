@@ -105,17 +105,16 @@ The host currently generates 128-bit random incarnation IDs and rejects
 duplicates within a load. Their cross-restart uniqueness is probabilistic; the
 format does not claim a deterministic, durable uniqueness guarantee.
 
-The reserved host endpoint may read and CAS-write its own State namespace at
-`host/effect-retirement/v1/{slot:02}`, using `{version:1, receipts:[...]}` with
-at most 32 records. A new receipt must be constructed by the live broker after
-the host verifies the actual join; an older receipt can be retained only from a
-current authenticated read of the same host-owned key. After restart,
+The host reads the joined provider's stable broker snapshot one receipt at a
+time and CAS-writes each exact receipt in its State namespace at
+`host/effect-retirement/v2/{slot:02}/{slot-incarnation}/{sequence}`. A retry
+accepts an identical saved receipt and fails on a conflicting value. The broker
+continues to read the legacy v1 slot arrays during recovery. After restart,
 `HostRecoverHistorical` requires a retained host-namespace State Get containing
 the exact old receipt in addition to the pairing-journal read. The host must
 preserve unresolved records until its lifecycle and pairing cleanup complete.
-Automatic removal after confirmed pairing cleanup and slot close is not yet
-wired. A full 32-record slot fails closed until a trusted coordinator verifies
-which receipts are safe to remove; the host must not evict them by age.
+Removal after confirmed pairing cleanup and slot close is not yet wired; State
+capacity exhaustion remains fail-closed and the host must not evict by age.
 
 On shutdown, the host first fences a protected provider and polls its optional
 `amaterasu_module_retirement_v1` capability. Only an explicit successful result

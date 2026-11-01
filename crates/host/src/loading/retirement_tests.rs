@@ -249,7 +249,7 @@ fn scoped(
         },
     )
 }
-fn setup_broker(instance_digit: &str) -> (Broker, ProviderIncarnation) {
+fn setup_broker(instance_digit: &str, count: u64) -> (Broker, ProviderIncarnation) {
     let service = "example.effects/1";
     let mut config = RuntimeConfig {
         host_lifecycle_control: true,
@@ -426,8 +426,9 @@ fn setup_broker(instance_digit: &str) -> (Broker, ProviderIncarnation) {
     ) else {
         panic!()
     };
-    let selected = serde_json::from_value(payload).unwrap();
-    let effect = GuardedEffect {
+    let selected: amaterasu_contracts::effect_fence::SelectedEffectMethod =
+        serde_json::from_value(payload).unwrap();
+    let mut effect = GuardedEffect {
         scope,
         sequence: 1,
         capability: "example.effect".into(),
@@ -442,18 +443,24 @@ fn setup_broker(instance_digit: &str) -> (Broker, ProviderIncarnation) {
         operation_id: "operation.1".into(),
         parent: None,
     };
-    assert!(matches!(
-        scoped(
-            &mut broker,
-            "authority",
-            &lease,
-            EffectFenceCommand::ArmSelected {
-                effect: effect.clone(),
-                expected: Box::new(selected)
-            }
-        ),
-        Response::Ok
-    ));
+    for sequence in 1..=count {
+        effect.sequence = sequence;
+        effect.operation_id = format!("operation.{sequence}");
+        assert!(matches!(
+            scoped(
+                &mut broker,
+                "authority",
+                &lease,
+                EffectFenceCommand::ArmSelected {
+                    effect: effect.clone(),
+                    expected: Box::new(selected.clone())
+                }
+            ),
+            Response::Ok
+        ));
+    }
+    effect.sequence = 1;
+    effect.operation_id = "operation.1".into();
     assert!(matches!(
         scoped(
             &mut broker,
@@ -470,7 +477,7 @@ fn setup_broker(instance_digit: &str) -> (Broker, ProviderIncarnation) {
     (broker, instance)
 }
 
-fn exercise(mode: Mode) {
+fn exercise(mode: Mode, count: u64) {
     let path = std::env::temp_dir().join(format!(
         "host-retirement-{}-{}",
         std::process::id(),
@@ -480,7 +487,7 @@ fn exercise(mode: Mode) {
             .as_nanos()
     ));
     let store = TestStateStore::open(path.clone()).unwrap();
-    let (broker, incarnation) = setup_broker("a");
+    let (broker, incarnation) = setup_broker("a", count);
     let harness = Arc::new(Harness {
         broker: Mutex::new(broker),
         store,
@@ -569,7 +576,7 @@ fn exercise(mode: Mode) {
         &mut |_| Ok(()),
     )
     .unwrap();
-    loaded.retirement_providers = vec![("provider".into(), incarnation)];
+    loaded.retirement_providers = vec![("provider".into(), incarnation.clone())];
     loaded.retirement_state_provider = Some("state".into());
     let limit = if matches!(mode, Mode::Timeout | Mode::LateSuccess | Mode::LateDestroy) {
         Duration::from_millis(if matches!(mode, Mode::LateDestroy) {
@@ -583,35 +590,53 @@ fn exercise(mode: Mode) {
     let result = loaded.retire_effect_providers(Instant::now() + limit);
     assert_eq!(result.is_ok(), matches!(mode, Mode::Delayed));
     if matches!(mode, Mode::Delayed) {
+        // Repeating persistence must replay the same snapshot without growing
+        // State or replacing an existing, different receipt.
+        loaded
+            .persist_provider_retirements(
+                "provider",
+                &incarnation,
+                Instant::now() + Duration::from_secs(2),
+            )
+            .unwrap();
         loaded.retirement_providers.clear();
     }
     drop(loaded);
     let saved = harness.store.handle(
         HOST_LIFECYCLE_CONTROL_PRINCIPAL,
-        json!({"action":"get","key":"host/effect-retirement/v1/00"}),
+        json!({"action":"get","key":"host/effect-retirement/v2/00/1/1"}),
     );
     assert_eq!(saved["found"], matches!(mode, Mode::Delayed));
     if matches!(mode, Mode::Delayed) {
-        assert_eq!(saved["value"]["receipts"].as_array().unwrap().len(), 1);
+        for sequence in 1..=count {
+            let record = harness.store.handle(
+                HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+                json!({"action":"get","key":format!("host/effect-retirement/v2/00/1/{sequence}")}),
+            );
+            assert_eq!(record["value"]["effect"]["sequence"], sequence);
+        }
+    }
+    if matches!(mode, Mode::Delayed) {
+        assert_eq!(saved["value"]["effect"]["sequence"], 1);
     }
     drop(harness);
     let reopened = TestStateStore::open(path.clone()).unwrap();
     let saved_again = reopened.handle(
         HOST_LIFECYCLE_CONTROL_PRINCIPAL,
-        json!({"action":"get","key":"host/effect-retirement/v1/00"}),
+        json!({"action":"get","key":"host/effect-retirement/v2/00/1/1"}),
     );
     assert_eq!(saved_again["found"], matches!(mode, Mode::Delayed));
     if matches!(mode, Mode::Delayed) {
-        let (mut restarted, replacement_instance) = setup_broker("b");
+        let (mut restarted, replacement_instance) = setup_broker("b", 1);
         assert_ne!(
-            saved_again["value"]["receipts"][0]["provider_incarnation"]["id"],
+            saved_again["value"]["provider_incarnation"]["id"],
             replacement_instance.id
         );
         let Response::Accepted { id } = restarted.dispatch(
             HOST_LIFECYCLE_CONTROL_PRINCIPAL,
             Command::Request {
                 service: "amaterasu.state/1".into(),
-                payload: json!({"action":"get","key":"host/effect-retirement/v1/00"}),
+                payload: json!({"action":"get","key":"host/effect-retirement/v2/00/1/1"}),
                 timeout_ms: 30_000,
                 operation_id: "restart.read".into(),
                 parent: None,
@@ -650,29 +675,33 @@ fn exercise(mode: Mode) {
 
 #[test]
 fn delayed_worker_is_joined_before_durable_host_receipt() {
-    exercise(Mode::Delayed);
+    exercise(Mode::Delayed, 1);
+}
+#[test]
+fn full_slot_is_persisted_in_stable_retryable_records() {
+    exercise(Mode::Delayed, 32);
 }
 #[test]
 fn panicking_retirement_never_persists_a_receipt() {
-    exercise(Mode::Panic);
+    exercise(Mode::Panic, 1);
 }
 #[test]
 fn timeout_never_persists_a_late_receipt() {
-    exercise(Mode::Timeout);
+    exercise(Mode::Timeout, 1);
 }
 #[test]
 fn success_returning_after_deadline_never_persists_a_receipt() {
-    exercise(Mode::LateSuccess);
+    exercise(Mode::LateSuccess, 1);
 }
 #[test]
 fn swallowed_destructor_panic_never_persists_a_receipt() {
-    exercise(Mode::DestructorPanic);
+    exercise(Mode::DestructorPanic, 1);
 }
 #[test]
 fn checked_destruction_after_deadline_never_persists_a_receipt() {
-    exercise(Mode::LateDestroy);
+    exercise(Mode::LateDestroy, 1);
 }
 #[test]
 fn legacy_module_never_persists_a_receipt() {
-    exercise(Mode::Unsupported);
+    exercise(Mode::Unsupported, 1);
 }

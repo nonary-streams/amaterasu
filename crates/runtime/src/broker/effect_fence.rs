@@ -43,6 +43,8 @@ pub(super) struct EffectFences {
     slots: Option<super::source_slots::SourceSlots>,
     sources: BTreeMap<EffectScope, SourceState>,
     joined_providers: BTreeMap<String, ProviderIncarnation>,
+    joined_receipts: BTreeMap<(String, u8, u64), HostProviderRetirement>,
+    incomplete_receipt_snapshots: BTreeSet<String>,
     retiring_providers: BTreeSet<String>,
 }
 
@@ -102,6 +104,8 @@ impl EffectFences {
             slots,
             sources: BTreeMap::new(),
             joined_providers: BTreeMap::new(),
+            joined_receipts: BTreeMap::new(),
+            incomplete_receipt_snapshots: BTreeSet::new(),
             retiring_providers: BTreeSet::new(),
         })
     }
@@ -182,6 +186,9 @@ impl EffectFences {
         provider: &str,
         incarnation: &ProviderIncarnation,
     ) -> Vec<u64> {
+        if self.joined_providers.get(provider) == Some(incarnation) {
+            return Vec::new();
+        }
         let cancel = self.host_provider_retiring(provider, incarnation);
         self.joined_providers
             .insert(provider.to_owned(), incarnation.clone());
@@ -195,7 +202,76 @@ impl EffectFences {
                 }
             }
         }
+        // Capture once, before any authority can compact a record. Joined
+        // providers cannot admit more work, so this snapshot stays stable.
+        let mut receipts = Vec::new();
+        for (scope, source) in &self.sources {
+            for (sequence, record) in &source.records {
+                if record.provider == provider
+                    && record.provider_incarnation.as_ref() == Some(incarnation)
+                {
+                    if let Response::Result { payload } =
+                        self.host_retirement_receipt(scope, *sequence)
+                        && let Ok(receipt) =
+                            serde_json::from_value::<HostProviderRetirement>(payload)
+                    {
+                        receipts.push(receipt);
+                    } else {
+                        self.incomplete_receipt_snapshots
+                            .insert(provider.to_owned());
+                    }
+                }
+            }
+        }
+        for receipt in receipts {
+            self.joined_receipts.insert(
+                (
+                    provider.to_owned(),
+                    receipt.issued_lease.slot,
+                    receipt.effect.sequence,
+                ),
+                receipt,
+            );
+        }
         cancel
+    }
+    pub fn host_provider_slot_receipts_page(
+        &self,
+        provider: &str,
+        incarnation: &ProviderIncarnation,
+        slot: u8,
+        after: Option<u64>,
+    ) -> Response {
+        if slot >= 64 || self.joined_providers.get(provider) != Some(incarnation) {
+            return Response::error("effect_pending", "provider worker is not joined");
+        }
+        if self.incomplete_receipt_snapshots.contains(provider) {
+            return Response::error(
+                "recovery_required",
+                "provider receipt snapshot is incomplete",
+            );
+        }
+        let next = self
+            .joined_receipts
+            .iter()
+            .find(|((name, index, sequence), _)| {
+                name == provider && *index == slot && after.is_none_or(|last| *sequence > last)
+            })
+            .map(|(_, receipt)| receipt);
+        let payload =
+            json!({"receipt": next, "next_sequence": next.map(|receipt| receipt.effect.sequence)});
+        if !payload_fits(&payload) {
+            return capacity_exhausted();
+        }
+        Response::Result { payload }
+    }
+
+    pub fn captured_host_receipt(&self, receipt: &HostProviderRetirement) -> bool {
+        self.joined_receipts.get(&(
+            receipt.effect.provider.clone(),
+            receipt.issued_lease.slot,
+            receipt.effect.sequence,
+        )) == Some(receipt)
     }
     pub fn host_provider_slot_receipts(
         &self,

@@ -347,6 +347,12 @@ impl LoadedComponents {
         // In particular, no consumer can retain a native provider guard when
         // that provider's checked destructor is invoked.
         while let Some(mut module) = self.modules.pop() {
+            if self.retirement_state_provider.as_deref() == Some(&module.id) {
+                // Keep the State instance available for idempotent persistence
+                // retries; ordinary Drop will release it in dependency order.
+                self.modules.push(module);
+                break;
+            }
             let Some((provider, incarnation)) = providers
                 .iter()
                 .find(|(provider, _)| *provider == module.id)
@@ -508,70 +514,71 @@ impl LoadedComponents {
         incarnation: &amaterasu_contracts::effect_fence::ProviderIncarnation,
         deadline: std::time::Instant,
     ) -> PackageResult<()> {
-        use amaterasu_contracts::effect_fence::EffectFenceCommand;
+        use amaterasu_contracts::effect_fence::{EffectFenceCommand, HostProviderRetirement};
         for slot in 0..64_u8 {
-            if std::time::Instant::now() >= deadline {
-                return Err("retirement persistence timed out".into());
-            }
-            let command = Command::EffectFence {
-                command: Box::new(EffectFenceCommand::HostProviderSlotReceipts {
-                    provider: provider.into(),
-                    provider_incarnation: incarnation.clone(),
-                    slot,
-                }),
-            };
-            let Response::Result { payload } =
-                crate::worker::invoke(&self.lifecycle_endpoint, &command)?
-            else {
-                return Err("retirement receipts unavailable".into());
-            };
-            let current = payload
-                .get("receipts")
-                .and_then(serde_json::Value::as_array)
-                .ok_or("invalid retirement receipts")?;
-            if current.is_empty() {
-                continue;
-            }
-            let key = format!("host/effect-retirement/v1/{slot:02}");
-            let (lookup, read) =
-                self.retirement_state_request(json!({"action":"get","key":key}), deadline, true)?;
-            let revision = lookup
-                .get("revision")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or("invalid State revision")?;
-            let mut receipts = match lookup.get("found").and_then(serde_json::Value::as_bool) {
-                Some(false) => Vec::new(),
-                Some(true)
-                    if lookup
-                        .pointer("/value/version")
+            let mut after_sequence = None;
+            loop {
+                if std::time::Instant::now() >= deadline {
+                    return Err("retirement persistence timed out".into());
+                }
+                let command = Command::EffectFence {
+                    command: Box::new(EffectFenceCommand::HostProviderSlotReceiptsPage {
+                        provider: provider.into(),
+                        provider_incarnation: incarnation.clone(),
+                        slot,
+                        after_sequence,
+                    }),
+                };
+                let Response::Result { payload } =
+                    crate::worker::invoke(&self.lifecycle_endpoint, &command)?
+                else {
+                    return Err("retirement receipts unavailable".into());
+                };
+                let value = payload
+                    .get("receipt")
+                    .ok_or("invalid retirement receipt page")?;
+                if value.is_null() {
+                    break;
+                }
+                let receipt: HostProviderRetirement = serde_json::from_value(value.clone())
+                    .map_err(|_| "invalid retirement receipt")?;
+                if receipt.issued_lease.slot != slot
+                    || receipt.provider_incarnation != *incarnation
+                    || after_sequence.is_some_and(|sequence| receipt.effect.sequence <= sequence)
+                    || payload
+                        .get("next_sequence")
                         .and_then(serde_json::Value::as_u64)
-                        == Some(1) =>
+                        != Some(receipt.effect.sequence)
                 {
-                    lookup
-                        .pointer("/value/receipts")
-                        .and_then(serde_json::Value::as_array)
-                        .ok_or("invalid saved retirement records")?
-                        .clone()
+                    return Err("inconsistent retirement receipt page".into());
                 }
-                _ => return Err("invalid saved retirement records".into()),
-            };
-            for receipt in current {
-                if !receipts.contains(receipt) {
-                    receipts.push(receipt.clone());
+                after_sequence = Some(receipt.effect.sequence);
+                let key = receipt.state_key();
+                let (lookup, read) = self.retirement_state_request(
+                    json!({"action":"get","key":key}),
+                    deadline,
+                    true,
+                )?;
+                let revision = lookup
+                    .get("revision")
+                    .and_then(serde_json::Value::as_u64)
+                    .ok_or("invalid State revision")?;
+                match lookup.get("found").and_then(serde_json::Value::as_bool) {
+                    Some(false) => {
+                        self.retirement_state_request(json!({"action":"set","key":key,"value":receipt,"expected_revision":revision}), deadline, false)?;
+                    }
+                    Some(true) if lookup.get("value") == Some(value) => {}
+                    _ => return Err("conflicting saved retirement receipt".into()),
                 }
-            }
-            if receipts.len() > 32 {
-                return Err("retirement receipt slot is full".into());
-            }
-            self.retirement_state_request(json!({"action":"set","key":key,"value":{"version":1,"receipts":receipts},"expected_revision":revision}), deadline, false)?;
-            if !matches!(
-                crate::worker::invoke(
-                    &self.lifecycle_endpoint,
-                    &Command::ReleaseResult { request: read }
-                )?,
-                Response::Ok
-            ) {
-                return Err("retirement State read release failed".into());
+                if !matches!(
+                    crate::worker::invoke(
+                        &self.lifecycle_endpoint,
+                        &Command::ReleaseResult { request: read }
+                    )?,
+                    Response::Ok
+                ) {
+                    return Err("retirement State read release failed".into());
+                }
             }
         }
         Ok(())
