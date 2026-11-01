@@ -19,6 +19,7 @@ struct Provider {
     invalid_status: bool,
     audio_failed: bool,
     send_busy: bool,
+    send_failed: bool,
     sent_control: Vec<(u64, u32, u32, u32, Vec<u8>)>,
     control_failed: bool,
     pcm_failed: bool,
@@ -287,7 +288,9 @@ unsafe extern "C" fn send_control(
         message.delivery,
         bytes.to_vec(),
     ));
-    if provider.send_busy {
+    if provider.send_failed {
+        MEDIA_BACKEND_ERROR
+    } else if provider.send_busy {
         MEDIA_BUSY
     } else {
         STATUS_OK
@@ -794,6 +797,287 @@ fn source_feedback_lease_holds_authority_during_blocked_native_enqueue() {
     let mut aggregate = lease
         .retire(&receipt)
         .unwrap_or_else(|_| panic!("retirement"));
+    authority.complete_stream(&mut aggregate);
+    authority.drain();
+}
+
+#[test]
+fn source_feedback_queue_retains_busy_stop_and_reconciles_lost_producer_ack() {
+    use amaterasu_module_sdk::effect_authority::consumer::{FeedbackLease, TransportRetirement};
+    use amaterasu_module_sdk::transport::control_retirement::Receipt;
+    let (mut authority, aggregate) =
+        effect_authority_test::Fixture::stream_admitted(source_feedback_scope(50, &"c".repeat(32)));
+    let retirement = TransportRetirement {
+        stream: 50,
+        operation_id: "retire".into(),
+        provider_epoch: "c".repeat(32),
+    };
+    let lease = FeedbackLease::new(aggregate, retirement, 7, source_feedback_capabilities())
+        .unwrap_or_else(|_| panic!("lease"));
+    let mut queue = SourceFeedbackPending::new(lease);
+    let mut host = Host::new();
+    let backend = NativeBackend::new(
+        &host.runtime(),
+        handles(),
+        &crate::providers::ProviderServices::default(),
+    )
+    .unwrap();
+    let mut pump = Pump::new(backend);
+    for sequence in 1..=300 {
+        let operation = format!("pcm-{sequence}");
+        let feedback = scoped_pcm(sequence as u32);
+        assert_eq!(
+            queue.enqueue(sequence, &operation, feedback.clone()),
+            Ok(SourceFeedbackAdmission::Pending)
+        );
+        assert_eq!(
+            queue
+                .pump(|lease, seq, op, message| pump.send_source_feedback(lease, seq, op, message))
+                .unwrap(),
+            SourceFeedbackProgress::Sent(sequence)
+        );
+        // Lost producer acknowledgement: the exact repeated peek cannot resend.
+        assert_eq!(
+            queue.enqueue(sequence, &operation, feedback),
+            Ok(SourceFeedbackAdmission::AlreadySent)
+        );
+        assert_eq!(
+            queue.pump(|_, _, _, _| panic!("must not resend")).unwrap(),
+            SourceFeedbackProgress::AwaitingAcknowledgment(sequence)
+        );
+        queue.acknowledge(sequence, &operation).unwrap();
+    }
+    assert_eq!(host.provider.sent_control.len(), 300);
+    assert_eq!(authority.gate.in_flight(), 1);
+    let stop = scoped_rumble(7);
+    assert_eq!(
+        queue.enqueue(301, "stop", stop.clone()),
+        Ok(SourceFeedbackAdmission::Pending)
+    );
+    host.provider.send_busy = true;
+    assert_eq!(
+        queue
+            .pump(|lease, seq, op, message| pump.send_source_feedback(lease, seq, op, message))
+            .unwrap(),
+        SourceFeedbackProgress::Busy
+    );
+    assert_eq!(
+        queue.enqueue(301, "stop", stop),
+        Ok(SourceFeedbackAdmission::AlreadyPending)
+    );
+    assert_eq!(
+        queue.enqueue(302, "next", scoped_rumble(7)),
+        Err(SourceFeedbackAdmissionError::Busy)
+    );
+    let changed = HostFeedback::Rumble {
+        controller: 7,
+        low_frequency: 1,
+        high_frequency: 0,
+    };
+    assert_eq!(
+        queue.enqueue(301, "stop", changed),
+        Err(SourceFeedbackAdmissionError::ConflictingRetry)
+    );
+    host.provider.send_busy = false;
+    assert_eq!(
+        queue
+            .pump(|lease, seq, op, message| pump.send_source_feedback(lease, seq, op, message))
+            .unwrap(),
+        SourceFeedbackProgress::Sent(301)
+    );
+    queue.acknowledge(301, "stop").unwrap();
+    assert_eq!(
+        queue.enqueue(301, "stop", scoped_rumble(7)),
+        Err(SourceFeedbackAdmissionError::Stale)
+    );
+    assert_eq!(
+        queue.enqueue(302, "wrong-device", scoped_rumble(8)),
+        Err(SourceFeedbackAdmissionError::WrongDevice)
+    );
+    authority.fence();
+    let mut lease = queue.fence().unwrap();
+    assert_eq!(
+        queue.enqueue(302, "after-revoke", scoped_rumble(7)),
+        Err(SourceFeedbackAdmissionError::Stopped)
+    );
+    let receipt = Receipt {
+        ok: true,
+        state: "retired".into(),
+        scope: "whole_control_stream".into(),
+        stream: 50,
+        operation_id: "retire".into(),
+        provider_epoch: "c".repeat(32),
+    };
+    let mut aggregate = lease.retire(&receipt).unwrap_or_else(|_| panic!("retire"));
+    authority.complete_stream(&mut aggregate);
+    authority.drain();
+}
+
+#[test]
+fn source_feedback_queue_fence_cancels_busy_retry_without_acknowledging() {
+    use amaterasu_module_sdk::effect_authority::consumer::{FeedbackLease, TransportRetirement};
+    use amaterasu_module_sdk::transport::control_retirement::Receipt;
+    let (mut authority, aggregate) =
+        effect_authority_test::Fixture::stream_admitted(source_feedback_scope(50, &"c".repeat(32)));
+    let retirement = TransportRetirement {
+        stream: 50,
+        operation_id: "retire".into(),
+        provider_epoch: "c".repeat(32),
+    };
+    let lease = FeedbackLease::new(aggregate, retirement, 7, source_feedback_capabilities())
+        .unwrap_or_else(|_| panic!("lease"));
+    let mut queue = SourceFeedbackPending::new(lease);
+    let mut host = Host::new();
+    host.provider.send_busy = true;
+    let backend = NativeBackend::new(
+        &host.runtime(),
+        handles(),
+        &crate::providers::ProviderServices::default(),
+    )
+    .unwrap();
+    let mut pump = Pump::new(backend);
+    queue.enqueue(1, "stop", scoped_rumble(7)).unwrap();
+    assert_eq!(
+        queue
+            .pump(|lease, seq, op, message| pump.send_source_feedback(lease, seq, op, message))
+            .unwrap(),
+        SourceFeedbackProgress::Busy
+    );
+    assert!(queue.acknowledge(1, "stop").is_err());
+    authority.fence();
+    let mut lease = queue.fence().unwrap();
+    let receipt = Receipt {
+        ok: true,
+        state: "retired".into(),
+        scope: "whole_control_stream".into(),
+        stream: 50,
+        operation_id: "retire".into(),
+        provider_epoch: "c".repeat(32),
+    };
+    let mut aggregate = lease.retire(&receipt).unwrap_or_else(|_| panic!("retire"));
+    authority.complete_stream(&mut aggregate);
+    authority.drain();
+}
+
+#[test]
+fn source_feedback_queue_drops_only_best_effort_pcm_before_reliable_stop() {
+    use amaterasu_module_sdk::effect_authority::consumer::{FeedbackLease, TransportRetirement};
+    use amaterasu_module_sdk::transport::control_retirement::Receipt;
+    let (mut authority, aggregate) =
+        effect_authority_test::Fixture::stream_admitted(source_feedback_scope(50, &"c".repeat(32)));
+    let retirement = TransportRetirement {
+        stream: 50,
+        operation_id: "retire".into(),
+        provider_epoch: "c".repeat(32),
+    };
+    let lease = FeedbackLease::new(aggregate, retirement, 7, source_feedback_capabilities())
+        .unwrap_or_else(|_| panic!("lease"));
+    let mut queue = SourceFeedbackPending::new(lease);
+    let mut host = Host::new();
+    host.provider.send_busy = true;
+    let backend = NativeBackend::new(
+        &host.runtime(),
+        handles(),
+        &crate::providers::ProviderServices::default(),
+    )
+    .unwrap();
+    let mut pump = Pump::new(backend);
+    queue.enqueue(1, "pcm", scoped_pcm(1)).unwrap();
+    assert_eq!(
+        queue
+            .pump(|lease, seq, op, message| pump.send_source_feedback(lease, seq, op, message))
+            .unwrap(),
+        SourceFeedbackProgress::Busy
+    );
+    assert_eq!(queue.drop_best_effort().unwrap(), Some(1));
+    assert_eq!(
+        queue.enqueue(1, "pcm", scoped_pcm(1)),
+        Ok(SourceFeedbackAdmission::AlreadyDropped)
+    );
+    assert_eq!(
+        queue.enqueue(2, "stop", scoped_rumble(7)),
+        Err(SourceFeedbackAdmissionError::Busy)
+    );
+    queue.acknowledge(1, "pcm").unwrap();
+    queue.enqueue(2, "stop", scoped_rumble(7)).unwrap();
+    assert_eq!(
+        queue
+            .pump(|lease, seq, op, message| pump.send_source_feedback(lease, seq, op, message))
+            .unwrap(),
+        SourceFeedbackProgress::Busy
+    );
+    assert_eq!(queue.drop_best_effort().unwrap(), None);
+    authority.fence();
+    let mut lease = queue.fence().unwrap();
+    let receipt = Receipt {
+        ok: true,
+        state: "retired".into(),
+        scope: "whole_control_stream".into(),
+        stream: 50,
+        operation_id: "retire".into(),
+        provider_epoch: "c".repeat(32),
+    };
+    let mut aggregate = lease.retire(&receipt).unwrap_or_else(|_| panic!("retire"));
+    authority.complete_stream(&mut aggregate);
+    authority.drain();
+}
+
+#[test]
+fn source_feedback_queue_reconciles_busy_then_uncertain_send_only_after_retirement() {
+    use amaterasu_module_sdk::effect_authority::consumer::{FeedbackLease, TransportRetirement};
+    use amaterasu_module_sdk::transport::control_retirement::Receipt;
+    let (mut authority, aggregate) =
+        effect_authority_test::Fixture::stream_admitted(source_feedback_scope(50, &"c".repeat(32)));
+    let retirement = TransportRetirement {
+        stream: 50,
+        operation_id: "retire".into(),
+        provider_epoch: "c".repeat(32),
+    };
+    let lease = FeedbackLease::new(aggregate, retirement, 7, source_feedback_capabilities())
+        .unwrap_or_else(|_| panic!("lease"));
+    let mut queue = SourceFeedbackPending::new(lease);
+    let mut host = Host::new();
+    host.provider.send_busy = true;
+    let backend = NativeBackend::new(
+        &host.runtime(),
+        handles(),
+        &crate::providers::ProviderServices::default(),
+    )
+    .unwrap();
+    let mut pump = Pump::new(backend);
+    queue.enqueue(1, "stop", scoped_rumble(7)).unwrap();
+    assert_eq!(
+        queue
+            .pump(|lease, seq, op, message| pump.send_source_feedback(lease, seq, op, message))
+            .unwrap(),
+        SourceFeedbackProgress::Busy
+    );
+    host.provider.send_busy = false;
+    host.provider.send_failed = true;
+    assert_eq!(
+        queue.pump(|lease, seq, op, message| pump.send_source_feedback(lease, seq, op, message)),
+        Err("native_feedback_failed")
+    );
+    assert_eq!(
+        queue.enqueue(2, "late", scoped_rumble(7)),
+        Err(SourceFeedbackAdmissionError::Stopped)
+    );
+    authority.fence();
+    assert_eq!(authority.gate.in_flight(), 1);
+    assert!(queue.fence().is_err());
+    let mut receipt = Receipt {
+        ok: true,
+        state: "retired".into(),
+        scope: "whole_control_stream".into(),
+        stream: 51,
+        operation_id: "retire".into(),
+        provider_epoch: "c".repeat(32),
+    };
+    assert!(queue.retire_after_receipt(&receipt).is_err());
+    receipt.stream = 50;
+    let mut aggregate = queue
+        .retire_after_receipt(&receipt)
+        .unwrap_or_else(|_| panic!("retire"));
     authority.complete_stream(&mut aggregate);
     authority.drain();
 }

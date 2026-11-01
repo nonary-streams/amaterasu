@@ -168,7 +168,27 @@ an authenticated revoke signal for each selected effect owner.
 The owner must coordinate the actual in-flight input producer, plane calls,
 control-transport `retire`/`retirement_status`, scoped lease completion,
 acknowledgment, and matching pairing drain. The lifecycle join must establish the
-source/device-to-slot mapping; `StreamScope` alone does not carry the slot.
+source/device-to-slot mapping; `StreamScope` carries the slot but does not
+prove that the source owns it.
 None of these callsites is activated by this branch. The production binding
 remains blocked pending that join, host-configuration fencing, combined broker
 and provider tests, owner-restart proof, and independent review.
+
+
+`SourceFeedbackPending` is a dormant, single-item source queue for that future
+coordinator. It retains the exact item after local transport admission until
+producer acknowledgment, so a repeated peek cannot resend it. A busy reliable
+item stays queued and applies backpressure. A busy best-effort PCM item may be
+explicitly dropped, but the dropped sequence remains pending producer
+acknowledgment before a later stop can advance. On a native error the queue
+fences itself; if an earlier busy retry has an uncertain outcome, it can only
+reconcile the lease after a verified whole-stream retirement receipt. The
+queue does not itself authenticate a source or install a production route.
+
+The queue owns its `FeedbackLease` as an in-process Rust value. Pairing admits
+only one selected direct effect-owner principal, so startup composition must
+select the stream-session owner or provide a reviewed broker-mediated ownership
+handshake that retains the ticket with the selected owner. An SDK Rust value
+must not be passed across the module ABI, and a copied JSON label is not a
+replacement for the authority ticket. Source input effects and feedback must
+share that single owner policy before activation.

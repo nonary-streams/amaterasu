@@ -2,6 +2,15 @@
 //! pipeline; this plane owns only bindings and bounded copied pending output.
 mod native;
 mod packets;
+// The authenticated source route is intentionally not installed yet.
+#[allow(dead_code)]
+pub(super) mod source_feedback;
+
+#[cfg(test)]
+use source_feedback::{
+    Admission as SourceFeedbackAdmission, AdmissionError as SourceFeedbackAdmissionError,
+};
+use source_feedback::{Progress as SourceFeedbackProgress, SourceFeedbackPending};
 
 use amaterasu_gamestream::control::{
     FeedbackEncodeError, HostFeedback, HostFeedbackDelivery, HostFeedbackMessage,
@@ -204,6 +213,17 @@ impl Plane {
     ) -> PlaneResult<bool> {
         self.pump
             .send_source_feedback(lease, sequence, operation_id, feedback)
+    }
+
+    /// Pump one source-owned feedback item through the selected native transport.
+    #[allow(dead_code)]
+    pub fn pump_source_feedback(
+        &mut self,
+        queue: &mut SourceFeedbackPending,
+    ) -> PlaneResult<SourceFeedbackProgress> {
+        queue.pump(|lease, sequence, operation, feedback| {
+            self.send_source_feedback(lease, sequence, operation, feedback)
+        })
     }
 
     /// Stops new PCM capture and cancels pending feedback. The pipeline separately
