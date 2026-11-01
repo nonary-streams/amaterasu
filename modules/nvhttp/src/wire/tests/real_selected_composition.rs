@@ -189,6 +189,124 @@ fn real_selected_composition() {
     assert!(executed, "unknown AMATERASU_COMPOSITION_CASE");
 }
 
+#[test]
+#[ignore = "requires independently built runtime and sequenced provider artifacts"]
+fn sequenced_provider_real_broker_stress() {
+    let artifacts = PathBuf::from(
+        std::env::var_os("AMATERASU_COMPOSITION_ARTIFACT_DIR").expect("artifact directory"),
+    );
+    let implementation =
+        std::env::var("AMATERASU_RANGE_IMPLEMENTATION").expect("provider or replacement");
+    let (principal, provider_artifact, mode) = match implementation.as_str() {
+        "provider" => (
+            "executor",
+            PathBuf::from(std::env::var_os("AMATERASU_EXECUTOR_ARTIFACT").unwrap()),
+            "range_supported",
+        ),
+        "replacement" => (
+            "replacement",
+            PathBuf::from(std::env::var_os("AMATERASU_REPLACEMENT_ARTIFACT").unwrap()),
+            "limiter_range",
+        ),
+        _ => panic!("unknown implementation"),
+    };
+    let policy = json!({"range-tester":{"initiators":["range-tester"],"lifecycle":true}});
+    let mut config = json!({"principals":{
+        "range-tester":{"call":["example.library.provider/2"]},
+    },"settings":{}});
+    config["principals"][principal] = json!({"provide":["example.library.provider/1","example.library.provider/2","fixture.library/2","fixture.policy/2"]});
+    config["settings"][principal] = if implementation == "provider" {
+        json!({"callers":policy,"limiter_mode":mode})
+    } else {
+        json!({"certificate_id":"a".repeat(64),"mode":mode,"range_callers":policy})
+    };
+    let runtime = Runtime::new(&artifact(&artifacts, "amaterasu_runtime"), config);
+    let mut provider = LoadedModule::start(&provider_artifact, &runtime.endpoint(principal));
+    let client = runtime.client("range-tester");
+    let mut sequence_id = 0u64;
+    let mut call = |payload: Value| {
+        sequence_id += 1;
+        let request = broker_request(
+            &client,
+            "example.library.provider/2",
+            payload,
+            &format!("range-broker-{sequence_id}"),
+        );
+        for _ in 0..100 {
+            provider.tick();
+            if let Some(result) = take(&client, request) {
+                return result;
+            }
+        }
+        panic!("sequenced provider request stalled")
+    };
+    let identity = call(json!({"action":"identity"}));
+    let incarnation = identity["provider_incarnation"].as_str().unwrap();
+    for sequence in 1..=1200u64 {
+        let position = json!({"generation":"broker-generation","sequence":sequence});
+        let operation = format!("lim2.broker-generation.{sequence:016x}");
+        let policy = json!({"source":"library","version":1,"application":{"library":"games","id":"opaque"},"entry_revision":"entry","policy_revision":"policy","policy_source":"authority","snapshot_id":"snapshot"});
+        let target = json!({"version":1,"stage":"reserve","operation_id":operation,"application_id":"fixture-game","provider_incarnation":incarnation,"ticket":null,"policy_identity":policy});
+        let reservation = json!({"version":2,"position":position,"target":target,"original_initiator":"range-tester"});
+        assert_eq!(
+            call(json!({"action":"attest_limiter_target_v2","request":reservation}))["ok"],
+            true
+        );
+        let start = json!({"version":2,"action":"launch","reservation":reservation});
+        assert_eq!(
+            call(json!({"action":"limiter_lifecycle_v2","request":start}))["lifecycle"]["observation"]
+                ["state"],
+            "running"
+        );
+        let fence = json!({"version":2,"generation":"broker-generation","through":sequence,"provider_incarnation":incarnation,"original_initiator":"range-tester"});
+        assert_ne!(
+            call(json!({"action":"fence_limiter_targets_v2","request":fence}))["ok"],
+            true
+        );
+        assert_eq!(
+            call(
+                json!({"action":"limiter_lifecycle_v2","request":{"version":2,"action":"recover_stop","reservation":reservation}})
+            )["lifecycle"]["observation"]["state"],
+            "stopped"
+        );
+        let retire = json!({"version":2,"position":position,"retirement":{"version":1,"operation_id":operation,"application_id":"fixture-game","provider_incarnation":incarnation,"original_initiator":"range-tester","policy_identity":policy}});
+        assert_eq!(
+            call(json!({"action":"retire_limiter_target_v2","request":retire}))["retirement"]["retired"],
+            true
+        );
+        assert_eq!(
+            call(json!({"action":"fence_limiter_targets_v2","request":fence}))["fence"]["fenced"],
+            true
+        );
+        assert_ne!(
+            call(json!({"action":"attest_limiter_target_v2","request":reservation}))["ok"],
+            true
+        );
+        assert_ne!(
+            call(json!({"action":"limiter_lifecycle_v2","request":start}))["ok"],
+            true
+        );
+        if sequence == 1200 {
+            assert_eq!(
+                call(json!({"action":"fence_limiter_targets_v2","request":fence}))["fence"]["fenced"],
+                true
+            );
+            let mut foreign = fence.clone();
+            foreign["original_initiator"] = json!("foreign");
+            assert_ne!(
+                call(json!({"action":"fence_limiter_targets_v2","request":foreign}))["ok"],
+                true
+            );
+            let mut stale = fence.clone();
+            stale["provider_incarnation"] = json!("stale-incarnation");
+            assert_ne!(
+                call(json!({"action":"fence_limiter_targets_v2","request":stale}))["ok"],
+                true
+            );
+        }
+    }
+}
+
 fn run_composition(replacement: bool, scenario: &str) {
     let artifacts = PathBuf::from(
         std::env::var_os("AMATERASU_COMPOSITION_ARTIFACT_DIR").expect("set artifact directory"),

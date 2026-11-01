@@ -21,6 +21,9 @@ struct Settings {
     mode: String,
     #[serde(default)]
     limiter_capacity: usize,
+    #[serde(default)]
+    range_callers:
+        BTreeMap<String, amaterasu_module_sdk::application_library::provider_adapter::CallerPolicy>,
 }
 struct GeneratedLibrary {
     mode: String,
@@ -599,6 +602,11 @@ struct Module {
     executor: amaterasu_module_sdk::application_library::provider_adapter::ProviderAdapter<
         GeneratedExecutor,
     >,
+    sequenced_executor: Option<
+        amaterasu_module_sdk::application_library::provider_adapter::ProviderAdapter<
+            GeneratedExecutor,
+        >,
+    >,
 }
 impl ManagedModule for Module {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
@@ -637,7 +645,15 @@ impl ManagedModule for Module {
         .map_err(str::to_owned)?;
         let mut nonce = [0u8; 16];
         getrandom::fill(&mut nonce).map_err(|_| "entropy unavailable")?;
-        let incarnation = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+        let incarnation: String = nonce.iter().map(|byte| format!("{byte:02x}")).collect();
+        let sequenced_executor = if executor_mode == "limiter_range" {
+            Some(amaterasu_module_sdk::application_library::provider_adapter::ProviderAdapter::with_sequenced_policies(
+                GeneratedExecutor { incarnation:incarnation.clone(), mode:executor_mode.clone(), limiter_capacity:if settings.limiter_capacity == 0 { 4096 } else { settings.limiter_capacity.min(4096) }, limiter_v2:Default::default(), operations:BTreeMap::new(), reservations:BTreeMap::new(), retirements:BTreeMap::new() },
+                "example.library.provider/2".into(), settings.range_callers,
+            ).map_err(str::to_owned)?)
+        } else {
+            None
+        };
         let executor=amaterasu_module_sdk::application_library::provider_adapter::ProviderAdapter::with_policies(
             GeneratedExecutor { incarnation, mode:executor_mode, limiter_capacity:if settings.limiter_capacity == 0 { 4096 } else { settings.limiter_capacity.min(4096) }, limiter_v2:Default::default(), operations:BTreeMap::new(), reservations:BTreeMap::new(), retirements:BTreeMap::new() },
             "example.library.provider/1".into(), BTreeMap::from([("amaterasu.launch".into(),amaterasu_module_sdk::application_library::provider_adapter::CallerPolicy { initiators:["amaterasu.nvhttp".into(),"amaterasu.launch".into()].into(), lifecycle:true,..Default::default() })])
@@ -651,11 +667,17 @@ impl ManagedModule for Module {
                 service: service.into(),
             })?;
         }
+        if sequenced_executor.is_some() {
+            runtime.require_success(Command::Register {
+                service: "example.library.provider/2".into(),
+            })?;
+        }
         Ok(Self {
             runtime,
             library,
             policy,
             executor,
+            sequenced_executor,
         })
     }
     fn tick(&mut self) -> ModuleResult<()> {
@@ -664,6 +686,11 @@ impl ManagedModule for Module {
                 self.library.dispatch(&request)
             } else if request.service == "fixture.policy/2" {
                 self.policy.dispatch(&request)
+            } else if request.service == "example.library.provider/2" {
+                self.sequenced_executor
+                    .as_mut()
+                    .ok_or("sequenced provider unavailable")?
+                    .dispatch(&request)
             } else {
                 self.executor.dispatch(&request)
             };

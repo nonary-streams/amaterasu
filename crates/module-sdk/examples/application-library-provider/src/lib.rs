@@ -13,6 +13,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 
 const SERVICE: &str = "example.library.provider/1";
+const SEQUENCED_SERVICE: &str = "example.library.provider/2";
 const COVER: &[u8] = &[
     137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 4, 0,
     0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 252, 255, 31, 0, 3, 3, 2, 0,
@@ -486,6 +487,7 @@ impl Provider for Fixture {
 struct Module {
     runtime: RuntimeClient,
     adapter: ProviderAdapter<Fixture>,
+    sequenced_adapter: Option<ProviderAdapter<Fixture>>,
 }
 impl ManagedModule for Module {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
@@ -495,22 +497,52 @@ impl ManagedModule for Module {
         let settings: Settings =
             serde_json::from_value(payload).map_err(|error| error.to_string())?;
         let mut fixture = Fixture::new().map_err(str::to_owned)?;
-        fixture.limiter_mode = settings.limiter_mode;
+        fixture.limiter_mode = settings.limiter_mode.clone();
         fixture.limiter_capacity = if settings.limiter_capacity == 0 {
             4096
         } else {
             settings.limiter_capacity.min(4096)
+        };
+        let sequenced_adapter = if settings.limiter_mode == "range_supported" {
+            let mut sequenced = Fixture::new().map_err(str::to_owned)?;
+            sequenced.limiter_mode = settings.limiter_mode.clone();
+            Some(
+                ProviderAdapter::with_sequenced_policies(
+                    sequenced,
+                    SEQUENCED_SERVICE.into(),
+                    settings.callers.clone(),
+                )
+                .map_err(str::to_owned)?,
+            )
+        } else {
+            None
         };
         let adapter = ProviderAdapter::with_policies(fixture, SERVICE.into(), settings.callers)
             .map_err(str::to_owned)?;
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
-        Ok(Self { runtime, adapter })
+        if sequenced_adapter.is_some() {
+            runtime.require_success(Command::Register {
+                service: SEQUENCED_SERVICE.into(),
+            })?;
+        }
+        Ok(Self {
+            runtime,
+            adapter,
+            sequenced_adapter,
+        })
     }
     fn tick(&mut self) -> ModuleResult<()> {
         if let Some(request) = self.runtime.poll_serialized()? {
-            let response = self.adapter.dispatch(&request);
+            let response = if request.service == SEQUENCED_SERVICE {
+                self.sequenced_adapter
+                    .as_mut()
+                    .ok_or("sequenced provider unavailable")?
+                    .dispatch(&request)
+            } else {
+                self.adapter.dispatch(&request)
+            };
             self.runtime.complete_serialized(request.id, &response)?;
         }
         Ok(())
