@@ -1,6 +1,7 @@
 //! Safe module-facing API. ABI ownership and panic containment live in `exports`.
 pub mod application_library;
 pub mod audio;
+pub mod broker_effect_fence;
 pub mod capture;
 pub mod configuration;
 pub mod data_plane;

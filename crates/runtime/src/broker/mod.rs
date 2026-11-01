@@ -1,5 +1,6 @@
 mod api;
 mod configuration;
+mod effect_fence;
 mod errors;
 mod events;
 mod hooks;
@@ -29,6 +30,7 @@ pub struct Broker {
     logging_revision: u64,
     logging_policy_received: bool,
     api: ApiRegistry,
+    effect_fences: effect_fence::EffectFences,
 }
 
 const HOST_LIFECYCLE_QUEUE_CAPACITY: usize = 8;
@@ -60,6 +62,7 @@ impl Broker {
         Ok(Self {
             hooks: HookRegistry::new(configuration.hooks.clone()),
             api: ApiRegistry::new(&configuration),
+            effect_fences: effect_fence::EffectFences::new(&configuration)?,
             configuration,
             requests,
             events: EventBus::default(),
@@ -278,6 +281,7 @@ impl Broker {
                 },
                 true,
             ),
+            Command::EffectFence { command } => self.handle_effect_fence(caller, *command, now),
             Command::CallApi {
                 service,
                 method,
@@ -288,7 +292,11 @@ impl Broker {
                 operation_id,
                 parent,
             } => {
-                if service == HOST_LOG_SERVICE {
+                if service == HOST_LOG_SERVICE
+                    || self
+                        .effect_fences
+                        .direct_call_denied(&service, &method, interface_major)
+                {
                     return errors::permission_denied();
                 }
                 let initiator = match parent {
@@ -335,7 +343,9 @@ impl Broker {
                 operation_id,
                 parent,
             } => {
-                if service == HOST_LOG_SERVICE && caller != "amaterasu.management" {
+                if (service == HOST_LOG_SERVICE && caller != "amaterasu.management")
+                    || self.effect_fences.direct_service_denied(&service)
+                {
                     return errors::permission_denied();
                 }
                 if self.api.owns_service(&service) {
@@ -351,7 +361,13 @@ impl Broker {
                 };
                 self.requests.submit(caller, grants, options, now)
             }
-            Command::Poll {} => self.requests.poll(caller, now),
+            Command::Poll {} => {
+                let response = self.requests.poll(caller, now);
+                if let Response::Request { id, .. } = &response {
+                    self.effect_fences.delivered(*id);
+                }
+                response
+            }
             Command::CheckRequest { request } => self.requests.check_active(caller, request),
             Command::Complete { request, payload } => {
                 self.requests.complete(caller, request, payload, now)
@@ -407,6 +423,128 @@ impl Broker {
                     .advance(caller, grants, invocation, now, &mut self.requests)
             }
         }
+    }
+
+    fn handle_effect_fence(
+        &mut self,
+        caller: &str,
+        command: amaterasu_contracts::effect_fence::EffectFenceCommand,
+        now: Instant,
+    ) -> Response {
+        use amaterasu_contracts::effect_fence::EffectFenceCommand;
+        match command {
+            EffectFenceCommand::OpenSource {
+                scope,
+                retired_through,
+            } => self.effect_fences.open(caller, scope, retired_through),
+            EffectFenceCommand::Compact {
+                scope,
+                retired_through,
+            } => self.effect_fences.compact(caller, &scope, retired_through),
+            EffectFenceCommand::ProviderRetired { request } => {
+                self.effect_fences.provider_retired(caller, request)
+            }
+            EffectFenceCommand::Lookup { effect } => self.effect_fences.lookup(caller, &effect),
+            EffectFenceCommand::Arm { effect } => {
+                let Some(provider) = self.effect_provider(&effect) else {
+                    return errors::permission_denied();
+                };
+                self.effect_fences.arm(caller, effect, &provider)
+            }
+            EffectFenceCommand::Fence { effect } => {
+                let Some(provider) = self.effect_provider(&effect) else {
+                    return errors::permission_denied();
+                };
+                match self.effect_fences.fence(caller, effect, &provider) {
+                    Ok(Some(request)) => {
+                        let issuer = self
+                            .effect_fences
+                            .issuer_name()
+                            .expect("configured authority");
+                        // Under this lock the request has never been delivered. It may
+                        // already have expired or been released.
+                        let _ = self.requests.cancel(issuer, request, now);
+                        Response::Ok
+                    }
+                    Ok(None) => Response::Ok,
+                    Err(error) => error,
+                }
+            }
+            EffectFenceCommand::Dispatch { effect } => {
+                match self.effect_fences.may_dispatch(caller, &effect) {
+                    Ok(Some(id)) => {
+                        return if self.requests.retained(caller, id) {
+                            Response::Accepted { id }
+                        } else {
+                            Response::error(
+                                "effect_admission_expired",
+                                "admitted request is no longer retained",
+                            )
+                        };
+                    }
+                    Ok(None) => {}
+                    Err(error) => return error,
+                }
+                let Some(grants) = self.configuration.principals.get(caller) else {
+                    return errors::permission_denied();
+                };
+                let initiator = match effect.parent {
+                    Some(parent) => match self.requests.initiator_for_parent(caller, parent) {
+                        Ok(initiator) => initiator.to_owned(),
+                        Err(error) => return error,
+                    },
+                    None => caller.to_owned(),
+                };
+                let (payload, response_schema) = match self.api.callable(
+                    caller,
+                    &initiator,
+                    grants,
+                    ApiInvocation {
+                        service: &effect.service,
+                        method: &effect.method,
+                        major: effect.interface_major,
+                        minor: effect.interface_minor,
+                        payload: &effect.payload,
+                    },
+                ) {
+                    Ok(value) => value,
+                    Err(error) => return error,
+                };
+                let response = self.requests.submit_guarded(
+                    caller,
+                    grants,
+                    RequestOptions {
+                        service: effect.service.clone(),
+                        payload,
+                        timeout_ms: effect.timeout_ms,
+                        operation_id: effect.operation_id.clone(),
+                        parent: effect.parent,
+                        response_schema: Some(response_schema),
+                    },
+                    now,
+                );
+                if let Response::Accepted { id } = &response {
+                    self.effect_fences.admitted(&effect, *id);
+                }
+                response
+            }
+        }
+    }
+
+    fn effect_provider(
+        &self,
+        effect: &amaterasu_contracts::effect_fence::GuardedEffect,
+    ) -> Option<String> {
+        self.configuration
+            .api_methods
+            .iter()
+            .find(|approval| {
+                approval.method.service == effect.service
+                    && approval.method.method == effect.method
+                    && approval.method.interface_major == effect.interface_major
+                    && approval.method.interface_minor == effect.interface_minor
+            })
+            .map(|approval| approval.provider.clone())
     }
 
     fn enqueue_log(

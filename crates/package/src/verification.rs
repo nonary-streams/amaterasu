@@ -224,6 +224,9 @@ fn resolve_runtime_grants(
     let mut runtime = RuntimeConfig {
         principals: BTreeMap::new(),
         service_selections: Default::default(),
+        // The broker validates this trusted policy against effective grants.
+        // Never silently discard a requested protection.
+        effect_fence: bootstrap.policy.effect_fence.clone(),
         legacy_native_contracts: BTreeMap::new(),
         api_methods: Vec::new(),
         hooks: bootstrap.policy.hooks.clone(),
@@ -299,6 +302,36 @@ mod tests {
     use crate::BootstrapConfig;
     use amaterasu_contracts::{HOST_LIFECYCLE_CONTROL_PRINCIPAL, RuntimeConfig};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn explicitly_requested_effect_fence_is_not_silently_discarded() {
+        use amaterasu_contracts::effect_fence::{EffectFencePolicy, ProtectedMethod};
+        let policy = EffectFencePolicy {
+            authority: "authority".into(),
+            issuer: "issuer".into(),
+            methods: vec![ProtectedMethod {
+                service: "example.effect/1".into(),
+                method: "apply".into(),
+                interface_major: 1,
+            }],
+            cleanup_methods: vec![],
+        };
+        let bootstrap = BootstrapConfig {
+            development: false,
+            allow_unsigned: false,
+            trusted_keys: BTreeMap::new(),
+            policy: RuntimeConfig {
+                effect_fence: Some(policy.clone()),
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            resolve_runtime_grants(&bootstrap, &[]).effect_fence,
+            Some(policy)
+        );
+        // Missing effective principals and approvals are rejected by Broker::new,
+        // rather than falling back to an unprotected route.
+    }
 
     #[test]
     fn package_policy_cannot_claim_the_host_lifecycle_identity() {
