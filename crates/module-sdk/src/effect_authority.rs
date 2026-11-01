@@ -207,6 +207,9 @@ pub struct ProtocolEffectPolicy {
     pub message_type: u16,
     pub method: crate::extension_api::MethodRef,
     pub cleanup: crate::extension_api::MethodRef,
+    /// Full approved schemas pinned to the semantic method revisions above.
+    pub method_schema: amaterasu_contracts::ApiMethod,
+    pub cleanup_schema: amaterasu_contracts::ApiMethod,
     pub max_payload_bytes: usize,
     pub required_permission: FeedbackPermission,
 }
@@ -221,10 +224,20 @@ impl ProtocolEffectPolicy {
             && self.method.interface_major != 0
             && self.method.schema_revision > 0
             && u32::try_from(self.method.schema_revision).is_ok()
+            && self.method_schema.service == self.method.service
+            && self.method_schema.method == self.method.method
+            && self.method_schema.interface_major == self.method.interface_major
+            && self.method_schema.interface_minor == self.method.interface_minor
+            && self.method_schema.privilege == amaterasu_contracts::ApiPrivilege::User
             && amaterasu_contracts::valid_name(&self.cleanup.service)
             && amaterasu_contracts::valid_name(&self.cleanup.method)
             && self.cleanup.interface_major != 0
             && self.cleanup.schema_revision > 0
+            && self.cleanup_schema.service == self.cleanup.service
+            && self.cleanup_schema.method == self.cleanup.method
+            && self.cleanup_schema.interface_major == self.cleanup.interface_major
+            && self.cleanup_schema.interface_minor == self.cleanup.interface_minor
+            && self.cleanup_schema.privilege == amaterasu_contracts::ApiPrivilege::User
             && (self.cleanup.service != self.method.service
                 || self.cleanup.method != self.method.method
                 || self.cleanup.interface_major != self.method.interface_major)

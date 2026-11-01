@@ -114,7 +114,9 @@ mod settings_tests {
         let rule = json!({"capability":"example.control/1","provider":"example-provider",
             "message_type":21818,"max_payload_bytes":64,"required_permission":"view",
             "method":{"service":"example.effects/1","method":"apply","interface_major":1,"interface_minor":0,"schema_revision":1},
-            "cleanup":{"service":"example.effects/1","method":"cleanup","interface_major":1,"interface_minor":0,"schema_revision":1}});
+            "cleanup":{"service":"example.effects/1","method":"cleanup","interface_major":1,"interface_minor":0,"schema_revision":1},
+            "method_schema":{"service":"example.effects/1","method":"apply","interface_major":1,"interface_minor":0,"request":{"required":{},"optional":{},"allow_extra":false},"response":{"required":{},"optional":{},"allow_extra":false},"privilege":"user"},
+            "cleanup_schema":{"service":"example.effects/1","method":"cleanup","interface_major":1,"interface_minor":0,"request":{"required":{},"optional":{},"allow_extra":false},"response":{"required":{},"optional":{},"allow_extra":false},"privilege":"user"}});
         let mut settings = json!({"transport_principals":["nvhttp"],"effect_authority":{
             "protocol_owner":"nvhttp","effect_owner":"issuer","protocol_policies":[rule]}});
         assert!(parse_settings(settings.clone()).is_ok());

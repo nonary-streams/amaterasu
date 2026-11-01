@@ -5513,7 +5513,8 @@ fn broker_protocol_attestation_requires_paired_source_and_exact_client_grant() {
     let method = json!({"service":"example.effects/1","method":"apply","interface_major":1,"interface_minor":0,"schema_revision":1});
     let cleanup = json!({"service":"example.effects/1","method":"cleanup","interface_major":1,"interface_minor":0,"schema_revision":1});
     selected.protocol_policies = serde_json::from_value(json!([{"capability":"example.control/1","provider":"provider",
-        "message_type":21818,"method":method,"cleanup":cleanup,"max_payload_bytes":64,"required_permission":"view"}])).unwrap();
+        "message_type":21818,"method":method,"cleanup":cleanup,"method_schema":protocol_test_schema(&method),
+        "cleanup_schema":protocol_test_schema(&cleanup),"max_payload_bytes":64,"required_permission":"view"}])).unwrap();
     pipeline.effect_authority = Some(selected);
     let initial = pipeline.effect_gate.as_ref().unwrap().epoch().to_owned();
     let epoch = pipeline
@@ -5647,4 +5648,307 @@ fn broker_protocol_attestation_requires_paired_source_and_exact_client_grant() {
         call(&mut restarted, "input", request)["code"],
         "stale_epoch"
     );
+}
+
+#[test]
+fn real_state_pairing_and_broker_keep_protocol_admission_closed_across_restart() {
+    use amaterasu_state::test_support::TestStateStore;
+    let path = std::env::temp_dir().join(format!(
+        "pairing-protocol-state-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let store = TestStateStore::open(path.clone()).unwrap();
+    let (mut pairing, fixture, certificate_id) = paired_native_client();
+    assert_eq!(store.handle("pairing",json!({"action":"set","key":"pairing/v1","value":fixture.document.unwrap(),"expected_revision":0}))["revision"],1);
+    let mut broker = authority_broker();
+    let mut counter = 0_u64;
+    let mut call = |pairing: &mut Pipeline, caller: &str, service: &str, payload: Value| -> Value {
+        counter += 1;
+        let Response::Accepted { id } = broker.dispatch(
+            caller,
+            Command::Request {
+                service: service.into(),
+                payload,
+                timeout_ms: 30_000,
+                operation_id: format!("real-state-protocol-{counter}"),
+                parent: None,
+            },
+        ) else {
+            panic!("request denied")
+        };
+        for _ in 0..100 {
+            pairing
+                .tick_at(now(), |command| Ok(broker.dispatch("pairing", command)))
+                .unwrap();
+            loop {
+                match broker.dispatch("state", Command::Poll {}) {
+                    Response::Request {
+                        id: state_id,
+                        caller: state_caller,
+                        payload,
+                        ..
+                    } => {
+                        let response = store.handle(&state_caller, payload);
+                        assert!(matches!(
+                            broker.dispatch(
+                                "state",
+                                Command::Complete {
+                                    request: state_id,
+                                    payload: response
+                                }
+                            ),
+                            Response::Ok
+                        ));
+                    }
+                    Response::Pending => break,
+                    other => panic!("unexpected State poll {other:?}"),
+                }
+            }
+            match broker.dispatch(caller, Command::TakeResult { request: id }) {
+                Response::Pending => {}
+                Response::Result { payload } => {
+                    assert!(matches!(
+                        broker.dispatch(caller, Command::ReleaseResult { request: id }),
+                        Response::Ok
+                    ));
+                    return payload;
+                }
+                other => panic!("unexpected result {other:?}"),
+            }
+        }
+        panic!("request did not complete")
+    };
+    let listed = call(
+        &mut pairing,
+        "console",
+        SERVICE,
+        json!({"action":"list_clients"}),
+    );
+    assert!(listed["clients"][0].get("protocol_grants").is_none());
+    let updated = call(
+        &mut pairing,
+        "console",
+        SERVICE,
+        json!({"action":"update_client_protocol_grants","certificate_id":certificate_id,
+        "expected_revision":1,"grants":["example.control/1"]}),
+    );
+    assert_eq!(updated["ok"], true);
+    drop(pairing);
+    let mut pairing = Pipeline::new(settings());
+    let listed = call(
+        &mut pairing,
+        "console",
+        SERVICE,
+        json!({"action":"list_clients"}),
+    );
+    assert_eq!(
+        listed["clients"][0]["protocol_grants"],
+        json!(["example.control/1"])
+    );
+    let mut selected = policy_for_feedback(&[], crate::protocol::FeedbackPermission::View);
+    let method = json!({"service":"example.effects/1","method":"apply","interface_major":1,"interface_minor":0,"schema_revision":1});
+    let cleanup = json!({"service":"example.effects/1","method":"cleanup","interface_major":1,"interface_minor":0,"schema_revision":1});
+    selected.protocol_policies = serde_json::from_value(
+        json!([{"capability":"example.control/1","provider":"provider","message_type":21818,
+        "method":method,"cleanup":cleanup,"method_schema":protocol_test_schema(&method),
+        "cleanup_schema":protocol_test_schema(&cleanup),"max_payload_bytes":64,"required_permission":"view"}]),
+    )
+    .unwrap();
+    pairing.effect_authority = Some(selected);
+    let initial = pairing.effect_gate.as_ref().unwrap().epoch().to_owned();
+    let epoch = call(
+        &mut pairing,
+        "input",
+        EFFECT_SERVICE,
+        json!({"action":"recover","epoch":initial,"owner_epoch":"owner"}),
+    )["epoch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let source = feedback_source_for_test("owner");
+    assert_eq!(
+        call(
+            &mut pairing,
+            "nvhttp",
+            EFFECT_SERVICE,
+            json!({"action":"bind","epoch":epoch,"certificate_pem":CLIENT_CERT,"source":source})
+        )["ok"],
+        true
+    );
+    let attestation = json!({"action":"attest_protocol_capabilities","version":1,"epoch":epoch,"source":source,"capabilities":["example.control/1"]});
+    assert_eq!(
+        call(&mut pairing, "input", EFFECT_SERVICE, attestation.clone())["code"],
+        "forbidden"
+    );
+    assert_eq!(
+        call(&mut pairing, "nvhttp", EFFECT_SERVICE, attestation)["ok"],
+        true
+    );
+    let effect = json!({"caller":"input","operation_id":"effect.1","issuer_epoch":"issuer-epoch",
+        "context":{"authority_epoch":epoch,"effect_owner_epoch":"owner","target":{"kind":"stream","host_epoch":source["host_epoch"],
+            "session_id":source["session_id"],"stream_id":source["stream_id"],"generation":source["stream_generation"]},"peer_ref":source["id"]},
+        "message_type":21818,"capability":"example.control/1","provider":"provider","method":method,"cleanup":cleanup,
+        "payload_sha256":"c".repeat(64),"timeout_ms":1000,"parent":null});
+    let request = json!({"action":"admit_protocol_effect","version":1,"epoch":epoch,"source":source,"effect":effect});
+    assert_eq!(
+        call(&mut pairing, "input", EFFECT_SERVICE, request.clone())["code"],
+        "protocol_authority_unavailable"
+    );
+    drop(pairing);
+    let mut restarted = Pipeline::new(settings());
+    restarted.effect_authority = Some(policy_for_feedback(
+        &[],
+        crate::protocol::FeedbackPermission::View,
+    ));
+    assert_eq!(
+        call(&mut restarted, "input", EFFECT_SERVICE, request)["code"],
+        "stale_epoch"
+    );
+    drop(call);
+    drop(store);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn real_state_lost_grant_reply_stays_closed_until_durable_reload() {
+    use amaterasu_state::test_support::TestStateStore;
+    let path = std::env::temp_dir().join(format!(
+        "pairing-protocol-lost-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let store = TestStateStore::open(path.clone()).unwrap();
+    let (mut pairing, fixture, certificate_id) = paired_native_client();
+    assert_eq!(store.handle("pairing",json!({"action":"set","key":"pairing/v1","value":fixture.document.unwrap(),"expected_revision":0}))["revision"],1);
+    let mut broker = authority_broker();
+    let Response::Accepted{id:parent}=broker.dispatch("console",Command::Request {service:SERVICE.into(),
+        payload:json!({"action":"update_client_protocol_grants","certificate_id":certificate_id,"expected_revision":1,"grants":["example.control/1"]}),
+        timeout_ms:30_000,operation_id:"lost-grant-reply".into(),parent:None}) else {panic!("request rejected")};
+    let mut committed = false;
+    for _ in 0..100 {
+        pairing
+            .tick_at(now(), |command| Ok(broker.dispatch("pairing", command)))
+            .unwrap();
+        match broker.dispatch("state", Command::Poll {}) {
+            Response::Request {
+                id,
+                caller,
+                payload,
+                ..
+            } => {
+                let is_write = payload["action"] == "set";
+                let result = store.handle(&caller, payload);
+                if is_write {
+                    assert_eq!(result["ok"], true);
+                    assert!(matches!(
+                        broker.dispatch("console", Command::Cancel { request: parent }),
+                        Response::Ok
+                    ));
+                    assert!(matches!(
+                        broker.dispatch(
+                            "state",
+                            Command::Complete {
+                                request: id,
+                                payload: result
+                            }
+                        ),
+                        Response::Error { .. }
+                    ));
+                    committed = true;
+                    break;
+                }
+                assert!(matches!(
+                    broker.dispatch(
+                        "state",
+                        Command::Complete {
+                            request: id,
+                            payload: result
+                        }
+                    ),
+                    Response::Ok
+                ));
+            }
+            Response::Pending => {}
+            other => panic!("unexpected State poll {other:?}"),
+        }
+    }
+    assert!(committed);
+    for _ in 0..3 {
+        pairing
+            .tick_at(now(), |command| Ok(broker.dispatch("pairing", command)))
+            .unwrap();
+    }
+    assert!(pairing.identity.get(now()).is_err());
+    let durable = store.handle("pairing", json!({"action":"get","key":"pairing/v1"}));
+    assert_eq!(
+        durable["value"]["clients"][0]["protocol_grants"],
+        json!(["example.control/1"])
+    );
+    drop(pairing);
+    let mut restarted = Pipeline::new(settings());
+    let Response::Accepted { id } = broker.dispatch(
+        "console",
+        Command::Request {
+            service: SERVICE.into(),
+            payload: json!({"action":"list_clients"}),
+            timeout_ms: 30_000,
+            operation_id: "reload-grants".into(),
+            parent: None,
+        },
+    ) else {
+        panic!("reload rejected")
+    };
+    let mut listed = None;
+    for _ in 0..50 {
+        restarted
+            .tick_at(now(), |command| Ok(broker.dispatch("pairing", command)))
+            .unwrap();
+        if let Response::Request {
+            id: state_id,
+            caller,
+            payload,
+            ..
+        } = broker.dispatch("state", Command::Poll {})
+        {
+            let result = store.handle(&caller, payload);
+            assert!(matches!(
+                broker.dispatch(
+                    "state",
+                    Command::Complete {
+                        request: state_id,
+                        payload: result
+                    }
+                ),
+                Response::Ok
+            ));
+        }
+        if let Response::Result { payload } =
+            broker.dispatch("console", Command::TakeResult { request: id })
+        {
+            listed = Some(payload);
+            break;
+        }
+    }
+    assert_eq!(
+        listed.unwrap()["clients"][0]["protocol_grants"],
+        json!(["example.control/1"])
+    );
+    drop(store);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+fn protocol_test_schema(method: &Value) -> Value {
+    let mut schema = method.clone();
+    schema.as_object_mut().unwrap().remove("schema_revision");
+    schema["request"] = json!({"required":{},"optional":{},"allow_extra":false});
+    schema["response"] = json!({"required":{},"optional":{},"allow_extra":false});
+    schema["privilege"] = json!("user");
+    schema
 }
