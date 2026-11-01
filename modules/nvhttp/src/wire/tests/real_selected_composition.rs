@@ -27,7 +27,47 @@ struct LoadedModule {
     api: ModuleApi,
     instance: *mut c_void,
     _library: libloading::Library,
+    _observer: Option<Box<ObserveEndpoint>>,
 }
+
+struct ObserveEndpoint {
+    inner: HostApi,
+    observed: std::sync::Arc<
+        std::sync::Mutex<Option<amaterasu_module_sdk::nvhttp_source::BindFeedbackSource>>,
+    >,
+}
+
+unsafe extern "C" fn observe_invoke(
+    context: *mut c_void,
+    message: BorrowedBytes,
+    reply: abi::ReplySink,
+) -> abi::Status {
+    // SAFETY: the boxed observer and its inner endpoint outlive the module,
+    // including its workers, and message bytes are borrowed only for this call.
+    let observer = unsafe { &*(context.cast::<ObserveEndpoint>()) };
+    if let Ok(bytes) = unsafe { message.read() }
+        && let Ok(Command::Request {
+            service,
+            mut payload,
+            ..
+        }) = serde_json::from_slice(bytes)
+        && service == "amaterasu.nvhttp/1"
+        && payload["action"] == "bind_feedback_source"
+    {
+        payload
+            .as_object_mut()
+            .map(|object| object.remove("action"));
+        if let Ok(request) = serde_json::from_value(payload)
+            && let Ok(mut last) = observer.observed.lock()
+        {
+            *last = Some(request);
+        }
+    }
+    // SAFETY: the unchanged request and reply sink are passed directly to the
+    // original runtime-attested endpoint, which remains live through destroy.
+    unsafe { (observer.inner.invoke)(observer.inner.context, message, reply) }
+}
+
 impl LoadedModule {
     fn start(path: &Path, host: &HostApi) -> Self {
         Self::start_entry(path, host, b"amaterasu_module_v1")
@@ -54,7 +94,28 @@ impl LoadedModule {
             api,
             instance,
             _library: library,
+            _observer: None,
         }
+    }
+    fn start_observed(
+        path: &Path,
+        host: HostApi,
+        observed: std::sync::Arc<
+            std::sync::Mutex<Option<amaterasu_module_sdk::nvhttp_source::BindFeedbackSource>>,
+        >,
+    ) -> Self {
+        let mut observer = Box::new(ObserveEndpoint {
+            inner: host,
+            observed,
+        });
+        let proxy = HostApi {
+            header: host.header,
+            context: (&mut *observer as *mut ObserveEndpoint).cast(),
+            invoke: observe_invoke,
+        };
+        let mut module = Self::start(path, &proxy);
+        module._observer = Some(observer);
+        module
     }
     fn tick(&mut self) {
         // SAFETY: instance is live, belongs to this table, and calls are serialized.
@@ -359,6 +420,10 @@ fn run_composition(
     },"host_context":{"schema":1,"state_root":temp.0.join("state")}});
     if play {
         fixture_capture::configure(&mut config);
+    } else {
+        // The harness obtains this endpoint in both modes; legacy launch does
+        // not register a capture service or require capture permissions.
+        config["principals"]["fixture-capture"] = json!({});
     }
     if full {
         fixture_capture::configure_input(&mut config);

@@ -37,24 +37,18 @@ pub(super) struct Context<'a> {
     pub previous: Option<&'a amaterasu_module_sdk::nvhttp_source::BindFeedbackSource>,
 }
 
-fn load_stream(runtime: &Runtime) -> LoadedModule {
-    if std::env::var_os("AMATERASU_COMPOSITION_NORMAL_ABI").is_some() {
-        let artifacts =
-            PathBuf::from(std::env::var_os("AMATERASU_COMPOSITION_ARTIFACT_DIR").unwrap());
-        LoadedModule::start(
-            &artifact(&artifacts, "amaterasu_stream_session"),
-            &runtime.endpoint("stream"),
-        )
-    } else {
-        let qualification = PathBuf::from(
-            std::env::var_os("AMATERASU_FEEDBACK_QUALIFICATION_ARTIFACT_DIR").unwrap(),
-        );
-        LoadedModule::start_entry(
-            &artifact(&qualification, "amaterasu_stream_session"),
-            &runtime.endpoint("stream"),
-            b"amaterasu_qualification_module_v1",
-        )
-    }
+fn load_stream(
+    runtime: &Runtime,
+    observed: std::sync::Arc<
+        std::sync::Mutex<Option<amaterasu_module_sdk::nvhttp_source::BindFeedbackSource>>,
+    >,
+) -> LoadedModule {
+    let artifacts = PathBuf::from(std::env::var_os("AMATERASU_COMPOSITION_ARTIFACT_DIR").unwrap());
+    LoadedModule::start_observed(
+        &artifact(&artifacts, "amaterasu_stream_session"),
+        runtime.endpoint("stream"),
+        observed,
+    )
 }
 
 pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::BindFeedbackSource {
@@ -93,49 +87,52 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
         second_key,
         previous,
     } = context;
-    use amaterasu_module_sdk::ManagedModule;
     let owner = runtime.client("stream");
     provision_authority(pairing, memory, console, &owner, cert_id, second_cert_id);
-    let mut module =
-        crate::NvhttpModule::start(runtime.client("amaterasu.nvhttp")).expect("real NVHTTP module");
-    if std::env::var_os("AMATERASU_COMPOSITION_NORMAL_ABI").is_some() {
-        assert!(
-            module.startup_settings.live_feedback_authorized,
-            "broker did not inject the validated profile"
-        );
-    }
-    for _ in 0..500 {
-        module.tick().unwrap();
-        pairing.tick();
-        memory.tick();
-        pump_input_configuration(configuration);
-        if module.certificate.is_some() {
-            break;
-        }
-    }
-    assert!(
-        module.certificate.is_some(),
-        "NVHTTP TLS identity was not loaded"
+    let artifacts = PathBuf::from(std::env::var_os("AMATERASU_COMPOSITION_ARTIFACT_DIR").unwrap());
+    let mut module = LoadedModule::start(
+        &artifact(&artifacts, "amaterasu_nvhttp"),
+        &runtime.endpoint("amaterasu.nvhttp"),
     );
-    *selected_stream = Some(load_stream(runtime));
-    let start = std::time::Instant::now();
-    while module.source_join_startup.is_some()
-        && start.elapsed() < std::time::Duration::from_secs(10)
-    {
-        module.tick().unwrap();
+    let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+    *selected_stream = Some(load_stream(runtime, observed.clone()));
+    let address = std::net::SocketAddr::from((
+        [127, 0, 0, 1],
+        QUALIFICATION_PORT.load(std::sync::atomic::Ordering::Relaxed) + 5,
+    ));
+    let mut status = None;
+    let mut status_sequence = 0u64;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        module.tick();
         pairing.tick();
         memory.tick();
         selected_stream.as_mut().unwrap().tick();
         selected_control.as_mut().unwrap().tick();
         pump_input_configuration(configuration);
+        if status.is_none() {
+            status = Some(broker_request(
+                &owner,
+                "amaterasu.nvhttp/1",
+                json!({"action":"status"}),
+                &format!("normal-nvhttp-status-{status_sequence}"),
+            ));
+            status_sequence += 1;
+        }
+        if let Some(result) = take(&owner, status.unwrap()) {
+            status = None;
+            assert_eq!(result["https_address"], address.to_string());
+            if result["tls_ready"] == true && result["feedback_source_ready"] == true {
+                break;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "NVHTTP status timed out"
+        );
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    assert!(
-        module.source_join_startup.is_none(),
-        "NVHTTP source startup did not settle"
-    );
     let (_, host_der) = pem_rfc7468::decode_vec(HOST_CERT.as_bytes()).unwrap();
-    let address = module.server.as_ref().unwrap().https_address();
     let target =
         "/launch?appid=1&mode=1280x720x60&rikey=00112233445566778899aabbccddeeff&rikeyid=17";
     let mut client = authenticated_tls::ModuleConnection::connect_with_key(
@@ -151,7 +148,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         client.tick();
-        module.tick().unwrap();
+        module.tick();
         pairing.tick();
         memory.tick();
         launch.tick();
@@ -197,7 +194,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
         .map(|(url, _)| url.to_owned())
         .unwrap_or_else(|| panic!("launch rejected: {response}"));
     let mut control_client = rtsp_client::play(&url, || {
-        module.tick().unwrap();
+        module.tick();
         pairing.tick();
         memory.tick();
         launch.tick();
@@ -229,7 +226,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
     let mut last = Value::Null;
     for n in 0..300 {
         for _ in 0..30 {
-            module.tick().unwrap();
+            module.tick();
             pairing.tick();
             memory.tick();
             lifecycle.tick();
@@ -279,9 +276,9 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
             control_client.keep_alive();
         }
         for _ in 0..20 {
-            module.tick().unwrap();
-            if let Some(join) = module.source_join.as_ref() {
-                observed_join = Some(join.request_for_test());
+            module.tick();
+            if let Ok(last) = observed.lock() {
+                observed_join = last.clone();
             }
             pairing.tick();
             memory.tick();
@@ -340,7 +337,6 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
     let observed_join = observed_join.expect("real source join was observed");
     assert_eq!(observed_join.scope.controller_slot, 0);
     assert_ne!(cert, second_cert);
-    assert!(module.identity.as_ref().unwrap().view_allowed(second_cert));
     let second_target =
         "/launch?appid=1&mode=1280x720x60&rikey=10112233445566778899aabbccddeeff&rikeyid=18";
     let mut second = authenticated_tls::ModuleConnection::connect_with_key(
@@ -354,7 +350,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         second.tick();
-        module.tick().unwrap();
+        module.tick();
         pairing.tick();
         memory.tick();
         launch.tick();
@@ -430,7 +426,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
     );
     let mut denied_response = None;
     for _ in 0..500 {
-        module.tick().unwrap();
+        module.tick();
         if let Some(value) = take(&attacker, denied) {
             denied_response = Some(value);
             break;
@@ -467,7 +463,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
         );
         let mut result = None;
         for _ in 0..1000 {
-            module.tick().unwrap();
+            module.tick();
             lifecycle.tick();
             pairing.tick();
             memory.tick();
@@ -502,7 +498,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
         );
         let mut denied = None;
         for _ in 0..1000 {
-            module.tick().unwrap();
+            module.tick();
             lifecycle.tick();
             pairing.tick();
             memory.tick();
@@ -595,7 +591,7 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
     let mut revoked = None;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
-        module.tick().unwrap();
+        module.tick();
         pairing.tick();
         memory.tick();
         launch.tick();
@@ -653,12 +649,12 @@ pub(super) fn run(context: Context<'_>) -> amaterasu_module_sdk::nvhttp_source::
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
     drop(selected_stream.take());
-    *selected_stream = Some(load_stream(runtime));
+    *selected_stream = Some(load_stream(runtime, observed.clone()));
     let mut restart_status = Value::Null;
     let mut pending = None;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
-        module.tick().unwrap();
+        module.tick();
         pairing.tick();
         memory.tick();
         selected_stream.as_mut().unwrap().tick();

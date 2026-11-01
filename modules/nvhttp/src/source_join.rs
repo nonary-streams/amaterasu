@@ -48,11 +48,6 @@ pub enum Outcome {
 }
 
 impl Join {
-    #[cfg(test)]
-    pub(crate) fn request_for_test(&self) -> Request {
-        self.request.clone()
-    }
-
     pub fn request_id(&self) -> u64 {
         self.request_id
     }

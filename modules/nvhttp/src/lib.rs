@@ -1000,6 +1000,11 @@ impl NvhttpModule {
                             "http_addresses":self.server.as_ref().map(|server|server.http_addresses().iter().map(ToString::to_string).collect::<Vec<_>>()),
                             "https_addresses":self.server.as_ref().map(|server|server.https_addresses().iter().map(ToString::to_string).collect::<Vec<_>>()),
                             "tls_ready":self.server.as_ref().is_some_and(|server|server.tls_ready()),
+                            "feedback_source_ready":self.startup_settings.effect_source_join.is_some()
+                                && source_join_available(self.startup_settings.live_feedback_authorized)
+                                && self.source_join_startup.is_none()
+                                && self.source_join_recovery.is_none()
+                                && self.source_join.is_none(),
                             "connections":self.server.as_ref().map_or(0,|server|server.connections()),
                             "tls_error":self.tls_error,
                             "settings_hostname":self.product_settings.hostname(),
