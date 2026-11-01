@@ -65,6 +65,64 @@ pub enum Phase {
     ReleaseHistory,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PhaseResponseStatus {
+    Succeeded,
+    Pending,
+    Rejected,
+    Unknown,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LifecycleResponseStatus {
+    Succeeded,
+    Pending,
+    Rejected,
+    NotFound,
+    Ok,
+}
+
+// This is a diagnostic of the response envelope, not validation of its target,
+// operation identity, or the resulting workflow state.
+fn phase_response_status(phase: Phase, payload: &Value) -> PhaseResponseStatus {
+    let snapshot = matches!(phase, Phase::VerifyPaused | Phase::VerifyResumeSession);
+    let lifecycle_operation = matches!(
+        phase,
+        Phase::PrepareLifecycle
+            | Phase::LookupLifecycle
+            | Phase::BindApplication
+            | Phase::LookupApplicationBinding
+            | Phase::EndLifecycle
+            | Phase::ReportApplicationRetired
+            | Phase::AwaitLifecycleEnd
+    );
+    if snapshot || lifecycle_operation {
+        let status = payload
+            .get("status")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<LifecycleResponseStatus>(value).ok());
+        return match status {
+            Some(LifecycleResponseStatus::Succeeded) if lifecycle_operation => {
+                PhaseResponseStatus::Succeeded
+            }
+            Some(LifecycleResponseStatus::Ok) if snapshot => PhaseResponseStatus::Succeeded,
+            Some(LifecycleResponseStatus::Pending) if lifecycle_operation => {
+                PhaseResponseStatus::Pending
+            }
+            Some(LifecycleResponseStatus::Rejected | LifecycleResponseStatus::NotFound) => {
+                PhaseResponseStatus::Rejected
+            }
+            _ => PhaseResponseStatus::Unknown,
+        };
+    }
+    match payload.get("ok").and_then(Value::as_bool) {
+        Some(true) => PhaseResponseStatus::Succeeded,
+        Some(false) => PhaseResponseStatus::Rejected,
+        None => PhaseResponseStatus::Unknown,
+    }
+}
+
 pub struct Job {
     pub record: u64,
     pub phase: Phase,
@@ -735,9 +793,9 @@ impl Controller {
         replies: &mut Vec<(u64, Reply)>,
     ) {
         eprintln!(
-            "amaterasu launch phase result={:?} ok={}",
+            "amaterasu launch phase result={:?} response_status={:?}",
             job.phase,
-            payload["ok"] == true
+            phase_response_status(job.phase, &payload)
         );
         if job.phase == Phase::RefreshResumePolicy {
             let Some(mut record) = self.records.remove(&job.record) else {
@@ -4222,6 +4280,72 @@ fn reply_failure(record: &mut Record, replies: &mut Vec<(u64, Reply)>) {
             connection,
             private_error(503, "stream cleanup is incomplete"),
         ));
+    }
+}
+
+#[cfg(test)]
+mod phase_response_status_tests {
+    use super::{Phase, PhaseResponseStatus, phase_response_status};
+    use serde_json::json;
+
+    #[test]
+    fn lifecycle_operations_report_their_status_envelope() {
+        for phase in [
+            Phase::PrepareLifecycle,
+            Phase::LookupLifecycle,
+            Phase::BindApplication,
+            Phase::LookupApplicationBinding,
+            Phase::EndLifecycle,
+            Phase::ReportApplicationRetired,
+            Phase::AwaitLifecycleEnd,
+        ] {
+            assert_eq!(
+                phase_response_status(phase, &json!({"status":"succeeded"})),
+                PhaseResponseStatus::Succeeded
+            );
+            assert_eq!(
+                phase_response_status(phase, &json!({"status":"pending"})),
+                PhaseResponseStatus::Pending
+            );
+            for status in ["rejected", "not_found"] {
+                assert_eq!(
+                    phase_response_status(phase, &json!({"status":status})),
+                    PhaseResponseStatus::Rejected
+                );
+            }
+            for payload in [json!({"status":"ok"}), json!({"ok":true}), json!({})] {
+                assert_eq!(
+                    phase_response_status(phase, &payload),
+                    PhaseResponseStatus::Unknown
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_snapshots_and_other_services_use_their_own_envelopes() {
+        for phase in [Phase::VerifyPaused, Phase::VerifyResumeSession] {
+            assert_eq!(
+                phase_response_status(phase, &json!({"status":"ok"})),
+                PhaseResponseStatus::Succeeded
+            );
+            assert_eq!(
+                phase_response_status(phase, &json!({"status":"succeeded"})),
+                PhaseResponseStatus::Unknown
+            );
+        }
+        assert_eq!(
+            phase_response_status(Phase::OpenRtsp, &json!({"ok":true})),
+            PhaseResponseStatus::Succeeded
+        );
+        assert_eq!(
+            phase_response_status(Phase::OpenRtsp, &json!({"ok":false})),
+            PhaseResponseStatus::Rejected
+        );
+        assert_eq!(
+            phase_response_status(Phase::OpenRtsp, &json!({"status":"succeeded"})),
+            PhaseResponseStatus::Unknown
+        );
     }
 }
 
