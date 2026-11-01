@@ -16,6 +16,17 @@ const CONTROL: &str = "amaterasu.control-transport/1";
 const HOST_CONFIG: &str = "amaterasu.host-configuration/1";
 
 pub(super) fn validate(config: &RuntimeConfig) -> Result<(), String> {
+    validate_topology(config)?;
+    if config.live_feedback.is_some() {
+        // Neither an absent journal nor a new process proves that previous
+        // workers or external effects were retired. The host must first supply
+        // an authenticated clean-bootstrap or retirement proof.
+        return Err("live feedback requires verified host bootstrap evidence".into());
+    }
+    Ok(())
+}
+
+fn validate_topology(config: &RuntimeConfig) -> Result<(), String> {
     if config.settings.values().any(|s| s.get(MARKER).is_some()) {
         return Err("live feedback marker is broker-owned".into());
     }
@@ -178,19 +189,33 @@ pub(super) fn validate(config: &RuntimeConfig) -> Result<(), String> {
         || lifecycle["input_provider"] != p.input_owner
         || !contains(&lifecycle["consumers"]["input"], &p.input_owner)
         || !contains(&lifecycle["consumers"]["input"], &p.stream_owner)
-        || !contains(
-            &lifecycle["operation_grants"][&p.protocol_owner],
+        || !contains(&lifecycle["consumers"]["capture"], &p.stream_owner)
+        || !contains(&lifecycle["session_delegates"], &p.stream_owner)
+        || [
+            "prepare",
+            "lookup",
+            "snapshot",
+            "bind_application",
+            "end_session",
+            "application_retired",
             "resolve_effect_sources",
-        )
+        ]
+        .iter()
+        .any(|operation| !contains(&lifecycle["operation_grants"][&p.protocol_owner], operation))
         || !contains(
             &lifecycle["operation_grants"][&p.input_owner],
             "validate_input_binding",
         )
         || [
+            "validate_candidate",
             "ack_binding",
             "start_stream",
-            "issue_input_binding",
+            "pause_stream",
             "retire_stream",
+            "binding_validate",
+            "capture_invalidated",
+            "issue_input_binding",
+            "lookup",
         ]
         .iter()
         .any(|operation| !contains(&lifecycle["operation_grants"][&p.stream_owner], operation))
@@ -288,7 +313,7 @@ mod tests {
                 "pairing":{"transport_principals":["protocol"],"effect_authority":{"protocol_owner":"protocol","effect_owner":"stream","feedback_policies":[{}]}},
                 "stream":{"enabled":true,"allowed_principals":["protocol"],"enable_input":true,"observe_feedback_sources":true,"feedback_retirement_input_principal":"input","feedback_source_protocol_service":PROTOCOL,"feedback_owner_restart_recovery":true},
                 "input":{"feedback_owner":"stream","feedback_retirement_service":STREAM},
-                "lifecycle":{"trusted_callers":["protocol","stream","input"],"input_provider":"input","consumers":{"input":["stream","input"]},"operation_grants":{"protocol":["resolve_effect_sources"],"input":["validate_input_binding"],"stream":["ack_binding","start_stream","issue_input_binding","retire_stream"]}},
+                "lifecycle":{"trusted_callers":["protocol","stream","input"],"session_delegates":["stream"],"input_provider":"input","consumers":{"capture":["stream"],"input":["stream","input"]},"operation_grants":{"protocol":["prepare","lookup","snapshot","bind_application","end_session","application_retired","resolve_effect_sources"],"input":["validate_input_binding"],"stream":["validate_candidate","ack_binding","start_stream","pause_stream","retire_stream","binding_validate","capture_invalidated","issue_input_binding","lookup"]}},
                 "control":{"enabled":true,"allowed_principals":["stream"]}
             },
             "live_feedback":{"protocol_owner":"protocol","pairing_owner":"pairing","stream_owner":"stream","input_owner":"input","lifecycle_owner":"lifecycle","control_owner":"control"}
@@ -328,21 +353,15 @@ mod tests {
         c
     }
     #[test]
-    fn selected_profile_requires_coherent_routes_and_injects_only_its_owners() {
-        let mut broker = Broker::new(profile()).unwrap();
-        for owner in ["protocol", "pairing", "stream"] {
-            assert!(
-                matches!(broker.dispatch(owner,Command::GetSettings {}), Response::Result {payload} if payload[MARKER] == true)
-            );
-        }
-        assert!(
-            matches!(broker.dispatch("input",Command::GetSettings {}), Response::Result {payload} if payload.get(MARKER).is_none())
-        );
+    fn selected_profile_stays_closed_without_host_bootstrap_proof() {
+        let selected = profile();
+        assert!(validate_topology(&selected).is_ok());
+        assert!(Broker::new(selected).is_err());
         let mut unselected = profile();
         unselected.live_feedback = None;
         let mut broker = Broker::new(unselected).unwrap();
         assert!(
-            matches!(broker.dispatch("protocol",Command::GetSettings {}), Response::Result {payload} if payload.get(MARKER).is_none())
+            matches!(broker.dispatch("protocol", Command::GetSettings {}), Response::Result {payload} if payload.get(MARKER).is_none())
         );
     }
     #[test]
@@ -377,7 +396,39 @@ mod tests {
                 contract: "amaterasu.control-transport.native/1".into(),
             }),
         );
-        assert!(Broker::new(c).is_ok());
+        assert!(validate_topology(&c).is_ok());
+    }
+    #[test]
+    fn every_live_lifecycle_operation_is_required() {
+        for (owner, operation) in [
+            ("protocol", "prepare"),
+            ("protocol", "lookup"),
+            ("protocol", "snapshot"),
+            ("protocol", "bind_application"),
+            ("protocol", "end_session"),
+            ("protocol", "application_retired"),
+            ("protocol", "resolve_effect_sources"),
+            ("input", "validate_input_binding"),
+            ("stream", "validate_candidate"),
+            ("stream", "ack_binding"),
+            ("stream", "start_stream"),
+            ("stream", "pause_stream"),
+            ("stream", "retire_stream"),
+            ("stream", "binding_validate"),
+            ("stream", "capture_invalidated"),
+            ("stream", "issue_input_binding"),
+            ("stream", "lookup"),
+        ] {
+            let mut c = profile();
+            c.settings.get_mut("lifecycle").unwrap()["operation_grants"][owner]
+                .as_array_mut()
+                .unwrap()
+                .retain(|entry| entry != operation);
+            assert!(
+                validate_topology(&c).is_err(),
+                "missing {owner}:{operation}"
+            );
+        }
     }
     #[test]
     fn profile_requires_the_selected_host_configuration_precommit_authority() {
@@ -406,22 +457,22 @@ mod tests {
         c.settings.get_mut("pairing").unwrap()["effect_authority"]["configuration_owner"] =
             json!("configuration");
         c.live_feedback.as_mut().unwrap().host_configuration_owner = Some("configuration".into());
-        assert!(Broker::new(c.clone()).is_ok());
+        assert!(validate_topology(&c).is_ok());
         c.principals
             .get_mut("configuration")
             .unwrap()
             .call
             .remove(PAIRING);
-        assert!(Broker::new(c).is_err());
+        assert!(validate_topology(&c).is_err());
     }
     #[test]
     fn profile_rejects_missing_grants_owner_mismatch_and_unfenced_host_configuration() {
         let mut c = profile();
         c.principals.get_mut("stream").unwrap().call.remove(CONTROL);
-        assert!(Broker::new(c).is_err());
+        assert!(validate_topology(&c).is_err());
         let mut c = profile();
         c.settings.get_mut("input").unwrap()["feedback_owner"] = json!("other");
-        assert!(Broker::new(c).is_err());
+        assert!(validate_topology(&c).is_err());
         let mut c = profile();
         c.service_selections
             .native
@@ -430,25 +481,25 @@ mod tests {
             .as_mut()
             .unwrap()
             .provider = "stream".into();
-        assert!(Broker::new(c).is_err());
+        assert!(validate_topology(&c).is_err());
         let mut c = profile();
         c.service_selections.broker.remove(LIFECYCLE);
-        assert!(Broker::new(c).is_err());
+        assert!(validate_topology(&c).is_err());
         let mut c = profile();
         c.effect_fence = Some(
             serde_json::from_value(json!({"authority":"pairing","issuer":"stream","methods":[]}))
                 .unwrap(),
         );
-        assert!(Broker::new(c).is_err());
+        assert!(validate_topology(&c).is_err());
         let mut c = profile();
         c.settings.get_mut("stream").unwrap()["feedback_owner_restart_recovery"] = json!(false);
-        assert!(Broker::new(c).is_err());
+        assert!(validate_topology(&c).is_err());
         let mut c = profile();
         c.settings.get_mut("pairing").unwrap()["host_configuration"] = json!(true);
-        assert!(Broker::new(c).is_err());
+        assert!(validate_topology(&c).is_err());
         let mut c = profile();
         c.live_feedback = None;
         c.settings.get_mut("pairing").unwrap()[MARKER] = json!(true);
-        assert!(Broker::new(c).is_err());
+        assert!(validate_topology(&c).is_err());
     }
 }
