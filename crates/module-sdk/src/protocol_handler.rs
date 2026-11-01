@@ -45,6 +45,74 @@ pub struct Response {
     pub body_base64: String,
 }
 
+/// Owner-created channel IDs and exact negotiated descriptions sent only to
+/// the broker-selected handler. IDs are not credentials and are never sent to
+/// the remote HTTP client. Native access still checks the runtime principal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UpgradeOffer {
+    pub version: u32,
+    pub request: Request,
+    pub transfer_service: String,
+    pub input_id: crate::data_plane::abi::ChannelId,
+    pub input: crate::data_plane::abi::Description,
+    pub output_id: crate::data_plane::abi::ChannelId,
+    pub output: crate::data_plane::abi::Description,
+}
+
+/// A distinct handler result, accepted only for a configured upgrade binding.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum UpgradeDecision {
+    Accept { version: u32 },
+    Reject { version: u32 },
+}
+
+impl UpgradeDecision {
+    pub fn accepted(&self) -> Option<bool> {
+        match self {
+            Self::Accept { version: 1 } => Some(true),
+            Self::Reject { version: 1 } => Some(false),
+            _ => None,
+        }
+    }
+}
+
+impl UpgradeOffer {
+    pub fn validate(&self) -> bool {
+        use crate::data_plane::{
+            self,
+            abi::{SINK, SOURCE},
+        };
+        self.version == 1
+            && self.request.validate()
+            && amaterasu_contracts::valid_name(&self.transfer_service)
+            && self.input_id.incarnation != 0
+            && self.input_id.sequence != 0
+            && self.output_id.incarnation != 0
+            && self.output_id.sequence != 0
+            && self.input_id != self.output_id
+            && self.input_id.incarnation == self.output_id.incarnation
+            && self.input.direction == SOURCE
+            && self.output.direction == SINK
+            && self.input.limits.max_metadata_bytes == 0
+            && self.output.limits.max_metadata_bytes == 0
+            && data_plane::description(
+                SOURCE,
+                self.input.format,
+                self.input.metadata_schema,
+                self.input.limits,
+            ) == Ok(self.input)
+            && data_plane::description(
+                SINK,
+                self.output.format,
+                self.output.metadata_schema,
+                self.output.limits,
+            ) == Ok(self.output)
+            && fits_message(self)
+    }
+}
+
 fn bounded_base64(value: &str, limit: usize, empty_allowed: bool) -> bool {
     if value.len() > limit.div_ceil(3) * 4 {
         return false;
@@ -128,6 +196,37 @@ mod tests {
         request.body_base64.clear();
         request.version = 2;
         assert!(!request.validate());
+    }
+
+    #[test]
+    fn upgrade_decision_is_distinct_and_rejects_unknown_versions() {
+        assert_eq!(
+            serde_json::from_str::<UpgradeDecision>(r#"{"outcome":"accept","version":1}"#)
+                .unwrap()
+                .accepted(),
+            Some(true)
+        );
+        assert_eq!(
+            serde_json::from_str::<UpgradeDecision>(r#"{"outcome":"reject","version":1}"#)
+                .unwrap()
+                .accepted(),
+            Some(false)
+        );
+        assert!(
+            serde_json::from_str::<UpgradeDecision>(
+                r#"{"version":1,"status":200,"content_type":"text/plain","body_base64":""}"#
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<UpgradeDecision>(r#"{"outcome":"accept","version":2}"#)
+                .unwrap()
+                .accepted()
+                .is_none()
+        );
+        assert!(
+            serde_json::from_str::<UpgradeDecision>(r#"{"outcome":"other","version":1}"#).is_err()
+        );
     }
 
     #[test]

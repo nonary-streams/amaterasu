@@ -5,11 +5,13 @@
 //! rejected because matching table size and version do not identify a contract.
 pub use amaterasu_data_plane as abi;
 mod client;
+mod duplex;
 mod hub;
 mod native;
 mod queue;
 mod storage;
 pub use client::{ChunkView, TransferClient};
+pub use duplex::DuplexPair;
 pub use hub::{Hub, NativeFactory};
 pub use queue::Channel;
 pub use storage::OwnedChunk;
@@ -94,3 +96,6 @@ pub fn description(
         limits,
     })
 }
+
+#[cfg(test)]
+mod duplex_conformance;

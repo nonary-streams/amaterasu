@@ -459,6 +459,7 @@ impl Router {
                 None
             }
             Purpose::Participant { .. }
+            | Purpose::UpgradeParticipant { .. }
             | Purpose::Cleanup
             | Purpose::Applications { .. }
             | Purpose::Artwork { .. }

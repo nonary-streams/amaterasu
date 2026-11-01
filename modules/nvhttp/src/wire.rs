@@ -98,6 +98,7 @@ pub struct RouterConfig {
 pub struct Router {
     config: RouterConfig,
     participants: Vec<participants::Binding>,
+    approved_upgrades: BTreeSet<u64>,
     launches: LaunchController,
     transcripts: BTreeMap<String, pairing::Transcript>,
     jobs: BTreeMap<u64, Job>,
@@ -168,6 +169,10 @@ enum Purpose {
         binding: participants::Binding,
         certificate: Vec<u8>,
     },
+    UpgradeParticipant {
+        binding: participants::Binding,
+        certificate: Vec<u8>,
+    },
     Applications {
         desktop_enabled: bool,
         certificate: Vec<u8>,
@@ -185,6 +190,7 @@ impl Router {
         Self {
             config,
             participants: Vec::new(),
+            approved_upgrades: BTreeSet::new(),
             launches,
             transcripts: BTreeMap::new(),
             jobs: BTreeMap::new(),
@@ -202,6 +208,50 @@ impl Router {
     pub fn participant_entitlement(&self, request: &Request) -> Option<&str> {
         participants::select(&self.participants, &request.method, &request.target)
             .map(|binding| binding.entitlement.as_str())
+    }
+
+    pub fn upgrade_binding(&self, request: &Request) -> Option<participants::Binding> {
+        participants::select(&self.participants, &request.method, &request.target)
+            .filter(|binding| binding.upgrade.is_some())
+            .cloned()
+    }
+
+    pub fn queue_upgrade(
+        &mut self,
+        connection: u64,
+        binding: participants::Binding,
+        offer: protocol_handler::UpgradeOffer,
+        certificate: Vec<u8>,
+    ) -> Result<(), &'static str> {
+        if binding.upgrade.is_none()
+            || binding
+                .call_upgrade(&offer, 1, "upgrade-validation".into())
+                .is_err()
+            || !offer.validate()
+            || offer.transfer_service != crate::DUPLEX_TRANSFER_SERVICE
+            || STANDARD
+                .decode(&offer.request.peer.certificate_der_base64)
+                .ok()
+                .as_deref()
+                != Some(certificate.as_slice())
+        {
+            return Err("invalid_upgrade_offer");
+        }
+        let now = Instant::now();
+        self.queue(
+            Some(connection),
+            Purpose::UpgradeParticipant {
+                binding,
+                certificate,
+            },
+            serde_json::to_value(offer).map_err(|_| "invalid_upgrade_offer")?,
+            now + SERVICE_TIMEOUT,
+            now,
+        )
+    }
+
+    pub fn take_approved_upgrades(&mut self) -> BTreeSet<u64> {
+        std::mem::take(&mut self.approved_upgrades)
     }
 
     pub fn set_hostname(&mut self, hostname: String) {
@@ -359,6 +409,9 @@ impl Router {
         if let Some(binding) =
             participants::select(&self.participants, &request.method, &request.target).cloned()
         {
+            if binding.upgrade.is_some() {
+                return Some(xml::error(503, "upgrade requires owner preparation"));
+            }
             if !peer.trusted() {
                 return Some(xml::error(401, "authenticated paired TLS is required"));
             }
@@ -616,7 +669,7 @@ impl Router {
         self.poll_with_identity(now, send, |_, _| true)
     }
 
-    fn poll_with_identity(
+    pub(crate) fn poll_with_identity(
         &mut self,
         now: Instant,
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
@@ -651,6 +704,10 @@ impl Router {
                 Purpose::Participant {
                     binding,
                     certificate,
+                }
+                | Purpose::UpgradeParticipant {
+                    binding,
+                    certificate,
                 } => Some((
                     certificate.as_slice(),
                     Permission::Entitlement(binding.entitlement.clone()),
@@ -674,7 +731,9 @@ impl Router {
                 self.jobs.insert(key, job);
                 continue;
             };
-            let continued = if matches!(job.purpose, Purpose::Participant { .. }) {
+            let continued = if matches!(job.purpose, Purpose::UpgradeParticipant { .. }) {
+                self.resolve_upgrade(job, result, &mut replies)
+            } else if matches!(job.purpose, Purpose::Participant { .. }) {
                 self.resolve_participant(job, result, &mut replies)
             } else if matches!(job.purpose, Purpose::ArtworkRelease { .. }) {
                 self.resolve_artwork_release(job, result, now)
@@ -720,12 +779,9 @@ impl Router {
                     .min(SERVICE_TIMEOUT)
                     .as_millis()
                     .max(1) as u64;
-                let command = if let Purpose::Participant { binding, .. } = &job.purpose {
-                    let request: protocol_handler::Request =
-                        match serde_json::from_value(payload.clone()) {
-                            Ok(request) => request,
-                            Err(_) => return Some(Err("invalid protocol request".into())),
-                        };
+                let command = if let Purpose::Participant { binding, .. }
+                | Purpose::UpgradeParticipant { binding, .. } = &job.purpose
+                {
                     // Random operation IDs prevent an old retained broker record
                     // from being reused after this protocol owner restarts.
                     let mut nonce = [0u8; 16];
@@ -739,7 +795,18 @@ impl Router {
                             .map(|byte| format!("{byte:02x}"))
                             .collect::<String>()
                     );
-                    match binding.call(&request, timeout_ms, operation_id) {
+                    let command = if matches!(job.purpose, Purpose::UpgradeParticipant { .. }) {
+                        serde_json::from_value::<protocol_handler::UpgradeOffer>(payload.clone())
+                            .map_err(|_| "invalid upgrade offer")
+                            .and_then(|offer| {
+                                binding.call_upgrade(&offer, timeout_ms, operation_id)
+                            })
+                    } else {
+                        serde_json::from_value::<protocol_handler::Request>(payload.clone())
+                            .map_err(|_| "invalid protocol request")
+                            .and_then(|request| binding.call(&request, timeout_ms, operation_id))
+                    };
+                    match command {
                         Ok(command) => command,
                         Err(error) => return Some(Err(error.into())),
                     }
@@ -762,7 +829,12 @@ impl Router {
                         job.call = Call::Waiting { request: id };
                         None
                     }
-                    Err(_) if matches!(job.purpose, Purpose::Participant { .. }) => {
+                    Err(_)
+                        if matches!(
+                            job.purpose,
+                            Purpose::Participant { .. } | Purpose::UpgradeParticipant { .. }
+                        ) =>
+                    {
                         job.call = Call::Uncertain {
                             command,
                             not_before: now + Duration::from_millis(100),
@@ -807,6 +879,34 @@ impl Router {
                 }
             },
         }
+    }
+
+    fn resolve_upgrade(
+        &mut self,
+        job: Job,
+        result: Result<Value, String>,
+        replies: &mut Vec<(u64, Reply)>,
+    ) -> Option<Job> {
+        let accepted = result
+            .ok()
+            .and_then(|value| {
+                serde_json::from_value::<protocol_handler::UpgradeDecision>(value).ok()
+            })
+            .and_then(|decision| decision.accepted());
+        if let Some(connection) = job.connection {
+            if accepted == Some(true) {
+                self.approved_upgrades.insert(connection);
+            } else {
+                replies.push((
+                    connection,
+                    xml::error(
+                        if accepted == Some(false) { 403 } else { 502 },
+                        "upgrade unavailable",
+                    ),
+                ));
+            }
+        }
+        None
     }
 
     fn resolve_participant(
@@ -856,6 +956,7 @@ impl Router {
         send: &mut impl FnMut(Command) -> ModuleResult<Response>,
     ) {
         self.artwork_reservations.remove(&connection);
+        self.approved_upgrades.remove(&connection);
         self.launches.connection_closed(connection, now);
         let keys: Vec<_> = self
             .jobs
@@ -905,7 +1006,11 @@ impl Router {
             .jobs
             .iter()
             .filter_map(|(key, job)| {
-                matches!(job.purpose, Purpose::Participant { .. }).then_some(*key)
+                matches!(
+                    job.purpose,
+                    Purpose::Participant { .. } | Purpose::UpgradeParticipant { .. }
+                )
+                .then_some(*key)
             })
             .collect();
         for key in participants {

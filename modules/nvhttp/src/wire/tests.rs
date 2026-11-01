@@ -1305,6 +1305,7 @@ fn neutral_binding(method: &str, api: &str) -> participants::Binding {
         interface_major: 1,
         interface_minor: 0,
         schema: "org.example.request/1".into(),
+        upgrade: None,
         entitlement: "org.example/read".into(),
     }
 }
@@ -1936,4 +1937,114 @@ fn approved_handler_obeys_exact_wrapped_broker_size_limit() {
         broker.dispatch(provider, Command::Poll {}),
         Response::Pending
     ));
+}
+
+#[test]
+fn configured_upgrade_requires_distinct_acceptance_and_fails_closed() {
+    use amaterasu_module_sdk::data_plane::{self, DuplexPair, Hub, abi::*};
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let schema = Schema {
+        namespace: 1,
+        value: 1,
+        version: 1,
+    };
+    let limits = Limits {
+        max_chunk_bytes: 4,
+        max_queued_bytes: 4,
+        max_record_bytes: 4,
+        max_queued_chunks: 1,
+        max_segments: 1,
+        max_metadata_bytes: 0,
+        reserved: 0,
+    };
+    let input = data_plane::description(SOURCE, schema, schema, limits).unwrap();
+    let output_schema = Schema { value: 2, ..schema };
+    let output = data_plane::description(SINK, output_schema, schema, limits).unwrap();
+    let hub = Hub::new(2, 8).unwrap();
+    let pair = DuplexPair::create(&hub, "consumer", input, output).unwrap();
+    let mut binding = neutral_binding("GET", "first");
+    binding.upgrade = Some(participants::UpgradeProfile {
+        protocol: "neutral".into(),
+        input_format: schema,
+        output_format: output_schema,
+        metadata_schema: schema,
+    });
+    let offer = protocol_handler::UpgradeOffer {
+        version: 1,
+        request: protocol_handler::Request {
+            version: 1,
+            schema: binding.schema.clone(),
+            method: "GET".into(),
+            target: "/neutral".into(),
+            body_base64: String::new(),
+            peer: protocol_handler::VerifiedPeer {
+                remote: "127.0.0.1".parse().unwrap(),
+                certificate_der_base64: STANDARD.encode(b"certificate"),
+            },
+        },
+        transfer_service: crate::DUPLEX_TRANSFER_SERVICE.into(),
+        input_id: pair.input_id(),
+        input,
+        output_id: pair.output_id(),
+        output,
+    };
+    for (decision, expected_reply, accepted) in [
+        (json!({"outcome":"accept", "version":1}), None, true),
+        (json!({"outcome":"reject", "version":1}), Some(403), false),
+        (json!({"outcome":"accept", "version":2}), Some(502), false),
+        (
+            json!({"version":1,"status":200,"content_type":"text/plain","body_base64":""}),
+            Some(502),
+            false,
+        ),
+        (
+            json!({"outcome":"accept", "version":1,"extra":true}),
+            Some(502),
+            false,
+        ),
+    ] {
+        let mut router = router();
+        router
+            .queue_upgrade(1, binding.clone(), offer.clone(), b"certificate".to_vec())
+            .unwrap();
+        let now = Instant::now();
+        let mut send = |command: Command| {
+            Ok(match command {
+                Command::CallApi { payload, .. } => {
+                    assert_eq!(
+                        serde_json::from_value::<protocol_handler::UpgradeOffer>(payload).unwrap(),
+                        offer
+                    );
+                    Response::Accepted { id: 7 }
+                }
+                Command::TakeResult { request: 7 } => Response::Result {
+                    payload: decision.clone(),
+                },
+                other => panic!("unexpected command: {other:?}"),
+            })
+        };
+        assert!(
+            router
+                .poll_with_identity(now, &mut send, |_, _| true)
+                .is_empty()
+        );
+        let replies = router.poll_with_identity(now, &mut send, |_, _| true);
+        assert_eq!(
+            replies.first().map(|(_, reply)| reply.status),
+            expected_reply
+        );
+        assert_eq!(router.take_approved_upgrades().contains(&1), accepted);
+    }
+    let mut router = router();
+    assert!(
+        router
+            .queue_upgrade(1, binding.clone(), offer.clone(), b"wrong".to_vec())
+            .is_err()
+    );
+    binding.upgrade = None;
+    assert!(
+        router
+            .queue_upgrade(1, binding, offer, b"certificate".to_vec())
+            .is_err()
+    );
 }

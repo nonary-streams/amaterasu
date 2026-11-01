@@ -313,6 +313,13 @@ impl Signer for DelegatedSigner {
 struct PossessionVerifier {
     provider: Arc<CryptoProvider>,
 }
+#[cfg(test)]
+pub(crate) fn test_possession_verifier() -> Arc<dyn ClientCertVerifier> {
+    Arc::new(PossessionVerifier {
+        provider: Arc::new(rustls::crypto::ring::default_provider()),
+    })
+}
+
 impl ClientCertVerifier for PossessionVerifier {
     fn client_auth_mandatory(&self) -> bool {
         false

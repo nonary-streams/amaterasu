@@ -388,7 +388,7 @@ const NVHTTP: ComponentDefinition = ComponentDefinition {
         "amaterasu.management/1",
     ],
     publishes: &[],
-    native_provides: &[],
+    native_provides: &["amaterasu.nvhttp.duplex/1"],
     native_uses: &["amaterasu.network/1", "amaterasu.identity/1"],
     dependencies: &[
         "amaterasu.network",

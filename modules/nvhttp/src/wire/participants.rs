@@ -28,6 +28,19 @@ pub struct Binding {
     pub interface_minor: u32,
     pub schema: String,
     pub entitlement: String,
+    #[serde(default)]
+    pub upgrade: Option<UpgradeProfile>,
+}
+
+/// Trusted startup policy for a byte-stream upgrade; no peer-selected service,
+/// schema or protocol name is accepted.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpgradeProfile {
+    pub protocol: String,
+    pub input_format: amaterasu_module_sdk::data_plane::abi::Schema,
+    pub output_format: amaterasu_module_sdk::data_plane::abi::Schema,
+    pub metadata_schema: amaterasu_module_sdk::data_plane::abi::Schema,
 }
 
 pub fn validate(bindings: &[Binding]) -> Result<(), &'static str> {
@@ -70,6 +83,21 @@ pub fn validate(bindings: &[Binding]) -> Result<(), &'static str> {
             || binding.method.contains('/')
             || !amaterasu_contracts::valid_name(&binding.schema)
             || !amaterasu_identity::valid_entitlement(&binding.entitlement)
+            || binding.upgrade.as_ref().is_some_and(|profile| {
+                profile.protocol.is_empty()
+                    || profile.protocol.len() > 64
+                    || !profile
+                        .protocol
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+                    || [
+                        profile.input_format,
+                        profile.output_format,
+                        profile.metadata_schema,
+                    ]
+                    .iter()
+                    .any(|schema| schema.namespace == 0 || schema.value == 0 || schema.version == 0)
+            })
             || !claims.insert((&binding.path, &binding.http_method))
         {
             return Err("invalid_protocol_binding");
@@ -92,6 +120,48 @@ impl Binding {
             .is_ok_and(|bytes| bytes.len() <= protocol_handler::MAX_MESSAGE_BYTES)
     }
 
+    /// Build an upgrade call from the owner-created offer and this exact
+    /// configured profile. The broker still enforces provider and caller grants.
+    pub fn call_upgrade(
+        &self,
+        offer: &protocol_handler::UpgradeOffer,
+        timeout_ms: u64,
+        operation_id: String,
+    ) -> Result<Command, &'static str> {
+        let profile = self.upgrade.as_ref().ok_or("upgrade_not_configured")?;
+        if !offer.validate()
+            || offer.request.schema != self.schema
+            || offer.request.method != self.http_method
+            || offer.request.target.split('?').next() != Some(self.path.as_str())
+            || offer.input.format != profile.input_format
+            || offer.output.format != profile.output_format
+            || offer.input.metadata_schema != profile.metadata_schema
+            || offer.output.metadata_schema != profile.metadata_schema
+            || !(1..=30_000).contains(&timeout_ms)
+            || !amaterasu_contracts::valid_name(&operation_id)
+        {
+            return Err("invalid_upgrade_offer");
+        }
+        let payload = serde_json::to_value(offer).map_err(|_| "invalid_upgrade_offer")?;
+        let wrapped = serde_json::json!({"method": self.method, "interface_major": self.interface_major,
+            "interface_minor": self.interface_minor, "arguments": payload});
+        if serde_json::to_vec(&wrapped).map_or(true, |bytes| {
+            bytes.len() > protocol_handler::MAX_MESSAGE_BYTES
+        }) {
+            return Err("invalid_upgrade_offer");
+        }
+        Ok(Command::CallApi {
+            service: self.service.clone(),
+            method: self.method.clone(),
+            interface_major: self.interface_major,
+            interface_minor: self.interface_minor,
+            payload,
+            timeout_ms,
+            operation_id,
+            parent: None,
+        })
+    }
+
     /// Construct a broker call only from the trusted binding, never a service
     /// or method supplied by the HTTP client. Authentication and authorization
     /// must be checked by the protocol owner before this method is called.
@@ -101,7 +171,8 @@ impl Binding {
         timeout_ms: u64,
         operation_id: String,
     ) -> Result<Command, &'static str> {
-        if !self.accepts(request)
+        if self.upgrade.is_some()
+            || !self.accepts(request)
             || request.schema != self.schema
             || request.method != self.http_method
             || request.target.split('?').next() != Some(self.path.as_str())
@@ -144,6 +215,7 @@ mod tests {
             interface_minor: 0,
             schema: "org.example.request/1".into(),
             entitlement: "org.example/read".into(),
+            upgrade: None,
         }
     }
     #[test]
@@ -170,6 +242,28 @@ mod tests {
         value.interface_major = 2;
         assert!(validate(&[value]).is_err());
     }
+    #[test]
+    fn upgrade_profile_requires_safe_protocol_and_nonzero_schemas() {
+        let schema = amaterasu_module_sdk::data_plane::abi::Schema {
+            namespace: 1,
+            value: 1,
+            version: 1,
+        };
+        let mut value = binding("/neutral", "GET");
+        value.upgrade = Some(UpgradeProfile {
+            protocol: "neutral".into(),
+            input_format: schema,
+            output_format: schema,
+            metadata_schema: schema,
+        });
+        assert!(validate(&[value.clone()]).is_ok());
+        value.upgrade.as_mut().unwrap().protocol = "neutral\r\nInjected".into();
+        assert!(validate(&[value.clone()]).is_err());
+        value.upgrade.as_mut().unwrap().protocol = "neutral".into();
+        value.upgrade.as_mut().unwrap().metadata_schema.namespace = 0;
+        assert!(validate(&[value]).is_err());
+    }
+
     #[test]
     fn call_uses_selected_api_and_rejects_mismatched_input() {
         let binding = binding("/neutral", "POST");

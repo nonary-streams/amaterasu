@@ -2,6 +2,7 @@
 #![recursion_limit = "256"]
 
 mod audio_driver_install;
+pub mod duplex_owner;
 mod encoder_refresh;
 mod encoder_snapshot;
 mod frame_limiter;
@@ -35,7 +36,135 @@ use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
 const SERVICE: &str = "amaterasu.nvhttp/1";
+const DUPLEX_TRANSFER_SERVICE: &str = "amaterasu.nvhttp.duplex/1";
 const MANAGEMENT_PRINCIPAL: &str = "amaterasu.management";
+
+// The owner selects an installed broker approval and binds both native channels
+// to its provider. Any failed preparation closes the original connection.
+fn begin_configured_upgrade(
+    server: &mut server::Server,
+    router: &mut wire::Router,
+    hub: &amaterasu_module_sdk::data_plane::Hub,
+    incoming: server::Incoming,
+    binding: wire::participants::Binding,
+    mut verify: impl FnMut(&[u8], Option<wire::Permission>) -> bool,
+    mut send: impl FnMut(Command) -> ModuleResult<Response>,
+) -> Result<(), &'static str> {
+    use amaterasu_module_sdk::data_plane::{
+        self,
+        abi::{Limits, SINK, SOURCE},
+    };
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let id = incoming.id;
+    let result = (|| {
+        let certificate = incoming
+            .peer_certificate
+            .as_ref()
+            .filter(|cert| {
+                incoming.secure
+                    && verify(
+                        cert,
+                        Some(wire::Permission::Entitlement(binding.entitlement.clone())),
+                    )
+            })
+            .cloned()
+            .ok_or("upgrade_denied")?;
+        let approval = match send(Command::QueryApiApproval {
+            service: binding.service.clone(),
+            method: binding.method.clone(),
+            interface_major: binding.interface_major,
+            min_minor: binding.interface_minor,
+        }) {
+            Ok(Response::Result { payload }) => {
+                serde_json::from_value::<amaterasu_contracts::ApiMethodApproval>(payload).ok()
+            }
+            _ => None,
+        }
+        .filter(|approval| {
+            approval.method.service == binding.service
+                && approval.method.method == binding.method
+                && approval.method.interface_major == binding.interface_major
+                && approval.method.interface_minor >= binding.interface_minor
+        })
+        .ok_or("upgrade_approval_unavailable")?;
+        let profile = binding.upgrade.as_ref().ok_or("upgrade_not_configured")?;
+        let limits = Limits {
+            max_chunk_bytes: 16 * 1024,
+            max_queued_bytes: 64 * 1024,
+            max_record_bytes: 64 * 1024,
+            max_queued_chunks: 4,
+            max_segments: 8,
+            max_metadata_bytes: 0,
+            reserved: 0,
+        };
+        let input = data_plane::description(
+            SOURCE,
+            profile.input_format,
+            profile.metadata_schema,
+            limits,
+        )
+        .map_err(|_| "invalid_upgrade_profile")?;
+        let output =
+            data_plane::description(SINK, profile.output_format, profile.metadata_schema, limits)
+                .map_err(|_| "invalid_upgrade_profile")?;
+        let response = format!(
+            "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: {}\r\n\r\n",
+            profile.protocol
+        )
+        .into_bytes();
+        let peer = certificate.clone();
+        let principal = approval.provider;
+        let (input_id, output_id) = server
+            .prepare_upgrade(
+                id,
+                binding.entitlement.clone(),
+                |cert, permission| verify(cert, permission),
+                |buffered| {
+                    crate::duplex_owner::DuplexOwner::new(
+                        hub,
+                        crate::duplex_owner::Binding {
+                            connection_id: id,
+                            peer_certificate: peer,
+                            consumer_principal: principal,
+                        },
+                        input,
+                        output,
+                        response,
+                        buffered,
+                        crate::duplex_owner::BufferLimits {
+                            response: 256,
+                            staging: 16 * 1024,
+                        },
+                    )
+                },
+            )
+            .ok_or("upgrade_preparation_failed")?;
+        let offer = amaterasu_module_sdk::protocol_handler::UpgradeOffer {
+            version: 1,
+            request: amaterasu_module_sdk::protocol_handler::Request {
+                version: 1,
+                schema: binding.schema.clone(),
+                method: incoming.request.method,
+                target: incoming.request.target,
+                body_base64: STANDARD.encode(incoming.request.body),
+                peer: amaterasu_module_sdk::protocol_handler::VerifiedPeer {
+                    remote: incoming.remote,
+                    certificate_der_base64: STANDARD.encode(&certificate),
+                },
+            },
+            transfer_service: DUPLEX_TRANSFER_SERVICE.into(),
+            input_id,
+            input,
+            output_id,
+            output,
+        };
+        router.queue_upgrade(id, binding, offer, certificate)
+    })();
+    if result.is_err() {
+        server.close(id);
+    }
+    result
+}
 
 fn should_attempt_listener_rebind(
     server: Option<&server::Server>,
@@ -244,6 +373,8 @@ struct NvhttpModule {
     server: Option<server::Server>,
     router: Option<wire::Router>,
     identity: Option<tls::Identity>,
+    duplex_hub: Option<amaterasu_module_sdk::data_plane::Hub>,
+    duplex_factory: Option<Box<amaterasu_module_sdk::data_plane::NativeFactory>>,
     certificate: Option<Vec<u8>>,
     tls_error: Option<&'static str>,
     next_refresh: Instant,
@@ -320,6 +451,28 @@ impl ManagedModule for NvhttpModule {
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
+        let (duplex_hub, duplex_factory) = if settings.enabled
+            && settings
+                .protocol_handlers
+                .iter()
+                .any(|binding| binding.upgrade.is_some())
+        {
+            let hub = amaterasu_module_sdk::data_plane::Hub::new(64, 4 * 1024 * 1024)
+                .map_err(|status| format!("duplex hub: {status}"))?;
+            let factory = hub.factory();
+            // SAFETY: the module owns the boxed factory until all connections
+            // and consumer bindings are retired during module shutdown.
+            unsafe {
+                amaterasu_module_sdk::data_plane::register_transfer(
+                    &runtime,
+                    DUPLEX_TRANSFER_SERVICE,
+                    &factory.api,
+                )?;
+            }
+            (Some(hub), Some(factory))
+        } else {
+            (None, None)
+        };
         // Host filtering and file policy are applied downstream. Keep this
         // lifecycle event free of configured addresses and request contents.
         let _ = runtime.log(
@@ -333,6 +486,8 @@ impl ManagedModule for NvhttpModule {
             server,
             router,
             identity,
+            duplex_hub,
+            duplex_factory,
             certificate: None,
             tls_error: None,
             next_refresh: Instant::now(),
@@ -495,14 +650,25 @@ impl ManagedModule for NvhttpModule {
             for connection in revoked {
                 server.close(connection);
             }
-            let events = server.tick_checked(|certificate, permission| {
-                self.identity.as_ref().is_some_and(|identity| {
-                    permission.map_or_else(
-                        || identity.trusted(certificate),
-                        |permission| identity.allowed(certificate, permission),
+            let events = server.tick_checked_with_upgrades(
+                |certificate, permission| {
+                    self.identity.as_ref().is_some_and(|identity| {
+                        permission.map_or_else(
+                            || identity.trusted(certificate),
+                            |permission| identity.allowed(certificate, permission),
+                        )
+                    })
+                },
+                |method, target| {
+                    wire::participants::select(
+                        &self.startup_settings.protocol_handlers,
+                        method,
+                        target,
                     )
-                })
-            });
+                    .and_then(|binding| binding.upgrade.as_ref())
+                    .map(|profile| profile.protocol.clone())
+                },
+            );
             for closed in events.closed {
                 if closed.response_delivered {
                     router.reply_delivered(closed.id);
@@ -538,6 +704,29 @@ impl ManagedModule for NvhttpModule {
                         .is_some_and(|name| {
                             allowed(wire::Permission::Entitlement(name.to_owned()))
                         });
+                if let Some(binding) = router.upgrade_binding(&incoming.request) {
+                    if let Some(hub) = &self.duplex_hub {
+                        let _ = begin_configured_upgrade(
+                            server,
+                            router,
+                            hub,
+                            incoming,
+                            binding,
+                            |cert, permission| {
+                                self.identity.as_ref().is_some_and(|identity| {
+                                    permission.map_or_else(
+                                        || identity.trusted(cert),
+                                        |permission| identity.allowed(cert, permission),
+                                    )
+                                })
+                            },
+                            |command| self.runtime.send_ephemeral(command),
+                        );
+                    } else {
+                        server.close(incoming.id);
+                    }
+                    continue;
+                }
                 if incoming.request.target.split('?').next() == Some("/launch") {
                     // Deliberately omit the query: Moonlight sends session keys there.
                     eprintln!(
@@ -587,6 +776,15 @@ impl ManagedModule for NvhttpModule {
                     })
                 });
                 if !accepted {
+                    router.cancel(id, &self.runtime);
+                }
+            }
+            for id in router.take_approved_upgrades() {
+                if !server.activate_upgrade(id, |cert, permission| {
+                    self.identity.as_ref().is_some_and(|identity| {
+                        permission.is_some_and(|permission| identity.allowed(cert, permission))
+                    })
+                }) {
                     router.cancel(id, &self.runtime);
                 }
             }
@@ -977,6 +1175,11 @@ impl Drop for NvhttpModule {
         // Every rustls connection/configuration is dropped before the identity
         // gate closes and its native binding releases. No worker or signer escapes.
         self.server = None;
+        if let Some(hub) = &self.duplex_hub {
+            hub.close_all();
+        }
+        self.duplex_hub = None;
+        self.duplex_factory = None;
         self.warm.cancel(&self.runtime);
         self.identity = None;
     }

@@ -659,6 +659,7 @@ dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
  "httparse",
+ "libloading",
  "pem-rfc7468",
  "rustls",
  "serde",
@@ -768,6 +769,7 @@ dependencies = [
  "amaterasu-abi",
  "amaterasu-contracts",
  "amaterasu-module-sdk",
+ "amaterasu-nvhttp",
  "libloading",
  "serde_json",
 ]

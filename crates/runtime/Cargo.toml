@@ -13,5 +13,6 @@ serde_json.workspace = true
 workspace = true
 
 [dev-dependencies]
+amaterasu-nvhttp = { path = "../../modules/nvhttp" }
 amaterasu-module-sdk.workspace = true
 libloading.workspace = true

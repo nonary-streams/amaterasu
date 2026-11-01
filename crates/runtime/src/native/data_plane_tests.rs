@@ -387,3 +387,197 @@ fn independently_built_binary_provider_transfers_large_assets_and_retained_frame
     unsafe { (api.destroy)(module) };
     drop(library);
 }
+
+// Exercise the real connection adapter with runtime-attested native consumers.
+// This is not a TLS connection or a separately loaded consumer DLL.
+#[test]
+fn duplex_owner_uses_runtime_attested_consumers_and_retires_on_denial() {
+    use amaterasu_nvhttp::duplex_owner::{Binding, BufferLimits, DuplexOwner};
+    use std::io::Write;
+    let runtime = Runtime::new();
+    let provider = runtime.client("provider");
+    let consumer = runtime.client("consumer");
+    let outsider = runtime.client("outsider");
+    let hub = Hub::new(2, 8).unwrap();
+    let factory = hub.factory();
+    // SAFETY: runtime and factory outlive all native bindings and the owner.
+    unsafe { register_transfer(&provider, SERVICE, &factory.api).unwrap() };
+    let mut input = config(SOURCE, 4);
+    input.limits.max_metadata_bytes = 0;
+    let mut output = config(SINK, 4);
+    output.limits.max_metadata_bytes = 0;
+    for (principal, chosen, rejected) in [
+        ("consumer", &consumer, &outsider),
+        ("outsider", &outsider, &consumer),
+    ] {
+        let mut owner = DuplexOwner::new(
+            &hub,
+            Binding {
+                connection_id: 1,
+                peer_certificate: vec![1],
+                consumer_principal: principal.into(),
+            },
+            input,
+            output,
+            b"OK".to_vec(),
+            b"pre".to_vec(),
+            BufferLimits {
+                response: 4,
+                staging: 4,
+            },
+        )
+        .unwrap();
+        let input_id = owner.pair().input_id();
+        let output_id = owner.pair().output_id();
+        // SAFETY: factory and runtime outlive every binding in this iteration.
+        assert!(unsafe { TransferClient::bind(rejected, SERVICE, input_id, input) }.is_err());
+        let source = unsafe { TransferClient::bind(chosen, SERVICE, input_id, input).unwrap() };
+        let sink = unsafe { TransferClient::bind(chosen, SERVICE, output_id, output).unwrap() };
+        owner.flush_input().unwrap();
+        let mut received = Vec::new();
+        assert_eq!(
+            source.receive(|view| {
+                for segment in view.segments {
+                    received.extend_from_slice(segment);
+                }
+                STATUS_OK
+            }),
+            STATUS_OK
+        );
+        assert_eq!(received, b"pre");
+        assert_eq!(
+            sink.submit(&OwnedChunk::with_bytes(1, b"data".to_vec())),
+            STATUS_OK
+        );
+        let mut wire = Vec::new();
+        owner
+            .write_step(&mut wire, |binding| binding.consumer_principal == principal)
+            .unwrap();
+        owner.response_flushed().unwrap();
+        owner.write_step(&mut wire, |_| true).unwrap();
+        wire.flush().unwrap();
+        assert_eq!(wire, b"OKdata");
+        assert_eq!(
+            owner.write_step(&mut wire, |_| false).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            sink.submit(&OwnedChunk::with_bytes(2, b"x".to_vec())),
+            CLOSED
+        );
+        assert_eq!(source.receive(|_| STATUS_OK), CLOSED);
+        drop(sink);
+        drop(source);
+        drop(owner);
+    }
+    let mut owner = DuplexOwner::new(
+        &hub,
+        Binding {
+            connection_id: 2,
+            peer_certificate: vec![1],
+            consumer_principal: "consumer".into(),
+        },
+        input,
+        output,
+        b"OK".to_vec(),
+        vec![],
+        BufferLimits {
+            response: 4,
+            staging: 4,
+        },
+    )
+    .unwrap();
+    // SAFETY: runtime and factory outlive the two bindings.
+    let source = unsafe {
+        TransferClient::bind(&consumer, SERVICE, owner.pair().input_id(), input).unwrap()
+    };
+    let sink = unsafe {
+        TransferClient::bind(&consumer, SERVICE, owner.pair().output_id(), output).unwrap()
+    };
+    drop(source); // independently released native input binding
+    assert_eq!(owner.check_channels(), Err(CLOSED));
+    assert_eq!(
+        sink.submit(&OwnedChunk::with_bytes(1, b"x".to_vec())),
+        CLOSED
+    );
+    drop(sink);
+    drop(owner);
+}
+
+// Two separately compiled C consumers use the documented public table against
+// the same adapter. This does not exercise broker dispatch or real TLS I/O.
+#[test]
+#[ignore = "requires independently compiled neutral consumer libraries"]
+fn independently_built_neutral_duplex_consumers_use_the_same_owner() {
+    use amaterasu_nvhttp::duplex_owner::{Binding, BufferLimits, DuplexOwner};
+    type Exchange = unsafe extern "C" fn(*const TransferApi, ChannelId, ChannelId) -> Status;
+    let runtime = Runtime::new();
+    let provider = runtime.client("provider");
+    let consumer = runtime.client("consumer");
+    let hub = Hub::new(2, 8).unwrap();
+    let factory = hub.factory();
+    // SAFETY: the runtime, factory and hub remain alive until all bindings drop.
+    unsafe { register_transfer(&provider, SERVICE, &factory.api).unwrap() };
+    let mut input = config(SOURCE, 4);
+    input.limits.max_metadata_bytes = 0;
+    let mut output = config(SINK, 4);
+    output.limits.max_metadata_bytes = 0;
+    for (variable, expected) in [
+        ("AMATERASU_DUPLEX_IDENTITY", b"OKpre".as_slice()),
+        ("AMATERASU_DUPLEX_REVERSE", b"OKerp".as_slice()),
+    ] {
+        let path = std::env::var(variable).expect("fixture library path");
+        // SAFETY: test fixture is built from the repository and stays loaded
+        // until all its synchronous callbacks and native bindings have retired.
+        let library = unsafe { libloading::Library::new(path).unwrap() };
+        let exchange: libloading::Symbol<Exchange> =
+            unsafe { library.get(b"neutral_exchange\0").unwrap() };
+        let mut owner = DuplexOwner::new(
+            &hub,
+            Binding {
+                connection_id: 1,
+                peer_certificate: vec![1],
+                consumer_principal: "consumer".into(),
+            },
+            input,
+            output,
+            b"OK".to_vec(),
+            b"pre".to_vec(),
+            BufferLimits {
+                response: 4,
+                staging: 4,
+            },
+        )
+        .unwrap();
+        // SAFETY: runtime and provider factory outlive this typed native binding.
+        let binding = unsafe {
+            consumer
+                .bind_native_typed(
+                    SERVICE,
+                    TRANSFER_CONTRACT,
+                    INTERFACE_MAJOR,
+                    INTERFACE_MINOR,
+                    API_SIZE,
+                )
+                .unwrap()
+        };
+        // SAFETY: registration promises this exact transfer contract and layout.
+        let api = unsafe { binding.table::<TransferApi>().unwrap() };
+        owner.flush_input().unwrap();
+        // SAFETY: native table, channel IDs and fixture code remain live for the
+        // call; the C consumer uses only synchronous borrows and copies input.
+        assert_eq!(
+            unsafe { exchange(api, owner.pair().input_id(), owner.pair().output_id()) },
+            STATUS_OK
+        );
+        let mut wire = Vec::new();
+        owner.write_step(&mut wire, |_| true).unwrap();
+        owner.response_flushed().unwrap();
+        owner.write_step(&mut wire, |_| true).unwrap();
+        assert_eq!(wire, expected);
+        owner.signal_cancel();
+        drop(binding);
+        drop(owner);
+        drop(library);
+    }
+}

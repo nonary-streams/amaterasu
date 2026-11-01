@@ -336,3 +336,41 @@ fn registry_enforces_aggregate_budget_principal_binding_and_restart_identity() {
     let (next, _) = hub.create("alice", config(SOURCE, 100, 2)).unwrap();
     assert_ne!(id, next);
 }
+
+#[test]
+fn duplex_pair_rolls_back_and_retires_both_directions() {
+    let hub = Hub::new(2, 8).unwrap();
+    assert!(
+        DuplexPair::create(&hub, "consumer", config(SOURCE, 4, 1), config(SINK, 8, 1)).is_err()
+    );
+    let pair =
+        DuplexPair::create(&hub, "consumer", config(SOURCE, 4, 1), config(SINK, 4, 1)).unwrap();
+    let input = pair.input().clone();
+    let output = pair.output().clone();
+    input.push(OwnedChunk::with_bytes(1, vec![1; 4])).unwrap();
+    assert_eq!(
+        input
+            .push(OwnedChunk::with_bytes(2, vec![2]))
+            .unwrap_err()
+            .0,
+        BUSY
+    );
+    output.push(OwnedChunk::with_bytes(1, vec![3])).unwrap();
+    input.finish().unwrap();
+    assert_eq!(consume(&input), STATUS_OK);
+    assert_eq!(consume(&input), CLOSED);
+    assert_eq!(consume(&output), STATUS_OK);
+    output.push(OwnedChunk::with_bytes(2, vec![4])).unwrap();
+    drop(pair);
+    assert_eq!(consume(&input), CLOSED);
+    assert_eq!(consume(&output), CLOSED);
+    assert!(DuplexPair::create(&hub, "consumer", config(SOURCE, 4, 1), config(SINK, 4, 1)).is_ok());
+}
+
+#[test]
+fn duplex_pair_rejects_wrong_directions() {
+    let hub = Hub::new(2, 8).unwrap();
+    assert!(
+        DuplexPair::create(&hub, "consumer", config(SINK, 4, 1), config(SOURCE, 4, 1)).is_err()
+    );
+}

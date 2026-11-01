@@ -99,6 +99,20 @@ impl Hub {
         );
         Ok((id, channel))
     }
+    // Reject new native claims and signal channel waiters without a retirement
+    // barrier. Only the pair owner uses this before closing both directions.
+    pub(super) fn begin_close(&self, id: ChannelId) {
+        let channel = {
+            let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.entries.get_mut(&id).map(|entry| {
+                entry.closing = true;
+                entry.channel.clone()
+            })
+        };
+        if let Some(channel) = channel {
+            channel.begin_cancel();
+        }
+    }
     /// Domain revocation/timeout calls close. Remove authority first; retire
     /// callbacks outside registry locks; return the reserved budget last.
     pub fn close(&self, id: ChannelId) {

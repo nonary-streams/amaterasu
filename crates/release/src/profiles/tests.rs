@@ -48,6 +48,29 @@ fn every_profile_contains_unique_providers_and_all_dependencies() {
 }
 
 #[test]
+fn nvhttp_profiles_allow_the_opt_in_duplex_factory() {
+    for profile in [
+        PackageProfile::Platform,
+        PackageProfile::StreamProbe,
+        PackageProfile::SoftwareProbe,
+        PackageProfile::LinuxProbe,
+        PackageProfile::LinuxSession,
+        PackageProfile::LinuxSessionExtensions,
+    ] {
+        let components = profile.components();
+        let nvhttp = components
+            .iter()
+            .find(|component| component.id == NVHTTP.id)
+            .unwrap();
+        assert!(
+            nvhttp
+                .native_provides
+                .contains(&"amaterasu.nvhttp.duplex/1")
+        );
+    }
+}
+
+#[test]
 fn nvhttp_policy_sync_and_management_audio_status_keep_the_provider_call_grant() {
     assert!(NVHTTP.calls.contains(&"amaterasu.audio/1"));
     assert!(MANAGEMENT.calls.contains(&"amaterasu.audio/1"));
