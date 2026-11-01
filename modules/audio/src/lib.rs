@@ -59,6 +59,9 @@ impl ManagedModule for AudioModule {
         let ordered_factory = settings
             .ordered_service
             .as_ref()
+            // Only Linux currently exports the actual capture lane map. Do
+            // not let a successful bind advertise this provider elsewhere.
+            .filter(|_| cfg!(target_os = "linux"))
             .map(|_| native::ordered::Factory::new(controller.clone()));
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
