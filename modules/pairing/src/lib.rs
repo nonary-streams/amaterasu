@@ -100,6 +100,16 @@ mod settings_tests {
     }
 
     #[test]
+    fn feedback_policy_requires_distinct_valid_explicit_capabilities() {
+        let rule = json!({"capability":{"schema":"speaker.pcm","version":1,"direction":"to_client"},"required_permission":"view"});
+        let mut settings = json!({"transport_principals":["nvhttp"],"effect_authority":{
+            "protocol_owner":"nvhttp","effect_owner":"input","feedback_policies":[rule,rule]}});
+        assert!(parse_settings(settings.clone()).is_err());
+        settings["effect_authority"]["feedback_policies"] = json!([{"capability":{"schema":"speaker.pcm","version":0,"direction":"to_client"},"required_permission":"view"}]);
+        assert!(parse_settings(settings).is_err());
+    }
+
+    #[test]
     fn host_configuration_marker_must_be_boolean() {
         assert!(parse_settings(json!({"host_configuration":"enabled"})).is_err());
     }

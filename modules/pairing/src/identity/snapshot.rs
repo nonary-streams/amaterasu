@@ -84,6 +84,9 @@ struct CertificateRecord {
     not_before: u64,
     not_after: u64,
     permissions: crate::protocol::ClientPermissions,
+    feedback_grants:
+        std::collections::BTreeSet<amaterasu_module_sdk::effect_authority::FeedbackCapability>,
+    controller: Option<bool>,
 }
 impl CertificateRecord {
     fn parse(certificate: &Certificate) -> Result<Self, &'static str> {
@@ -94,6 +97,8 @@ impl CertificateRecord {
         Ok(Self {
             der,
             permissions: crate::protocol::ClientPermissions::default(),
+            feedback_grants: Default::default(),
+            controller: None,
             not_before: certificate
                 .tbs_certificate
                 .validity
@@ -189,6 +194,8 @@ impl Snapshot {
                     &crypto::parse_certificate(&client.certificate_pem, None)?.certificate,
                 )?;
                 record.permissions = client.permissions;
+                record.feedback_grants = client.feedback_grants.clone();
+                record.controller = client.config_overrides.controller;
                 Ok(record)
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -229,6 +236,29 @@ impl Snapshot {
         } else {
             Err(IDENTITY_FORBIDDEN)
         }
+    }
+
+    /// Checks an explicitly granted feedback capability against the selected
+    /// existing permission and a client-level controller restriction. This is
+    /// only an upper bound: the protocol/input owner must also enforce effective
+    /// global, application and session policy before binding or dispatch.
+    pub fn check_feedback_grant(
+        &self,
+        der: &[u8],
+        now: u64,
+        capability: &amaterasu_module_sdk::effect_authority::FeedbackCapability,
+        permission: u32,
+    ) -> Result<(), Status> {
+        self.check_permission(der, now, permission)?;
+        let client = self
+            .clients
+            .iter()
+            .find(|client| client.der == der && client.valid(now))
+            .ok_or(IDENTITY_UNTRUSTED)?;
+        if client.controller == Some(false) || !client.feedback_grants.contains(capability) {
+            return Err(IDENTITY_FORBIDDEN);
+        }
+        Ok(())
     }
 
     pub fn verify_client(&self, der: &[u8], now: u64) -> bool {

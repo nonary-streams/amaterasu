@@ -1,3 +1,5 @@
+use amaterasu_module_sdk::effect_authority::FeedbackCapability;
+pub use amaterasu_module_sdk::effect_authority::{FeedbackPermission, FeedbackPolicy};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -18,6 +20,8 @@ pub struct Settings {
 pub struct EffectAuthoritySettings {
     pub protocol_owner: String,
     pub effect_owner: String,
+    #[serde(default)]
+    pub feedback_policies: Vec<FeedbackPolicy>,
 }
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -31,6 +35,18 @@ impl Settings {
                 || !identifier(&settings.effect_owner, 128)
                 || !self.transport_principals.contains(&settings.protocol_owner)
                 || settings.protocol_owner == settings.effect_owner
+                || settings.feedback_policies.len() > 32
+                || settings
+                    .feedback_policies
+                    .iter()
+                    .any(|policy| !policy.capability.valid())
+                || settings
+                    .feedback_policies
+                    .iter()
+                    .map(|policy| &policy.capability)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    != settings.feedback_policies.len()
         }) {
             return Err("invalid_settings");
         }
@@ -95,6 +111,11 @@ pub enum Operation {
     UpdateClientPermissions {
         certificate_id: String,
         permissions: ClientPermissions,
+        expected_revision: u64,
+    },
+    UpdateClientFeedbackGrants {
+        certificate_id: String,
+        grants: BTreeSet<FeedbackCapability>,
         expected_revision: u64,
     },
     SetPermissionMode {
@@ -178,6 +199,15 @@ impl Operation {
                 expected_revision: _,
             } => hex_length(certificate_id, 32) && config_overrides.validate().is_ok(),
             Self::UpdateClientPermissions { certificate_id, .. } => hex_length(certificate_id, 32),
+            Self::UpdateClientFeedbackGrants {
+                certificate_id,
+                grants,
+                ..
+            } => {
+                hex_length(certificate_id, 32)
+                    && grants.len() <= 32
+                    && grants.iter().all(FeedbackCapability::valid)
+            }
             Self::CheckClientCertificate { certificate_pem }
             | Self::UnpairPresentedClient { certificate_pem } => certificate_pem.len() <= 4096,
             _ => true,
@@ -199,6 +229,7 @@ impl Operation {
                 | Self::UnpairPresentedClient { .. }
                 | Self::UpdateClientConfigOverrides { .. }
                 | Self::UpdateClientPermissions { .. }
+                | Self::UpdateClientFeedbackGrants { .. }
                 | Self::SetPermissionMode { .. }
         )
     }
@@ -224,6 +255,7 @@ impl Operation {
                 | Self::Unpair { .. }
                 | Self::UpdateClientConfigOverrides { .. }
                 | Self::UpdateClientPermissions { .. }
+                | Self::UpdateClientFeedbackGrants { .. }
                 | Self::SetPermissionMode { .. }
         )
     }
@@ -256,6 +288,9 @@ pub struct Client {
     pub permissions: ClientPermissions,
     #[serde(default, skip_serializing_if = "ClientConfigOverrides::is_empty")]
     pub config_overrides: ClientConfigOverrides,
+    /// Explicit per-client opt-in; old clients have no extension grants.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub feedback_grants: BTreeSet<FeedbackCapability>,
 }
 
 /// Certificate-bound privileges. Missing legacy metadata retains full access.
@@ -924,6 +959,8 @@ impl Document {
                 || client.name.is_empty()
                 || client.name.len() > 128
                 || client.config_overrides.validate().is_err()
+                || client.feedback_grants.len() > 32
+                || client.feedback_grants.iter().any(|grant| !grant.valid())
             {
                 return Err("invalid_state");
             }

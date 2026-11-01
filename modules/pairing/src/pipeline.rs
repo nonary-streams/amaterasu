@@ -907,7 +907,10 @@ impl Pipeline {
                     caller,
                     deadline: Instant::now() + Duration::from_millis(remaining_ms.min(30_000)),
                 };
-                if operation.may_write() && !is_client_configuration_update(&operation) {
+                if operation.may_write()
+                    && (!is_client_configuration_update(&operation)
+                        || self.effect_authority.is_some())
+                {
                     if self.effect_authority.is_some() && self.effect_gate.is_none() {
                         return complete(&mut send, id, error("authority_unavailable"));
                     }
@@ -1055,13 +1058,10 @@ impl Pipeline {
                 gate.require_epoch(&epoch)?;
                 let (snapshot, certificate) =
                     self.effect_bindings.get(&source).ok_or("source_denied")?;
-                if !self.identity.current(snapshot, now)
-                    || snapshot
-                        .check_permission(certificate, now, amaterasu_identity::PERMISSION_LAUNCH)
-                        .is_err()
-                {
+                if !self.identity.current(snapshot, now) {
                     return Err("source_denied");
                 }
+                authorize_feedback_scope(policy, snapshot, certificate, &scope, now)?;
                 let ticket = gate
                     .admit_stream_lease(&source, &operation_id, sequence, scope.clone())?
                     .to_owned();
@@ -1090,27 +1090,7 @@ impl Pipeline {
                 gate.complete_stream_lease(&epoch, &operation_id, &ticket, &retirement)?;
                 Ok(json!({"ok":true,"epoch":gate.epoch(),"operation_id":operation_id}))
             }
-            EffectRequest::Admit {
-                epoch,
-                source,
-                operation_id,
-                sequence,
-            } => {
-                gate.require_epoch(&epoch)?;
-                let (snapshot, certificate) =
-                    self.effect_bindings.get(&source).ok_or("source_denied")?;
-                if !self.identity.current(snapshot, now)
-                    || snapshot
-                        .check_permission(certificate, now, amaterasu_identity::PERMISSION_LAUNCH)
-                        .is_err()
-                {
-                    return Err("source_denied");
-                }
-                let ticket = gate.admit(&source, &operation_id, sequence)?.to_owned();
-                Ok(
-                    json!({"ok":true,"epoch":gate.epoch(),"operation_id":operation_id,"ticket":ticket}),
-                )
-            }
+            EffectRequest::Admit { .. } => Err("scope_required"),
             EffectRequest::Status {} => Ok(
                 json!({"ok":true,"epoch":gate.epoch(),"owner_epoch":gate.owner_epoch(),"startup_recovery_required":gate.startup_recovery_required(),"fence_generation":gate.fence_generation(),"drain_required":gate.drain_required(),"in_flight":gate.in_flight()}),
             ),
@@ -1172,9 +1152,16 @@ impl Pipeline {
             .to_der()
             .map_err(|_| "source_denied")?;
         let snapshot = self.identity.get(now).map_err(|_| "source_denied")?;
-        snapshot
-            .check_permission(&der, now, amaterasu_identity::PERMISSION_LAUNCH)
-            .map_err(|_| "source_denied")?;
+        if !snapshot.verify_client(&der, now) {
+            return Err("source_denied");
+        }
+        if let Some(scope) = &stream_scope {
+            let policy = self
+                .effect_authority
+                .as_ref()
+                .ok_or("authority_unavailable")?;
+            authorize_feedback_scope(policy, &snapshot, &der, scope, now)?;
+        }
         if !self.identity.current(&snapshot, now) {
             return Err("source_denied");
         }
@@ -1489,7 +1476,8 @@ impl Pipeline {
         // Only this operation replaces configuration on an existing certificate.
         // Publish the validated durable base while its CAS is pending; trust and
         // identity mutations retain their fail-closed invalidation boundary.
-        let configuration_only = is_client_configuration_update(&operation);
+        let configuration_only =
+            is_client_configuration_update(&operation) && self.effect_authority.is_none();
         if configuration_only {
             self.publish_identity(revision, loaded.clone())?;
         }
@@ -1508,6 +1496,9 @@ impl Pipeline {
                 expected_revision, ..
             }
             | Operation::UpdateClientPermissions {
+                expected_revision, ..
+            }
+            | Operation::UpdateClientFeedbackGrants {
                 expected_revision, ..
             }
             | Operation::SetPermissionMode {
@@ -1779,6 +1770,41 @@ impl Pipeline {
             snapshot,
         )
     }
+}
+
+fn authorize_feedback_scope(
+    policy: &EffectAuthoritySettings,
+    snapshot: &Snapshot,
+    certificate: &[u8],
+    scope: &crate::effect_gate::StreamScope,
+    now: u64,
+) -> Result<(), &'static str> {
+    if !scope.valid() {
+        return Err("scope_denied");
+    }
+    for capability in &scope.capabilities {
+        let selected = policy
+            .feedback_policies
+            .iter()
+            .find(|rule| &rule.capability == capability)
+            .ok_or("scope_denied")?;
+        snapshot
+            .check_feedback_grant(
+                certificate,
+                now,
+                capability,
+                match selected.required_permission {
+                    crate::protocol::FeedbackPermission::View => {
+                        amaterasu_identity::PERMISSION_VIEW
+                    }
+                    crate::protocol::FeedbackPermission::Launch => {
+                        amaterasu_identity::PERMISSION_LAUNCH
+                    }
+                },
+            )
+            .map_err(|_| "scope_denied")?;
+    }
+    Ok(())
 }
 
 fn source_join_available() -> bool {

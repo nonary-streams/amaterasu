@@ -38,6 +38,7 @@ fn document() -> Document {
             paired_at: 0,
             permissions: crate::protocol::ClientPermissions::default(),
             config_overrides: crate::protocol::ClientConfigOverrides::default(),
+            feedback_grants: Default::default(),
         }],
     }
 }

@@ -10,6 +10,7 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 
 pub const SERVICE: &str = "amaterasu.pairing-effects/1";
+pub const ADMINISTRATION_SERVICE: &str = "amaterasu.pairing/1";
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq, Ord, PartialOrd)]
 #[serde(deny_unknown_fields)]
@@ -166,6 +167,73 @@ impl FeedbackCapability {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'))
             && self.version != 0
+    }
+}
+
+/// A trusted startup policy selects a specific existing paired-client permission
+/// for each supported feedback schema. Capability advertisement is not a grant.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackPermission {
+    View,
+    Launch,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FeedbackPolicy {
+    pub capability: FeedbackCapability,
+    pub required_permission: FeedbackPermission,
+}
+
+/// Administrator-only pairing operation. The certificate reference belongs to
+/// the existing private pairing administration API; it is never sent to clients
+/// or the effect provider. Empty grants revoke all optional feedback scopes.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AdministrationRequest {
+    UpdateClientFeedbackGrants {
+        certificate_id: String,
+        grants: BTreeSet<FeedbackCapability>,
+        expected_revision: u64,
+    },
+}
+impl AdministrationRequest {
+    /// Submit to the existing pairing administrator service. The broker supplies
+    /// the caller identity; acceptance does not confirm that the update committed.
+    pub fn submit(
+        &self,
+        runtime: &crate::RuntimeClient,
+        timeout_ms: u64,
+        operation_id: &str,
+        parent: Option<u64>,
+    ) -> crate::ModuleResult<u64> {
+        self.validate().map_err(str::to_owned)?;
+        runtime.request_serialized(
+            crate::requests::RequestOptions {
+                service: ADMINISTRATION_SERVICE,
+                timeout_ms,
+                operation_id,
+                parent,
+            },
+            self,
+        )
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::UpdateClientFeedbackGrants {
+                certificate_id,
+                grants,
+                ..
+            } if certificate_id.len() == 64
+                && certificate_id.bytes().all(|b| b.is_ascii_hexdigit())
+                && grants.len() <= 32
+                && grants.iter().all(FeedbackCapability::valid) =>
+            {
+                Ok(())
+            }
+            _ => Err("invalid_request"),
+        }
     }
 }
 
@@ -518,6 +586,25 @@ mod tests {
             "epoch",
             "operation"
         ));
+    }
+
+    #[test]
+    fn administration_request_is_bounded_and_never_supplies_effect_authority() {
+        let request = json!({"action":"update_client_feedback_grants","certificate_id":"a".repeat(64),
+            "expected_revision":7,"grants":[{"schema":"speaker.pcm","version":1,"direction":"to_client"}]});
+        let parsed: AdministrationRequest = serde_json::from_value(request.clone()).unwrap();
+        assert!(parsed.validate().is_ok());
+        let mut forged = request.clone();
+        forged["caller"] = json!("administrator");
+        assert!(serde_json::from_value::<AdministrationRequest>(forged).is_err());
+        let mut invalid = request;
+        invalid["grants"][0]["version"] = json!(0);
+        assert!(
+            serde_json::from_value::<AdministrationRequest>(invalid)
+                .unwrap()
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]
