@@ -1284,6 +1284,31 @@ fn run_composition(replacement: bool, scenario: &str) {
                 let identity = await_provider(&coordinator, identity, &mut generated);
                 let incarnation = identity["provider_incarnation"].as_str().unwrap();
                 let policy = last_policy.expect("qualified selected policy");
+                // Each failed lookup exercises a terminal State result through
+                // the real broker. Exceed its shared 512-request capacity.
+                for index in 0..650 {
+                    let request = broker_request(
+                        &nvhttp,
+                        "amaterasu.launch/3",
+                        json!({
+                            "action":"cancel_streaming", "operation_id":format!("missing-{index}"),
+                            "certificate_id":cert_id,"preflight_token":"f".repeat(64),"policy_identity":policy
+                        }),
+                        &format!("missing-recovery-{index}"),
+                    );
+                    let result = await_launch(
+                        &nvhttp,
+                        request,
+                        &mut launch,
+                        &mut generated,
+                        &mut provider,
+                        &mut memory,
+                    );
+                    assert_eq!(
+                        result["code"], "preflight_retirement_unconfirmed",
+                        "{index}: {result}"
+                    );
+                }
                 let retirement = json!({"version":1,"operation_id":"late-reservation","application_id":"fixture-game","provider_incarnation":incarnation,"original_initiator":"amaterasu.nvhttp","policy_identity":policy});
                 for index in 0..2 {
                     let request = broker_request(
