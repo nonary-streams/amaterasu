@@ -4376,7 +4376,7 @@ fn authorized_feedback_for_test() -> (Pipeline, Harness, String, String, Value, 
     assert_eq!(bound["ok"], true);
     (pipeline, harness, certificate_id, epoch, source, scope)
 }
-fn authority_broker() -> amaterasu_runtime::Broker {
+fn authority_configuration() -> amaterasu_contracts::RuntimeConfig {
     use amaterasu_contracts::{Grants, RuntimeConfig};
     let mut configuration = RuntimeConfig::default();
     configuration.principals.insert(
@@ -4423,6 +4423,12 @@ fn authority_broker() -> amaterasu_runtime::Broker {
             ..Default::default()
         },
     );
+    configuration
+}
+
+fn broker_for_authority(
+    configuration: amaterasu_contracts::RuntimeConfig,
+) -> amaterasu_runtime::Broker {
     let mut broker = amaterasu_runtime::Broker::new(configuration).unwrap();
     for (principal, service) in [
         ("pairing", SERVICE),
@@ -4440,6 +4446,54 @@ fn authority_broker() -> amaterasu_runtime::Broker {
             Response::Ok
         ));
     }
+    broker
+}
+
+fn authority_broker() -> amaterasu_runtime::Broker {
+    broker_for_authority(authority_configuration())
+}
+
+fn protocol_authority_broker(method_schema: Value) -> amaterasu_runtime::Broker {
+    use amaterasu_contracts::{
+        ApiMethod, ApiMethodApproval, Grants,
+        effect_fence::{EffectFencePolicy, ProtectedMethod},
+    };
+    let mut config = authority_configuration();
+    config
+        .principals
+        .get_mut("input")
+        .unwrap()
+        .call
+        .insert("example.effects/1".into());
+    config.principals.insert(
+        "provider".into(),
+        Grants {
+            provide: ["example.effects/1".into()].into(),
+            ..Default::default()
+        },
+    );
+    let method: ApiMethod = serde_json::from_value(method_schema).unwrap();
+    config.api_methods.push(ApiMethodApproval {
+        provider: "provider".into(),
+        callers: ["input".into()].into(),
+        method: method.clone(),
+    });
+    config.effect_fence = Some(EffectFencePolicy {
+        authority: "pairing".into(),
+        issuer: "input".into(),
+        source_slots: false,
+        methods: vec![ProtectedMethod {
+            service: "example.effects/1".into(),
+            method: "apply".into(),
+            interface_major: 1,
+        }],
+        cleanup_methods: vec![],
+    });
+    let mut broker = broker_for_authority(config);
+    assert!(matches!(
+        broker.dispatch("provider", Command::RegisterApi { method }),
+        Response::Ok
+    ));
     broker
 }
 
@@ -5531,7 +5585,7 @@ fn broker_protocol_attestation_requires_paired_source_and_exact_client_grant() {
     let source = feedback_source_for_test("owner");
     let scope = feedback_scope_for_test(&["speaker.pcm"]);
     assert_eq!(pipeline.apply_effect_request("nvhttp","nvhttp",json!({"action":"bind_stream","epoch":epoch,"certificate_pem":CLIENT_CERT,"source":source,"scope":scope}),now()).unwrap()["ok"],true);
-    let mut broker = authority_broker();
+    let mut broker = protocol_authority_broker(protocol_test_schema(&method));
     let mut next = 0_u64;
     let mut call = |pipeline: &mut Pipeline, caller: &str, payload: Value| {
         next += 1;
@@ -5603,6 +5657,26 @@ fn broker_protocol_attestation_requires_paired_source_and_exact_client_grant() {
         .as_mut()
         .unwrap()
         .protocol_policies[0]
+        .method_schema
+        .request
+        .allow_extra = true;
+    assert_eq!(
+        call(&mut pipeline, "input", request.clone())["code"],
+        "scope_denied"
+    );
+    pipeline
+        .effect_authority
+        .as_mut()
+        .unwrap()
+        .protocol_policies[0]
+        .method_schema
+        .request
+        .allow_extra = false;
+    pipeline
+        .effect_authority
+        .as_mut()
+        .unwrap()
+        .protocol_policies[0]
         .provider = "replacement".into();
     assert_eq!(
         call(&mut pipeline, "input", request.clone())["code"],
@@ -5612,7 +5686,7 @@ fn broker_protocol_attestation_requires_paired_source_and_exact_client_grant() {
     replacement["effect"]["provider"] = json!("replacement");
     assert_eq!(
         call(&mut pipeline, "input", replacement)["code"],
-        "protocol_authority_unavailable"
+        "scope_denied"
     );
     pipeline
         .effect_authority

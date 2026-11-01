@@ -996,6 +996,9 @@ impl Pipeline {
         if !matches!(send(Command::CheckRequest { request: id })?, Response::Ok) {
             return complete(send, id, error("request_ended"));
         }
+        if payload["action"] == "admit_protocol_effect" {
+            return self.handle_protocol_admission(id, caller, initiator, payload, now, send);
+        }
         let response = self.apply_effect_request(caller, initiator, payload, now);
         complete(
             send,
@@ -1083,7 +1086,8 @@ impl Pipeline {
                 source,
                 effect,
             } => {
-                return self.admit_protocol_effect(version, epoch, source, *effect, caller, now);
+                self.admit_protocol_effect(version, epoch, source, *effect, caller, now)?;
+                return Err("protocol_authority_unavailable");
             }
             _ => {}
         }
