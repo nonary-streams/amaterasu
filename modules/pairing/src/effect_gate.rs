@@ -6,7 +6,9 @@ const MAX_SOURCES: usize = 64;
 const MAX_OPERATIONS: usize = 256;
 const MAX_RETIRED_SOURCES: usize = 4096;
 
-pub use amaterasu_module_sdk::effect_authority::{Request, Source, StreamRetirement, StreamScope};
+pub use amaterasu_module_sdk::effect_authority::{
+    ClipboardDirection, ClipboardStream, Request, Source, StreamRetirement, StreamScope,
+};
 use amaterasu_module_sdk::effect_owner_recovery::{
     Lease, MAX_RECORDS, SourceRecord, SourceRetirement as RestartSourceRetirement,
 };
@@ -44,6 +46,15 @@ struct SourceRetirement {
     receipt: Option<StreamRetirement>,
 }
 
+struct ClipboardAdmission {
+    stream: ClipboardStream,
+    client_fingerprint: String,
+    direction: ClipboardDirection,
+    ticket: String,
+    sequence: u64,
+    complete: bool,
+}
+
 struct OwnerRestart {
     owner_epoch: String,
     operation_id: String,
@@ -66,6 +77,9 @@ pub struct EffectGate {
     configuration_sources: BTreeMap<Source, StreamScope>,
     fenced_scoped_sources: BTreeMap<Source, StreamScope>,
     highwater: u64,
+    clipboard_operations: BTreeMap<String, ClipboardAdmission>,
+    clipboard_fences: std::collections::BTreeSet<ClipboardStream>,
+    clipboard_highwater: u64,
     fenced: bool,
     fence_generation: u64,
     drain_required: bool,
@@ -89,6 +103,9 @@ impl EffectGate {
             configuration_sources: BTreeMap::new(),
             fenced_scoped_sources: BTreeMap::new(),
             highwater: 0,
+            clipboard_operations: BTreeMap::new(),
+            clipboard_fences: Default::default(),
+            clipboard_highwater: 0,
             fenced: true,
             fence_generation: 0,
             drain_required: false,
@@ -141,6 +158,9 @@ impl EffectGate {
         self.configuration_sources.clear();
         self.fenced_scoped_sources.clear();
         self.highwater = 0;
+        self.clipboard_operations.clear();
+        self.clipboard_fences.clear();
+        self.clipboard_highwater = 0;
         self.fence_generation = 0;
         self.drain_required = false;
         self.owner_epoch = Some(owner_epoch.into());
@@ -403,6 +423,140 @@ impl EffectGate {
         Ok(())
     }
 
+    /// Account for a request until its provider and response are settled.
+    /// The caller must already have reserved this exact active stream.
+    pub fn admit_clipboard(
+        &mut self,
+        stream: &ClipboardStream,
+        client_fingerprint: &str,
+        direction: ClipboardDirection,
+        operation: &str,
+        sequence: u64,
+    ) -> Result<&str, &'static str> {
+        if self.fenced
+            || !stream.valid()
+            || self.clipboard_fences.contains(stream)
+            || !token(operation)
+            || client_fingerprint.len() != 64
+            || !client_fingerprint
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err("admission_denied");
+        }
+        if stream.operation_id(sequence).as_deref() != Some(operation) {
+            return Err("operation_conflict");
+        }
+        if let Some(prior) = self.clipboard_operations.get(operation) {
+            if prior.stream != *stream
+                || prior.client_fingerprint != client_fingerprint
+                || prior.direction != direction
+                || prior.sequence != sequence
+                || prior.complete
+            {
+                return Err("operation_conflict");
+            }
+        } else {
+            if sequence == 0 || sequence <= self.clipboard_highwater {
+                return Err("operation_conflict");
+            }
+            if self.clipboard_operations.len() >= MAX_OPERATIONS {
+                return Err("admission_capacity");
+            }
+            let mut bytes = [0_u8; 16];
+            getrandom::fill(&mut bytes).map_err(|_| "entropy_unavailable")?;
+            self.clipboard_operations.insert(
+                operation.into(),
+                ClipboardAdmission {
+                    stream: stream.clone(),
+                    client_fingerprint: client_fingerprint.into(),
+                    direction,
+                    ticket: bytes.iter().map(|b| format!("{b:02x}")).collect(),
+                    sequence,
+                    complete: false,
+                },
+            );
+            self.clipboard_highwater = sequence;
+        }
+        Ok(&self
+            .clipboard_operations
+            .get(operation)
+            .expect("admitted clipboard operation")
+            .ticket)
+    }
+    pub fn lookup_clipboard(
+        &self,
+        operation: &str,
+    ) -> Result<(&str, &ClipboardStream, bool), &'static str> {
+        let item = self
+            .clipboard_operations
+            .get(operation)
+            .ok_or("unknown_admission")?;
+        if item.complete {
+            return Err("operation_complete");
+        }
+        Ok((
+            &item.ticket,
+            &item.stream,
+            self.fenced || self.clipboard_fences.contains(&item.stream),
+        ))
+    }
+    pub fn complete_clipboard(
+        &mut self,
+        epoch: &str,
+        operation: &str,
+        ticket: &str,
+    ) -> Result<(), &'static str> {
+        self.require_epoch(epoch)?;
+        let item = self
+            .clipboard_operations
+            .get_mut(operation)
+            .ok_or("unknown_admission")?;
+        if item.ticket != ticket {
+            return Err("unknown_admission");
+        }
+        item.complete = true;
+        Ok(())
+    }
+    pub fn acknowledge_clipboard(
+        &mut self,
+        epoch: &str,
+        operation: &str,
+        ticket: &str,
+    ) -> Result<(), &'static str> {
+        self.require_epoch(epoch)?;
+        if let Some(item) = self.clipboard_operations.get(operation) {
+            if item.ticket != ticket || !item.complete {
+                return Err("unknown_admission");
+            }
+            self.clipboard_operations.remove(operation);
+        }
+        Ok(())
+    }
+    /// Fences a specific stream before lifecycle can complete teardown. A
+    /// pending result must be retried; a timeout is not a completion receipt.
+    pub fn fence_clipboard_stream(
+        &mut self,
+        epoch: &str,
+        stream: ClipboardStream,
+    ) -> Result<bool, &'static str> {
+        self.require_epoch(epoch)?;
+        if !stream.valid() {
+            return Err("invalid_stream");
+        }
+        if !self.clipboard_fences.contains(&stream)
+            && self.clipboard_fences.len() >= MAX_RETIRED_SOURCES
+        {
+            self.fence();
+            return Err("retirement_capacity");
+        }
+        self.clipboard_fences.insert(stream.clone());
+        Ok(!self
+            .clipboard_operations
+            .values()
+            .any(|item| item.stream == stream && !item.complete))
+    }
+
     pub fn admit(
         &mut self,
         source: &Source,
@@ -644,6 +798,10 @@ impl EffectGate {
             } else {
                 Err("owner_restart_pending")
             };
+        }
+        if !self.clipboard_operations.is_empty() {
+            self.fence();
+            return Err("clipboard_operations_pending");
         }
         if self.unscoped_restart_blocked
             || self.sources.values().any(Option::is_none)
@@ -903,6 +1061,11 @@ impl EffectGate {
     }
     pub fn in_flight(&self) -> usize {
         self.operations.values().filter(|a| !a.complete).count()
+            + self
+                .clipboard_operations
+                .values()
+                .filter(|a| !a.complete)
+                .count()
     }
     pub fn drained(&self) -> bool {
         self.fenced
@@ -1595,5 +1758,156 @@ mod tests {
         );
         replacement.recover("new-owner").unwrap();
         assert_eq!(replacement.bind(source), Err("source_denied"));
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::*;
+    fn stream(id: &str) -> ClipboardStream {
+        ClipboardStream {
+            version: 1,
+            host_epoch: "host".into(),
+            session_id: "session".into(),
+            stream_id: id.into(),
+            generation: 1,
+        }
+    }
+    #[test]
+    fn revocation_waits_for_clipboard_completion_and_fences_new_admission() {
+        let mut gate = EffectGate::new().unwrap();
+        gate.recover("stream-owner").unwrap();
+        let epoch = gate.epoch().to_owned();
+        let source = stream("first");
+        let operation = source.operation_id(1).unwrap();
+        let ticket = gate
+            .admit_clipboard(
+                &source,
+                &"a".repeat(64),
+                ClipboardDirection::Write,
+                &operation,
+                1,
+            )
+            .unwrap()
+            .to_owned();
+        gate.fence();
+        assert!(!gate.drained());
+        assert!(gate.lookup_clipboard(&operation).unwrap().2);
+        assert_eq!(
+            gate.admit_clipboard(
+                &source,
+                &"a".repeat(64),
+                ClipboardDirection::Read,
+                &source.operation_id(2).unwrap(),
+                2
+            ),
+            Err("admission_denied")
+        );
+        let generation = gate.fence_generation();
+        assert_eq!(
+            gate.acknowledge_drain(&epoch, generation),
+            Err("effects_in_flight")
+        );
+        assert_eq!(
+            gate.complete_clipboard(&epoch, &operation, "wrong"),
+            Err("unknown_admission")
+        );
+        gate.complete_clipboard(&epoch, &operation, &ticket)
+            .unwrap();
+        gate.acknowledge_clipboard(&epoch, &operation, &ticket)
+            .unwrap();
+        gate.acknowledge_drain(&epoch, generation).unwrap();
+        assert!(gate.drained());
+    }
+    #[test]
+    fn stream_fence_denies_replay_and_isolates_other_streams() {
+        let mut gate = EffectGate::new().unwrap();
+        gate.recover("stream-owner").unwrap();
+        let epoch = gate.epoch().to_owned();
+        let first = stream("first");
+        let other = stream("other");
+        let operation = first.operation_id(1).unwrap();
+        let ticket = gate
+            .admit_clipboard(
+                &first,
+                &"a".repeat(64),
+                ClipboardDirection::Read,
+                &operation,
+                1,
+            )
+            .unwrap()
+            .to_owned();
+        assert!(!gate.fence_clipboard_stream(&epoch, first.clone()).unwrap());
+        assert!(gate.lookup_clipboard(&operation).unwrap().2);
+        assert!(
+            gate.admit_clipboard(
+                &other,
+                &"b".repeat(64),
+                ClipboardDirection::Write,
+                &other.operation_id(2).unwrap(),
+                2
+            )
+            .is_ok()
+        );
+        gate.complete_clipboard(&epoch, &operation, &ticket)
+            .unwrap();
+        gate.acknowledge_clipboard(&epoch, &operation, &ticket)
+            .unwrap();
+        assert!(gate.fence_clipboard_stream(&epoch, first.clone()).unwrap());
+        assert_eq!(
+            gate.admit_clipboard(
+                &other,
+                &"a".repeat(64),
+                ClipboardDirection::Read,
+                &operation,
+                3
+            ),
+            Err("operation_conflict")
+        );
+        assert_eq!(
+            gate.admit_clipboard(
+                &first,
+                &"a".repeat(64),
+                ClipboardDirection::Read,
+                &operation,
+                1
+            ),
+            Err("admission_denied")
+        );
+        assert_eq!(
+            gate.admit_clipboard(
+                &other,
+                &"b".repeat(64),
+                ClipboardDirection::Write,
+                &other.operation_id(1).unwrap(),
+                1
+            ),
+            Err("operation_conflict")
+        );
+    }
+    #[test]
+    fn sequential_clipboard_operations_do_not_exhaust_terminal_slots() {
+        let mut gate = EffectGate::new().unwrap();
+        gate.recover("stream-owner").unwrap();
+        let epoch = gate.epoch().to_owned();
+        let source = stream("first");
+        for sequence in 1..=5000 {
+            let operation = source.operation_id(sequence).unwrap();
+            let ticket = gate
+                .admit_clipboard(
+                    &source,
+                    &"a".repeat(64),
+                    ClipboardDirection::Read,
+                    &operation,
+                    sequence,
+                )
+                .unwrap()
+                .to_owned();
+            gate.complete_clipboard(&epoch, &operation, &ticket)
+                .unwrap();
+            gate.acknowledge_clipboard(&epoch, &operation, &ticket)
+                .unwrap();
+        }
+        assert_eq!(gate.in_flight(), 0);
     }
 }

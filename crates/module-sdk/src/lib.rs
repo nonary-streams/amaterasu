@@ -3,6 +3,7 @@ pub mod application_library;
 pub mod audio;
 pub mod broker_effect_fence;
 pub mod capture;
+pub mod clipboard_authority;
 pub mod configuration;
 pub mod data_plane;
 pub mod effect_authority;

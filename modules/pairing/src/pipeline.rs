@@ -1001,6 +1001,10 @@ impl Pipeline {
                     Some(
                         "complete"
                             | "complete_stream_lease"
+                            | "lookup_clipboard"
+                            | "complete_clipboard"
+                            | "acknowledge_clipboard"
+                            | "fence_clipboard_stream"
                             | "lookup_stream_lease"
                             | "lookup"
                             | "acknowledge"
@@ -1109,8 +1113,14 @@ impl Pipeline {
             | EffectRequest::ReconcileConfigurationChange { .. } => {
                 policy.configuration_owner.as_deref() == Some(caller)
             }
-            EffectRequest::Bind { .. } | EffectRequest::BindStream { .. } => {
-                caller == policy.protocol_owner
+            EffectRequest::Bind { .. }
+            | EffectRequest::BindStream { .. }
+            | EffectRequest::AdmitClipboard { .. }
+            | EffectRequest::LookupClipboard { .. }
+            | EffectRequest::CompleteClipboard { .. }
+            | EffectRequest::AcknowledgeClipboard { .. } => caller == policy.protocol_owner,
+            EffectRequest::FenceClipboardStream { .. } => {
+                caller == policy.protocol_owner || caller == policy.effect_owner
             }
             EffectRequest::Status {} => {
                 caller == policy.protocol_owner
@@ -1205,6 +1215,58 @@ impl Pipeline {
                 }
                 return Ok(json!({"ok":true,"state":"pending"}));
             }
+            EffectRequest::AdmitClipboard {
+                epoch,
+                certificate_pem,
+                stream,
+                direction,
+                operation_id,
+                sequence,
+            } => {
+                // The live lifecycle reservation and teardown handshake are a
+                // prerequisite. Keep production closed until both are wired.
+                if !clipboard_authority_available() {
+                    return Err("clipboard_authority_unavailable");
+                }
+                if !self.configuration_reconciled || self.configuration_hold.is_some() {
+                    return Err("configuration_change_pending");
+                }
+                let certificate = crate::crypto::parse_certificate(&certificate_pem, Some(now))
+                    .map_err(|_| "source_denied")?;
+                let der = certificate
+                    .certificate
+                    .to_der()
+                    .map_err(|_| "source_denied")?;
+                let snapshot = self.identity.get(now).map_err(|_| "source_denied")?;
+                let selector = match direction {
+                    amaterasu_module_sdk::effect_authority::ClipboardDirection::Read => {
+                        amaterasu_identity::PERMISSION_CLIPBOARD_READ
+                    }
+                    amaterasu_module_sdk::effect_authority::ClipboardDirection::Write => {
+                        amaterasu_identity::PERMISSION_CLIPBOARD_WRITE
+                    }
+                };
+                snapshot
+                    .check_permission(&der, now, selector)
+                    .map_err(|_| "scope_denied")?;
+                if !self.identity.current(&snapshot, now) {
+                    return Err("source_denied");
+                }
+                let gate = self.effect_gate.as_mut().ok_or("authority_unavailable")?;
+                gate.require_epoch(&epoch)?;
+                let ticket = gate
+                    .admit_clipboard(
+                        &stream,
+                        &certificate.fingerprint,
+                        direction,
+                        &operation_id,
+                        sequence,
+                    )?
+                    .to_owned();
+                return Ok(
+                    json!({"ok":true,"epoch":epoch,"stream":stream,"direction":direction,"operation_id":operation_id,"ticket":ticket}),
+                );
+            }
             EffectRequest::Bind {
                 epoch,
                 certificate_pem,
@@ -1232,6 +1294,39 @@ impl Pipeline {
             }
             EffectRequest::Bind { .. } | EffectRequest::BindStream { .. } => {
                 unreachable!("handled above")
+            }
+            EffectRequest::AdmitClipboard { .. } => unreachable!("handled above"),
+            EffectRequest::LookupClipboard {
+                epoch,
+                operation_id,
+            } => {
+                gate.require_epoch(&epoch)?;
+                let (ticket, stream, fenced) = gate.lookup_clipboard(&operation_id)?;
+                Ok(
+                    json!({"ok":true,"epoch":epoch,"operation_id":operation_id,"ticket":ticket,"stream":stream,"fenced":fenced}),
+                )
+            }
+            EffectRequest::CompleteClipboard {
+                epoch,
+                operation_id,
+                ticket,
+            } => {
+                gate.complete_clipboard(&epoch, &operation_id, &ticket)?;
+                Ok(json!({"ok":true,"epoch":epoch,"operation_id":operation_id}))
+            }
+            EffectRequest::AcknowledgeClipboard {
+                epoch,
+                operation_id,
+                ticket,
+            } => {
+                gate.acknowledge_clipboard(&epoch, &operation_id, &ticket)?;
+                Ok(json!({"ok":true,"epoch":epoch,"operation_id":operation_id}))
+            }
+            EffectRequest::FenceClipboardStream { epoch, stream } => {
+                let drained = gate.fence_clipboard_stream(&epoch, stream.clone())?;
+                Ok(
+                    json!({"ok":true,"epoch":epoch,"stream":stream,"state":if drained {"drained"} else {"fenced"}}),
+                )
             }
             EffectRequest::AdmitStreamLease {
                 epoch,
@@ -2040,6 +2135,12 @@ fn authorize_feedback_scope(
             .map_err(|_| "scope_denied")?;
     }
     Ok(())
+}
+
+// Clipboard needs its own lifecycle/provider retirement handshake. Do not tie
+// this gate to the independent feedback startup profile.
+fn clipboard_authority_available() -> bool {
+    cfg!(test)
 }
 
 fn source_join_available() -> bool {

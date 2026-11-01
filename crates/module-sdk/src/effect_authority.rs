@@ -495,6 +495,47 @@ impl StreamRetirement {
     }
 }
 
+/// Lifecycle stream identity for effects that are not tied to an input device.
+/// A selector alone is never proof of an active stream or a client grant.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq, Ord, PartialOrd)]
+#[serde(deny_unknown_fields)]
+pub struct ClipboardStream {
+    pub version: u8,
+    pub host_epoch: String,
+    pub session_id: String,
+    pub stream_id: String,
+    pub generation: u64,
+}
+impl ClipboardStream {
+    pub fn valid(&self) -> bool {
+        self.version == 1
+            && self.generation > 0
+            && [&self.host_epoch, &self.session_id, &self.stream_id]
+                .into_iter()
+                .all(|v| token(v))
+    }
+    /// Stable, source-bound operation ID. The authority's persistent highwater
+    /// prevents replay without retaining one tombstone per finished request.
+    pub fn operation_id(&self, sequence: u64) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        if !self.valid() || sequence == 0 {
+            return None;
+        }
+        let mut hash = Sha256::new();
+        hash.update(b"amaterasu.clipboard.stream-operation/v1\0");
+        hash.update(serde_json::to_vec(self).ok()?);
+        hash.update(sequence.to_be_bytes());
+        Some(format!("clipboard-{:x}", hash.finalize()))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardDirection {
+    Read,
+    Write,
+}
+
 /// Broker request shape for the optional, startup-selected authority service.
 /// Bind is an assertion by the trusted protocol component, never client JSON.
 #[derive(Deserialize, Serialize)]
@@ -525,6 +566,34 @@ pub enum Request {
         certificate_pem: String,
         source: Source,
         scope: StreamScope,
+    },
+    /// Trusted protocol owner has authenticated TLS and reserved this active
+    /// stream at lifecycle. Pairing independently checks current client policy.
+    AdmitClipboard {
+        epoch: String,
+        certificate_pem: String,
+        stream: ClipboardStream,
+        direction: ClipboardDirection,
+        operation_id: String,
+        sequence: u64,
+    },
+    LookupClipboard {
+        epoch: String,
+        operation_id: String,
+    },
+    CompleteClipboard {
+        epoch: String,
+        operation_id: String,
+        ticket: String,
+    },
+    AcknowledgeClipboard {
+        epoch: String,
+        operation_id: String,
+        ticket: String,
+    },
+    FenceClipboardStream {
+        epoch: String,
+        stream: ClipboardStream,
     },
     AdmitStreamLease {
         epoch: String,

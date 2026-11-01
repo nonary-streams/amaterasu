@@ -2129,10 +2129,13 @@ impl Coordinator {
         save(&self.shared, next)
     }
 
-    fn retirement_ready(&self, work: &Work) -> ModuleResult<bool> {
+    pub(super) fn retirement_ready(&self, work: &Work) -> ModuleResult<bool> {
         let (_, id, stream_id, _) = super::operations::target_parts(&work.target)?;
         let journal = &self.shared.borrow().value;
         let session = journal.sessions.get(id).ok_or("unknown_session")?;
+        if journal.clipboard_reservations.blocks(&work.target) {
+            return Ok(false);
+        }
         if journal.receipts.values().any(|receipt| {
             receipt.work.as_ref().is_some_and(|other| {
                 other.transition_id != work.transition_id
@@ -2893,6 +2896,7 @@ mod admission_target_tests {
             authority: Default::default(),
             inputs: Default::default(),
             actions: Default::default(),
+            clipboard_reservations: Default::default(),
             input_bindings: Default::default(),
             revoked_inputs: Default::default(),
             recovery_sources: Default::default(),

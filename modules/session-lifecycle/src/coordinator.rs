@@ -12,6 +12,7 @@ mod action_root_retirement;
 mod action_target;
 mod application;
 mod checkpoint_queries;
+mod clipboard;
 #[allow(dead_code)] // Checkpoint integration is not yet enabled.
 mod closed_stream;
 mod composed_release_proof;
@@ -457,6 +458,11 @@ struct Journal {
     inputs: crate::input_authority::InputAuthority,
     #[serde(default)]
     actions: crate::action_authority::ActionAuthority,
+    #[serde(
+        default,
+        skip_serializing_if = "clipboard::ClipboardReservations::is_empty"
+    )]
+    clipboard_reservations: clipboard::ClipboardReservations,
     #[serde(default)]
     input_bindings: BTreeMap<String, crate::input_authority::ActiveBinding>,
     #[serde(default)]
@@ -1058,6 +1064,7 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
                         .is_ok()
                 })
         })
+        || !journal.clipboard_reservations.valid()
         || !journal.inputs.validate()
         || {
             let sources: Vec<_> = journal
@@ -1122,6 +1129,7 @@ impl Coordinator {
             authority: AuthorityState::default(),
             inputs: Default::default(),
             actions: Default::default(),
+            clipboard_reservations: Default::default(),
             input_bindings: BTreeMap::new(),
             revoked_inputs: BTreeSet::new(),
             recovery_sources: BTreeMap::new(),
@@ -1161,6 +1169,7 @@ impl Coordinator {
                 }
             }
         }
+        journal.clipboard_reservations.recover_after_restart();
         journal.inputs.recover_after_restart();
         journal.composition.fence_after_restart();
         journal.input_bindings.clear();
@@ -1218,6 +1227,16 @@ impl Coordinator {
         let Some(operation) = payload.get("operation").and_then(Value::as_str) else {
             return rejection("invalid_request");
         };
+        if matches!(
+            operation,
+            "clipboard_stream_status"
+                | "reserve_clipboard_stream"
+                | "lookup_clipboard_stream"
+                | "complete_clipboard_stream"
+                | "acknowledge_clipboard_stream"
+        ) {
+            return self.clipboard_reservation(caller, initiator, &payload);
+        }
         if operation == "snapshot" {
             return self.snapshot(caller, initiator);
         }

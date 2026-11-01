@@ -983,3 +983,100 @@ fn selected_application_scope_requires_the_direct_paired_tls_coordinator() {
         "pending"
     );
 }
+
+#[test]
+fn clipboard_stream_reservation_fences_shutdown_until_effect_settles() {
+    let dir = TestDirectory::new();
+    let mut coordinator = Coordinator::open(&dir.journal()).unwrap();
+    let session = coordinator.handle("amaterasu.nvhttp", "amaterasu.nvhttp", json!({
+        "operation":"prepare","operation_id":"clipboard-session", "source_attestation":{"version":1,"kind":"paired_tls"}}));
+    let epoch = session["host_epoch"].as_str().unwrap().to_owned();
+    let session_id = session["session_id"].as_str().unwrap().to_owned();
+    let source = json!({"version":1,"host_epoch":epoch,"session_id":session_id,"stream_id":"stream","generation":4});
+    let target = json!({"kind":"stream","host_epoch":epoch,"session_id":session_id,"stream_id":"stream","generation":4});
+    let typed_source: amaterasu_module_sdk::effect_authority::ClipboardStream =
+        serde_json::from_value(source.clone()).unwrap();
+    let first_operation = typed_source.operation_id(1).unwrap();
+    let next_operation = typed_source.operation_id(2).unwrap();
+    let candidate: CaptureBinding = serde_json::from_value(json!({"capture_provider":"capture", "selector_schema":"selector/1", "selector":{}, "resource":{"provider":"display","resource_id":"output","incarnation":"native","revision":1,"execution_domain":"seat","mutation_domain":null},"mode":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false},"plan_revision":1,"geometry_revision":7,"generation":4})).unwrap();
+    {
+        let mut shared = coordinator.shared.borrow_mut();
+        let session = shared.value.sessions.get_mut(&session_id).unwrap();
+        session.phase = SessionPhase::Ready;
+        session.streams.insert(
+            "stream".into(),
+            StreamRecord {
+                provider_graph: None,
+                generation: 4,
+                phase: StreamPhase::Active,
+                candidate: Some(candidate),
+                required: BTreeSet::new(),
+                acknowledgements: BTreeSet::new(),
+                retirements: BTreeSet::new(),
+                binding_owner: String::new(),
+                preparation_transition: String::new(),
+                provider_settings: Default::default(),
+            },
+        );
+    }
+    let status = coordinator.handle(
+        "amaterasu.nvhttp",
+        "amaterasu.nvhttp",
+        json!({"operation":"clipboard_stream_status"}),
+    );
+    assert_eq!(status["highwater"], 0);
+    let reserve = json!({"operation":"reserve_clipboard_stream","operation_id":first_operation,"source":source,"sequence":1});
+    assert_eq!(
+        coordinator.handle("foreign", "foreign", reserve.clone())["reason"],
+        "source_denied"
+    );
+    let receipt = coordinator.handle("amaterasu.nvhttp", "amaterasu.nvhttp", reserve.clone());
+    assert_eq!(receipt["status"], "reserved", "{receipt}");
+    assert_eq!(
+        coordinator.handle("amaterasu.nvhttp", "amaterasu.nvhttp", reserve.clone()),
+        receipt
+    );
+    let ticket = receipt["ticket"].as_str().unwrap().to_owned();
+    let restart_dir = TestDirectory::new();
+    std::fs::copy(dir.journal(), restart_dir.journal()).unwrap();
+    let mut restarted = Coordinator::open(&restart_dir.journal()).unwrap();
+    assert_eq!(
+        restarted.handle(
+            "amaterasu.nvhttp",
+            "amaterasu.nvhttp",
+            json!({"operation":"lookup_clipboard_stream","operation_id":first_operation})
+        )["reason"],
+        "clipboard_recovery_required"
+    );
+    let status = restarted.handle(
+        "amaterasu.nvhttp",
+        "amaterasu.nvhttp",
+        json!({"operation":"clipboard_stream_status"}),
+    );
+    assert_eq!(status["highwater"], 1);
+    assert_eq!(status["recovery_required"], true);
+    drop(restarted);
+    let paused = coordinator.handle(
+        "amaterasu.nvhttp",
+        "amaterasu.nvhttp",
+        json!({"operation":"pause_stream","operation_id":"pause-clipboard","target":target}),
+    );
+    assert_eq!(paused["status"], "pending", "{paused}");
+    assert_eq!(coordinator.handle("amaterasu.nvhttp","amaterasu.nvhttp",json!({"operation":"reserve_clipboard_stream","operation_id":next_operation,"source":source,"sequence":2}))["reason"],"source_denied");
+    let work = coordinator
+        .shared
+        .borrow()
+        .value
+        .receipts
+        .values()
+        .find_map(|r| {
+            r.work
+                .clone()
+                .filter(|w| w.phase == LifecyclePhase::StreamRelease)
+        })
+        .unwrap();
+    assert!(!coordinator.retirement_ready(&work).unwrap());
+    assert_eq!(coordinator.handle("foreign","foreign",json!({"operation":"complete_clipboard_stream","operation_id":first_operation,"ticket":ticket}))["reason"],"source_denied");
+    assert_eq!(coordinator.handle("amaterasu.nvhttp","amaterasu.nvhttp",json!({"operation":"complete_clipboard_stream","operation_id":first_operation,"ticket":ticket}))["status"],"completed");
+    assert!(coordinator.retirement_ready(&work).unwrap());
+}

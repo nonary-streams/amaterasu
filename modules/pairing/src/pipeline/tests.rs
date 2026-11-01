@@ -5681,3 +5681,188 @@ fn broker_lost_lease_lookup_reports_shared_transport_retirement() {
 }
 
 mod owner_restart_tests;
+
+#[test]
+fn real_broker_clipboard_admission_respects_grants_and_holds_revocation_until_settled() {
+    let (mut pipeline, mut harness, certificate_id) = paired_native_client();
+    let grant = json!({"action":"update_client_clipboard_grants","certificate_id":certificate_id,
+        "expected_revision":harness.revision,"grants":{"read":true,"write":false}});
+    assert_eq!(
+        harness.request(&mut pipeline, "console", grant, now())["ok"],
+        true
+    );
+    pipeline.effect_authority = Some(policy_for_feedback(
+        &[],
+        crate::protocol::FeedbackPermission::View,
+    ));
+    let initial = pipeline.effect_gate.as_ref().unwrap().epoch().to_owned();
+    let epoch = pipeline
+        .apply_effect_request(
+            "input",
+            "input",
+            json!({"action":"recover","epoch":initial,"owner_epoch":"stream-owner"}),
+            now(),
+        )
+        .unwrap()["epoch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let stream = json!({"version":1,"host_epoch":"host","session_id":"session","stream_id":"stream","generation":1});
+    let typed_stream: amaterasu_module_sdk::effect_authority::ClipboardStream =
+        serde_json::from_value(stream.clone()).unwrap();
+    let first_operation = typed_stream.operation_id(1).unwrap();
+    let mut broker = authority_broker();
+    let mut number = 0;
+    let mut call = |pipeline: &mut Pipeline, caller: &str, payload: Value| {
+        number += 1;
+        let Response::Accepted { id } = broker.dispatch(
+            caller,
+            Command::Request {
+                service: EFFECT_SERVICE.into(),
+                payload,
+                timeout_ms: 30_000,
+                operation_id: format!("clipboard-test-{number}"),
+                parent: None,
+            },
+        ) else {
+            panic!("request")
+        };
+        pipeline
+            .tick_at(now(), |command| Ok(broker.dispatch("pairing", command)))
+            .unwrap();
+        let Response::Result { payload } =
+            broker.dispatch(caller, Command::TakeResult { request: id })
+        else {
+            panic!("response")
+        };
+        assert!(matches!(
+            broker.dispatch(caller, Command::ReleaseResult { request: id }),
+            Response::Ok
+        ));
+        payload
+    };
+    let request = |direction: &str, _label: &str, sequence| json!({"action":"admit_clipboard","epoch":epoch,"certificate_pem":CLIENT_CERT,"stream":stream,"direction":direction,"operation_id":typed_stream.operation_id(sequence).unwrap(),"sequence":sequence});
+    assert_eq!(
+        call(&mut pipeline, "foreign", request("read", "foreign", 1))["code"],
+        "forbidden"
+    );
+    assert_eq!(
+        call(&mut pipeline, "nvhttp", request("write", "denied", 1))["code"],
+        "scope_denied"
+    );
+    let admitted = call(&mut pipeline, "nvhttp", request("read", "read-one", 1));
+    let ticket = admitted["ticket"].as_str().unwrap().to_owned();
+    assert_eq!(admitted["stream"], stream);
+    let writes = harness.writes;
+    harness.enqueue(
+        "console",
+        json!({"action":"update_client_clipboard_grants","certificate_id":certificate_id,
+        "expected_revision":harness.revision,"grants":{"read":false,"write":false}}),
+    );
+    for _ in 0..3 {
+        pipeline
+            .tick_at(now(), |command| harness.send(command))
+            .unwrap();
+        if pipeline.deferred_effect_mutation.is_some() {
+            break;
+        }
+    }
+    assert!(pipeline.deferred_effect_mutation.is_some());
+    assert_eq!(harness.writes, writes);
+    let lookup = pipeline
+        .apply_effect_request(
+            "nvhttp",
+            "nvhttp",
+            json!({"action":"lookup_clipboard","epoch":epoch,"operation_id":first_operation}),
+            now(),
+        )
+        .unwrap();
+    assert_eq!(lookup["fenced"], true);
+    assert!(
+        pipeline
+            .apply_effect_request("nvhttp", "nvhttp", request("read", "after-fence", 2), now())
+            .is_err()
+    );
+    assert_eq!(pipeline.apply_effect_request("nvhttp","nvhttp",json!({"action":"complete_clipboard","epoch":epoch,"operation_id":first_operation,"ticket":ticket}),now()).unwrap()["ok"],true);
+    assert_eq!(pipeline.apply_effect_request("nvhttp","nvhttp",json!({"action":"acknowledge_clipboard","epoch":epoch,"operation_id":first_operation,"ticket":ticket}),now()).unwrap()["ok"],true);
+    let generation = pipeline.effect_gate.as_ref().unwrap().fence_generation();
+    assert_eq!(
+        pipeline
+            .apply_effect_request(
+                "input",
+                "input",
+                json!({"action":"drain","epoch":epoch,"fence_generation":generation}),
+                now()
+            )
+            .unwrap()["ok"],
+        true
+    );
+    for _ in 0..8 {
+        pipeline
+            .tick_at(now(), |command| harness.send(command))
+            .unwrap();
+        if harness.output.is_some() {
+            break;
+        }
+    }
+    assert_eq!(harness.output.take().unwrap()["ok"], true);
+    assert_eq!(harness.writes, writes + 1);
+}
+
+#[test]
+fn canceled_delivered_clipboard_admission_cannot_create_a_permit() {
+    let (mut pipeline, mut harness, certificate_id) = paired_native_client();
+    let grant = json!({"action":"update_client_clipboard_grants","certificate_id":certificate_id,
+        "expected_revision":harness.revision,"grants":{"read":true,"write":false}});
+    assert_eq!(
+        harness.request(&mut pipeline, "console", grant, now())["ok"],
+        true
+    );
+    pipeline.effect_authority = Some(policy_for_feedback(
+        &[],
+        crate::protocol::FeedbackPermission::View,
+    ));
+    let initial = pipeline.effect_gate.as_ref().unwrap().epoch().to_owned();
+    let epoch = pipeline
+        .apply_effect_request(
+            "input",
+            "input",
+            json!({"action":"recover","epoch":initial,"owner_epoch":"owner"}),
+            now(),
+        )
+        .unwrap()["epoch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut broker = authority_broker();
+    let Response::Accepted { id } = broker.dispatch("nvhttp",Command::Request {service:EFFECT_SERVICE.into(),
+        payload:json!({"action":"admit_clipboard","epoch":epoch,"certificate_pem":CLIENT_CERT,"stream":{"version":1,"host_epoch":"host","session_id":"session","stream_id":"stream","generation":1},"direction":"read","operation_id":"cancelled","sequence":1}),
+        timeout_ms:30_000,operation_id:"cancelled-outer".into(),parent:None}) else { panic!("request") };
+    let Response::Request {
+        caller,
+        initiator,
+        payload,
+        ..
+    } = broker.dispatch("pairing", Command::Poll {})
+    else {
+        panic!("delivery")
+    };
+    assert!(matches!(
+        broker.dispatch("nvhttp", Command::Cancel { request: id }),
+        Response::Ok
+    ));
+    pipeline
+        .handle_effect_request(id, &caller, &initiator, payload, now(), &mut |command| {
+            Ok(broker.dispatch("pairing", command))
+        })
+        .unwrap();
+    assert_eq!(pipeline.effect_gate.as_ref().unwrap().in_flight(), 0);
+    assert_eq!(
+        pipeline
+            .effect_gate
+            .as_ref()
+            .unwrap()
+            .lookup_clipboard("cancelled"),
+        Err("unknown_admission")
+    );
+}
