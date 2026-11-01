@@ -107,6 +107,79 @@ type AudioProbe<'a> = dyn FnMut(
     ) -> Result<amaterasu_module_sdk::audio::OrderedAudioCandidate, &'static str>
     + 'a;
 
+/// A completed RPC is evidence that its provider call returned; cancellation
+/// and result release alone do not prove that a mutation has stopped. Keep an
+/// unresolved mutation fenced until a terminal response is observed, then use
+/// the existing owner-scoped display recovery before clearing the marker.
+fn reconcile_uncertain_display(record: &mut Record, send: &mut Send<'_>) -> bool {
+    let Some(mut pending) = record.uncertain.take() else {
+        return true;
+    };
+    let Some(step) = record.uncertain_step else {
+        record.uncertain = Some(pending);
+        return false;
+    };
+    let mutating = matches!(
+        step,
+        Step::ApplyDisplay
+            | Step::RestoreDisplay
+            | Step::RecoverDisplay
+            | Step::CreateVirtualDisplay
+            | Step::RemoveVirtualDisplay
+            | Step::CreateOwnedVirtualDisplay
+            | Step::RemoveOwnedVirtualDisplay
+    );
+    let mut terminal = !pending.was_sent() || pending.released_completion();
+    if !terminal {
+        match pending.observe_completion(send) {
+            Some(response) => {
+                match step {
+                    Step::ApplyDisplay => {
+                        record.display_attempted = true;
+                        display::accept_apply(record, &response);
+                        record.display_status_verified = false;
+                    }
+                    Step::RestoreDisplay | Step::RecoverDisplay => {
+                        let _ = display::accept_restore(record, &response);
+                        record.display_status_verified = false;
+                    }
+                    Step::CreateVirtualDisplay | Step::CreateOwnedVirtualDisplay => {
+                        record.virtual_display_attempted = true;
+                    }
+                    _ => {}
+                }
+                terminal = pending.release_result(send);
+            }
+            None if !mutating => terminal = pending.shutdown(send),
+            None => {
+                let _ = pending.shutdown(send);
+            }
+        }
+    }
+    if terminal {
+        if matches!(
+            step,
+            Step::ApplyDisplay | Step::RestoreDisplay | Step::RecoverDisplay
+        ) {
+            // A prior status predates the completed mutation and cannot prove
+            // the current lease state during retirement.
+            record.display_status_verified = false;
+        }
+        let display_done = display::shutdown(record, send);
+        let virtual_done = if record.config.virtual_display_intent.is_some() {
+            virtual_display::shutdown(record, send)
+        } else {
+            virtual_display::owned_shutdown(record, send)
+        };
+        if display_done && virtual_done {
+            record.uncertain_step = None;
+            return true;
+        }
+    }
+    record.uncertain = Some(pending);
+    false
+}
+
 struct NativeOperations<'a, 'b> {
     factory: &'a mut Factory<'b>,
     probe: &'a mut Probe<'b>,
@@ -251,12 +324,12 @@ impl Pipeline {
                     }
                 }
                 if !resolved {
-                    let cleanup_settled = pending.shutdown(send);
-                    if !cleanup_settled {
-                        record.uncertain = Some(pending);
-                        record.uncertain_step = Some(Step::ApplyDisplay);
-                    }
-                    settled &= cleanup_settled;
+                    // Cancel/release settles only the RPC. The provider may
+                    // still finish the display mutation after cancellation.
+                    let _ = pending.shutdown(send);
+                    record.uncertain = Some(pending);
+                    record.uncertain_step = Some(Step::ApplyDisplay);
+                    settled = false;
                 }
             }
         }
@@ -267,21 +340,44 @@ impl Pipeline {
                     | Step::StatusVirtualDisplay
                     | Step::SnapshotDisplay
                     | Step::RemoveVirtualDisplay
+                    | Step::CheckDisplay
+                    | Step::FindDisplay
+                    | Step::RestoreDisplay
+                    | Step::RecoverDisplay
+                    | Step::CreateOwnedVirtualDisplay
+                    | Step::FindOwnedVirtualDisplay
+                    | Step::RemoveOwnedVirtualDisplay
             )
             && let Some(mut pending) = job.pending.take()
             && let Some(record) = self.records.get_mut(&job.session)
         {
             if !pending.was_sent() {
-                if job.step == Step::CreateVirtualDisplay {
+                if matches!(
+                    job.step,
+                    Step::CreateVirtualDisplay | Step::CreateOwnedVirtualDisplay
+                ) {
                     record.virtual_display_attempted = false;
                 }
                 if job.step == Step::RemoveVirtualDisplay {
                     record.virtual_display_remove_attempted = false;
                 }
-            } else if !pending.shutdown(send) {
-                record.uncertain = Some(pending);
-                record.uncertain_step = Some(job.step);
-                settled = false;
+            } else {
+                let settled_request = pending.shutdown(send);
+                if !settled_request
+                    || matches!(
+                        job.step,
+                        Step::CreateVirtualDisplay
+                            | Step::RemoveVirtualDisplay
+                            | Step::RestoreDisplay
+                            | Step::RecoverDisplay
+                            | Step::CreateOwnedVirtualDisplay
+                            | Step::RemoveOwnedVirtualDisplay
+                    )
+                {
+                    record.uncertain = Some(pending);
+                    record.uncertain_step = Some(job.step);
+                    settled = false;
+                }
             }
         }
         for record in self.records.values_mut() {
@@ -289,10 +385,6 @@ impl Pipeline {
             settled &= record.history.shutdown(send);
             let now = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
             settled &= record.host_metrics.shutdown(record.id, now, send);
-            if let Some(pending) = record.uncertain.as_mut() {
-                settled &= pending.shutdown(send);
-            }
-            settled &= limiter::shutdown(record, send);
             let display_request_uncertain = record.uncertain.is_some()
                 && matches!(
                     record.uncertain_step,
@@ -306,11 +398,17 @@ impl Pipeline {
                             | Step::StatusVirtualDisplay
                             | Step::SnapshotDisplay
                             | Step::RemoveVirtualDisplay
+                            | Step::CreateOwnedVirtualDisplay
+                            | Step::FindOwnedVirtualDisplay
+                            | Step::RemoveOwnedVirtualDisplay
                     )
                 );
             if display_request_uncertain {
-                settled = false;
+                settled &= reconcile_uncertain_display(record, send);
             } else {
+                if let Some(pending) = record.uncertain.as_mut() {
+                    settled &= pending.shutdown(send);
+                }
                 settled &= display::shutdown(record, send);
                 settled &= if record.config.virtual_display_intent.is_some() {
                     virtual_display::shutdown(record, send)
@@ -318,6 +416,7 @@ impl Pipeline {
                     virtual_display::owned_shutdown(record, send)
                 };
             }
+            settled &= limiter::shutdown(record, send);
         }
         settled &= self.history_activities.shutdown(send);
         if let Some(pending) = self.job.as_mut().and_then(|job| job.pending.as_mut()) {
