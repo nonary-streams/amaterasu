@@ -194,8 +194,8 @@ impl Pipeline {
 
     /// Unload cannot drive asynchronous provider cleanup. Release native bindings
     /// and settle broker work; active provider resources require their own unload.
-    pub fn shutdown(&mut self, runtime: &RuntimeClient) {
-        self.shutdown_with(&mut |command| runtime.send_ephemeral(command));
+    pub fn shutdown(&mut self, runtime: &RuntimeClient) -> bool {
+        self.shutdown_with(&mut |command| runtime.send_ephemeral(command))
     }
 
     fn shutdown_with(&mut self, send: &mut Send<'_>) -> bool {
