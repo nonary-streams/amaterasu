@@ -5,7 +5,44 @@ use super::{
     KNOWN_CLIENT_FEATURE_FLAGS, Video,
 };
 use amaterasu_contracts::encoder::{DynamicRange, VideoCodec, VideoStreamFormat};
-use amaterasu_contracts::media_profile::{VideoProfile, VideoProfileSnapshot};
+use amaterasu_contracts::media_profile::{FormatId, VideoProfile, VideoProfileSnapshot};
+
+/// Parse an explicit peer acceptance of one metadata schema and selector.
+/// It is never inferred from a codec marker or a host-side provider claim.
+pub fn metadata_claim(bytes: &[u8]) -> Result<Option<(u32, FormatId)>, Error> {
+    let document = syntax::parse(bytes)?;
+    let Some(value) = document.attributes.get("x-amaterasu-video-metadata") else {
+        return Ok(None);
+    };
+    let parts: Vec<_> = value.split(' ').collect();
+    if parts.len() != 4
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || !part.bytes().all(|b| b.is_ascii_digit())
+                || (part.len() > 1 && part.starts_with('0'))
+        })
+    {
+        return Err(Error::Invalid("video metadata schema"));
+    }
+    let selector = parts[0]
+        .parse::<u32>()
+        .map_err(|_| Error::Invalid("video metadata schema"))?;
+    let schema = FormatId {
+        namespace_id: parts[1]
+            .parse()
+            .map_err(|_| Error::Invalid("video metadata schema"))?,
+        value: parts[2]
+            .parse()
+            .map_err(|_| Error::Invalid("video metadata schema"))?,
+        schema: parts[3]
+            .parse()
+            .map_err(|_| Error::Invalid("video metadata schema"))?,
+    };
+    if selector < 3 || !schema.is_valid() {
+        return Err(Error::Invalid("video metadata schema"));
+    }
+    Ok(Some((selector, schema)))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NegotiatedVideoFormat {

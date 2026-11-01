@@ -67,7 +67,8 @@ impl ManagedModule for Video {
                     settings.gpu_processor_service.as_deref(),
                     settings.generic_processor_service.as_deref(),
                 )?
-                .with_required_frame_leases(settings.require_frame_lease),
+                .with_required_frame_leases(settings.require_frame_lease)
+                .with_metadata_route(&runtime, settings.metadata_route.as_ref())?,
             )
         } else {
             Box::new(Disabled)

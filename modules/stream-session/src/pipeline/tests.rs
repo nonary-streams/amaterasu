@@ -90,6 +90,166 @@ fn extension_offer_requires_source_and_downstream_probes_then_selects_the_planne
 }
 
 #[test]
+fn metadata_extension_requires_exact_peer_acceptance_and_selected_source_generation() {
+    use amaterasu_media::*;
+    let profile = json!({"codec":{"namespace_id":7,"value":8,"schema":1},
+        "framing":{"namespace_id":7,"value":9,"schema":1},"wire_selector":4,
+        "payload_type":100,"encoding_name":"EXAMPLE"});
+    let schema = json!({"namespace_id":1,"value":1,"schema":1});
+    let route: crate::model::ExtensionRoute = serde_json::from_value(json!({"profile":profile,
+        "source_id":0,"encoder_provider":"fixture","encoder":{"clsid":"source","friendly_name":"Source","hardware_url":null},
+        "video_unit_service":"example.units/1","framer_service":"example.framer/1","plan_transport_service":"example.plan/1",
+        "metadata_schema":schema})).unwrap();
+    let limits = VideoFramingLimits {
+        size: size_of::<VideoFramingLimits>() as u32,
+        version: VIDEO_FRAMING_LIMITS_VERSION,
+        packet_size: 1024,
+        crypto_overhead: 16,
+        network_overhead: 28,
+        allowed_extensions: 0,
+        max_datagrams: 64,
+        max_queue_bytes: 65536,
+        min_parity_shards: 2,
+        max_fec_percentage: 255,
+        max_wire_bytes: 65536,
+        min_fec_percentage: 20,
+        max_fec_blocks: 1,
+        fec_policy_flags: 0,
+        reserved: 0,
+    };
+    let mut host = Harness::new();
+    host.pipeline.settings.allowed_principals = vec!["amaterasu.rtsp".into()];
+    host.pipeline.settings.extension_route = Some(route);
+    host.broker.extension_probe_supported = true;
+    host.broker.extension_metadata_schema = Some(schema.clone());
+    host.extension_probe_limits = Some(limits);
+    let mut request = prepare();
+    request["stream_audio"] = json!(false);
+    request["extension_probe"] = start(0)["configuration"]["configuration"].clone();
+    let prepared = host.response_from(1, "amaterasu.rtsp", request);
+    assert_eq!(prepared["extension_metadata_schema"], schema);
+    let session = prepared["session"].as_u64().unwrap();
+    for (request_id, accepted_schema) in [
+        (2, Value::Null),
+        (3, json!({"namespace_id":1,"value":2,"schema":1})),
+    ] {
+        let mut request = start(session);
+        request["configuration"]["client_feature_flags"] = json!(0);
+        request["configuration"]["client_metadata_schema"] = accepted_schema;
+        request["configuration"]["configuration"]["extension_profile"] = profile.clone();
+        assert_eq!(
+            host.response_from(request_id, "amaterasu.rtsp", request)["code"],
+            "extension_profile_not_offered"
+        );
+    }
+    let mut request = start(session);
+    request["configuration"]["client_feature_flags"] = json!(0);
+    request["configuration"]["client_metadata_schema"] = schema;
+    request["configuration"]["configuration"]["extension_profile"] = profile;
+    let result = host.response_from(4, "amaterasu.rtsp", request);
+    assert_eq!(result["state"], "active", "{result}");
+    assert_eq!(host.plane.borrow().planned_planes, 1);
+    assert!(
+        host.broker
+            .calls
+            .iter()
+            .any(|call| call.service == "amaterasu.video/1"
+                && call.payload["action"] == "probe_submitted_metadata")
+    );
+}
+
+#[test]
+#[ignore = "requires separately built metadata framing provider artifacts"]
+fn managed_session_pipeline_uses_two_metadata_framing_artifacts() {
+    use crate::plane::{MetadataFixture, Plane, with_two_metadata_framers};
+    use amaterasu_module_sdk::RuntimeClient;
+
+    fn tick_native(
+        host: &mut Harness,
+        runtime: &RuntimeClient,
+        limits: amaterasu_media::VideoFramingLimits,
+    ) {
+        host.now += 1;
+        host.broker.now = host.now;
+        host.pipeline
+            .tick_with(
+                host.now,
+                &mut |command| host.broker.send(command),
+                &mut |handles, providers, route, _audio| {
+                    let route = route.ok_or("metadata_route_missing")?;
+                    Ok(
+                        Box::new(Plane::new_planned(runtime, handles, providers, route)?)
+                            as Box<dyn Drive>,
+                    )
+                },
+                &mut |_, _, _| Ok(limits),
+                &mut |_, _, _, _, _| Err("unsupported"),
+            )
+            .unwrap();
+    }
+    fn response_native(
+        host: &mut Harness,
+        runtime: &RuntimeClient,
+        limits: amaterasu_media::VideoFramingLimits,
+        id: u64,
+        payload: Value,
+    ) -> Value {
+        host.broker.enqueue(id, "amaterasu.rtsp", payload);
+        for _ in 0..600 {
+            tick_native(host, runtime, limits);
+            if let Some(value) = host.broker.replies.remove(&id) {
+                return value;
+            }
+        }
+        panic!("managed metadata request did not complete");
+    }
+    with_two_metadata_framers(|factory, marker| {
+        let mut fixture = MetadataFixture::new(factory);
+        let runtime = fixture.runtime();
+        let limits = fixture.limits;
+        let mut host = Harness::new();
+        host.pipeline.settings.allowed_principals = vec!["amaterasu.rtsp".into()];
+        let profile = json!({"codec":{"namespace_id":42,"value":9,"schema":1},
+            "framing":{"namespace_id":42,"value":10,"schema":1},"wire_selector":9,
+            "payload_type":99,"encoding_name":"TEST9"});
+        let schema = json!({"namespace_id":1,"value":1,"schema":1});
+        host.pipeline.settings.extension_route = Some(serde_json::from_value(json!({"profile":profile,
+            "source_id":0,"encoder_provider":"fixture","encoder":{"clsid":"source","friendly_name":"Source","hardware_url":null},
+            "video_unit_service":"test.units/1","framer_service":"test.framer/1","plan_transport_service":"test.plan/1",
+            "metadata_schema":schema})).unwrap());
+        host.broker.extension_probe_supported = true;
+        host.broker.extension_metadata_schema = Some(schema.clone());
+        host.broker
+            .forced_stream_ids
+            .insert("amaterasu.video/1".into(), 10);
+        host.broker
+            .forced_stream_ids
+            .insert("amaterasu.media-transport/1".into(), 40);
+        host.broker
+            .forced_stream_ids
+            .insert("amaterasu.control-transport/1".into(), 50);
+        let mut request = prepare();
+        request["stream_audio"] = json!(false);
+        request["extension_probe"] = start(0)["configuration"]["configuration"].clone();
+        let prepared = response_native(&mut host, &runtime, limits, 1, request);
+        assert_eq!(prepared["extension_metadata_schema"], schema);
+        let session = prepared["session"].as_u64().unwrap();
+        let mut request = start(session);
+        request["configuration"]["client_feature_flags"] = json!(0);
+        request["configuration"]["client_metadata_schema"] = schema;
+        request["configuration"]["configuration"]["extension_profile"] = profile;
+        let result = response_native(&mut host, &runtime, limits, 2, request);
+        assert_eq!(result["state"], "active", "{result}");
+        for _ in 0..8 {
+            tick_native(&mut host, &runtime, limits);
+        }
+        assert!(fixture.retired());
+        assert_eq!(fixture.wire(), [1, 2, 3, marker, 0xb5, 1]);
+        drop(host);
+    });
+}
+
+#[test]
 fn selected_control_retirement_epoch_is_retained_only_with_the_owned_stream() {
     for (offered, valid) in [
         (json!("c".repeat(32)), true),

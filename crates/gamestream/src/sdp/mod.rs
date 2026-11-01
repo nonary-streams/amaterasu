@@ -5,7 +5,9 @@ mod attributes;
 mod negotiate;
 mod syntax;
 
-pub use negotiate::{NegotiatedVideoFormat, parse_announce, parse_profile_announce};
+pub use negotiate::{
+    NegotiatedVideoFormat, metadata_claim, parse_announce, parse_profile_announce,
+};
 
 pub const MAX_BYTES: usize = 16 * 1024;
 pub const MAX_LINES: usize = 192;

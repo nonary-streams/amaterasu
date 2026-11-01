@@ -236,8 +236,9 @@ pub(crate) struct VideoUnitSelection {
     pub source_id: u64,
     pub config_generation: u64,
     pub clock_epoch: [u8; 16],
-    /// V1 units cannot carry required frame metadata.
     pub metadata_required: bool,
+    pub metadata_schema: Option<amaterasu_media::FrameMetadataSchemaId>,
+    pub source_generation: Option<u64>,
 }
 
 impl VideoUnitSelection {
@@ -252,7 +253,20 @@ impl VideoUnitSelection {
             && self.clock_epoch != [0; 16]
             && valid_id(self.codec)
             && valid_id(self.framing)
-            && !self.metadata_required
+            && match (
+                self.metadata_required,
+                self.metadata_schema,
+                self.source_generation,
+            ) {
+                (false, None, None) => true,
+                (true, Some(schema), Some(generation)) => {
+                    schema.namespace_id != 0
+                        && schema.value != 0
+                        && schema.schema != 0
+                        && generation != 0
+                }
+                _ => false,
+            }
     }
     pub(super) fn accepts(&self, unit: &NegotiatedVideoUnit) -> bool {
         self.valid()
@@ -275,6 +289,7 @@ impl VideoUnitSelection {
 pub(super) struct VideoUnitPacket {
     metadata: NegotiatedVideoUnit,
     bytes: Vec<u8>,
+    side_data: Option<Vec<u8>>,
 }
 
 impl VideoUnitPacket {
@@ -285,7 +300,7 @@ impl VideoUnitPacket {
         unit: &NegotiatedVideoUnit,
         selection: &VideoUnitSelection,
     ) -> PlaneResult<Self> {
-        if !selection.accepts(unit) {
+        if selection.metadata_required || !selection.accepts(unit) {
             return Err("invalid_negotiated_video_unit");
         }
         let bytes = if unit.data.len == 0 {
@@ -296,7 +311,76 @@ impl VideoUnitPacket {
         };
         let mut metadata = *unit;
         metadata.data = amaterasu_module_sdk::abi::BorrowedBytes::new(&[]);
-        Ok(Self { metadata, bytes })
+        Ok(Self {
+            metadata,
+            bytes,
+            side_data: None,
+        })
+    }
+
+    /// # Safety
+    /// The provider lends both initialized allocations synchronously.
+    pub(super) unsafe fn copy_metadata(
+        wrapped: &amaterasu_media::NegotiatedVideoMetadataUnitV1,
+        selection: &VideoUnitSelection,
+    ) -> PlaneResult<Self> {
+        use amaterasu_module_sdk::media::metadata::{CarriageOwner, FrameMetadataBundle};
+        if !selection.metadata_required
+            || !selection.accepts(&wrapped.unit)
+            || wrapped.size as usize
+                != std::mem::size_of::<amaterasu_media::NegotiatedVideoMetadataUnitV1>()
+            || wrapped.version != 1
+        {
+            return Err("invalid_negotiated_video_unit");
+        }
+        let mut plain_selection = *selection;
+        plain_selection.metadata_required = false;
+        plain_selection.metadata_schema = None;
+        plain_selection.source_generation = None;
+        let mut packet = unsafe { Self::copy(&wrapped.unit, &plain_selection)? };
+        if wrapped.unit.flags == amaterasu_media::VIDEO_UNIT_END_OF_STREAM {
+            if wrapped.metadata.len != 0 {
+                return Err("invalid_negotiated_video_metadata");
+            }
+            return Ok(packet);
+        }
+        if wrapped.metadata.len == 0
+            || wrapped.metadata.len > amaterasu_media::FRAME_METADATA_MAX_BUNDLE_BYTES
+            || wrapped.metadata.ptr.is_null()
+        {
+            return Err("invalid_negotiated_video_metadata");
+        }
+        let bytes =
+            unsafe { std::slice::from_raw_parts(wrapped.metadata.ptr, wrapped.metadata.len) }
+                .to_vec();
+        let bundle =
+            FrameMetadataBundle::decode(&bytes).map_err(|_| "invalid_negotiated_video_metadata")?;
+        let schema = selection
+            .metadata_schema
+            .ok_or("invalid_negotiated_video_metadata")?;
+        if bundle.owner != CarriageOwner::FramerInsert
+            || bundle.identity.session_id != wrapped.unit.stream
+            || bundle.identity.submission_id != wrapped.unit.submission_id
+            || bundle.identity.source_id != wrapped.unit.source_id
+            || Some(bundle.identity.source_generation) != selection.source_generation
+            || bundle.identity.config_generation != wrapped.unit.config_generation
+            || !bundle.items.iter().any(|item| {
+                item.required
+                    && (
+                        item.schema.namespace_id,
+                        item.schema.value,
+                        item.schema.schema,
+                    ) == (schema.namespace_id, schema.value, schema.schema)
+            })
+        {
+            return Err("invalid_negotiated_video_metadata");
+        }
+        packet.side_data = Some(bytes);
+        Ok(packet)
+    }
+
+    pub(super) fn side_data(&self) -> Option<&[u8]> {
+        self.side_data.as_deref()
     }
 
     pub(super) fn header(&self) -> NegotiatedVideoUnit {

@@ -1,6 +1,8 @@
 //! Native calls borrow copied headers only synchronously. Bindings are retained
 //! until every pending call and callback has returned, then released by the SDK.
 use super::*;
+#[cfg(test)]
+pub(crate) mod metadata_tests;
 mod ordered_audio;
 mod planned;
 use amaterasu_gamestream::control::{RUMBLE_MESSAGE_TYPE, RumbleFeedback, encode_rumble_feedback};
@@ -31,18 +33,36 @@ pub(super) fn probe_chain(
     config: &crate::model::PrepareConfig,
 ) -> PlaneResult<VideoFramingLimits> {
     let _video = unsafe {
-        amaterasu_module_sdk::video_framing::bind_video(runtime, &route.video_unit_service)
+        if route.metadata_schema.is_some() {
+            amaterasu_module_sdk::video_framing::bind_video_metadata(
+                runtime,
+                &route.video_unit_service,
+            )
+        } else {
+            amaterasu_module_sdk::video_framing::bind_video(runtime, &route.video_unit_service)
+        }
     }
     .map_err(|_| "native_binding_failed")?;
     let framer = unsafe {
-        amaterasu_module_sdk::video_framing::bind_with_probe(runtime, &route.framer_service)
+        if route.metadata_schema.is_some() {
+            amaterasu_module_sdk::video_framing::bind_with_metadata(runtime, &route.framer_service)
+        } else {
+            amaterasu_module_sdk::video_framing::bind_with_probe(runtime, &route.framer_service)
+        }
     }
     .map_err(|_| "native_binding_failed")?;
     let transport = unsafe {
-        amaterasu_module_sdk::video_framing::bind_plan_transport_v2(
-            runtime,
-            &route.plan_transport_service,
-        )
+        if route.metadata_schema.is_some() {
+            amaterasu_module_sdk::video_framing::bind_plan_transport_metadata(
+                runtime,
+                &route.plan_transport_service,
+            )
+        } else {
+            amaterasu_module_sdk::video_framing::bind_plan_transport_v2(
+                runtime,
+                &route.plan_transport_service,
+            )
+        }
     }
     .map_err(|_| "native_binding_failed")?;
     let id = |format: amaterasu_contracts::media_profile::FormatId| EncoderFormatId {
@@ -57,7 +77,7 @@ pub(super) fn probe_chain(
             stream: 1,
             generation: 1,
             offer_id: u64::from(route.profile.wire_selector),
-            source_id: route.source_id,
+            source_id: route.source_id.max(1),
             config_generation: 1,
             codec: id(route.profile.codec),
             framing: id(route.profile.framing),
@@ -74,9 +94,36 @@ pub(super) fn probe_chain(
         .map_err(|_| "native_layout_mismatch")?;
     let mut limits = VideoFramingLimits::default();
     // SAFETY: bindings and input/output descriptors remain live for each call.
-    if unsafe { (api.probe)(transport.context(), transport_stream, &request, &mut limits) }
-        != STATUS_OK
-    {
+    let metadata_schema = route.metadata_schema.map(|schema| FrameMetadataSchemaId {
+        namespace_id: schema.namespace_id,
+        value: schema.value,
+        schema: schema.schema,
+    });
+    let status = if let Some(schema) = metadata_schema {
+        let mut base = request;
+        base.base.size = size_of::<VideoPlanSelectionV3>() as u32;
+        base.base.version = 3;
+        base.base.metadata_required = 1;
+        let metadata_request = VideoPlanSelectionV3 {
+            base,
+            schema,
+            carriage_owner: FRAME_METADATA_OWNER_FRAMER,
+            reserved: 0,
+        };
+        let api = unsafe { transport.table::<NegotiatedVideoPlanTransportApiV2_1>() }
+            .map_err(|_| "native_layout_mismatch")?;
+        unsafe {
+            (api.probe_metadata)(
+                transport.context(),
+                transport_stream,
+                &metadata_request,
+                &mut limits,
+            )
+        }
+    } else {
+        unsafe { (api.probe)(transport.context(), transport_stream, &request, &mut limits) }
+    };
+    if status != STATUS_OK {
         return Err("video_plan_probe_failed");
     }
     let expected_crypto = if config.encrypt_video {
@@ -118,6 +165,22 @@ pub(super) fn probe_chain(
     } != STATUS_OK
     {
         return Err("video_framer_probe_failed");
+    }
+    if let Some(schema) = metadata_schema {
+        let api = unsafe { framer.table::<VideoFramingApiV2_2>() }
+            .map_err(|_| "native_layout_mismatch")?;
+        if unsafe {
+            (api.probe_metadata)(
+                framer.context(),
+                &request.base.codec,
+                &request.base.framing,
+                &schema,
+                &limits,
+            )
+        } != STATUS_OK
+        {
+            return Err("video_metadata_framer_probe_failed");
+        }
     }
     Ok(limits)
 }
@@ -198,6 +261,7 @@ pub(super) struct NativeBackend {
     framer: Option<NativeBinding>,
     plan_transport: Option<NativeBinding>,
     framing_limits: Option<VideoFramingLimits>,
+    pending_video_metadata: Option<PendingVideoMetadata>,
     capture: Option<NativeBinding>,
     encoder: Option<NativeBinding>,
     media: NativeBinding,
@@ -208,7 +272,98 @@ pub(super) struct NativeBackend {
     ordered_audio: Option<OrderedBindings>,
 }
 
+struct PendingVideoMetadata {
+    access_unit: u64,
+    bytes: Vec<u8>,
+    plan: Option<planned::OwnedPlan>,
+    framed: bool,
+    transport_admitted: bool,
+}
+
 impl NativeBackend {
+    fn submit_metadata_unit(&mut self, unit: &NegotiatedVideoUnit) -> PlaneResult<bool> {
+        let pending = self
+            .pending_video_metadata
+            .as_mut()
+            .ok_or("video_metadata_missing")?;
+        if pending.access_unit != unit.access_unit_id {
+            return Err("video_metadata_mismatch");
+        }
+        let video = self
+            .video_unit
+            .as_ref()
+            .ok_or("video_metadata_unavailable")?;
+        let framer = self.framer.as_ref().ok_or("video_metadata_unavailable")?;
+        let transport = self
+            .plan_transport
+            .as_ref()
+            .ok_or("video_metadata_unavailable")?;
+        let limits = self
+            .framing_limits
+            .as_ref()
+            .ok_or("video_metadata_unavailable")?;
+        let video_api = unsafe { video.table::<NegotiatedVideoApiV1_1>() }
+            .map_err(|_| "native_layout_mismatch")?;
+        if pending.plan.is_none() {
+            let Some(plan) = planned::metadata_plan(framer, limits, unit, &pending.bytes)? else {
+                return Ok(false);
+            };
+            pending.plan = Some(plan);
+        }
+        if !pending.framed {
+            // SAFETY: the selected Video binding owns the live reserved unit.
+            if !accepted(
+                unsafe {
+                    (video_api.framed_metadata)(video.context(), unit.stream, unit.access_unit_id)
+                },
+                "video_metadata_carriage_failed",
+            )? {
+                return Ok(false);
+            }
+            pending.framed = true;
+        }
+        if !pending.transport_admitted {
+            // A fresh check precedes every attempt; BUSY retains the accepted plan.
+            if !accepted(
+                unsafe {
+                    (video_api.check_metadata)(video.context(), unit.stream, unit.access_unit_id)
+                },
+                "video_metadata_stale",
+            )? {
+                return Ok(false);
+            }
+            let api = unsafe { transport.table::<NegotiatedVideoPlanTransportApiV2>() }
+                .map_err(|_| "native_layout_mismatch")?;
+            let plan = pending.plan.as_ref().ok_or("video_metadata_plan_missing")?;
+            // SAFETY: unit and cached plan remain owned through this synchronous call.
+            if !accepted(
+                unsafe {
+                    (api.submit)(
+                        transport.context(),
+                        self.handles.media_transport,
+                        unit,
+                        &plan.header(),
+                    )
+                },
+                "native_video_plan_submit_failed",
+            )? {
+                return Ok(false);
+            }
+            pending.transport_admitted = true;
+        }
+        // Retire only after admission. If retirement is busy, do not submit again.
+        if !accepted(
+            unsafe {
+                (video_api.retire_metadata)(video.context(), unit.stream, unit.access_unit_id)
+            },
+            "video_metadata_retirement_failed",
+        )? {
+            return Ok(false);
+        }
+        self.pending_video_metadata = None;
+        Ok(true)
+    }
+
     fn update_hdr(&mut self) -> PlaneResult<()> {
         if !self.handles.hdr {
             return Ok(());
@@ -325,18 +480,39 @@ impl NativeBackend {
             return Err("negotiated_video_selection_invalid");
         }
         let video = unsafe {
-            amaterasu_module_sdk::video_framing::bind_video(runtime, &route.video_service)
+            if selection.metadata_required {
+                amaterasu_module_sdk::video_framing::bind_video_metadata(
+                    runtime,
+                    &route.video_service,
+                )
+            } else {
+                amaterasu_module_sdk::video_framing::bind_video(runtime, &route.video_service)
+            }
         }
         .map_err(|_| "native_binding_failed")?;
         let framer = unsafe {
-            amaterasu_module_sdk::video_framing::bind_with_probe(runtime, &route.framer_service)
+            if selection.metadata_required {
+                amaterasu_module_sdk::video_framing::bind_with_metadata(
+                    runtime,
+                    &route.framer_service,
+                )
+            } else {
+                amaterasu_module_sdk::video_framing::bind_with_probe(runtime, &route.framer_service)
+            }
         }
         .map_err(|_| "native_binding_failed")?;
         let transport = unsafe {
-            amaterasu_module_sdk::video_framing::bind_plan_transport_v2(
-                runtime,
-                &route.transport_service,
-            )
+            if selection.metadata_required {
+                amaterasu_module_sdk::video_framing::bind_plan_transport_metadata(
+                    runtime,
+                    &route.transport_service,
+                )
+            } else {
+                amaterasu_module_sdk::video_framing::bind_plan_transport_v2(
+                    runtime,
+                    &route.transport_service,
+                )
+            }
         }
         .map_err(|_| "native_binding_failed")?;
         let mut backend = Self::with_video(runtime, handles, providers, None, Some(video), None)?;
@@ -364,15 +540,40 @@ impl NativeBackend {
             .map_err(|_| "native_layout_mismatch")?;
         let mut probe_limits = VideoFramingLimits::default();
         // SAFETY: bindings and stack descriptors remain valid during both calls.
-        if unsafe {
-            (api.probe)(
-                transport.context(),
-                handles.media_transport,
-                &request,
-                &mut probe_limits,
-            )
-        } != STATUS_OK
-        {
+        let metadata_request = selection.metadata_schema.map(|schema| {
+            let mut base = request;
+            base.base.size = size_of::<VideoPlanSelectionV3>() as u32;
+            base.base.version = 3;
+            base.base.metadata_required = 1;
+            VideoPlanSelectionV3 {
+                base,
+                schema,
+                carriage_owner: FRAME_METADATA_OWNER_FRAMER,
+                reserved: 0,
+            }
+        });
+        let probe_status = if let Some(request) = &metadata_request {
+            let api = unsafe { transport.table::<NegotiatedVideoPlanTransportApiV2_1>() }
+                .map_err(|_| "native_layout_mismatch")?;
+            unsafe {
+                (api.probe_metadata)(
+                    transport.context(),
+                    handles.media_transport,
+                    request,
+                    &mut probe_limits,
+                )
+            }
+        } else {
+            unsafe {
+                (api.probe)(
+                    transport.context(),
+                    handles.media_transport,
+                    &request,
+                    &mut probe_limits,
+                )
+            }
+        };
+        if probe_status != STATUS_OK {
             return Err("video_plan_probe_failed");
         }
         if probe_limits != route.limits {
@@ -391,16 +592,45 @@ impl NativeBackend {
         {
             return Err("video_framer_probe_failed");
         }
+        if let Some(schema) = selection.metadata_schema {
+            let api = unsafe { framer.table::<VideoFramingApiV2_2>() }
+                .map_err(|_| "native_layout_mismatch")?;
+            if unsafe {
+                (api.probe_metadata)(
+                    framer.context(),
+                    &selection.codec,
+                    &selection.framing,
+                    &schema,
+                    &probe_limits,
+                )
+            } != STATUS_OK
+            {
+                return Err("video_metadata_framer_probe_failed");
+            }
+        }
         let mut selected_limits = VideoFramingLimits::default();
-        if unsafe {
-            (api.prepare)(
-                transport.context(),
-                handles.media_transport,
-                &request,
-                &mut selected_limits,
-            )
-        } != STATUS_OK
-        {
+        let prepare_status = if let Some(request) = &metadata_request {
+            let api = unsafe { transport.table::<NegotiatedVideoPlanTransportApiV2_1>() }
+                .map_err(|_| "native_layout_mismatch")?;
+            unsafe {
+                (api.prepare_metadata)(
+                    transport.context(),
+                    handles.media_transport,
+                    request,
+                    &mut selected_limits,
+                )
+            }
+        } else {
+            unsafe {
+                (api.prepare)(
+                    transport.context(),
+                    handles.media_transport,
+                    &request,
+                    &mut selected_limits,
+                )
+            }
+        };
+        if prepare_status != STATUS_OK {
             return Err("video_plan_prepare_failed");
         }
         if selected_limits != probe_limits {
@@ -449,6 +679,7 @@ impl NativeBackend {
             framer: None,
             plan_transport: None,
             framing_limits: None,
+            pending_video_metadata: None,
             capture,
             encoder,
             media: unsafe {
@@ -626,27 +857,60 @@ impl Backend for NativeBackend {
             .video_unit
             .as_ref()
             .ok_or("negotiated_video_unsupported")?;
-        let api = unsafe { binding.table::<NegotiatedVideoApi>() }
-            .map_err(|_| "native_layout_mismatch")?;
         let mut output = UnitDelivery {
             delivery: Delivery::default(),
             selection: *selection,
         };
         // SAFETY: binding and stack output remain live throughout the callback.
-        let status = unsafe {
-            (api.receive)(
-                binding.context(),
-                self.handles.video,
-                NegotiatedVideoUnitSink {
-                    context: (&mut output as *mut UnitDelivery).cast(),
-                    write: copy_video_unit,
-                },
-            )
+        let status = if selection.metadata_required {
+            let api = unsafe { binding.table::<NegotiatedVideoApiV1_1>() }
+                .map_err(|_| "native_layout_mismatch")?;
+            unsafe {
+                (api.receive_metadata)(
+                    binding.context(),
+                    self.handles.video,
+                    NegotiatedVideoMetadataUnitSinkV1 {
+                        context: (&mut output as *mut UnitDelivery).cast(),
+                        write: copy_metadata_video_unit,
+                    },
+                )
+            }
+        } else {
+            let api = unsafe { binding.table::<NegotiatedVideoApi>() }
+                .map_err(|_| "native_layout_mismatch")?;
+            unsafe {
+                (api.receive)(
+                    binding.context(),
+                    self.handles.video,
+                    NegotiatedVideoUnitSink {
+                        context: (&mut output as *mut UnitDelivery).cast(),
+                        write: copy_video_unit,
+                    },
+                )
+            }
         };
-        output.delivery.finish(status, DeliveryLane::Video)
+        let packet = output.delivery.finish(status, DeliveryLane::Video)?;
+        if let Some(packet) = &packet
+            && let Some(metadata) = packet.side_data()
+        {
+            if self.pending_video_metadata.is_some() {
+                return Err("video_metadata_already_pending");
+            }
+            self.pending_video_metadata = Some(PendingVideoMetadata {
+                access_unit: packet.header().access_unit_id,
+                bytes: metadata.to_vec(),
+                plan: None,
+                framed: false,
+                transport_admitted: false,
+            });
+        }
+        Ok(packet)
     }
 
     fn submit_video_unit(&mut self, unit: &NegotiatedVideoUnit) -> PlaneResult<bool> {
+        if self.pending_video_metadata.is_some() {
+            return self.submit_metadata_unit(unit);
+        }
         if let (Some(framer), Some(transport), Some(limits)) =
             (&self.framer, &self.plan_transport, &self.framing_limits)
         {
@@ -942,6 +1206,28 @@ unsafe extern "C" fn copy_video_unit(
             (&mut output.delivery as *mut Delivery<VideoUnitPacket>).cast(),
             unit,
             |value| VideoUnitPacket::copy(value, &selection),
+        )
+    }
+}
+
+unsafe extern "C" fn copy_metadata_video_unit(
+    context: *mut c_void,
+    unit: *const NegotiatedVideoMetadataUnitV1,
+) -> Status {
+    if context.is_null()
+        || unit.is_null()
+        || !(unit as usize).is_multiple_of(align_of::<NegotiatedVideoMetadataUnitV1>())
+    {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: provider lends the wrapper and buffers through this synchronous callback.
+    let output = unsafe { &mut *context.cast::<UnitDelivery>() };
+    let selection = output.selection;
+    unsafe {
+        deliver(
+            (&mut output.delivery as *mut Delivery<VideoUnitPacket>).cast(),
+            unit,
+            |value| VideoUnitPacket::copy_metadata(value, &selection),
         )
     }
 }

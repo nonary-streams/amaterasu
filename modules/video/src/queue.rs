@@ -1,4 +1,5 @@
 //! Bounded encoded packet ownership shared with native consumer bindings.
+use crate::plane::{MetadataCapabilities, MetadataFlow};
 use amaterasu_media::{
     ENCODER_CHUNK_ACCESS_UNIT_END, ENCODER_CHUNK_ACCESS_UNIT_START, ENCODER_CHUNK_END_OF_STREAM,
     ENCODER_CHUNK_KEYFRAME, EncodedPacket, EncoderFormatId, EncoderOutputChunk, FLAG_END_OF_STREAM,
@@ -8,7 +9,13 @@ use amaterasu_media::{
     VIDEO_UNIT_VERSION,
 };
 use amaterasu_module_sdk::abi::{BorrowedBytes, STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
-use std::collections::{BTreeMap, VecDeque};
+use amaterasu_module_sdk::media::metadata::{
+    EncodedMetadataAssociation, EncodedMetadataSelection, MetadataApplication,
+};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::{Arc, Mutex},
+};
 
 struct Packet {
     bytes: Vec<u8>,
@@ -54,6 +61,18 @@ struct Unit {
     flags: u32,
     bytes: Vec<u8>,
     fragments: usize,
+    metadata: Option<UnitMetadata>,
+}
+
+struct MetadataSelection {
+    flow: Arc<Mutex<MetadataFlow>>,
+    capabilities: MetadataCapabilities,
+}
+
+struct UnitMetadata {
+    bytes: Vec<u8>,
+    association: EncodedMetadataAssociation,
+    delivered: bool,
 }
 
 struct UnitQueue {
@@ -63,6 +82,73 @@ struct UnitQueue {
     bytes: usize,
     eos_queued: bool,
     eos_accepted: bool,
+    metadata: Option<MetadataSelection>,
+    failed: bool,
+}
+
+fn unit_header(selection: UnitSelection, unit: &Unit) -> NegotiatedVideoUnit {
+    NegotiatedVideoUnit {
+        size: std::mem::size_of::<NegotiatedVideoUnit>() as u32,
+        version: VIDEO_UNIT_VERSION,
+        stream: selection.stream,
+        generation: selection.generation,
+        offer_id: selection.offer_id,
+        codec: selection.codec,
+        framing: selection.framing,
+        access_unit_id: unit.access_unit_id,
+        submission_id: unit.submission_id,
+        source_id: selection.source_id,
+        config_generation: selection.config_generation,
+        timestamp_us: unit.timestamp_us,
+        clock: FrameClockMetadata {
+            size: std::mem::size_of::<FrameClockMetadata>() as u32,
+            version: 1,
+            domain: FRAME_CLOCK_STREAM_RELATIVE,
+            reserved: 0,
+            epoch_id: selection.clock_epoch,
+        },
+        flags: unit.flags,
+        reserved: 0,
+        data: BorrowedBytes::new(&unit.bytes),
+    }
+}
+
+fn associate_metadata(queue: &UnitQueue, unit: &mut Unit) -> Result<(), Status> {
+    let Some(selected) = &queue.metadata else {
+        return Ok(());
+    };
+    let header = unit_header(queue.selection, unit);
+    let mut flow = selected.flow.lock().map_err(|_| STATUS_INVALID_ARGUMENT)?;
+    let bytes = flow
+        .output_bytes(selected.capabilities)
+        .map_err(|_| STATUS_INVALID_ARGUMENT)?;
+    let mut association = flow
+        .claim_output(
+            EncodedMetadataSelection {
+                stream: header.stream,
+                generation: header.generation,
+                offer_id: header.offer_id,
+                codec: header.codec,
+                framing: header.framing,
+                clock_epoch: header.clock.epoch_id,
+            },
+            selected.capabilities,
+        )
+        .map_err(|_| STATUS_INVALID_ARGUMENT)?;
+    association
+        .accept_encoder_output(
+            &header,
+            &bytes,
+            MetadataApplication::Forwarded,
+            selected.capabilities.encoder,
+        )
+        .map_err(|_| STATUS_INVALID_ARGUMENT)?;
+    unit.metadata = Some(UnitMetadata {
+        bytes,
+        association,
+        delivered: false,
+    });
+    Ok(())
 }
 
 #[derive(Default)]
@@ -154,7 +240,27 @@ impl Queues {
             bytes: 0,
             eos_queued: false,
             eos_accepted: false,
+            metadata: None,
+            failed: false,
         });
+        Ok(())
+    }
+
+    pub(crate) fn configure_metadata(
+        &mut self,
+        id: u64,
+        flow: Arc<Mutex<MetadataFlow>>,
+        capabilities: MetadataCapabilities,
+    ) -> Result<(), Status> {
+        let queue = self
+            .streams
+            .get_mut(&id)
+            .and_then(|stream| stream.negotiated.as_mut())
+            .ok_or(MEDIA_CLOSED)?;
+        if queue.metadata.is_some() || queue.current.is_some() || !queue.ready.is_empty() {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        queue.metadata = Some(MetadataSelection { flow, capabilities });
         Ok(())
     }
 
@@ -168,7 +274,7 @@ impl Queues {
         else {
             return MEDIA_CLOSED;
         };
-        if queue.eos_queued {
+        if queue.eos_queued || queue.failed {
             return MEDIA_CLOSED;
         }
         let selection = queue.selection;
@@ -248,6 +354,7 @@ impl Queues {
                 flags: VIDEO_UNIT_END_OF_STREAM,
                 bytes: Vec::new(),
                 fragments: 0,
+                metadata: None,
             });
             return STATUS_OK;
         }
@@ -258,14 +365,18 @@ impl Queues {
             flags: if picture { VIDEO_UNIT_KEYFRAME } else { 0 },
             bytes: Vec::new(),
             fragments: 0,
+            metadata: None,
         });
         unit.bytes.extend_from_slice(bytes);
         unit.fragments += 1;
         queue.bytes += bytes.len();
         if end {
-            queue
-                .ready
-                .push_back(queue.current.take().expect("unit initialized"));
+            let mut unit = queue.current.take().expect("unit initialized");
+            if associate_metadata(queue, &mut unit).is_err() {
+                queue.failed = true;
+                return STATUS_INVALID_ARGUMENT;
+            }
+            queue.ready.push_back(unit);
         }
         STATUS_OK
     }
@@ -286,6 +397,9 @@ impl Queues {
         else {
             return MEDIA_CLOSED;
         };
+        if queue.failed || queue.metadata.is_some() {
+            return STATUS_INVALID_ARGUMENT;
+        }
         let Some(unit) = queue.ready.front() else {
             return if queue.eos_accepted {
                 MEDIA_CLOSED
@@ -293,31 +407,7 @@ impl Queues {
                 MEDIA_PENDING
             };
         };
-        let s = queue.selection;
-        let header = NegotiatedVideoUnit {
-            size: std::mem::size_of::<NegotiatedVideoUnit>() as u32,
-            version: VIDEO_UNIT_VERSION,
-            stream: s.stream,
-            generation: s.generation,
-            offer_id: s.offer_id,
-            codec: s.codec,
-            framing: s.framing,
-            access_unit_id: unit.access_unit_id,
-            submission_id: unit.submission_id,
-            source_id: s.source_id,
-            config_generation: s.config_generation,
-            timestamp_us: unit.timestamp_us,
-            clock: FrameClockMetadata {
-                size: std::mem::size_of::<FrameClockMetadata>() as u32,
-                version: 1,
-                domain: FRAME_CLOCK_STREAM_RELATIVE,
-                reserved: 0,
-                epoch_id: s.clock_epoch,
-            },
-            flags: unit.flags,
-            reserved: 0,
-            data: BorrowedBytes::new(&unit.bytes),
-        };
+        let header = unit_header(queue.selection, unit);
         // SAFETY: queue retains header and bytes during this synchronous callback.
         let status = unsafe { (sink.write)(sink.context, &header) };
         if status == STATUS_OK {
@@ -326,6 +416,160 @@ impl Queues {
             queue.ready.pop_front();
         }
         status
+    }
+
+    /// # Safety
+    /// Sink borrows the unit and envelope synchronously and must not reenter.
+    pub(crate) unsafe fn receive_unit_metadata(
+        &mut self,
+        owner: &str,
+        id: u64,
+        sink: amaterasu_media::NegotiatedVideoMetadataUnitSinkV1,
+    ) -> Status {
+        let Some(queue) = self
+            .streams
+            .get_mut(&id)
+            .filter(|stream| stream.owner == owner)
+            .and_then(|stream| stream.negotiated.as_mut())
+        else {
+            return MEDIA_CLOSED;
+        };
+        if queue.failed || queue.metadata.is_none() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let Some(unit) = queue.ready.front_mut() else {
+            return if queue.eos_accepted {
+                MEDIA_CLOSED
+            } else {
+                MEDIA_PENDING
+            };
+        };
+        let header = unit_header(queue.selection, unit);
+        if unit
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.delivered)
+        {
+            return MEDIA_BUSY;
+        }
+        let envelope = unit
+            .metadata
+            .as_ref()
+            .map_or(&[][..], |metadata| metadata.bytes.as_slice());
+        if header.flags != VIDEO_UNIT_END_OF_STREAM && envelope.is_empty() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let wrapped = amaterasu_media::NegotiatedVideoMetadataUnitV1 {
+            size: std::mem::size_of::<amaterasu_media::NegotiatedVideoMetadataUnitV1>() as u32,
+            version: 1,
+            unit: header,
+            metadata: BorrowedBytes::new(envelope),
+        };
+        // SAFETY: queue owns unit and envelope until the callback returns.
+        let status = unsafe { (sink.write)(sink.context, &wrapped) };
+        if status == STATUS_OK {
+            if let Some(metadata) = unit.metadata.as_mut() {
+                metadata.delivered = true;
+            } else {
+                queue.eos_accepted = true;
+                queue.ready.pop_front();
+            }
+        }
+        status
+    }
+
+    fn with_metadata_unit<T>(
+        &mut self,
+        owner: &str,
+        id: u64,
+        unit_id: u64,
+        operation: impl FnOnce(
+            &MetadataSelection,
+            &NegotiatedVideoUnit,
+            &mut UnitMetadata,
+        ) -> Result<T, Status>,
+    ) -> Result<T, Status> {
+        let queue = self
+            .streams
+            .get_mut(&id)
+            .filter(|stream| stream.owner == owner)
+            .and_then(|stream| stream.negotiated.as_mut())
+            .ok_or(MEDIA_CLOSED)?;
+        if queue.failed {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        let selected = queue.metadata.as_ref().ok_or(STATUS_INVALID_ARGUMENT)?;
+        if !selected
+            .flow
+            .lock()
+            .map_err(|_| STATUS_INVALID_ARGUMENT)?
+            .is_current(selected.capabilities)
+        {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        let unit = queue.ready.front_mut().ok_or(MEDIA_PENDING)?;
+        let header = unit_header(queue.selection, unit);
+        if unit.access_unit_id != unit_id {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        let metadata = unit
+            .metadata
+            .as_mut()
+            .filter(|metadata| metadata.delivered)
+            .ok_or(STATUS_INVALID_ARGUMENT)?;
+        operation(selected, &header, metadata)
+    }
+
+    pub(crate) fn framed_metadata(&mut self, owner: &str, id: u64, unit: u64) -> Status {
+        self.with_metadata_unit(owner, id, unit, |selected, header, metadata| {
+            metadata
+                .association
+                .accept_framer_output(
+                    header,
+                    &metadata.bytes,
+                    MetadataApplication::FramerApplied,
+                    selected.capabilities.encoder,
+                )
+                .map_err(|_| STATUS_INVALID_ARGUMENT)
+        })
+        .map_or_else(|status| status, |_| STATUS_OK)
+    }
+
+    pub(crate) fn check_metadata(&mut self, owner: &str, id: u64, unit: u64) -> Status {
+        self.with_metadata_unit(owner, id, unit, |selected, header, metadata| {
+            metadata
+                .association
+                .check_transport(header, &metadata.bytes, selected.capabilities.encoder)
+                .map_err(|_| STATUS_INVALID_ARGUMENT)
+        })
+        .map_or_else(|status| status, |_| STATUS_OK)
+    }
+
+    pub(crate) fn retire_metadata(&mut self, owner: &str, id: u64, unit: u64) -> Status {
+        let result = self.with_metadata_unit(owner, id, unit, |selected, header, metadata| {
+            let mut flow = selected.flow.lock().map_err(|_| STATUS_INVALID_ARGUMENT)?;
+            flow.retire(
+                &mut metadata.association,
+                header,
+                &metadata.bytes,
+                selected.capabilities,
+            )
+            .map_err(|_| STATUS_INVALID_ARGUMENT)
+        });
+        if let Err(status) = result {
+            return status;
+        }
+        let queue = self
+            .streams
+            .get_mut(&id)
+            .and_then(|stream| stream.negotiated.as_mut())
+            .expect("metadata unit was just checked");
+        let retired = queue
+            .ready
+            .pop_front()
+            .expect("metadata unit was just checked");
+        queue.bytes -= retired.bytes.len();
+        STATUS_OK
     }
 
     pub fn eos_queued(&self, id: u64) -> bool {

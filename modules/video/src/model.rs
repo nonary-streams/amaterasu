@@ -258,6 +258,21 @@ pub struct SourceEncoderRegistration {
     pub extension_profiles: Vec<amaterasu_contracts::media_profile::VideoProfile>,
 }
 
+/// Trusted selection for one frame-metadata-required submitted profile.
+/// Capability services are independently bound; declarations cannot select an
+/// owner or establish client compatibility.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetadataRoute {
+    pub profile: amaterasu_contracts::media_profile::VideoProfile,
+    pub schema: amaterasu_contracts::media_profile::FormatId,
+    pub capture_service: String,
+    pub encoder_control_service: String,
+    pub capture_capabilities: String,
+    pub processor_capabilities: String,
+    pub encoder_capabilities: String,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -282,6 +297,8 @@ pub struct Settings {
     pub gpu_processor_service: Option<String>,
     #[serde(default)]
     pub generic_processor_service: Option<String>,
+    #[serde(default)]
+    pub metadata_route: Option<MetadataRoute>,
     /// Refuse borrowed/CPU fallbacks when this composition requires retained GPU frames.
     #[serde(default)]
     pub require_frame_lease: bool,
@@ -314,6 +331,7 @@ impl Default for Settings {
             cpu_processor_service: None,
             gpu_processor_service: None,
             generic_processor_service: None,
+            metadata_route: None,
             require_frame_lease: false,
             drain_timeout_ms: default_drain_timeout(),
         }
@@ -374,7 +392,37 @@ impl Settings {
         })
     }
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self
+        if self.metadata_route.as_ref().is_some_and(|route| {
+            let caps = [
+                &route.capture_capabilities,
+                &route.processor_capabilities,
+                &route.encoder_capabilities,
+            ];
+            !route.profile.is_valid()
+                || !route.schema.is_valid()
+                || self.unit_service.is_none()
+                || self.generic_processor_service.is_none()
+                || !self
+                    .resolved_providers()
+                    .iter()
+                    .any(|provider| provider.service() == route.capture_service)
+                || !self.source_encoder_providers.values().any(|provider| {
+                    provider.control_service == route.encoder_control_service
+                        && provider.extension_profiles.contains(&route.profile)
+                })
+                || !self
+                    .external_encoder_providers
+                    .iter()
+                    .any(|(alias, service)| {
+                        service == &route.encoder_control_service
+                            && self.external_encoder_consumers.contains_key(alias)
+                    })
+                || caps.iter().any(|service| !valid_external_service(service))
+                || caps
+                    .iter()
+                    .enumerate()
+                    .any(|(index, service)| caps[..index].contains(service))
+        }) || self
             .unit_service
             .as_deref()
             .is_some_and(|name| !valid_external_service(name) || name == "amaterasu.video/1")
@@ -667,6 +715,18 @@ impl Configuration {
             && self.sw_tune.is_none()
     }
 
+    /// A trusted, registered submitted-frame encoder may consume the same
+    /// bounded custom profile as a source encoder, but capture retains the
+    /// stricter ordinary frame geometry and rate limits.
+    pub fn validate_submitted_extension(&self) -> bool {
+        if self.extension_profile.is_none() || !self.validate_source() {
+            return false;
+        }
+        let mut legacy = self.clone();
+        legacy.extension_profile = None;
+        legacy.validate()
+    }
+
     pub fn validate(&self) -> bool {
         self.extension_profile.is_none()
             && self.video_stream_format.validate().is_ok()
@@ -762,6 +822,11 @@ pub enum Operation {
         encoder: EncoderIdentity,
         configuration: Box<Configuration>,
     },
+    ProbeSubmittedMetadata {
+        encoder_provider: String,
+        encoder: EncoderIdentity,
+        configuration: Box<Configuration>,
+    },
     Lookup {
         operation_id: String,
     },
@@ -798,6 +863,11 @@ enum OperationInput {
     },
     ProbeSource {
         source_id: u64,
+        encoder_provider: String,
+        encoder: EncoderIdentity,
+        configuration: Box<Configuration>,
+    },
+    ProbeSubmittedMetadata {
         encoder_provider: String,
         encoder: EncoderIdentity,
         configuration: Box<Configuration>,
@@ -925,6 +995,15 @@ impl<'de> Deserialize<'de> for Operation {
                 configuration,
             } => Self::ProbeSource {
                 source_id,
+                encoder_provider,
+                encoder,
+                configuration,
+            },
+            OperationInput::ProbeSubmittedMetadata {
+                encoder_provider,
+                encoder,
+                configuration,
+            } => Self::ProbeSubmittedMetadata {
                 encoder_provider,
                 encoder,
                 configuration,
@@ -1504,6 +1583,7 @@ mod tests {
             cpu_processor_service: None,
             gpu_processor_service: None,
             generic_processor_service: None,
+            metadata_route: None,
             require_frame_lease: false,
             drain_timeout_ms: 5000,
         };
@@ -1531,6 +1611,7 @@ mod tests {
             cpu_processor_service: None,
             gpu_processor_service: None,
             generic_processor_service: None,
+            metadata_route: None,
             require_frame_lease: false,
             drain_timeout_ms: 5000,
         };

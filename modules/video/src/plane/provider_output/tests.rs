@@ -129,6 +129,43 @@ fn pop(queues: &mut Queues) -> Status {
 }
 
 #[test]
+fn submitted_output_must_match_the_single_admitted_frame() {
+    let data = [1];
+    let mut cfg = config();
+    cfg.mode = ENCODER_SESSION_SUBMITTED;
+    let mut output = ProviderOutput::new(4, 9, &cfg).unwrap();
+    let mut queues = Queues::default();
+    queues.open(9, "alice", 0);
+    let mut mock = Mock {
+        chunk: chunk(&data),
+        calls: 0,
+        repeat: false,
+        no_callback: false,
+    };
+    let api = api(&mut mock);
+    mock.chunk.submission_id = 11;
+    assert_eq!(
+        unsafe { output.receive(&api, &mut queues) },
+        STATUS_INVALID_ARGUMENT
+    );
+    output.admit_submission(11).unwrap();
+    assert!(output.admit_submission(12).is_err());
+    mock.chunk.submission_id = 12;
+    std::hint::black_box(&mock);
+    assert_eq!(
+        unsafe { output.receive(&api, &mut queues) },
+        STATUS_INVALID_ARGUMENT
+    );
+    assert!(!output.can_submit());
+    mock.chunk.submission_id = 11;
+    std::hint::black_box(&mock);
+    assert_eq!(unsafe { output.receive(&api, &mut queues) }, STATUS_OK);
+    assert!(output.can_submit());
+    assert!(output.admit_submission(11).is_err());
+    output.admit_submission(12).unwrap();
+}
+
+#[test]
 fn negotiated_provider_fragments_reach_owned_unit_queue_with_backpressure() {
     use crate::queue::UnitSelection;
     let codec = EncoderFormatId {

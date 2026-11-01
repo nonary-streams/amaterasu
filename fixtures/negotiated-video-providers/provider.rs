@@ -165,6 +165,39 @@ impl FramingProvider for Framer {
             }],
         })
     }
+
+    fn probe_metadata(
+        &self,
+        principal: &str,
+        codec: EncoderFormatId,
+        framing: EncoderFormatId,
+        schema: FrameMetadataSchemaId,
+        limits: &VideoFramingLimits,
+    ) -> Result<(), Status> {
+        self.probe(principal, codec, framing, limits)?;
+        if (schema.namespace_id, schema.value, schema.schema) != (1, 1, 1) {
+            return Err(MEDIA_UNSUPPORTED);
+        }
+        Ok(())
+    }
+
+    fn plan_metadata(
+        &self,
+        principal: &str,
+        unit: &NegotiatedVideoUnit,
+        bytes: &[u8],
+        metadata: &amaterasu_module_sdk::media::metadata::FrameMetadataBundle,
+        limits: &VideoFramingLimits,
+    ) -> Result<OwnedFramePlan, Status> {
+        let item = metadata.items.iter().find(|item| {
+            item.required && (item.schema.namespace_id, item.schema.value, item.schema.schema) == (1, 1, 1)
+        }).ok_or(STATUS_INVALID_ARGUMENT)?;
+        let mut plan = self.plan(principal, unit, bytes, limits)?;
+        // Synthetic test bytes demonstrate which independent framer was used;
+        // this is not a real HDR or codec bitstream.
+        plan.framed_bytes.extend_from_slice(&item.payload);
+        Ok(plan)
+    }
 }
 struct Bundle {
     encoder: NativeServiceFactory,

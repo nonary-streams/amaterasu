@@ -137,6 +137,9 @@ pub struct ExtensionRoute {
     pub video_unit_service: String,
     pub framer_service: String,
     pub plan_transport_service: String,
+    /// Required frame metadata is negotiated separately from the codec marker.
+    #[serde(default)]
+    pub metadata_schema: Option<amaterasu_contracts::media_profile::FormatId>,
 }
 impl ExtensionRoute {
     fn valid(&self) -> bool {
@@ -146,7 +149,10 @@ impl ExtensionRoute {
             &self.plan_transport_service,
         ];
         self.profile.is_valid()
-            && self.source_id != 0
+            && match self.metadata_schema {
+                Some(schema) => self.source_id == 0 && schema.is_valid(),
+                None => self.source_id != 0,
+            }
             && !self.encoder_provider.is_empty()
             && self.encoder_provider.len() <= 64
             && self.encoder_provider.bytes().all(|byte| {
@@ -1030,6 +1036,9 @@ pub struct StartConfigData {
     /// Immutable Moonlight feature flags retained from the accepted RTSP ANNOUNCE.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_feature_flags: Option<u32>,
+    /// Exact frame-metadata schema accepted in the authenticated RTSP exchange.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_metadata_schema: Option<amaterasu_contracts::media_profile::FormatId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuous_audio: Option<bool>,
     /// Authenticated RTSP audio selection; accepted only against a prepared route.

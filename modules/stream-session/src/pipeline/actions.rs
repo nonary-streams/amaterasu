@@ -254,6 +254,10 @@ impl Pipeline {
             rpc::complete(send, request, error("permission_denied"));
             return;
         }
+        if configuration.client_metadata_schema.is_some() && owner != "amaterasu.rtsp" {
+            rpc::complete(send, request, error("permission_denied"));
+            return;
+        }
 
         let Some(record) = self
             .records
@@ -281,6 +285,7 @@ impl Pipeline {
                     && configuration.client_feature_flags.is_some()
                     && record.extension_limits.is_some()
                     && route.profile == profile
+                    && route.metadata_schema == configuration.client_metadata_schema
             }) else {
                 rpc::complete(send, request, error("extension_profile_not_offered"));
                 return;
@@ -299,9 +304,12 @@ impl Pipeline {
                 rpc::complete(send, request, error("extension_configuration_mismatch"));
                 return;
             }
-            configuration.source_id = Some(route.source_id);
+            configuration.source_id = (route.source_id != 0).then_some(route.source_id);
             configuration.encoder_provider = Some(route.encoder_provider.clone());
             configuration.encoder = route.encoder.clone();
+        } else if configuration.client_metadata_schema.is_some() {
+            rpc::complete(send, request, error("extension_profile_not_offered"));
+            return;
         }
         match (
             &record.config.lifecycle_session_target,

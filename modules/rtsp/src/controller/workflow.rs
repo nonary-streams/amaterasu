@@ -360,6 +360,9 @@ impl Controller {
                 udp_discovery: record.udp_discovery.clone(),
             };
             let profile = if self.settings.extension_enabled
+                && payload
+                    .get("extension_metadata_schema")
+                    .is_none_or(Value::is_null)
                 && !record.config.profile.hdr
                 && record.config.profile.max_reference_frames == 0
                 && record.config.min_threads == 2

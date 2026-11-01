@@ -405,11 +405,14 @@ impl Job {
                         .expect("selected probe")
                 );
                 configuration["extension_profile"] = json!(route.profile);
-                (
-                    record.service(Resource::Video),
+                let payload = if route.metadata_schema.is_some() {
+                    json!({"action":"probe_submitted_metadata", "encoder_provider":route.encoder_provider,
+                        "encoder":route.encoder,"configuration":configuration})
+                } else {
                     json!({"action":"probe_source", "source_id":route.source_id,
-                    "encoder_provider":route.encoder_provider,"encoder":route.encoder,"configuration":configuration}),
-                )
+                        "encoder_provider":route.encoder_provider,"encoder":route.encoder,"configuration":configuration})
+                };
+                (record.service(Resource::Video), payload)
             }
             Step::MediaReady => (
                 record.service(Resource::Media),

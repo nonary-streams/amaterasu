@@ -2,7 +2,8 @@
 use super::{Shared, guarded};
 use amaterasu_media::{
     MEDIA_BACKEND_ERROR, MEDIA_BUSY, MEDIA_UNSUPPORTED, NegotiatedVideoPlanTransportApiV2,
-    NegotiatedVideoUnit, VideoFramePlan, VideoFramingLimits, VideoPlanSelectionV2,
+    NegotiatedVideoPlanTransportApiV2_1, NegotiatedVideoUnit, VideoFramePlan, VideoFramingLimits,
+    VideoPlanSelectionV2, VideoPlanSelectionV3,
 };
 use amaterasu_module_sdk::abi::*;
 use std::{ffi::c_void, sync::TryLockError};
@@ -26,7 +27,7 @@ impl Factory {
     }
 }
 struct Binding {
-    api: NegotiatedVideoPlanTransportApiV2,
+    api: NegotiatedVideoPlanTransportApiV2_1,
     shared: Shared,
     owner: String,
 }
@@ -52,8 +53,8 @@ unsafe extern "C" fn bind(
         let query = unsafe { &*query };
         if !query.header.supports::<NativeInterfaceQuery>()
             || query.interface_major != 2
-            || query.min_minor > 0
-            || query.min_size as usize > size_of::<NegotiatedVideoPlanTransportApiV2>()
+            || query.min_minor > 1
+            || query.min_size as usize > size_of::<NegotiatedVideoPlanTransportApiV2_1>()
         {
             return MEDIA_UNSUPPORTED;
         }
@@ -67,31 +68,86 @@ unsafe extern "C" fn bind(
         };
         let factory = unsafe { &*context.cast::<Factory>() };
         let mut binding = Box::new(Binding {
-            api: NegotiatedVideoPlanTransportApiV2 {
-                base: NativeInterface {
-                    header: AbiHeader {
-                        size: size_of::<NegotiatedVideoPlanTransportApiV2>() as u32,
-                        major: 2,
-                        minor: 0,
+            api: NegotiatedVideoPlanTransportApiV2_1 {
+                base: NegotiatedVideoPlanTransportApiV2 {
+                    base: NativeInterface {
+                        header: AbiHeader {
+                            size: size_of::<NegotiatedVideoPlanTransportApiV2_1>() as u32,
+                            major: 2,
+                            minor: 1,
+                        },
+                        context: std::ptr::null_mut(),
+                        release: Some(release),
                     },
-                    context: std::ptr::null_mut(),
-                    release: Some(release),
+                    probe,
+                    prepare,
+                    submit,
+                    drain,
                 },
-                probe,
-                prepare,
-                submit,
-                drain,
+                probe_metadata,
+                prepare_metadata,
             },
             shared: factory.shared.clone(),
             owner,
         });
-        binding.api.base.context = (&mut *binding as *mut Binding).cast();
+        binding.api.base.base.context = (&mut *binding as *mut Binding).cast();
         let binding = Box::into_raw(binding);
         // SAFETY: table allocation transfers to runtime until release.
         unsafe {
-            *output = &(*binding).api.base;
+            *output = &(*binding).api.base.base;
         }
         STATUS_OK
+    })
+}
+
+unsafe extern "C" fn probe_metadata(
+    context: *mut c_void,
+    stream: u64,
+    selection: *const VideoPlanSelectionV3,
+    limits: *mut VideoFramingLimits,
+) -> Status {
+    metadata_limits(context, stream, selection, limits, false)
+}
+unsafe extern "C" fn prepare_metadata(
+    context: *mut c_void,
+    stream: u64,
+    selection: *const VideoPlanSelectionV3,
+    limits: *mut VideoFramingLimits,
+) -> Status {
+    metadata_limits(context, stream, selection, limits, true)
+}
+fn metadata_limits(
+    context: *mut c_void,
+    stream: u64,
+    selection: *const VideoPlanSelectionV3,
+    limits: *mut VideoFramingLimits,
+    commit: bool,
+) -> Status {
+    guarded(|| {
+        if selection.is_null()
+            || limits.is_null()
+            || !(selection as usize).is_multiple_of(align_of::<VideoPlanSelectionV3>())
+            || !(limits as usize).is_multiple_of(align_of::<VideoFramingLimits>())
+        {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the caller lends aligned descriptors and writable limits synchronously.
+        unsafe {
+            with_binding(context, |controller, owner| {
+                let result = if commit {
+                    controller.prepare_metadata_video_plan(owner, stream, &*selection)
+                } else {
+                    controller.probe_metadata_video_plan(owner, stream, &*selection)
+                };
+                match result {
+                    Ok(selected) => {
+                        limits.write(selected);
+                        STATUS_OK
+                    }
+                    Err(status) => status,
+                }
+            })
+        }
     })
 }
 unsafe extern "C" fn release(context: *mut c_void) {
@@ -451,5 +507,123 @@ mod tests {
         assert!(received >= 44);
         assert_eq!(&packet[40..44], &data);
         unsafe { ((*table).base.release.unwrap())((*table).base.context) };
+    }
+    #[test]
+    fn metadata_selection_cannot_downgrade_to_legacy_plan_or_change_schema() {
+        let profile = VideoProfile {
+            codec: FormatId {
+                namespace_id: 7,
+                value: 2,
+                schema: 1,
+            },
+            framing: FormatId {
+                namespace_id: 7,
+                value: 3,
+                schema: 1,
+            },
+            wire_selector: 4,
+            payload_type: 100,
+            encoding_name: "EXAMPLE".into(),
+        };
+        let schema = FormatId {
+            namespace_id: 1,
+            value: 1,
+            schema: 1,
+        };
+        let settings = Settings {
+            enabled: true,
+            allowed_principals: vec!["owner".into()],
+            plan_service_v2: Some("example.plan/1".into()),
+            extension_profiles: vec![profile.clone()],
+            metadata_profiles: vec![crate::model::MetadataProfile { profile, schema }],
+            ..Default::default()
+        };
+        settings.validate().unwrap();
+        let mut controller = Controller::new(settings);
+        let stream = 1;
+        let mut selection = VideoPlanSelectionV3 {
+            base: VideoPlanSelectionV2 {
+                base: VideoPlanSelection {
+                    size: size_of::<VideoPlanSelectionV3>() as u32,
+                    version: 3,
+                    stream: 5,
+                    generation: 5,
+                    offer_id: 4,
+                    source_id: 6,
+                    config_generation: 1,
+                    codec: EncoderFormatId {
+                        namespace_id: 7,
+                        value: 2,
+                        schema: 1,
+                    },
+                    framing: EncoderFormatId {
+                        namespace_id: 7,
+                        value: 3,
+                        schema: 1,
+                    },
+                    clock_epoch: [3; 16],
+                    clock_origin_us: host_monotonic_micros().max(1),
+                    metadata_required: 1,
+                    reserved: 0,
+                },
+                payload_type: 100,
+                encoding_name_len: 7,
+                encoding_name: {
+                    let mut name = [0; 32];
+                    name[..7].copy_from_slice(b"EXAMPLE");
+                    name
+                },
+            },
+            schema: FrameMetadataSchemaId {
+                namespace_id: 1,
+                value: 1,
+                schema: 1,
+            },
+            carriage_owner: FRAME_METADATA_OWNER_FRAMER,
+            reserved: 0,
+        };
+        let v2 = selection.base_v2().unwrap();
+        assert!(controller.probe_video_plan("owner", stream, &v2).is_err());
+        assert!(
+            controller
+                .probe_legacy_video_plan("owner", stream, &v2.base_v1().unwrap())
+                .is_err()
+        );
+        assert!(
+            controller
+                .probe_metadata_video_plan("other", stream, &selection)
+                .is_err()
+        );
+        selection.schema.value = 2;
+        assert!(
+            controller
+                .probe_metadata_video_plan("owner", stream, &selection)
+                .is_err()
+        );
+        assert!(
+            controller
+                .prepare_metadata_video_plan("owner", stream, &selection)
+                .is_err()
+        );
+        selection.schema.value = 1;
+        selection.carriage_owner = FRAME_METADATA_OWNER_ENCODER;
+        assert!(
+            controller
+                .probe_metadata_video_plan("owner", stream, &selection)
+                .is_err()
+        );
+        selection.carriage_owner = FRAME_METADATA_OWNER_FRAMER;
+        assert_eq!(
+            controller
+                .probe_metadata_video_plan("owner", stream, &selection)
+                .unwrap_err(),
+            MEDIA_CLOSED
+        );
+        assert_eq!(
+            controller
+                .prepare_metadata_video_plan("owner", stream, &selection)
+                .unwrap_err(),
+            MEDIA_CLOSED
+        );
     }
 }

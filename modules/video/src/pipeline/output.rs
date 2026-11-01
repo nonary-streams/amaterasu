@@ -95,7 +95,7 @@ pub(super) fn tick(
         return;
     }
     if !grace.drain_sent {
-        match if stream.source_id.is_some() {
+        match if stream.source_started {
             plane.drain_source(id)
         } else {
             plane.drain(stream.session.unwrap())
@@ -107,7 +107,7 @@ pub(super) fn tick(
             }
         }
     }
-    if stream.source_id.is_some() {
+    if stream.source_started {
         if let Err(code) = plane.pump_source(id, stream.session.unwrap(), false) {
             stream.cleanup(code);
         }

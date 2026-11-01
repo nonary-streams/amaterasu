@@ -1,6 +1,8 @@
 //! Bounded, synchronous native media forwarding. Provider resources belong to the
 //! pipeline; this plane owns only bindings and bounded copied pending output.
 mod native;
+#[cfg(test)]
+pub(crate) use native::metadata_tests::{Fixture as MetadataFixture, with_two_metadata_framers};
 mod ordered_clock;
 mod packets;
 // The authenticated source route is intentionally not installed yet.
@@ -195,7 +197,11 @@ impl Plane {
         transport_service: &str,
         selection: VideoUnitSelection,
     ) -> PlaneResult<Self> {
-        if !selection.valid() || selection.stream != handles.video || handles.hdr {
+        if !selection.valid()
+            || selection.metadata_required
+            || selection.stream != handles.video
+            || handles.hdr
+        {
             return Err("negotiated_video_selection_invalid");
         }
         let backend = native::NativeBackend::new_negotiated(

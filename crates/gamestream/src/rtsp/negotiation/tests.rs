@@ -223,6 +223,86 @@ fn announce() -> Request {
 }
 
 #[test]
+fn metadata_profile_requires_exact_explicit_client_acceptance() {
+    use amaterasu_contracts::media_profile::{FormatId, VideoProfile, VideoProfileSnapshot};
+    let profile = VideoProfile {
+        codec: FormatId {
+            namespace_id: 42,
+            value: 9,
+            schema: 1,
+        },
+        framing: FormatId {
+            namespace_id: 42,
+            value: 10,
+            schema: 1,
+        },
+        wire_selector: 9,
+        payload_type: 99,
+        encoding_name: "TEST9".into(),
+    };
+    let schema = FormatId {
+        namespace_id: 1,
+        value: 1,
+        schema: 1,
+    };
+    let mut offer = negotiation();
+    offer.profile_offer = Some(VideoProfileSnapshot {
+        profiles: vec![profile.clone()],
+    });
+    offer = offer.with_metadata_offer(9, schema).unwrap();
+    let target = offer.launch.rtsp_target.clone();
+    offer
+        .handle(7, &request(Method::Options, &target, 1, false))
+        .unwrap();
+    let mut describe = request(Method::Describe, &target, 2, false);
+    describe
+        .headers
+        .push(("accept".into(), "application/sdp".into()));
+    let Step::Reply(reply) = offer.handle(7, &describe).unwrap() else {
+        panic!()
+    };
+    assert!(
+        String::from_utf8(reply)
+            .unwrap()
+            .contains("a=x-amaterasu-video-metadata:9 1 1 1\r\n")
+    );
+    for (claim, accepted) in [
+        (None, false),
+        (Some("9 1 2 1"), false),
+        (Some("09 1 1 1"), false),
+        (Some("9 1 1 1"), true),
+    ] {
+        let mut machine = negotiation();
+        machine.profile_offer = Some(VideoProfileSnapshot {
+            profiles: vec![profile.clone()],
+        });
+        machine = machine.with_metadata_offer(9, schema).unwrap();
+        setup_to_announce(&mut machine);
+        let mut input = announce();
+        let mut body = String::from_utf8(input.body)
+            .unwrap()
+            .replace("bitStreamFormat:0", "bitStreamFormat:9");
+        if let Some(claim) = claim {
+            body.push_str(&format!("a=x-amaterasu-video-metadata:{claim}\r\n"));
+        }
+        input.body = body.into_bytes();
+        let result = machine.handle(7, &input);
+        if accepted {
+            assert!(matches!(
+                result,
+                Ok(Step::Action {
+                    action: Action::ExtensionAnnounce(_),
+                    ..
+                })
+            ));
+        } else {
+            assert_eq!(result, Err(Error::UnsupportedMedia));
+            assert_eq!(machine.state(), State::Announce);
+        }
+    }
+}
+
+#[test]
 fn audio_offer_requires_an_exact_client_acceptance_and_backend_success() {
     for (offered, accepted, expected) in [
         (

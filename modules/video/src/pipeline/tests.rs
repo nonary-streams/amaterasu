@@ -364,6 +364,10 @@ fn capture_provider_for_service(service: &str) -> Option<CaptureProvider> {
 struct FakePlane {
     selected_encoders: Vec<String>,
     source_starts: Vec<(u64, u64, u64)>,
+    submitted_starts: Vec<(u64, u64, u64)>,
+    metadata_prepares: usize,
+    metadata_probes: usize,
+    reject_metadata_probe: bool,
     source_pumps: Vec<(u64, bool)>,
     source_drains: usize,
     calls: usize,
@@ -401,6 +405,14 @@ struct FakePlane {
 }
 
 impl Plane for FakePlane {
+    fn probe_submitted_metadata(&mut self, _: &str, _: &Configuration) -> Result<(), &'static str> {
+        self.metadata_probes += 1;
+        if self.reject_metadata_probe {
+            Err("metadata_profile_unsupported")
+        } else {
+            Ok(())
+        }
+    }
     fn select_encoder(&mut self, service: &str) {
         self.selected_encoders.push(service.to_owned());
     }
@@ -415,6 +427,22 @@ impl Plane for FakePlane {
     ) -> Result<(), &'static str> {
         self.source_starts.push((video, session, source));
         Ok(())
+    }
+    fn start_submitted(
+        &mut self,
+        video: u64,
+        session: u64,
+        capture: u64,
+        _: &Configuration,
+        _: u64,
+        _: [u8; 16],
+    ) -> Result<(), &'static str> {
+        self.submitted_starts.push((video, session, capture));
+        Ok(())
+    }
+    fn prepare_submitted_metadata(&mut self, _: Pump<'_>) -> Result<Option<u64>, &'static str> {
+        self.metadata_prepares += 1;
+        Ok(Some(9))
     }
     fn pump_source(&mut self, video: u64, _: u64, idr: bool) -> Result<bool, &'static str> {
         self.source_pumps.push((video, idr));
@@ -4682,6 +4710,184 @@ fn explicitly_registered_generic_consumer_routes_capture_to_generic_plane() {
     tick(&mut pipeline, &mut runtime, &mut plane, 8);
     assert_eq!(pipeline.streams[&1].frame_path, FramePath::Generic);
     assert!(plane.frame_paths.contains(&FramePath::Generic));
+}
+
+#[test]
+fn submitted_extension_requires_selected_registered_chain_before_open() {
+    use amaterasu_contracts::media_profile::{FormatId, VideoProfile};
+    let profile = VideoProfile {
+        codec: FormatId {
+            namespace_id: 7,
+            value: 8,
+            schema: 1,
+        },
+        framing: FormatId {
+            namespace_id: 7,
+            value: 9,
+            schema: 1,
+        },
+        wire_selector: 4,
+        payload_type: 100,
+        encoding_name: "EXAMPLE".into(),
+    };
+    let (mut pipeline, mut runtime, mut plane) = setup();
+    pipeline
+        .encoder_providers
+        .insert("vendor".into(), "example.encode/1".into());
+    pipeline.encoder_consumers.insert("vendor".into());
+    pipeline.unit_service_enabled = true;
+    let request = || {
+        let mut operation = open();
+        if let Operation::Open {
+            encoder_provider,
+            configuration,
+            ..
+        } = &mut operation
+        {
+            *encoder_provider = Some("vendor".into());
+            configuration.extension_profile = Some(profile.clone());
+        }
+        operation
+    };
+    pipeline.handle("alice", 90, request(), &mut |command| runtime.send(command));
+    assert_eq!(
+        runtime.completed.last().unwrap().1["code"],
+        "submitted_extension_profile_not_allowed"
+    );
+    assert_eq!(runtime.open_effects, 0);
+    pipeline.source_encoders.insert(
+        "fixture".into(),
+        crate::model::SourceEncoderRegistration {
+            control_service: "example.encode/1".into(),
+            native_service: "example.encode-native/1".into(),
+            source_ids: [42].into(),
+            extension_profiles: vec![profile.clone()],
+        },
+    );
+    pipeline.metadata_route = Some(crate::model::MetadataRoute {
+        profile: profile.clone(),
+        schema: FormatId {
+            namespace_id: 1,
+            value: 1,
+            schema: 1,
+        },
+        capture_service: CaptureProvider::Dxgi.service().into(),
+        encoder_control_service: "example.encode/1".into(),
+        capture_capabilities: "example.capture-caps/1".into(),
+        processor_capabilities: "example.processor-caps/1".into(),
+        encoder_capabilities: "example.encoder-caps/1".into(),
+    });
+    let mut probe_configuration = open_configuration();
+    probe_configuration.extension_profile = Some(profile.clone());
+    let probe = || Operation::ProbeSubmittedMetadata {
+        encoder_provider: "vendor".into(),
+        encoder: encoder_identity(),
+        configuration: Box::new(probe_configuration.clone()),
+    };
+    pipeline.handle("alice", 94, probe(), &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 3);
+    let result = &runtime
+        .completed
+        .iter()
+        .find(|(id, _)| *id == 94)
+        .unwrap()
+        .1;
+    assert_eq!(
+        result["metadata_schema"],
+        json!({"namespace_id":1,"value":1,"schema":1})
+    );
+    assert_eq!(plane.metadata_probes, 1);
+    assert_eq!(runtime.open_effects, 0);
+    let mut wrong_identity = probe_reply(
+        &json!(encoder_identity()),
+        &json!(probe_configuration),
+        true,
+    );
+    wrong_identity["encoder"]["clsid"] = json!("a-different-encoder");
+    runtime
+        .encoder_probe_replies
+        .insert(encoder_identity().clsid, wrong_identity);
+    pipeline.handle("alice", 95, probe(), &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 3);
+    assert_eq!(
+        runtime
+            .completed
+            .iter()
+            .find(|(id, _)| *id == 95)
+            .unwrap()
+            .1["code"],
+        "encoder_probe_unavailable"
+    );
+    assert_eq!(plane.metadata_probes, 1);
+    runtime.encoder_probe_replies.clear();
+    plane.reject_metadata_probe = true;
+    pipeline.handle("alice", 96, probe(), &mut |command| runtime.send(command));
+    tick(&mut pipeline, &mut runtime, &mut plane, 3);
+    assert_eq!(
+        runtime
+            .completed
+            .iter()
+            .find(|(id, _)| *id == 96)
+            .unwrap()
+            .1["code"],
+        "metadata_profile_unsupported"
+    );
+    assert_eq!(runtime.open_effects, 0);
+    let mut source_configuration = open_configuration();
+    source_configuration.extension_profile = Some(profile.clone());
+    pipeline.handle(
+        "alice",
+        93,
+        Operation::OpenSource {
+            packet_boundaries: true,
+            operation_id: None,
+            source_id: 42,
+            encoder_options: None,
+            encoder_provider: "fixture".into(),
+            encoder: EncoderSelection::Identity(encoder_identity()),
+            configuration: Box::new(source_configuration),
+        },
+        &mut |command| runtime.send(command),
+    );
+    assert_eq!(
+        runtime.completed.last().unwrap().1["code"],
+        "metadata_route_mismatch"
+    );
+    assert_eq!(runtime.open_effects, 0);
+    pipeline.handle("alice", 91, request(), &mut |command| runtime.send(command));
+    for _ in 0..10 {
+        if pipeline.streams[&1].stage == Stage::Encoder && pipeline.streams[&1].pending.is_some() {
+            break;
+        }
+        tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    }
+    assert_eq!(pipeline.streams[&1].stage, Stage::Encoder);
+    assert!(pipeline.streams[&1].pending.is_some());
+    plane.geometry_results.extend([
+        Ok(GeometryProgress::Busy),
+        Ok(GeometryProgress::Busy),
+        Ok(GeometryProgress::Ready),
+    ]);
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert_eq!(pipeline.streams[&1].stage, Stage::Activating);
+    let retired_before_wait = plane.retired_events.len();
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert_eq!(plane.retired_events.len(), retired_before_wait);
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert_eq!(pipeline.streams[&1].stage, Stage::Activating);
+    tick(&mut pipeline, &mut runtime, &mut plane, 1);
+    assert_eq!(pipeline.streams[&1].stage, Stage::Running);
+    assert_eq!(plane.metadata_prepares, 1);
+    assert_eq!(plane.submitted_starts, [(1, 51, 41)]);
+    let response = &runtime
+        .completed
+        .iter()
+        .find(|(id, _)| *id == 91)
+        .unwrap()
+        .1;
+    assert_eq!(response["negotiated_unit"]["source_id"], 41);
+    assert_eq!(response["negotiated_unit"]["source_generation"], 9);
+    assert!(runtime.commands.iter().any(|command| matches!(command, Command::Request { service, payload, .. } if service == "example.encode/1" && payload["action"] == "open" && payload["mode"] == "submitted" && payload["source_id"] == 41)));
 }
 
 #[test]

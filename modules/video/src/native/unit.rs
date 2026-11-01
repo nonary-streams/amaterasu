@@ -1,6 +1,9 @@
 //! Typed negotiated-unit delivery over the video module's owned queue.
 use crate::queue::Queues;
-use amaterasu_media::{MEDIA_BUSY, MEDIA_UNSUPPORTED, NegotiatedVideoApi, NegotiatedVideoUnitSink};
+use amaterasu_media::{
+    MEDIA_BUSY, MEDIA_UNSUPPORTED, NegotiatedVideoApi, NegotiatedVideoApiV1_1,
+    NegotiatedVideoMetadataUnitSinkV1, NegotiatedVideoUnitSink,
+};
 use amaterasu_module_sdk::abi::*;
 use std::{
     ffi::c_void,
@@ -29,7 +32,7 @@ impl Factory {
 }
 
 struct Binding {
-    api: NegotiatedVideoApi,
+    api: NegotiatedVideoApiV1_1,
     queues: Arc<Mutex<Queues>>,
     owner: String,
 }
@@ -56,8 +59,8 @@ unsafe extern "C" fn bind(
         let query = unsafe { &*query };
         if !query.header.supports::<NativeInterfaceQuery>()
             || query.interface_major != 1
-            || query.min_minor > 0
-            || query.min_size as usize > size_of::<NegotiatedVideoApi>()
+            || query.min_minor > 1
+            || query.min_size as usize > size_of::<NegotiatedVideoApiV1_1>()
         {
             return MEDIA_UNSUPPORTED;
         }
@@ -71,30 +74,86 @@ unsafe extern "C" fn bind(
         // SAFETY: factory remains registered until all bindings retire.
         let factory = unsafe { &*context.cast::<Factory>() };
         let mut binding = Box::new(Binding {
-            api: NegotiatedVideoApi {
-                base: NativeInterface {
-                    header: AbiHeader {
-                        size: size_of::<NegotiatedVideoApi>() as u32,
-                        major: 1,
-                        minor: 0,
+            api: NegotiatedVideoApiV1_1 {
+                base: NegotiatedVideoApi {
+                    base: NativeInterface {
+                        header: AbiHeader {
+                            size: size_of::<NegotiatedVideoApiV1_1>() as u32,
+                            major: 1,
+                            minor: 1,
+                        },
+                        context: std::ptr::null_mut(),
+                        release: Some(release),
                     },
-                    context: std::ptr::null_mut(),
-                    release: Some(release),
+                    receive,
                 },
-                receive,
+                receive_metadata,
+                framed_metadata,
+                check_metadata,
+                retire_metadata,
             },
             queues: factory.queues.clone(),
             owner,
         });
-        binding.api.base.context = (&mut *binding as *mut Binding).cast();
+        binding.api.base.base.context = (&mut *binding as *mut Binding).cast();
         let binding = Box::into_raw(binding);
         // SAFETY: table belongs to the transferred binding until release.
         unsafe {
-            *output = &(*binding).api.base;
+            *output = &(*binding).api.base.base;
         }
         STATUS_OK
     }))
     .unwrap_or(STATUS_INTERNAL_ERROR)
+}
+
+unsafe extern "C" fn receive_metadata(
+    context: *mut c_void,
+    stream: u64,
+    sink: NegotiatedVideoMetadataUnitSinkV1,
+) -> Status {
+    catch_unwind(AssertUnwindSafe(|| {
+        if context.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: runtime retains this binding during the synchronous call.
+        let binding = unsafe { &*context.cast::<Binding>() };
+        let Ok(mut queues) = binding.queues.try_lock() else {
+            return MEDIA_BUSY;
+        };
+        // SAFETY: sink obeys the non-reentrant borrowed-unit contract.
+        unsafe { queues.receive_unit_metadata(&binding.owner, stream, sink) }
+    }))
+    .unwrap_or(STATUS_INTERNAL_ERROR)
+}
+
+unsafe fn metadata_operation(
+    context: *mut c_void,
+    stream: u64,
+    unit: u64,
+    operation: impl FnOnce(&mut Queues, &str, u64, u64) -> Status,
+) -> Status {
+    catch_unwind(AssertUnwindSafe(|| {
+        if context.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: runtime retains this binding during the synchronous call.
+        let binding = unsafe { &*context.cast::<Binding>() };
+        let Ok(mut queues) = binding.queues.try_lock() else {
+            return MEDIA_BUSY;
+        };
+        operation(&mut queues, &binding.owner, stream, unit)
+    }))
+    .unwrap_or(STATUS_INTERNAL_ERROR)
+}
+
+unsafe extern "C" fn framed_metadata(context: *mut c_void, stream: u64, unit: u64) -> Status {
+    unsafe { metadata_operation(context, stream, unit, Queues::framed_metadata) }
+}
+unsafe extern "C" fn check_metadata(context: *mut c_void, stream: u64, unit: u64) -> Status {
+    unsafe { metadata_operation(context, stream, unit, Queues::check_metadata) }
+}
+unsafe extern "C" fn retire_metadata(context: *mut c_void, stream: u64, unit: u64) -> Status {
+    unsafe { metadata_operation(context, stream, unit, Queues::retire_metadata) }
 }
 
 unsafe extern "C" fn release(context: *mut c_void) {

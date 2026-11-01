@@ -34,6 +34,14 @@ pub struct Settings {
     pub plan_service_v2: Option<String>,
     pub ordered_audio_service: Option<String>,
     pub extension_profiles: Vec<amaterasu_contracts::media_profile::VideoProfile>,
+    pub metadata_profiles: Vec<MetadataProfile>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetadataProfile {
+    pub profile: amaterasu_contracts::media_profile::VideoProfile,
+    pub schema: amaterasu_contracts::media_profile::FormatId,
 }
 
 impl Settings {
@@ -46,6 +54,19 @@ impl Settings {
         .into_iter()
         .flatten()
         .any(|name| !amaterasu_contracts::valid_name(name) || name == "amaterasu.media-transport/1")
+            || self.metadata_profiles.len() > 16
+            || (!self.metadata_profiles.is_empty() && self.plan_service_v2.is_none())
+            || self
+                .metadata_profiles
+                .iter()
+                .enumerate()
+                .any(|(index, selected)| {
+                    !selected.schema.is_valid()
+                        || !self.extension_profiles.contains(&selected.profile)
+                        || self.metadata_profiles[..index].iter().any(|prior| {
+                            prior.profile == selected.profile && prior.schema == selected.schema
+                        })
+                })
             || self.plan_service.is_some() && self.plan_service == self.plan_service_v2
             || self.ordered_audio_service.is_some()
                 && (self.ordered_audio_service == self.plan_service

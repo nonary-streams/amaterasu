@@ -64,7 +64,8 @@ pub(super) struct Source {
     next_control: u64,
     pending_idr: Option<u64>,
 }
-fn with_source_config<T>(
+fn with_config<T>(
+    mode: u32,
     source: u64,
     configuration: &Configuration,
     clock_origin_us: u64,
@@ -137,7 +138,7 @@ fn with_source_config<T>(
     };
     let config = EncoderSessionConfig {
         size: size_of::<EncoderSessionConfig>() as u32,
-        mode: ENCODER_SESSION_SOURCE,
+        mode,
         codec,
         framing,
         source_id: source,
@@ -177,51 +178,111 @@ impl Source {
         clock_origin_us: u64,
         epoch_id: [u8; 16],
     ) -> Result<Self, &'static str> {
-        with_source_config(source, configuration, clock_origin_us, epoch_id, |config| {
-            let output = if configuration.extension_profile.is_some() {
-                ProviderOutput::new_negotiated(session, video, config)
-            } else {
-                ProviderOutput::new(session, video, config)
-            }
-            .map_err(|_| "encoder_format_unsupported")?;
-            // SAFETY: caller retains the selected provider binding.
-            unsafe { probe_config(api, config) }?;
-            // SAFETY: authorized session is created by the matching control provider.
-            if unsafe { (api.configure_session)(api.base.context, session, config) } != STATUS_OK {
-                // SAFETY: conservatively retire any provider state from failed configure.
-                unsafe { (api.destroy_session)(api.base.context, session) };
-                return Err("encoder_configure_failed");
-            }
-            let signal = Box::new(AtomicU32::new(0));
-            let subscribed = match (api.subscribe, api.unsubscribe) {
-                (Some(subscribe), Some(_)) => {
-                    let event = EncoderEventSink {
-                        context: (&*signal as *const AtomicU32).cast_mut().cast(),
-                        notify,
-                    };
-                    // SAFETY: signal is boxed and kept alive until the unsubscribe barrier.
-                    if unsafe { subscribe(api.base.context, session, event) } != STATUS_OK {
-                        unsafe { (api.destroy_session)(api.base.context, session) };
-                        return Err("encoder_subscribe_failed");
-                    }
-                    true
-                }
-                (None, None) => false,
-                _ => {
-                    unsafe { (api.destroy_session)(api.base.context, session) };
-                    return Err("encoder_notification_interface");
-                }
-            };
-            Ok(Self {
+        // SAFETY: this method has the same binding and session lifetime requirements.
+        unsafe {
+            Self::open_mode(
+                api,
+                video,
                 session,
-                output,
-                signal,
-                subscribed,
-                stopped: false,
-                next_control: 1,
-                pending_idr: None,
-            })
-        })
+                source,
+                configuration,
+                clock_origin_us,
+                epoch_id,
+                ENCODER_SESSION_SOURCE,
+            )
+        }
+    }
+
+    /// # Safety
+    /// The selected submitted encoder binding and control session remain live.
+    pub(super) unsafe fn open_submitted(
+        api: &EncoderProviderApi,
+        video: u64,
+        session: u64,
+        source: u64,
+        configuration: &Configuration,
+        clock_origin_us: u64,
+        epoch_id: [u8; 16],
+    ) -> Result<Self, &'static str> {
+        unsafe {
+            Self::open_mode(
+                api,
+                video,
+                session,
+                source,
+                configuration,
+                clock_origin_us,
+                epoch_id,
+                ENCODER_SESSION_SUBMITTED,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)] // These are the independently bound session identities.
+    unsafe fn open_mode(
+        api: &EncoderProviderApi,
+        video: u64,
+        session: u64,
+        source: u64,
+        configuration: &Configuration,
+        clock_origin_us: u64,
+        epoch_id: [u8; 16],
+        mode: u32,
+    ) -> Result<Self, &'static str> {
+        with_config(
+            mode,
+            source,
+            configuration,
+            clock_origin_us,
+            epoch_id,
+            |config| {
+                let output = if configuration.extension_profile.is_some() {
+                    ProviderOutput::new_negotiated(session, video, config)
+                } else {
+                    ProviderOutput::new(session, video, config)
+                }
+                .map_err(|_| "encoder_format_unsupported")?;
+                // SAFETY: caller retains the selected provider binding.
+                unsafe { probe_config(api, config) }?;
+                // SAFETY: authorized session is created by the matching control provider.
+                if unsafe { (api.configure_session)(api.base.context, session, config) }
+                    != STATUS_OK
+                {
+                    // SAFETY: conservatively retire any provider state from failed configure.
+                    unsafe { (api.destroy_session)(api.base.context, session) };
+                    return Err("encoder_configure_failed");
+                }
+                let signal = Box::new(AtomicU32::new(0));
+                let subscribed = match (api.subscribe, api.unsubscribe) {
+                    (Some(subscribe), Some(_)) => {
+                        let event = EncoderEventSink {
+                            context: (&*signal as *const AtomicU32).cast_mut().cast(),
+                            notify,
+                        };
+                        // SAFETY: signal is boxed and kept alive until the unsubscribe barrier.
+                        if unsafe { subscribe(api.base.context, session, event) } != STATUS_OK {
+                            unsafe { (api.destroy_session)(api.base.context, session) };
+                            return Err("encoder_subscribe_failed");
+                        }
+                        true
+                    }
+                    (None, None) => false,
+                    _ => {
+                        unsafe { (api.destroy_session)(api.base.context, session) };
+                        return Err("encoder_notification_interface");
+                    }
+                };
+                Ok(Self {
+                    session,
+                    output,
+                    signal,
+                    subscribed,
+                    stopped: false,
+                    next_control: 1,
+                    pending_idr: None,
+                })
+            },
+        )
     }
 
     /// # Safety
@@ -231,7 +292,8 @@ impl Source {
         source: u64,
         configuration: &Configuration,
     ) -> Result<(), &'static str> {
-        with_source_config(
+        with_config(
+            ENCODER_SESSION_SOURCE,
             source,
             configuration,
             host_monotonic_micros().max(1),
@@ -239,6 +301,16 @@ impl Source {
             |config| unsafe { probe_config(api, config) },
         )
     }
+    pub(super) fn can_submit(&self) -> bool {
+        self.output.can_submit()
+    }
+
+    pub(super) fn admit_submission(&mut self, sequence: u64) -> Result<(), &'static str> {
+        self.output
+            .admit_submission(sequence)
+            .map_err(|_| "encoder_submission_invalid")
+    }
+
     /// # Safety
     /// api is the same live binding used to open the session.
     pub(super) unsafe fn pump(

@@ -622,6 +622,8 @@ fn exercise<P: FramingProvider>(framer: P, selector: u32, marker: u8) {
             config_generation: 8,
             clock_epoch: [1; 16],
             metadata_required: false,
+            metadata_schema: None,
+            source_generation: None,
         };
         let mut missing_metadata = selection;
         missing_metadata.metadata_required = true;
@@ -1119,6 +1121,8 @@ fn planned_pump_switches_framers_and_delivers_through_the_real_transport() {
                 config_generation: 1,
                 clock_epoch: epoch,
                 metadata_required: false,
+                metadata_schema: None,
+                source_generation: None,
             };
             let planned = NegotiatedRoute {
                 profile: route.profile.clone(),
@@ -1176,6 +1180,8 @@ fn negotiated_unit_copy_requires_exact_selection_and_owns_payload() {
         config_generation: 8,
         clock_epoch: [1; 16],
         metadata_required: false,
+        metadata_schema: None,
+        source_generation: None,
     };
     let mut bytes = vec![10, 20, 30];
     let unit = NegotiatedVideoUnit {

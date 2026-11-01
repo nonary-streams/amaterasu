@@ -8,6 +8,7 @@ use amaterasu_media::{
 use amaterasu_module_sdk::abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
 pub(super) use processor::ProcessorBridge;
 use processor::ProcessorDelivery;
+pub(crate) use processor::{MetadataCapabilities, MetadataFlow};
 use std::{ffi::c_void, marker::PhantomData, rc::Rc};
 
 const MAX_OFFERS: usize = 64;
@@ -307,6 +308,10 @@ impl ResourceBridge {
         })
     }
 
+    pub(super) fn last_submitted_sequence(&self) -> Option<u64> {
+        self.output_delivered.then_some(self.last_sequence)
+    }
+
     pub(super) fn is_retired(&self) -> bool {
         self.retired
     }
@@ -560,6 +565,7 @@ mod tests {
         seen_producer_generation: u64,
         namespace: Option<[u8; 16]>,
         last_flags: u32,
+        metadata: Vec<u8>,
         hold: bool,
         held: Option<CaptureResourceFrame>,
         cancel_log: Option<std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>>,
@@ -859,6 +865,8 @@ mod tests {
         no_frame_busy: bool,
         frame_sequence: u64,
         wrong_epoch: bool,
+        metadata_context: Option<amaterasu_media::FrameMetadataCaptureContextV1>,
+        wrong_metadata_source: bool,
     }
     unsafe extern "C" fn producer_enumerate(
         context: *mut c_void,
@@ -1299,6 +1307,8 @@ mod tests {
         drop_output: bool,
         swallow_error: bool,
         corrupt_clock: bool,
+        corrupt_metadata: bool,
+        claim_application: bool,
         lease: Option<*mut TestLease>,
         cancellations: u32,
         log: Option<std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>>,
@@ -1527,9 +1537,13 @@ mod tests {
 
     struct PipelineHost {
         capture: CaptureApiV1_8,
+        metadata_capture: *const amaterasu_media::CaptureApiV1_11,
         encoder: amaterasu_media::EncoderApi,
         consumer: FrameResourceConsumerApi,
+        metadata_consumer: *const amaterasu_media::FrameResourceConsumerApiV1_1,
         processor: *const FrameResourceProcessorApi,
+        submitted_encoder: *const amaterasu_media::EncoderProviderApi,
+        metadata_capabilities: *const amaterasu_media::FrameMetadataCapabilitiesApiV1,
     }
     unsafe extern "C" fn runtime_invoke(
         context: *mut c_void,
@@ -1552,7 +1566,11 @@ mod tests {
             } => {
                 let address = match (service.as_str(), contract.as_str()) {
                     ("example.capture/1", "amaterasu.video-capture.native/1") => {
-                        &host.capture as *const _ as usize
+                        if host.metadata_capture.is_null() {
+                            &host.capture as *const _ as usize
+                        } else {
+                            host.metadata_capture as usize
+                        }
                     }
                     (
                         "amaterasu.encode/1" | "example.encode/1",
@@ -1561,10 +1579,25 @@ mod tests {
                     (
                         "example.resource-consumer/1",
                         "amaterasu.frame-resource-consumer.native/1",
-                    ) => &host.consumer as *const _ as usize,
+                    ) => {
+                        if host.metadata_consumer.is_null() {
+                            &host.consumer as *const _ as usize
+                        } else {
+                            host.metadata_consumer as usize
+                        }
+                    }
                     ("example.processor/1", "amaterasu.frame-resource-processor.native/1") => {
                         host.processor as usize
                     }
+                    ("example.submitted-native/1", "amaterasu.encoder-provider.native/1") => {
+                        host.submitted_encoder as usize
+                    }
+                    (
+                        "example.capture-caps/1"
+                        | "example.processor-caps/1"
+                        | "example.encoder-caps/1",
+                        "amaterasu.frame-metadata-capabilities.native/1",
+                    ) => host.metadata_capabilities as usize,
                     _ => 0,
                 };
                 if address == 0 {
@@ -1617,6 +1650,7 @@ mod tests {
         consumer_api.enumerate_resources = consumer_enumerate;
         let mut host = Box::new(PipelineHost {
             capture,
+            metadata_capture: ptr::null(),
             encoder: amaterasu_media::EncoderApi {
                 base: NativeInterface {
                     header: AbiHeader::of::<amaterasu_media::EncoderApi>(),
@@ -1628,7 +1662,10 @@ mod tests {
                 drain: legacy_drain,
             },
             consumer: consumer_api,
+            metadata_consumer: ptr::null(),
             processor,
+            submitted_encoder: ptr::null(),
+            metadata_capabilities: ptr::null(),
         });
         let runtime = unsafe {
             RuntimeClient::from_endpoint(amaterasu_module_sdk::abi::HostApi {
@@ -1782,5 +1819,1016 @@ mod tests {
         assert_eq!(lease.references, 0);
         assert_eq!(lease.completion, amaterasu_media::FRAME_SYNC_VENDOR_BASE);
         assert_eq!(&*log.borrow(), &["encoder", "processor"]);
+    }
+    unsafe extern "C" fn metadata_setup(
+        context: *mut c_void,
+        _: u64,
+        setup: *const amaterasu_media::FrameMetadataCaptureContextV1,
+    ) -> Status {
+        let producer = unsafe { &mut *context.cast::<Producer>() };
+        if setup.is_null() || !producer.selected || unsafe { (*setup).validate() }.is_err() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        producer.metadata_context = Some(unsafe { *setup });
+        STATUS_OK
+    }
+    struct MetadataSink {
+        setup: amaterasu_media::FrameMetadataCaptureContextV1,
+        sink: amaterasu_media::FrameResourceMetadataSinkV1,
+        wrong_source: bool,
+    }
+    unsafe extern "C" fn capture_to_metadata(
+        context: *mut c_void,
+        frame: *const CaptureResourceFrame,
+    ) -> Status {
+        use amaterasu_module_sdk::{abi::BorrowedBytes, encode::FormatId, media::metadata::*};
+        let output = unsafe { &mut *context.cast::<MetadataSink>() };
+        let frame = unsafe { &*frame };
+        let setup = &output.setup;
+        let bytes = FrameMetadataBundle {
+            identity: FrameMetadataIdentity {
+                session_id: setup.session_id,
+                submission_id: frame.sequence,
+                source_id: setup.source_id + u64::from(output.wrong_source),
+                source_generation: setup.source_generation,
+                config_generation: setup.config_generation,
+                timestamp_us: frame.timestamp_us,
+                clock_domain: setup.clock.domain,
+                clock_epoch: setup.clock.epoch_id,
+            },
+            owner: CarriageOwner::FramerInsert,
+            items: vec![FrameMetadataItem {
+                schema: FormatId {
+                    namespace_id: 1,
+                    value: 1,
+                    schema: 1,
+                },
+                required: true,
+                payload: vec![0xb5, frame.sequence as u8],
+            }],
+        }
+        .encode()
+        .unwrap();
+        let wrapped = amaterasu_media::FrameResourceMetadataFrameV1 {
+            size: amaterasu_media::FRAME_RESOURCE_METADATA_FRAME_V1_SIZE,
+            version: 1,
+            frame: *frame,
+            metadata: BorrowedBytes::new(&bytes),
+        };
+        unsafe { (output.sink.write)(output.sink.context, &wrapped) }
+    }
+    unsafe extern "C" fn producer_metadata_read(
+        context: *mut c_void,
+        stream: u64,
+        sink: amaterasu_media::FrameResourceMetadataSinkV1,
+    ) -> Status {
+        let producer = unsafe { &mut *context.cast::<Producer>() };
+        let Some(setup) = producer.metadata_context else {
+            return MEDIA_UNSUPPORTED;
+        };
+        let mut output = MetadataSink {
+            setup,
+            sink,
+            wrong_source: producer.wrong_metadata_source,
+        };
+        unsafe {
+            producer_read(
+                context,
+                stream,
+                CaptureResourceFrameSink {
+                    context: (&mut output as *mut MetadataSink).cast(),
+                    write: capture_to_metadata,
+                },
+            )
+        }
+    }
+    unsafe extern "C" fn unused_hdr(
+        _: *mut c_void,
+        _: u64,
+        _: *mut amaterasu_media::HdrMetadata,
+    ) -> Status {
+        MEDIA_UNSUPPORTED
+    }
+    fn metadata_capture_table(producer: &mut Producer) -> amaterasu_media::CaptureApiV1_11 {
+        let mut original = capture_table(producer);
+        original.base.base.base.header = AbiHeader {
+            size: size_of::<amaterasu_media::CaptureApiV1_11>() as u32,
+            major: 1,
+            minor: 11,
+        };
+        let capture9 = amaterasu_media::CaptureApiV1_9 {
+            base: original.base,
+            enumerate_resources: original.enumerate_resources,
+            select_resource: original.select_resource,
+            read_resource_frame: original.read_resource_frame,
+            hdr_metadata: unused_hdr,
+        };
+        amaterasu_media::CaptureApiV1_11 {
+            base: amaterasu_media::CaptureApiV1_10 {
+                base: capture9,
+                read_resource_frame_with_metadata: producer_metadata_read,
+            },
+            configure_frame_metadata: metadata_setup,
+        }
+    }
+    unsafe extern "C" fn processor_metadata_process(
+        context: *mut c_void,
+        _: u64,
+        input: *const amaterasu_media::FrameResourceMetadataFrameV1,
+        sink: amaterasu_media::FrameResourceMetadataSinkV1,
+    ) -> Status {
+        use amaterasu_module_sdk::{abi::BorrowedBytes, media::metadata::FrameMetadataBundle};
+        let processor = unsafe { &mut *context.cast::<TestProcessor>() };
+        if !processor.selected {
+            return MEDIA_UNSUPPORTED;
+        }
+        let input = unsafe { &*input };
+        let mut output = *input;
+        output.frame.offer_generation = 9;
+        output.frame.offer_id = 5;
+        output.frame.color = amaterasu_media::FrameColorMetadata {
+            version: 1,
+            size: size_of::<amaterasu_media::FrameColorMetadata>() as u32,
+            transfer: processor.transfer,
+            ..Default::default()
+        };
+        let bytes = unsafe { input.metadata.read() }.unwrap();
+        let changed = if processor.corrupt_metadata || processor.claim_application {
+            let mut bundle = FrameMetadataBundle::decode(bytes).unwrap();
+            if processor.corrupt_metadata {
+                bundle.items[0].payload.push(42);
+            }
+            if processor.claim_application {
+                bundle.owner = amaterasu_module_sdk::media::metadata::CarriageOwner::EncoderEmbed;
+            }
+            Some(bundle.encode().unwrap())
+        } else {
+            None
+        };
+        if let Some(bytes) = &changed {
+            output.metadata = BorrowedBytes::new(bytes);
+        }
+        unsafe { (sink.write)(sink.context, &output) }
+    }
+    unsafe extern "C" fn consumer_metadata_submit(
+        context: *mut c_void,
+        _: u64,
+        frame: *const amaterasu_media::FrameResourceMetadataFrameV1,
+        flags: u32,
+    ) -> Status {
+        let consumer = unsafe { &mut *context.cast::<Consumer>() };
+        if consumer.busy {
+            return amaterasu_media::MEDIA_BUSY;
+        }
+        let frame = unsafe { &*frame };
+        consumer.metadata = unsafe { frame.metadata.read() }.unwrap().to_vec();
+        consumer.last_flags = flags;
+        consumer.transfer = frame.frame.color.transfer;
+        consumer.submitted += 1;
+        STATUS_OK
+    }
+    fn metadata_policy(
+        stage: amaterasu_module_sdk::media::metadata::MetadataStage,
+        generation: u64,
+    ) -> amaterasu_module_sdk::media::metadata::MetadataPolicy {
+        use amaterasu_module_sdk::{encode::FormatId, media::metadata::*};
+        MetadataPolicy {
+            session_id: 50,
+            capability_generation: generation,
+            owner: CarriageOwner::FramerInsert,
+            stage,
+            capabilities: vec![MetadataCapability {
+                schema: FormatId {
+                    namespace_id: 1,
+                    value: 1,
+                    schema: 1,
+                },
+                treatment: MetadataTreatment::Forward,
+            }],
+            allow_drop_unknown_optional: false,
+        }
+    }
+    fn metadata_flow() -> (processor::MetadataFlow, processor::MetadataCapabilities) {
+        use amaterasu_module_sdk::{encode::FormatId, media::metadata::*};
+        let context = FrameMetadataContext {
+            session_id: 50,
+            source_id: 1,
+            source_generation: 9,
+            config_generation: 1,
+            clock_domain: amaterasu_media::FRAME_CLOCK_HOST_MONOTONIC,
+            clock_epoch: [1; 16],
+        };
+        let versions = processor::MetadataCapabilities {
+            capture: 1,
+            processor: 2,
+            encoder: 3,
+        };
+        let flow = processor::MetadataFlow::new(
+            context,
+            metadata_policy(MetadataStage::Capture, 1),
+            metadata_policy(MetadataStage::Processor, 2),
+            metadata_policy(MetadataStage::Encoder, 3),
+            vec![FormatId {
+                namespace_id: 1,
+                value: 1,
+                schema: 1,
+            }],
+        )
+        .unwrap();
+        (flow, versions)
+    }
+    #[test]
+    fn metadata_processor_preserves_required_data_across_busy_and_retires_association() {
+        use amaterasu_media::*;
+        use amaterasu_module_sdk::{abi::BorrowedBytes, media::metadata::*};
+        for transfer in [FRAME_TRANSFER_PQ, FRAME_TRANSFER_SRGB] {
+            let mut producer = Producer::default();
+            let capture = metadata_capture_table(&mut producer);
+            let mut processor = TestProcessor {
+                transfer,
+                ..Default::default()
+            };
+            let processor_api = FrameResourceProcessorApiV1_2 {
+                base: processor_table(&mut processor),
+                process_with_metadata: processor_metadata_process,
+            };
+            let mut consumer = Consumer {
+                busy: true,
+                ..Default::default()
+            };
+            let mut base = table(&mut consumer);
+            base.enumerate_resources = consumer_enumerate;
+            let encoder = FrameResourceConsumerApiV1_1 {
+                base,
+                submit_with_metadata: consumer_metadata_submit,
+            };
+            let mut bridge = ProcessorBridge::new(1, 2, 3, [1; 16]).unwrap();
+            let (mut flow, versions) = metadata_flow();
+            assert_eq!(
+                unsafe {
+                    bridge.forward_metadata(
+                        &capture,
+                        &processor_api,
+                        &encoder,
+                        &mut flow,
+                        versions,
+                        0,
+                    )
+                },
+                Ok(MEDIA_BUSY)
+            );
+            assert_eq!(consumer.submitted, 0);
+            producer.frame_sequence = 0;
+            consumer.busy = false;
+            std::hint::black_box((&producer, &consumer));
+            assert_eq!(
+                unsafe {
+                    bridge.forward_metadata(
+                        &capture,
+                        &processor_api,
+                        &encoder,
+                        &mut flow,
+                        versions,
+                        0,
+                    )
+                },
+                Ok(STATUS_OK)
+            );
+            assert_eq!((consumer.submitted, consumer.transfer), (1, transfer));
+            let selection = EncodedMetadataSelection {
+                stream: 50,
+                generation: 50,
+                offer_id: 9,
+                codec: EncoderFormatId {
+                    namespace_id: 7,
+                    value: 8,
+                    schema: 1,
+                },
+                framing: EncoderFormatId {
+                    namespace_id: 7,
+                    value: 9,
+                    schema: 1,
+                },
+                clock_epoch: [2; 16],
+            };
+            let mut association = flow.claim_output(selection, versions).unwrap();
+            assert!(flow.claim_output(selection, versions).is_err());
+            let payload = [10, 20];
+            let unit = NegotiatedVideoUnit {
+                size: size_of::<NegotiatedVideoUnit>() as u32,
+                version: 1,
+                stream: 50,
+                generation: 50,
+                offer_id: 9,
+                codec: selection.codec,
+                framing: selection.framing,
+                access_unit_id: 1,
+                submission_id: 1,
+                source_id: 1,
+                config_generation: 1,
+                timestamp_us: 2,
+                clock: FrameClockMetadata {
+                    version: 1,
+                    size: size_of::<FrameClockMetadata>() as u32,
+                    domain: FRAME_CLOCK_STREAM_RELATIVE,
+                    reserved: 0,
+                    epoch_id: [2; 16],
+                },
+                flags: VIDEO_UNIT_KEYFRAME,
+                reserved: 0,
+                data: BorrowedBytes::new(&payload),
+            };
+            assert!(
+                association
+                    .accept_encoder_output(
+                        &unit,
+                        &consumer.metadata,
+                        MetadataApplication::EncoderApplied,
+                        3
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                association.accept_encoder_output(
+                    &unit,
+                    &consumer.metadata,
+                    MetadataApplication::Forwarded,
+                    3
+                ),
+                Ok(())
+            );
+            assert!(
+                association
+                    .accept_framer_output(
+                        &unit,
+                        &consumer.metadata,
+                        MetadataApplication::Forwarded,
+                        3
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                association.accept_framer_output(
+                    &unit,
+                    &consumer.metadata,
+                    MetadataApplication::FramerApplied,
+                    3
+                ),
+                Ok(())
+            );
+            assert!(
+                association
+                    .accept_framer_output(
+                        &unit,
+                        &consumer.metadata,
+                        MetadataApplication::FramerApplied,
+                        3
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                flow.retire(&mut association, &unit, &consumer.metadata, versions),
+                Ok(())
+            );
+            unsafe { bridge.cancel(&processor_api.base, &encoder.base) };
+        }
+    }
+    #[test]
+    fn metadata_processor_rejects_stale_source_or_changed_required_payload() {
+        for (wrong_source, corrupt_metadata, claim_application) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let mut producer = Producer {
+                wrong_metadata_source: wrong_source,
+                ..Default::default()
+            };
+            let capture = metadata_capture_table(&mut producer);
+            let mut processor = TestProcessor {
+                corrupt_metadata,
+                claim_application,
+                ..Default::default()
+            };
+            let processor_api = amaterasu_media::FrameResourceProcessorApiV1_2 {
+                base: processor_table(&mut processor),
+                process_with_metadata: processor_metadata_process,
+            };
+            let mut consumer = Consumer::default();
+            let mut base = table(&mut consumer);
+            base.enumerate_resources = consumer_enumerate;
+            let encoder = amaterasu_media::FrameResourceConsumerApiV1_1 {
+                base,
+                submit_with_metadata: consumer_metadata_submit,
+            };
+            let mut bridge = ProcessorBridge::new(1, 2, 3, [1; 16]).unwrap();
+            let (mut flow, versions) = metadata_flow();
+            assert_eq!(
+                unsafe {
+                    bridge.forward_metadata(
+                        &capture,
+                        &processor_api,
+                        &encoder,
+                        &mut flow,
+                        versions,
+                        0,
+                    )
+                },
+                Err(ConnectionError::Protocol)
+            );
+            assert_eq!(consumer.submitted, 0);
+            assert_eq!(consumer.cancelled, 1);
+        }
+    }
+    struct SubmittedEncoderFixture {
+        consumer: *mut Consumer,
+        configured: bool,
+        sent: bool,
+    }
+    unsafe extern "C" fn submitted_probe(
+        _: *mut c_void,
+        config: *const amaterasu_media::EncoderSessionConfig,
+        sink: amaterasu_media::EncoderControlSink,
+    ) -> Status {
+        let config = unsafe { &*config };
+        if config.mode != amaterasu_media::ENCODER_SESSION_SUBMITTED
+            || config.source_id != 1
+            || config.codec.namespace_id != 42
+            || config.codec.value != 9
+            || config.framing.value != 10
+        {
+            return MEDIA_UNSUPPORTED;
+        }
+        let response = amaterasu_media::EncoderControlResponse {
+            size: size_of::<amaterasu_media::EncoderControlResponse>() as u32,
+            kind: 0,
+            request_id: 0,
+            effective_generation: 1,
+            effective_submission_id: 0,
+            outcome: amaterasu_media::ENCODER_OUTCOME_APPLIED,
+            reserved: 0,
+            schema: amaterasu_media::EncoderFormatId {
+                namespace_id: 0,
+                value: 0,
+                schema: 0,
+            },
+            data: amaterasu_module_sdk::abi::BorrowedBytes::new(&[]),
+        };
+        unsafe { (sink.write)(sink.context, &response) }
+    }
+    unsafe extern "C" fn submitted_configure(
+        context: *mut c_void,
+        _: u64,
+        config: *const amaterasu_media::EncoderSessionConfig,
+    ) -> Status {
+        let fixture = unsafe { &mut *context.cast::<SubmittedEncoderFixture>() };
+        if unsafe { (*config).mode } != amaterasu_media::ENCODER_SESSION_SUBMITTED {
+            return MEDIA_UNSUPPORTED;
+        }
+        fixture.configured = true;
+        STATUS_OK
+    }
+    unsafe extern "C" fn submitted_receive(
+        context: *mut c_void,
+        session: u64,
+        _: usize,
+        sink: amaterasu_media::EncoderOutputSink,
+    ) -> Status {
+        use amaterasu_media::*;
+        use amaterasu_module_sdk::abi::BorrowedBytes;
+        let fixture = unsafe { &mut *context.cast::<SubmittedEncoderFixture>() };
+        if !fixture.configured || fixture.sent || unsafe { (*fixture.consumer).submitted } == 0 {
+            return MEDIA_PENDING;
+        }
+        let bytes = [10, 20, 30];
+        let chunk = EncoderOutputChunk {
+            size: size_of::<EncoderOutputChunk>() as u32,
+            flags: ENCODER_CHUNK_ACCESS_UNIT_START
+                | ENCODER_CHUNK_ACCESS_UNIT_END
+                | ENCODER_CHUNK_KEYFRAME,
+            session_id: session,
+            access_unit_id: 1,
+            submission_id: 1,
+            source_id: 1,
+            config_generation: 1,
+            timestamp_us: 1,
+            codec: EncoderFormatId {
+                namespace_id: 42,
+                value: 9,
+                schema: 1,
+            },
+            framing: EncoderFormatId {
+                namespace_id: 42,
+                value: 10,
+                schema: 1,
+            },
+            bytes: BorrowedBytes::new(&bytes),
+        };
+        let status = unsafe { (sink.write)(sink.context, &chunk) };
+        if status == STATUS_OK {
+            fixture.sent = true;
+        }
+        status
+    }
+    unsafe extern "C" fn submitted_control(
+        _: *mut c_void,
+        _: u64,
+        _: *const amaterasu_media::EncoderControlRequest,
+        _: amaterasu_media::EncoderControlSink,
+    ) -> Status {
+        MEDIA_UNSUPPORTED
+    }
+    unsafe extern "C" fn submitted_drain(_: *mut c_void, _: u64) -> Status {
+        STATUS_OK
+    }
+    unsafe extern "C" fn submitted_destroy(_: *mut c_void, _: u64) {}
+    unsafe extern "C" fn capture_submitted_unit(
+        context: *mut c_void,
+        unit: *const amaterasu_media::NegotiatedVideoUnit,
+    ) -> Status {
+        let unit = unsafe { &*unit };
+        assert_eq!(
+            (unit.submission_id, unit.source_id, unit.generation),
+            (1, 1, 1)
+        );
+        unsafe {
+            *context.cast::<Vec<u8>>() = unit.data.read().unwrap().to_vec();
+        }
+        STATUS_OK
+    }
+    #[test]
+    fn selected_generic_processor_feeds_submitted_negotiated_encoder_output() {
+        use crate::plane::{FramePath, NativePlane, Plane, Pump};
+        use amaterasu_media::*;
+        use amaterasu_module_sdk::RuntimeClient;
+        use std::sync::{Arc, Mutex};
+        for transfer in [FRAME_TRANSFER_PQ, FRAME_TRANSFER_SRGB] {
+            let mut source = Box::new(Producer::default());
+            let mut consumer = Box::new(Consumer::default());
+            let mut processor = Box::new(TestProcessor {
+                transfer,
+                ..Default::default()
+            });
+            let processor_api = processor_table(&mut processor);
+            let mut submitted = Box::new(SubmittedEncoderFixture {
+                consumer: (&mut *consumer as *mut Consumer),
+                configured: false,
+                sent: false,
+            });
+            let submitted_api = EncoderProviderApi {
+                base: NativeInterface {
+                    header: AbiHeader::of::<EncoderProviderApi>(),
+                    context: (&mut *submitted as *mut SubmittedEncoderFixture).cast(),
+                    release: None,
+                },
+                probe: submitted_probe,
+                configure_session: submitted_configure,
+                receive: submitted_receive,
+                control: submitted_control,
+                subscribe: None,
+                unsubscribe: None,
+                drain: submitted_drain,
+                destroy_session: submitted_destroy,
+            };
+            let mut capture = capture_table(&mut source);
+            capture.base.base.base.header = AbiHeader {
+                size: size_of::<CaptureApiV1_8>() as u32,
+                major: 1,
+                minor: 8,
+            };
+            let mut consumer_api = table(&mut consumer);
+            consumer_api.enumerate_resources = consumer_enumerate;
+            let mut host = Box::new(PipelineHost {
+                capture,
+                metadata_capture: ptr::null(),
+                encoder: EncoderApi {
+                    base: NativeInterface {
+                        header: AbiHeader::of::<EncoderApi>(),
+                        context: ptr::null_mut(),
+                        release: None,
+                    },
+                    submit: legacy_submit,
+                    receive: legacy_receive,
+                    drain: legacy_drain,
+                },
+                consumer: consumer_api,
+                metadata_consumer: ptr::null(),
+                processor: &processor_api,
+                submitted_encoder: &submitted_api,
+                metadata_capabilities: ptr::null(),
+            });
+            let runtime = unsafe {
+                RuntimeClient::from_endpoint(amaterasu_module_sdk::abi::HostApi {
+                    header: AbiHeader::of::<amaterasu_module_sdk::abi::HostApi>(),
+                    context: (&mut *host as *mut PipelineHost).cast(),
+                    invoke: runtime_invoke,
+                })
+            };
+            let profile = serde_json::json!({"codec":{"namespace_id":42,"value":9,"schema":1},"framing":{"namespace_id":42,"value":10,"schema":1},"wire_selector":9,"payload_type":99,"encoding_name":"TEST9"});
+            let settings:crate::model::Settings=serde_json::from_value(serde_json::json!({"capture_providers":[],"unit_service":"example.units/1",
+                "external_capture_providers":{"vendor":{"service":"example.capture/1","frame_transport":"generic_cpu"}},
+                "external_encoder_providers":{"vendor":"example.encode/1"},"external_encoder_consumers":{"vendor":"example.resource-consumer/1"},
+                "source_encoder_providers":{"source":{"control_service":"example.encode/1","native_service":"example.submitted-native/1","source_ids":[1],"extension_profiles":[profile]}},
+                "generic_processor_service":"example.processor/1"})).unwrap();
+            settings.validate().unwrap();
+            let providers = settings.resolved_providers();
+            let provider = *providers.first().unwrap();
+            let queues = Arc::new(Mutex::new(crate::queue::Queues::default()));
+            queues.lock().unwrap().open(1, "owner", 100);
+            let mut plane = NativePlane::bind(
+                &runtime,
+                queues.clone(),
+                &providers,
+                &settings.external_encoder_providers,
+                &settings.source_encoder_providers,
+                &settings.external_encoder_consumers,
+                None,
+                None,
+                settings.generic_processor_service.as_deref(),
+            )
+            .unwrap();
+            plane.select_encoder("example.encode/1");
+            plane.set_stream_clock(1, 100, [1; 16]);
+            let configuration:crate::model::Configuration=serde_json::from_value(serde_json::json!({"width":16,"height":16,"fps":60,"bitrate":100000,"extension_profile":profile})).unwrap();
+            assert!(configuration.validate_submitted_extension());
+            plane
+                .start_submitted(1, 3, 1, &configuration, 100, [1; 16])
+                .unwrap();
+            let progress = plane
+                .pump(Pump {
+                    video: 1,
+                    provider,
+                    frame_path: FramePath::Generic,
+                    capture: 1,
+                    encoder: 3,
+                    configuration: &configuration,
+                    capture_due: true,
+                    constant_rate: false,
+                    repeat_due: false,
+                    repeat_frame: None,
+                    timestamp_us: 1,
+                    sequence: 1,
+                    force_idr: false,
+                })
+                .unwrap();
+            assert!(progress.submitted);
+            assert_eq!((consumer.submitted, consumer.transfer), (1, transfer));
+            let mut output = Vec::<u8>::new();
+            assert_eq!(
+                unsafe {
+                    queues.lock().unwrap().receive_unit(
+                        "owner",
+                        1,
+                        NegotiatedVideoUnitSink {
+                            context: (&mut output as *mut Vec<u8>).cast(),
+                            write: capture_submitted_unit,
+                        },
+                    )
+                },
+                STATUS_OK
+            );
+            assert_eq!(output, [10, 20, 30]);
+            plane.finish_stream(1);
+            queues.lock().unwrap().close(1);
+        }
+    }
+    unsafe extern "C" fn capability_enumerate(
+        context: *mut c_void,
+        session: u64,
+        sink: amaterasu_media::FrameMetadataCapabilitySinkV1,
+        generation: *mut u64,
+    ) -> Status {
+        use amaterasu_media::*;
+        if session == 0 || generation.is_null() || context.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        unsafe {
+            *generation = *context.cast::<u64>();
+        }
+        let claim = FrameMetadataCapabilityV1 {
+            schema: FrameMetadataSchemaId {
+                namespace_id: 1,
+                value: 1,
+                schema: 1,
+            },
+            operations: FRAME_METADATA_CAP_FORWARD,
+            reserved: 0,
+        };
+        unsafe { (sink.write)(sink.context, &claim) }
+    }
+
+    unsafe extern "C" fn capability_probe(
+        _: *mut c_void,
+        query: *const amaterasu_media::FrameMetadataProfileProbeV1,
+    ) -> Status {
+        use amaterasu_media::*;
+        if query.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        let query = unsafe { &*query };
+        if query.size as usize != size_of::<FrameMetadataProfileProbeV1>()
+            || query.version != 1
+            || !(FRAME_METADATA_STAGE_CAPTURE..=FRAME_METADATA_STAGE_ENCODER).contains(&query.stage)
+            || query.owner != FRAME_METADATA_OWNER_FRAMER
+            || (
+                query.schema.namespace_id,
+                query.schema.value,
+                query.schema.schema,
+            ) != (1, 1, 1)
+            || (
+                query.codec.namespace_id,
+                query.codec.value,
+                query.codec.schema,
+            ) != (42, 9, 1)
+            || (
+                query.framing.namespace_id,
+                query.framing.value,
+                query.framing.schema,
+            ) != (42, 10, 1)
+            || (
+                query.width,
+                query.height,
+                query.fps,
+                query.bit_depth,
+                query.chroma,
+                query.bitrate,
+            ) != (16, 16, 60, 8, ENCODER_CHROMA_420, 100000)
+            || query.reserved != 0
+        {
+            return MEDIA_UNSUPPORTED;
+        }
+        STATUS_OK
+    }
+
+    unsafe extern "C" fn collect_metadata_unit(
+        context: *mut c_void,
+        unit: *const amaterasu_media::NegotiatedVideoMetadataUnitV1,
+    ) -> Status {
+        let output = unsafe { &mut *context.cast::<Vec<u8>>() };
+        let unit = unsafe { &*unit };
+        output.extend_from_slice(unsafe { unit.metadata.read() }.unwrap());
+        STATUS_OK
+    }
+
+    #[test]
+    fn selected_metadata_route_reaches_reserved_video_unit_and_retires_once() {
+        use crate::plane::{FramePath, NativePlane, Plane, Pump};
+        use amaterasu_media::*;
+        use amaterasu_module_sdk::RuntimeClient;
+        use std::sync::{Arc, Mutex};
+        for (transfer, fault) in [
+            (FRAME_TRANSFER_PQ, 0),
+            (FRAME_TRANSFER_SRGB, 0),
+            (FRAME_TRANSFER_SRGB, 1),
+            (FRAME_TRANSFER_SRGB, 2),
+            (FRAME_TRANSFER_SRGB, 3),
+            (FRAME_TRANSFER_SRGB, 4),
+            (FRAME_TRANSFER_SRGB, 5),
+        ] {
+            let mut source = Box::new(Producer {
+                wrong_metadata_source: fault == 1,
+                ..Default::default()
+            });
+            let capture = metadata_capture_table(&mut source);
+            let mut consumer = Box::new(Consumer {
+                busy: fault == 4,
+                ..Default::default()
+            });
+            let mut consumer_base = table(&mut consumer);
+            consumer_base.enumerate_resources = consumer_enumerate;
+            consumer_base.base.header = AbiHeader {
+                size: size_of::<FrameResourceConsumerApiV1_1>() as u32,
+                major: 1,
+                minor: 1,
+            };
+            let consumer_api = FrameResourceConsumerApiV1_1 {
+                base: consumer_base,
+                submit_with_metadata: consumer_metadata_submit,
+            };
+            let mut processor = Box::new(TestProcessor {
+                transfer,
+                corrupt_metadata: fault == 2,
+                claim_application: fault == 3,
+                ..Default::default()
+            });
+            let mut processor_base = processor_table(&mut processor);
+            processor_base.base.base.header = AbiHeader {
+                size: size_of::<FrameResourceProcessorApiV1_2>() as u32,
+                major: 1,
+                minor: 2,
+            };
+            let processor_api = FrameResourceProcessorApiV1_2 {
+                base: processor_base,
+                process_with_metadata: processor_metadata_process,
+            };
+            let mut submitted = Box::new(SubmittedEncoderFixture {
+                consumer: &mut *consumer,
+                configured: false,
+                sent: false,
+            });
+            let submitted_api = EncoderProviderApi {
+                base: NativeInterface {
+                    header: AbiHeader::of::<EncoderProviderApi>(),
+                    context: (&mut *submitted as *mut SubmittedEncoderFixture).cast(),
+                    release: None,
+                },
+                probe: submitted_probe,
+                configure_session: submitted_configure,
+                receive: submitted_receive,
+                control: submitted_control,
+                subscribe: None,
+                unsubscribe: None,
+                drain: submitted_drain,
+                destroy_session: submitted_destroy,
+            };
+            let mut caps_generation = 1u64;
+            let caps = FrameMetadataCapabilitiesApiV1_1 {
+                base: FrameMetadataCapabilitiesApiV1 {
+                    base: NativeInterface {
+                        header: AbiHeader {
+                            size: size_of::<FrameMetadataCapabilitiesApiV1_1>() as u32,
+                            major: 1,
+                            minor: 1,
+                        },
+                        context: (&mut caps_generation as *mut u64).cast(),
+                        release: None,
+                    },
+                    enumerate: capability_enumerate,
+                },
+                probe_profile: capability_probe,
+            };
+            let mut host = Box::new(PipelineHost {
+                capture: capture_table(&mut source),
+                metadata_capture: &capture,
+                encoder: EncoderApi {
+                    base: NativeInterface {
+                        header: AbiHeader::of::<EncoderApi>(),
+                        context: ptr::null_mut(),
+                        release: None,
+                    },
+                    submit: legacy_submit,
+                    receive: legacy_receive,
+                    drain: legacy_drain,
+                },
+                consumer: table(&mut consumer),
+                metadata_consumer: &consumer_api,
+                processor: (&processor_api as *const FrameResourceProcessorApiV1_2).cast(),
+                submitted_encoder: &submitted_api,
+                metadata_capabilities: &caps.base,
+            });
+            let runtime = unsafe {
+                RuntimeClient::from_endpoint(amaterasu_module_sdk::abi::HostApi {
+                    header: AbiHeader::of::<amaterasu_module_sdk::abi::HostApi>(),
+                    context: (&mut *host as *mut PipelineHost).cast(),
+                    invoke: runtime_invoke,
+                })
+            };
+            let profile = serde_json::json!({"codec":{"namespace_id":42,"value":9,"schema":1},"framing":{"namespace_id":42,"value":10,"schema":1},"wire_selector":9,"payload_type":99,"encoding_name":"TEST9"});
+            let settings: crate::model::Settings = serde_json::from_value(serde_json::json!({
+                "capture_providers":[], "unit_service":"example.units/1",
+                "external_capture_providers":{"vendor":{"service":"example.capture/1","frame_transport":"generic_cpu"}},
+                "external_encoder_providers":{"vendor":"example.encode/1"},"external_encoder_consumers":{"vendor":"example.resource-consumer/1"},
+                "source_encoder_providers":{"source":{"control_service":"example.encode/1","native_service":"example.submitted-native/1","source_ids":[1],"extension_profiles":[profile]}},
+                "generic_processor_service":"example.processor/1",
+                "metadata_route":{"profile":profile,"schema":{"namespace_id":1,"value":1,"schema":1},"capture_service":"example.capture/1","encoder_control_service":"example.encode/1","capture_capabilities":"example.capture-caps/1","processor_capabilities":"example.processor-caps/1","encoder_capabilities":"example.encoder-caps/1"}
+            })).unwrap();
+            settings.validate().unwrap();
+            let providers = settings.resolved_providers();
+            let provider = *providers.first().unwrap();
+            let queues = Arc::new(Mutex::new(crate::queue::Queues::default()));
+            queues.lock().unwrap().open(1, "owner", 100);
+            let mut plane = NativePlane::bind(
+                &runtime,
+                queues.clone(),
+                &providers,
+                &settings.external_encoder_providers,
+                &settings.source_encoder_providers,
+                &settings.external_encoder_consumers,
+                None,
+                None,
+                settings.generic_processor_service.as_deref(),
+            )
+            .unwrap()
+            .with_metadata_route(&runtime, settings.metadata_route.as_ref())
+            .unwrap();
+            plane.select_encoder("example.encode/1");
+            plane.set_stream_clock(1, 100, [1; 16]);
+            let configuration: crate::model::Configuration = serde_json::from_value(serde_json::json!({"width":16,"height":16,"fps":60,"bitrate":100000,"extension_profile":profile})).unwrap();
+            assert!(
+                plane
+                    .probe_submitted_metadata("example.encode/1", &configuration)
+                    .is_ok()
+            );
+            let mut unsupported = configuration.clone();
+            unsupported.fps = 30;
+            assert!(
+                plane
+                    .probe_submitted_metadata("example.encode/1", &unsupported)
+                    .is_err()
+            );
+            assert!(
+                plane
+                    .probe_submitted_metadata("example.other/1", &configuration)
+                    .is_err()
+            );
+            plane
+                .start_submitted(1, 3, 1, &configuration, 100, [1; 16])
+                .unwrap();
+            let pump = || Pump {
+                video: 1,
+                provider,
+                frame_path: FramePath::Generic,
+                capture: 1,
+                encoder: 3,
+                configuration: &configuration,
+                capture_due: true,
+                constant_rate: false,
+                repeat_due: false,
+                repeat_frame: None,
+                timestamp_us: 1,
+                sequence: 1,
+                force_idr: false,
+            };
+            assert_eq!(plane.prepare_submitted_metadata(pump()).unwrap(), Some(9));
+            assert_eq!(source.metadata_context.unwrap().source_generation, 9);
+            let first = plane.pump(pump());
+            if (1..=3).contains(&fault) {
+                assert!(first.is_err());
+                assert_eq!(consumer.submitted, 0);
+                let mut bytes = Vec::<u8>::new();
+                assert_eq!(
+                    unsafe {
+                        queues.lock().unwrap().receive_unit_metadata(
+                            "owner",
+                            1,
+                            NegotiatedVideoMetadataUnitSinkV1 {
+                                context: (&mut bytes as *mut Vec<u8>).cast(),
+                                write: collect_metadata_unit,
+                            },
+                        )
+                    },
+                    MEDIA_PENDING
+                );
+                plane.finish_stream(1);
+                continue;
+            }
+            let progress = if fault == 4 {
+                assert!(first.unwrap().capture_deferred);
+                assert_eq!(consumer.submitted, 0);
+                source.frame_sequence = 0;
+                consumer.busy = false;
+                std::hint::black_box((&source, &consumer));
+                plane.pump(pump()).unwrap()
+            } else {
+                first.unwrap()
+            };
+            assert!(progress.submitted);
+            assert_eq!((consumer.submitted, consumer.transfer), (1, transfer));
+            let mut bytes = Vec::<u8>::new();
+            let mut queue = queues.lock().unwrap();
+            assert_eq!(queue.check_metadata("owner", 1, 1), STATUS_INVALID_ARGUMENT);
+            assert_eq!(
+                unsafe {
+                    queue.receive_unit_metadata(
+                        "owner",
+                        1,
+                        NegotiatedVideoMetadataUnitSinkV1 {
+                            context: (&mut bytes as *mut Vec<u8>).cast(),
+                            write: collect_metadata_unit,
+                        },
+                    )
+                },
+                STATUS_OK
+            );
+            assert_eq!(bytes, consumer.metadata);
+            if fault == 5 {
+                caps_generation = 2;
+                std::hint::black_box(&caps_generation);
+                drop(queue);
+                assert!(plane.pump(pump()).is_err());
+                assert_eq!(
+                    queues.lock().unwrap().framed_metadata("owner", 1, 1),
+                    STATUS_INVALID_ARGUMENT
+                );
+                plane.finish_stream(1);
+                continue;
+            }
+            assert_eq!(queue.check_metadata("owner", 1, 1), STATUS_INVALID_ARGUMENT);
+            assert_eq!(
+                queue.framed_metadata("owner", 1, 2),
+                STATUS_INVALID_ARGUMENT
+            );
+            assert_eq!(queue.framed_metadata("owner", 1, 1), STATUS_OK);
+            assert_eq!(
+                queue.framed_metadata("owner", 1, 1),
+                STATUS_INVALID_ARGUMENT
+            );
+            assert_eq!(queue.check_metadata("owner", 1, 1), STATUS_OK);
+            assert_eq!(queue.check_metadata("owner", 1, 1), STATUS_OK);
+            assert_eq!(queue.retire_metadata("owner", 1, 1), STATUS_OK);
+            assert_ne!(queue.retire_metadata("owner", 1, 1), STATUS_OK);
+            drop(queue);
+            plane.finish_stream(1);
+        }
     }
 }

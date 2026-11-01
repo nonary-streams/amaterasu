@@ -1,7 +1,7 @@
 //! Synchronous plan capture before any transport mutation.
 use super::*;
 
-struct OwnedPlan {
+pub(super) struct OwnedPlan {
     bytes: Vec<u8>,
     record_starts: Vec<u8>,
     critical_prefix_shards: u32,
@@ -9,7 +9,7 @@ struct OwnedPlan {
     blocks: [VideoFecBlock; VIDEO_FRAME_MAX_BLOCKS],
 }
 impl OwnedPlan {
-    fn header(&self) -> VideoFramePlan {
+    pub(super) fn header(&self) -> VideoFramePlan {
         VideoFramePlan {
             size: size_of::<VideoFramePlan>() as u32,
             version: 1,
@@ -20,6 +20,51 @@ impl OwnedPlan {
             blocks: self.blocks,
         }
     }
+}
+
+pub(super) fn metadata_plan(
+    framer: &NativeBinding,
+    limits: &VideoFramingLimits,
+    unit: &NegotiatedVideoUnit,
+    metadata: &[u8],
+) -> PlaneResult<Option<OwnedPlan>> {
+    let api =
+        unsafe { framer.table::<VideoFramingApiV2_2>() }.map_err(|_| "native_layout_mismatch")?;
+    let mut delivery = Delivery {
+        limits,
+        calls: 0,
+        plan: None,
+        status: None,
+    };
+    let wrapped = NegotiatedVideoMetadataUnitV1 {
+        size: size_of::<NegotiatedVideoMetadataUnitV1>() as u32,
+        version: 1,
+        unit: *unit,
+        metadata: BorrowedBytes::new(metadata),
+    };
+    // SAFETY: input bytes, limits and callback state remain live synchronously.
+    let status = unsafe {
+        (api.plan_metadata)(
+            framer.context(),
+            unit.stream,
+            &wrapped,
+            limits,
+            VideoFramePlanSink {
+                context: (&mut delivery as *mut Delivery<'_>).cast(),
+                write: capture,
+            },
+        )
+    };
+    if matches!(status, MEDIA_BUSY | MEDIA_PENDING) && delivery.calls == 0 {
+        return Ok(None);
+    }
+    if status != STATUS_OK || delivery.calls != 1 || delivery.status != Some(STATUS_OK) {
+        return Err("video_metadata_framer_failed");
+    }
+    delivery
+        .plan
+        .map(Some)
+        .ok_or("video_metadata_framer_failed")
 }
 struct Delivery<'a> {
     limits: &'a VideoFramingLimits,

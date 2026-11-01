@@ -18,6 +18,8 @@ struct UnitResponse {
     generation: u64,
     offer_id: u64,
     source_id: u64,
+    #[serde(default)]
+    source_generation: Option<u64>,
     config_generation: u64,
     codec: amaterasu_contracts::media_profile::FormatId,
     framing: amaterasu_contracts::media_profile::FormatId,
@@ -269,7 +271,10 @@ impl Record {
             || unit.stream != self.resources[&Resource::Video]
             || unit.generation != unit.stream
             || unit.offer_id != u64::from(profile.wire_selector)
-            || unit.source_id != route.source_id
+            || (route.metadata_schema.is_none() && unit.source_id != route.source_id)
+            || (route.metadata_schema.is_some() && unit.source_id == 0)
+            || (route.metadata_schema.is_some() != unit.source_generation.is_some())
+            || unit.source_generation == Some(0)
             || unit.config_generation != 1
             || unit.codec != profile.codec
             || unit.framing != profile.framing
@@ -301,7 +306,15 @@ impl Record {
                 source_id: unit.source_id,
                 config_generation: unit.config_generation,
                 clock_epoch: unit.clock_epoch,
-                metadata_required: false,
+                metadata_required: route.metadata_schema.is_some(),
+                metadata_schema: route.metadata_schema.map(|schema| {
+                    amaterasu_media::FrameMetadataSchemaId {
+                        namespace_id: schema.namespace_id,
+                        value: schema.value,
+                        schema: schema.schema,
+                    }
+                }),
+                source_generation: unit.source_generation,
             },
         });
         Ok(())
@@ -583,6 +596,7 @@ impl Record {
             "source_id": self.start.as_ref().and_then(|start| start.source_id),
             "client_feature_flags": self.start.as_ref().and_then(|start| start.client_feature_flags),
             "extension_profile": self.extension_limits.as_ref().and_then(|_| self.extension_route.as_ref().map(|route| &route.profile)),
+            "extension_metadata_schema": self.extension_limits.as_ref().and_then(|_| self.extension_route.as_ref().and_then(|route| route.metadata_schema)),
             "audio_offer": self.ordered_audio_candidate.as_ref().and_then(|_| self.audio_extension_route.as_ref().map(|route| route.codec.as_str())),
             "haptics_pcm_negotiated": self.start.as_ref().is_some_and(|start| {
                 start.client_feature_flags.is_some_and(|flags| {

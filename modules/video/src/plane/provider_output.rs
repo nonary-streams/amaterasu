@@ -6,7 +6,7 @@
 use crate::queue::Queues;
 use amaterasu_media::*;
 use amaterasu_module_sdk::abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
-use std::{ffi::c_void, mem::size_of};
+use std::{collections::VecDeque, ffi::c_void, mem::size_of};
 
 #[derive(Clone, Copy)]
 struct AccessUnit {
@@ -22,6 +22,7 @@ struct AccessUnit {
 /// the downstream packet contract defines; no custom framing is inferred.
 pub struct ProviderOutput {
     session: u64,
+    mode: u32,
     queue_stream: u64,
     source: u64,
     generation: u64,
@@ -32,6 +33,8 @@ pub struct ProviderOutput {
     last: Option<AccessUnit>,
     eos: bool,
     poisoned: bool,
+    submitted: VecDeque<u64>,
+    last_submitted: u64,
 }
 
 fn standard_id(id: EncoderFormatId, value: u64) -> bool {
@@ -72,6 +75,7 @@ impl ProviderOutput {
         }
         Ok(Self {
             session,
+            mode: config.mode,
             queue_stream,
             source: config.source_id,
             generation: config.config_generation,
@@ -82,6 +86,8 @@ impl ProviderOutput {
             last: None,
             eos: false,
             poisoned: false,
+            submitted: VecDeque::new(),
+            last_submitted: 0,
         })
     }
 
@@ -97,6 +103,7 @@ impl ProviderOutput {
         }
         Ok(Self {
             session,
+            mode: config.mode,
             queue_stream,
             source: config.source_id,
             generation: config.config_generation,
@@ -107,7 +114,27 @@ impl ProviderOutput {
             last: None,
             eos: false,
             poisoned: false,
+            submitted: VecDeque::new(),
+            last_submitted: 0,
         })
+    }
+
+    /// Only one submitted frame is admitted at a time until its complete unit
+    /// has entered the bounded output queue. This preserves exact association.
+    pub fn can_submit(&self) -> bool {
+        self.mode == ENCODER_SESSION_SUBMITTED
+            && self.submitted.is_empty()
+            && !self.eos
+            && !self.poisoned
+    }
+
+    pub fn admit_submission(&mut self, sequence: u64) -> Result<(), Status> {
+        if !self.can_submit() || sequence == 0 || sequence <= self.last_submitted {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        self.submitted.push_back(sequence);
+        self.last_submitted = sequence;
+        Ok(())
     }
 
     /// Receive one provider chunk. A queue rejection is returned to the provider
@@ -189,12 +216,22 @@ impl ProviderOutput {
             if chunk.flags != ENCODER_CHUNK_END_OF_STREAM
                 || chunk.bytes.len != 0
                 || self.current.is_some()
+                || (self.mode == ENCODER_SESSION_SUBMITTED && !self.submitted.is_empty())
             {
                 return Err(STATUS_INVALID_ARGUMENT);
             }
             return Ok((FLAG_END_OF_STREAM, None, true));
         }
-        if chunk.bytes.len == 0 || chunk.access_unit_id == 0 {
+        if chunk.bytes.len == 0
+            || chunk.access_unit_id == 0
+            || (self.mode == ENCODER_SESSION_SUBMITTED && chunk.submission_id == 0)
+            || (self.mode == ENCODER_SESSION_SOURCE && chunk.submission_id != 0)
+        {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        if self.mode == ENCODER_SESSION_SUBMITTED
+            && self.submitted.front().copied() != Some(chunk.submission_id)
+        {
             return Err(STATUS_INVALID_ARGUMENT);
         }
         let start = chunk.flags & ENCODER_CHUNK_ACCESS_UNIT_START != 0;
@@ -292,6 +329,9 @@ unsafe extern "C" fn receive_chunk(
                     if end {
                         call.output.current = None;
                         call.output.last = Some(unit);
+                        if call.output.mode == ENCODER_SESSION_SUBMITTED {
+                            call.output.submitted.pop_front();
+                        }
                     } else {
                         call.output.current = Some(unit);
                     }

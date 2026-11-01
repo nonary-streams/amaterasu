@@ -485,6 +485,8 @@ impl Pipeline {
                 && payload["source_id"].as_u64() == Some(route.source_id)
                 && payload["encoder"] == json!(route.encoder)
                 && payload["profile"] == json!(route.profile)
+                && (route.metadata_schema.is_none()
+                    || payload["metadata_schema"] == json!(route.metadata_schema))
                 && let Some(media) = record.resources.get(&Resource::Media)
             {
                 record.extension_limits = (operations.probe)(route, *media, &record.config).ok();

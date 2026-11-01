@@ -1,5 +1,7 @@
 //! Negotiated processor composition and synchronous output validation.
 use super::*;
+mod metadata;
+pub(crate) use metadata::{MetadataCapabilities, MetadataFlow};
 
 pub(super) struct ProcessorDelivery<'a> {
     processor: &'a FrameResourceProcessorApi,
@@ -36,25 +38,12 @@ unsafe extern "C" fn deliver_processed(
     // SAFETY: the processor supplies a borrowed descriptor for this call.
     let output = unsafe { &*frame };
     let input = state.input;
-    let same_clock = |a: &amaterasu_media::FrameClockMetadata,
-                      b: &amaterasu_media::FrameClockMetadata| {
-        a.version == b.version
-            && a.size == b.size
-            && a.domain == b.domain
-            && a.reserved == b.reserved
-            && a.epoch_id == b.epoch_id
-    };
-    if output.offer_generation != state.destination.output_generation
-        || output.offer_id != state.destination.output_offer
-        || output.reserved != 0
-        || !valid_color_metadata(&output.color)
-        || !same_clock(&output.clock, &input.clock)
-        || !same_clock(&output.pacing_clock, &input.pacing_clock)
-        || output.sequence != input.sequence
-        || output.timestamp_us != input.timestamp_us
-        || output.capture_pacing_timestamp_us != input.capture_pacing_timestamp_us
-        || output.freshness != input.freshness
-    {
+    if !valid_output(
+        input,
+        output,
+        state.destination.output_generation,
+        state.destination.output_offer,
+    ) {
         state.invalid = true;
         return STATUS_INVALID_ARGUMENT;
     }
@@ -69,6 +58,32 @@ unsafe extern "C" fn deliver_processed(
         )
     };
     state.result
+}
+
+fn valid_output(
+    input: &CaptureResourceFrame,
+    output: &CaptureResourceFrame,
+    output_generation: u64,
+    output_offer: u64,
+) -> bool {
+    let same_clock = |a: &amaterasu_media::FrameClockMetadata,
+                      b: &amaterasu_media::FrameClockMetadata| {
+        a.version == b.version
+            && a.size == b.size
+            && a.domain == b.domain
+            && a.reserved == b.reserved
+            && a.epoch_id == b.epoch_id
+    };
+    output.offer_generation == output_generation
+        && output.offer_id == output_offer
+        && output.reserved == 0
+        && valid_color_metadata(&output.color)
+        && same_clock(&output.clock, &input.clock)
+        && same_clock(&output.pacing_clock, &input.pacing_clock)
+        && output.sequence == input.sequence
+        && output.timestamp_us == input.timestamp_us
+        && output.capture_pacing_timestamp_us == input.capture_pacing_timestamp_us
+        && output.freshness == input.freshness
 }
 
 /// Invoke one processor while validating its synchronous output contract.
@@ -128,6 +143,10 @@ impl ProcessorBridge {
 
     pub(crate) fn is_retired(&self) -> bool {
         self.input.is_retired() || self.output.is_retired()
+    }
+
+    pub(crate) fn last_submitted_sequence(&self) -> Option<u64> {
+        self.input.last_submitted_sequence()
     }
 
     pub(crate) fn output_delivered(&self) -> bool {

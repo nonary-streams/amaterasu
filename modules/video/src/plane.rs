@@ -5,6 +5,7 @@ mod dmabuf;
 mod freshness_tests;
 mod gpu_processor;
 mod lease_lifecycle;
+mod metadata_route;
 #[cfg(amaterasu_swscale)]
 mod preprocess;
 mod processor;
@@ -12,6 +13,7 @@ mod provider_output;
 mod resize;
 mod resource_cpu;
 mod resource_generic;
+pub(crate) use resource_generic::{MetadataCapabilities, MetadataFlow};
 mod source;
 use crate::{
     model::{CaptureProvider, Configuration},
@@ -161,6 +163,9 @@ pub trait Plane {
     fn probe_source(&mut self, _: &str, _: u64, _: &Configuration) -> Result<(), &'static str> {
         Err("encoder_source_unavailable")
     }
+    fn probe_submitted_metadata(&mut self, _: &str, _: &Configuration) -> Result<(), &'static str> {
+        Err("metadata_route_unavailable")
+    }
     fn start_source(
         &mut self,
         _: u64,
@@ -171,6 +176,23 @@ pub trait Plane {
         _: [u8; 16],
     ) -> Result<(), &'static str> {
         Err("encoder_source_unavailable")
+    }
+    /// Start a custom encoder that receives frames from a selected capture.
+    fn start_submitted(
+        &mut self,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: &Configuration,
+        _: u64,
+        _: [u8; 16],
+    ) -> Result<(), &'static str> {
+        Err("submitted_encoder_unavailable")
+    }
+    /// Prepare selected metadata resources and return their source generation;
+    /// `None` means a provider is busy and no open response may be sent yet.
+    fn prepare_submitted_metadata(&mut self, _: Pump<'_>) -> Result<Option<u64>, &'static str> {
+        Err("metadata_route_unavailable")
     }
     fn pump_source(&mut self, _: u64, _: u64, _: bool) -> Result<bool, &'static str> {
         Err("encoder_source_unavailable")
@@ -239,6 +261,8 @@ pub struct NativePlane {
     resource_consumers: BTreeMap<String, NativeBinding>,
     resource_bridges: BTreeMap<u64, (String, resource_generic::ResourceBridge)>,
     processor_bridges: BTreeMap<u64, (String, resource_generic::ProcessorBridge)>,
+    metadata_route: Option<metadata_route::BoundRoute>,
+    metadata_flows: BTreeMap<u64, Arc<Mutex<MetadataFlow>>>,
     generic_processor: Option<NativeBinding>,
     stream_clocks: BTreeMap<u64, (u64, [u8; 16])>,
     sources: BTreeMap<u64, (String, source::Source)>,
@@ -256,10 +280,26 @@ pub struct NativePlane {
     processors: preprocess::Processors,
 }
 
+struct PreparedMetadataRoute {
+    source_generation: u64,
+    capabilities: MetadataCapabilities,
+    flow: Arc<Mutex<MetadataFlow>>,
+}
+
 impl NativePlane {
     pub fn with_required_frame_leases(mut self, required: bool) -> Self {
         self.require_frame_lease = required;
         self
+    }
+    pub fn with_metadata_route(
+        mut self,
+        runtime: &RuntimeClient,
+        route: Option<&crate::model::MetadataRoute>,
+    ) -> ModuleResult<Self> {
+        self.metadata_route = route
+            .map(|route| metadata_route::BoundRoute::bind(runtime, route))
+            .transpose()?;
+        Ok(self)
     }
     #[allow(clippy::too_many_arguments)] // Independent signed service registries and processors.
     pub fn bind(
@@ -343,6 +383,8 @@ impl NativePlane {
                 resource_consumers,
                 resource_bridges: BTreeMap::new(),
                 processor_bridges: BTreeMap::new(),
+                metadata_route: None,
+                metadata_flows: BTreeMap::new(),
                 generic_processor: generic_processor_service
                     .map(|service| {
                         amaterasu_module_sdk::media::bind_frame_resource_processor(runtime, service)
@@ -665,6 +707,54 @@ unsafe extern "C" fn packet(context: *mut c_void, packet: *const EncodedPacket) 
 }
 
 impl Plane for NativePlane {
+    fn probe_submitted_metadata(
+        &mut self,
+        service: &str,
+        configuration: &Configuration,
+    ) -> Result<(), &'static str> {
+        let route = self
+            .metadata_route
+            .as_ref()
+            .ok_or("metadata_route_unavailable")?;
+        if route.spec.encoder_control_service != service {
+            return Err("metadata_route_mismatch");
+        }
+        let capture = self
+            .captures
+            .iter()
+            .find(|(provider, _)| provider.service() == route.spec.capture_service)
+            .map(|(_, binding)| binding)
+            .ok_or("capture_metadata_unavailable")?;
+        let processor = self
+            .generic_processor
+            .as_ref()
+            .ok_or("metadata_processor_unavailable")?;
+        let consumer = self
+            .resource_consumers
+            .get(service)
+            .ok_or("encoder_metadata_unavailable")?;
+        let encoder = self
+            .source_encoders
+            .get(service)
+            .ok_or("submitted_encoder_unavailable")?;
+        // SAFETY: each binding is independently typed and retained throughout the probe.
+        let capture = unsafe { capture.table::<CaptureApiV1_11>() }
+            .map_err(|_| "capture_metadata_unavailable")?;
+        let processor = unsafe { processor.table::<FrameResourceProcessorApiV1_2>() }
+            .map_err(|_| "metadata_processor_unavailable")?;
+        let consumer = unsafe { consumer.table::<FrameResourceConsumerApiV1_1>() }
+            .map_err(|_| "encoder_metadata_unavailable")?;
+        let encoder = unsafe { encoder.table::<EncoderProviderApi>() }
+            .map_err(|_| "submitted_encoder_unavailable")?;
+        if capture.base.base.base.base.base.header.minor < CAPTURE_METADATA_CONTEXT_INTERFACE_MINOR
+            || processor.base.base.base.header.minor < FRAME_RESOURCE_PROCESSOR_METADATA_MINOR
+            || consumer.base.base.header.minor < FRAME_RESOURCE_CONSUMER_METADATA_MINOR
+            || !encoder_provider_available(encoder.base.header)
+        {
+            return Err("metadata_interface_version");
+        }
+        route.probe(configuration)
+    }
     fn probe_source(
         &mut self,
         service: &str,
@@ -755,6 +845,70 @@ impl Plane for NativePlane {
             .insert(video, (self.active_encoder.clone(), source));
         Ok(())
     }
+    fn start_submitted(
+        &mut self,
+        video: u64,
+        session: u64,
+        source_id: u64,
+        configuration: &Configuration,
+        clock_origin_us: u64,
+        clock_epoch: [u8; 16],
+    ) -> Result<(), &'static str> {
+        let profile = configuration
+            .extension_profile
+            .as_ref()
+            .ok_or("submitted_profile_missing")?;
+        let binding = self
+            .source_encoders
+            .get(&self.active_encoder)
+            .ok_or("submitted_encoder_unavailable")?;
+        let api =
+            unsafe { binding.table::<EncoderProviderApi>() }.map_err(|_| "encoder_interface")?;
+        if !encoder_provider_available(api.base.header) {
+            return Err("encoder_interface");
+        }
+        let id = |format: amaterasu_contracts::media_profile::FormatId| EncoderFormatId {
+            namespace_id: format.namespace_id,
+            value: format.value,
+            schema: format.schema,
+        };
+        let selection = crate::queue::UnitSelection {
+            stream: video,
+            generation: video,
+            offer_id: u64::from(profile.wire_selector),
+            source_id,
+            config_generation: 1,
+            codec: id(profile.codec),
+            framing: id(profile.framing),
+            clock_epoch,
+        };
+        self.queues
+            .lock()
+            .map_err(|_| "queue_failed")?
+            .configure_units(video, selection)
+            .map_err(|_| "unit_queue_configuration_failed")?;
+        // SAFETY: the control session authorizes this exact submitted encoder; binding outlives it.
+        let submitted = unsafe {
+            source::Source::open_submitted(
+                api,
+                video,
+                session,
+                source_id,
+                configuration,
+                clock_origin_us,
+                clock_epoch,
+            )
+        }?;
+        self.sources
+            .insert(video, (self.active_encoder.clone(), submitted));
+        Ok(())
+    }
+
+    fn prepare_submitted_metadata(&mut self, input: Pump<'_>) -> Result<Option<u64>, &'static str> {
+        self.prepare_generic_metadata(&input)
+            .map(|selection| selection.map(|selection| selection.source_generation))
+    }
+
     fn pump_source(&mut self, video: u64, _: u64, force_idr: bool) -> Result<bool, &'static str> {
         let (service, source) = self
             .sources
@@ -927,7 +1081,54 @@ impl Plane for NativePlane {
         }
         // SAFETY: configured services promise these layouts; bindings remain live.
         if input.frame_path == FramePath::Generic {
+            if let Some(flow) = self.metadata_flows.get(&input.video) {
+                let versions = self
+                    .metadata_route
+                    .as_ref()
+                    .ok_or("metadata_route_unavailable")
+                    .and_then(|route| route.policies(input.video, input.capture, input.encoder))
+                    .map(|(_, _, _, versions)| versions);
+                let mut flow = flow.lock().map_err(|_| "metadata_flow_failed")?;
+                match versions {
+                    Ok(versions) if flow.versions_match(versions) => {}
+                    _ => {
+                        flow.cancel();
+                        return Err("metadata_capability_changed");
+                    }
+                }
+            }
+            if let Some((_, submitted)) = self.sources.get(&input.video)
+                && !submitted.can_submit()
+            {
+                self.pump_source(input.video, input.encoder, false)?;
+                return Ok(Progress {
+                    capture_deferred: input.capture_due,
+                    ..Progress::default()
+                });
+            }
             let progress = self.deliver_generic(&input)?;
+            if self.sources.contains_key(&input.video) {
+                if progress.submitted {
+                    let sequence = self
+                        .processor_bridges
+                        .get(&input.video)
+                        .and_then(|(_, bridge)| bridge.last_submitted_sequence())
+                        .or_else(|| {
+                            self.resource_bridges
+                                .get(&input.video)
+                                .and_then(|(_, bridge)| bridge.last_submitted_sequence())
+                        })
+                        .ok_or("encoder_submission_identity_missing")?;
+                    self.sources
+                        .get_mut(&input.video)
+                        .ok_or("submitted_encoder_unavailable")?
+                        .1
+                        .admit_submission(sequence)?;
+                }
+                // Submitted-frame keyframe requests travel with the frame.
+                self.pump_source(input.video, input.encoder, false)?;
+                return Ok(progress);
+            }
             let encoder = unsafe {
                 self.encoders
                     .get(&self.active_encoder)
@@ -1081,6 +1282,11 @@ impl Plane for NativePlane {
     }
 
     fn release_stream(&mut self, video: u64) {
+        if let Some(flow) = self.metadata_flows.remove(&video)
+            && let Ok(mut flow) = flow.lock()
+        {
+            flow.cancel();
+        }
         if let Some((service, mut bridge)) = self.resource_bridges.remove(&video)
             && let Some(binding) = self.resource_consumers.get(&service)
             && let Ok(api) = unsafe { binding.table::<FrameResourceConsumerApi>() }
@@ -1144,6 +1350,11 @@ impl NativePlane {
         }
         if self.processor.is_some() || self.gpu_processor.is_some() {
             return Err("generic_processor_unsupported");
+        }
+        if self.metadata_route.as_ref().is_some_and(|route| {
+            input.configuration.extension_profile.as_ref() == Some(&route.spec.profile)
+        }) {
+            return self.deliver_generic_metadata(input);
         }
         let capture = self
             .captures
@@ -1229,6 +1440,189 @@ impl NativePlane {
                 ..Progress::default()
             }),
             _ => Err("resource_submission_failed"),
+        }
+    }
+
+    fn prepare_generic_metadata(
+        &mut self,
+        input: &Pump<'_>,
+    ) -> Result<Option<PreparedMetadataRoute>, &'static str> {
+        use amaterasu_module_sdk::media::metadata::FrameMetadataContext;
+        let route = self
+            .metadata_route
+            .as_ref()
+            .ok_or("metadata_route_unavailable")?;
+        if !route.matches(input, &self.active_encoder) || !self.sources.contains_key(&input.video) {
+            return Err("metadata_route_mismatch");
+        }
+        let capture = self
+            .captures
+            .get(&input.provider)
+            .ok_or("capture_provider_unavailable")?;
+        let processor = self
+            .generic_processor
+            .as_ref()
+            .ok_or("metadata_processor_unavailable")?;
+        let consumer = self
+            .resource_consumers
+            .get(&self.active_encoder)
+            .ok_or("resource_consumer_unavailable")?;
+        // SAFETY: typed registrations retain each exact table; check both the
+        // version and size before reading any additive metadata callbacks.
+        let capture = unsafe { capture.table::<CaptureApiV1_11>() }
+            .map_err(|_| "capture_metadata_unavailable")?;
+        let processor = unsafe { processor.table::<FrameResourceProcessorApiV1_2>() }
+            .map_err(|_| "processor_metadata_unavailable")?;
+        let consumer = unsafe { consumer.table::<FrameResourceConsumerApiV1_1>() }
+            .map_err(|_| "encoder_metadata_unavailable")?;
+        if capture.base.base.base.base.base.header.minor < CAPTURE_METADATA_CONTEXT_INTERFACE_MINOR
+            || processor.base.base.base.header.minor < FRAME_RESOURCE_PROCESSOR_METADATA_MINOR
+            || consumer.base.base.header.minor < FRAME_RESOURCE_CONSUMER_METADATA_MINOR
+        {
+            return Err("metadata_interface_version");
+        }
+        let (_, epoch) = self
+            .stream_clocks
+            .get(&input.video)
+            .copied()
+            .ok_or("resource_clock_unavailable")?;
+        let (_, bridge) = match self.processor_bridges.entry(input.video) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => entry.insert((
+                self.active_encoder.clone(),
+                resource_generic::ProcessorBridge::new(
+                    input.capture,
+                    input.video,
+                    input.encoder,
+                    epoch,
+                )
+                .map_err(|_| "resource_negotiation_failed")?,
+            )),
+        };
+        // SAFETY: provider bindings and owned sessions remain live through cancellation.
+        let source_generation =
+            match unsafe { bridge.negotiate_metadata(capture, processor, consumer) } {
+                Ok(generation) => generation,
+                Err(resource_generic::ConnectionError::Native(MEDIA_BUSY | MEDIA_PENDING)) => {
+                    return Ok(None);
+                }
+                Err(_) => return Err("metadata_negotiation_failed"),
+            };
+        let (capture_policy, processor_policy, encoder_policy, versions) =
+            route.policies(input.video, input.capture, input.encoder)?;
+        let flow = if let Some(flow) = self.metadata_flows.get(&input.video) {
+            flow.clone()
+        } else {
+            let context = FrameMetadataContext {
+                session_id: input.video,
+                source_id: input.capture,
+                source_generation,
+                config_generation: 1,
+                clock_domain: FRAME_CLOCK_HOST_MONOTONIC,
+                clock_epoch: epoch,
+            };
+            let flow = Arc::new(Mutex::new(
+                MetadataFlow::new(
+                    context,
+                    capture_policy,
+                    processor_policy,
+                    encoder_policy,
+                    vec![route.schema()],
+                )
+                .map_err(|_| "metadata_policy_invalid")?,
+            ));
+            self.queues
+                .lock()
+                .map_err(|_| "queue_failed")?
+                .configure_metadata(input.video, flow.clone(), versions)
+                .map_err(|_| "metadata_queue_failed")?;
+            self.metadata_flows.insert(input.video, flow.clone());
+            flow
+        };
+        {
+            let mut guard = flow.lock().map_err(|_| "metadata_flow_failed")?;
+            if !guard.versions_match(versions) {
+                guard.cancel();
+                return Err("metadata_capability_changed");
+            }
+            // SAFETY: capture and its selected resource remain live until cancellation.
+            match unsafe { bridge.setup_metadata(capture, &mut guard) } {
+                Ok(()) => {}
+                Err(resource_generic::ConnectionError::Native(MEDIA_BUSY | MEDIA_PENDING)) => {
+                    return Ok(None);
+                }
+                Err(_) => {
+                    guard.cancel();
+                    return Err("metadata_setup_failed");
+                }
+            }
+        }
+        Ok(Some(PreparedMetadataRoute {
+            source_generation,
+            capabilities: versions,
+            flow,
+        }))
+    }
+
+    fn deliver_generic_metadata(&mut self, input: &Pump<'_>) -> Result<Progress, &'static str> {
+        let Some(PreparedMetadataRoute {
+            capabilities: versions,
+            flow,
+            ..
+        }) = self.prepare_generic_metadata(input)?
+        else {
+            return Ok(Progress {
+                capture_deferred: true,
+                ..Progress::default()
+            });
+        };
+        let capture = self
+            .captures
+            .get(&input.provider)
+            .ok_or("capture_provider_unavailable")?;
+        let processor = self
+            .generic_processor
+            .as_ref()
+            .ok_or("metadata_processor_unavailable")?;
+        let consumer = self
+            .resource_consumers
+            .get(&self.active_encoder)
+            .ok_or("resource_consumer_unavailable")?;
+        // SAFETY: preparation checked these exact typed bindings and their versions.
+        let capture = unsafe { capture.table::<CaptureApiV1_11>() }
+            .map_err(|_| "capture_metadata_unavailable")?;
+        let processor = unsafe { processor.table::<FrameResourceProcessorApiV1_2>() }
+            .map_err(|_| "processor_metadata_unavailable")?;
+        let consumer = unsafe { consumer.table::<FrameResourceConsumerApiV1_1>() }
+            .map_err(|_| "encoder_metadata_unavailable")?;
+        let (_, bridge) = self
+            .processor_bridges
+            .get_mut(&input.video)
+            .ok_or("metadata_processor_unavailable")?;
+        let flags = if input.force_idr {
+            FRAME_RESOURCE_SUBMIT_FORCE_IDR
+        } else {
+            0
+        };
+        let mut flow = flow.lock().map_err(|_| "metadata_flow_failed")?;
+        // SAFETY: the selected tables, session state and flow remain live through this synchronous call.
+        let status = unsafe {
+            bridge.forward_metadata(capture, processor, consumer, &mut flow, versions, flags)
+        };
+        match status {
+            Ok(STATUS_OK) => Ok(Progress {
+                submitted: bridge.output_delivered(),
+                capture_frame_count: 1,
+                ..Progress::default()
+            }),
+            Ok(MEDIA_BUSY | MEDIA_PENDING)
+            | Err(resource_generic::ConnectionError::Native(MEDIA_BUSY | MEDIA_PENDING)) => {
+                Ok(Progress {
+                    capture_deferred: true,
+                    ..Progress::default()
+                })
+            }
+            _ => Err("metadata_submission_failed"),
         }
     }
 

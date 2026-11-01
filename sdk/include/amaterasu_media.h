@@ -575,6 +575,7 @@ typedef struct {
 #define AMATERASU_FRAME_METADATA_CAP_FORWARD 1u
 #define AMATERASU_FRAME_METADATA_CAP_APPLY 2u
 #define AMATERASU_FRAME_METADATA_CAPABILITIES_CONTRACT "amaterasu.frame-metadata-capabilities.native/1"
+#define AMATERASU_FRAME_METADATA_PROFILE_PROBE_MINOR 1u
 typedef struct { uint64_t namespace_id, value, schema; } AmaterasuFrameMetadataSchemaId;
 typedef struct { AmaterasuFrameMetadataSchemaId schema; uint32_t operations, reserved; } AmaterasuFrameMetadataCapabilityV1;
 typedef struct { void *context; AmaterasuStatus (*write)(void *, const AmaterasuFrameMetadataCapabilityV1 *); } AmaterasuFrameMetadataCapabilitySinkV1;
@@ -584,6 +585,20 @@ typedef struct {
     AmaterasuNativeInterface base;
     AmaterasuStatus (*enumerate)(void *, uint64_t, AmaterasuFrameMetadataCapabilitySinkV1, uint64_t *generation);
 } AmaterasuFrameMetadataCapabilitiesApiV1;
+#define AMATERASU_FRAME_METADATA_STAGE_CAPTURE 1u
+#define AMATERASU_FRAME_METADATA_STAGE_PROCESSOR 2u
+#define AMATERASU_FRAME_METADATA_STAGE_ENCODER 3u
+/* Probe is read-only and does not replace per-session capability checks. */
+typedef struct {
+    uint32_t size, version, stage, owner;
+    AmaterasuFrameMetadataSchemaId schema, codec, framing;
+    uint32_t width, height, fps, bit_depth, chroma, reserved;
+    uint64_t bitrate;
+} AmaterasuFrameMetadataProfileProbeV1;
+typedef struct {
+    AmaterasuFrameMetadataCapabilitiesApiV1 base;
+    AmaterasuStatus (*probe_profile)(void *, const AmaterasuFrameMetadataProfileProbeV1 *);
+} AmaterasuFrameMetadataCapabilitiesApiV1_1;
 #define AMATERASU_FRAME_METADATA_CAPABILITIES_API_V1_SIZE ((uint32_t)sizeof(AmaterasuFrameMetadataCapabilitiesApiV1))
 #define AMATERASU_CAPTURE_METADATA_INTERFACE_MINOR 10u
 #define AMATERASU_FRAME_RESOURCE_CONSUMER_METADATA_MINOR 1u
@@ -783,6 +798,9 @@ typedef struct {
 #define AMATERASU_VIDEO_FRAMING_LIMITS_VERSION 2u
 #define AMATERASU_VIDEO_FRAMING_INTERFACE_MAJOR 2u
 #define AMATERASU_VIDEO_FRAMING_INTERFACE_MINOR 1u
+#define AMATERASU_VIDEO_FRAMING_METADATA_INTERFACE_MINOR 2u
+#define AMATERASU_NEGOTIATED_VIDEO_METADATA_INTERFACE_MINOR 1u
+#define AMATERASU_VIDEO_PLAN_TRANSPORT_METADATA_INTERFACE_MINOR 1u
 typedef struct { uint64_t namespace_id, value, schema; } AmaterasuVideoFormatId;
 typedef struct {
     uint32_t size, version;
@@ -801,6 +819,22 @@ typedef struct {
     AmaterasuNativeInterface base;
     AmaterasuStatus (*receive)(void *, uint64_t, AmaterasuNegotiatedVideoUnitSink);
 } AmaterasuNegotiatedVideoApi;
+typedef struct {
+    uint32_t size, version;
+    AmaterasuNegotiatedVideoUnit unit;
+    AmaterasuBorrowedBytes metadata;
+} AmaterasuNegotiatedVideoMetadataUnitV1;
+typedef struct {
+    void *context;
+    AmaterasuStatus (*write)(void *, const AmaterasuNegotiatedVideoMetadataUnitV1 *);
+} AmaterasuNegotiatedVideoMetadataUnitSinkV1;
+typedef struct {
+    AmaterasuNegotiatedVideoApi base;
+    AmaterasuStatus (*receive_metadata)(void *, uint64_t, AmaterasuNegotiatedVideoMetadataUnitSinkV1);
+    AmaterasuStatus (*framed_metadata)(void *, uint64_t, uint64_t);
+    AmaterasuStatus (*check_metadata)(void *, uint64_t, uint64_t);
+    AmaterasuStatus (*retire_metadata)(void *, uint64_t, uint64_t);
+} AmaterasuNegotiatedVideoApiV1_1;
 typedef struct {
     AmaterasuNativeInterface base;
     AmaterasuStatus (*submit)(void *, uint64_t, const AmaterasuNegotiatedVideoUnit *);
@@ -853,6 +887,16 @@ typedef struct {
     AmaterasuStatus (*drain)(void *, uint64_t);
 } AmaterasuNegotiatedVideoPlanTransportApiV2;
 typedef struct {
+    AmaterasuVideoPlanSelectionV2 base;
+    AmaterasuFrameMetadataSchemaId schema;
+    uint32_t carriage_owner, reserved;
+} AmaterasuVideoPlanSelectionV3;
+typedef struct {
+    AmaterasuNegotiatedVideoPlanTransportApiV2 base;
+    AmaterasuStatus (*probe_metadata)(void *, uint64_t, const AmaterasuVideoPlanSelectionV3 *, AmaterasuVideoFramingLimits *);
+    AmaterasuStatus (*prepare_metadata)(void *, uint64_t, const AmaterasuVideoPlanSelectionV3 *, AmaterasuVideoFramingLimits *);
+} AmaterasuNegotiatedVideoPlanTransportApiV2_1;
+typedef struct {
     void *context;
     AmaterasuStatus (*write)(void *, const AmaterasuVideoFramePlan *);
 } AmaterasuVideoFramePlanSink;
@@ -868,6 +912,15 @@ typedef struct {
     AmaterasuVideoFramingApi base;
     AmaterasuStatus (*probe)(void *, const AmaterasuVideoFormatId *, const AmaterasuVideoFormatId *, const AmaterasuVideoFramingLimits *);
 } AmaterasuVideoFramingApiV2_1;
+/* Success from plan_metadata asserts that this plan contains the selected
+ * AFM1 carriage. The host retains the plan across transport retries. */
+typedef struct {
+    AmaterasuVideoFramingApiV2_1 base;
+    AmaterasuStatus (*probe_metadata)(void *, const AmaterasuVideoFormatId *, const AmaterasuVideoFormatId *,
+                                     const AmaterasuFrameMetadataSchemaId *, const AmaterasuVideoFramingLimits *);
+    AmaterasuStatus (*plan_metadata)(void *, uint64_t, const AmaterasuNegotiatedVideoMetadataUnitV1 *,
+                                    const AmaterasuVideoFramingLimits *, AmaterasuVideoFramePlanSink);
+} AmaterasuVideoFramingApiV2_2;
 
 /* HDR metadata is tied to a completed capture presentation. Fields: RGB xy,
  * white xy (1/50000), max nits, min 1/10000 nit, MaxCLL and MaxFALL. */

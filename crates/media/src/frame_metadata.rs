@@ -230,3 +230,38 @@ pub struct FrameMetadataCapabilitiesApiV1 {
 }
 pub const FRAME_METADATA_CAPABILITIES_API_V1_SIZE: u32 =
     size_of::<FrameMetadataCapabilitiesApiV1>() as u32;
+
+pub const FRAME_METADATA_STAGE_CAPTURE: u32 = 1;
+pub const FRAME_METADATA_STAGE_PROCESSOR: u32 = 2;
+pub const FRAME_METADATA_STAGE_ENCODER: u32 = 3;
+
+/// Source-independent, read-only metadata preflight. The host supplies the
+/// candidate profile and output geometry; this does not create provider state
+/// or stand in for the per-session capability and source-generation checks.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct FrameMetadataProfileProbeV1 {
+    pub size: u32,
+    pub version: u32,
+    pub stage: u32,
+    pub owner: u32,
+    pub schema: FrameMetadataSchemaId,
+    pub codec: crate::EncoderFormatId,
+    pub framing: crate::EncoderFormatId,
+    pub width: u32,
+    pub height: u32,
+    pub fps: u32,
+    pub bit_depth: u32,
+    pub chroma: u32,
+    pub reserved: u32,
+    pub bitrate: u64,
+}
+
+/// Additive capability v1.1 profile probe. OK is a provider declaration,
+/// not an allocation or evidence of client or hardware interoperability.
+#[repr(C)]
+pub struct FrameMetadataCapabilitiesApiV1_1 {
+    pub base: FrameMetadataCapabilitiesApiV1,
+    pub probe_profile:
+        unsafe extern "C" fn(*mut c_void, *const FrameMetadataProfileProbeV1) -> Status,
+}

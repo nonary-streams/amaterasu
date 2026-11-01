@@ -114,6 +114,7 @@ pub struct Negotiation {
     last_cseq: Option<u32>,
     pending: Option<Pending>,
     profile_offer: Option<VideoProfileSnapshot>,
+    metadata_offer: Option<(u32, amaterasu_contracts::media_profile::FormatId)>,
     audio_offer: Option<sdp::AudioCodec>,
 }
 
@@ -127,6 +128,7 @@ impl Negotiation {
             last_cseq: None,
             pending: None,
             profile_offer: None,
+            metadata_offer: None,
             audio_offer: None,
         })
     }
@@ -155,6 +157,29 @@ impl Negotiation {
         let mut negotiation = Self::new(launch, capabilities)?;
         negotiation.profile_offer = Some(offered);
         Ok(negotiation)
+    }
+
+    /// Require explicit peer acceptance of the schema for one offered selector.
+    pub fn with_metadata_offer(
+        mut self,
+        selector: u32,
+        schema: amaterasu_contracts::media_profile::FormatId,
+    ) -> Result<Self, Error> {
+        if self.state != State::Options
+            || self.last_cseq.is_some()
+            || self.pending.is_some()
+            || !schema.is_valid()
+            || self.profile_offer.as_ref().is_none_or(|offer| {
+                !offer
+                    .profiles
+                    .iter()
+                    .any(|profile| profile.wire_selector == selector)
+            })
+        {
+            return Err(Error::UnsupportedMedia);
+        }
+        self.metadata_offer = Some((selector, schema));
+        Ok(self)
     }
 
     pub fn state(&self) -> State {
@@ -280,6 +305,16 @@ impl Negotiation {
                         .collect::<String>();
                     body.insert_str(insertion, &markers);
                 }
+                if let Some((selector, schema)) = self.metadata_offer {
+                    let insertion = body.find("m=audio ").ok_or(Error::Serialization)?;
+                    body.insert_str(
+                        insertion,
+                        &format!(
+                            "a=x-amaterasu-video-metadata:{selector} {} {} {}\r\n",
+                            schema.namespace_id, schema.value, schema.schema
+                        ),
+                    );
+                }
                 if let Some(codec) = self.audio_offer {
                     body.push_str(&format!(
                         "a=x-ss-audio-codec-offer:{}\r\n",
@@ -329,6 +364,21 @@ impl Negotiation {
                 if let Some(offer) = &self.profile_offer {
                     let mut selected = sdp::parse_profile_announce(&request.body, offer)
                         .map_err(|_| Error::UnsupportedMedia)?;
+                    let claim =
+                        sdp::metadata_claim(&request.body).map_err(|_| Error::UnsupportedMedia)?;
+                    match &selected.video.format {
+                        sdp::NegotiatedVideoFormat::Extension(profile)
+                            if self
+                                .metadata_offer
+                                .is_some_and(|(selector, _)| selector == profile.wire_selector) =>
+                        {
+                            if claim != self.metadata_offer {
+                                return Err(Error::UnsupportedMedia);
+                            }
+                        }
+                        _ if claim.is_some() => return Err(Error::UnsupportedMedia),
+                        _ => {}
+                    }
                     self.match_audio_offer(&mut selected.audio)?;
                     if matches!(
                         selected.video.format,
@@ -340,6 +390,11 @@ impl Negotiation {
                             State::Play,
                         ));
                     }
+                } else if sdp::metadata_claim(&request.body)
+                    .map_err(|_| Error::UnsupportedMedia)?
+                    .is_some()
+                {
+                    return Err(Error::UnsupportedMedia);
                 }
                 let mut announce = sdp::parse_announce(&request.body).map_err(|error| {
                     eprintln!("amaterasu rtsp announce parse rejection reason={error:?}");

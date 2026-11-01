@@ -330,6 +330,29 @@ impl Controller {
     // V1 predates wire markers. Keep its exact legacy allowlist semantics;
     // the production negotiated route binds only V2.
     fn legacy_plan_allowlisted(&self, selection: &VideoPlanSelection) -> bool {
+        if self.settings.metadata_profiles.iter().any(|required| {
+            u64::from(required.profile.wire_selector) == selection.offer_id
+                && (
+                    required.profile.codec.namespace_id,
+                    required.profile.codec.value,
+                    required.profile.codec.schema,
+                ) == (
+                    selection.codec.namespace_id,
+                    selection.codec.value,
+                    selection.codec.schema,
+                )
+                && (
+                    required.profile.framing.namespace_id,
+                    required.profile.framing.value,
+                    required.profile.framing.schema,
+                ) == (
+                    selection.framing.namespace_id,
+                    selection.framing.value,
+                    selection.framing.schema,
+                )
+        }) {
+            return false;
+        }
         self.settings.extension_profiles.iter().any(|profile| {
             let same = |a: &amaterasu_contracts::media_profile::FormatId,
                         b: amaterasu_media::EncoderFormatId| {
@@ -377,7 +400,7 @@ impl Controller {
         id: u64,
         selection: &VideoPlanSelectionV2,
     ) -> Result<VideoFramingLimits, Status> {
-        if !self.plan_allowlisted(selection) {
+        if !self.plan_allowlisted(selection) || self.metadata_profile_required(selection) {
             return Err(STATUS_INVALID_ARGUMENT);
         }
         self.owned(owner, id)
@@ -392,12 +415,108 @@ impl Controller {
         id: u64,
         selection: &VideoPlanSelectionV2,
     ) -> Result<VideoFramingLimits, Status> {
-        if !self.plan_allowlisted(selection) {
+        if !self.plan_allowlisted(selection) || self.metadata_profile_required(selection) {
             return Err(STATUS_INVALID_ARGUMENT);
         }
         self.owned_mut(owner, id)
             .ok_or(MEDIA_CLOSED)?
             .prepare_video_plan(&selection.base_v1().ok_or(STATUS_INVALID_ARGUMENT)?)
+            .map_err(|_| STATUS_INVALID_ARGUMENT)
+    }
+
+    fn metadata_profile_required(&self, selection: &VideoPlanSelectionV2) -> bool {
+        self.settings.metadata_profiles.iter().any(|selected| {
+            u64::from(selected.profile.wire_selector) == selection.base.offer_id
+                && u32::from(selected.profile.payload_type) == selection.payload_type
+                && Some(selected.profile.encoding_name.as_bytes()) == selection.wire_name()
+                && (
+                    selected.profile.codec.namespace_id,
+                    selected.profile.codec.value,
+                    selected.profile.codec.schema,
+                ) == (
+                    selection.base.codec.namespace_id,
+                    selection.base.codec.value,
+                    selection.base.codec.schema,
+                )
+                && (
+                    selected.profile.framing.namespace_id,
+                    selected.profile.framing.value,
+                    selected.profile.framing.schema,
+                ) == (
+                    selection.base.framing.namespace_id,
+                    selection.base.framing.value,
+                    selection.base.framing.schema,
+                )
+        })
+    }
+
+    fn metadata_plan_base(
+        &self,
+        selection: &amaterasu_media::VideoPlanSelectionV3,
+    ) -> Result<VideoPlanSelectionV2, Status> {
+        let base = selection.base_v2().ok_or(STATUS_INVALID_ARGUMENT)?;
+        if !self.plan_allowlisted(&base)
+            || !self.settings.metadata_profiles.iter().any(|allowed| {
+                (
+                    allowed.schema.namespace_id,
+                    allowed.schema.value,
+                    allowed.schema.schema,
+                ) == (
+                    selection.schema.namespace_id,
+                    selection.schema.value,
+                    selection.schema.schema,
+                ) && self.settings.extension_profiles.contains(&allowed.profile)
+                    && u64::from(allowed.profile.wire_selector) == base.base.offer_id
+                    && u32::from(allowed.profile.payload_type) == base.payload_type
+                    && Some(allowed.profile.encoding_name.as_bytes()) == base.wire_name()
+                    && (
+                        allowed.profile.codec.namespace_id,
+                        allowed.profile.codec.value,
+                        allowed.profile.codec.schema,
+                    ) == (
+                        base.base.codec.namespace_id,
+                        base.base.codec.value,
+                        base.base.codec.schema,
+                    )
+                    && (
+                        allowed.profile.framing.namespace_id,
+                        allowed.profile.framing.value,
+                        allowed.profile.framing.schema,
+                    ) == (
+                        base.base.framing.namespace_id,
+                        base.base.framing.value,
+                        base.base.framing.schema,
+                    )
+            })
+        {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        Ok(base)
+    }
+
+    pub fn probe_metadata_video_plan(
+        &self,
+        owner: &str,
+        id: u64,
+        selection: &amaterasu_media::VideoPlanSelectionV3,
+    ) -> Result<VideoFramingLimits, Status> {
+        let base = self.metadata_plan_base(selection)?;
+        self.owned(owner, id)
+            .map_err(|_| MEDIA_CLOSED)?
+            .probe_video_plan(&base.base_v1().ok_or(STATUS_INVALID_ARGUMENT)?)
+            .map_err(|_| STATUS_INVALID_ARGUMENT)
+    }
+
+    pub fn prepare_metadata_video_plan(
+        &mut self,
+        owner: &str,
+        id: u64,
+        selection: &amaterasu_media::VideoPlanSelectionV3,
+    ) -> Result<VideoFramingLimits, Status> {
+        let base = self.metadata_plan_base(selection)?;
+        self.owned_mut(owner, id)
+            .ok_or(MEDIA_CLOSED)?
+            .prepare_video_plan(&base.base_v1().ok_or(STATUS_INVALID_ARGUMENT)?)
             .map_err(|_| STATUS_INVALID_ARGUMENT)
     }
 

@@ -14,6 +14,7 @@ pub const VIDEO_UNIT_VERSION: u32 = 1;
 pub const VIDEO_FRAMING_LIMITS_VERSION: u32 = 2;
 pub const VIDEO_FRAMING_INTERFACE_MAJOR: u32 = 2;
 pub const VIDEO_FRAMING_INTERFACE_MINOR: u32 = 1;
+pub const VIDEO_FRAMING_METADATA_INTERFACE_MINOR: u32 = 2;
 pub const VIDEO_UNIT_KEYFRAME: u32 = 1;
 pub const VIDEO_UNIT_DISCONTINUITY: u32 = 2;
 pub const VIDEO_UNIT_END_OF_STREAM: u32 = 4;
@@ -118,6 +119,40 @@ pub struct NegotiatedVideoUnitSink {
 pub struct NegotiatedVideoApi {
     pub base: NativeInterface,
     pub receive: unsafe extern "C" fn(*mut c_void, u64, NegotiatedVideoUnitSink) -> Status,
+}
+
+/// A unit and its exact canonical AFM1 envelope, borrowed only during the
+/// synchronous receive callback. The unit producer retains the association
+/// until the consumer acknowledges local transport admission.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NegotiatedVideoMetadataUnitV1 {
+    pub size: u32,
+    pub version: u32,
+    pub unit: NegotiatedVideoUnit,
+    pub metadata: BorrowedBytes,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NegotiatedVideoMetadataUnitSinkV1 {
+    pub context: *mut c_void,
+    pub write: unsafe extern "C" fn(*mut c_void, *const NegotiatedVideoMetadataUnitV1) -> Status,
+}
+
+/// Optional video-unit v1.1 tail. `receive_metadata` reserves the unit until
+/// `retire_metadata` after local transport admission or stream cancellation.
+/// `framed_metadata` records the selected framer's successful application;
+/// `check_metadata` must precede every transport attempt, including retries.
+/// All operations use the same authorized binding and exact access-unit ID.
+#[repr(C)]
+pub struct NegotiatedVideoApiV1_1 {
+    pub base: NegotiatedVideoApi,
+    pub receive_metadata:
+        unsafe extern "C" fn(*mut c_void, u64, NegotiatedVideoMetadataUnitSinkV1) -> Status,
+    pub framed_metadata: unsafe extern "C" fn(*mut c_void, u64, u64) -> Status,
+    pub check_metadata: unsafe extern "C" fn(*mut c_void, u64, u64) -> Status,
+    pub retire_metadata: unsafe extern "C" fn(*mut c_void, u64, u64) -> Status,
 }
 
 #[repr(C)]
@@ -242,6 +277,59 @@ pub struct NegotiatedVideoPlanTransportApiV2 {
         *const VideoFramePlan,
     ) -> Status,
     pub drain: unsafe extern "C" fn(*mut c_void, u64) -> Status,
+}
+
+/// Metadata-required profile where a selected framer applies one exact schema
+/// before plan admission. The transport never interprets the envelope.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VideoPlanSelectionV3 {
+    pub base: VideoPlanSelectionV2,
+    pub schema: crate::FrameMetadataSchemaId,
+    pub carriage_owner: u32,
+    pub reserved: u32,
+}
+
+impl VideoPlanSelectionV3 {
+    /// Validate the additional contract before using the existing wire and FEC
+    /// machinery. Returning v2 does not authorize v2 metadata admission.
+    pub fn base_v2(&self) -> Option<VideoPlanSelectionV2> {
+        if self.base.base.size as usize != size_of::<Self>()
+            || self.base.base.version != 3
+            || self.base.base.metadata_required != 1
+            || self.schema.namespace_id == 0
+            || self.schema.value == 0
+            || self.schema.schema == 0
+            || self.carriage_owner != crate::FRAME_METADATA_OWNER_FRAMER
+            || self.reserved != 0
+        {
+            return None;
+        }
+        let mut base = self.base;
+        base.base.size = size_of::<VideoPlanSelectionV2>() as u32;
+        base.base.version = 2;
+        base.base.metadata_required = 0;
+        base.wire_name()?;
+        Some(base)
+    }
+}
+
+/// Additive transport v2.1 tail: v2 probe and prepare still reject metadata.
+#[repr(C)]
+pub struct NegotiatedVideoPlanTransportApiV2_1 {
+    pub base: NegotiatedVideoPlanTransportApiV2,
+    pub probe_metadata: unsafe extern "C" fn(
+        *mut c_void,
+        u64,
+        *const VideoPlanSelectionV3,
+        *mut VideoFramingLimits,
+    ) -> Status,
+    pub prepare_metadata: unsafe extern "C" fn(
+        *mut c_void,
+        u64,
+        *const VideoPlanSelectionV3,
+        *mut VideoFramingLimits,
+    ) -> Status,
 }
 
 /// Plan transport is a distinct typed family from unit-only transport. Prepare
@@ -504,6 +592,30 @@ pub struct VideoFramingApiV2_1 {
     ) -> Status,
 }
 
+/// Optional v2.2 metadata carriage. A successful plan callback means the
+/// selected framer applied the supplied AFM1 exactly once to this plan; this
+/// is a provider assertion, not proof of a particular codec's syntax. Calls
+/// are pure and retry-safe; the host retains an accepted plan across transport
+/// retries rather than asking the provider to apply the data again.
+#[repr(C)]
+pub struct VideoFramingApiV2_2 {
+    pub base: VideoFramingApiV2_1,
+    pub probe_metadata: unsafe extern "C" fn(
+        *mut c_void,
+        *const EncoderFormatId,
+        *const EncoderFormatId,
+        *const crate::FrameMetadataSchemaId,
+        *const VideoFramingLimits,
+    ) -> Status,
+    pub plan_metadata: unsafe extern "C" fn(
+        *mut c_void,
+        u64,
+        *const NegotiatedVideoMetadataUnitV1,
+        *const VideoFramingLimits,
+        VideoFramePlanSink,
+    ) -> Status,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,6 +848,9 @@ mod tests {
             136
         );
         assert_eq!(size_of::<NegotiatedVideoPlanTransportApiV2>(), 64);
+        assert_eq!(size_of::<VideoPlanSelectionV3>(), 200);
+        assert_eq!(std::mem::offset_of!(VideoPlanSelectionV3, schema), 168);
+        assert_eq!(size_of::<NegotiatedVideoPlanTransportApiV2_1>(), 80);
         assert_eq!(size_of::<VideoPlanSelection>(), 128);
         assert_eq!(std::mem::offset_of!(VideoPlanSelection, codec), 48);
         assert_eq!(std::mem::offset_of!(VideoPlanSelection, clock_epoch), 96);
@@ -750,7 +865,22 @@ mod tests {
         );
         assert_eq!(size_of::<VideoFramingApiV2_1>(), 48);
         assert_eq!(std::mem::offset_of!(VideoFramingApiV2_1, probe), 40);
+        assert_eq!(size_of::<VideoFramingApiV2_2>(), 64);
+        assert_eq!(
+            std::mem::offset_of!(VideoFramingApiV2_2, probe_metadata),
+            48
+        );
         assert_eq!(size_of::<NegotiatedVideoUnit>(), 176);
+        assert_eq!(size_of::<NegotiatedVideoMetadataUnitV1>(), 200);
+        assert_eq!(
+            std::mem::offset_of!(NegotiatedVideoMetadataUnitV1, metadata),
+            184
+        );
+        assert_eq!(size_of::<NegotiatedVideoApiV1_1>(), 72);
+        assert_eq!(
+            std::mem::offset_of!(NegotiatedVideoApiV1_1, receive_metadata),
+            40
+        );
         assert_eq!(std::mem::offset_of!(NegotiatedVideoUnit, clock), 120);
         assert_eq!(std::mem::offset_of!(NegotiatedVideoUnit, data), 160);
         assert_eq!(size_of::<VideoFecBlock>(), 16);

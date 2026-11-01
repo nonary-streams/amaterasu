@@ -18,6 +18,7 @@ struct Pending {
     parent: u64,
     service: String,
     source_id: u64,
+    metadata_schema: Option<amaterasu_contracts::media_profile::FormatId>,
     encoder: EncoderIdentity,
     configuration: Configuration,
     command: Command,
@@ -29,6 +30,7 @@ struct Pending {
 
 pub(super) struct Probe {
     pub source_id: u64,
+    pub metadata_schema: Option<amaterasu_contracts::media_profile::FormatId>,
     pub encoder: EncoderIdentity,
     pub configuration: Configuration,
     pub service: String,
@@ -48,12 +50,18 @@ impl Control {
         let Probe {
             service,
             source_id,
+            metadata_schema,
             encoder,
             configuration,
         } = probe;
+        let payload = if metadata_schema.is_some() {
+            json!({"action":"probe", "encoder":encoder, "configuration":configuration})
+        } else {
+            json!({"action":"probe_source", "source_id":source_id, "encoder":encoder, "configuration":configuration})
+        };
         let command = Command::Request {
             service: service.clone(),
-            payload: json!({"action":"probe_source", "source_id":source_id, "encoder":encoder, "configuration":configuration}),
+            payload,
             operation_id: format!("video-source-probe-{epoch}-{parent}"),
             timeout_ms: TIMEOUT.as_millis() as u64,
             parent: Some(parent),
@@ -62,6 +70,7 @@ impl Control {
             parent,
             service,
             source_id,
+            metadata_schema,
             encoder,
             configuration,
             command,
@@ -136,20 +145,30 @@ impl Control {
             }
             let pending = self.pending.remove(&parent).expect("selected probe");
             let reply = pending.result.as_ref().expect("result read");
-            let correlated = reply["ok"] == true
-                && reply["usable"] == true
-                && reply["settled"] == true
-                && reply["source_id"].as_u64() == Some(pending.source_id)
-                && reply["encoder"] == json!(pending.encoder)
-                && reply["configuration"] == json!(pending.configuration);
+            let correlated = if pending.metadata_schema.is_some() {
+                super::encoder::probe_result(&pending.encoder, &pending.configuration, reply)
+                    .is_ok_and(|reason| reason.is_none())
+            } else {
+                reply["ok"] == true
+                    && reply["usable"] == true
+                    && reply["settled"] == true
+                    && reply["source_id"].as_u64() == Some(pending.source_id)
+                    && reply["encoder"] == json!(pending.encoder)
+                    && reply["configuration"] == json!(pending.configuration)
+            };
             let payload = if correlated {
-                match plane.probe_source(
-                    &pending.service,
-                    pending.source_id,
-                    &pending.configuration,
-                ) {
+                let probe = if pending.metadata_schema.is_some() {
+                    plane.probe_submitted_metadata(&pending.service, &pending.configuration)
+                } else {
+                    plane.probe_source(&pending.service, pending.source_id, &pending.configuration)
+                };
+                match probe {
                     Ok(()) => {
-                        json!({"ok":true,"source_id":pending.source_id,"encoder":pending.encoder,"profile":pending.configuration.extension_profile})
+                        let mut result = json!({"ok":true,"source_id":pending.source_id,"encoder":pending.encoder,"profile":pending.configuration.extension_profile});
+                        if let Some(schema) = pending.metadata_schema {
+                            result["metadata_schema"] = json!(schema);
+                        }
+                        result
                     }
                     Err(code) => error(code),
                 }

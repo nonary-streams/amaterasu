@@ -151,6 +151,7 @@ pub struct Broker {
     pub state_value: Option<Value>,
     pub state_fail_set: bool,
     pub extension_probe_supported: bool,
+    pub extension_metadata_schema: Option<Value>,
     pub extension_probe_encoder_override: Option<Value>,
     pub extension_bad_unit: bool,
 }
@@ -435,9 +436,11 @@ impl Broker {
         }
         let action = call.payload["action"].as_str().unwrap();
         let service = call.service.as_str();
-        if service == "amaterasu.video/1" && action == "probe_source" {
+        if service == "amaterasu.video/1"
+            && matches!(action, "probe_source" | "probe_submitted_metadata")
+        {
             return if self.extension_probe_supported {
-                json!({"ok":true,"source_id":call.payload["source_id"],"encoder":self.extension_probe_encoder_override.clone().unwrap_or_else(|| call.payload["encoder"].clone()),"profile":call.payload["configuration"]["extension_profile"]})
+                json!({"ok":true,"source_id":call.payload["source_id"].as_u64().unwrap_or(0),"encoder":self.extension_probe_encoder_override.clone().unwrap_or_else(|| call.payload["encoder"].clone()),"profile":call.payload["configuration"]["extension_profile"],"metadata_schema":self.extension_metadata_schema})
             } else {
                 error("encoder_probe_failed")
             };
@@ -1249,9 +1252,12 @@ impl Broker {
                     allocation.request["configuration"]["extension_profile"].as_object()
                 {
                     reply["negotiated_unit"] = json!({"stream":id,"generation":id,"offer_id":profile["wire_selector"],
-                        "source_id":if self.extension_bad_unit { 99 } else { allocation.request["source_id"].as_u64().unwrap() },
+                        "source_id":if self.extension_bad_unit { 99 } else { allocation.request["source_id"].as_u64().unwrap_or(77) },
                         "config_generation":1,"codec":profile["codec"],"framing":profile["framing"],
                         "clock_epoch":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"clock_origin_us":100});
+                    if allocation.request["source_id"].is_null() {
+                        reply["negotiated_unit"]["source_generation"] = json!(9);
+                    }
                 }
                 if let Some(geometry) = &self.desktop_geometry {
                     reply["desktop_geometry"] = geometry.clone();
