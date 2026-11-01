@@ -1154,3 +1154,39 @@ fn completed_source_histories_still_exhaust_the_broker_lifetime_limit() {
         "resource_exhausted"
     );
 }
+
+#[test]
+fn authority_cannot_verify_provider_before_arm_without_broker_support() {
+    let mut broker = setup();
+    let query = || Command::QueryApiApproval {
+        service: "example.effects/1".into(),
+        method: "apply".into(),
+        interface_major: 1,
+        min_minor: 0,
+    };
+    assert_eq!(
+        code(broker.dispatch("authority", query())),
+        "permission_denied"
+    );
+    let Response::Result { payload } = broker.dispatch("issuer", query()) else {
+        panic!("issuer cannot query selected provider")
+    };
+    assert_eq!(payload["provider"], "provider");
+    // Arm has no expected-provider field, and its response does not identify the
+    // chosen provider. The authority cannot pin its selected provider here.
+    let request = effect(1);
+    open(&mut broker, scope(), 0);
+    arm(&mut broker, &request);
+    assert!(matches!(
+        invoke(
+            &mut broker,
+            "issuer",
+            EffectFenceCommand::Dispatch { effect: request }
+        ),
+        Response::Accepted { .. }
+    ));
+    assert!(matches!(
+        broker.dispatch("provider", Command::Poll {}),
+        Response::Request { .. }
+    ));
+}
