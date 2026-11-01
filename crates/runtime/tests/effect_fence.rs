@@ -1118,3 +1118,39 @@ fn invalid_effect_policy_never_falls_back_to_unprotected_calls() {
         .clear();
     assert!(Broker::new(missing_issuer_grant).is_err());
 }
+
+#[test]
+fn completed_source_histories_still_exhaust_the_broker_lifetime_limit() {
+    let mut broker = setup();
+    for index in 0..64_u64 {
+        let mut source = scope();
+        source.source.id = format!("{index:032x}");
+        source.source.stream_id = format!("stream-{index}");
+        open(&mut broker, source.clone(), 0);
+        assert!(matches!(
+            invoke(
+                &mut broker,
+                "authority",
+                EffectFenceCommand::Compact {
+                    scope: source,
+                    retired_through: 0,
+                }
+            ),
+            Response::Ok
+        ));
+    }
+    let mut next = scope();
+    next.source.id = format!("{:032x}", 64);
+    next.source.stream_id = "stream-64".into();
+    assert_eq!(
+        code(invoke(
+            &mut broker,
+            "authority",
+            EffectFenceCommand::OpenSource {
+                scope: next,
+                retired_through: 0,
+            }
+        )),
+        "resource_exhausted"
+    );
+}
