@@ -1183,3 +1183,43 @@ fn real_broker_reads_authoritative_configuration_while_update_waits() {
     drop(state);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn concurrent_read_transport_failure_preserves_pending_update() {
+    let root = test_root();
+    let mut pipeline = Pipeline::new(Ok(root.clone()));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    pipeline.pending = Some(Pending {
+        request_id: 7,
+        deadline,
+        state_request_id: 21,
+        stage: Stage::Applying {
+            response: json!({"revision": 1}),
+            previous: Document::default(),
+            saved_state_revision: 1,
+        },
+        phase: PendingPhase::Waiting,
+    });
+    pipeline.concurrent_read = Some(Pending {
+        request_id: 8,
+        deadline,
+        state_request_id: 22,
+        stage: Stage::Loading(Operation::Get {}),
+        phase: PendingPhase::Waiting,
+    });
+    assert!(
+        pipeline
+            .tick(|command| match command {
+                Command::TakeResult { request: 21 } => Ok(Response::Pending),
+                Command::TakeResult { request: 22 } => Ok(Response::Result {
+                    payload: json!({"ok":true,"revision":0,"found":false,"value":null}),
+                }),
+                Command::ReleaseResult { request: 22 } => Err("transport failure".into()),
+                command => panic!("unexpected command: {command:?}"),
+            })
+            .is_err()
+    );
+    assert_eq!(pipeline.pending.as_ref().unwrap().request_id, 7);
+    assert_eq!(pipeline.concurrent_read.as_ref().unwrap().request_id, 8);
+    std::fs::remove_dir_all(root).unwrap();
+}

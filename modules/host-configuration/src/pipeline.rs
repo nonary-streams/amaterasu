@@ -95,10 +95,13 @@ impl Pipeline {
         }
         let primary = self.pending.take();
         if let Some(read) = self.concurrent_read.take() {
-            self.advance(read, &mut send)?;
+            let result = self.advance(read, &mut send);
             self.concurrent_read = self.pending.take();
+            self.pending = primary;
+            result?;
+        } else {
+            self.pending = primary;
         }
-        self.pending = primary;
         if self.concurrent_read.is_none() {
             if self.pending.is_some() {
                 let primary = self.pending.take();
