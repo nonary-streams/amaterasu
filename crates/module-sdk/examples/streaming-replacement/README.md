@@ -22,8 +22,13 @@ root with `out` pointing to task-owned scratch space:
 For an additional selected-input check, build `amaterasu-input` with the
 `qualification-fake-backend` feature into the protocol target and set
 `AMATERASU_COMPOSITION_REAL_INPUT=1`. The input library then runs with a fake,
-device-free backend and a fixture configuration service. Stream and media
-services still use fixture implementations.
+device-free backend and a fixture configuration service. To exercise stream
+preparation as well, build `amaterasu-stream-session`, `amaterasu-control-transport`
+and `amaterasu-media-transport` into the protocol target and set
+`AMATERASU_COMPOSITION_REAL_STREAM=1`. The success case then verifies the real
+RTSP owner's prepared or armed stream; audio is disabled and session/application
+services remain fixtures. No client controller or feedback effect is admitted by
+this launch test.
 
 ```sh
 CARGO_TARGET_DIR="$out/protocol" cargo build --offline --locked -p amaterasu-runtime -p amaterasu-pairing -p amaterasu-launch -p amaterasu-rtsp -p amaterasu-session-lifecycle
