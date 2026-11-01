@@ -1134,7 +1134,12 @@ impl Pipeline {
                 Ok(false)
             }
             Step::FeedbackPeek => {
-                if let Some(through_sequence) = accept_feedback_peek(record, &payload, now)? {
+                let scoped = cfg!(test)
+                    && self.settings.observe_feedback_sources
+                    && self.settings.feedback_retirement_input_principal.is_some();
+                let owner = scoped.then_some(&mut self.feedback_retirement_inbox);
+                if let Some(through_sequence) = accept_feedback_peek(record, &payload, now, owner)?
+                {
                     record.feedback_ack_through = Some(through_sequence);
                     job.step = Step::FeedbackAck;
                     Ok(true)
@@ -1143,7 +1148,16 @@ impl Pipeline {
                 }
             }
             Step::FeedbackAck => {
+                let through = record.feedback_ack_through;
                 accept_feedback_ack(record, &payload, now)?;
+                if cfg!(test)
+                    && self.settings.observe_feedback_sources
+                    && self.settings.feedback_retirement_input_principal.is_some()
+                    && let Some(through) = through
+                {
+                    self.feedback_retirement_inbox
+                        .acknowledge_feedback(record, through)?;
+                }
                 Ok(false)
             }
             Step::PollGamepadFeedback => {

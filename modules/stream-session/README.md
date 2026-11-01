@@ -70,10 +70,14 @@ are bounded and are serviced while a stream workflow is active. Identical retrie
 may share a pending request; changed payloads with the same operation ID are
 rejected. Unstarted requests whose callers cancel can be removed safely.
 
-This ingress currently holds requests without acknowledging retirement. It is
-not connected to the pairing source registry, transport retirement or drain
-receipt, and must not be enabled in a deployed composition. The default remains
-disabled. Native code is trusted and broker identity is not a sandbox.
+The source-scoped route, pairing join and feedback lease are compiled for unit
+qualification only; production source admission remains closed. The receiver
+retains an exact in-process source registry, fences every source sharing the
+selected control transport, and waits for the selected provider's whole-stream
+receipt and pairing settlement before acknowledging input. A process restart
+still needs durable source recovery and full provider integration proof, so this
+option must not be enabled in deployed composition. The default remains disabled.
+Native code is trusted and broker identity is not a sandbox.
 
 ## Lifecycle
 

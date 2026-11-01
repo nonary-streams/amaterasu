@@ -1843,3 +1843,79 @@ fn retirement_ingress_defers_regular_requests_without_losing_them() {
     assert!(host.broker.replies.contains_key(&1));
     assert_eq!(host.broker.replies[&2]["ok"], true);
 }
+
+#[test]
+fn controller_rearrival_fences_owned_source_before_input_provider_delivery() {
+    use amaterasu_module_sdk::effect_authority::{
+        FeedbackCapability, FeedbackDirection, Source, StreamScope,
+    };
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.input_controller_supported = Some(json!(true));
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    let target = amaterasu_extension_api::LifecycleTarget::Stream {
+        host_epoch: "host".into(),
+        session_id: "session".into(),
+        stream_id: "stream".into(),
+        generation: 2,
+    };
+    let source = Source {
+        version: 1,
+        id: "a".repeat(32),
+        generation: 2,
+        host_epoch: "host".into(),
+        session_id: "session".into(),
+        stream_id: "stream".into(),
+        stream_generation: 2,
+        device: "slot-3".into(),
+        device_generation: 1,
+        effect_owner_epoch: "owner".into(),
+    };
+    let scope = StreamScope {
+        capabilities: [FeedbackCapability {
+            schema: "org.amaterasu.feedback.rumble".into(),
+            version: 1,
+            direction: FeedbackDirection::ToClient,
+        }]
+        .into(),
+        controller_slot: 3,
+        transport_service: "amaterasu.control-transport/1".into(),
+        transport_stream: 7,
+        transport_epoch: "c".repeat(32),
+    };
+    {
+        let record = host.pipeline.records.get_mut(&id).unwrap();
+        record.start.as_mut().unwrap().lifecycle_target = Some(target.clone());
+        record.lifecycle_input_token = Some("binding".into());
+        record.lifecycle_delivery_permit = true;
+        record.lifecycle_control_permit = true;
+        record.client_haptics_requested = true;
+        record.input_controller_supported = true;
+        record.feedback_device_observations.insert(3, (1, 0));
+        record.feedback_source_observations.insert(
+            3,
+            json!({"source":{"id":"a".repeat(32)},"input_boot_epoch":"b".repeat(32)}),
+        );
+    }
+    host.pipeline
+        .feedback_retirement_inbox
+        .install_test_source(target, source, scope);
+    host.pipeline.settings.observe_feedback_sources = true;
+    host.pipeline.settings.feedback_retirement_input_principal = Some("input.owner".into());
+    let mut arrival = [0u8; 8];
+    arrival[0] = 3;
+    arrival[1] = 2;
+    host.plane
+        .borrow_mut()
+        .controls
+        .push(controller_extension_packet(0x55000004, &arrival, 1));
+    host.tick();
+    assert_eq!(host.pipeline.records[&id].state, State::Stopping);
+    assert_eq!(
+        host.pipeline.records[&id].error,
+        Some("controller_source_retirement")
+    );
+    assert!(host.broker.input_events.is_empty());
+    assert!(host.plane.borrow().stopping);
+}

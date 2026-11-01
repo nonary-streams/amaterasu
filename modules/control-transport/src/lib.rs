@@ -3,6 +3,8 @@ mod controller;
 mod model;
 mod native;
 mod stream;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 use amaterasu_module_sdk::{
     Command, ManagedModule, ModuleResult, Response, RuntimeClient, network::Network,
@@ -133,6 +135,7 @@ impl Drop for ControlTransport {
     }
 }
 
+#[cfg(not(feature = "test-support"))]
 amaterasu_module_sdk::export_module!(ControlTransport);
 
 #[cfg(test)]

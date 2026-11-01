@@ -60,6 +60,7 @@ pub(super) fn accept_feedback_peek(
     record: &mut Record,
     payload: &Value,
     now: u64,
+    scoped_owner: Option<&mut super::feedback_retirement::Inbox>,
 ) -> Result<Option<u64>, &'static str> {
     let events = payload
         .get("events")
@@ -80,6 +81,7 @@ pub(super) fn accept_feedback_peek(
     if record.plane.is_none() {
         return Err("feedback_plane_unavailable");
     }
+    let mut scoped_owner = scoped_owner;
     let mut last_accepted = None;
     let mut previous = 0;
     for event in events {
@@ -104,6 +106,16 @@ pub(super) fn accept_feedback_peek(
             }
             last_accepted = Some(sequence);
             continue;
+        }
+        if let Some(owner) = scoped_owner.as_deref_mut() {
+            let Some((slot, generation, capabilities)) = device else {
+                return Err("invalid_feedback_device");
+            };
+            note_feedback_device(record, slot, generation, capabilities);
+            if owner.route_feedback(record, slot, generation, sequence, feedback)? {
+                last_accepted = Some(sequence);
+            }
+            break;
         }
         match record
             .plane

@@ -220,6 +220,9 @@ impl Plane {
     }
 
     pub fn send_rumble(&mut self, command: RumbleCommand) -> PlaneResult<bool> {
+        if self.pump.stopping || self.pump.failure.is_some() {
+            return Err("feedback_stopped");
+        }
         self.pump.backend.send_rumble(command)
     }
 

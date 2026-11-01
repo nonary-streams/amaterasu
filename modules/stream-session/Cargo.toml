@@ -23,6 +23,7 @@ sha2.workspace = true
 workspace = true
 
 [dev-dependencies]
+amaterasu-control-transport = { path = "../control-transport", features = ["test-support"] }
 amaterasu-rtsp = { path = "../rtsp", features = ["test-support"] }
 amaterasu-runtime = { path = "../../crates/runtime" }
 amaterasu-media-transport = { path = "../media-transport", features = ["test-support"] }

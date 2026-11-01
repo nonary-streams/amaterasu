@@ -52,6 +52,26 @@ impl Controller {
         }
     }
 
+    #[cfg(feature = "test-support")]
+    pub(crate) fn stage_feedback_for_test(
+        &mut self,
+        owner: &str,
+        id: u64,
+        destination: std::net::SocketAddr,
+    ) -> ControlResult<()> {
+        if !destination.ip().is_loopback() {
+            return Err("invalid_destination");
+        }
+        let stream = self
+            .streams
+            .get_mut(&id)
+            .filter(|stream| stream.owner == owner)
+            .ok_or("stream_not_found")?;
+        stream.stage_pending_datagram_for_test(destination, b"queued-feedback".to_vec());
+        stream.stage_reliable_enet_for_test(destination, 17);
+        Ok(())
+    }
+
     pub fn handle(&mut self, owner: &str, operation: Operation) -> ControlResult<Reply> {
         let (payload, created) = match operation {
             Operation::Open(request) => return self.open(owner, request),
