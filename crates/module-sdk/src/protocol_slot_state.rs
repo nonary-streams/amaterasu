@@ -30,7 +30,7 @@ pub struct ProviderIncarnation {
 impl ProviderIncarnation {
     pub fn valid(&self) -> bool {
         self.version == 1
-            && self.id.len() == 32
+            && self.id.len() == 64
             && self
                 .id
                 .bytes()

@@ -94,7 +94,7 @@ fn entry(scope: &EffectScope, sequence: u64, lease: &SourceSlotLease) -> Entry {
         issued_lease: lease.clone(),
         provider_incarnation: ProviderIncarnation {
             version: 1,
-            id: "e".repeat(32),
+            id: "e".repeat(64),
         },
         identity: GuardedEffectIdentity {
             scope: scope.clone(),
