@@ -23,7 +23,8 @@ older unbound `Arm`; unslotted legacy callers retain their existing behavior.
 
 ## Broker startup and recovery
 
-1. The host, selected issuer, each protected provider, and authority read
+1. The host, selected issuer, each protected provider, explicitly selected State
+   provider, and authority read
    `BrokerEpoch`. Before acknowledging `RecoveryRetired` with that epoch, each
    issuer/provider must actually retire its old workers and local transport
    obligations. The reserved host endpoint separately confirms that it joined
@@ -75,3 +76,34 @@ native component actually joined its worker or cleaned an external effect. The
 production host and pairing integration for these acknowledgments and durable
 ordering are not supplied by this SDK increment; do not enable a production route
 until that integration and restart tests pass.
+
+`VerifyHistoricalJournal`, inside a recovery-only `SlotCommand`, verifies a
+retained authority-owned State Get from the explicitly selected State provider
+against `pairing/protocol-slot/v1/{slot:02}`. It requires the saved original
+effect, selected method, provider incarnation and cleanup identity to match.
+It denies stale snapshots, pending State writes and uncertain delivered writes.
+The result only confirms journal data; it cannot fence, retire, dispatch, or
+prove cleanup. Entries lacking an incarnation fail closed. The authority must
+select a State implementation with durable atomic CAS and preserve its caller
+namespace. Historical provider retirement and persistent cleanup still require
+independent proofs; a newly selected provider cannot supply them.
+
+The host may issue `HostProviderJoined` only after it independently proves that
+the exact provider incarnation's workers have joined. The broker then stops
+admissions to that instance and can return a `HostRetirementReceipt` for an exact
+fenced effect. After restart, the trusted host may supply that old receipt to
+`HostRecoverHistorical` together with the retained authenticated pairing-journal
+read. The broker checks the old broker epoch against the entry's `issued_lease`,
+the full entry, provider incarnation and current recovery lease. This establishes
+only local worker retirement, never persistent cleanup. `Compact` stays blocked
+until `ConfirmHistoricalCleanup` verifies a fresh journal entry with pairing's
+durable `cleanup_confirmed` flag. Pairing must set that flag only after its own
+independent cleanup proof; the broker does not perform that cleanup.
+
+The host currently has no production persistence or replay of these exact
+receipts. In particular, do not derive a join receipt merely from a generic
+module destroy call: the current SDK catches destructor panics without reporting
+whether every join completed. A missing host receipt or cleanup proof leaves the
+historical source fenced. `ProviderRetiredInIncarnation` separately binds a live
+provider's acknowledgment to the host-issued instance; providers must emit it
+only after their actual worker retirement.
