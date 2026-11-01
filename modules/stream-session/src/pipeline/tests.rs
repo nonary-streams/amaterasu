@@ -1,6 +1,6 @@
 mod armed;
 mod display;
-mod harness;
+pub(crate) mod harness;
 mod history;
 mod input;
 mod limiter;
@@ -1244,6 +1244,15 @@ fn disabled_audio_skips_encoder_capture_and_audio_lease_but_keeps_video_plane() 
         .map(|call| call.payload["resource"].as_str().unwrap())
         .collect();
     assert_eq!(leases.len(), 1);
+    let stopped = host.response(3, json!({"action":"stop", "session":id}));
+    assert_eq!(stopped["state"], "stopped");
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == Resource::AudioCapture.service())
+    );
 }
 
 #[test]

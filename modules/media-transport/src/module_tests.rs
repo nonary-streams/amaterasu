@@ -128,3 +128,158 @@ fn startup_rejects_an_unavailable_selected_network_provider() {
     assert_eq!(host.typed_network_binds, 1);
     assert!(host.replies.is_empty());
 }
+
+#[test]
+fn managed_transport_registers_distinct_v1_and_v2_plan_services() {
+    use amaterasu_module_sdk::{RuntimeClient, video_framing};
+    use std::mem::MaybeUninit;
+    unsafe extern "C" {
+        fn amaterasu_runtime_v1() -> *const RuntimeApi;
+    }
+    const OLD: &str = "test.plan-old/1";
+    const NEW: &str = "test.plan-new/1";
+    let policy = serde_json::to_vec(&json!({"principals":{
+        "provider":{"provide":[SERVICE],"native_provide":[SERVICE,OLD,NEW]},
+        "consumer":{"native_use":[OLD,NEW]}},
+        "settings":{"provider":{"enabled":true,"allowed_principals":["consumer"],"plan_service":OLD,"plan_service_v2":NEW,
+            "extension_profiles":[{"codec":{"namespace_id":7,"value":2,"schema":1},"framing":{"namespace_id":7,"value":3,"schema":1},"wire_selector":4,"payload_type":100,"encoding_name":"EXAMPLE"}]}},
+        "service_selections":{"native":{
+            SERVICE:{"provider":"provider","contract":amaterasu_module_sdk::transport::MEDIA_CONTRACT},
+            OLD:{"provider":"provider","contract":video_framing::VIDEO_PLAN_TRANSPORT_CONTRACT},
+            NEW:{"provider":"provider","contract":video_framing::VIDEO_PLAN_TRANSPORT_V2_CONTRACT}}}})).unwrap();
+    let api = unsafe { &*amaterasu_runtime_v1() };
+    let mut runtime = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { (api.create)(BorrowedBytes::new(&policy), &mut runtime) },
+        STATUS_OK
+    );
+    let endpoint = |name: &str| {
+        let mut output = MaybeUninit::uninit();
+        assert_eq!(
+            unsafe {
+                (api.endpoint)(
+                    runtime,
+                    BorrowedBytes::new(name.as_bytes()),
+                    output.as_mut_ptr(),
+                )
+            },
+            STATUS_OK
+        );
+        unsafe { RuntimeClient::from_endpoint(output.assume_init()) }
+    };
+    {
+        let module = MediaTransportModule::start_configured(
+            endpoint("provider"),
+            Some(Network::test_provider()),
+        )
+        .unwrap();
+        let consumer = endpoint("consumer");
+        let old = unsafe { video_framing::bind_plan_transport(&consumer, OLD) }.unwrap();
+        let new = unsafe { video_framing::bind_plan_transport_v2(&consumer, NEW) }.unwrap();
+        assert!(unsafe { video_framing::bind_plan_transport_v2(&consumer, OLD) }.is_err());
+        assert!(unsafe { video_framing::bind_plan_transport(&consumer, NEW) }.is_err());
+        assert_eq!(
+            unsafe { old.table::<amaterasu_media::NegotiatedVideoPlanTransportApi>() }
+                .unwrap()
+                .base
+                .header
+                .major,
+            1
+        );
+        assert_eq!(
+            unsafe { new.table::<amaterasu_media::NegotiatedVideoPlanTransportApiV2>() }
+                .unwrap()
+                .base
+                .header
+                .major,
+            2
+        );
+        use amaterasu_media::{
+            EncoderFormatId, VideoFramingLimits, VideoPlanSelection, VideoPlanSelectionV2,
+        };
+        let (video_peer, audio_peer) = crate::stream::tests::receivers();
+        let open = || crate::stream::tests::request(&video_peer, &audio_peer, false);
+        let stream1 = module
+            .controller
+            .lock()
+            .unwrap()
+            .handle("consumer", Operation::Open(open()))
+            .unwrap()
+            .created
+            .unwrap();
+        let stream2 = module
+            .controller
+            .lock()
+            .unwrap()
+            .handle("consumer", Operation::Open(open()))
+            .unwrap()
+            .created
+            .unwrap();
+        let format = |value| EncoderFormatId {
+            namespace_id: 7,
+            value,
+            schema: 1,
+        };
+        let base = VideoPlanSelection {
+            size: size_of::<VideoPlanSelection>() as u32,
+            version: 1,
+            stream: 5,
+            generation: 5,
+            offer_id: 4,
+            source_id: 6,
+            config_generation: 1,
+            codec: format(2),
+            framing: format(3),
+            clock_epoch: [3; 16],
+            clock_origin_us: amaterasu_media::host_monotonic_micros().max(1),
+            metadata_required: 0,
+            reserved: 0,
+        };
+        let old_api =
+            unsafe { old.table::<amaterasu_media::NegotiatedVideoPlanTransportApi>() }.unwrap();
+        let mut limits = VideoFramingLimits::default();
+        assert_eq!(
+            unsafe { (old_api.probe)(old.context(), stream1, &base, &mut limits) },
+            STATUS_OK
+        );
+        assert_eq!(
+            unsafe { (old_api.prepare)(old.context(), stream1, &base, &mut limits) },
+            STATUS_OK
+        );
+        let mut selection = VideoPlanSelectionV2 {
+            base,
+            payload_type: 100,
+            encoding_name_len: 7,
+            encoding_name: [0; 32],
+        };
+        selection.base.size = size_of::<VideoPlanSelectionV2>() as u32;
+        selection.base.version = 2;
+        selection.encoding_name[..7].copy_from_slice(b"EXAMPLE");
+        let new_api =
+            unsafe { new.table::<amaterasu_media::NegotiatedVideoPlanTransportApiV2>() }.unwrap();
+        assert_eq!(
+            unsafe { (new_api.probe)(new.context(), stream2, &selection, &mut limits) },
+            STATUS_OK
+        );
+        assert_eq!(
+            unsafe { (new_api.prepare)(new.context(), stream2, &selection, &mut limits) },
+            STATUS_OK
+        );
+        drop((old, new, consumer, module));
+    }
+    unsafe { (api.destroy)(runtime) };
+}
+
+#[test]
+fn plan_contract_versions_require_distinct_valid_service_names() {
+    let settings: Settings = serde_json::from_value(
+        json!({"plan_service":"test.plan/1","plan_service_v2":"test.plan/1"}),
+    )
+    .unwrap();
+    assert!(settings.validate().is_err());
+    let settings: Settings = serde_json::from_value(
+        json!({"plan_service":"test.plan/1","plan_service_v2":"test.plan-v2/1"}),
+    )
+    .unwrap();
+    assert!(settings.validate().is_ok());
+}

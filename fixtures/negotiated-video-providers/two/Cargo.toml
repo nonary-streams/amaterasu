@@ -1,0 +1,11 @@
+[package]
+name = "amaterasu-video-route-two"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+amaterasu-media = { path = "../../../crates/media" }
+amaterasu-module-sdk = { path = "../../../crates/module-sdk" }

@@ -30,18 +30,28 @@ pub struct Settings {
     pub allowed_principals: Vec<String>,
     /// Separately granted native service and startup-authorized profiles.
     pub plan_service: Option<String>,
+    /// Separate typed service name for the complete wire-profile contract.
+    pub plan_service_v2: Option<String>,
     pub extension_profiles: Vec<amaterasu_contracts::media_profile::VideoProfile>,
 }
 
 impl Settings {
     pub fn validate(&self) -> TransportResult<()> {
-        if self.plan_service.as_deref().is_some_and(|name| {
-            !amaterasu_contracts::valid_name(name) || name == "amaterasu.media-transport/1"
-        }) || !(amaterasu_contracts::media_profile::VideoProfileSnapshot {
-            profiles: self.extension_profiles.clone(),
-        })
-        .validate()
-            || (!self.extension_profiles.is_empty() && self.plan_service.is_none())
+        if [
+            self.plan_service.as_deref(),
+            self.plan_service_v2.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|name| !amaterasu_contracts::valid_name(name) || name == "amaterasu.media-transport/1")
+            || self.plan_service.is_some() && self.plan_service == self.plan_service_v2
+            || !(amaterasu_contracts::media_profile::VideoProfileSnapshot {
+                profiles: self.extension_profiles.clone(),
+            })
+            .validate()
+            || (!self.extension_profiles.is_empty()
+                && self.plan_service.is_none()
+                && self.plan_service_v2.is_none())
             || self
                 .network_provider
                 .as_deref()

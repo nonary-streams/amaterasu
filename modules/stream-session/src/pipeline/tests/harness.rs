@@ -402,7 +402,7 @@ impl Broker {
         }
     }
 
-    fn execute(&mut self, call: &Call) -> Value {
+    pub(crate) fn execute(&mut self, call: &Call) -> Value {
         if call.service == "amaterasu.session-lifecycle/1" {
             if !self.lifecycle_success {
                 return json!({"status":"rejected"});

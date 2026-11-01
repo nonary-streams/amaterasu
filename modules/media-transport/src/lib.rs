@@ -22,7 +22,8 @@ struct MediaTransportModule {
     runtime: RuntimeClient,
     controller: native::Shared,
     _factory: Box<native::Factory>,
-    _plan_factory: Option<Box<native::plan::Factory>>,
+    _plan_factory: Option<Box<native::legacy_plan::Factory>>,
+    _plan_factory_v2: Option<Box<native::plan::Factory>>,
 }
 
 impl ManagedModule for MediaTransportModule {
@@ -104,9 +105,13 @@ impl MediaTransportModule {
             None => Network::from_settings(&runtime, &payload)?,
         };
         let plan_service = settings.plan_service.clone();
+        let plan_service_v2 = settings.plan_service_v2.clone();
         let controller = Arc::new(Mutex::new(Controller::with_network(settings, network)));
         let factory = native::Factory::new(controller.clone());
         let plan_factory = plan_service
+            .as_ref()
+            .map(|_| native::legacy_plan::Factory::new(controller.clone()));
+        let plan_factory_v2 = plan_service_v2
             .as_ref()
             .map(|_| native::plan::Factory::new(controller.clone()));
         runtime.require_success(Command::Register {
@@ -121,18 +126,29 @@ impl MediaTransportModule {
         if let (Some(service), Some(factory)) = (plan_service, &plan_factory) {
             // SAFETY: factory is retained for module lifetime and callbacks borrow synchronously.
             unsafe {
-                amaterasu_module_sdk::video_framing::register_plan_transport_v2(
+                amaterasu_module_sdk::video_framing::register_plan_transport(
                     &runtime,
                     &service,
                     &factory.api,
                 )
             }?;
         }
+        if let (Some(service), Some(factory)) = (plan_service_v2, &plan_factory_v2) {
+            // SAFETY: retained factory and controller outlive all native bindings.
+            unsafe {
+                amaterasu_module_sdk::video_framing::register_plan_transport_v2(
+                    &runtime,
+                    &service,
+                    &factory.api,
+                )?;
+            }
+        }
         Ok(Self {
             runtime,
             controller,
             _factory: factory,
             _plan_factory: plan_factory,
+            _plan_factory_v2: plan_factory_v2,
         })
     }
 }

@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+test-support = ["amaterasu-module-sdk/network-test-support"]
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 

@@ -788,8 +788,33 @@ impl<const MARKER: u8> amaterasu_module_sdk::encode::EncoderProvider for Fixture
     ) -> Result<amaterasu_module_sdk::encode::ControlResponse, Status> {
         Err(MEDIA_UNSUPPORTED)
     }
-    fn drain(&self, _: u64) -> Result<(), Status> {
-        Ok(())
+    fn drain(&self, session: u64) -> Result<(), Status> {
+        if self.queue.snapshot().ended {
+            return Ok(());
+        }
+        self.queue.drain().map_err(|_| STATUS_INVALID_ARGUMENT)?;
+        self.queue
+            .finish(amaterasu_module_sdk::encode::EncodedPacket {
+                flags: ENCODER_CHUNK_END_OF_STREAM,
+                session_id: session,
+                access_unit_id: 0,
+                submission_id: 0,
+                source_id: 6,
+                config_generation: 1,
+                timestamp_us: 100,
+                codec: amaterasu_module_sdk::encode::FormatId {
+                    namespace_id: 42,
+                    value: 9,
+                    schema: 1,
+                },
+                framing: amaterasu_module_sdk::encode::FormatId {
+                    namespace_id: 42,
+                    value: 10,
+                    schema: 1,
+                },
+                bytes: Vec::new(),
+            })
+            .map_err(|_| MEDIA_BUSY)
     }
     fn destroy(&self, _: u64) {
         self.queue.cancel();
@@ -891,7 +916,7 @@ fn planned_pump_switches_framers_and_delivers_through_the_real_transport() {
             "provider":{"provide":[MEDIA,ENCODER_CONTROL],"native_provide":[ENCODER_NATIVE,FRAMER,BAD_FRAMER,PLAN,MEDIA,CONTROL]},
             "video":{"provide":[VIDEO_CONTROL],"call":[ENCODER_CONTROL],"native_provide":[VIDEO,VIDEO_CONTROL],"native_use":[ENCODER_NATIVE]},
             "consumer":{"call":[VIDEO_CONTROL,ENCODER_CONTROL],"native_use":[VIDEO,FRAMER,BAD_FRAMER,PLAN,MEDIA,CONTROL]}},
-            "settings":{"provider":{"enabled":true,"allowed_principals":["consumer"],"plan_service":PLAN,"extension_profiles":[profile_json]},
+            "settings":{"provider":{"enabled":true,"allowed_principals":["consumer"],"plan_service_v2":PLAN,"extension_profiles":[profile_json]},
                 "video":{"enabled":true,"capture_providers":[],"unit_service":VIDEO,"source_encoder_providers":{"fixture":{
                     "control_service":ENCODER_CONTROL,"native_service":ENCODER_NATIVE,"source_ids":[6],"extension_profiles":[profile_json]}}}},
             "service_selections":{"native":native}})).unwrap();
@@ -1228,3 +1253,6 @@ fn negotiated_unit_copy_requires_exact_selection_and_owns_payload() {
         [10, 20, 30]
     );
 }
+
+#[path = "negotiated_tests/managed_route_test.rs"]
+mod managed_route_test;

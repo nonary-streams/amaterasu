@@ -69,18 +69,22 @@ Unusable or unselected routes leave legacy negotiation unchanged.
 Trusted startup composition must explicitly enable RTSP's `extension_enabled`,
 select stream-session's `extension_route`, configure Video's `unit_service`
 and per-source `extension_profiles`, and configure media transport's
-`plan_service` and `extension_profiles`. The selected profile and service names
+`plan_service_v2` and `extension_profiles`. An optional distinct `plan_service`
+retains the v1 typed service for existing consumers; the runtime requires each
+contract to use a separate service name. The selected profile and service names
 must agree. Package grants and dependencies must authorize the unit, framer and
 plan native interfaces and the source encoder's broker/native services. The
 initiator's inherited broker call grants must include the source encoder control
 service as well as Video; native grants are trusted-code authority, not a sandbox.
 No installed settings are changed by these interfaces.
 
-Tests use two synthetic source encoders and framers through runtime bindings,
-the managed Video module, the stream-session pump and the real media transport
-over loopback. Separate tests exercise the RTSP and session handoff. This does
-not establish PyroWave or Dolby interoperability, real client compatibility,
-GPU support, codec syntax correctness, or HDR decoding.
+A loopback integration test drives encrypted RTSP negotiation through the managed
+RTSP and stream-session modules, the managed Video queue and real media transport.
+It loads two separately built synthetic encoder/framer libraries and checks stale
+queue retirement. These bytes are not a real codec. The test does not establish
+PyroWave or Dolby interoperability, real client compatibility, GPU support,
+codec syntax correctness, or HDR decoding. Build and run instructions are in
+`fixtures/negotiated-video-providers/README.md`.
 
 ## Frame-to-access-unit metadata seam
 

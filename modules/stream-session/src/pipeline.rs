@@ -13,7 +13,7 @@ mod responses;
 mod rpc;
 mod session_effects;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod virtual_display;
 mod workflow;
 

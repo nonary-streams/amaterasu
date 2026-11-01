@@ -1089,7 +1089,11 @@ impl Pipeline {
                 Ok(true)
             }
             Step::DrainVideo => {
-                job.step = Step::CloseCapture;
+                job.step = if record.resources.contains_key(&Resource::AudioCapture) {
+                    Step::CloseCapture
+                } else {
+                    Step::WaitDrain
+                };
                 Ok(true)
             }
             Step::CloseCapture => {

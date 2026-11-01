@@ -50,7 +50,36 @@ impl Drop for RtspModule {
     }
 }
 
+#[cfg(not(feature = "test-support"))]
 amaterasu_module_sdk::export_module!(RtspModule);
+
+/// Managed entry point with loopback network injection for integration tests.
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    use super::*;
+    pub struct ManagedRtsp(RtspModule);
+    impl ManagedRtsp {
+        pub fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
+            let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
+                return Err("RTSP settings unavailable".into());
+            };
+            let settings: Settings =
+                serde_json::from_value(payload).map_err(|_| "invalid RTSP settings")?;
+            let controller = Controller::with_network(settings, Network::test_provider())?;
+            runtime.require_success(Command::Register {
+                service: SERVICE.into(),
+            })?;
+            Ok(Self(RtspModule {
+                runtime,
+                controller,
+                started: Instant::now(),
+            }))
+        }
+        pub fn tick(&mut self) -> ModuleResult<()> {
+            self.0.tick()
+        }
+    }
+}
 
 #[cfg(test)]
 mod network_startup_tests {

@@ -1,7 +1,7 @@
 use crate::{model::*, stream::Stream};
 use amaterasu_media::{
     EncodedAudioPacket, EncodedPacket, MEDIA_CLOSED, NegotiatedVideoUnit, VideoFramePlan,
-    VideoFramingLimits, VideoPlanSelectionV2,
+    VideoFramingLimits, VideoPlanSelection, VideoPlanSelectionV2,
 };
 use amaterasu_module_sdk::{
     abi::{STATUS_INVALID_ARGUMENT, Status},
@@ -279,6 +279,50 @@ impl Controller {
                 && u32::from(profile.payload_type) == selection.payload_type
                 && profile.encoding_name.as_bytes() == name
         })
+    }
+
+    // V1 predates wire markers. Keep its exact legacy allowlist semantics;
+    // the production negotiated route binds only V2.
+    fn legacy_plan_allowlisted(&self, selection: &VideoPlanSelection) -> bool {
+        self.settings.extension_profiles.iter().any(|profile| {
+            let same = |a: &amaterasu_contracts::media_profile::FormatId,
+                        b: amaterasu_media::EncoderFormatId| {
+                (a.namespace_id, a.value, a.schema) == (b.namespace_id, b.value, b.schema)
+            };
+            u64::from(profile.wire_selector) == selection.offer_id
+                && same(&profile.codec, selection.codec)
+                && same(&profile.framing, selection.framing)
+        })
+    }
+
+    pub fn probe_legacy_video_plan(
+        &self,
+        owner: &str,
+        id: u64,
+        selection: &VideoPlanSelection,
+    ) -> Result<VideoFramingLimits, Status> {
+        if !self.legacy_plan_allowlisted(selection) {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        self.owned(owner, id)
+            .map_err(|_| MEDIA_CLOSED)?
+            .probe_video_plan(selection)
+            .map_err(|_| STATUS_INVALID_ARGUMENT)
+    }
+
+    pub fn prepare_legacy_video_plan(
+        &mut self,
+        owner: &str,
+        id: u64,
+        selection: &VideoPlanSelection,
+    ) -> Result<VideoFramingLimits, Status> {
+        if !self.legacy_plan_allowlisted(selection) {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        self.owned_mut(owner, id)
+            .ok_or(MEDIA_CLOSED)?
+            .prepare_video_plan(selection)
+            .map_err(|_| STATUS_INVALID_ARGUMENT)
     }
 
     pub fn probe_video_plan(

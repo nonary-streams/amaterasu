@@ -1,6 +1,6 @@
 //! Test-only access to the production module and native factories.
 use crate::{MediaTransportModule, model::Operation};
-use amaterasu_module_sdk::{RuntimeClient, network::Network};
+use amaterasu_module_sdk::{ManagedModule, RuntimeClient, network::Network};
 use serde_json::Value;
 
 pub struct Transport {
@@ -23,5 +23,16 @@ impl Transport {
     }
     pub fn tick(&self) {
         self.module.controller.lock().unwrap().tick();
+    }
+}
+
+/// Drive the normal managed control service using the test loopback provider.
+pub struct ManagedTransport(MediaTransportModule);
+impl ManagedTransport {
+    pub fn start(runtime: RuntimeClient) -> Result<Self, String> {
+        MediaTransportModule::start_configured(runtime, Some(Network::test_provider())).map(Self)
+    }
+    pub fn tick(&mut self) -> Result<(), String> {
+        self.0.tick()
     }
 }
