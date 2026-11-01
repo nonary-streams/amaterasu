@@ -146,33 +146,6 @@ fn take(client: &RuntimeClient, id: u64) -> Option<Value> {
     }
 }
 
-#[derive(Default)]
-struct MemoryState {
-    revision: u64,
-    document: Option<Value>,
-}
-impl MemoryState {
-    fn pump(&mut self, runtime: &RuntimeClient) {
-        while let Some(request) = runtime.poll_serialized().unwrap() {
-            let payload = if request.payload["action"] == "get" {
-                json!({"ok":true,"revision":self.revision,"found":self.document.is_some(),"value":self.document})
-            } else if request.payload["expected_revision"] == self.revision {
-                self.revision += 1;
-                self.document = Some(request.payload["value"].clone());
-                json!({"ok":true,"revision":self.revision})
-            } else {
-                json!({"ok":false,"error":{"code":"revision_conflict","current_revision":self.revision}})
-            };
-            runtime
-                .require_success(Command::Complete {
-                    request: request.id,
-                    payload,
-                })
-                .unwrap();
-        }
-    }
-}
-
 #[test]
 #[ignore = "requires independently built protocol and fixture artifacts plus an ephemeral loopback listener"]
 fn real_selected_composition() {
@@ -184,8 +157,12 @@ fn real_selected_composition() {
         (true, "stale"),
         (true, "limiter_unsupported"),
         (true, "limiter_no_retirement"),
+        (true, "limiter_unconfigured"),
         (true, "retirement_cancel"),
         (true, "retirement_restart"),
+        (true, "retirement_restart_running"),
+        (true, "retirement_uncertain_write"),
+        (true, "retirement_unconfirmed"),
         (false, "limiter_success"),
         (true, "limiter_success"),
         (true, "limiter_mismatch"),
@@ -243,13 +220,13 @@ fn run_composition(replacement: bool, scenario: &str) {
         "attacker":{"call":["amaterasu.launch/1","amaterasu.launch/3","example.library.provider/1"]},
         "amaterasu.nvhttp":{"call":services},
         "amaterasu.pairing":{"provide":["amaterasu.pairing/1"],"call":["amaterasu.state/1"],"native_provide":["amaterasu.identity/1"]},
-        "amaterasu.launch":{"provide":["amaterasu.launch/1","amaterasu.launch/2","amaterasu.launch/3"],"call":["fixture.library/2","fixture.policy/2","example.library.provider/1","amaterasu.session/1","amaterasu.application/1"]},
+        "amaterasu.launch":{"provide":["amaterasu.launch/1","amaterasu.launch/2","amaterasu.launch/3"],"call":["fixture.library/2","fixture.policy/2","example.library.provider/1","amaterasu.session/1","amaterasu.application/1","amaterasu.state/1"]},
         "amaterasu.rtsp":{"provide":["amaterasu.rtsp/1"],"call":["amaterasu.launch/1","amaterasu.stream-session/1"],"native_use":["amaterasu.network/1"]},
         "amaterasu.session-lifecycle":{"provide":["amaterasu.session-lifecycle/1"],"call":["amaterasu.launch/1"]},
         "network":{"native_provide":["amaterasu.network/1"]},
         "capture":{"call":["amaterasu.session-lifecycle/1"]},
         "foreign":{"call":["amaterasu.session-lifecycle/1"]},
-        "state":{"provide":["amaterasu.state/1"]},
+        "amaterasu.state":{"provide":["amaterasu.state/1"]},
         "session":{"provide":["amaterasu.session/1"]},
         "stream":{"provide":["amaterasu.stream-session/1"]},
         "input":{"provide":["amaterasu.input/1"]},
@@ -261,7 +238,7 @@ fn run_composition(replacement: bool, scenario: &str) {
         "replacement":{"provide":["fixture.library/2","fixture.policy/2","example.library.provider/1"]}
     },"settings":{
         "amaterasu.pairing":{"administrator_principals":["console"],"transport_principals":["amaterasu.nvhttp"]},
-        "amaterasu.launch":{"enable_library_preflight":true,"retirement_observers":["amaterasu.session-lifecycle"],"library_routes":{"games":{
+        "amaterasu.launch":{"enable_library_preflight":true,"limiter_journal_service":if scenario == "limiter_unconfigured" { Value::Null } else { json!("amaterasu.state/1") },"retirement_observers":["amaterasu.session-lifecycle"],"library_routes":{"games":{
             "service":"fixture.library/2","callers":["amaterasu.nvhttp"],"executors":{"runner":"example.library.provider/1"},
             "streaming_policy_service":"fixture.policy/2","streaming_policy_source":"test-policy"}}},
         "amaterasu.rtsp":{"enabled":true,"bind":"127.0.0.1:0","allowed_principals":["amaterasu.nvhttp"]},
@@ -272,10 +249,12 @@ fn run_composition(replacement: bool, scenario: &str) {
         "policy":{"service":"fixture.policy/2","callers":{"amaterasu.launch":["amaterasu.nvhttp"]},"rules":[{"certificates":[cert_id],"policy":{"application":{"library":"games","id":"opaque/game"},"entry_revision":"entry:opaque","policy_revision":"policy:one","preparation":[]},"config_overrides":{},"application_display_settings":null}]},
         "executor":{"callers":{"amaterasu.launch":{"initiators":["amaterasu.nvhttp","amaterasu.launch"],"lifecycle":true}}, "limiter_mode":match scenario { "limiter_success" => "supported", "limiter_mismatch" => "mismatch", "limiter_stale" => "stale", _ => "" }},
         "replacement":{"certificate_id":cert_id,"mode":scenario,"limiter_capacity":2}
-    }});
+    },"host_context":{"schema":1,"state_root":temp.0.join("state")}});
     let runtime = Runtime::new(&artifact(&artifacts, "amaterasu_runtime"), config);
-    let state = runtime.client("state");
-    register(&state, "amaterasu.state/1");
+    let mut memory = LoadedModule::start(
+        &artifact(&artifacts, "amaterasu_state"),
+        &runtime.endpoint("amaterasu.state"),
+    );
     let network = runtime.client("network");
     let factory = amaterasu_network_sockets::Factory::new();
     // SAFETY: factory lives until after RTSP and its native binding are destroyed.
@@ -333,12 +312,11 @@ fn run_composition(replacement: bool, scenario: &str) {
     let mut provider =
         (!replacement).then(|| LoadedModule::start(&executor, &runtime.endpoint("executor")));
     let console = runtime.client("console");
-    let mut memory = MemoryState::default();
     for (sequence, payload) in [json!({"action":"import_identity","certificate_pem":HOST_CERT,"private_key_pem":HOST_KEY}), json!({"action":"import_client","client_id":"test-client","name":"Client","certificate_pem":CLIENT_CERT})].into_iter().enumerate() {
         let pending = broker_request(&console, "amaterasu.pairing/1", payload, &format!("pairing-{sequence}"));
         let mut result = None;
         for _ in 0..500 {
-            pairing.tick(); memory.pump(&state);
+            pairing.tick(); memory.tick();
             if let Some(value) = take(&console, pending) { result = Some(value); break; }
         }
         assert_eq!(result.as_ref().map(|value| &value["ok"]), Some(&json!(true)), "{result:?}");
@@ -357,6 +335,7 @@ fn run_composition(replacement: bool, scenario: &str) {
         let mut epoch = None;
         for _ in 0..100 {
             launch.tick();
+            memory.tick();
             if let Some(value) = take(&nvhttp, epoch_request) {
                 epoch = value["operation_epoch"].as_str().map(str::to_owned);
                 break;
@@ -373,6 +352,7 @@ fn run_composition(replacement: bool, scenario: &str) {
         let mut preflight = None;
         for _ in 0..200 {
             launch.tick();
+            memory.tick();
             if let Some(module) = &mut library {
                 module.tick();
             }
@@ -395,6 +375,7 @@ fn run_composition(replacement: bool, scenario: &str) {
         let mut rejected = None;
         for _ in 0..100 {
             launch.tick();
+            memory.tick();
             if let Some(value) = take(&attacker, forged) {
                 rejected = Some(value);
                 break;
@@ -459,7 +440,12 @@ fn run_composition(replacement: bool, scenario: &str) {
     if scenario.starts_with("limiter_")
         || matches!(
             scenario,
-            "resume_limiter" | "retirement_cancel" | "retirement_restart"
+            "resume_limiter"
+                | "retirement_cancel"
+                | "retirement_restart"
+                | "retirement_restart_running"
+                | "retirement_uncertain_write"
+                | "retirement_unconfirmed"
         )
     {
         router.set_global_frame_limiter_settings(&crate::frame_limiter::FrameLimiterSettings {
@@ -467,7 +453,7 @@ fn run_composition(replacement: bool, scenario: &str) {
             ..Default::default()
         });
     }
-    if scenario == "retirement_restart" {
+    if matches!(scenario, "retirement_restart" | "retirement_unconfirmed") {
         router.launches.pause_selected_after_accept_for_test();
     }
     let nvhttp = runtime.client("amaterasu.nvhttp");
@@ -487,9 +473,33 @@ fn run_composition(replacement: bool, scenario: &str) {
     let mut backends = Hardware::default();
     let mut replies = vec![];
     let mut cancelled = false;
-    for _ in 0..5000 {
+    for turn in 0..5000 {
         pairing.tick();
-        memory.pump(&state);
+        memory.tick();
+        if scenario == "retirement_uncertain_write"
+            && !cancelled
+            && router.launches.selected_preflight_state_for_test() == Some((true, false))
+        {
+            let coordinator = runtime.client("amaterasu.launch");
+            let probe = broker_request(
+                &coordinator,
+                "amaterasu.state/1",
+                json!({"action":"snapshot","cursor":null,"limit":128}),
+                &format!("uncertain-probe-{turn}"),
+            );
+            memory.tick();
+            let snapshot = take(&coordinator, probe).expect("journal probe");
+            if snapshot["values"]
+                .as_object()
+                .unwrap()
+                .values()
+                .any(|entry| entry["phase"] == "reservation_pending")
+            {
+                // State committed, but Launch has not consumed the write reply.
+                router.cancel(1, &nvhttp);
+                cancelled = true;
+            }
+        }
         launch.tick();
         lifecycle.tick();
         if let Some(module) = &mut library {
@@ -518,7 +528,80 @@ fn run_composition(replacement: bool, scenario: &str) {
             && !cancelled
             && router.launches.selected_preflight_state_for_test() == Some((true, true))
         {
-            // Restart only Launch. The executor and its reservation stay live.
+            // Restart Launch and State; the executor and its reservation stay live.
+            let cancel = router
+                .launches
+                .selected_preflight_cancel_for_test()
+                .unwrap();
+            drop(launch);
+            drop(memory);
+            memory = LoadedModule::start(
+                &artifact(&artifacts, "amaterasu_state"),
+                &runtime.endpoint("amaterasu.state"),
+            );
+            launch = LoadedModule::start(
+                &artifact(&artifacts, "amaterasu_launch"),
+                &runtime.endpoint("amaterasu.launch"),
+            );
+            let attacker = runtime.client("attacker");
+            let stolen = broker_request(
+                &attacker,
+                "amaterasu.launch/3",
+                cancel.clone(),
+                "restart-foreign-owner",
+            );
+            let stolen = await_launch(
+                &attacker,
+                stolen,
+                &mut launch,
+                &mut generated,
+                &mut provider,
+                &mut memory,
+            );
+            assert_ne!(stolen["cancelled"], true, "{stolen}");
+            // Startup recovery must retire the durable obligation even before
+            // NVHTTP sends a cancellation for it.
+            let coordinator = runtime.client("amaterasu.launch");
+            let snapshot = broker_request(
+                &coordinator,
+                "amaterasu.state/1",
+                json!({"action":"snapshot","cursor":null,"limit":128}),
+                "startup-recovered-journal",
+            );
+            memory.tick();
+            let snapshot = take(&coordinator, snapshot).expect("startup journal snapshot");
+            assert!(
+                snapshot["values"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .any(|entry| entry["phase"] == "retired"),
+                "{snapshot}"
+            );
+            let mut changed = cancel;
+            changed["preflight_token"] = json!("f".repeat(64));
+            let changed = broker_request(
+                &nvhttp,
+                "amaterasu.launch/3",
+                changed,
+                "restart-foreign-token",
+            );
+            let changed = await_launch(
+                &nvhttp,
+                changed,
+                &mut launch,
+                &mut generated,
+                &mut provider,
+                &mut memory,
+            );
+            assert_ne!(changed["cancelled"], true, "{changed}");
+            router.cancel(1, &nvhttp);
+            cancelled = true;
+        }
+        if scenario == "retirement_unconfirmed"
+            && !cancelled
+            && router.launches.selected_preflight_state_for_test() == Some((true, true))
+        {
             drop(launch);
             launch = LoadedModule::start(
                 &artifact(&artifacts, "amaterasu_launch"),
@@ -536,13 +619,16 @@ fn run_composition(replacement: bool, scenario: &str) {
             router.cancel(1, &nvhttp);
             cancelled = true;
         }
-        if scenario == "retirement_restart" {
+        if scenario == "retirement_unconfirmed" {
             if router.launches.selected_preflight_cleanup_for_test()
                 == Some("preflight_retirement_unconfirmed")
             {
                 break;
             }
-        } else if scenario == "cancelled" || scenario == "retirement_cancel" {
+        } else if matches!(
+            scenario,
+            "cancelled" | "retirement_cancel" | "retirement_restart" | "retirement_uncertain_write"
+        ) {
             if backends.calls.iter().any(|(service, payload)| {
                 service == "stream" && payload["action"] == "release_history_activity"
             }) {
@@ -557,7 +643,7 @@ fn run_composition(replacement: bool, scenario: &str) {
         .iter()
         .any(|(service, payload)| service == "stream" && payload["action"] == "prepare");
     match scenario {
-        "retirement_restart" => {
+        "retirement_unconfirmed" => {
             assert!(cancelled);
             assert_eq!(
                 router.launches.selected_preflight_state_for_test(),
@@ -574,6 +660,72 @@ fn run_composition(replacement: bool, scenario: &str) {
                     .any(|(service, payload)| service == "stream"
                         && payload["action"] == "release_history_activity")
             );
+            let coordinator = runtime.client("amaterasu.launch");
+            let snapshot = broker_request(
+                &coordinator,
+                "amaterasu.state/1",
+                json!({"action":"snapshot","cursor":null,"limit":128}),
+                "unconfirmed-journal",
+            );
+            memory.tick();
+            let snapshot = take(&coordinator, snapshot).expect("unconfirmed journal");
+            assert!(
+                snapshot["values"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .any(|entry| entry["phase"] == "reservation_pending"),
+                "{snapshot}"
+            );
+        }
+        "retirement_restart" => {
+            assert!(cancelled);
+            assert_eq!(
+                router.launches.selected_preflight_state_for_test(),
+                Some((false, true))
+            );
+            assert_eq!(router.launches.selected_preflight_cleanup_for_test(), None);
+            assert!(
+                backends
+                    .calls
+                    .iter()
+                    .any(|(service, payload)| service == "stream"
+                        && payload["action"] == "release_history_activity")
+            );
+            let coordinator = runtime.client("amaterasu.launch");
+            let snapshot = broker_request(
+                &coordinator,
+                "amaterasu.state/1",
+                json!({"action":"snapshot","cursor":null,"limit":128}),
+                "recovered-journal",
+            );
+            let mut journal = None;
+            for _ in 0..200 {
+                memory.tick();
+                if let Some(value) = take(&coordinator, snapshot) {
+                    journal = Some(value);
+                    break;
+                }
+            }
+            let journal = journal.expect("journal snapshot");
+            let entry = journal["values"]
+                .as_object()
+                .unwrap()
+                .values()
+                .find(|value| value["phase"] == "retired")
+                .expect("retirement tombstone");
+            let retirement = &entry["retirement"];
+            let late = broker_request(
+                &coordinator,
+                "example.library.provider/1",
+                json!({"action":"attest_limiter_target_v1","request":{
+                "version":1,"stage":"reserve","operation_id":retirement["operation_id"],
+                "application_id":retirement["application_id"],"provider_incarnation":retirement["provider_incarnation"],
+                "ticket":null,"policy_identity":retirement["policy_identity"]}}),
+                "recovered-late-reserve",
+            );
+            let late = await_provider(&coordinator, late, &mut generated);
+            assert_ne!(late["ok"], true, "{late}");
         }
         "success"
         | "limiter_success"
@@ -583,7 +735,8 @@ fn run_composition(replacement: bool, scenario: &str) {
         | "resume_stale"
         | "resume_foreign"
         | "resume_failed"
-        | "resume_unpaired" => {
+        | "resume_unpaired"
+        | "retirement_restart_running" => {
             assert_eq!(replies.len(), 1, "hardware requests: {:?}", backends.calls);
             assert_eq!(
                 replies[0].1.status,
@@ -594,6 +747,56 @@ fn run_composition(replacement: bool, scenario: &str) {
             );
             assert!(prepared, "{:?}", backends.calls);
             assert_eq!(backends.session_state, "active");
+            if scenario == "retirement_restart_running" {
+                drop(launch);
+                launch = LoadedModule::start(
+                    &artifact(&artifacts, "amaterasu_launch"),
+                    &runtime.endpoint("amaterasu.launch"),
+                );
+                let epoch = broker_request(
+                    &nvhttp,
+                    "amaterasu.launch/1",
+                    json!({"action":"operation_epoch"}),
+                    "restart-running-epoch",
+                );
+                let epoch = await_launch(
+                    &nvhttp,
+                    epoch,
+                    &mut launch,
+                    &mut generated,
+                    &mut provider,
+                    &mut memory,
+                );
+                assert_eq!(epoch["ok"], true, "{epoch}");
+                let coordinator = runtime.client("amaterasu.launch");
+                let snapshot = broker_request(
+                    &coordinator,
+                    "amaterasu.state/1",
+                    json!({"action":"snapshot","cursor":null,"limit":128}),
+                    "running-recovered-journal",
+                );
+                memory.tick();
+                let snapshot = take(&coordinator, snapshot).expect("running journal snapshot");
+                let entry = snapshot["values"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .find(|entry| entry["phase"] == "retired")
+                    .expect("running retirement tombstone");
+                let retired = &entry["retirement"];
+                let lookup = broker_request(
+                    &coordinator,
+                    "example.library.provider/1",
+                    json!({"action":"lookup","operation_id":retired["operation_id"],"application_id":retired["application_id"],"provider_incarnation":retired["provider_incarnation"]}),
+                    "running-recovered-lookup",
+                );
+                let lookup = await_provider(&coordinator, lookup, &mut generated);
+                assert_eq!(lookup["state"], "stopped", "{lookup}");
+                assert_eq!(
+                    lookup["retirement_proof"]["kind"], "fenced_stopped",
+                    "{lookup}"
+                );
+            }
             if scenario.starts_with("resume_") {
                 router.reply_delivered(1);
                 let (old_ticket, session_target) = router
@@ -722,7 +925,7 @@ fn run_composition(replacement: bool, scenario: &str) {
                     let mut result = None;
                     for _ in 0..500 {
                         pairing.tick();
-                        memory.pump(&state);
+                        memory.tick();
                         if let Some(value) = take(&nvhttp, unpair) {
                             result = Some(value);
                             break;
@@ -751,7 +954,7 @@ fn run_composition(replacement: bool, scenario: &str) {
                 let mut resumed = vec![];
                 for _ in 0..5000 {
                     pairing.tick();
-                    memory.pump(&state);
+                    memory.tick();
                     launch.tick();
                     lifecycle.tick();
                     if let Some(module) = &mut library {
@@ -884,6 +1087,7 @@ fn run_composition(replacement: bool, scenario: &str) {
                     let mut reply = None;
                     for _ in 0..200 {
                         launch.tick();
+                        memory.tick();
                         if let Some(module) = &mut generated {
                             module.tick();
                         }
@@ -903,7 +1107,7 @@ fn run_composition(replacement: bool, scenario: &str) {
                 }
             }
         }
-        "cancelled" | "retirement_cancel" => {
+        "cancelled" | "retirement_cancel" | "retirement_uncertain_write" => {
             assert!(cancelled);
             assert!(
                 backends
@@ -915,6 +1119,34 @@ fn run_composition(replacement: bool, scenario: &str) {
                 backends.calls
             );
             assert!(!prepared);
+            if scenario == "retirement_uncertain_write" {
+                let coordinator = runtime.client("amaterasu.launch");
+                let snapshot = broker_request(
+                    &coordinator,
+                    "amaterasu.state/1",
+                    json!({"action":"snapshot","cursor":null,"limit":128}),
+                    "uncertain-final-journal",
+                );
+                memory.tick();
+                let snapshot = take(&coordinator, snapshot).expect("uncertain final journal");
+                let entry = snapshot["values"]
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .find(|entry| entry["phase"] == "retired")
+                    .expect("uncertain write tombstone");
+                let retired = &entry["retirement"];
+                let late = broker_request(
+                    &coordinator,
+                    "example.library.provider/1",
+                    json!({"action":"attest_limiter_target_v1","request":{
+                    "version":1,"stage":"reserve","operation_id":retired["operation_id"],"application_id":retired["application_id"],
+                    "provider_incarnation":retired["provider_incarnation"],"ticket":null,"policy_identity":retired["policy_identity"]}}),
+                    "uncertain-late-reserve",
+                );
+                let late = await_provider(&coordinator, late, &mut generated);
+                assert_ne!(late["ok"], true, "{late}");
+            }
             if scenario == "retirement_cancel" {
                 assert_eq!(
                     router.launches.selected_preflight_state_for_test(),
@@ -932,6 +1164,7 @@ fn run_composition(replacement: bool, scenario: &str) {
                     &mut launch,
                     &mut generated,
                     &mut provider,
+                    &mut memory,
                 );
                 let epoch = epoch["operation_epoch"].as_str().unwrap();
                 let application = json!({"library":"games","id":"opaque/game"});
@@ -945,8 +1178,14 @@ fn run_composition(replacement: bool, scenario: &str) {
                         json!({"action":"prepare_streaming","operation_id":operation,"application":application,"entry_revision":"entry:opaque","certificate_id":cert_id}),
                         &format!("retire-prepare-{index}"),
                     );
-                    let pre =
-                        await_launch(&nvhttp, pre, &mut launch, &mut generated, &mut provider);
+                    let pre = await_launch(
+                        &nvhttp,
+                        pre,
+                        &mut launch,
+                        &mut generated,
+                        &mut provider,
+                        &mut memory,
+                    );
                     assert_eq!(pre["ok"], true, "{pre}");
                     last_policy = Some(pre["policy_identity"].clone());
                     let accept = broker_request(
@@ -959,6 +1198,7 @@ fn run_composition(replacement: bool, scenario: &str) {
                     // observer asks whether the now-reserved operation is retired.
                     for _ in 0..100 {
                         launch.tick();
+                        memory.tick();
                         if let Some(module) = &mut generated {
                             module.tick();
                         }
@@ -980,6 +1220,7 @@ fn run_composition(replacement: bool, scenario: &str) {
                         &mut launch,
                         &mut generated,
                         &mut provider,
+                        &mut memory,
                     );
                     assert_eq!(result["code"], "retirement_unconfirmed", "{result}");
                     let accepted = take(&nvhttp, accept).expect("delayed admission response");
@@ -998,6 +1239,7 @@ fn run_composition(replacement: bool, scenario: &str) {
                             &mut launch,
                             &mut generated,
                             &mut provider,
+                            &mut memory,
                         );
                         assert_eq!(result["cancelled"], true, "{result}");
                     }
@@ -1013,6 +1255,7 @@ fn run_composition(replacement: bool, scenario: &str) {
                         &mut launch,
                         &mut generated,
                         &mut provider,
+                        &mut memory,
                     );
                     assert_eq!(result["retired"], true, "{result}");
                     let replay = broker_request(
@@ -1021,8 +1264,14 @@ fn run_composition(replacement: bool, scenario: &str) {
                         json!({"action":"prepare_streaming","operation_id":operation,"application":application,"entry_revision":"entry:opaque","certificate_id":cert_id}),
                         &format!("retire-replay-{index}"),
                     );
-                    let rejected =
-                        await_launch(&nvhttp, replay, &mut launch, &mut generated, &mut provider);
+                    let rejected = await_launch(
+                        &nvhttp,
+                        replay,
+                        &mut launch,
+                        &mut generated,
+                        &mut provider,
+                        &mut memory,
+                    );
                     assert_ne!(rejected["ok"], true, "{rejected}");
                 }
                 let coordinator = runtime.client("amaterasu.launch");
@@ -1110,6 +1359,7 @@ fn run_composition(replacement: bool, scenario: &str) {
         | "failed_preparation"
         | "limiter_unsupported"
         | "limiter_no_retirement"
+        | "limiter_unconfigured"
         | "limiter_mismatch"
         | "limiter_stale" => {
             assert_eq!(replies.len(), 1, "hardware requests: {:?}", backends.calls);
@@ -1206,9 +1456,11 @@ fn await_launch(
     launch: &mut LoadedModule,
     generated: &mut Option<LoadedModule>,
     provider: &mut Option<LoadedModule>,
+    memory: &mut LoadedModule,
 ) -> Value {
     for _ in 0..500 {
         launch.tick();
+        memory.tick();
         if let Some(module) = generated {
             module.tick();
         }

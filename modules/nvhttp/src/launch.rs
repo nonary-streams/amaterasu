@@ -881,6 +881,19 @@ impl Controller {
     }
 
     #[cfg(test)]
+    pub(crate) fn selected_preflight_cancel_for_test(&self) -> Option<Value> {
+        let record = self
+            .records
+            .values()
+            .find(|record| record.selected_application.is_some())?;
+        Some(
+            json!({"action":"cancel_streaming","operation_id":record.application_operation,
+            "certificate_id":record.peer.certificate_id,"preflight_token":record.application_preflight_token,
+            "policy_identity":record.policy_identity}),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn selected_limiter_verification_for_test(&self) -> Option<Value> {
         let record = self.records.values().find(|record| {
             record.selected_application.is_some() && record.executable_path.is_some()

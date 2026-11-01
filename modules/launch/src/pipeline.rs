@@ -519,6 +519,14 @@ pub struct Pipeline {
     retirement_observers: BTreeSet<String>,
     provider_routes: BTreeMap<String, ProviderRoute>,
     library_routes: BTreeMap<String, crate::library::Route>,
+    limiter_journal_service: Option<String>,
+    recovery: Option<crate::limiter_journal::Recovery>,
+    recovery_background: bool,
+    journal_sweep: Option<crate::limiter_journal::Sweep>,
+    journal_queue: std::collections::VecDeque<crate::limiter_journal::Entry>,
+    journal_ready: bool,
+    journal_sweep_healthy: bool,
+    next_journal_sweep: Instant,
 }
 impl Pipeline {
     pub fn new(environment: BTreeMap<String, String>) -> Result<Self, &'static str> {
@@ -534,6 +542,14 @@ impl Pipeline {
             retirement_observers: BTreeSet::new(),
             provider_routes: BTreeMap::new(),
             library_routes: BTreeMap::new(),
+            limiter_journal_service: None,
+            recovery: None,
+            recovery_background: false,
+            journal_sweep: None,
+            journal_queue: std::collections::VecDeque::new(),
+            journal_ready: false,
+            journal_sweep_healthy: true,
+            next_journal_sweep: Instant::now(),
         })
     }
     pub fn set_retirement_observers(&mut self, observers: BTreeSet<String>) {
@@ -546,6 +562,11 @@ impl Pipeline {
 
     pub fn set_library_routes(&mut self, routes: BTreeMap<String, crate::library::Route>) {
         self.library_routes = routes;
+    }
+
+    pub fn set_limiter_journal_service(&mut self, service: Option<String>) {
+        self.limiter_journal_service = service;
+        self.next_journal_sweep = Instant::now();
     }
 
     fn verify_retirement(
@@ -598,6 +619,82 @@ impl Pipeline {
             "launch_id":record.launch_id,"operation_id":operation_id})
     }
     pub fn tick(&mut self, mut send: impl FnMut(Command) -> Transport) -> ModuleResult<()> {
+        if let Some(mut recovery) = self.recovery.take() {
+            match recovery.tick(&mut send, &self.library_routes) {
+                Ok(None) => self.recovery = Some(recovery),
+                Ok(Some(ok)) => {
+                    if self.recovery_background && !ok {
+                        self.journal_sweep_healthy = false;
+                    }
+                    if self.recovery_background && self.journal_queue.is_empty() {
+                        self.next_journal_sweep = Instant::now() + Duration::from_secs(5);
+                    }
+                    self.recovery_background = false;
+                }
+                Err(_) => {
+                    if self.recovery_background {
+                        self.journal_sweep_healthy = false;
+                        if self.journal_queue.is_empty() {
+                            self.next_journal_sweep = Instant::now() + Duration::from_secs(5);
+                        }
+                    }
+                    self.recovery_background = false;
+                }
+            }
+            return Ok(());
+        }
+        if self.job.is_none() && self.parked_job.is_none() {
+            if let Some(entry) = self.journal_queue.pop_front() {
+                if !self.records.values.values().any(|record| {
+                    record.owner == entry.owner
+                        && record.operation_id == entry.operation_id
+                        && record.limiter_reservation_pending
+                }) && let Some(service) = self.limiter_journal_service.clone()
+                {
+                    match crate::limiter_journal::Recovery::background(entry, service) {
+                        Ok(recovery) => {
+                            self.recovery = Some(recovery);
+                            self.recovery_background = true;
+                        }
+                        Err(_) => self.journal_sweep_healthy = false,
+                    }
+                }
+                return Ok(());
+            }
+            if let Some(mut sweep) = self.journal_sweep.take() {
+                match sweep.tick(&mut send) {
+                    Ok(crate::limiter_journal::SweepResult::Pending) => {
+                        self.journal_sweep = Some(sweep)
+                    }
+                    Ok(crate::limiter_journal::SweepResult::Complete(entries)) => {
+                        self.journal_queue = entries.into();
+                        self.journal_sweep_healthy = true;
+                        self.journal_ready = self.journal_queue.is_empty();
+                        self.next_journal_sweep = Instant::now() + Duration::from_secs(5);
+                    }
+                    Ok(crate::limiter_journal::SweepResult::Failed) | Err(_) => {
+                        self.journal_ready = false;
+                        self.journal_sweep_healthy = false;
+                        self.next_journal_sweep = Instant::now() + Duration::from_secs(5);
+                    }
+                }
+                return Ok(());
+            }
+            if !self.journal_ready && self.journal_sweep_healthy {
+                self.journal_ready = true;
+            }
+            if Instant::now() >= self.next_journal_sweep
+                && let Some(service) = self.limiter_journal_service.clone()
+            {
+                self.journal_ready = false;
+                self.journal_sweep = crate::limiter_journal::Sweep::new(service).ok();
+                if self.journal_sweep.is_none() {
+                    self.journal_sweep_healthy = false;
+                    self.next_journal_sweep = Instant::now() + Duration::from_secs(5);
+                }
+                return Ok(());
+            }
+        }
         if self.job.is_none() {
             self.job = self.parked_job.take();
         }
@@ -1027,6 +1124,7 @@ impl Pipeline {
                         record.streaming_certificate_id = Some(certificate_id);
                         record.streaming_policy_service = route.streaming_policy_service.clone();
                         record.streaming_policy_source = route.streaming_policy_source.clone();
+                        record.limiter_journal_service = self.limiter_journal_service.clone();
                         let mut workflow = Workflow::launch(id, request, remaining_ms);
                         workflow.step = Step::Library;
                         self.job = Some(workflow);
@@ -1058,7 +1156,24 @@ impl Pipeline {
                     return complete(send, request, error("permission_denied"));
                 }
                 let Ok(record) = self.records.owned_operation(caller, &operation_id) else {
-                    return complete(send, request, error("preflight_not_found"));
+                    let Some(service) = self.limiter_journal_service.clone() else {
+                        return complete(send, request, error("preflight_not_found"));
+                    };
+                    let recovery = match crate::limiter_journal::Recovery::new(
+                        request,
+                        caller.to_owned(),
+                        operation_id,
+                        certificate_id,
+                        preflight_token,
+                        policy_identity,
+                        service,
+                    ) {
+                        Ok(recovery) => recovery,
+                        Err(code) => return complete(send, request, error(code)),
+                    };
+                    self.recovery = Some(recovery);
+                    self.recovery_background = false;
+                    return Ok(());
                 };
                 if record.streaming_certificate_id.as_deref() != Some(certificate_id.as_str())
                     || record.preflight_token.as_deref() != Some(preflight_token.as_str())
@@ -2077,8 +2192,12 @@ impl Pipeline {
         if matches!(job.step, Step::StartPlaynite | Step::StartProvider) {
             record.provider_launch_requested = true;
         }
-        if job.step == Step::ReserveLimiterTarget {
-            // A delivered request may reserve even if its acknowledgement is lost.
+        if matches!(
+            job.step,
+            Step::JournalReserveWrite | Step::ReserveLimiterTarget
+        ) {
+            // A journal write or reservation may commit after its reply is lost.
+            // Fence the executor and commit a CAS tombstone in either case.
             record.limiter_reservation_pending = true;
         }
         self.sequence = self
@@ -2245,7 +2364,42 @@ impl Pipeline {
                         send,
                     );
                 }
-                job.step = Step::ReserveLimiterTarget;
+                if record.limiter_journal_service.is_none() || !self.journal_ready {
+                    return self.dependency_failed(job, "limiter_journal_unavailable", send);
+                }
+                job.step = Step::JournalReserveRead;
+            }
+            Step::JournalReserveRead | Step::JournalExecutionRead => {
+                use crate::limiter_journal::Phase;
+                let (revision, phase) =
+                    match crate::limiter_journal::read_for_record(record, &payload) {
+                        Ok(result) => result,
+                        Err(code) => return self.dependency_failed(job, code, send),
+                    };
+                record.limiter_journal_revision = Some(revision);
+                job.step = match (job.step, phase) {
+                    (Step::JournalReserveRead, None) => Step::JournalReserveWrite,
+                    (Step::JournalReserveRead, Some(Phase::ReservationPending)) => {
+                        Step::ReserveLimiterTarget
+                    }
+                    (Step::JournalExecutionRead, Some(Phase::ReservationPending)) => {
+                        Step::JournalExecutionWrite
+                    }
+                    (Step::JournalExecutionRead, Some(Phase::ExecutionPending)) => {
+                        Step::StartProvider
+                    }
+                    _ => return self.dependency_failed(job, "journal_identity_conflict", send),
+                };
+            }
+            Step::JournalReserveWrite | Step::JournalExecutionWrite => {
+                if let Err(code) = crate::limiter_journal::validate_write(record, &payload) {
+                    return self.dependency_failed(job, code, send);
+                }
+                job.step = if job.step == Step::JournalReserveWrite {
+                    Step::ReserveLimiterTarget
+                } else {
+                    Step::StartProvider
+                };
             }
             Step::VerifyActiveLimiterTarget => {
                 use amaterasu_module_sdk::application_library::limiter_target::{
@@ -2754,7 +2908,11 @@ impl Pipeline {
                     return self.dependency_failed(job, "provider_incarnation_changed", send);
                 }
                 record.generic_provider_incarnation = Some(incarnation);
-                job.step = Step::StartProvider;
+                job.step = if record.limiter_reservation_pending {
+                    Step::JournalExecutionRead
+                } else {
+                    Step::StartProvider
+                };
             }
             Step::StartProvider | Step::MonitorProvider => {
                 let evidence = match responses::generic_provider(&payload, record) {
@@ -2931,8 +3089,44 @@ impl Pipeline {
                 if payload["ok"] != true || proof.validate_for(&expected).is_err() {
                     return self.cleanup_failed(job, "limiter_retirement_unconfirmed", send);
                 }
-                record.limiter_reservation_pending = false;
+                record.limiter_retirement_confirmed = true;
                 record.limiter_target_verified = false;
+                job.step = first_cleanup_step(record);
+            }
+            Step::JournalRetireRead => {
+                use crate::limiter_journal::Phase;
+                let (revision, phase) =
+                    match crate::limiter_journal::read_for_record(record, &payload) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return self.cleanup_failed(
+                                job,
+                                "journal_retirement_unconfirmed",
+                                send,
+                            );
+                        }
+                    };
+                record.limiter_journal_revision = Some(revision);
+                match phase {
+                    Some(Phase::ReservationPending | Phase::ExecutionPending) => {
+                        job.step = Step::JournalRetireWrite
+                    }
+                    Some(Phase::Retired) => {
+                        record.limiter_reservation_pending = false;
+                        job.step = first_cleanup_step(record);
+                    }
+                    None => job.step = Step::JournalRetireWrite,
+                }
+            }
+            Step::JournalRetireWrite => {
+                if payload["error"]["code"] == "revision_conflict" {
+                    job.step = Step::JournalRetireRead;
+                    return self.retain(job);
+                }
+                if crate::limiter_journal::validate_write(record, &payload).is_err() {
+                    return self.cleanup_failed(job, "journal_retirement_unconfirmed", send);
+                }
+                record.limiter_reservation_pending = false;
                 job.step = first_cleanup_step(record);
             }
             Step::FindSession => {
