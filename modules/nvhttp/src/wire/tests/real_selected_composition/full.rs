@@ -31,6 +31,26 @@ pub(super) struct Context<'a> {
     pub cert: &'a [u8],
 }
 
+fn load_stream(runtime: &Runtime) -> LoadedModule {
+    if std::env::var_os("AMATERASU_COMPOSITION_NORMAL_ABI").is_some() {
+        let artifacts =
+            PathBuf::from(std::env::var_os("AMATERASU_COMPOSITION_ARTIFACT_DIR").unwrap());
+        LoadedModule::start(
+            &artifact(&artifacts, "amaterasu_stream_session"),
+            &runtime.endpoint("stream"),
+        )
+    } else {
+        let qualification = PathBuf::from(
+            std::env::var_os("AMATERASU_FEEDBACK_QUALIFICATION_ARTIFACT_DIR").unwrap(),
+        );
+        LoadedModule::start_entry(
+            &artifact(&qualification, "amaterasu_stream_session"),
+            &runtime.endpoint("stream"),
+            b"amaterasu_qualification_module_v1",
+        )
+    }
+}
+
 pub(super) fn run(context: Context<'_>) {
     let Context {
         runtime,
@@ -66,6 +86,12 @@ pub(super) fn run(context: Context<'_>) {
     provision_authority(pairing, memory, console, &owner, cert_id);
     let mut module =
         crate::NvhttpModule::start(runtime.client("amaterasu.nvhttp")).expect("real NVHTTP module");
+    if std::env::var_os("AMATERASU_COMPOSITION_NORMAL_ABI").is_some() {
+        assert!(
+            module.startup_settings.live_feedback_authorized,
+            "broker did not inject the validated profile"
+        );
+    }
     for _ in 0..500 {
         module.tick().unwrap();
         pairing.tick();
@@ -79,13 +105,7 @@ pub(super) fn run(context: Context<'_>) {
         module.certificate.is_some(),
         "NVHTTP TLS identity was not loaded"
     );
-    let qualification =
-        PathBuf::from(std::env::var_os("AMATERASU_FEEDBACK_QUALIFICATION_ARTIFACT_DIR").unwrap());
-    *selected_stream = Some(LoadedModule::start_entry(
-        &artifact(&qualification, "amaterasu_stream_session"),
-        &runtime.endpoint("stream"),
-        b"amaterasu_qualification_module_v1",
-    ));
+    *selected_stream = Some(load_stream(runtime));
     let start = std::time::Instant::now();
     while module.source_join_startup.is_some()
         && start.elapsed() < std::time::Duration::from_secs(10)
@@ -430,11 +450,7 @@ pub(super) fn run(context: Context<'_>) {
         std::thread::sleep(std::time::Duration::from_millis(2));
     }
     drop(selected_stream.take());
-    *selected_stream = Some(LoadedModule::start_entry(
-        &artifact(&qualification, "amaterasu_stream_session"),
-        &runtime.endpoint("stream"),
-        b"amaterasu_qualification_module_v1",
-    ));
+    *selected_stream = Some(load_stream(runtime));
     let mut restart_status = Value::Null;
     let mut pending = None;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

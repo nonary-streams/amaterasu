@@ -1,5 +1,6 @@
 use super::*;
 mod display_plugin_smoke;
+mod identity_plugin_smoke;
 mod library_provider_smoke;
 mod media_profile_smoke;
 mod video_framing_smoke;

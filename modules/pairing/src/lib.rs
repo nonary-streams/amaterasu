@@ -40,7 +40,20 @@ impl ManagedModule for PairingModule {
         let factory = identity::Factory::new(shared.clone(), settings.transport_principals.clone());
         // SAFETY: boxed factory context is stable; signed dependency order stops
         // native consumers before pairing destruction. Callbacks share immutable data.
-        unsafe { runtime.register_native(amaterasu_identity::SERVICE, &factory.api) }?;
+        if settings.live_feedback_authorized {
+            // SAFETY: the factory implements the exact shared identity contract
+            // and outlives every native binding.
+            unsafe {
+                amaterasu_module_sdk::identity::register(
+                    &runtime,
+                    amaterasu_identity::SERVICE,
+                    &factory.api,
+                )
+            }?;
+        } else {
+            // SAFETY: the legacy factory lifetime is unchanged.
+            unsafe { runtime.register_native(amaterasu_identity::SERVICE, &factory.api) }?;
+        }
         let pipeline =
             Pipeline::with_host_configuration(settings, shared, host_configuration_enabled);
         if !pipeline.authority_available() {

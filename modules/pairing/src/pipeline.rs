@@ -97,6 +97,7 @@ pub struct Pipeline {
     engine: Engine,
     effect_gate: Option<EffectGate>,
     effect_authority: Option<EffectAuthoritySettings>,
+    live_feedback_authorized: bool,
     configuration_hold: Option<ConfigurationHold>,
     configuration_reconciled: bool,
     configuration_status_request: Option<u64>,
@@ -173,6 +174,7 @@ impl Pipeline {
             HostConfigurationState::Disabled
         };
         let effect_authority = settings.effect_authority.clone();
+        let live_feedback_authorized = settings.live_feedback_authorized;
         let configuration_reconciled = effect_authority
             .as_ref()
             .is_none_or(|policy| policy.configuration_owner.is_none());
@@ -180,6 +182,7 @@ impl Pipeline {
             engine: Engine::new(settings),
             effect_gate: EffectGate::new().ok(),
             effect_authority,
+            live_feedback_authorized,
             configuration_hold: None,
             configuration_reconciled,
             configuration_status_request: None,
@@ -1327,7 +1330,7 @@ impl Pipeline {
         gate.require_epoch(&epoch)?;
         // Keep the production endpoint closed until the protocol authenticates
         // the lifecycle join and the end-to-end retirement barrier is proven.
-        if !source_join_available() {
+        if !source_join_available(self.live_feedback_authorized) {
             return Err("source_attestation_unavailable");
         }
         let certificate = crate::crypto::parse_certificate(&certificate_pem, Some(now))
@@ -2039,8 +2042,8 @@ fn authorize_feedback_scope(
     Ok(())
 }
 
-fn source_join_available() -> bool {
-    cfg!(any(test, feature = "feedback-qualification"))
+fn source_join_available(authorized: bool) -> bool {
+    cfg!(any(test, feature = "feedback-qualification")) || authorized
 }
 
 fn is_client_configuration_update(operation: &Operation) -> bool {

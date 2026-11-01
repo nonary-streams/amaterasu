@@ -280,8 +280,8 @@ fn source_evidence(
 
 // A replacement pairing provider must not accidentally open this path before
 // stream-owner negotiation and the live retirement barrier are integrated.
-fn source_join_available() -> bool {
-    cfg!(test)
+fn source_join_available(authorized: bool) -> bool {
+    cfg!(test) || authorized
 }
 
 struct NvhttpModule {
@@ -323,7 +323,8 @@ impl ManagedModule for NvhttpModule {
             .then(|| amaterasu_module_sdk::network::Network::from_settings(&runtime, &payload))
             .transpose()?;
         let (server, router, identity) = if settings.enabled {
-            let identity = tls::Identity::bind(&runtime)?;
+            let identity =
+                tls::Identity::bind_with_contract(&runtime, settings.live_feedback_authorized)?;
             let server = server::Server::bind_with_network(
                 network
                     .as_ref()
@@ -375,7 +376,7 @@ impl ManagedModule for NvhttpModule {
             "nvhttp",
             "control and pairing module initialized",
         );
-        let source_join_startup = if source_join_available() {
+        let source_join_startup = if source_join_available(settings.live_feedback_authorized) {
             settings
                 .effect_source_join
                 .as_ref()
@@ -839,7 +840,7 @@ impl NvhttpModule {
                                 json!({"ok":false,"code":"permission_denied"}),
                             );
                         }
-                        if !source_join_available() {
+                        if !source_join_available(self.startup_settings.live_feedback_authorized) {
                             return complete_control(
                                 &self.runtime,
                                 id,

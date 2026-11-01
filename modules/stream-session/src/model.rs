@@ -21,8 +21,9 @@ pub struct Settings {
     pub observe_feedback_sources: bool,
     pub feedback_retirement_input_principal: Option<String>,
     pub feedback_source_protocol_service: Option<String>,
-    #[cfg(any(test, feature = "feedback-qualification"))]
     pub feedback_owner_restart_recovery: bool,
+    /// Injected only for a validated live-feedback composition.
+    pub live_feedback_authorized: bool,
     pub input_lease_ttl_ms: u64,
 }
 impl Default for Settings {
@@ -40,8 +41,8 @@ impl Default for Settings {
             observe_feedback_sources: false,
             feedback_retirement_input_principal: None,
             feedback_source_protocol_service: None,
-            #[cfg(any(test, feature = "feedback-qualification"))]
             feedback_owner_restart_recovery: false,
+            live_feedback_authorized: false,
             input_lease_ttl_ms: 30000,
         }
     }
@@ -49,7 +50,6 @@ impl Default for Settings {
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
         self.providers.validate()?;
-        #[cfg(any(test, feature = "feedback-qualification"))]
         if self.feedback_owner_restart_recovery
             && (self.feedback_source_protocol_service.is_none()
                 || self.feedback_retirement_input_principal.is_none())

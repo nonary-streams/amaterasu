@@ -147,10 +147,9 @@ struct DeferredRequest {
 impl Pipeline {
     pub fn new(settings: Settings) -> Result<Self, &'static str> {
         settings.validate()?;
-        #[cfg(any(test, feature = "feedback-qualification"))]
-        let restart_recovery = settings.feedback_owner_restart_recovery;
-        #[cfg(not(any(test, feature = "feedback-qualification")))]
-        let restart_recovery = false;
+        let restart_recovery = settings.feedback_owner_restart_recovery
+            && (cfg!(any(test, feature = "feedback-qualification"))
+                || settings.live_feedback_authorized);
         let feedback_retirement_inbox = feedback_retirement::Inbox::new(
             restart_recovery,
             settings.providers.control_transport.clone(),
@@ -390,7 +389,8 @@ impl Pipeline {
         self.feedback_retirement_inbox.prune_unstarted(send);
         self.feedback_retirement_inbox.advance(
             &mut self.records,
-            if cfg!(any(test, feature = "feedback-qualification"))
+            if (cfg!(any(test, feature = "feedback-qualification"))
+                || self.settings.live_feedback_authorized)
                 && self.settings.observe_feedback_sources
                 && self.settings.feedback_retirement_input_principal.is_some()
             {
@@ -705,7 +705,8 @@ impl Pipeline {
 
     fn schedule_control(&mut self, now: u64) -> bool {
         let observe_sources = self.settings.observe_feedback_sources;
-        let scoped_route = cfg!(any(test, feature = "feedback-qualification"))
+        let scoped_route = (cfg!(any(test, feature = "feedback-qualification"))
+            || self.settings.live_feedback_authorized)
             && observe_sources
             && self.settings.feedback_retirement_input_principal.is_some();
         let source_due = |record: &Record| {
@@ -879,7 +880,8 @@ impl Pipeline {
             control::{self, Message, Profile},
             crypto::Direction,
         };
-        let scoped_route = cfg!(any(test, feature = "feedback-qualification"))
+        let scoped_route = (cfg!(any(test, feature = "feedback-qualification"))
+            || self.settings.live_feedback_authorized)
             && self.settings.observe_feedback_sources
             && self.settings.feedback_retirement_input_principal.is_some();
         for record in self.records.values_mut() {

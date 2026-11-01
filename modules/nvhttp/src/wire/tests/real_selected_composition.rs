@@ -408,7 +408,12 @@ fn run_composition(replacement: bool, scenario: &str) {
     register(&display, "amaterasu.display/1");
     let application = runtime.client("application");
     register(&application, "amaterasu.application/1");
-    let mut pairing = if full {
+    let mut pairing = if full && std::env::var_os("AMATERASU_COMPOSITION_NORMAL_ABI").is_some() {
+        LoadedModule::start(
+            &artifact(&artifacts, "amaterasu_pairing"),
+            &runtime.endpoint("amaterasu.pairing"),
+        )
+    } else if full {
         let qualification = PathBuf::from(
             std::env::var_os("AMATERASU_FEEDBACK_QUALIFICATION_ARTIFACT_DIR")
                 .expect("set qualification artifact directory"),
@@ -2047,6 +2052,29 @@ impl Hardware {
 }
 
 fn configure_full(config: &mut Value, streaming: &crate::launch::StreamingConfig) {
+    if std::env::var_os("AMATERASU_COMPOSITION_NORMAL_ABI").is_some() {
+        config["live_feedback"] = json!({"protocol_owner":"amaterasu.nvhttp","pairing_owner":"amaterasu.pairing","stream_owner":"stream","input_owner":"input","lifecycle_owner":"amaterasu.session-lifecycle","control_owner":"control"});
+        for (service, owner) in [
+            ("amaterasu.nvhttp/1", "amaterasu.nvhttp"),
+            ("amaterasu.pairing-effects/1", "amaterasu.pairing"),
+            ("amaterasu.pairing/1", "amaterasu.pairing"),
+            ("amaterasu.state/1", "amaterasu.state"),
+            ("amaterasu.stream-session/1", "stream"),
+            ("amaterasu.input/1", "input"),
+            (
+                "amaterasu.session-lifecycle/1",
+                "amaterasu.session-lifecycle",
+            ),
+            ("amaterasu.control-transport/1", "control"),
+        ] {
+            config["service_selections"]["broker"][service] =
+                json!({"provider":owner,"contract":service});
+        }
+        config["service_selections"]["native"]["amaterasu.identity/1"] =
+            json!({"provider":"amaterasu.pairing","contract":"amaterasu.identity.native/1"});
+        config["service_selections"]["native"]["amaterasu.control-transport/1"] =
+            json!({"provider":"control","contract":"amaterasu.control-transport.native/1"});
+    }
     let nvhttp = &mut config["principals"]["amaterasu.nvhttp"];
     nvhttp["provide"] = json!(["amaterasu.nvhttp/1"]);
     nvhttp["call"].as_array_mut().unwrap().extend([

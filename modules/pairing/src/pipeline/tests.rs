@@ -45,6 +45,7 @@ fn settings() -> Settings {
         administrator_principals: BTreeSet::from(["console".into()]),
         transport_principals: BTreeSet::from(["nvhttp".into()]),
         effect_authority: None,
+        live_feedback_authorized: false,
     }
 }
 

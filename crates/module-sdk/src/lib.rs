@@ -11,6 +11,7 @@ pub mod effect_source_retirement;
 pub mod encode;
 pub mod events;
 pub mod exports;
+pub mod identity;
 pub mod input;
 pub mod media;
 pub mod media_profile;

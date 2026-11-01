@@ -14,6 +14,8 @@ pub struct Settings {
     pub administrator_principals: BTreeSet<String>,
     pub transport_principals: BTreeSet<String>,
     pub effect_authority: Option<EffectAuthoritySettings>,
+    /// Injected by the runtime after validating the selected feedback profile.
+    pub live_feedback_authorized: bool,
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]

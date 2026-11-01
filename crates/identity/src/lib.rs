@@ -6,6 +6,8 @@ use amaterasu_abi::{BorrowedBytes, NativeInterface, ReplySink, Status};
 use std::ffi::c_void;
 
 pub const SERVICE: &str = "amaterasu.identity/1";
+/// Identity of the complete native interface family, independent of a service alias.
+pub const CONTRACT: &str = "amaterasu.identity.native/1";
 pub const INTERFACE_MAJOR: u32 = 1;
 pub const INTERFACE_MINOR: u32 = 0;
 /// Minor version required for the appended permission query.

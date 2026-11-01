@@ -33,6 +33,8 @@ pub struct Settings {
     pub session_lifecycle_required: bool,
     /// Optional trusted composition for the feedback-source join.
     pub effect_source_join: Option<EffectSourceJoinSettings>,
+    /// Injected only for a validated live-feedback composition.
+    pub live_feedback_authorized: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -63,6 +65,7 @@ impl Default for Settings {
             streaming: None,
             session_lifecycle_required: false,
             effect_source_join: None,
+            live_feedback_authorized: false,
         }
     }
 }

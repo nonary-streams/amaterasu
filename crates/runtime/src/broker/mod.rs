@@ -4,6 +4,7 @@ mod effect_fence;
 mod errors;
 mod events;
 mod hooks;
+mod live_feedback;
 mod requests;
 mod source_slots;
 
@@ -44,6 +45,7 @@ const MAX_LOG_PATH_BYTES: usize = 4096;
 impl Broker {
     pub fn new(configuration: RuntimeConfig) -> Result<Self, String> {
         configuration::validate(&configuration)?;
+        live_feedback::validate(&configuration)?;
 
         let mut requests = RequestRouter::default();
         if configuration.host_lifecycle_control {
@@ -155,14 +157,23 @@ impl Broker {
                 minimum_level,
                 log_path,
             } => self.update_logging_policy(caller, revision, minimum_level, log_path),
-            Command::GetSettings {} => Response::Result {
-                payload: self
+            Command::GetSettings {} => {
+                let mut payload = self
                     .configuration
                     .settings
                     .get(caller)
                     .cloned()
-                    .unwrap_or_else(|| serde_json::json!({})),
-            },
+                    .unwrap_or_else(|| serde_json::json!({}));
+                if self
+                    .configuration
+                    .live_feedback
+                    .as_ref()
+                    .is_some_and(|profile| live_feedback::authorized(profile, caller))
+                {
+                    live_feedback::inject(&mut payload);
+                }
+                Response::Result { payload }
+            }
             Command::GetHostContext {} => {
                 // Audio needs the host-owned state root on Linux to reconcile
                 // its own Pulse cleanup journal after a worker restart.

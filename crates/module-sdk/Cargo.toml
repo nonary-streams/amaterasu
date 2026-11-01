@@ -11,6 +11,7 @@ network-http = ["dep:ureq"]
 [dependencies]
 base64 = "0.22"
 amaterasu-abi.workspace = true
+amaterasu-identity.workspace = true
 amaterasu-network-api.workspace = true
 amaterasu-network-sockets = {workspace = true, optional = true}
 amaterasu-data-plane.workspace = true

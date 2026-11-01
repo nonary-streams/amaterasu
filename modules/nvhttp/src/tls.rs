@@ -137,17 +137,32 @@ pub struct Identity {
     binding: Option<NativeBinding>,
 }
 impl Identity {
+    #[cfg(test)]
     pub fn bind(runtime: &RuntimeClient) -> Result<Self, String> {
+        Self::bind_with_contract(runtime, false)
+    }
+
+    pub fn bind_with_contract(
+        runtime: &RuntimeClient,
+        selected_contract: bool,
+    ) -> Result<Self, String> {
         // SAFETY: signed dependency order keeps the identity provider loaded;
         // this owner gates all cloned signer references before releasing binding.
-        let binding = unsafe {
-            runtime.bind_native(
-                amaterasu_identity::SERVICE,
-                amaterasu_identity::INTERFACE_MAJOR,
-                INTERFACE_MINOR_PERMISSIONS,
-                size_of::<IdentityApiV1_1>() as u32,
-            )
-        }?;
+        let binding = if selected_contract {
+            // SAFETY: the selected contract has the documented identity layout
+            // and the binding is retired before the provider.
+            unsafe { amaterasu_module_sdk::identity::bind(runtime, amaterasu_identity::SERVICE) }?
+        } else {
+            // SAFETY: legacy hosts retain the existing version and size checks.
+            unsafe {
+                runtime.bind_native(
+                    amaterasu_identity::SERVICE,
+                    amaterasu_identity::INTERFACE_MAJOR,
+                    INTERFACE_MINOR_PERMISSIONS,
+                    size_of::<IdentityApiV1_1>() as u32,
+                )
+            }?
+        };
         let bridge = {
             // SAFETY: requested product interface/version/size match IdentityApi.
             let api = unsafe { binding.table::<IdentityApiV1_1>() }?;

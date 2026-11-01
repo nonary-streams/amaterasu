@@ -509,11 +509,6 @@ impl Inbox {
         send: &mut Send<'_>,
     ) {
         if self.restart_required {
-            // The restart consumer remains qualification-only until reviewed
-            // with the real selected providers and full authenticated session.
-            if !cfg!(any(test, feature = "feedback-qualification")) {
-                return;
-            }
             if self
                 .restart
                 .as_mut()

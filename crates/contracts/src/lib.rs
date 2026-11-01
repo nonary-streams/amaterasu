@@ -82,6 +82,9 @@ pub struct RuntimeConfig {
     /// Nonempty selections require a runtime that understands this field.
     #[serde(default, skip_serializing_if = "ServiceSelections::is_empty")]
     pub service_selections: ServiceSelections,
+    /// Explicit trusted composition for authenticated live feedback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_feedback: Option<LiveFeedbackProfile>,
     /// Optional protected API routes; absent preserves legacy behavior.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effect_fence: Option<effect_fence::EffectFencePolicy>,
@@ -104,6 +107,21 @@ pub struct RuntimeConfig {
     /// the host sets it after verification when creating its private control endpoint.
     #[serde(default)]
     pub host_lifecycle_control: bool,
+}
+
+/// Principals selected for one coherent live-feedback pipeline. The broker
+/// validates the associated grants, selected routes and retirement settings.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveFeedbackProfile {
+    pub protocol_owner: String,
+    pub pairing_owner: String,
+    pub stream_owner: String,
+    pub input_owner: String,
+    pub lifecycle_owner: String,
+    pub control_owner: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_configuration_owner: Option<String>,
 }
 
 /// A missing key retains legacy behavior; a null value disables registration.

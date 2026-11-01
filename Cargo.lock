@@ -608,6 +608,7 @@ dependencies = [
  "amaterasu-contracts",
  "amaterasu-data-plane",
  "amaterasu-extension-api",
+ "amaterasu-identity",
  "amaterasu-media",
  "amaterasu-network-api",
  "amaterasu-network-sockets",
