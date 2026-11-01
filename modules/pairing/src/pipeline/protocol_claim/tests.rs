@@ -30,6 +30,9 @@ fn broker() -> Broker {
     broker_with_state_instance('b')
 }
 fn broker_with_state_instance(state_instance: char) -> Broker {
+    broker_with_recovery(state_instance, true)
+}
+fn broker_with_recovery(state_instance: char, recover: bool) -> Broker {
     let mut config = RuntimeConfig {
         host_lifecycle_control: true,
         ..Default::default()
@@ -187,6 +190,9 @@ fn broker_with_state_instance(state_instance: char) -> Broker {
         ),
         Response::Ok
     ));
+    if !recover {
+        return broker;
+    }
     // Test fixture only: production participants must independently retire real workers.
     let Response::Result { payload } = broker.dispatch(
         "pairing",
@@ -1353,6 +1359,274 @@ fn run_real_broker_fence(explicit_source: bool) {
         broker.dispatch("state", Command::Poll {}),
         Response::Pending
     ));
+    drop(store);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn startup_enumeration_fences_orphan_broker_source_without_inferring_empty_state() {
+    run_orphan_recovery(false);
+}
+
+#[test]
+fn selected_owner_can_fence_broker_source_before_startup_scan_finishes() {
+    run_orphan_recovery(true);
+}
+
+fn run_orphan_recovery(explicit_fence: bool) {
+    use amaterasu_module_sdk::broker_effect_fence::{GuardedEffect, SelectedEffectMethod};
+    let path = directory();
+    let store = TestStateStore::open(path.clone()).unwrap();
+    let mut broker = broker();
+    let active_scope = scope();
+    let slot = active_scope.source.slot().unwrap();
+    let Response::Result { payload } = broker.dispatch(
+        "pairing",
+        Command::EffectFence {
+            command: Box::new(EffectFenceCommand::SlotStatus { slot }),
+        },
+    ) else {
+        panic!("slot")
+    };
+    let lease: SourceSlotLease = serde_json::from_value(payload["lease"].clone()).unwrap();
+    assert!(matches!(
+        broker.dispatch(
+            "pairing",
+            Command::EffectFence {
+                command: Box::new(EffectFenceCommand::OpenSlot {
+                    lease: lease.clone(),
+                    scope: active_scope.clone(),
+                    retired_through: 0
+                })
+            }
+        ),
+        Response::Ok
+    ));
+    let Response::Result { payload } = broker.dispatch(
+        "pairing",
+        Command::EffectFence {
+            command: Box::new(EffectFenceCommand::SelectedMethod {
+                method: ProtectedMethod {
+                    service: "example.effects/1".into(),
+                    method: "apply".into(),
+                    interface_major: 1,
+                },
+            }),
+        },
+    ) else {
+        panic!("selected action")
+    };
+    let selected: SelectedEffectMethod = serde_json::from_value(payload).unwrap();
+    let effect = GuardedEffect {
+        scope: active_scope.clone(),
+        sequence: 1,
+        capability: "example.control/1".into(),
+        service: "example.effects/1".into(),
+        method: "apply".into(),
+        interface_major: 1,
+        interface_minor: 0,
+        schema_revision: 1,
+        payload_sha256: "a".repeat(64),
+        payload: json!({}),
+        timeout_ms: 5_000,
+        operation_id: "orphan.effect".into(),
+        parent: None,
+    };
+    assert!(matches!(
+        broker.dispatch(
+            "pairing",
+            Command::EffectFence {
+                command: Box::new(EffectFenceCommand::SlotCommand {
+                    lease: lease.clone(),
+                    command: Box::new(EffectFenceCommand::ArmSelected {
+                        effect: effect.clone(),
+                        expected: Box::new(selected)
+                    })
+                })
+            }
+        ),
+        Response::Ok
+    ));
+    let Response::Accepted { id } = broker.dispatch(
+        "issuer",
+        Command::EffectFence {
+            command: Box::new(EffectFenceCommand::SlotCommand {
+                lease: lease.clone(),
+                command: Box::new(EffectFenceCommand::Dispatch {
+                    effect: effect.clone(),
+                }),
+            }),
+        },
+    ) else {
+        panic!("effect")
+    };
+    assert!(
+        matches!(broker.dispatch("provider", Command::Poll {}), Response::Request { id:delivered, .. } if delivered == id)
+    );
+    let (mut pairing, _, _, _, _) = super::super::tests::authorized_protocol_for_test();
+    let method = json!({"service":"example.effects/1","method":"apply","interface_major":1,"interface_minor":0,"schema_revision":1});
+    let cleanup = json!({"service":"example.effects/1","method":"cleanup","interface_major":1,"interface_minor":0,"schema_revision":1});
+    let schema = |method: &Value| {
+        let mut value = method.clone();
+        value.as_object_mut().unwrap().remove("schema_revision");
+        value["request"] = json!({"required":{},"optional":{},"allow_extra":false});
+        value["response"] = json!({"required":{},"optional":{},"allow_extra":false});
+        value["privilege"] = json!("user");
+        value
+    };
+    pairing.effect_authority.as_mut().unwrap().protocol_policies=serde_json::from_value(json!([{"capability":"example.control/1","provider":"provider","message_type":21818,"method":method,"cleanup":cleanup,"method_schema":schema(&method),"cleanup_schema":schema(&cleanup),"max_payload_bytes":64,"required_permission":"view"}])).unwrap();
+    pairing.protocol_state_binding = Some(binding());
+    pairing.protocol_claim_recovery_required = true;
+    if explicit_fence {
+        let mut request = json!({"action":"fence_protocol_source","version":1,"epoch":active_scope.authority_epoch,"issuer_epoch":active_scope.issuer_epoch,"source":active_scope.source});
+        request["issuer_epoch"] = json!("wrong-issuer");
+        let Response::Accepted { id: wrong } = broker.dispatch(
+            "issuer",
+            Command::Request {
+                service: "amaterasu.pairing-effects/1".into(),
+                payload: request.clone(),
+                timeout_ms: 30_000,
+                operation_id: "restart.fence.wrong".into(),
+                parent: None,
+            },
+        ) else {
+            panic!("request")
+        };
+        pairing
+            .tick_at(super::super::tests::now(), |command| {
+                Ok(broker.dispatch("pairing", command))
+            })
+            .unwrap();
+        assert!(
+            matches!(broker.dispatch("issuer", Command::TakeResult { request:wrong }), Response::Result { payload } if payload["code"] == "source_denied")
+        );
+        assert!(
+            matches!(broker.dispatch("pairing", Command::EffectFence { command:Box::new(EffectFenceCommand::SlotCommand { lease:lease.clone(), command:Box::new(EffectFenceCommand::Lookup { effect:effect.clone() }) }) }), Response::Result { payload } if payload["status"] == "admitted")
+        );
+        request["issuer_epoch"] = json!(active_scope.issuer_epoch);
+        let Response::Accepted { id: fence } = broker.dispatch(
+            "issuer",
+            Command::Request {
+                service: "amaterasu.pairing-effects/1".into(),
+                payload: request,
+                timeout_ms: 30_000,
+                operation_id: "restart.fence".into(),
+                parent: None,
+            },
+        ) else {
+            panic!("request")
+        };
+        pairing
+            .tick_at(super::super::tests::now(), |command| {
+                Ok(broker.dispatch("pairing", command))
+            })
+            .unwrap();
+        assert!(
+            matches!(broker.dispatch("issuer", Command::TakeResult { request:fence }), Response::Result { payload } if payload["state"] == "fenced")
+        );
+    }
+    for _ in 0..300 {
+        pairing
+            .tick_at(super::super::tests::now(), |command| {
+                Ok(broker.dispatch("pairing", command))
+            })
+            .unwrap();
+        if let Some(state) = service_one(&mut broker, &store) {
+            finish_state(&mut broker, state);
+        }
+        if pairing.protocol_recovery_inventory.is_some() {
+            break;
+        }
+    }
+    let inventory = pairing
+        .protocol_recovery_inventory
+        .as_ref()
+        .expect("startup scan did not finish");
+    assert!(inventory.broker_ready);
+    assert!(!inventory.broker_frozen);
+    assert_eq!(
+        inventory.broker_sources,
+        vec![(lease.clone(), active_scope)]
+    );
+    assert!(inventory.state.active.is_empty());
+    assert!(inventory.state.pending_close.is_empty());
+    assert!(pairing.protocol_claim_recovery_required);
+    assert!(
+        matches!(broker.dispatch("pairing", Command::EffectFence { command:Box::new(EffectFenceCommand::SlotCommand { lease, command:Box::new(EffectFenceCommand::Lookup { effect }) }) }), Response::Result { payload } if payload["status"] == "fenced")
+    );
+    drop(store);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn fresh_broker_inventory_retains_durable_claim_without_assuming_old_workers_retired() {
+    let path = directory();
+    let store = TestStateStore::open(path.clone()).unwrap();
+    let mut old_broker = broker();
+    let parent = open_parent(&mut old_broker);
+    let mut claim = ClaimJob::new(parent, scope(), "issuer".into(), binding()).unwrap();
+    loop {
+        match claim
+            .advance(true, |command| Ok(old_broker.dispatch("pairing", command)))
+            .unwrap()
+        {
+            Outcome::Pending => {}
+            Outcome::Claimed { .. } => break,
+            Outcome::Failed(code) => panic!("{code}"),
+        }
+        if let Some(state) = service_one(&mut old_broker, &store) {
+            finish_state(&mut old_broker, state);
+        }
+    }
+    drop(old_broker);
+    let mut broker = broker_with_recovery('c', false);
+    let (mut pairing, _, _, _, _) = super::super::tests::authorized_protocol_for_test();
+    let method = json!({"service":"example.effects/1","method":"apply","interface_major":1,"interface_minor":0,"schema_revision":1});
+    let cleanup = json!({"service":"example.effects/1","method":"cleanup","interface_major":1,"interface_minor":0,"schema_revision":1});
+    let schema = |method: &Value| {
+        let mut value = method.clone();
+        value.as_object_mut().unwrap().remove("schema_revision");
+        value["request"] = json!({"required":{},"optional":{},"allow_extra":false});
+        value["response"] = json!({"required":{},"optional":{},"allow_extra":false});
+        value["privilege"] = json!("user");
+        value
+    };
+    pairing.effect_authority.as_mut().unwrap().protocol_policies=serde_json::from_value(json!([{"capability":"example.control/1","provider":"provider","message_type":21818,"method":method,"cleanup":cleanup,"method_schema":schema(&method),"cleanup_schema":schema(&cleanup),"max_payload_bytes":64,"required_permission":"view"}])).unwrap();
+    pairing.protocol_state_binding = Some(binding());
+    pairing.protocol_claim_recovery_required = true;
+    let mut attempted_recovery = false;
+    for _ in 0..200 {
+        pairing.tick_at(super::super::tests::now(), |command| {
+            if matches!(&command, Command::EffectFence { command } if matches!(**command, EffectFenceCommand::RecoverSlots { .. })) { attempted_recovery = true; }
+            Ok(broker.dispatch("pairing", command))
+        }).unwrap();
+        if let Some(state) = service_one(&mut broker, &store) {
+            finish_state(&mut broker, state);
+        }
+        if pairing.protocol_recovery_inventory.is_some() {
+            break;
+        }
+    }
+    let inventory = pairing
+        .protocol_recovery_inventory
+        .as_ref()
+        .expect("startup scan did not finish");
+    assert!(!inventory.broker_ready);
+    assert!(!inventory.broker_frozen);
+    assert!(inventory.broker_sources.is_empty());
+    assert_eq!(inventory.state.active.len(), 1);
+    assert_eq!(inventory.state.active[0].scope, scope());
+    assert!(pairing.protocol_claim_recovery_required);
+    assert!(!attempted_recovery);
+    let Response::Result { payload } = broker.dispatch(
+        "pairing",
+        Command::EffectFence {
+            command: Box::new(EffectFenceCommand::SlotStatus { slot: 0 }),
+        },
+    ) else {
+        panic!("slot status")
+    };
+    assert_eq!(payload["ready"], false);
     drop(store);
     std::fs::remove_dir_all(path).unwrap();
 }

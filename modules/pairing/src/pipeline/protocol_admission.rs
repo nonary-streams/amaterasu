@@ -55,20 +55,55 @@ impl Pipeline {
             if version != 1 || !source.valid() {
                 return Err("invalid_request");
             }
-            self.effect_gate
-                .as_ref()
-                .ok_or("authority_unavailable")?
-                .require_epoch(&epoch)?;
-            let (lease, scope) = self
-                .retained_protocol_claim
-                .as_ref()
-                .ok_or("protocol_reconciliation_required")?;
+            let broker_source = amaterasu_module_sdk::broker_effect_fence::source(&source)
+                .map_err(|_| "source_denied")?;
+            let retained = self.retained_protocol_claim.as_ref().filter(|(_, scope)| {
+                scope.authority_epoch == epoch
+                    && scope.issuer_epoch == issuer_epoch
+                    && scope.source == broker_source
+            });
+            let (lease, scope) = if let Some((lease, scope)) = retained {
+                self.effect_gate
+                    .as_ref()
+                    .ok_or("authority_unavailable")?
+                    .require_epoch(&epoch)?;
+                (lease.clone(), (**scope).clone())
+            } else {
+                if !self.protocol_claim_recovery_required {
+                    return Err("protocol_reconciliation_required");
+                }
+                let slot = broker_source.slot().ok_or("source_denied")?;
+                let Ok(Response::Result { payload }) = send(Command::EffectFence {
+                    command: Box::new(EffectFenceCommand::SlotStatus { slot }),
+                }) else {
+                    return Err("protocol_reconciliation_required");
+                };
+                if payload["ready"] != true {
+                    return Err("protocol_reconciliation_required");
+                }
+                let lease: amaterasu_module_sdk::broker_effect_fence::SourceSlotLease =
+                    serde_json::from_value(payload["lease"].clone())
+                        .map_err(|_| "protocol_reconciliation_required")?;
+                let scope: amaterasu_module_sdk::broker_effect_fence::EffectScope =
+                    serde_json::from_value(payload["active"].clone())
+                        .map_err(|_| "source_denied")?;
+                if lease.slot != slot
+                    || payload["broker_epoch"] != lease.broker_epoch
+                    || lease.incarnation == 0
+                    || lease.token.is_empty()
+                    || lease.token.len() > 128
+                    || lease.token.chars().any(char::is_control)
+                    || lease.broker_epoch.is_empty()
+                    || lease.broker_epoch.len() > 128
+                    || lease.broker_epoch.chars().any(char::is_control)
+                {
+                    return Err("protocol_reconciliation_required");
+                }
+                (lease, scope)
+            };
             if scope.authority_epoch != epoch
                 || scope.issuer_epoch != issuer_epoch
-                || amaterasu_module_sdk::broker_effect_fence::source(&source)
-                    .ok()
-                    .as_ref()
-                    != Some(&scope.source)
+                || scope.source != broker_source
             {
                 return Err("source_denied");
             }
@@ -80,10 +115,9 @@ impl Pipeline {
             ) {
                 return Err("request_ended");
             }
-            let lease = lease.clone();
-            let scope = (**scope).clone();
             self.protocol_capabilities.remove(&source);
             self.protocol_claim_recovery_required = true;
+            self.protocol_recovery_retry_at = None;
             match send(Command::EffectFence {
                 command: Box::new(EffectFenceCommand::BeginCloseSlot { lease, scope }),
             }) {

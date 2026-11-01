@@ -17,6 +17,7 @@ use x509_cert::der::Encode;
 mod protocol_admission;
 mod protocol_claim;
 mod protocol_issue;
+mod protocol_recovery;
 mod source_retirement;
 
 const STATE_KEY: &str = "pairing/v1";
@@ -86,6 +87,9 @@ pub struct Pipeline {
     protocol_issue_draft: Option<protocol_issue::IssueDraft>,
     protocol_state_binding: Option<amaterasu_module_sdk::protocol_state::DurableStateBinding>,
     protocol_state_instance: Option<amaterasu_module_sdk::broker_effect_fence::ProviderIncarnation>,
+    protocol_recovery_scan: Option<protocol_recovery::RecoveryScan>,
+    protocol_recovery_inventory: Option<protocol_recovery::RecoveryInventory>,
+    protocol_recovery_retry_at: Option<Instant>,
     protocol_claim_recovery_required: bool,
     retained_protocol_claim: Option<(
         amaterasu_module_sdk::broker_effect_fence::SourceSlotLease,
@@ -185,6 +189,9 @@ impl Pipeline {
             protocol_issue_draft: None,
             protocol_state_binding,
             protocol_state_instance: None,
+            protocol_recovery_scan: None,
+            protocol_recovery_inventory: None,
+            protocol_recovery_retry_at: None,
             protocol_claim_recovery_required,
             retained_protocol_claim: None,
             deferred_effect_mutation: None,
@@ -979,7 +986,10 @@ impl Pipeline {
             None => send(Command::Poll {})?,
         };
         match incoming {
-            Response::Pending => self.recover_identity(now, &mut send),
+            Response::Pending => {
+                self.progress_protocol_recovery(&mut send);
+                self.recover_identity(now, &mut send)
+            }
             Response::Request {
                 id,
                 caller,
@@ -1075,7 +1085,10 @@ impl Pipeline {
         send: &mut impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
         match send(Command::Poll {})? {
-            Response::Pending => Ok(()),
+            Response::Pending => {
+                self.progress_protocol_recovery(send);
+                Ok(())
+            }
             Response::Request {
                 id,
                 caller,
@@ -1181,17 +1194,19 @@ impl Pipeline {
     /// mutation can proceed. A fence error is never a retirement receipt; the
     /// reconciliation latch continues to block the mutation in every case.
     fn fence_retained_protocol_claim(&self, send: &mut impl FnMut(Command) -> Transport) {
-        let Some((lease, scope)) = &self.retained_protocol_claim else {
-            return;
-        };
-        let _ = send(Command::EffectFence {
-            command: Box::new(
-                amaterasu_module_sdk::broker_effect_fence::EffectFenceCommand::BeginCloseSlot {
-                    lease: lease.clone(),
-                    scope: (**scope).clone(),
-                },
-            ),
-        });
+        if let Some((lease, scope)) = &self.retained_protocol_claim {
+            let _ = send(Command::EffectFence {
+                command: Box::new(
+                    amaterasu_module_sdk::broker_effect_fence::EffectFenceCommand::BeginCloseSlot {
+                        lease: lease.clone(),
+                        scope: (**scope).clone(),
+                    },
+                ),
+            });
+        }
+        if let Some(inventory) = &self.protocol_recovery_inventory {
+            inventory.refence(send);
+        }
     }
 
     fn handle_effect_request(
