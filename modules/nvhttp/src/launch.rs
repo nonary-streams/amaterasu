@@ -920,6 +920,45 @@ impl Controller {
         self.records.values().any(|record| !record.state.terminal())
     }
 
+    /// Resolve private certificate evidence only for one live paired session.
+    /// The caller must recheck this evidence against the pairing authority; this
+    /// retained snapshot does not itself prove that permission remains current.
+    #[allow(
+        dead_code,
+        reason = "consumed by the internal pairing authority adapter"
+    )]
+    pub(crate) fn paired_lifecycle_session(
+        &self,
+        host_epoch: &str,
+        session_id: &str,
+    ) -> Option<(&amaterasu_module_sdk::extension_api::LifecycleTarget, &[u8])> {
+        use amaterasu_module_sdk::extension_api::LifecycleTarget;
+        let mut matches = self.records.values().filter_map(|record| {
+            if !record.peer.paired()
+                || record.lifecycle_end_fenced
+                || !matches!(
+                    record.state,
+                    State::Starting | State::AwaitingDelivery | State::Ready | State::Paused
+                )
+            {
+                return None;
+            }
+            let target = record.lifecycle_session_target.as_ref()?;
+            match target {
+                LifecycleTarget::Session {
+                    host_epoch: epoch,
+                    session_id: id,
+                    ..
+                } if epoch == host_epoch && id == session_id => {
+                    Some((target, record.peer.certificate()))
+                }
+                _ => None,
+            }
+        });
+        let found = matches.next()?;
+        matches.next().is_none().then_some(found)
+    }
+
     /// Management sees only opaque launch identities and cleanup state. This is
     /// separate from RTSP's ticket and stream-session's owner-bound handles.
     pub fn management_status(&self, reference: Option<&str>) -> Value {

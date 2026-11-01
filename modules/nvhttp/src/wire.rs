@@ -192,6 +192,20 @@ impl Router {
         self.launches.busy()
     }
 
+    /// Internal evidence for pairing rechecks; never a broker response.
+    #[allow(
+        dead_code,
+        reason = "consumed by the internal pairing authority adapter"
+    )]
+    pub(crate) fn paired_lifecycle_session(
+        &self,
+        host_epoch: &str,
+        session_id: &str,
+    ) -> Option<(&amaterasu_module_sdk::extension_api::LifecycleTarget, &[u8])> {
+        self.launches
+            .paired_lifecycle_session(host_epoch, session_id)
+    }
+
     pub fn management_launch_status(&self, reference: Option<&str>) -> Value {
         self.launches.management_status(reference)
     }
