@@ -13,7 +13,7 @@ use amaterasu_contracts::{
     HOST_LIFECYCLE_SERVICE, HOST_LOG_SERVICE, HOST_STATE_CONTEXT_SERVICE, HostLifecycleAction,
     HostLogEvent, Response, RuntimeConfig,
 };
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
 
 use api::{ApiInvocation, ApiQuery, ApiRegistry};
@@ -33,6 +33,7 @@ pub struct Broker {
     logging_policy_received: bool,
     api: ApiRegistry,
     effect_fences: effect_fence::EffectFences,
+    receipt_cleanup: BTreeMap<String, u64>,
 }
 
 const HOST_LIFECYCLE_QUEUE_CAPACITY: usize = 8;
@@ -78,6 +79,10 @@ fn host_retirement_state_request(payload: &serde_json::Value) -> bool {
         }
         return match payload.get("action").and_then(serde_json::Value::as_str) {
             Some("get") => true,
+            Some("delete") => payload
+                .get("expected_revision")
+                .and_then(serde_json::Value::as_u64)
+                .is_some(),
             Some("set") => {
                 payload
                     .get("expected_revision")
@@ -173,6 +178,7 @@ impl Broker {
             hooks: HookRegistry::new(configuration.hooks.clone()),
             api: ApiRegistry::new(&configuration),
             effect_fences: effect_fence::EffectFences::new(&configuration)?,
+            receipt_cleanup: BTreeMap::new(),
             configuration,
             requests,
             events: EventBus::default(),
@@ -227,8 +233,11 @@ impl Broker {
                         || !self.configuration.service_selections.broker.get(&service).and_then(Option::as_ref).is_some_and(|selection| selection.contract == "amaterasu.state/1") {
                         return errors::permission_denied();
                     }
+                    let cleanup_key = (payload.get("action").and_then(serde_json::Value::as_str) == Some("delete")).then(|| payload.get("key").and_then(serde_json::Value::as_str).map(str::to_owned)).flatten();
                     let grants = Grants { call: [service.clone()].into(), ..Grants::default() };
-                    self.requests.submit(caller, &grants, RequestOptions { service, payload, timeout_ms, operation_id, parent: None, response_schema: None }, now)
+                    let response = self.requests.submit(caller, &grants, RequestOptions { service, payload, timeout_ms, operation_id, parent: None, response_schema: None }, now);
+                    if matches!(response, Response::Accepted { .. }) && let Some(key) = cleanup_key { self.receipt_cleanup.remove(&key); }
+                    response
                 }
                 Command::CheckRequest { request } => self.requests.check_active(caller, request),
                 Command::Complete { request, payload } => {
@@ -747,6 +756,84 @@ impl Broker {
                 }
                 Response::Ok
             }
+            EffectFenceCommand::AuthorizeHostReceiptCleanup {
+                receipt,
+                authority_state_request,
+                host_state_request,
+            } => {
+                if !self.effect_fences.authority(caller) {
+                    return errors::permission_denied();
+                }
+                let Some(Some(selection)) = self
+                    .configuration
+                    .service_selections
+                    .broker
+                    .get("amaterasu.state/1")
+                else {
+                    return errors::permission_denied();
+                };
+                let Some((request, result)) = self.requests.selected_state_read(
+                    caller,
+                    &selection.provider,
+                    authority_state_request,
+                ) else {
+                    return Response::error(
+                        "recovery_required",
+                        "fresh authority retirement state is unavailable",
+                    );
+                };
+                let key = format!("pairing/protocol-slot/v1/{:02}", receipt.issued_lease.slot);
+                let journal = result.get("value").unwrap_or(&serde_json::Value::Null);
+                if !self.effect_fences.slot_incarnation_retired(
+                    receipt.issued_lease.slot,
+                    receipt.issued_lease.incarnation,
+                ) || request.get("key").and_then(serde_json::Value::as_str) != Some(key.as_str())
+                    || result.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
+                    || result.get("found").and_then(serde_json::Value::as_bool) != Some(true)
+                    || journal.get("version").and_then(serde_json::Value::as_u64) != Some(1)
+                    || journal.get("slot").and_then(serde_json::Value::as_u64)
+                        != Some(u64::from(receipt.issued_lease.slot))
+                    || journal
+                        .get("retired_incarnation")
+                        .and_then(serde_json::Value::as_u64)
+                        .is_none_or(|floor| floor < receipt.issued_lease.incarnation)
+                    || journal
+                        .get("pending_close")
+                        .is_none_or(|value| !value.is_null())
+                    || !self.host_retirement_record_matches(&receipt, host_state_request)
+                {
+                    return Response::error(
+                        "recovery_required",
+                        "durable slot retirement and exact host receipt are required",
+                    );
+                }
+                let Some((host_request, host_result)) = self.requests.selected_state_read(
+                    HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+                    &selection.provider,
+                    host_state_request,
+                ) else {
+                    return errors::permission_denied();
+                };
+                let receipt_key = receipt.state_key();
+                if host_request.get("key").and_then(serde_json::Value::as_str)
+                    != Some(receipt_key.as_str())
+                {
+                    return errors::permission_denied();
+                }
+                let Some(revision) = host_result
+                    .get("revision")
+                    .and_then(serde_json::Value::as_u64)
+                else {
+                    return errors::permission_denied();
+                };
+                if self.receipt_cleanup.len() >= 2048
+                    && !self.receipt_cleanup.contains_key(&receipt_key)
+                {
+                    return errors::capacity_exhausted();
+                }
+                self.receipt_cleanup.insert(receipt_key, revision);
+                Response::Ok
+            }
             EffectFenceCommand::HostRetirementReceipt { scope, sequence } => {
                 if caller != HOST_LIFECYCLE_CONTROL_PRINCIPAL {
                     return errors::permission_denied();
@@ -1246,6 +1333,12 @@ impl Broker {
         let Some(key) = request.get("key").and_then(serde_json::Value::as_str) else {
             return false;
         };
+        if request.get("action").and_then(serde_json::Value::as_str) == Some("delete") {
+            return request
+                .get("expected_revision")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|revision| self.receipt_cleanup.get(key) == Some(&revision));
+        }
         if key.starts_with("host/effect-retirement/v2/") {
             return request
                 .get("value")
@@ -1253,7 +1346,12 @@ impl Broker {
                     serde_json::from_value::<HostProviderRetirement>(value.clone()).ok()
                 })
                 .is_some_and(|receipt| {
-                    receipt.state_key() == key && self.effect_fences.captured_host_receipt(&receipt)
+                    receipt.state_key() == key
+                        && !self.effect_fences.slot_incarnation_retired(
+                            receipt.issued_lease.slot,
+                            receipt.issued_lease.incarnation,
+                        )
+                        && self.effect_fences.captured_host_receipt(&receipt)
                 });
         }
         let Some(revision) = request

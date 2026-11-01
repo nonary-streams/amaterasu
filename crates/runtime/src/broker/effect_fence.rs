@@ -391,6 +391,14 @@ impl EffectFences {
             .as_ref()
             .is_some_and(|slots| slots.valid_for(lease, scope))
     }
+    pub fn slot_incarnation_retired(&self, slot: u8, incarnation: u64) -> bool {
+        incarnation > 0
+            && self
+                .slots
+                .as_ref()
+                .and_then(|slots| slots.retired_incarnation(slot))
+                .is_some_and(|retired| retired >= incarnation)
+    }
     pub fn recovery_only(&self, scope: &EffectScope) -> bool {
         self.sources
             .get(scope)

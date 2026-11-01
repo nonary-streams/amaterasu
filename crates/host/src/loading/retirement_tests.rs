@@ -258,9 +258,13 @@ fn setup_broker(instance_digit: &str, count: u64) -> (Broker, ProviderIncarnatio
     config
         .principals
         .insert(HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(), Grants::default());
-    config
-        .principals
-        .insert("authority".into(), Grants::default());
+    config.principals.insert(
+        "authority".into(),
+        Grants {
+            call: ["amaterasu.state/1".into()].into(),
+            ..Default::default()
+        },
+    );
     config.principals.insert(
         "issuer".into(),
         Grants {
@@ -477,6 +481,143 @@ fn setup_broker(instance_digit: &str, count: u64) -> (Broker, ProviderIncarnatio
     (broker, instance)
 }
 
+fn verify_receipt_cleanup(loaded: &mut LoadedComponents, harness: &Harness) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let key = "host/effect-retirement/v2/00/1/32";
+    let (host_read, host_id) = loaded
+        .retirement_state_request(json!({"action":"get","key":key}), deadline, true)
+        .unwrap();
+    let receipt: amaterasu_contracts::effect_fence::HostProviderRetirement =
+        serde_json::from_value(host_read["value"].clone()).unwrap();
+    let revision = host_read["revision"].as_u64().unwrap();
+    let journal = |retired| json!({"version":1,"slot":0,"retired_incarnation":retired,"active":null,"pending_close":null});
+    assert_eq!(harness.store.handle("authority", json!({"action":"set","key":"pairing/protocol-slot/v1/00","value":journal(0),"expected_revision":0}))["ok"], true);
+    let authority_read = |loaded: &mut LoadedComponents, harness: &Harness, operation: &str| {
+        let Response::Accepted { id } = harness.broker.lock().unwrap().dispatch(
+            "authority",
+            Command::Request {
+                service: "amaterasu.state/1".into(),
+                payload: json!({"action":"get","key":"pairing/protocol-slot/v1/00"}),
+                timeout_ms: 30_000,
+                operation_id: operation.into(),
+                parent: None,
+            },
+        ) else {
+            panic!("authority read denied")
+        };
+        loaded.tick_retirement_state_provider().unwrap();
+        assert!(matches!(
+            harness
+                .broker
+                .lock()
+                .unwrap()
+                .dispatch("authority", Command::TakeResult { request: id }),
+            Response::Result { .. }
+        ));
+        id
+    };
+    let old_read = authority_read(loaded, harness, "cleanup.old");
+    let authorize = |id| EffectFenceCommand::AuthorizeHostReceiptCleanup {
+        receipt: Box::new(receipt.clone()),
+        authority_state_request: id,
+        host_state_request: host_id,
+    };
+    assert!(
+        matches!(broker_invoke(&mut harness.broker.lock().unwrap(), "issuer", authorize(old_read)), Response::Error { ref code, .. } if code == "permission_denied")
+    );
+    assert!(
+        matches!(broker_invoke(&mut harness.broker.lock().unwrap(), "authority", authorize(old_read)), Response::Error { ref code, .. } if code == "recovery_required")
+    );
+    assert_eq!(harness.store.handle("authority", json!({"action":"set","key":"pairing/protocol-slot/v1/00","value":journal(1),"expected_revision":1}))["ok"], true);
+    let fresh = authority_read(loaded, harness, "cleanup.fresh");
+    assert!(
+        matches!(broker_invoke(&mut harness.broker.lock().unwrap(), "authority", authorize(old_read)), Response::Error { ref code, .. } if code == "recovery_required")
+    );
+    assert!(
+        matches!(broker_invoke(&mut harness.broker.lock().unwrap(), "authority", authorize(fresh)), Response::Error { ref code, .. } if code == "recovery_required")
+    );
+    let lease = receipt.issued_lease.clone();
+    let scope = receipt.effect.scope.clone();
+    assert!(matches!(
+        broker_invoke(
+            &mut harness.broker.lock().unwrap(),
+            "authority",
+            EffectFenceCommand::BeginCloseSlot {
+                lease: lease.clone(),
+                scope: scope.clone()
+            }
+        ),
+        Response::Ok
+    ));
+    for principal in ["issuer", HOST_LIFECYCLE_CONTROL_PRINCIPAL] {
+        assert!(matches!(
+            broker_invoke(
+                &mut harness.broker.lock().unwrap(),
+                principal,
+                EffectFenceCommand::SourceRetired {
+                    lease: lease.clone(),
+                    scope: scope.clone()
+                }
+            ),
+            Response::Ok
+        ));
+    }
+    assert!(matches!(
+        scoped(
+            &mut harness.broker.lock().unwrap(),
+            "authority",
+            &lease,
+            EffectFenceCommand::Compact {
+                scope: scope.clone(),
+                retired_through: 32
+            }
+        ),
+        Response::Ok
+    ));
+    assert!(matches!(
+        broker_invoke(
+            &mut harness.broker.lock().unwrap(),
+            "authority",
+            EffectFenceCommand::FinishCloseSlot {
+                lease,
+                scope,
+                retired_through: 32
+            }
+        ),
+        Response::Ok
+    ));
+    let mut forged = receipt.clone();
+    forged.effect.sequence = 31;
+    assert!(
+        matches!(broker_invoke(&mut harness.broker.lock().unwrap(), "authority", EffectFenceCommand::AuthorizeHostReceiptCleanup { receipt: Box::new(forged), authority_state_request: fresh, host_state_request: host_id }), Response::Error { ref code, .. } if code == "recovery_required")
+    );
+    assert!(matches!(
+        broker_invoke(
+            &mut harness.broker.lock().unwrap(),
+            "authority",
+            authorize(fresh)
+        ),
+        Response::Ok
+    ));
+    loaded
+        .retirement_state_request(
+            json!({"action":"delete","key":key,"expected_revision":revision}),
+            deadline,
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        harness.store.handle(
+            HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            json!({"action":"get","key":key})
+        )["found"],
+        false
+    );
+    assert!(
+        matches!(broker_invoke(&mut harness.broker.lock().unwrap(), "authority", authorize(fresh)), Response::Error { ref code, .. } if code == "recovery_required")
+    );
+}
+
 fn exercise(mode: Mode, count: u64) {
     let path = std::env::temp_dir().join(format!(
         "host-retirement-{}-{}",
@@ -599,6 +740,13 @@ fn exercise(mode: Mode, count: u64) {
                 Instant::now() + Duration::from_secs(2),
             )
             .unwrap();
+        if count == 32 {
+            for sequence in 1..=count {
+                let record = harness.store.handle(HOST_LIFECYCLE_CONTROL_PRINCIPAL, json!({"action":"get","key":format!("host/effect-retirement/v2/00/1/{sequence}")}));
+                assert_eq!(record["value"]["effect"]["sequence"], sequence);
+            }
+            verify_receipt_cleanup(&mut loaded, &harness);
+        }
         loaded.retirement_providers.clear();
     }
     drop(loaded);
@@ -608,7 +756,7 @@ fn exercise(mode: Mode, count: u64) {
     );
     assert_eq!(saved["found"], matches!(mode, Mode::Delayed));
     if matches!(mode, Mode::Delayed) {
-        for sequence in 1..=count {
+        for sequence in 1..=if count == 32 { 31 } else { count } {
             let record = harness.store.handle(
                 HOST_LIFECYCLE_CONTROL_PRINCIPAL,
                 json!({"action":"get","key":format!("host/effect-retirement/v2/00/1/{sequence}")}),

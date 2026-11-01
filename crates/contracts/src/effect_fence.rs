@@ -341,6 +341,14 @@ pub enum EffectFenceCommand {
         slot: u8,
         after_sequence: Option<u64>,
     },
+    /// Authority authorizes one host-namespace deletion only after fresh
+    /// selected-State reads prove both this exact receipt and a fully retired
+    /// durable slot incarnation. This never establishes effect cleanup itself.
+    AuthorizeHostReceiptCleanup {
+        receipt: Box<HostProviderRetirement>,
+        authority_state_request: u64,
+        host_state_request: u64,
+    },
     /// Reserved host endpoint: build a local-worker retirement record for an
     /// exact retained effect after the original provider instance has joined.
     HostRetirementReceipt {
