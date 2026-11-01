@@ -1,7 +1,7 @@
 //! Opt-in v1 sequence journal for one trusted caller and session generation.
 //!
-//! Journal format version 2 binds each issuer to its lifecycle source and
-//! effect-owner incarnation. Version 1 journals fail closed and need safe
+//! Journal format version 3 binds each issuer to its lifecycle source,
+//! effect-owner and broker-issuer incarnations. Earlier journals fail closed and need safe
 //! migration; they are never reset. The host allocates a fresh, contiguous
 //! sequence in the same State CAS that records the effect. A sequence is not a
 //! credential: authenticated ingress and the selected shared authority must
@@ -103,7 +103,7 @@ struct Journal {
 impl Journal {
     fn empty(source: &SequencedSource) -> Self {
         Self {
-            version: 2,
+            version: 3,
             source: source.hash.clone(),
             retired: 0,
             issued: 0,
@@ -120,7 +120,7 @@ fn read(source: &SequencedSource, response: &Value) -> Result<(u64, Journal), &'
     } else {
         Journal::empty(source)
     };
-    if journal.version != 2
+    if journal.version != 3
         || journal.source != source.hash
         || journal.retired > journal.issued
         || journal.entries.len() > WINDOW
@@ -171,6 +171,24 @@ fn set(
         expected_revision: Some(revision),
     })
 }
+/// The durable contiguous retirement watermark, not a provider result.
+/// Opening a broker source additionally requires the authority to verify old
+/// workers are retired and every unresolved record is reconciled.
+pub fn retired_through(source: &SequencedSource, response: &Value) -> Result<u64, &'static str> {
+    Ok(read(source, response)?.1.retired)
+}
+
+/// A watermark usable during source recovery only after all journal entries are
+/// reconciled. It does not prove retirement of old workers, authenticate the
+/// source, or authorize the broker's OpenSource operation.
+pub fn recovery_watermark(source: &SequencedSource, response: &Value) -> Result<u64, &'static str> {
+    let (_, journal) = read(source, response)?;
+    if !journal.entries.is_empty() {
+        return Err("reconciliation_required");
+    }
+    Ok(journal.retired)
+}
+
 /// A candidate is not issued until the associated CAS is confirmed. Keep its
 /// sequence for reconciliation if the write response is lost.
 pub fn next_sequence(source: &SequencedSource, response: &Value) -> Result<u64, &'static str> {

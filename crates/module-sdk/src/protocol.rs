@@ -81,6 +81,8 @@ pub struct PendingEffect {
     /// identifies the broker operation and the authority used for reconciliation.
     pub caller: String,
     pub operation_id: String,
+    /// Broker-issuer incarnation selected by the trusted authority.
+    pub issuer_epoch: String,
     pub context: SessionContext,
     pub message_type: u16,
     pub capability: String,
@@ -138,6 +140,8 @@ pub struct DispatchRequest<'a> {
     pub message_type: u16,
     pub payload: &'a [u8],
     pub operation_id: &'a str,
+    /// Never derived from client input.
+    pub issuer_epoch: &'a str,
     pub timeout_ms: u64,
     pub parent: Option<u64>,
 }
@@ -208,6 +212,7 @@ impl ProtocolRouter {
             || !route.cleanup_approval.callers.contains(caller)
             || !valid_context(request.context)
             || !amaterasu_contracts::valid_name(request.operation_id)
+            || !valid_name(request.issuer_epoch)
             || !(1..=30_000).contains(&request.timeout_ms)
             || request.payload.len() > route.max_payload_bytes
         {
@@ -216,6 +221,7 @@ impl ProtocolRouter {
         Ok(PendingEffect {
             caller: caller.into(),
             operation_id: request.operation_id.into(),
+            issuer_epoch: request.issuer_epoch.into(),
             context: request.context.clone(),
             message_type: request.message_type,
             capability: route.capability.clone(),
@@ -272,6 +278,7 @@ impl ProtocolRouter {
             message_type,
             payload,
             operation_id,
+            issuer_epoch: _,
             timeout_ms,
             parent,
         } = request;

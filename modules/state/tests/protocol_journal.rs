@@ -34,6 +34,7 @@ fn effect(caller: &str, operation: &str) -> PendingEffect {
     PendingEffect {
         caller: caller.into(),
         operation_id: operation.into(),
+        issuer_epoch: "issuer.epoch".into(),
         context: amaterasu_module_sdk::protocol::SessionContext {
             authority_epoch: "authority.epoch".into(),
             effect_owner_epoch: "owner.epoch".into(),
@@ -660,6 +661,39 @@ fn sequenced_version_one_without_issuer_fails_closed() {
     assert_eq!(
         invoke(&store, &source.read_request())["value"]["version"],
         1
+    );
+    drop(store);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn sequenced_version_two_without_broker_incarnation_fails_closed() {
+    use amaterasu_module_sdk::protocol_sequence::{self, SequencedSource};
+    let path = directory();
+    let store = TestStateStore::open(path.clone()).unwrap();
+    let template = effect("caller", "unused");
+    let source = SequencedSource::new(&template.caller, &template.context).unwrap();
+    let StateRequest::Get { key } = source.read_request() else {
+        panic!()
+    };
+    let source_hash = key
+        .strip_prefix("protocol-sequence/v1/")
+        .unwrap()
+        .to_string();
+    let legacy = StateRequest::Set {
+        key,
+        value: serde_json::json!({"version":2,"source":source_hash,"retired":0,"issued":0,"entries":[]}),
+        expected_revision: Some(0),
+    };
+    assert_eq!(invoke(&store, &legacy)["ok"], true);
+    let read = invoke(&store, &source.read_request());
+    assert_eq!(
+        protocol_sequence::next_sequence(&source, &read),
+        Err("invalid_journal")
+    );
+    assert_eq!(
+        invoke(&store, &source.read_request())["value"]["version"],
+        2
     );
     drop(store);
     std::fs::remove_dir_all(path).unwrap();

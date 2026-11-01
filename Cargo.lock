@@ -777,6 +777,7 @@ dependencies = [
  "amaterasu-contracts",
  "amaterasu-gamestream",
  "amaterasu-module-sdk",
+ "amaterasu-state",
  "libloading",
  "serde",
  "serde_json",

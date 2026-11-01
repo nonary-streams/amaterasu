@@ -13,6 +13,7 @@ serde_json.workspace = true
 workspace = true
 
 [dev-dependencies]
+amaterasu-state = { path = "../../modules/state", features = ["test-support"] }
 amaterasu-gamestream.workspace = true
 serde.workspace = true
 amaterasu-module-sdk.workspace = true
