@@ -19,6 +19,10 @@ pub struct Format {
     pub sample_rate: u32,
     pub channels: u32,
     pub channel_mask: u32,
+    /// Obtained from the platform capture map, in actual sample-lane order.
+    /// Zero entries mean unknown; no order is inferred from the mask.
+    #[serde(skip)]
+    pub speaker_order: [u64; 8],
     #[serde(rename = "format")]
     pub name: &'static str,
 }
@@ -44,8 +48,21 @@ impl Format {
                 8 => 0x063f,
                 _ => 0,
             },
+            speaker_order: [0; 8],
             name,
         })
+    }
+
+    pub fn ordered_layout(self) -> Option<amaterasu_media::AudioChannelLayoutV2> {
+        let layout = amaterasu_media::AudioChannelLayoutV2 {
+            size: std::mem::size_of::<amaterasu_media::AudioChannelLayoutV2>() as u32,
+            version: amaterasu_media::AUDIO_ORDERED_VERSION,
+            channels: self.channels,
+            reserved: 0,
+            mask: u64::from(self.channel_mask),
+            lanes: self.speaker_order,
+        };
+        layout.validate().ok().map(|_| layout)
     }
 
     pub fn code(self) -> u32 {

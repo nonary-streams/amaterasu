@@ -142,6 +142,61 @@ fn open() -> Operation {
 }
 
 #[test]
+fn ordered_capture_rejects_unknown_layout_and_retains_exact_packet_on_busy() {
+    let (mut controller, _) = controller(true);
+    controller.handle("alice", open()).unwrap();
+    struct Received {
+        busy: bool,
+        seen: Vec<(u64, u64, [u64; 8], Vec<u8>)>,
+    }
+    unsafe extern "C" fn receive(
+        context: *mut c_void,
+        packet: *const OrderedAudioFrameV2,
+    ) -> Status {
+        // SAFETY: test supplies a live sink and callback-scoped frame.
+        let sink = unsafe { &mut *context.cast::<Received>() };
+        let packet = unsafe { &*packet };
+        assert!(packet.validate().is_ok());
+        let bytes = unsafe { packet.frame.bytes().unwrap() }.to_vec();
+        sink.seen
+            .push((packet.stream, packet.generation, packet.layout.lanes, bytes));
+        if sink.busy { MEDIA_BUSY } else { STATUS_OK }
+    }
+    let mut received = Received {
+        busy: true,
+        seen: Vec::new(),
+    };
+    let sink = OrderedAudioSinkV2 {
+        context: (&mut received as *mut Received).cast(),
+        write: receive,
+    };
+    // SAFETY: test sink remains live for synchronous callbacks.
+    assert_eq!(
+        unsafe { controller.read_ordered("alice", 1, sink) },
+        MEDIA_UNSUPPORTED
+    );
+    assert!(received.seen.is_empty());
+    controller.streams.get_mut(&1).unwrap().format.speaker_order = [2, 1, 0, 0, 0, 0, 0, 0];
+    assert_eq!(
+        unsafe { controller.read_ordered("bob", 1, sink) },
+        MEDIA_CLOSED
+    );
+    assert_eq!(
+        unsafe { controller.read_ordered("alice", 1, sink) },
+        MEDIA_BUSY
+    );
+    received.busy = false;
+    assert_eq!(
+        unsafe { controller.read_ordered("alice", 1, sink) },
+        STATUS_OK
+    );
+    assert_eq!(received.seen.len(), 2);
+    assert_eq!(received.seen[0], received.seen[1]);
+    assert_eq!((received.seen[0].0, received.seen[0].1), (1, 1));
+    assert_eq!(received.seen[0].2, [2, 1, 0, 0, 0, 0, 0, 0]);
+}
+
+#[test]
 fn explicit_capture_format_reaches_backend_and_reports_requested_stereo() {
     let (mut controller, observed) = controller(true);
     let operation: Operation = serde_json::from_value(json!({
@@ -1335,6 +1390,7 @@ fn cancelled_open_completion_rolls_back_only_newly_created_streams() {
         runtime: client,
         controller: shared.clone(),
         _factory: Factory::new(shared.clone()),
+        _ordered_factory: None,
         platform_started: false,
     };
     let request = |payload| Response::Request {

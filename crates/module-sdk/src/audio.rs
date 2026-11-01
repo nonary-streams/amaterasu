@@ -10,12 +10,69 @@ pub use negotiation::{
 use crate::{ModuleResult, NativeBinding, RuntimeClient, abi::NativeServiceFactory};
 use amaterasu_media::{
     AudioCaptureApi, AudioEncoderApi, INTERFACE_MAJOR, NegotiatedAudioEncoderApi,
+    OrderedAudioCaptureApiV2, OrderedAudioEncoderApiV2,
 };
 
 pub const CAPTURE_CONTRACT: &str = "amaterasu.audio-capture.native/1";
 pub const ENCODER_CONTRACT: &str = "amaterasu.audio-encoder.native/1";
 /// Separate family; the legacy Opus table and behavior remain unchanged.
 pub const NEGOTIATED_ENCODER_CONTRACT: &str = "amaterasu.audio-encoder-negotiated.native/1";
+pub const ORDERED_CAPTURE_CONTRACT: &str = "amaterasu.audio-capture-ordered.native/2";
+pub const ORDERED_ENCODER_CONTRACT: &str = "amaterasu.audio-encoder-ordered.native/2";
+
+/// # Safety
+/// The factory implements the ordered capture table and outlives all bindings.
+pub unsafe fn register_ordered_capture(
+    runtime: &RuntimeClient,
+    service: &str,
+    factory: &NativeServiceFactory,
+) -> ModuleResult<()> {
+    unsafe { runtime.register_native_typed(service, ORDERED_CAPTURE_CONTRACT, factory) }
+}
+
+/// # Safety
+/// The runtime and provider outlive the binding and all calls.
+pub unsafe fn bind_ordered_capture(
+    runtime: &RuntimeClient,
+    service: &str,
+) -> ModuleResult<NativeBinding> {
+    unsafe {
+        runtime.bind_native_typed(
+            service,
+            ORDERED_CAPTURE_CONTRACT,
+            2,
+            0,
+            size_of::<OrderedAudioCaptureApiV2>() as u32,
+        )
+    }
+}
+
+/// # Safety
+/// The factory implements the ordered encoder table and outlives all bindings.
+pub unsafe fn register_ordered_encoder(
+    runtime: &RuntimeClient,
+    service: &str,
+    factory: &NativeServiceFactory,
+) -> ModuleResult<()> {
+    unsafe { runtime.register_native_typed(service, ORDERED_ENCODER_CONTRACT, factory) }
+}
+
+/// # Safety
+/// The runtime and provider outlive the binding and all calls.
+pub unsafe fn bind_ordered_encoder(
+    runtime: &RuntimeClient,
+    service: &str,
+) -> ModuleResult<NativeBinding> {
+    unsafe {
+        runtime.bind_native_typed(
+            service,
+            ORDERED_ENCODER_CONTRACT,
+            2,
+            0,
+            size_of::<OrderedAudioEncoderApiV2>() as u32,
+        )
+    }
+}
 
 /// # Safety
 /// Factory implements the negotiated table and remains live through binding release.

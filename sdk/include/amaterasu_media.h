@@ -136,6 +136,56 @@ typedef struct {
     AmaterasuStatus (*drain)(void *, uint64_t);
 } AmaterasuNegotiatedAudioEncoderApi;
 
+/* Separate ordered capture/encoder v2 families. A lane is a single speaker bit;
+ * occupied lanes must be a permutation of mask and unused lanes must be zero.
+ * Stream and generation identify the capture layout, not the encoder stream.
+ * All sample/config pointers remain borrowed only during synchronous calls. */
+#define AMATERASU_AUDIO_ORDERED_VERSION 2u
+typedef struct {
+    uint32_t size, version, channels, reserved;
+    uint64_t mask, lanes[8];
+} AmaterasuAudioChannelLayoutV2;
+typedef struct {
+    uint32_t size, version;
+    uint64_t stream, generation;
+    AmaterasuAudioFrame frame;
+    AmaterasuAudioChannelLayoutV2 layout;
+} AmaterasuOrderedAudioFrameV2;
+typedef struct {
+    void *context;
+    AmaterasuStatus (*write)(void *, const AmaterasuOrderedAudioFrameV2 *);
+} AmaterasuOrderedAudioSinkV2;
+typedef struct {
+    AmaterasuNativeInterface base;
+    AmaterasuStatus (*read_audio)(void *, uint64_t, AmaterasuOrderedAudioSinkV2);
+} AmaterasuOrderedAudioCaptureApiV2;
+typedef struct {
+    uint32_t size, version;
+    uint64_t stream, generation;
+    AmaterasuAudioChannelLayoutV2 layout;
+} AmaterasuAudioInputSelectionV2;
+/* Zero fixed_packet_bytes means variable length. A nonzero value promises that
+ * exact payload size for this offer generation, excluding any encryption. */
+typedef struct {
+    uint32_t size, version;
+    AmaterasuAudioFormatDescriptor format;
+    AmaterasuAudioChannelLayoutV2 layout;
+    uint32_t fixed_packet_bytes, reserved;
+} AmaterasuAudioFormatDescriptorV2;
+typedef struct { uint64_t id; AmaterasuAudioFormatDescriptorV2 format; } AmaterasuAudioFormatOfferV2;
+typedef struct {
+    void *context;
+    AmaterasuStatus (*write)(void *, const AmaterasuAudioFormatOfferV2 *);
+} AmaterasuAudioFormatOfferSinkV2;
+typedef struct {
+    AmaterasuNativeInterface base;
+    AmaterasuStatus (*enumerate)(void *, uint64_t, AmaterasuAudioFormatOfferSinkV2, uint64_t *);
+    AmaterasuStatus (*configure)(void *, uint64_t, uint64_t, uint64_t, const AmaterasuAudioInputSelectionV2 *);
+    AmaterasuStatus (*submit)(void *, uint64_t, const AmaterasuOrderedAudioFrameV2 *);
+    AmaterasuStatus (*receive)(void *, uint64_t, AmaterasuNegotiatedAudioPacketSink);
+    AmaterasuStatus (*drain)(void *, uint64_t);
+} AmaterasuOrderedAudioEncoderApiV2;
+
 /* CPU bytes are borrowed only during submit or a synchronous frame callback.
  * NV12 is Y then UV, both with the same stride and even width/height. */
 typedef struct {

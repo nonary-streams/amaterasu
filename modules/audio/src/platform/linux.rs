@@ -1161,24 +1161,44 @@ fn pa_channel_map(channels: u32, positions: &[c_int]) -> AudioResult<PaChannelMa
 fn channel_mask(positions: &[c_int]) -> u32 {
     let mut mask = 0;
     for position in positions {
-        let speaker = match *position {
-            0 => 0x0004,  // mono maps to front center
-            1 => 0x0001,  // front left
-            2 => 0x0002,  // front right
-            3 => 0x0004,  // front center
-            7 => 0x0008,  // low frequency
-            5 => 0x0010,  // rear left
-            6 => 0x0020,  // rear right
-            8 => 0x0040,  // front left of center
-            9 => 0x0080,  // front right of center
-            4 => 0x0100,  // rear center
-            10 => 0x0200, // side left
-            11 => 0x0400, // side right
-            _ => return 0,
+        let Some(speaker) = speaker_bit(*position) else {
+            return 0;
         };
         mask |= speaker;
     }
     mask
+}
+
+fn speaker_bit(position: c_int) -> Option<u32> {
+    Some(match position {
+        0 => 0x0004,  // mono maps to front center
+        1 => 0x0001,  // front left
+        2 => 0x0002,  // front right
+        3 => 0x0004,  // front center
+        7 => 0x0008,  // low frequency
+        5 => 0x0010,  // rear left
+        6 => 0x0020,  // rear right
+        8 => 0x0040,  // front left of center
+        9 => 0x0080,  // front right of center
+        4 => 0x0100,  // rear center
+        10 => 0x0200, // side left
+        11 => 0x0400, // side right
+        _ => return None,
+    })
+}
+
+fn ordered_speakers(positions: &[c_int]) -> [u64; 8] {
+    let mut result = [0; 8];
+    if positions.len() > result.len() {
+        return result;
+    }
+    for (slot, position) in result.iter_mut().zip(positions) {
+        let Some(bit) = speaker_bit(*position) else {
+            return [0; 8];
+        };
+        *slot = u64::from(bit);
+    }
+    result
 }
 
 #[derive(Debug)]
@@ -2265,6 +2285,7 @@ impl Capture {
         )?;
         let mut format = Format::new(AUDIO_RATE, channels, PCM_F32)?;
         format.channel_mask = channel_mask(&channel_positions);
+        format.speaker_order = ordered_speakers(&channel_positions);
 
         let follows_default = virtual_sink.is_none()
             && host_audio_enabled
@@ -2320,6 +2341,7 @@ impl Capture {
             u32::try_from(config.channel_positions.len()).map_err(|_| "unsupported_format")?;
         let mut format = Format::new(AUDIO_RATE, channel_count, PCM_F32)?;
         format.channel_mask = channel_mask(&config.channel_positions);
+        format.speaker_order = ordered_speakers(&config.channel_positions);
         open_selected(CaptureSetup {
             client,
             selected,
@@ -2782,6 +2804,12 @@ mod tests {
         assert_eq!(channel_mask(stereo.positions), 0x0003);
         assert_eq!(channel_mask(surround51.positions), 0x003f);
         assert_eq!(channel_mask(surround71.positions), 0x063f);
+        assert_eq!(
+            ordered_speakers(surround51.positions),
+            [1, 2, 4, 8, 16, 32, 0, 0]
+        );
+        assert_eq!(ordered_speakers(&[2, 1]), [2, 1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(ordered_speakers(&[1, -1]), [0; 8]);
         assert_eq!(channel_mask(&[0]), 0x0004);
         assert_eq!(
             null_sink_layout(4).unwrap_err(),

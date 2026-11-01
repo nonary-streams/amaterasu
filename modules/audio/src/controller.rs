@@ -4,8 +4,9 @@ use crate::{
     worker::{Backend, NativeBackend, Opened, Source},
 };
 use amaterasu_media::{
-    AUDIO_SILENT, AUDIO_TIMESTAMP_ESTIMATED, AudioFrame, AudioSink, MEDIA_BACKEND_ERROR,
-    MEDIA_CLOSED, MEDIA_PENDING, PCM_F32, PCM_I16,
+    AUDIO_ORDERED_VERSION, AUDIO_SILENT, AUDIO_TIMESTAMP_ESTIMATED, AudioChannelLayoutV2,
+    AudioFrame, AudioSink, MEDIA_BACKEND_ERROR, MEDIA_CLOSED, MEDIA_PENDING, MEDIA_UNSUPPORTED,
+    OrderedAudioFrameV2, OrderedAudioSinkV2, PCM_F32, PCM_I16,
 };
 use amaterasu_module_sdk::abi::{STATUS_OK, Status};
 use serde_json::{Value, json};
@@ -645,6 +646,64 @@ impl Controller {
         }
         status
     }
+
+    /// # Safety
+    /// Sink and callback remain live for this synchronous read and cannot retain samples.
+    pub unsafe fn read_ordered(
+        &mut self,
+        owner: &str,
+        id: u64,
+        sink: OrderedAudioSinkV2,
+    ) -> Status {
+        let layout = match self.owned(owner, id) {
+            Ok(stream) => match stream.format.ordered_layout() {
+                Some(layout) => layout,
+                None => return MEDIA_UNSUPPORTED,
+            },
+            Err(_) => return MEDIA_CLOSED,
+        };
+        let mut bridge = OrderedBridge {
+            sink,
+            stream: id,
+            layout,
+        };
+        let legacy = AudioSink {
+            context: (&mut bridge as *mut OrderedBridge).cast(),
+            write: ordered_delivery,
+        };
+        // SAFETY: bridge, layout, downstream sink and samples remain live synchronously.
+        unsafe { self.read(owner, id, legacy) }
+    }
+}
+
+struct OrderedBridge {
+    sink: OrderedAudioSinkV2,
+    stream: u64,
+    layout: AudioChannelLayoutV2,
+}
+
+unsafe extern "C" fn ordered_delivery(
+    context: *mut std::ffi::c_void,
+    frame: *const AudioFrame,
+) -> Status {
+    // SAFETY: read_ordered owns the bridge and legacy read lends the frame.
+    let bridge = unsafe { &mut *context.cast::<OrderedBridge>() };
+    let frame = unsafe { &*frame };
+    let ordered = OrderedAudioFrameV2 {
+        size: size_of::<OrderedAudioFrameV2>() as u32,
+        version: AUDIO_ORDERED_VERSION,
+        stream: bridge.stream,
+        // A stream ID is never reused; recovery retains this format only when
+        // the complete source format, including lane order, still matches.
+        generation: 1,
+        frame: *frame,
+        layout: bridge.layout,
+    };
+    if let Err(status) = ordered.validate() {
+        return status;
+    }
+    // SAFETY: caller guarantees the sink lifetime and packet is callback-scoped.
+    unsafe { (bridge.sink.write)(bridge.sink.context, &ordered) }
 }
 
 fn open_reply(id: u64, stream: &Stream) -> Value {

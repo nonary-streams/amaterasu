@@ -28,12 +28,15 @@ const SERVICE: &str = "amaterasu.audio/1";
 struct Settings {
     #[serde(default)]
     enabled: bool,
+    #[serde(default)]
+    ordered_service: Option<String>,
 }
 
 struct AudioModule {
     runtime: RuntimeClient,
     controller: native::Shared,
     _factory: Box<native::Factory>,
+    _ordered_factory: Option<Box<native::ordered::Factory>>,
     platform_started: bool,
 }
 
@@ -44,8 +47,19 @@ impl ManagedModule for AudioModule {
         };
         let settings: Settings =
             serde_json::from_value(payload).map_err(|_| "invalid audio settings")?;
+        if settings
+            .ordered_service
+            .as_ref()
+            .is_some_and(|service| service == SERVICE || !amaterasu_contracts::valid_name(service))
+        {
+            return Err("invalid ordered audio service".into());
+        }
         let controller = Arc::new(Mutex::new(Controller::new(settings.enabled)));
         let factory = native::Factory::new(controller.clone());
+        let ordered_factory = settings
+            .ordered_service
+            .as_ref()
+            .map(|_| native::ordered::Factory::new(controller.clone()));
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
@@ -54,6 +68,16 @@ impl ManagedModule for AudioModule {
         // release their bindings before provider unload.
         unsafe {
             amaterasu_module_sdk::audio::register_capture(&runtime, SERVICE, &factory.api)?;
+        }
+        if let (Some(service), Some(factory)) = (&settings.ordered_service, &ordered_factory) {
+            // SAFETY: factory and shared controller outlive all ordered bindings.
+            unsafe {
+                amaterasu_module_sdk::audio::register_ordered_capture(
+                    &runtime,
+                    service,
+                    &factory.api,
+                )?;
+            }
         }
         #[cfg(target_os = "linux")]
         {
@@ -71,6 +95,7 @@ impl ManagedModule for AudioModule {
             runtime,
             controller,
             _factory: factory,
+            _ordered_factory: ordered_factory,
             platform_started: true,
         })
     }
