@@ -5400,3 +5400,120 @@ fn broker_retirement_receipt_fences_every_source_on_the_transport() {
         true
     );
 }
+
+#[test]
+fn nvhttp_reconciles_wide_owner_operation_ids_through_real_broker() {
+    use amaterasu_nvhttp::test_support::{SourceRecovery, SourceRecoveryOutcome};
+    for owner_operation in ["Owner:retire".to_owned(), "X".repeat(128)] {
+        let (mut pairing, _state, _certificate, epoch, source, scope) =
+            authorized_feedback_for_test();
+        let mut broker = authority_broker();
+        let request = amaterasu_module_sdk::nvhttp_source::BindFeedbackSource {
+            authority_epoch: epoch.clone(),
+            source: serde_json::from_value(source.clone()).unwrap(),
+            scope: serde_json::from_value(scope.clone()).unwrap(),
+            input_boot_epoch: "input-boot".into(),
+        };
+        let Response::Accepted { id: fence } = broker.dispatch("nvhttp", Command::Request {
+            service: EFFECT_SERVICE.into(), payload: json!({"action":"fence_source","epoch":epoch,"source":source,"scope":scope,"operation_id":owner_operation}),
+            timeout_ms:30_000, operation_id:"owner-fence".into(), parent:None,
+        }) else { panic!("fence rejected") };
+        pairing
+            .tick_at(now(), |cmd| Ok(broker.dispatch("pairing", cmd)))
+            .unwrap();
+        assert!(matches!(
+            broker.dispatch("nvhttp", Command::TakeResult { request: fence }),
+            Response::Result { .. }
+        ));
+        assert!(matches!(
+            broker.dispatch("nvhttp", Command::ReleaseResult { request: fence }),
+            Response::Ok
+        ));
+        let Response::Accepted { id: origin } = broker.dispatch(
+            "input",
+            Command::Request {
+                service: "amaterasu.nvhttp/1".into(),
+                payload: request.payload(),
+                timeout_ms: 30_000,
+                operation_id: "owner-origin".into(),
+                parent: None,
+            },
+        ) else {
+            panic!("origin rejected")
+        };
+        assert!(matches!(
+            broker.dispatch("nvhttp", Command::Poll {}),
+            Response::Request { .. }
+        ));
+        let mut recovery = SourceRecovery::new(origin, request.clone());
+        let mut found = false;
+        for _ in 0..30 {
+            if let SourceRecoveryOutcome::FenceSettled {
+                fence_confirmed,
+                operation_id,
+                ..
+            } = recovery.advance(|cmd| Ok(broker.dispatch("nvhttp", cmd)))
+            {
+                assert!(fence_confirmed);
+                assert_eq!(operation_id, owner_operation);
+                found = true;
+                break;
+            }
+            pairing
+                .tick_at(now(), |cmd| Ok(broker.dispatch("pairing", cmd)))
+                .unwrap();
+        }
+        assert!(found);
+        let Response::Accepted { id: completion } = broker.dispatch("input", Command::Request {
+            service:EFFECT_SERVICE.into(), payload:json!({"action":"complete_source_retirement","epoch":epoch,"source":source,"scope":scope,"operation_id":owner_operation,"retirement":null}),
+            timeout_ms:30_000, operation_id:"owner-finish".into(), parent:None,
+        }) else { panic!("completion rejected") };
+        pairing
+            .tick_at(now(), |cmd| Ok(broker.dispatch("pairing", cmd)))
+            .unwrap();
+        let Response::Result { payload } = broker.dispatch(
+            "input",
+            Command::TakeResult {
+                request: completion,
+            },
+        ) else {
+            panic!("missing completion")
+        };
+        assert_eq!(payload["state"], "retired");
+        let Response::Accepted { id: reconcile } = broker.dispatch(
+            "input",
+            Command::Request {
+                service: "amaterasu.nvhttp/1".into(),
+                payload: request.reconciliation_payload(),
+                timeout_ms: 30_000,
+                operation_id: "owner-reconcile".into(),
+                parent: None,
+            },
+        ) else {
+            panic!("reconcile rejected")
+        };
+        assert!(matches!(
+            broker.dispatch("nvhttp", Command::Poll {}),
+            Response::Request { .. }
+        ));
+        recovery.begin_lookup(reconcile, &request).unwrap();
+        let mut retired = false;
+        for _ in 0..30 {
+            if let SourceRecoveryOutcome::Reply {
+                retired: is_retired,
+                payload,
+                ..
+            } = recovery.advance(|cmd| Ok(broker.dispatch("nvhttp", cmd)))
+            {
+                assert!(is_retired);
+                assert!(request.accepts_retirement_confirmation(&payload, &owner_operation));
+                retired = true;
+                break;
+            }
+            pairing
+                .tick_at(now(), |cmd| Ok(broker.dispatch("pairing", cmd)))
+                .unwrap();
+        }
+        assert!(retired);
+    }
+}
