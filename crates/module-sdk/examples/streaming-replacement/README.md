@@ -19,6 +19,12 @@ remain synthetic; this is not a feedback-retirement qualification. Build each
 standalone Cargo workspace in its own target directory to avoid artifact collisions. For example, from the repo
 root with `out` pointing to task-owned scratch space:
 
+For an additional selected-input check, build `amaterasu-input` with the
+`qualification-fake-backend` feature into the protocol target and set
+`AMATERASU_COMPOSITION_REAL_INPUT=1`. The input library then runs with a fake,
+device-free backend and a fixture configuration service. Stream and media
+services still use fixture implementations.
+
 ```sh
 CARGO_TARGET_DIR="$out/protocol" cargo build --offline --locked -p amaterasu-runtime -p amaterasu-pairing -p amaterasu-launch -p amaterasu-rtsp -p amaterasu-session-lifecycle
 CARGO_TARGET_DIR="$out/library" cargo build --offline --locked --manifest-path crates/module-sdk/examples/application-library-v2/Cargo.toml
