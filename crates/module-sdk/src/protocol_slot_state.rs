@@ -5,9 +5,7 @@
 //! write is reconciled from State and never treated as proof that an older
 //! continuation stopped.
 use crate::{
-    broker_effect_fence::{
-        EffectScope, GuardedEffectIdentity, SelectedEffectMethod, SourceSlotLease,
-    },
+    broker_effect_fence::{EffectScope, GuardedEffectIdentity, SourceSlotLease},
     protocol_state::CleanupReference,
     state::{self, StateLookup, StateMutation, StateRequest},
 };
@@ -27,10 +25,21 @@ pub struct ProviderIncarnation {
     pub id: String,
 }
 
+/// Stored selection must contain the original host-issued incarnation. The
+/// actor must compare this with the selected broker method before admission.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedEffectMethod {
+    pub version: u8,
+    pub provider: String,
+    pub method: amaterasu_contracts::ApiMethod,
+    pub provider_incarnation: ProviderIncarnation,
+}
+
 impl ProviderIncarnation {
     pub fn valid(&self) -> bool {
         self.version == 1
-            && self.id.len() == 64
+            && self.id.len() == 32
             && self
                 .id
                 .bytes()
@@ -48,7 +57,7 @@ pub struct Entry {
     /// Must be retrieved from the selected host lifecycle, never inferred
     /// from the provider name or copied from client input.
     pub provider_incarnation: ProviderIncarnation,
-    pub selected_method: SelectedEffectMethod,
+    pub selected_method: RecordedEffectMethod,
     pub cleanup_method: crate::extension_api::MethodRef,
     pub cleanup_approval: amaterasu_contracts::ApiMethodApproval,
     pub cleanup: CleanupReference,
@@ -139,6 +148,7 @@ fn valid_claim(slot: u8, retired: u64, claim: &Claim) -> bool {
             && crate::protocol_state::CleanupReference::new(entry.cleanup.id.clone()).is_ok()
             && entry.selected_method.version == 1
             && entry.selected_method.provider == effect.provider
+            && entry.selected_method.provider_incarnation == entry.provider_incarnation
             && entry.selected_method.method.service == effect.service
             && entry.selected_method.method.method == effect.method
             && entry.selected_method.method.interface_major == effect.interface_major

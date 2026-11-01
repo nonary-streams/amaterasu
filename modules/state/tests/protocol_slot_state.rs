@@ -1,11 +1,9 @@
 #![cfg(feature = "test-support")]
 use amaterasu_module_sdk::{
     ApiMethod, ApiMethodApproval, ApiPrivilege, ApiSchema,
-    broker_effect_fence::{
-        EffectScope, EffectSource, GuardedEffectIdentity, SelectedEffectMethod, SourceSlotLease,
-    },
+    broker_effect_fence::{EffectScope, EffectSource, GuardedEffectIdentity, SourceSlotLease},
     extension_api::MethodRef,
-    protocol_slot_state::{self, Entry, ProviderIncarnation},
+    protocol_slot_state::{self, Entry, ProviderIncarnation, RecordedEffectMethod},
     protocol_state::CleanupReference,
     state::StateRequest,
 };
@@ -94,7 +92,7 @@ fn entry(scope: &EffectScope, sequence: u64, lease: &SourceSlotLease) -> Entry {
         issued_lease: lease.clone(),
         provider_incarnation: ProviderIncarnation {
             version: 1,
-            id: "e".repeat(64),
+            id: "e".repeat(32),
         },
         identity: GuardedEffectIdentity {
             scope: scope.clone(),
@@ -111,10 +109,14 @@ fn entry(scope: &EffectScope, sequence: u64, lease: &SourceSlotLease) -> Entry {
             operation_id: format!("effect.{sequence}"),
             parent: None,
         },
-        selected_method: SelectedEffectMethod {
+        selected_method: RecordedEffectMethod {
             version: 1,
             provider: "provider".into(),
             method,
+            provider_incarnation: ProviderIncarnation {
+                version: 1,
+                id: "e".repeat(32),
+            },
         },
         cleanup_method: MethodRef {
             service: "example.effects/1".into(),
