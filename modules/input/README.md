@@ -14,7 +14,12 @@ Startup settings:
 The trusted startup setting `feedback_owner` selects the direct runtime principal
 allowed to observe and pull feedback. It defaults to `amaterasu.stream-session`;
 its name must be valid and must match the separately selected effect owner. This
-setting does not grant broker access or authorize a source route.
+setting does not grant broker access or authorize a source route. The optional
+`feedback_retirement_service` startup service selection makes lifecycle revocation wait
+for the selected feedback owner to report pairing settlement and a whole-control-
+stream retirement receipt after local input cleanup. The receiving stream-owner
+integration is not yet implemented, so this option remains fail-closed and must
+not be enabled in deployed composition until the complete route is verified.
 
 Injection defaults off. The Linux path is an administrator setting, never a request
 field. It must be an absolute, non-symlink character-device path and is opened

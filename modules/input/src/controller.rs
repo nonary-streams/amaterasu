@@ -1123,6 +1123,30 @@ impl<B: Backend> Controller<B> {
         })
     }
 
+    /// Only an explicit per-lease decision is immutable against later global edits.
+    pub(crate) fn feedback_policy_is_immutable(&self) -> bool {
+        self.lease
+            .as_ref()
+            .is_some_and(|lease| lease.requested_controller == Some(true))
+            && self.effective_controller_enabled()
+            && !self.controller_cleanup_pending
+    }
+
+    pub(crate) fn feedback_offer_observation(
+        &self,
+        caller: &str,
+        token: &str,
+        slot: u16,
+    ) -> InputResult<Vec<String>> {
+        self.feedback_device_observation(caller, token, slot)?;
+        Ok(self
+            .backend
+            .feedback_device_offer(slot)
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect())
+    }
+
     fn feedback_peek(&mut self, caller: &str, token: &str, limit: u8) -> InputResult<Value> {
         self.authorize_feedback_caller(caller)?;
         self.authorize(caller, token, false)?;

@@ -1131,6 +1131,10 @@ pub(super) struct Ds4Gamepad {
 }
 
 impl Ds4Gamepad {
+    pub(super) fn feedback_available(&self) -> bool {
+        self.device.is_some() && !self.recovery_required
+    }
+
     pub(super) fn create(
         slot: u8,
         back_as_touchpad_click: bool,

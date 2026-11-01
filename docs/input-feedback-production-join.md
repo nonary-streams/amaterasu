@@ -52,7 +52,17 @@ backend slot, and exact current device incarnation; it validates the lifecycle
 binding again with `source_version:1` and its boot epoch and rechecks the local
 state while the request is in flight. A successful selected-provider response
 returns `{ok:true,version:1,target,source,input_boot_epoch,device:{slot,
-generation,capabilities}}`. It contains no certificate. The lifecycle source
+generation,capabilities},provider_offer,immutable_controller_policy}`. The offer
+contains only schemas actually produced by the selected live Linux device: DS4
+rumble/RGB, DS5 rumble/RGB/adaptive triggers, and PCM only when the DS5 gadget
+transport is active. Other providers currently report an empty offer. The policy
+flag is true only for an explicitly enabled per-lease controller override; a
+lease inheriting mutable global policy is not treated as immutable. The stream
+adapter intersects that offer with authenticated RTSP flags, the per-controller
+PCM bit, controller support and the authenticated haptics enable command. An
+empty intersection grants nothing, and unknown schema offers are rejected by
+this built-in adapter. This observation remains point-in-time; it does not fence
+policy changes or admit a lease. It contains no certificate. The lifecycle source
 may be unavailable until activation; absent, mismatched, expired, cancelled or
 revoked observations fail closed. A trusted, default-off stream-session startup
 setting `observe_feedback_sources` enables the owner to request and validate
@@ -133,12 +143,17 @@ independent review remain prerequisites, not workarounds for missing evidence.
 
 The committed source-retirement protocol requires an exact admitted source and
 structured scope for every controller sharing a control transport. Input's raw
-controller-arrival capabilities are client claims; the selected provider does
-not expose an independently attested feedback schema intersection, and the
-stream owner lacks an effective per-session controller-policy decision. Neither
-value may be fabricated from the observation above. The input revoke path also
-acknowledges local cleanup without a stream-owner retirement response; it has
-no complete source/scope registry to issue a pairing fence.
+controller-arrival capabilities are client claims. The source observation above
+now carries a selected-provider offer and a conservative per-lease policy flag;
+the resulting intersection is still only a snapshot, not a pairing admission or
+a policy-change fence. Other input providers must supply their own offers.
+An opt-in `feedback_retirement_service` selection makes the input revoke
+handshake wait after local cleanup for a direct
+selected-owner response matching the binding, target, input boot epoch and
+operation ID, asserting pairing settlement and a whole-control-stream receipt.
+Missing or uncertain replies remain pending. The receiving stream-owner action
+and its complete source/scope registry are not yet implemented, so the option
+must remain disabled in deployed composition.
 
 The required bounded handoff is a direct, authenticated request from input to
 the selected stream owner when an owned binding or device retires. The stream
@@ -150,3 +165,14 @@ acknowledgment until that reply. Missing or uncertain identities and receipts
 remain fenced. The authority worker is repairing terminal lease replay,
 controller-specific operation identities and shared-transport receipt agreement;
 these must be covered with the combined real-provider test before activation.
+
+The stream pipeline currently returns immediately after advancing an active
+workflow and does not poll the service while that workflow is pending. A
+lifecycle-triggered input revoke can therefore deadlock if its stream cleanup
+workflow is waiting for input retirement. The receiving side must service
+retirement requests independently of that workflow, fence the exact admitted
+source registry, and drive selected transport and authority cleanup without
+allowing later sends. A standalone acknowledgment fixture does not prove this
+join. Authority repair `200f5aa0681df533f1630f960a189ddffe855ef7` must be
+incorporated and its terminal replay, distinct-controller identity, and shared
+receipt cases included in the combined real-provider test.

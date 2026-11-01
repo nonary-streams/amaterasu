@@ -1648,7 +1648,7 @@ fn selected_stream_owner_requests_and_validates_active_source_observation() {
     );
     let target = json!({"kind":"stream","host_epoch":"host","session_id":"session","stream_id":"stream","generation":2});
     host.broker.input_source_observation = Some(
-        json!({"ok":true,"version":1,"target":target,"source":{"version":1,"id":"b".repeat(32),"generation":2},"input_boot_epoch":"a".repeat(32),"device":{"slot":2,"generation":7,"capabilities":0}}),
+        json!({"ok":true,"version":1,"target":target,"source":{"version":1,"id":"b".repeat(32),"generation":2},"input_boot_epoch":"a".repeat(32),"device":{"slot":2,"generation":7,"capabilities":0},"provider_offer":["org.amaterasu.feedback.rumble"],"immutable_controller_policy":true}),
     );
     {
         let record = host.pipeline.records.get_mut(&id).unwrap();
@@ -1733,4 +1733,63 @@ fn stream_owner_rejects_stale_or_mismatched_feedback_source_observations() {
     super::super::input::retry_feedback_source_observation(record, 10);
     assert_eq!(record.feedback_source_retry_at, 1010);
     assert!(!record.feedback_source_attempts.contains_key(&2));
+}
+
+#[test]
+fn source_snapshot_intersects_live_offer_client_flags_and_stable_policy() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    let id = host.response_from(1, "amaterasu.rtsp", prepare())["session"]
+        .as_u64()
+        .unwrap();
+    let mut launch = start(id);
+    launch["configuration"]["client_feature_flags"] = json!(7);
+    assert_eq!(
+        host.response_from(2, "amaterasu.rtsp", launch)["state"],
+        "active"
+    );
+    let target = json!({"kind":"stream","host_epoch":"host","session_id":"session","stream_id":"stream","generation":2});
+    let record = host.pipeline.records.get_mut(&id).unwrap();
+    record.start.as_mut().unwrap().lifecycle_target =
+        Some(serde_json::from_value(target.clone()).unwrap());
+    record.input_controller_supported = true;
+    record.client_haptics_requested = true;
+    record.feedback_device_observations.insert(2, (7, 0x8000));
+    let payload = json!({"ok":true,"version":1,"target":target,"source":{"version":1,"id":"b".repeat(32),"generation":2},"input_boot_epoch":"a".repeat(32),"device":{"slot":2,"generation":7,"capabilities":0x8000},"provider_offer":["org.amaterasu.feedback.rumble","org.amaterasu.feedback.haptics_pcm"],"immutable_controller_policy":true});
+    record.feedback_source_candidate = Some((2, 7, 0x8000));
+    super::super::input::accept_feedback_source_observation(record, &payload).unwrap();
+    assert_eq!(
+        record.feedback_source_observations[&2]["scope_capabilities"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let mut disabled = payload.clone();
+    disabled["immutable_controller_policy"] = false.into();
+    record.feedback_source_candidate = Some((2, 7, 0x8000));
+    super::super::input::accept_feedback_source_observation(record, &disabled).unwrap();
+    assert_eq!(
+        record.feedback_source_observations[&2]["scope_capabilities"],
+        json!([])
+    );
+    record.start.as_mut().unwrap().client_feature_flags = Some(3);
+    record.feedback_source_candidate = Some((2, 7, 0x8000));
+    super::super::input::accept_feedback_source_observation(record, &payload).unwrap();
+    let result = record.feedback_source_observations[&2]["scope_capabilities"]
+        .as_array()
+        .unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0]["schema"], "org.amaterasu.feedback.rumble");
+    let mut unknown = payload;
+    unknown["provider_offer"][0] = "vendor.unknown".into();
+    record.feedback_source_candidate = Some((2, 7, 0x8000));
+    assert_eq!(
+        super::super::input::accept_feedback_source_observation(record, &unknown),
+        Err("unsupported_feedback_offer")
+    );
 }

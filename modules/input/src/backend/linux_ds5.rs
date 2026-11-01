@@ -1326,6 +1326,23 @@ pub(super) struct Ds5Gamepad {
 }
 
 impl Ds5Gamepad {
+    pub(super) fn feedback_available(&self) -> bool {
+        self.device.is_some() && !self.recovery_required
+    }
+
+    pub(super) fn supports_pcm_feedback(&self) -> bool {
+        if self.recovery_required {
+            return false;
+        }
+        match self.device.as_ref() {
+            #[cfg(not(test))]
+            Some(Ds5Transport::Gadget(_)) => true,
+            #[cfg(test)]
+            Some(Ds5Transport::FakeGadget(_)) => true,
+            _ => false,
+        }
+    }
+
     pub(super) fn create(
         slot: u8,
         randomize_mac: bool,
@@ -1838,6 +1855,7 @@ mod tests {
         let (_gadget_guard, gadget) = FakeGadgetGuard::install();
         let (_uhid_guard, uhid) = FakeUhidGuard::install();
         let mut device = Ds5Gamepad::create(4, false, test_feedback(4)).unwrap();
+        assert!(device.supports_pcm_feedback());
         device
             .update(ControllerSnapshot {
                 buttons: A,
@@ -1859,6 +1877,7 @@ mod tests {
         let (_uhid_guard, uhid) = FakeUhidGuard::install();
         let mut device = Ds5Gamepad::create(4, false, test_feedback(4)).unwrap();
         assert!(gadget.borrow().created.is_empty());
+        assert!(!device.supports_pcm_feedback());
         assert_eq!(uhid.borrow().created.len(), 1);
         device.release().unwrap();
         assert_eq!(uhid.borrow().destroyed.len(), 1);

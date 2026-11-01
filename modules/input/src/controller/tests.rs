@@ -5139,3 +5139,23 @@ fn authority_ticket_holds_drain_until_actual_input_backend_returns() {
     // The test fixture has no asynchronous input work or transport to retire.
     authority.drain();
 }
+
+#[test]
+fn source_feedback_policy_snapshot_requires_explicit_enabled_lease() {
+    let now = Instant::now();
+    let mut inherited = Controller::new(FakeBackend::default(), true);
+    let _lease = acquire(&mut inherited, now);
+    assert!(!inherited.feedback_policy_is_immutable());
+    let mut explicit = Controller::new(FakeBackend::default(), true);
+    let mut operation = acquire_operation();
+    if let Operation::Acquire { controller, .. } = &mut operation {
+        *controller = Some(true);
+    } else {
+        panic!("expected acquire");
+    }
+    let acquired = explicit.handle("owner", operation, now, &mut || Ok(()));
+    assert_eq!(acquired["ok"], true);
+    assert!(explicit.feedback_policy_is_immutable());
+    explicit.set_controller_enabled(false, now).unwrap();
+    assert!(explicit.feedback_policy_is_immutable());
+}

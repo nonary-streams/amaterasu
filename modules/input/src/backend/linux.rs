@@ -983,6 +983,29 @@ impl Backend for LinuxBackend {
     fn feedback_device_active(&self, controller: u16) -> bool {
         self.gamepads.is_live(controller)
     }
+    fn feedback_device_offer(&self, controller: u16) -> &'static [&'static str] {
+        const DS4: &[&str] = &[
+            "org.amaterasu.feedback.rumble",
+            "org.amaterasu.feedback.rgb_led",
+        ];
+        const DS5: &[&str] = &[
+            "org.amaterasu.feedback.rumble",
+            "org.amaterasu.feedback.rgb_led",
+            "org.amaterasu.feedback.adaptive_triggers",
+        ];
+        const DS5_PCM: &[&str] = &[
+            "org.amaterasu.feedback.rumble",
+            "org.amaterasu.feedback.rgb_led",
+            "org.amaterasu.feedback.adaptive_triggers",
+            "org.amaterasu.feedback.haptics_pcm",
+        ];
+        match self.gamepads.live_device(controller) {
+            Some(LinuxGamepad::Ds4(device)) if device.feedback_available() => DS4,
+            Some(LinuxGamepad::Ds5(device)) if device.supports_pcm_feedback() => DS5_PCM,
+            Some(LinuxGamepad::Ds5(device)) if device.feedback_available() => DS5,
+            _ => &[],
+        }
+    }
     fn effective_gamepad_profile(&self) -> Option<&'static str> {
         self.effective_profile
     }

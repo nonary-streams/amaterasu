@@ -31,12 +31,18 @@ impl Request {
     }
 }
 
+pub(crate) struct DeviceObservation {
+    pub device: (u64, u32),
+    pub offer: Vec<String>,
+    pub immutable_controller_policy: bool,
+}
+
 pub(crate) struct Job {
     pub request_id: u64,
     pub caller: String,
     pub request: Request,
     pub target: LifecycleTarget,
-    pub device: (u64, u32),
+    pub observation: DeviceObservation,
     boot_epoch: String,
     deadline: Instant,
     operation_id: String,
@@ -49,12 +55,17 @@ impl Job {
         caller: String,
         request: Request,
         target: LifecycleTarget,
-        device: (u64, u32),
+        observation: DeviceObservation,
         boot_epoch: String,
         deadline: Instant,
     ) -> Result<Self, &'static str> {
         if !request.valid()
-            || device.0 == 0
+            || observation.device.0 == 0
+            || observation.offer.len() > 32
+            || observation
+                .offer
+                .iter()
+                .any(|schema| schema.len() > 128 || schema.is_empty())
             || boot_epoch.len() != 32
             || !boot_epoch
                 .bytes()
@@ -77,7 +88,7 @@ impl Job {
             caller,
             request,
             target,
-            device,
+            observation,
             boot_epoch,
             deadline,
             operation_id,
@@ -123,7 +134,7 @@ impl Job {
                     Ok(Some(json!({"ok":true,"version":1,"target":self.target,
                         "source":{"version":source.version,"id":source.id,"generation":source.generation},
                         "input_boot_epoch":self.boot_epoch,
-                        "device":{"slot":self.request.controller_slot,"generation":self.device.0,"capabilities":self.device.1}})))
+                        "device":{"slot":self.request.controller_slot,"generation":self.observation.device.0,"capabilities":self.observation.device.1},"provider_offer":self.observation.offer,"immutable_controller_policy":self.observation.immutable_controller_policy})))
                 }
                 _ => Err("source_observation_unavailable"),
             };
@@ -225,7 +236,11 @@ mod tests {
             "amaterasu.stream-session".into(),
             request(),
             target(),
-            (7, 0x8000),
+            DeviceObservation {
+                device: (7, 0x8000),
+                offer: vec!["org.amaterasu.feedback.rumble".into()],
+                immutable_controller_policy: true,
+            },
             "a".repeat(32),
             Instant::now() + Duration::from_secs(5),
         )

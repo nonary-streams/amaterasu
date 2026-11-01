@@ -573,6 +573,15 @@ impl<Device: GamepadDevice> GamepadSlots<Device> {
             .is_some_and(|slot| !slot.pending_removal)
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn live_device(&self, number: u16) -> Option<&Device> {
+        self.devices
+            .get(usize::from(number))?
+            .as_ref()
+            .filter(|slot| !slot.pending_removal)
+            .map(|slot| &slot.device)
+    }
+
     pub(crate) fn remove(&mut self, number: u16) -> InputResult<()> {
         let Some(slot) = self.devices.get_mut(usize::from(number)) else {
             return Err(InputError::new(
