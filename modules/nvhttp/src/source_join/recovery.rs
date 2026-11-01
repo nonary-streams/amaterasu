@@ -5,6 +5,7 @@ use amaterasu_module_sdk::{
     nvhttp_source::BindFeedbackSource,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 const PAIRING: &str = "amaterasu.pairing-effects/1";
 
@@ -88,7 +89,7 @@ impl Recovery {
                     service: PAIRING.into(),
                     payload,
                     timeout_ms: 5000,
-                    operation_id: format!("nvhttp.{op}.fence"),
+                    operation_id: broker_operation_id(&self.request, &op, "fence", None),
                     parent: None,
                 }) {
                     Ok(Response::Accepted { id }) => self.phase = Phase::FenceWait(id),
@@ -153,7 +154,7 @@ impl Recovery {
                     service: PAIRING.into(),
                     payload,
                     timeout_ms: 5000,
-                    operation_id: format!("nvhttp.{}.discover", self.request.source.id),
+                    operation_id: broker_operation_id(&self.request, &op, "discover", None),
                     parent: None,
                 }) {
                     Ok(Response::Accepted { id }) => self.phase = Phase::DiscoverWait(id),
@@ -220,7 +221,7 @@ impl Recovery {
                     service: PAIRING.into(),
                     payload,
                     timeout_ms: 5000,
-                    operation_id: format!("nvhttp.{op}.lookup.{parent}"),
+                    operation_id: broker_operation_id(&self.request, &op, "lookup", Some(*parent)),
                     parent: None,
                 }) {
                     Ok(Response::Accepted { id }) => self.phase = Phase::LookupWait(*parent, id),
@@ -287,7 +288,12 @@ impl Recovery {
                     service: PAIRING.into(),
                     payload: json!({"action":"status"}),
                     timeout_ms: 5000,
-                    operation_id: format!("nvhttp.{op}.restart-status.{parent}"),
+                    operation_id: broker_operation_id(
+                        &self.request,
+                        &op,
+                        "restart-status",
+                        Some(*parent),
+                    ),
                     parent: None,
                 }) {
                     Ok(Response::Accepted { id }) => self.phase = Phase::StatusWait(*parent, id),
@@ -338,6 +344,35 @@ impl Recovery {
         }
         Outcome::Pending
     }
+}
+
+// Owner IDs have a wider grammar than broker operation IDs. Bind the broker
+// identity to the full source, exact owner ID, phase, and request instead of
+// copying an owner-controlled string into the broker namespace.
+fn broker_operation_id(
+    request: &BindFeedbackSource,
+    owner_operation: &str,
+    phase: &str,
+    parent: Option<u64>,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"amaterasu.nvhttp.recovery-broker-operation/v1\0");
+    for field in [
+        request.retirement_operation_id(),
+        owner_operation.into(),
+        phase.into(),
+    ] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field.as_bytes());
+    }
+    match parent {
+        Some(id) => {
+            digest.update([1]);
+            digest.update(id.to_be_bytes());
+        }
+        None => digest.update([0]),
+    }
+    format!("nvhttp.recovery.{:x}", digest.finalize())
 }
 
 fn released(result: ModuleResult<Response>) -> bool {
