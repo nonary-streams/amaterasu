@@ -3390,6 +3390,51 @@ fn pairing_mutation_fences_and_waits_for_effect_owner_completion() {
     assert_eq!(harness.writes, writes + 1);
 }
 #[test]
+fn host_configuration_refresh_prevents_reopening_effect_admission() {
+    let mut configured = settings();
+    configured.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        protocol_owner: "nvhttp".into(),
+        effect_owner: "input".into(),
+        feedback_policies: vec![],
+    });
+    let mut pipeline =
+        Pipeline::with_host_configuration(configured, Arc::new(Shared::default()), true);
+    pipeline.host_configuration = HostConfigurationState::WaitingGet(42);
+    let epoch = pipeline.effect_gate.as_ref().unwrap().epoch().to_owned();
+    let mut incoming = Some(Response::Request {
+        id: 8,
+        caller: "input".into(),
+        initiator: "input".into(),
+        service: EFFECT_SERVICE.into(),
+        remaining_ms: 30_000,
+        payload: json!({"action":"recover","epoch":epoch,"owner_epoch":"retired-owner"}),
+    });
+    let mut result = None;
+    pipeline
+        .tick_at(now(), |command| {
+            Ok(match command {
+                Command::TakeResult { request: 42 } => Response::Pending,
+                Command::Poll {} => incoming.take().unwrap_or(Response::Pending),
+                Command::CheckRequest { request: 8 } => Response::Ok,
+                Command::Complete {
+                    request: 8,
+                    payload,
+                } => {
+                    result = Some(payload);
+                    Response::Ok
+                }
+                other => panic!("unexpected command: {other:?}"),
+            })
+        })
+        .unwrap();
+    assert_eq!(result.unwrap()["code"], "host_configuration_unavailable");
+    let gate = pipeline.effect_gate.as_ref().unwrap();
+    assert_eq!(gate.epoch(), epoch);
+    assert!(gate.startup_recovery_required());
+    assert!(!gate.drained());
+}
+
+#[test]
 fn pairing_effect_service_checks_broker_identity_and_current_certificate() {
     let (mut pipeline, _harness, _) = paired_native_client();
     pipeline.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
@@ -4371,6 +4416,47 @@ fn authority_broker() -> amaterasu_runtime::Broker {
         ));
     }
     broker
+}
+
+#[test]
+fn real_broker_rejects_recovery_while_host_configuration_is_unavailable() {
+    let mut configured = settings();
+    configured.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        protocol_owner: "nvhttp".into(),
+        effect_owner: "input".into(),
+        feedback_policies: vec![],
+    });
+    let mut pipeline =
+        Pipeline::with_host_configuration(configured, Arc::new(Shared::default()), true);
+    pipeline.host_configuration = HostConfigurationState::Failed {
+        retry_at: now() + 10,
+    };
+    let epoch = pipeline.effect_gate.as_ref().unwrap().epoch().to_owned();
+    let mut broker = authority_broker();
+    let Response::Accepted { id } = broker.dispatch(
+        "input",
+        Command::Request {
+            service: EFFECT_SERVICE.into(),
+            payload: json!({"action":"recover","epoch":epoch,"owner_epoch":"retired-owner"}),
+            timeout_ms: 30_000,
+            operation_id: "recovery-during-config-failure".into(),
+            parent: None,
+        },
+    ) else {
+        panic!("broker admission failed");
+    };
+    pipeline
+        .tick_at(now(), |command| Ok(broker.dispatch("pairing", command)))
+        .unwrap();
+    let Response::Result { payload } =
+        broker.dispatch("input", Command::TakeResult { request: id })
+    else {
+        panic!("missing response");
+    };
+    assert_eq!(payload["code"], "host_configuration_unavailable");
+    let gate = pipeline.effect_gate.as_ref().unwrap();
+    assert_eq!(gate.epoch(), epoch);
+    assert!(gate.startup_recovery_required());
 }
 
 #[test]

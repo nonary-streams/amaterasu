@@ -1023,6 +1023,17 @@ impl Pipeline {
         if !permitted {
             return Err("forbidden");
         }
+        // Recovery reopens admission. While the authoritative host identity is
+        // being loaded or refreshed, the old snapshot cannot authorize that
+        // transition even after the effect owner has retired its old workers.
+        if matches!(&request, EffectRequest::Recover { .. })
+            && !matches!(
+                &self.host_configuration,
+                HostConfigurationState::Disabled | HostConfigurationState::Ready { .. }
+            )
+        {
+            return Err("host_configuration_unavailable");
+        }
         match request {
             EffectRequest::Bind {
                 epoch,
