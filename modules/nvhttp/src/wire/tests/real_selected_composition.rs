@@ -210,6 +210,8 @@ fn run_composition(replacement: bool, scenario: &str) {
         "amaterasu.session/1",
         "amaterasu.stream-session/1",
         "amaterasu.input/1",
+        "amaterasu.media-transport/1",
+        "amaterasu.control-transport/1",
         "amaterasu.application/1",
         "amaterasu.display/1",
         "fixture.library/2",
@@ -222,14 +224,16 @@ fn run_composition(replacement: bool, scenario: &str) {
         "amaterasu.nvhttp":{"call":services,"native_use":["amaterasu.identity/1"]},
         "amaterasu.pairing":{"provide":["amaterasu.pairing/1"],"call":["amaterasu.state/1"],"native_provide":["amaterasu.identity/1"]},
         "amaterasu.launch":{"provide":["amaterasu.launch/1","amaterasu.launch/2","amaterasu.launch/3"],"call":["fixture.library/2","fixture.policy/2","example.library.provider/1","amaterasu.session/1","amaterasu.application/1","amaterasu.state/1"]},
-        "amaterasu.rtsp":{"provide":["amaterasu.rtsp/1"],"call":["amaterasu.launch/1","amaterasu.stream-session/1"],"native_use":["amaterasu.network/1"]},
+        "amaterasu.rtsp":{"provide":["amaterasu.rtsp/1"],"call":["amaterasu.launch/1","amaterasu.stream-session/1","amaterasu.session/1","amaterasu.state/1","amaterasu.media-transport/1","amaterasu.control-transport/1","amaterasu.input/1","amaterasu.session-lifecycle/1","amaterasu.display/1"],"native_use":["amaterasu.network/1"]},
         "amaterasu.session-lifecycle":{"provide":["amaterasu.session-lifecycle/1"],"call":["amaterasu.launch/1"]},
         "network":{"native_provide":["amaterasu.network/1"]},
         "capture":{"call":["amaterasu.session-lifecycle/1"]},
         "foreign":{"call":["amaterasu.session-lifecycle/1"]},
         "amaterasu.state":{"provide":["amaterasu.state/1"]},
         "session":{"provide":["amaterasu.session/1"]},
-        "stream":{"provide":["amaterasu.stream-session/1"]},
+        "stream":{"provide":["amaterasu.stream-session/1"],"call":["amaterasu.state/1","amaterasu.session/1","amaterasu.input/1","amaterasu.session-lifecycle/1","amaterasu.display/1","amaterasu.media-transport/1","amaterasu.control-transport/1"],"native_use":["amaterasu.media-transport/1","amaterasu.control-transport/1"]},
+        "control":{"provide":["amaterasu.control-transport/1"],"native_provide":["amaterasu.control-transport/1"],"native_use":["amaterasu.network/1"]},
+        "media":{"provide":["amaterasu.media-transport/1"],"native_provide":["amaterasu.media-transport/1"],"native_use":["amaterasu.network/1"]},
         "input":{"provide":["amaterasu.input/1"],"call":["amaterasu.configuration/1"]},
         "fixture-configuration":{"provide":["amaterasu.configuration/1"]},
         "display":{"provide":["amaterasu.display/1"]},
@@ -240,6 +244,9 @@ fn run_composition(replacement: bool, scenario: &str) {
         "replacement":{"provide":["fixture.library/2","fixture.policy/2","example.library.provider/1"]}
     },"settings":{
         "input":{"allow_injection":true},
+        "stream":{"enabled":true,"allowed_principals":["amaterasu.nvhttp","amaterasu.rtsp"]},
+        "control":{"enabled":true,"allowed_principals":["stream"]},
+        "media":{"enabled":true,"allowed_principals":["stream"]},
         "amaterasu.pairing":{"administrator_principals":["console"],"transport_principals":["amaterasu.nvhttp"]},
         "amaterasu.launch":{"enable_library_preflight":true,"limiter_journal_service":if scenario == "limiter_unconfigured" { Value::Null } else { json!("amaterasu.state/1") },"retirement_observers":["amaterasu.session-lifecycle"],"library_routes":{"games":{
             "service":"fixture.library/2","callers":["amaterasu.nvhttp"],"executors":{"runner":"example.library.provider/1"},
@@ -271,7 +278,28 @@ fn run_composition(replacement: bool, scenario: &str) {
             .unwrap()
     };
     let stream = runtime.client("stream");
-    register(&stream, "amaterasu.stream-session/1");
+    let real_stream = std::env::var_os("AMATERASU_COMPOSITION_REAL_STREAM").is_some();
+    if !real_stream {
+        register(&stream, "amaterasu.stream-session/1");
+    }
+    let mut selected_control = real_stream.then(|| {
+        LoadedModule::start(
+            &artifact(&artifacts, "amaterasu_control_transport"),
+            &runtime.endpoint("control"),
+        )
+    });
+    let mut selected_media = real_stream.then(|| {
+        LoadedModule::start(
+            &artifact(&artifacts, "amaterasu_media_transport"),
+            &runtime.endpoint("media"),
+        )
+    });
+    let mut selected_stream = real_stream.then(|| {
+        LoadedModule::start(
+            &artifact(&artifacts, "amaterasu_stream_session"),
+            &runtime.endpoint("stream"),
+        )
+    });
     let session = runtime.client("session");
     register(&session, "amaterasu.session/1");
     let input = runtime.client("input");
@@ -453,6 +481,9 @@ fn run_composition(replacement: bool, scenario: &str) {
         },
         controller,
     );
+    if real_stream {
+        router.set_global_stream_audio(false);
+    }
     let display_policy = if scenario == "display_rejected" {
         json!({"dd_configuration_option":"ensure_active"})
     } else {
@@ -545,11 +576,21 @@ fn run_composition(replacement: bool, scenario: &str) {
     );
     let mut backends = Hardware {
         real_input,
+        real_stream,
         ..Hardware::default()
     };
     let mut replies = vec![];
     let mut cancelled = false;
     for turn in 0..5000 {
+        if let Some(module) = &mut selected_stream {
+            module.tick();
+        }
+        if let Some(module) = &mut selected_control {
+            module.tick();
+        }
+        if let Some(module) = &mut selected_media {
+            module.tick();
+        }
         if let Some(module) = &mut selected_input {
             module.tick();
             pump_input_configuration(&configuration);
@@ -764,10 +805,41 @@ fn run_composition(replacement: bool, scenario: &str) {
         }
         assert!(response.starts_with(format!("HTTP/1.1 {}", reply.status).as_bytes()));
     }
-    let prepared = backends
-        .calls
-        .iter()
-        .any(|(service, payload)| service == "stream" && payload["action"] == "prepare");
+    let selected_stream_prepared = if let Some(module) = &mut selected_stream {
+        let stream_owner = runtime.client("amaterasu.rtsp");
+        let request = broker_request(
+            &stream_owner,
+            "amaterasu.stream-session/1",
+            json!({"action":"status"}),
+            "selected-stream-status",
+        );
+        let mut status = None;
+        for _ in 0..200 {
+            module.tick();
+            if let Some(value) = take(&stream_owner, request) {
+                status = Some(value);
+                break;
+            }
+        }
+        let status = status.expect("selected stream status");
+        assert_eq!(status["ok"], true, "{status}");
+        let session = status["sessions"].as_array().and_then(|sessions| {
+            sessions
+                .iter()
+                .find(|session| matches!(session["state"].as_str(), Some("prepared" | "armed")))
+        });
+        if let Some(session) = session {
+            assert!(session["display_prepare_timeout_ms"].is_null(), "{session}");
+        }
+        session.is_some()
+    } else {
+        false
+    };
+    let prepared = selected_stream_prepared
+        || backends
+            .calls
+            .iter()
+            .any(|(service, payload)| service == "stream" && payload["action"] == "prepare");
     match scenario {
         "retirement_unconfirmed" => {
             assert!(cancelled);
@@ -1662,6 +1734,7 @@ fn tempfile_dir() -> TestRoot {
 #[derive(Default)]
 struct Hardware {
     real_input: bool,
+    real_stream: bool,
     session_key: String,
     session_state: String,
     lease: Option<String>,
@@ -1684,7 +1757,7 @@ impl Hardware {
             ("application", application),
             ("display", display),
         ] {
-            if name == "input" && self.real_input {
+            if (name == "input" && self.real_input) || (name == "stream" && self.real_stream) {
                 continue;
             }
             while let Some(request) = runtime.poll_serialized().unwrap() {

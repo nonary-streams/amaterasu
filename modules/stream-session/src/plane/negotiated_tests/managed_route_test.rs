@@ -21,9 +21,13 @@ const SESSION: &str = "amaterasu.session/1";
 const STATE: &str = "amaterasu.state/1";
 const RTSP: &str = "amaterasu.rtsp/1";
 const STREAM: &str = "amaterasu.stream-session/1";
+const LAUNCH: &str = "amaterasu.launch/1";
+const DISPLAY: &str = "amaterasu.display/1";
 
 struct Fixture {
     launcher: RuntimeClient,
+    nvhttp: RuntimeClient,
+    rtsp_owner: RuntimeClient,
     provider: RuntimeClient,
     rtsp: amaterasu_rtsp::test_support::ManagedRtsp,
     session: StreamSession,
@@ -57,7 +61,11 @@ impl Fixture {
             else {
                 break;
             };
-            let result = if service == ENCODER_CONTROL {
+            let result = if service == LAUNCH {
+                assert_eq!(payload["action"], "verify_display_admission");
+                json!({"ok":true,"verified":true,"rtsp_operation_id":payload["rtsp_operation_id"],
+                    "request_sha256":payload["request_sha256"],"preflight_remaining_ms":10_000})
+            } else if service == ENCODER_CONTROL {
                 match payload["action"].as_str().unwrap_or("") {
                     "probe_source" => {
                         self.probes.push(payload.clone());
@@ -128,6 +136,41 @@ impl Fixture {
                 result => panic!("unexpected result {result:?}"),
             }
             assert!(Instant::now() < deadline, "request {operation} timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    fn nvhttp_request(&mut self, service: &str, operation: &str, payload: Value) -> Value {
+        let Response::Accepted { id } = self
+            .nvhttp
+            .send(Command::Request {
+                service: service.into(),
+                payload,
+                operation_id: operation.into(),
+                timeout_ms: 5000,
+                parent: None,
+            })
+            .unwrap()
+        else {
+            panic!("NVHTTP request rejected")
+        };
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            self.tick();
+            match self
+                .nvhttp
+                .send(Command::TakeResult { request: id })
+                .unwrap()
+            {
+                Response::Result { payload } => {
+                    self.nvhttp
+                        .require_success(Command::ReleaseResult { request: id })
+                        .unwrap();
+                    return payload;
+                }
+                Response::Pending => {}
+                result => panic!("unexpected NVHTTP result {result:?}"),
+            }
+            assert!(Instant::now() < deadline, "NVHTTP request timed out");
             std::thread::sleep(Duration::from_millis(1));
         }
     }
@@ -294,14 +337,16 @@ fn fixture(marker: u8, encoder: &str, transport_name: &str) -> Fixture {
         CONTROL,
         VIDEO_CONTROL,
         ENCODER_CONTROL,
+        LAUNCH,
+        DISPLAY,
     ];
     let settings = json!({"principals":{
-        "provider":{"provide":[SESSION,STATE,CONTROL,ENCODER_CONTROL],"native_provide":[ENCODER_NATIVE,FRAMER,CONTROL]},
+        "provider":{"provide":[SESSION,STATE,CONTROL,ENCODER_CONTROL,LAUNCH,DISPLAY],"native_provide":[ENCODER_NATIVE,FRAMER,CONTROL]},
         "transport":{"provide":[MEDIA],"native_provide":[MEDIA,PLAN]},
         "video":{"provide":[VIDEO_CONTROL],"call":[ENCODER_CONTROL],"native_provide":[VIDEO,VIDEO_CONTROL],"native_use":[ENCODER_NATIVE]},
         "consumer":{"provide":[STREAM],"call":all_calls,"native_use":[VIDEO,FRAMER,PLAN,MEDIA,CONTROL]},
         "amaterasu.rtsp":{"provide":[RTSP],"call":all_calls},
-        "launcher":{"call":all_calls}},
+        "launcher":{"call":all_calls},"amaterasu.nvhttp":{"call":all_calls}},
         "settings":{
             "transport":{"enabled":true,"allowed_principals":["consumer"],"plan_service_v2":PLAN,"extension_profiles":[transport_profile]},
             "video":{"enabled":true,"capture_providers":[],"unit_service":VIDEO,"source_encoder_providers":{"fixture":{
@@ -309,7 +354,7 @@ fn fixture(marker: u8, encoder: &str, transport_name: &str) -> Fixture {
             "consumer":{"enabled":true,"allowed_principals":["amaterasu.rtsp"],"extension_route":{
                 "profile":profile,"source_id":6,"encoder_provider":"fixture","encoder":{"clsid":encoder,"friendly_name":"Source","hardware_url":null},
                 "video_unit_service":VIDEO,"framer_service":FRAMER,"plan_transport_service":PLAN}},
-            "amaterasu.rtsp":{"enabled":true,"extension_enabled":true,"bind":"127.0.0.1:0","allowed_principals":["launcher"]}},
+            "amaterasu.rtsp":{"enabled":true,"extension_enabled":true,"bind":"127.0.0.1:0","allowed_principals":["launcher","amaterasu.nvhttp"]}},
         "service_selections":{"native":native}});
     let api = unsafe { &*amaterasu_runtime_v1() };
     let mut runtime = std::ptr::null_mut();
@@ -337,7 +382,7 @@ fn fixture(marker: u8, encoder: &str, transport_name: &str) -> Fixture {
         unsafe { RuntimeClient::from_endpoint(out.assume_init()) }
     };
     let provider = endpoint("provider");
-    for service in [SESSION, STATE, CONTROL, ENCODER_CONTROL] {
+    for service in [SESSION, STATE, CONTROL, ENCODER_CONTROL, LAUNCH, DISPLAY] {
         provider
             .require_success(Command::Register {
                 service: service.into(),
@@ -384,6 +429,8 @@ fn fixture(marker: u8, encoder: &str, transport_name: &str) -> Fixture {
         amaterasu_rtsp::test_support::ManagedRtsp::start(endpoint("amaterasu.rtsp")).unwrap();
     Fixture {
         launcher: endpoint("launcher"),
+        nvhttp: endpoint("amaterasu.nvhttp"),
+        rtsp_owner: endpoint("amaterasu.rtsp"),
         provider,
         rtsp,
         session,
@@ -653,4 +700,72 @@ fn managed_rtsp_negotiates_the_real_session_route() {
         assert_eq!(host.opened_encoders, 0);
         assert_eq!(host.probes[0]["encoder"]["clsid"], encoder);
     }
+}
+
+#[test]
+#[ignore = "requires the separately built native fixture provider and ephemeral loopback ports"]
+fn managed_rtsp_and_stream_preserve_actual_display_preparation_timeout() {
+    let mut host = fixture(1, "source", "TEST9");
+    for _ in 0..100 {
+        host.tick();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let video = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let audio = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let display = json!({"expected_topology_revision":"0123456789abcdef0123456789abcdef",
+        "configuration":{"displays":[
+            {"id":"desktop-primary","width":1920,"height":1080,"refresh":{"numerator":60,"denominator":1},"x":0,"y":0,"rotation":"identity","hdr_enabled":false},
+            {"id":"desktop-secondary","width":1280,"height":720,"refresh":{"numerator":60,"denominator":1},"x":1920,"y":0,"rotation":"identity","hdr_enabled":false}]},
+        "mode_policy":{"display_id":"desktop-primary","configuration_option":"ensure_active","remapping":{},"context":{
+            "resolution_is_automatic":true,"refresh_rate_is_automatic":true,"client_display_mode_override":false,"optimize_game_settings":false}}});
+    let reply = host.nvhttp_request(RTSP,"display-launch",json!({"action":"open","operation_id":"display-launch",
+        "application_operation_id":"launch-one","display_admission_token":"ab".repeat(32),
+        "display_policy_snapshot":{"global_revision":1,"global_overrides":{},"catalog_revision":0,"certificate_id":"cd".repeat(32),"application_overrides":{},"client_overrides":{},"effective_overrides":{}},
+        "display_request":display,"peer_ip":"127.0.0.1","video_port":video.local_addr().unwrap().port(),"audio_port":audio.local_addr().unwrap().port(),
+        "key_hex":"00112233445566778899aabbccddeeff","key_id":1,"connect_data":2,"stream_audio":false,
+        "capture":{"capture_provider":"dxgi","output":"display","encoder":0,"audio_endpoint":"default"}}));
+    assert_eq!(reply["ok"], true, "{reply}");
+    assert_eq!(reply["display_applied"], true, "{reply}");
+    assert_eq!(
+        host.broker.display_lease.as_deref(),
+        Some("display-0000000000000001")
+    );
+    let request = match host
+        .rtsp_owner
+        .send(Command::Request {
+            service: STREAM.into(),
+            payload: json!({"action":"status","session":reply["session"]}),
+            operation_id: "display-stream-status".into(),
+            timeout_ms: 5000,
+            parent: None,
+        })
+        .unwrap()
+    {
+        Response::Accepted { id } => id,
+        other => panic!("stream status rejected: {other:?}"),
+    };
+    let mut status = None;
+    for _ in 0..1000 {
+        host.tick();
+        if let Response::Result { payload } = host
+            .rtsp_owner
+            .send(Command::TakeResult { request })
+            .unwrap()
+        {
+            status = Some(payload);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let status = status.expect("real stream status");
+    assert_eq!(status["display_applied"], true, "{status}");
+    assert!(
+        status["display_prepare_timeout_ms"]
+            .as_u64()
+            .is_some_and(|value| (1..=40_000).contains(&value)),
+        "{status}"
+    );
+    host.rtsp_owner
+        .require_success(Command::ReleaseResult { request })
+        .unwrap();
 }
