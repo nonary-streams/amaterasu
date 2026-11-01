@@ -2030,6 +2030,58 @@ fn prepared_controller_advertises_only_the_preflighted_extension() {
 }
 
 #[test]
+fn prepared_controller_exposes_only_the_audio_offer_from_stream_session() {
+    let _guard = NETWORK_TEST_LOCK.lock().unwrap();
+    for offered in [None, Some("AC3"), Some("EAC3")] {
+        let settings: Settings = serde_json::from_value(
+            json!({"enabled":true,"bind":"127.0.0.1:0","allowed_principals":["caller"]}),
+        )
+        .unwrap();
+        let mut controller = Controller::new(settings).unwrap();
+        let (mut record, _) = announced_profile_record();
+        record.state = State::Preparing;
+        let job = Job {
+            ticket: record.id,
+            phase: Phase::Prepare,
+            call: Call::new(json!({"action":"prepare"}), "prepare".into(), Some(19)),
+            caller: Some(19),
+            network: None,
+            deadline: 5000,
+        };
+        let prepared = json!({"ok":true,"state":"prepared","session":23,
+            "audio_local":"127.0.0.1:51000","video_local":"127.0.0.1:51002","control_local":"127.0.0.1:51004",
+            "audio_offer":offered});
+        let mut endpoint = Endpoint {
+            active_request: true,
+            ..Endpoint::default()
+        };
+        let runtime = client(&mut endpoint);
+        controller.prepared(&mut record, job, &prepared, 10, &runtime);
+        assert_eq!(record.state, State::Ready);
+        let target = record.url.clone();
+        let negotiation = record.negotiation.as_mut().unwrap();
+        negotiation
+            .handle(record.id, &request(Method::Options, &target, 1, false))
+            .unwrap();
+        let mut describe = request(Method::Describe, &target, 2, false);
+        describe
+            .headers
+            .push(("accept".into(), "application/sdp".into()));
+        let NegotiationStep::Reply(description) = negotiation.handle(record.id, &describe).unwrap()
+        else {
+            panic!()
+        };
+        let description = String::from_utf8(description).unwrap();
+        match offered {
+            Some(codec) => {
+                assert!(description.contains(&format!("a=x-ss-audio-codec-offer:{codec}\r\n")))
+            }
+            None => assert!(!description.contains("x-ss-audio-codec-offer")),
+        }
+    }
+}
+
+#[test]
 fn accepted_announce_encryption_flows_into_authenticated_play_start() {
     let (mut record, announce) = announced_profile_record();
     assert!(record.accept_announce(&announce));

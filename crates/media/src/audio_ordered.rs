@@ -190,7 +190,9 @@ pub struct AudioFormatOfferSinkV2 {
 /// binds an exact output offer to the supplied capture stream, generation and
 /// ordered input layout. The provider must reject unsupported layouts and
 /// interpret each lane according to this explicit selection. Submit borrows
-/// one ordered capture frame synchronously.
+/// one ordered capture frame synchronously. Encoders that accept a capture
+/// discontinuity must mark the next emitted unit discontinuous; output times
+/// identify the first sample in the same stream-relative epoch.
 #[repr(C)]
 pub struct OrderedAudioEncoderApiV2 {
     pub base: NativeInterface,

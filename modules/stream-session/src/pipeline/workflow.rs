@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 pub(super) enum Step {
     Open(Resource),
     ProbeExtensionSource,
+    ProbeOrderedAudio,
     Authenticate,
     ConfirmControlDisconnect,
     MediaReady,
@@ -382,6 +383,7 @@ impl Job {
                     .expect("journal write step owns a payload"),
             ),
             Step::Open(resource) => (record.service(resource), record.open(resource)),
+            Step::ProbeOrderedAudio => unreachable!("ordered audio probe is synchronous"),
             Step::Authenticate => (
                 record.service(Resource::Control),
                 json!({"action":"status","stream":record.resources[&Resource::Control]}),

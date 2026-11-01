@@ -328,6 +328,15 @@ fn audio_description_only_advertises_a_preflighted_offer() {
             None => assert!(!description.contains("x-ss-audio-codec-offer")),
         }
     }
+    let mut machine = negotiation();
+    let target = machine.launch.rtsp_target.clone();
+    machine
+        .handle(7, &request(Method::Options, &target, 1, false))
+        .unwrap();
+    assert!(matches!(
+        machine.with_audio_offer(sdp::AudioCodec::Ac3),
+        Err(Error::WrongState)
+    ));
 }
 
 #[test]

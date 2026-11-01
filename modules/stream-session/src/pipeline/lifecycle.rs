@@ -23,6 +23,14 @@ impl Pipeline {
         {
             job.fail(record, "request_cancelled", now);
         }
+        if !job.cleanup
+            && job.step == Step::ProbeOrderedAudio
+            && now.saturating_add(50) >= job.deadline
+        {
+            // Optional native preflight must not consume the response budget or
+            // discard an otherwise usable Opus session under persistent BUSY.
+            return self.deliver_success(record, job, now, send);
+        }
         if now >= job.deadline {
             if job.cleanup {
                 if let Some(mut pending) = job.pending.take() {
@@ -115,6 +123,7 @@ impl Pipeline {
                     if matches!(
                         job.step,
                         Step::ProbeExtensionSource
+                            | Step::Open(Resource::OrderedAudioEncoder)
                             | Step::ValidateLifecycleCandidate
                             | Step::ObserveLifecycleCapture
                             | Step::AckLifecycleCapture
@@ -134,7 +143,8 @@ impl Pipeline {
                     return self.consume(record, job, payload, now, send, operations);
                 }
                 rpc::Progress::Failed => {
-                    if job.step == Step::Open(Resource::OrderedAudioEncoder)
+                    if !job.cleanup
+                        && job.step == Step::Open(Resource::OrderedAudioEncoder)
                         && pending.admission_rejected()
                     {
                         record.attempted.remove(&Resource::OrderedAudioEncoder);
@@ -327,6 +337,28 @@ impl Pipeline {
                 return true;
             }
         }
+        if !job.cleanup && job.step == Step::ProbeOrderedAudio {
+            let result = match (
+                &record.audio_extension_route,
+                record.resources.get(&Resource::OrderedAudioEncoder),
+                record.resources.get(&Resource::Media),
+            ) {
+                (Some(route), Some(encoder), Some(media)) => (operations.audio_probe)(
+                    route,
+                    *encoder,
+                    *media,
+                    &record.config,
+                    record.ordered_audio_epoch,
+                ),
+                _ => Err("ordered_audio_unavailable"),
+            };
+            match result {
+                Ok(candidate) => record.ordered_audio_candidate = Some(candidate),
+                Err("ordered_probe_busy") => return true,
+                Err(_) => {}
+            }
+            return self.deliver_success(record, job, now, send);
+        }
         if !job.cleanup
             && job.step == Step::StatusVirtualDisplay
             && now < record.virtual_display_next_poll_at
@@ -459,7 +491,7 @@ impl Pipeline {
             }
             return self.deliver_success(record, job, now, send);
         }
-        if job.step == Step::Open(Resource::OrderedAudioEncoder) {
+        if !job.cleanup && job.step == Step::Open(Resource::OrderedAudioEncoder) {
             if let Some(id) = allocation_id(record, Resource::OrderedAudioEncoder, &payload) {
                 // Retain every allocated handle before checking the provider's
                 // declaration or native interface so cleanup always owns it.
@@ -467,19 +499,9 @@ impl Pipeline {
                 if record
                     .validate_native_contract(Resource::OrderedAudioEncoder, &payload)
                     .is_ok()
-                    && let (Some(route), Some(media)) = (
-                        &record.audio_extension_route,
-                        record.resources.get(&Resource::Media),
-                    )
                 {
-                    record.ordered_audio_candidate = (operations.audio_probe)(
-                        route,
-                        id,
-                        *media,
-                        &record.config,
-                        record.ordered_audio_epoch,
-                    )
-                    .ok();
+                    job.step = Step::ProbeOrderedAudio;
+                    return true;
                 }
             }
             return self.deliver_success(record, job, now, send);
@@ -883,6 +905,7 @@ impl Pipeline {
                         record.handles()?,
                         &record.providers,
                         record.negotiated_route.as_ref(),
+                        record.selected_ordered_audio()?.as_ref(),
                     )?);
                 }
                 result
@@ -991,6 +1014,7 @@ impl Pipeline {
                     record.handles()?,
                     &record.providers,
                     record.negotiated_route.as_ref(),
+                    record.selected_ordered_audio()?.as_ref(),
                 )?);
                 job.step = Step::Activate;
                 Ok(true)

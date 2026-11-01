@@ -19,7 +19,10 @@ use amaterasu_gamestream::control::{
 use amaterasu_media::*;
 use amaterasu_module_sdk::RuntimeClient;
 pub(crate) use packets::VideoUnitSelection;
-use packets::{AudioPacket, PcmPacket, VideoAssembly, VideoPacket, VideoUnitPacket};
+use packets::{
+    AudioPacket, OrderedAudioPacket, OrderedPcmPacket, PcmPacket, VideoAssembly, VideoPacket,
+    VideoUnitPacket,
+};
 use std::collections::VecDeque;
 
 pub type PlaneResult<T> = Result<T, &'static str>;
@@ -71,6 +74,15 @@ pub(crate) struct NegotiatedRoute {
     pub selection: VideoUnitSelection,
     pub clock_origin_us: u64,
     pub limits: VideoFramingLimits,
+}
+
+#[derive(Clone)]
+pub(crate) struct OrderedAudioRoute {
+    pub encoder_service: String,
+    pub capture_service: String,
+    pub transport_service: String,
+    pub candidate: amaterasu_module_sdk::audio::OrderedAudioCandidate,
+    pub clock_epoch: [u8; 16],
 }
 
 pub(crate) fn probe_extension_chain(
@@ -130,6 +142,15 @@ pub struct Plane {
 }
 
 impl Plane {
+    pub(crate) fn with_ordered_audio(
+        mut self,
+        runtime: &RuntimeClient,
+        route: &OrderedAudioRoute,
+    ) -> PlaneResult<Self> {
+        self.pump.backend.enable_ordered_audio(runtime, route)?;
+        self.pump.ordered_audio = true;
+        Ok(self)
+    }
     pub fn new(
         runtime: &RuntimeClient,
         handles: Handles,
@@ -312,6 +333,24 @@ trait Backend {
     fn submit_audio(&mut self, packet: &EncodedAudioPacket) -> PlaneResult<bool>;
     fn drain_encoder(&mut self) -> PlaneResult<bool>;
     fn drain_transport(&mut self) -> PlaneResult<bool>;
+    fn ordered_pcm(&mut self) -> PlaneResult<Option<OrderedPcmPacket>> {
+        Err("ordered_audio_unsupported")
+    }
+    fn ordered_audio(&mut self) -> PlaneResult<Option<OrderedAudioPacket>> {
+        Err("ordered_audio_unsupported")
+    }
+    fn submit_ordered_pcm(&mut self, _: &OrderedAudioFrameV2) -> PlaneResult<bool> {
+        Err("ordered_audio_unsupported")
+    }
+    fn submit_ordered_audio(&mut self, _: &NegotiatedAudioPacket) -> PlaneResult<bool> {
+        Err("ordered_audio_unsupported")
+    }
+    fn drain_ordered_encoder(&mut self) -> PlaneResult<bool> {
+        Err("ordered_audio_unsupported")
+    }
+    fn prepare_ordered_audio(&mut self) -> PlaneResult<bool> {
+        Err("ordered_audio_unsupported")
+    }
 }
 
 struct Pump<B> {
@@ -323,6 +362,9 @@ struct Pump<B> {
     pending_video_unit: Option<VideoUnitPacket>,
     pending_pcm: Option<PcmPacket>,
     pending_audio: Option<AudioPacket>,
+    ordered_audio: bool,
+    pending_ordered_pcm: Option<OrderedPcmPacket>,
+    pending_ordered_audio: Option<OrderedAudioPacket>,
     pending_feedback: VecDeque<HostFeedbackMessage>,
     pending_feedback_bytes: usize,
     stopping: bool,
@@ -352,6 +394,9 @@ impl<B: Backend> Pump<B> {
             pending_video_unit: None,
             pending_pcm: None,
             pending_audio: None,
+            ordered_audio: false,
+            pending_ordered_pcm: None,
+            pending_ordered_audio: None,
             pending_feedback: VecDeque::new(),
             pending_feedback_bytes: 0,
             stopping: false,
@@ -648,6 +693,9 @@ impl<B: Backend> Pump<B> {
     }
 
     fn pump_audio(&mut self, progress: &mut Progress) -> PlaneResult<()> {
+        if self.ordered_audio {
+            return self.pump_ordered_audio(progress);
+        }
         if !self.stream_audio {
             if !self.audio_ended {
                 let end = EncodedAudioPacket {
@@ -713,6 +761,53 @@ impl<B: Backend> Pump<B> {
         }
         Ok(())
     }
+
+    fn pump_ordered_audio(&mut self, progress: &mut Progress) -> PlaneResult<()> {
+        if !self.backend.prepare_ordered_audio()? {
+            return Ok(());
+        }
+        for _ in 0..PCM_READ_BUDGET {
+            for _ in 0..READ_BUDGET {
+                if let Some(packet) = &self.pending_ordered_audio {
+                    let header = packet.header();
+                    if !self.backend.submit_ordered_audio(&header)? {
+                        return Ok(());
+                    }
+                    if header.flags != AUDIO_PACKET_END_OF_STREAM {
+                        progress.accepted_media_payload_bytes = progress
+                            .accepted_media_payload_bytes
+                            .saturating_add(header.data.len as u64);
+                    }
+                    self.audio_ended = header.flags == AUDIO_PACKET_END_OF_STREAM;
+                    self.pending_ordered_audio = None;
+                }
+                if self.audio_ended {
+                    return Ok(());
+                }
+                let Some(packet) = self.backend.ordered_audio()? else {
+                    break;
+                };
+                self.pending_ordered_audio = Some(packet);
+            }
+            if self.pending_ordered_pcm.is_none() && !self.stopping {
+                self.pending_ordered_pcm = self.backend.ordered_pcm()?;
+            }
+            let Some(packet) = &self.pending_ordered_pcm else {
+                break;
+            };
+            if packet.header().frame.channels != self.audio_channels {
+                return Err("unsupported_audio_channels");
+            }
+            if !self.backend.submit_ordered_pcm(&packet.header())? {
+                return Ok(());
+            }
+            self.pending_ordered_pcm = None;
+        }
+        if self.stopping && !self.encoder_draining {
+            self.encoder_draining = self.backend.drain_ordered_encoder()?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -720,3 +815,5 @@ mod tests;
 
 #[cfg(test)]
 mod negotiated_tests;
+#[cfg(test)]
+mod ordered_tests;

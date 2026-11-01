@@ -122,6 +122,80 @@ impl PcmPacket {
     }
 }
 
+pub(super) struct OrderedPcmPacket {
+    metadata: OrderedAudioFrameV2,
+    bytes: Vec<u8>,
+}
+
+impl OrderedPcmPacket {
+    /// # Safety
+    /// Capture lends initialized immutable samples through this callback.
+    pub(super) unsafe fn copy(frame: &OrderedAudioFrameV2) -> PlaneResult<Self> {
+        frame.validate().map_err(|_| "invalid_ordered_pcm")?;
+        if frame.frame.sample_rate != 48_000 || !matches!(frame.frame.format, PCM_F32 | PCM_I16) {
+            return Err("unsupported_pcm_format");
+        }
+        // SAFETY: caller guarantees packet bytes during this synchronous copy.
+        let bytes = unsafe { frame.frame.bytes() }
+            .map_err(|_| "invalid_ordered_pcm")?
+            .to_vec();
+        let mut metadata = *frame;
+        metadata.frame.data = std::ptr::null();
+        Ok(Self { metadata, bytes })
+    }
+
+    pub(super) fn header(&self) -> OrderedAudioFrameV2 {
+        let mut header = self.metadata;
+        header.frame.data = self.bytes.as_ptr();
+        header
+    }
+}
+
+pub(super) struct OrderedAudioPacket {
+    metadata: NegotiatedAudioPacket,
+    bytes: Vec<u8>,
+}
+
+impl OrderedAudioPacket {
+    /// # Safety
+    /// Encoder owns immutable packet bytes for the synchronous callback.
+    pub(super) unsafe fn copy(
+        packet: &NegotiatedAudioPacket,
+        candidate: &amaterasu_module_sdk::audio::OrderedAudioCandidate,
+    ) -> PlaneResult<Self> {
+        let format = candidate.format().descriptor();
+        format
+            .validate_packet(
+                packet,
+                candidate.stream(),
+                candidate.generation(),
+                candidate.offer_id(),
+            )
+            .map_err(|_| "invalid_ordered_audio_packet")?;
+        // SAFETY: caller guarantees live packet bytes during this copy.
+        let bytes = unsafe {
+            packet.bytes(
+                candidate.stream(),
+                candidate.generation(),
+                candidate.offer_id(),
+                &format.format,
+            )
+        }
+        .map_err(|_| "invalid_ordered_audio_packet")?
+        .to_vec();
+        let mut metadata = *packet;
+        metadata.data = amaterasu_module_sdk::abi::BorrowedBytes::new(&[]);
+        Ok(Self { metadata, bytes })
+    }
+
+    pub(super) fn header(&self) -> NegotiatedAudioPacket {
+        NegotiatedAudioPacket {
+            data: amaterasu_module_sdk::abi::BorrowedBytes::new(&self.bytes),
+            ..self.metadata
+        }
+    }
+}
+
 pub(super) struct AudioPacket {
     metadata: EncodedAudioPacket,
     bytes: Vec<u8>,

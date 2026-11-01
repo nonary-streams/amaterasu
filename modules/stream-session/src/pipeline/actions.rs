@@ -263,9 +263,15 @@ impl Pipeline {
             rpc::complete(send, request, error("session_not_found"));
             return;
         };
-        // Until a prepared alternate encoder route is connected, an asserted
-        // audio selection must never silently enter the legacy Opus plane.
-        if configuration.audio_codec.is_some() {
+        if let Some(codec) = &configuration.audio_codec
+            && (owner != "amaterasu.rtsp"
+                || configuration.client_feature_flags.is_none()
+                || record.ordered_audio_candidate.is_none()
+                || record
+                    .audio_extension_route
+                    .as_ref()
+                    .is_none_or(|route| &route.codec != codec))
+        {
             rpc::complete(send, request, error("audio_codec_not_offered"));
             return;
         }

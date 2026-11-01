@@ -76,6 +76,7 @@ type Factory<'a> = dyn FnMut(
         Handles,
         &crate::providers::ProviderServices,
         Option<&crate::plane::NegotiatedRoute>,
+        Option<&crate::plane::OrderedAudioRoute>,
     ) -> Result<Box<dyn Drive>, &'static str>
     + 'a;
 type Probe<'a> = dyn FnMut(
@@ -296,12 +297,15 @@ impl Pipeline {
         self.tick_with(
             now,
             &mut |command| runtime.send_ephemeral(command),
-            &mut |handles, providers, route| {
-                match route {
+            &mut |handles, providers, route, audio_route| {
+                let mut plane = match route {
                     Some(route) => Plane::new_planned(runtime, handles, providers, route),
                     None => Plane::new(runtime, handles, providers),
+                }?;
+                if let Some(route) = audio_route {
+                    plane = plane.with_ordered_audio(runtime, route)?;
                 }
-                .map(|plane| Box::new(plane) as Box<dyn Drive>)
+                Ok(Box::new(plane) as Box<dyn Drive>)
             },
             &mut |route, media, config| {
                 crate::plane::probe_extension_chain(runtime, route, media, config)

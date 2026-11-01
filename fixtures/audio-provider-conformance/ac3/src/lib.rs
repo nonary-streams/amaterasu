@@ -2,6 +2,7 @@
 use amaterasu_abi::*;
 use amaterasu_media::*;
 use std::{ffi::c_void, mem::size_of};
+mod ordered;
 
 #[repr(C)]
 struct Provider {

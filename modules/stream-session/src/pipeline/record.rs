@@ -217,6 +217,37 @@ pub(super) struct Record {
 }
 
 impl Record {
+    pub fn selected_ordered_audio(
+        &self,
+    ) -> Result<Option<crate::plane::OrderedAudioRoute>, &'static str> {
+        let Some(codec) = self
+            .start
+            .as_ref()
+            .and_then(|start| start.audio_codec.as_ref())
+        else {
+            return Ok(None);
+        };
+        let route = self
+            .audio_extension_route
+            .as_ref()
+            .ok_or("audio_codec_not_offered")?;
+        let candidate = self
+            .ordered_audio_candidate
+            .as_ref()
+            .ok_or("audio_codec_not_offered")?;
+        if &route.codec != codec
+            || self.resources.get(&Resource::OrderedAudioEncoder) != Some(&candidate.stream())
+        {
+            return Err("audio_codec_not_offered");
+        }
+        Ok(Some(crate::plane::OrderedAudioRoute {
+            encoder_service: route.encoder_service.clone(),
+            capture_service: route.capture_service.clone(),
+            transport_service: route.transport_service.clone(),
+            candidate: candidate.clone(),
+            clock_epoch: self.ordered_audio_epoch,
+        }))
+    }
     pub fn accept_negotiated_unit(&mut self, payload: &Value) -> Result<(), &'static str> {
         let Some(profile) = self
             .start
@@ -552,6 +583,7 @@ impl Record {
             "source_id": self.start.as_ref().and_then(|start| start.source_id),
             "client_feature_flags": self.start.as_ref().and_then(|start| start.client_feature_flags),
             "extension_profile": self.extension_limits.as_ref().and_then(|_| self.extension_route.as_ref().map(|route| &route.profile)),
+            "audio_offer": self.ordered_audio_candidate.as_ref().and_then(|_| self.audio_extension_route.as_ref().map(|route| route.codec.as_str())),
             "haptics_pcm_negotiated": self.start.as_ref().is_some_and(|start| {
                 start.client_feature_flags.is_some_and(|flags| {
                     flags & amaterasu_gamestream::sdp::CLIENT_FEATURE_HAPTICS_PCM != 0

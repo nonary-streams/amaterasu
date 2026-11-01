@@ -1,10 +1,12 @@
 //! Native calls borrow copied headers only synchronously. Bindings are retained
 //! until every pending call and callback has returned, then released by the SDK.
 use super::*;
+mod ordered_audio;
 mod planned;
 use amaterasu_gamestream::control::{RUMBLE_MESSAGE_TYPE, RumbleFeedback, encode_rumble_feedback};
 use amaterasu_media::{CONTROL_RELIABLE, ControlMessage};
 use amaterasu_module_sdk::{NativeBinding, abi::*};
+use ordered_audio::OrderedBindings;
 use std::{
     ffi::c_void,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -131,6 +133,8 @@ pub(super) fn probe_ordered_audio_chain(
     epoch: [u8; 16],
 ) -> PlaneResult<amaterasu_module_sdk::audio::OrderedAudioCandidate> {
     use amaterasu_module_sdk::audio::{self, AudioFormat};
+    // SAFETY: trusted startup composition names the typed providers, and these
+    // temporary bindings live through every synchronous probe below.
     let encoder = unsafe { audio::bind_ordered_encoder(runtime, &route.encoder_service) }
         .map_err(|_| "ordered_encoder_unavailable")?;
     let _capture = unsafe { audio::bind_ordered_capture(runtime, &route.capture_service) }
@@ -169,13 +173,20 @@ pub(super) fn probe_ordered_audio_chain(
     let api = unsafe { encoder.table::<OrderedAudioEncoderApiV2>() }
         .map_err(|_| "native_layout_mismatch")?;
     let candidate = unsafe { audio::probe_ordered(api, encoder_stream, &[(format, layout)]) }
-        .map_err(|_| "ordered_encoder_probe_failed")?;
+        .map_err(|error| match error {
+            audio::AudioNegotiationError::Provider(MEDIA_BUSY | MEDIA_PENDING) => {
+                "ordered_probe_busy"
+            }
+            _ => "ordered_encoder_probe_failed",
+        })?;
     let selection = candidate.transport_selection(epoch);
     let api = unsafe { transport.table::<OrderedAudioTransportApiV2>() }
         .map_err(|_| "native_layout_mismatch")?;
     // SAFETY: selection and nested config remain live for this synchronous probe.
-    if unsafe { (api.probe)(transport.context(), media_stream, &selection) } != STATUS_OK {
-        return Err("ordered_transport_probe_failed");
+    match unsafe { (api.probe)(transport.context(), media_stream, &selection) } {
+        STATUS_OK => {}
+        MEDIA_BUSY | MEDIA_PENDING => return Err("ordered_probe_busy"),
+        _ => return Err("ordered_transport_probe_failed"),
     }
     Ok(candidate)
 }
@@ -194,6 +205,7 @@ pub(super) struct NativeBackend {
     handles: Handles,
     last_hdr: Option<HdrMetadata>,
     unit_transport_draining: bool,
+    ordered_audio: Option<OrderedBindings>,
 }
 
 impl NativeBackend {
@@ -450,11 +462,35 @@ impl NativeBackend {
             handles,
             last_hdr: None,
             unit_transport_draining: false,
+            ordered_audio: None,
         })
     }
 }
 
 impl Backend for NativeBackend {
+    fn prepare_ordered_audio(&mut self) -> PlaneResult<bool> {
+        self.prepare_ordered_audio_impl()
+    }
+
+    fn ordered_pcm(&mut self) -> PlaneResult<Option<OrderedPcmPacket>> {
+        self.ordered_pcm_impl()
+    }
+
+    fn ordered_audio(&mut self) -> PlaneResult<Option<OrderedAudioPacket>> {
+        self.ordered_audio_impl()
+    }
+
+    fn submit_ordered_pcm(&mut self, frame: &OrderedAudioFrameV2) -> PlaneResult<bool> {
+        self.submit_ordered_pcm_impl(frame)
+    }
+
+    fn submit_ordered_audio(&mut self, packet: &NegotiatedAudioPacket) -> PlaneResult<bool> {
+        self.submit_ordered_audio_impl(packet)
+    }
+
+    fn drain_ordered_encoder(&mut self) -> PlaneResult<bool> {
+        self.drain_ordered_encoder_impl()
+    }
     fn desktop_geometry(&mut self) -> PlaneResult<Option<CaptureGeometry>> {
         self.update_hdr()?;
         // SAFETY: the retained binding was validated for the v1.0 prefix. Only
@@ -918,6 +954,7 @@ unsafe extern "C" fn copy_pcm(context: *mut c_void, frame: *const AudioFrame) ->
     // SAFETY: trusted provider keeps frame and samples live until callback returns.
     unsafe { deliver(context, frame, |frame| PcmPacket::copy(frame)) }
 }
+
 unsafe extern "C" fn copy_audio(context: *mut c_void, packet: *const EncodedAudioPacket) -> Status {
     // SAFETY: trusted provider keeps packet bytes initialized and immutable.
     unsafe { deliver(context, packet, |packet| AudioPacket::copy(packet)) }

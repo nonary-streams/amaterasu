@@ -1204,6 +1204,8 @@ impl Broker {
                 }
                 reply
             }
+            "example.ordered-encoder/1" => json!({"ok":true,"stream":id,
+                "native_contract":amaterasu_module_sdk::audio::ORDERED_ENCODER_CONTRACT}),
             "amaterasu.media-transport/1" => {
                 let request = &allocation.request;
                 let video: crate::model::VideoWire =
@@ -1277,6 +1279,7 @@ pub struct PlaneState {
     pub desktop_geometry: Option<amaterasu_media::CaptureGeometry>,
     pub ticks: usize,
     pub planned_planes: usize,
+    pub ordered_audio_planes: usize,
     pub media_ticks: usize,
     pub media_ticks_when_stopped: Option<usize>,
     pub dropped: usize,
@@ -1364,6 +1367,8 @@ pub struct Harness {
     pub plane: Rc<RefCell<PlaneState>>,
     pub now: u64,
     pub extension_probe_limits: Option<amaterasu_media::VideoFramingLimits>,
+    pub ordered_audio_probe_enabled: bool,
+    pub ordered_audio_probe_busy_remaining: u32,
 }
 impl Harness {
     pub fn new() -> Self {
@@ -1385,6 +1390,8 @@ impl Harness {
             plane: Rc::new(RefCell::new(plane_state)),
             now: 0,
             extension_probe_limits: None,
+            ordered_audio_probe_enabled: false,
+            ordered_audio_probe_busy_remaining: 0,
         }
     }
     pub fn with_restart_state(document: Value, revision: u64) -> Self {
@@ -1403,18 +1410,33 @@ impl Harness {
         self.broker.now = self.now;
         let state = self.plane.clone();
         let probe_limits = self.extension_probe_limits;
+        let ordered_audio_probe_enabled = self.ordered_audio_probe_enabled;
+        let ordered_audio_probe_busy_remaining = &mut self.ordered_audio_probe_busy_remaining;
         self.pipeline
             .tick_with(
                 self.now,
                 &mut |command| self.broker.send(command),
-                &mut |_, _, route| {
+                &mut |_, _, route, audio_route| {
                     if route.is_some() {
                         state.borrow_mut().planned_planes += 1;
+                    }
+                    if audio_route.is_some() {
+                        state.borrow_mut().ordered_audio_planes += 1;
                     }
                     Ok(Box::new(FakePlane(state.clone())))
                 },
                 &mut |_, _, _| probe_limits.ok_or("unsupported"),
-                &mut |_, _, _, _, _| Err("unsupported"),
+                &mut |route, encoder, _, config, _| {
+                    if *ordered_audio_probe_busy_remaining != 0 {
+                        *ordered_audio_probe_busy_remaining -= 1;
+                        return Err("ordered_probe_busy");
+                    }
+                    if ordered_audio_probe_enabled {
+                        mock_ordered_audio_candidate(route, encoder, config)
+                    } else {
+                        Err("unsupported")
+                    }
+                },
             )
             .unwrap();
     }
@@ -1459,4 +1481,135 @@ pub fn prepare_discovery() -> Value {
 }
 pub fn start(id: u64) -> Value {
     json!({"action":"start","session":id,"configuration":{"capture_provider":"dxgi","output":"monitor-one","encoder":0,"configuration":{"width":1280,"height":720,"fps":60,"bitrate":10000000},"audio_endpoint":"default"}})
+}
+
+fn mock_ordered_audio_candidate(
+    route: &crate::model::AudioExtensionRoute,
+    stream: u64,
+    config: &crate::model::PrepareConfig,
+) -> Result<amaterasu_module_sdk::audio::OrderedAudioCandidate, &'static str> {
+    use amaterasu_media::*;
+    use amaterasu_module_sdk::{
+        abi::*,
+        audio::{self, AudioFormat},
+    };
+    use std::ffi::c_void;
+    struct Spec {
+        codec: u32,
+        framing: u32,
+        channels: u32,
+        mask: u64,
+    }
+    unsafe extern "C" fn enumerate(
+        ctx: *mut c_void,
+        _: u64,
+        sink: AudioFormatOfferSinkV2,
+        generation: *mut u64,
+    ) -> Status {
+        let spec = unsafe { &*ctx.cast::<Spec>() };
+        let lanes = if spec.channels == 2 {
+            [1, 2, 0, 0, 0, 0, 0, 0]
+        } else {
+            [1, 2, 4, 8, 16, 32, 0, 0]
+        };
+        let offer = AudioFormatOfferV2 {
+            id: 4,
+            format: AudioFormatDescriptorV2 {
+                size: size_of::<AudioFormatDescriptorV2>() as u32,
+                version: AUDIO_ORDERED_VERSION,
+                format: AudioFormatDescriptor {
+                    size: size_of::<AudioFormatDescriptor>() as u32,
+                    version: AUDIO_FORMAT_VERSION,
+                    namespace: [0; 16],
+                    codec: spec.codec,
+                    framing: spec.framing,
+                    sample_rate: 48_000,
+                    channels: spec.channels,
+                    channel_mask: spec.mask,
+                    frame_samples: 1536,
+                    reserved: 0,
+                    config: BorrowedBytes::new(&[]),
+                },
+                layout: AudioChannelLayoutV2 {
+                    size: size_of::<AudioChannelLayoutV2>() as u32,
+                    version: AUDIO_ORDERED_VERSION,
+                    channels: spec.channels,
+                    reserved: 0,
+                    mask: spec.mask,
+                    lanes,
+                },
+                fixed_packet_bytes: 4,
+                reserved: 0,
+            },
+        };
+        unsafe {
+            *generation = 2;
+            (sink.write)(sink.context, &offer)
+        }
+    }
+    unsafe extern "C" fn configure(
+        _: *mut c_void,
+        _: u64,
+        _: u64,
+        _: u64,
+        _: *const AudioInputSelectionV2,
+    ) -> Status {
+        STATUS_OK
+    }
+    unsafe extern "C" fn submit(_: *mut c_void, _: u64, _: *const OrderedAudioFrameV2) -> Status {
+        MEDIA_PENDING
+    }
+    unsafe extern "C" fn receive(_: *mut c_void, _: u64, _: NegotiatedAudioPacketSink) -> Status {
+        MEDIA_PENDING
+    }
+    unsafe extern "C" fn drain(_: *mut c_void, _: u64) -> Status {
+        STATUS_OK
+    }
+    let (codec, framing) = if route.codec == "AC3" {
+        (AUDIO_CODEC_AC3, AUDIO_FRAMING_AC3_SYNCFRAME)
+    } else {
+        (AUDIO_CODEC_EAC3, AUDIO_FRAMING_EAC3_SYNCFRAME)
+    };
+    let mut spec = Spec {
+        codec,
+        framing,
+        channels: config.audio.channels,
+        mask: u64::from(config.audio.channel_mask),
+    };
+    let api = OrderedAudioEncoderApiV2 {
+        base: NativeInterface {
+            header: AbiHeader::of::<OrderedAudioEncoderApiV2>(),
+            context: (&mut spec as *mut Spec).cast(),
+            release: None,
+        },
+        enumerate,
+        configure,
+        submit,
+        receive,
+        drain,
+    };
+    let layout = AudioChannelLayoutV2 {
+        size: size_of::<AudioChannelLayoutV2>() as u32,
+        version: AUDIO_ORDERED_VERSION,
+        channels: spec.channels,
+        reserved: 0,
+        mask: spec.mask,
+        lanes: if spec.channels == 2 {
+            [1, 2, 0, 0, 0, 0, 0, 0]
+        } else {
+            [1, 2, 4, 8, 16, 32, 0, 0]
+        },
+    };
+    let format = AudioFormat {
+        namespace: [0; 16],
+        codec,
+        framing,
+        sample_rate: 48_000,
+        channels: spec.channels,
+        channel_mask: spec.mask,
+        frame_samples: 1536,
+        config: vec![],
+    };
+    // SAFETY: mock table and its state live for the synchronous probe.
+    unsafe { audio::probe_ordered(&api, stream, &[(format, layout)]) }.map_err(|_| "unsupported")
 }

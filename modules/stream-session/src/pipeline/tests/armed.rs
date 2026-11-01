@@ -84,6 +84,204 @@ fn unavailable_ordered_encoder_preserves_opus_and_reconciles_its_attempt() {
     );
 }
 
+#[test]
+fn probed_ordered_route_requires_exact_acceptance_and_retires_both_encoders() {
+    let mut host = Harness::new();
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    host.pipeline.settings.audio_extension_route = Some(serde_json::from_value(json!({
+        "codec":"AC3", "encoder_control_service":"example.ordered-encoder/1",
+        "encoder_service":"example.ordered-encoder/1", "capture_service":"example.ordered-capture/1",
+        "transport_service":"example.ordered-transport/1"
+    })).unwrap());
+    host.ordered_audio_probe_enabled = true;
+    host.ordered_audio_probe_busy_remaining = 2;
+    let prepared = host.response_from(1, "amaterasu.rtsp", prepare());
+    assert_eq!(prepared["state"], "prepared");
+    assert_eq!(prepared["audio_offer"], "AC3");
+    assert_eq!(host.ordered_audio_probe_busy_remaining, 0);
+    assert_eq!(
+        host.broker
+            .calls
+            .iter()
+            .filter(|call| call.service == "example.ordered-encoder/1"
+                && call.payload["action"] == "open")
+            .count(),
+        1
+    );
+    let session = prepared["session"].as_u64().unwrap();
+    let mut mismatched = arm(session);
+    mismatched["configuration"]["client_feature_flags"] = json!(3);
+    mismatched["configuration"]["audio_codec"] = json!("EAC3");
+    assert_eq!(
+        host.response_from(2, "amaterasu.rtsp", mismatched)["code"],
+        "audio_codec_not_offered"
+    );
+    let mut accepted = arm(session);
+    accepted["configuration"]["client_feature_flags"] = json!(3);
+    accepted["configuration"]["audio_codec"] = json!("AC3");
+    assert_eq!(
+        host.response_from(3, "amaterasu.rtsp", accepted)["state"],
+        "armed"
+    );
+    host.idle();
+    assert_eq!(host.pipeline.records[&session].state, State::Active);
+    assert_eq!(host.plane.borrow().ordered_audio_planes, 1);
+    let stopped = host.response_from(
+        4,
+        "amaterasu.rtsp",
+        json!({"action":"stop","session":session}),
+    );
+    assert_eq!(stopped["state"], "stopped");
+    for service in ["amaterasu.audio-encode/1", "example.ordered-encoder/1"] {
+        assert!(
+            host.broker
+                .calls
+                .iter()
+                .any(|call| call.service == service && call.payload["action"] == "close"),
+            "{service}"
+        );
+    }
+}
+
+#[test]
+fn unaccepted_ordered_offer_keeps_the_legacy_audio_plane() {
+    let mut host = Harness::new();
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    host.pipeline.settings.audio_extension_route = Some(serde_json::from_value(json!({
+        "codec":"EAC3", "encoder_control_service":"example.ordered-encoder/1",
+        "encoder_service":"example.ordered-encoder/1", "capture_service":"example.ordered-capture/1",
+        "transport_service":"example.ordered-transport/1"
+    })).unwrap());
+    host.ordered_audio_probe_enabled = true;
+    let prepared = host.response_from(1, "amaterasu.rtsp", prepare());
+    assert_eq!(prepared["audio_offer"], "EAC3");
+    let session = prepared["session"].as_u64().unwrap();
+    let mut request = arm(session);
+    request["configuration"]["client_feature_flags"] = json!(3);
+    assert_eq!(
+        host.response_from(2, "amaterasu.rtsp", request)["state"],
+        "armed"
+    );
+    host.idle();
+    assert_eq!(host.pipeline.records[&session].state, State::Active);
+    assert_eq!(host.plane.borrow().ordered_audio_planes, 0);
+    assert_eq!(
+        host.response_from(
+            3,
+            "amaterasu.rtsp",
+            json!({"action":"stop","session":session})
+        )["state"],
+        "stopped"
+    );
+}
+
+#[test]
+fn unsupported_71_layout_does_not_remove_legacy_audio() {
+    let mut host = Harness::new();
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    host.pipeline.settings.audio_extension_route = Some(serde_json::from_value(json!({
+        "codec":"AC3", "encoder_control_service":"example.ordered-encoder/1",
+        "encoder_service":"example.ordered-encoder/1", "capture_service":"example.ordered-capture/1",
+        "transport_service":"example.ordered-transport/1"
+    })).unwrap());
+    host.ordered_audio_probe_enabled = true;
+    let mut request = prepare();
+    request["audio"] =
+        json!({"channels":8,"channel_mask":1599,"layout":"7.1","packet_ms":10,"bitrate":512000});
+    let prepared = host.response_from(1, "amaterasu.rtsp", request);
+    assert_eq!(prepared["state"], "prepared");
+    assert!(prepared["audio_offer"].is_null());
+    assert!(!host.broker.calls.iter().any(
+        |call| call.service == "example.ordered-encoder/1" && call.payload["action"] == "open"
+    ));
+    assert!(
+        host.broker
+            .calls
+            .iter()
+            .any(|call| call.service == "amaterasu.audio-encode/1"
+                && call.payload["action"] == "open")
+    );
+}
+
+#[test]
+fn persistently_busy_optional_audio_probe_leaves_time_for_opus() {
+    let mut host = Harness::new();
+    host.pipeline.settings.prepare_timeout_ms = 100;
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    host.pipeline.settings.audio_extension_route = Some(serde_json::from_value(json!({
+        "codec":"AC3", "encoder_control_service":"example.ordered-encoder/1",
+        "encoder_service":"example.ordered-encoder/1", "capture_service":"example.ordered-capture/1",
+        "transport_service":"example.ordered-transport/1"
+    })).unwrap());
+    host.ordered_audio_probe_enabled = true;
+    host.ordered_audio_probe_busy_remaining = 1000;
+    let prepared = host.response_from(1, "amaterasu.rtsp", prepare());
+    assert_eq!(prepared["state"], "prepared");
+    assert!(prepared["audio_offer"].is_null());
+    assert!(host.ordered_audio_probe_busy_remaining < 1000);
+    let session = prepared["session"].as_u64().unwrap();
+    assert_eq!(
+        host.response_from(
+            2,
+            "amaterasu.rtsp",
+            json!({"action":"stop","session":session})
+        )["state"],
+        "stopped"
+    );
+}
+
+#[test]
+fn cancelling_busy_audio_preflight_retires_the_owned_encoder() {
+    let mut host = Harness::new();
+    host.pipeline
+        .settings
+        .allowed_principals
+        .push("amaterasu.rtsp".into());
+    host.pipeline.settings.audio_extension_route = Some(serde_json::from_value(json!({
+        "codec":"AC3", "encoder_control_service":"example.ordered-encoder/1",
+        "encoder_service":"example.ordered-encoder/1", "capture_service":"example.ordered-capture/1",
+        "transport_service":"example.ordered-transport/1"
+    })).unwrap());
+    host.ordered_audio_probe_enabled = true;
+    host.ordered_audio_probe_busy_remaining = 1000;
+    host.broker.enqueue(91, "amaterasu.rtsp", prepare());
+    for _ in 0..500 {
+        host.tick();
+        if host
+            .pipeline
+            .job
+            .as_ref()
+            .is_some_and(|job| job.step == Step::ProbeOrderedAudio)
+        {
+            break;
+        }
+    }
+    assert!(
+        host.pipeline
+            .job
+            .as_ref()
+            .is_some_and(|job| job.step == Step::ProbeOrderedAudio)
+    );
+    host.broker.cancel_parent(91);
+    host.idle();
+    assert!(host.broker.calls.iter().any(
+        |call| call.service == "example.ordered-encoder/1" && call.payload["action"] == "close"
+    ));
+    assert_eq!(host.broker.live_components(), 0);
+}
+
 fn arm_lifecycle(host: &mut Harness) -> (u64, Value) {
     let session_target =
         json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1});

@@ -28,3 +28,4 @@ amaterasu-rtsp = { path = "../rtsp", features = ["test-support"] }
 amaterasu-runtime = { path = "../../crates/runtime" }
 amaterasu-media-transport = { path = "../media-transport", features = ["test-support"] }
 amaterasu-video = { path = "../video", features = ["test-support"] }
+libloading.workspace = true
