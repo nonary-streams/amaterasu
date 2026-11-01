@@ -147,9 +147,17 @@ struct DeferredRequest {
 impl Pipeline {
     pub fn new(settings: Settings) -> Result<Self, &'static str> {
         settings.validate()?;
+        #[cfg(test)]
+        let restart_recovery = settings.feedback_owner_restart_recovery;
+        #[cfg(not(test))]
+        let restart_recovery = false;
+        let feedback_retirement_inbox = feedback_retirement::Inbox::new(
+            restart_recovery,
+            settings.providers.control_transport.clone(),
+        );
         Ok(Self {
             settings,
-            feedback_retirement_inbox: feedback_retirement::Inbox::default(),
+            feedback_retirement_inbox,
             deferred_requests: VecDeque::new(),
             records: BTreeMap::new(),
             job: None,
