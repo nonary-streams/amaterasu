@@ -4472,6 +4472,13 @@ fn protocol_authority_broker(method_schema: Value) -> amaterasu_runtime::Broker 
             ..Default::default()
         },
     );
+    config.host_context.provider_incarnations.insert(
+        "provider".into(),
+        amaterasu_contracts::effect_fence::ProviderIncarnation {
+            version: 1,
+            id: "e".repeat(32),
+        },
+    );
     let method: ApiMethod = serde_json::from_value(method_schema).unwrap();
     config.api_methods.push(ApiMethodApproval {
         provider: "provider".into(),
@@ -5668,11 +5675,16 @@ fn broker_protocol_attestation_requires_paired_source_and_exact_client_grant() {
         use sha2::Digest;
         let payload = vec![1_u8, 2, 3];
         let mut effect = request["effect"].clone();
-        let context = serde_json::from_value(effect["context"].clone()).unwrap();
-        let sequence =
-            amaterasu_module_sdk::protocol_sequence::SequencedSource::new("input", &context)
-                .unwrap();
-        effect["operation_id"] = json!(sequence.operation_id(1).unwrap());
+        let source_identity: amaterasu_module_sdk::effect_authority::Source =
+            serde_json::from_value(source.clone()).unwrap();
+        let scope = amaterasu_module_sdk::broker_effect_fence::EffectScope {
+            authority_epoch: epoch.clone(),
+            issuer_epoch: issuer_epoch.clone(),
+            source: amaterasu_module_sdk::broker_effect_fence::source(&source_identity).unwrap(),
+        };
+        effect["operation_id"] = json!(
+            amaterasu_module_sdk::protocol_slot_state::operation_id("input", &scope, 1).unwrap()
+        );
         effect["payload_sha256"] = json!(format!("{:x}", sha2::Sha256::digest(&payload)));
         let request_v2 = json!({"action":"admit_protocol_effect_v2","version":2,"epoch":epoch,"source":source,
             "effect":effect,"sequence":1,"payload":payload,"cleanup":{"id":"d".repeat(64)}});
@@ -5700,6 +5712,12 @@ fn broker_protocol_attestation_requires_paired_source_and_exact_client_grant() {
         );
         let mut bad_issuer = request_v2;
         bad_issuer["effect"]["issuer_epoch"] = json!("forged");
+        let mut forged_scope = scope;
+        forged_scope.issuer_epoch = "forged".into();
+        bad_issuer["effect"]["operation_id"] = json!(
+            amaterasu_module_sdk::protocol_slot_state::operation_id("input", &forged_scope, 1)
+                .unwrap()
+        );
         assert_eq!(
             call(&mut pipeline, "input", bad_issuer)["code"],
             "scope_denied"

@@ -1,9 +1,11 @@
 #![cfg(feature = "test-support")]
 use amaterasu_module_sdk::{
     ApiMethod, ApiMethodApproval, ApiPrivilege, ApiSchema,
-    broker_effect_fence::{EffectScope, EffectSource, GuardedEffectIdentity, SourceSlotLease},
+    broker_effect_fence::{
+        EffectScope, EffectSource, GuardedEffectIdentity, SelectedEffectMethod, SourceSlotLease,
+    },
     extension_api::MethodRef,
-    protocol_slot_state::{self, Entry, ProviderIncarnation, RecordedEffectMethod},
+    protocol_slot_state::{self, Entry, ProviderIncarnation},
     protocol_state::CleanupReference,
     state::StateRequest,
 };
@@ -109,14 +111,14 @@ fn entry(scope: &EffectScope, sequence: u64, lease: &SourceSlotLease) -> Entry {
             operation_id: format!("effect.{sequence}"),
             parent: None,
         },
-        selected_method: RecordedEffectMethod {
+        selected_method: SelectedEffectMethod {
             version: 1,
             provider: "provider".into(),
             method,
-            provider_incarnation: ProviderIncarnation {
+            provider_incarnation: Some(ProviderIncarnation {
                 version: 1,
                 id: "e".repeat(32),
-            },
+            }),
         },
         cleanup_method: MethodRef {
             service: "example.effects/1".into(),
@@ -342,4 +344,29 @@ fn durable_slot_claim_and_issue_survive_lost_replies_and_restart() {
     );
     drop(store);
     std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn full_source_operation_ids_distinguish_devices_and_issuer_incarnations() {
+    let first = scope();
+    let mut second = first.clone();
+    second.source.device = "second-device".into();
+    second.source.device_generation += 1;
+    assert_eq!(first.source.slot(), second.source.slot());
+    let first_id = protocol_slot_state::operation_id("issuer", &first, 1).unwrap();
+    assert_eq!(
+        first_id,
+        protocol_slot_state::operation_id("issuer", &first, 1).unwrap()
+    );
+    assert_ne!(
+        first_id,
+        protocol_slot_state::operation_id("issuer", &second, 1).unwrap()
+    );
+    second = first.clone();
+    second.issuer_epoch = "replacement-issuer".into();
+    assert_ne!(
+        first_id,
+        protocol_slot_state::operation_id("issuer", &second, 1).unwrap()
+    );
+    assert!(protocol_slot_state::operation_id("issuer", &first, 0).is_err());
 }

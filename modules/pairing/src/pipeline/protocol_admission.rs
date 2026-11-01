@@ -22,8 +22,8 @@ pub(super) struct ProtocolAttestation {
 }
 
 impl Pipeline {
-    /// Check the real broker selection after source and client policy. A v1
-    /// selection has no host-issued provider incarnation and cannot be armed.
+    /// Check the real broker selection after source and client policy. An
+    /// absent or invalid host incarnation cannot be armed.
     pub(super) fn handle_protocol_admission(
         &self,
         request_id: u64,
@@ -71,16 +71,19 @@ impl Pipeline {
                     {
                         return Err("invalid_protocol_effect");
                     }
-                    // The existing sequence key does not include the full
-                    // device source. This check is provisional only: v2 stays
-                    // closed until a source-qualified journal is available.
-                    let source_sequence =
-                        amaterasu_module_sdk::protocol_sequence::SequencedSource::new(
-                            caller,
-                            &effect.context,
-                        )
-                        .map_err(|_| "invalid_protocol_effect")?;
-                    if source_sequence.operation_id(sequence).ok().as_deref()
+                    let source_identity =
+                        amaterasu_module_sdk::broker_effect_fence::source(&source)
+                            .map_err(|_| "invalid_protocol_effect")?;
+                    let scope = amaterasu_module_sdk::broker_effect_fence::EffectScope {
+                        authority_epoch: epoch.clone(),
+                        issuer_epoch: effect.issuer_epoch.clone(),
+                        source: source_identity,
+                    };
+                    if amaterasu_module_sdk::protocol_slot_state::operation_id(
+                        caller, &scope, sequence,
+                    )
+                    .ok()
+                    .as_deref()
                         != Some(effect.operation_id.as_str())
                     {
                         return Err("invalid_protocol_effect");
@@ -114,8 +117,21 @@ impl Pipeline {
             {
                 return Err("scope_denied");
             }
-            // v1 cannot bind a host-issued provider incarnation. Do not issue
-            // a claim, ticket, State write or Arm from this point.
+            let instance = actual
+                .provider_incarnation
+                .as_ref()
+                .ok_or("protocol_authority_unavailable")?;
+            if !(instance.version == 1
+                && instance.id.len() == 32
+                && instance
+                    .id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+            {
+                return Err("protocol_authority_unavailable");
+            }
+            // The selected cleanup approval and issuer/host retirement are
+            // not yet reconciled. Do not issue a claim, State write or Arm.
             Err("protocol_authority_unavailable")
         })();
         complete(

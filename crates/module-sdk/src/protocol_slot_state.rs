@@ -5,46 +5,29 @@
 //! write is reconciled from State and never treated as proof that an older
 //! continuation stopped.
 use crate::{
-    broker_effect_fence::{EffectScope, GuardedEffectIdentity, SourceSlotLease},
+    broker_effect_fence::{
+        EffectScope, GuardedEffectIdentity, SelectedEffectMethod, SourceSlotLease,
+    },
     protocol_state::CleanupReference,
     state::{self, StateLookup, StateMutation, StateRequest},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 const SLOT_COUNT: u8 = 64;
 const WINDOW: usize = 8;
 const MAX_VALUE_BYTES: usize = 12_000;
 
-/// Issued by the trusted host lifecycle for one concrete provider instance.
-/// This identifier is a selector, not a provider's self-asserted credential.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderIncarnation {
-    pub version: u8,
-    pub id: String,
-}
+pub use crate::broker_effect_fence::ProviderIncarnation;
 
-/// Stored selection must contain the original host-issued incarnation. The
-/// actor must compare this with the selected broker method before admission.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RecordedEffectMethod {
-    pub version: u8,
-    pub provider: String,
-    pub method: amaterasu_contracts::ApiMethod,
-    pub provider_incarnation: ProviderIncarnation,
-}
-
-impl ProviderIncarnation {
-    pub fn valid(&self) -> bool {
-        self.version == 1
-            && self.id.len() == 32
-            && self
-                .id
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    }
+fn valid_provider_incarnation(instance: &ProviderIncarnation) -> bool {
+    instance.version == 1
+        && instance.id.len() == 32
+        && instance
+            .id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,7 +40,7 @@ pub struct Entry {
     /// Must be retrieved from the selected host lifecycle, never inferred
     /// from the provider name or copied from client input.
     pub provider_incarnation: ProviderIncarnation,
-    pub selected_method: RecordedEffectMethod,
+    pub selected_method: SelectedEffectMethod,
     pub cleanup_method: crate::extension_api::MethodRef,
     pub cleanup_approval: amaterasu_contracts::ApiMethodApproval,
     pub cleanup: CleanupReference,
@@ -98,6 +81,49 @@ fn digest(value: &str) -> bool {
         && value
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Stable per-incarnation effect identity. Unlike the legacy session journal,
+/// this includes the complete source and the authority-issued issuer epoch.
+pub fn operation_id(
+    caller: &str,
+    scope: &EffectScope,
+    sequence: u64,
+) -> Result<String, &'static str> {
+    if !amaterasu_contracts::valid_name(caller)
+        || sequence == 0
+        || !token(&scope.authority_epoch)
+        || !token(&scope.issuer_epoch)
+    {
+        return Err("invalid_source");
+    }
+    let source: crate::effect_authority::Source =
+        serde_json::from_value(serde_json::to_value(&scope.source).map_err(|_| "invalid_source")?)
+            .map_err(|_| "invalid_source")?;
+    if !source.valid() {
+        return Err("invalid_source");
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"amaterasu.protocol.full-source-sequence/v2\0");
+    for value in [
+        caller,
+        &scope.authority_epoch,
+        &scope.issuer_epoch,
+        &source.id,
+        &source.host_epoch,
+        &source.session_id,
+        &source.stream_id,
+        &source.device,
+        &source.effect_owner_epoch,
+    ] {
+        hash.update((value.len() as u64).to_be_bytes());
+        hash.update(value.as_bytes());
+    }
+    hash.update([source.version]);
+    hash.update(source.generation.to_be_bytes());
+    hash.update(source.stream_generation.to_be_bytes());
+    hash.update(source.device_generation.to_be_bytes());
+    Ok(format!("ps2.{:x}.{sequence}", hash.finalize()))
 }
 fn key(slot: u8) -> Result<String, &'static str> {
     if slot >= SLOT_COUNT {
@@ -140,7 +166,7 @@ fn valid_claim(slot: u8, retired: u64, claim: &Claim) -> bool {
             && effect.scope == claim.scope
             && entry.issued_lease.slot == slot
             && entry.issued_lease.incarnation == claim.lease.incarnation
-            && entry.provider_incarnation.valid()
+            && valid_provider_incarnation(&entry.provider_incarnation)
             && token(&entry.issued_lease.broker_epoch)
             && token(&entry.issued_lease.token)
             && claim.retired_through.checked_add(index as u64 + 1) == Some(effect.sequence)
@@ -148,7 +174,8 @@ fn valid_claim(slot: u8, retired: u64, claim: &Claim) -> bool {
             && crate::protocol_state::CleanupReference::new(entry.cleanup.id.clone()).is_ok()
             && entry.selected_method.version == 1
             && entry.selected_method.provider == effect.provider
-            && entry.selected_method.provider_incarnation == entry.provider_incarnation
+            && entry.selected_method.provider_incarnation.as_ref()
+                == Some(&entry.provider_incarnation)
             && entry.selected_method.method.service == effect.service
             && entry.selected_method.method.method == effect.method
             && entry.selected_method.method.interface_major == effect.interface_major

@@ -2830,26 +2830,48 @@ fn historical_journal_verification_uses_real_selected_state_read() {
         callers: ["issuer".into()].into(),
         method: cleanup_method,
     };
-    let journal = json!({"version":1,"slot":0,"retired_incarnation":0,"pending_close":null,
-        "active":{"lease":lease,"scope":identity.scope,"issuer":"issuer","retired_through":0,"issued_through":1,
-        "entries":[{"identity":identity,"issued_lease":lease,"provider_incarnation":instance,"selected_method":selected,
-        "cleanup_method":{"service":"example.effects/1","method":"cleanup","interface_major":1,"interface_minor":0,"schema_revision":1},
-        "cleanup_approval":cleanup_approval,"cleanup":{"id":"a".repeat(64)},"cleanup_confirmed":false}]}});
+    // Use the actual SDK authority journal encoder, not a hand-written JSON
+    // approximation, to exercise the broker's canonical recovery contract.
+    let read_request = amaterasu_module_sdk::protocol_slot_state::read_request(0).unwrap();
+    let empty = store.handle("authority", read_request.payload());
+    let claim = amaterasu_module_sdk::protocol_slot_state::prepare_claim(
+        &empty,
+        lease.clone(),
+        identity.scope.clone(),
+        "issuer".into(),
+    )
+    .unwrap();
+    let saved = store.handle("authority", claim.request().payload());
+    claim.confirmed(saved).unwrap();
+    let current = store.handle("authority", read_request.payload());
+    let entry = amaterasu_module_sdk::protocol_slot_state::Entry {
+        identity: identity.clone(),
+        issued_lease: lease.clone(),
+        provider_incarnation: instance.clone(),
+        selected_method: selected.clone(),
+        cleanup_method: amaterasu_module_sdk::extension_api::MethodRef {
+            service: "example.effects/1".into(),
+            method: "cleanup".into(),
+            interface_major: 1,
+            interface_minor: 0,
+            schema_revision: 1,
+        },
+        cleanup_approval: cleanup_approval.clone(),
+        cleanup: amaterasu_module_sdk::protocol_state::CleanupReference::new("a".repeat(64))
+            .unwrap(),
+        cleanup_confirmed: false,
+    };
+    let issue =
+        amaterasu_module_sdk::protocol_slot_state::prepare_issue(&current, 0, &lease, entry)
+            .unwrap();
+    let saved = store.handle("authority", issue.request().payload());
+    issue.confirmed(saved).unwrap();
+    let journal = store.handle("authority", read_request.payload())["value"].clone();
     let expected_entry = journal["active"]["entries"][0].clone();
     let mut cleaned_journal = journal.clone();
     cleaned_journal["active"]["entries"][0]["cleanup_confirmed"] = json!(true);
     let cleaned_entry = cleaned_journal["active"]["entries"][0].clone();
     let key = "pairing/protocol-slot/v1/00";
-    let saved = store.handle(
-        "authority",
-        StateRequest::Set {
-            key: key.into(),
-            value: journal,
-            expected_revision: Some(0),
-        }
-        .payload(),
-    );
-    assert_eq!(saved["ok"], true, "journal must be durable before arm");
     assert!(matches!(
         slot_invoke(
             &mut old_broker,
@@ -3126,7 +3148,7 @@ fn historical_journal_verification_uses_real_selected_state_read() {
         StateRequest::Set {
             key: key.into(),
             value: changed_journal,
-            expected_revision: Some(1),
+            expected_revision: Some(2),
         },
         "changed.write",
     );
@@ -3164,7 +3186,7 @@ fn historical_journal_verification_uses_real_selected_state_read() {
         StateRequest::Set {
             key: key.into(),
             value: cleaned_journal,
-            expected_revision: Some(2),
+            expected_revision: Some(3),
         },
         "cleanup.write",
     );
@@ -3213,7 +3235,7 @@ fn historical_journal_verification_uses_real_selected_state_read() {
         StateRequest::Set {
             key: "unrelated".into(),
             value: json!({"revision":2}),
-            expected_revision: Some(3),
+            expected_revision: Some(4),
         },
         "later.write",
     );
@@ -3257,7 +3279,7 @@ fn historical_journal_verification_uses_real_selected_state_read() {
             payload: StateRequest::Set {
                 key: "late".into(),
                 value: json!(true),
-                expected_revision: Some(4),
+                expected_revision: Some(5),
             }
             .payload(),
             timeout_ms: 30_000,
