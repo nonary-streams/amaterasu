@@ -838,3 +838,91 @@ fn own_display_start(session: u64) -> Value {
     request["configuration"]["output"] = json!(crate::pipeline::virtual_display::REQUESTED_OUTPUT);
     request
 }
+
+#[test]
+fn active_create_completion_is_observed_before_retirement_cleanup() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    let record = host.pipeline.records.get_mut(&id).unwrap();
+    record.config.virtual_display_intent = Some(
+        serde_json::from_value(intent(
+            "retire",
+            VirtualDisplayMode::PerClient,
+            VirtualDisplayLayout::Extended,
+        ))
+        .unwrap(),
+    );
+    record.virtual_display_attempted = true;
+    let payload = super::super::virtual_display::create(record);
+    let mut pending = rpc::Pending::new(
+        "amaterasu.virtual-display/1",
+        payload,
+        "completed-create".into(),
+        None,
+    );
+    assert!(matches!(
+        pending.poll(&mut |command| host.broker.send(command), host.now),
+        rpc::Progress::Waiting
+    ));
+    let mut job = Job::new(id, None, Step::CreateVirtualDisplay, u64::MAX);
+    job.pending = Some(pending);
+    host.pipeline.job = Some(job);
+    assert!(
+        host.pipeline
+            .shutdown_with(&mut |command| host.broker.send(command))
+    );
+    assert!(host.pipeline.records[&id].uncertain.is_none());
+    assert!(host.broker.virtual_display_references.is_empty());
+    let calls = actions(&host, "amaterasu.virtual-display/1");
+    assert_eq!(calls.iter().filter(|action| *action == "create").count(), 1);
+    assert!(calls.iter().any(|action| action == "status"));
+    assert!(calls.iter().any(|action| action == "remove"));
+}
+
+#[test]
+fn active_create_with_unknown_outcome_stays_fenced_after_rpc_release() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    let record = host.pipeline.records.get_mut(&id).unwrap();
+    record.config.virtual_display_intent = Some(
+        serde_json::from_value(intent(
+            "retire",
+            VirtualDisplayMode::PerClient,
+            VirtualDisplayLayout::Extended,
+        ))
+        .unwrap(),
+    );
+    record.virtual_display_attempted = true;
+    let payload = super::super::virtual_display::create(record);
+    let mut pending = rpc::Pending::new(
+        "amaterasu.virtual-display/1",
+        payload,
+        "unknown-create".into(),
+        None,
+    );
+    assert!(matches!(
+        pending.poll(&mut |command| host.broker.send(command), host.now),
+        rpc::Progress::Waiting
+    ));
+    let mut job = Job::new(id, None, Step::CreateVirtualDisplay, u64::MAX);
+    job.pending = Some(pending);
+    host.pipeline.job = Some(job);
+    host.broker.fault = Some((
+        "amaterasu.virtual-display/1:create".into(),
+        Fault::AfterMutation,
+    ));
+    assert!(
+        !host
+            .pipeline
+            .shutdown_with(&mut |command| host.broker.send(command))
+    );
+    assert!(
+        !host
+            .pipeline
+            .shutdown_with(&mut |command| host.broker.send(command))
+    );
+    assert!(host.pipeline.records[&id].uncertain.is_some());
+    assert!(!host.broker.virtual_display_references.is_empty());
+    let calls = actions(&host, "amaterasu.virtual-display/1");
+    assert_eq!(calls, ["create"]);
+}

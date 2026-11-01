@@ -310,6 +310,11 @@ impl Pipeline {
         {
             if !pending.was_sent() {
                 record.display_attempted = false;
+            } else if pending.observe_completion(send).is_some() {
+                // Keep the terminal response until owner-scoped display
+                // reconciliation consumes it and releases the RPC.
+                record.uncertain = Some(pending);
+                record.uncertain_step = Some(Step::ApplyDisplay);
             } else {
                 let mut resolved = false;
                 for turn in 0..8 {
@@ -361,6 +366,11 @@ impl Pipeline {
                 if job.step == Step::RemoveVirtualDisplay {
                     record.virtual_display_remove_attempted = false;
                 }
+            } else if pending.observe_completion(send).is_some() {
+                // Do not cancel an available response: the reconciliation
+                // path needs its actual outcome before retiring the effect.
+                record.uncertain = Some(pending);
+                record.uncertain_step = Some(job.step);
             } else {
                 let settled_request = pending.shutdown(send);
                 if !settled_request

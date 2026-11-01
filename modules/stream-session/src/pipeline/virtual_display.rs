@@ -587,14 +587,16 @@ mod owned {
         );
         for turn in 0..8 {
             match pending.poll(send, turn) {
-                rpc::Progress::Result(_) => {
-                    return pending.release_result(send);
+                rpc::Progress::Result(response) => {
+                    let removed = absent(record, &response);
+                    return pending.release_result(send) && removed;
                 }
                 rpc::Progress::Waiting => {}
                 rpc::Progress::Failed | rpc::Progress::Unresolved => break,
             }
         }
-        pending.shutdown(send)
+        let _ = pending.shutdown(send);
+        false
     }
 
     #[cfg(test)]

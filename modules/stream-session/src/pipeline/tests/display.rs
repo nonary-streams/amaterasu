@@ -885,3 +885,70 @@ fn retirement_keeps_unknown_display_apply_fenced_after_rpc_cancellation() {
         ));
     }
 }
+
+#[test]
+fn active_restore_completion_is_observed_before_retirement() {
+    let mut host = Harness::new();
+    let mut request = prepare();
+    request["display_request"] = display_request();
+    let id = host.response(1, request)["session"].as_u64().unwrap();
+    let record = host.pipeline.records.get_mut(&id).unwrap();
+    record.display_status_verified = true;
+    let payload = json!({"action":"restore","lease":record.display_lease});
+    let mut pending = rpc::Pending::new(
+        "amaterasu.display/1",
+        payload,
+        "completed-restore".into(),
+        None,
+    );
+    assert!(matches!(
+        pending.poll(&mut |command| host.broker.send(command), host.now),
+        rpc::Progress::Waiting
+    ));
+    let mut job = Job::new(id, None, Step::RestoreDisplay, u64::MAX);
+    job.pending = Some(pending);
+    host.pipeline.job = Some(job);
+    assert!(
+        host.pipeline
+            .shutdown_with(&mut |command| host.broker.send(command))
+    );
+    assert!(host.pipeline.records[&id].uncertain.is_none());
+    assert!(host.broker.display_lease.is_none());
+}
+
+#[test]
+fn active_restore_with_lost_completion_stays_fenced() {
+    let mut host = Harness::new();
+    let mut request = prepare();
+    request["display_request"] = display_request();
+    let id = host.response(1, request)["session"].as_u64().unwrap();
+    let record = host.pipeline.records.get_mut(&id).unwrap();
+    record.display_status_verified = true;
+    let payload = json!({"action":"restore","lease":record.display_lease});
+    let mut pending = rpc::Pending::new(
+        "amaterasu.display/1",
+        payload,
+        "unknown-restore".into(),
+        None,
+    );
+    assert!(matches!(
+        pending.poll(&mut |command| host.broker.send(command), host.now),
+        rpc::Progress::Waiting
+    ));
+    let mut job = Job::new(id, None, Step::RestoreDisplay, u64::MAX);
+    job.pending = Some(pending);
+    host.pipeline.job = Some(job);
+    host.broker.fault = Some(("amaterasu.display/1:restore".into(), Fault::AfterMutation));
+    assert!(
+        !host
+            .pipeline
+            .shutdown_with(&mut |command| host.broker.send(command))
+    );
+    assert!(
+        !host
+            .pipeline
+            .shutdown_with(&mut |command| host.broker.send(command))
+    );
+    assert!(host.pipeline.records[&id].uncertain.is_some());
+    assert!(host.broker.display_lease.is_none());
+}
