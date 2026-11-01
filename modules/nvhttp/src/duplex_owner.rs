@@ -1,4 +1,4 @@
-//! Isolated, not routed, connection-owner adapter for bounded duplex transfer.
+//! Connection-owner adapter for bounded duplex transfer.
 //!
 //! Trusted composition and the TLS owner establish `Binding`. The caller must
 //! serialize connection effects and observed cancellation on its owner thread.
