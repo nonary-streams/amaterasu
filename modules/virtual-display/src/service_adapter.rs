@@ -119,6 +119,19 @@ struct OperationRecord {
     fenced_by_removal: Option<String>,
 }
 
+impl OperationRecord {
+    /// Confirmed absence or removal is final for this operation's epoch.
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self.reply,
+            Reply::Effect {
+                state: EffectState::Completed | EffectState::Removed | EffectState::Absent,
+                ..
+            }
+        )
+    }
+}
+
 #[derive(Default)]
 pub struct Adapter {
     operations: BTreeMap<(String, String), OperationRecord>,
@@ -146,6 +159,7 @@ impl Adapter {
                 || except == Some(operation_id.as_str())
                 || record.cleanup
                 || record.creation_fenced
+                || record.is_terminal()
             {
                 continue;
             }
@@ -413,6 +427,9 @@ impl<B: Backend> Invocation<'_, B> {
         if original != owner {
             return Self::effect(EffectState::Unknown, None);
         }
+        if record.is_terminal() {
+            return record.reply;
+        }
         if record.creation_fenced && !record.cleanup {
             let reply = self.fenced_creation_status(caller, &record.request);
             if matches!(
@@ -430,10 +447,6 @@ impl<B: Backend> Invocation<'_, B> {
             return reply;
         }
         let reply = match &record.reply {
-            Reply::Effect {
-                state: EffectState::Completed | EffectState::Removed | EffectState::Absent,
-                ..
-            } => record.reply.clone(),
             _ if record.cleanup => self.cleanup_status(caller, owner),
             Reply::Effect {
                 state:
@@ -1417,3 +1430,6 @@ mod tests {
         assert_eq!(backend.remove_calls, 1);
     }
 }
+
+#[cfg(test)]
+mod invariants;

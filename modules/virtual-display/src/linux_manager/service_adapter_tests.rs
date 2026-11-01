@@ -1388,19 +1388,6 @@ fn production_linux_manager_routes_fenced_requests_to_fake_worker_via_broker() {
             ..
         }
     ));
-    assert_eq!(
-        exchange(
-            &mut manager,
-            &mut adapter,
-            &alice,
-            "shared-release-r",
-            Request::ReleaseOperation {
-                owner: shared_r.clone(),
-                operation_id: "shared-r".into()
-            }
-        ),
-        Reply::OperationReleased
-    );
     assert!(matches!(
         exchange(
             &mut manager,
@@ -1444,6 +1431,35 @@ fn production_linux_manager_routes_fenced_requests_to_fake_worker_via_broker() {
             ..
         }
     ));
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "shared-old-r-after-reacquire",
+            Request::Recover {
+                owner: shared_r.clone(),
+                operation_id: "shared-r".into()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Absent,
+            ..
+        }
+    ));
+    assert_eq!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "shared-release-r",
+            Request::ReleaseOperation {
+                owner: shared_r.clone(),
+                operation_id: "shared-r".into()
+            }
+        ),
+        Reply::OperationReleased
+    );
     assert!(matches!(
         exchange(
             &mut manager,
@@ -1507,22 +1523,9 @@ fn production_linux_manager_routes_fenced_requests_to_fake_worker_via_broker() {
             &mut manager,
             &mut adapter,
             &alice,
-            "shared-release-r2",
-            Request::ReleaseOperation {
-                owner: shared_r.clone(),
-                operation_id: "shared-r2".into()
-            }
-        ),
-        Reply::OperationReleased
-    );
-    assert_eq!(
-        exchange(
-            &mut manager,
-            &mut adapter,
-            &alice,
             "shared-release-remove",
             Request::ReleaseOperation {
-                owner: shared_r,
+                owner: shared_r.clone(),
                 operation_id: "remove-r2".into()
             }
         ),
@@ -1579,6 +1582,35 @@ fn production_linux_manager_routes_fenced_requests_to_fake_worker_via_broker() {
             ..
         }
     ));
+    assert!(matches!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "shared-old-r2-after-reacquire",
+            Request::Recover {
+                owner: shared_r.clone(),
+                operation_id: "shared-r2".into()
+            }
+        ),
+        Reply::Effect {
+            state: EffectState::Absent,
+            ..
+        }
+    ));
+    assert_eq!(
+        exchange(
+            &mut manager,
+            &mut adapter,
+            &alice,
+            "shared-release-r2",
+            Request::ReleaseOperation {
+                owner: shared_r.clone(),
+                operation_id: "shared-r2".into()
+            }
+        ),
+        Reply::OperationReleased
+    );
     assert!(matches!(
         exchange(
             &mut manager,
