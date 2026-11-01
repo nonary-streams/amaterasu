@@ -229,7 +229,19 @@ fn encoded_output_association_enforces_selected_carriage_and_identity() {
             framing,
             clock_epoch: [7; 16],
         };
-        let mut association = EncodedMetadataAssociation::new(&input, 1, selection).unwrap();
+        let invalid_selection = EncodedMetadataSelection {
+            stream: 0,
+            ..selection
+        };
+        assert!(matches!(
+            EncodedMetadataAssociation::new(&mut input, 1, invalid_selection),
+            Err(MetadataError::Invalid)
+        ));
+        let mut association = EncodedMetadataAssociation::new(&mut input, 1, selection).unwrap();
+        assert!(matches!(
+            EncodedMetadataAssociation::new(&mut input, 1, selection),
+            Err(MetadataError::Duplicate)
+        ));
         let payload = [1, 2, 3];
         let unit = NegotiatedVideoUnit {
             size: size_of::<NegotiatedVideoUnit>() as u32,
@@ -291,6 +303,10 @@ fn encoded_output_association_enforces_selected_carriage_and_identity() {
         association
             .accept_encoder_output(&unit, &encoded, expected, 1)
             .unwrap();
+        assert!(matches!(
+            EncodedMetadataAssociation::new(&mut input, 1, selection),
+            Err(MetadataError::Duplicate)
+        ));
         assert_eq!(
             association.accept_encoder_output(&unit, &encoded, expected, 1),
             Err(MetadataError::Duplicate)
@@ -368,10 +384,20 @@ fn encoded_output_association_enforces_selected_carriage_and_identity() {
             Err(MetadataError::Foreign)
         );
         association.retire(&unit, &encoded, 1).unwrap();
+        assert!(matches!(
+            EncodedMetadataAssociation::new(&mut input, 1, selection),
+            Err(MetadataError::Duplicate)
+        ));
         assert_eq!(
             association.retire(&unit, &encoded, 1),
             Err(MetadataError::Closed)
         );
+        input.retire(identity().submission_id).unwrap();
+        let mut next = admitted.clone();
+        next.identity.submission_id += 1;
+        let next_bytes = next.encode().unwrap();
+        unsafe { input.prepare(&frame(&next_bytes, next.identity), next.identity, 1) }.unwrap();
+        assert!(EncodedMetadataAssociation::new(&mut input, 1, selection).is_ok());
     }
 }
 

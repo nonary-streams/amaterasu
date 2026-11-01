@@ -63,19 +63,13 @@ pub struct EncodedMetadataAssociation {
 
 impl EncodedMetadataAssociation {
     pub fn new(
-        admission: &FrameMetadataAdmission,
+        admission: &mut FrameMetadataAdmission,
         capability_generation: u64,
         selection: EncodedMetadataSelection,
     ) -> Result<Self, MetadataError> {
-        let frame = admission
-            .pending(capability_generation)?
-            .ok_or(MetadataError::Invalid)?;
-        frame.encoder_options()?;
-        let bundle = FrameMetadataBundle::decode(frame.bytes())?;
         let valid_format =
             |id: EncoderFormatId| id.namespace_id != 0 && id.value != 0 && id.schema != 0;
-        if bundle.identity != frame.identity()
-            || selection.stream == 0
+        if selection.stream == 0
             || selection.generation == 0
             || selection.offer_id == 0
             || selection.clock_epoch == [0; 16]
@@ -84,11 +78,23 @@ impl EncodedMetadataAssociation {
         {
             return Err(MetadataError::Invalid);
         }
+        let (bundle, bytes) = {
+            let frame = admission
+                .pending(capability_generation)?
+                .ok_or(MetadataError::Invalid)?;
+            frame.encoder_options()?;
+            let bundle = FrameMetadataBundle::decode(frame.bytes())?;
+            if bundle.identity != frame.identity() {
+                return Err(MetadataError::Invalid);
+            }
+            (bundle, frame.bytes().to_vec())
+        };
+        admission.claim_output(bundle.identity.submission_id, capability_generation)?;
         Ok(Self {
             selection,
             capability_generation,
             bundle,
-            bytes: frame.bytes().to_vec(),
+            bytes,
             unit_binding: None,
             stage: Stage::Encoder,
         })

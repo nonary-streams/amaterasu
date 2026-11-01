@@ -81,7 +81,12 @@ not consume these tails or enable framer-owned carriage. Codec carriage,
 negotiated client support and real HDR hardware remain separate work.
 
 `EncodedMetadataAssociation` is an opt-in SDK guard for this output-side work.
-It copies the encoder-stage admitted AFM1 bundle, checks the exact selected
+It makes a one-time claim on the pending encoder-stage admission and copies its
+AFM1 bundle. A second claim, including after output application or transport
+retirement, fails. If the association is lost, cancel or retire that submission
+instead of rebuilding the admission and resetting its state. Keep one
+`FrameMetadataAdmission` as the authoritative per-session/source epoch owner;
+separate admission instances do not coordinate with one another. The guard checks the exact selected
 unit and submission/source/configuration identities, preserves the original
 source generation in that bundle, and requires one declared application owner
 through encoder and framer stages before transport. Callers must provide the

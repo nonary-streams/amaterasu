@@ -105,6 +105,7 @@ pub struct PreparedFrameMetadata {
     source_bytes: Vec<u8>,
     outbound_bytes: Vec<u8>,
     stage: MetadataStage,
+    output_claimed: bool,
 }
 /// A borrowed encoder control descriptor. Its nested pointer cannot outlive the
 /// prepared envelope through this safe wrapper.
@@ -264,6 +265,7 @@ impl FrameMetadataAdmission {
             source_bytes: source.to_vec(),
             outbound_bytes: outbound,
             stage: self.policy.stage,
+            output_claimed: false,
         });
         Ok(MetadataAdmissionResult::Prepared)
     }
@@ -278,6 +280,32 @@ impl FrameMetadataAdmission {
             return Err(MetadataError::Stale);
         }
         Ok(self.pending.as_ref())
+    }
+    /// Claim one output association for this admitted submission. A dropped
+    /// association cannot be reconstructed; cancel or retire the submission.
+    pub(super) fn claim_output(
+        &mut self,
+        submission_id: u64,
+        current_capability_generation: u64,
+    ) -> Result<(), MetadataError> {
+        if self.closed {
+            return Err(MetadataError::Closed);
+        }
+        if current_capability_generation != self.policy.capability_generation {
+            return Err(MetadataError::Stale);
+        }
+        let pending = self.pending.as_mut().ok_or(MetadataError::Invalid)?;
+        if pending.identity.submission_id != submission_id {
+            return Err(MetadataError::Foreign);
+        }
+        if pending.stage != MetadataStage::Encoder {
+            return Err(MetadataError::WrongOwner);
+        }
+        if pending.output_claimed {
+            return Err(MetadataError::Duplicate);
+        }
+        pending.output_claimed = true;
+        Ok(())
     }
     /// Mark an accepted or intentionally discarded input as retired exactly once.
     pub fn retire(&mut self, submission_id: u64) -> Result<(), MetadataError> {
