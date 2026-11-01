@@ -23,11 +23,17 @@ const COVER: &[u8] = &[
 #[serde(default, deny_unknown_fields)]
 struct Settings {
     callers: BTreeMap<String, CallerPolicy>,
+    limiter_mode: String,
 }
 
 struct Fixture {
     incarnation: String,
     operations: BTreeMap<(String, String), (String, Option<String>, State)>,
+    limiter_reservations: BTreeMap<
+        (String, String, String),
+        amaterasu_module_sdk::application_library::limiter_target::Request,
+    >,
+    limiter_mode: String,
 }
 
 fn random_token() -> Result<String, &'static str> {
@@ -41,6 +47,8 @@ impl Fixture {
         Ok(Self {
             incarnation: random_token()?,
             operations: BTreeMap::new(),
+            limiter_reservations: BTreeMap::new(),
+            limiter_mode: String::new(),
         })
     }
 }
@@ -91,6 +99,89 @@ impl Provider for Fixture {
         &self.incarnation
     }
 
+    fn supports_limiter_target_v1(&self) -> bool {
+        !self.limiter_mode.is_empty()
+    }
+    fn attest_limiter_target(
+        &mut self,
+        identity: &Identity<'_>,
+        request: &amaterasu_module_sdk::application_library::limiter_target::Request,
+    ) -> Result<amaterasu_module_sdk::application_library::limiter_target::Attestation, &'static str>
+    {
+        use amaterasu_module_sdk::application_library::limiter_target::{Attestation, Stage};
+        if self.limiter_mode.is_empty() || request.application_id != "fixture-game" {
+            return Err("unsupported");
+        }
+        let key = (identity.caller.to_owned(), request.operation_id.clone());
+        let reservation_key = (
+            identity.caller.to_owned(),
+            identity.initiator.to_owned(),
+            request.operation_id.clone(),
+        );
+        match request.stage {
+            Stage::Reserve => {
+                if self.operations.contains_key(&key)
+                    && !self.limiter_reservations.contains_key(&reservation_key)
+                {
+                    return Err("operation_already_started");
+                }
+                if self.limiter_reservations.len() >= 4096
+                    && !self.limiter_reservations.contains_key(&reservation_key)
+                {
+                    return Err("capacity_exhausted");
+                }
+                if self
+                    .limiter_reservations
+                    .get(&reservation_key)
+                    .is_some_and(|previous| previous != request)
+                {
+                    return Err("operation_conflict");
+                }
+                self.limiter_reservations
+                    .insert(reservation_key.clone(), request.clone());
+            }
+            Stage::Running | Stage::Verify => {
+                let mut expected = request.clone();
+                expected.stage = Stage::Reserve;
+                expected.ticket = None;
+                let reserved = if request.stage == Stage::Verify {
+                    identity.caller == identity.initiator
+                        && self
+                            .limiter_reservations
+                            .iter()
+                            .filter(|((caller, _, operation), value)| {
+                                caller == identity.caller
+                                    && operation == &request.operation_id
+                                    && *value == &expected
+                            })
+                            .count()
+                            == 1
+                } else {
+                    self.limiter_reservations.get(&reservation_key) == Some(&expected)
+                };
+                if !reserved
+                    || !self.operations.get(&key).is_some_and(|entry| {
+                        entry.0 == request.application_id
+                            && entry.1 == request.ticket
+                            && entry.2 == State::Running
+                    })
+                {
+                    return Err("execution_mismatch");
+                }
+            }
+        }
+        let mut assertion = Attestation {
+            request: request.clone(),
+            executable_path: "/synthetic/game".into(),
+        };
+        if self.limiter_mode == "mismatch" && request.stage == Stage::Running {
+            assertion.executable_path = "/synthetic/other".into();
+        }
+        if self.limiter_mode == "stale" && request.stage == Stage::Running {
+            assertion.request.provider_incarnation = "stale".into();
+        }
+        Ok(assertion)
+    }
     fn lifecycle(
         &mut self,
         identity: &Identity<'_>,
@@ -178,12 +269,10 @@ impl ManagedModule for Module {
         };
         let settings: Settings =
             serde_json::from_value(payload).map_err(|error| error.to_string())?;
-        let adapter = ProviderAdapter::with_policies(
-            Fixture::new().map_err(str::to_owned)?,
-            SERVICE.into(),
-            settings.callers,
-        )
-        .map_err(str::to_owned)?;
+        let mut fixture = Fixture::new().map_err(str::to_owned)?;
+        fixture.limiter_mode = settings.limiter_mode;
+        let adapter = ProviderAdapter::with_policies(fixture, SERVICE.into(), settings.callers)
+            .map_err(str::to_owned)?;
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
@@ -225,6 +314,70 @@ mod tests {
             payload,
             remaining_ms: 100,
         }
+    }
+
+    #[test]
+    fn limiter_reservation_requires_the_same_broker_owner_and_running_ticket() {
+        use amaterasu_module_sdk::application_library::{
+            limiter_target::{Request, Stage},
+            preflight::PolicyIdentity,
+            v2::ApplicationReference,
+        };
+        let mut fixture = Fixture::new().unwrap();
+        fixture.limiter_mode = "supported".into();
+        let owner = Identity {
+            caller: "launch",
+            initiator: "nvhttp",
+        };
+        let foreign = Identity {
+            caller: "launch",
+            initiator: "foreign",
+        };
+        let mut request = Request {
+            version: 1,
+            stage: Stage::Reserve,
+            operation_id: "operation".into(),
+            application_id: "fixture-game".into(),
+            provider_incarnation: fixture.incarnation.clone(),
+            ticket: None,
+            policy_identity: PolicyIdentity::Library {
+                version: 1,
+                application: ApplicationReference {
+                    library: "games".into(),
+                    id: "opaque".into(),
+                },
+                entry_revision: "entry".into(),
+                policy_revision: "policy".into(),
+                policy_source: Some("source".into()),
+                snapshot_id: "snapshot".into(),
+            },
+        };
+        assert!(fixture.attest_limiter_target(&owner, &request).is_ok());
+        fixture.operations.insert(
+            ("launch".into(), "operation".into()),
+            ("fixture-game".into(), Some("ticket".into()), State::Running),
+        );
+        request.stage = Stage::Running;
+        request.ticket = Some("ticket".into());
+        assert!(fixture.attest_limiter_target(&owner, &request).is_ok());
+        assert!(fixture.attest_limiter_target(&foreign, &request).is_err());
+        request.stage = Stage::Verify;
+        let coordinator = Identity {
+            caller: "launch",
+            initiator: "launch",
+        };
+        assert!(
+            fixture
+                .attest_limiter_target(&coordinator, &request)
+                .is_ok()
+        );
+        assert!(fixture.attest_limiter_target(&foreign, &request).is_err());
+        request.ticket = Some("wrong-ticket".into());
+        assert!(
+            fixture
+                .attest_limiter_target(&coordinator, &request)
+                .is_err()
+        );
     }
 
     #[test]

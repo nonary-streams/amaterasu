@@ -28,6 +28,10 @@ enum Request {
         offset: u64,
     },
     Identity {},
+    LimiterTargetCapabilitiesV1 {},
+    AttestLimiterTargetV1 {
+        request: super::limiter_target::Request,
+    },
     Launch {
         operation_id: String,
         application_id: String,
@@ -88,6 +92,19 @@ pub trait Provider {
     ) -> Result<ArtworkChunk, &'static str>;
     /// Must be unique to this provider incarnation and stable while dispatching.
     fn incarnation(&self) -> &str;
+    /// Explicitly advertise the optional versioned executor-target contract.
+    fn supports_limiter_target_v1(&self) -> bool {
+        false
+    }
+    /// Bind the reserved target to this operation and keep it unchanged through
+    /// the running ticket's retirement. Reject if that guarantee is unavailable.
+    fn attest_limiter_target(
+        &mut self,
+        _identity: &Identity<'_>,
+        _request: &super::limiter_target::Request,
+    ) -> Result<super::limiter_target::Attestation, &'static str> {
+        Err("unsupported")
+    }
     fn lifecycle(
         &mut self,
         identity: &Identity<'_>,
@@ -199,6 +216,8 @@ impl<P: Provider> ProviderAdapter<P> {
             Request::Discover { .. } => policy.discovery && capabilities.discovery,
             Request::Artwork { .. } => policy.artwork && capabilities.artwork,
             Request::Identity { .. }
+            | Request::LimiterTargetCapabilitiesV1 { .. }
+            | Request::AttestLimiterTargetV1 { .. }
             | Request::Launch { .. }
             | Request::Lookup { .. }
             | Request::RecoverStop { .. }
@@ -267,6 +286,20 @@ impl<P: Provider> ProviderAdapter<P> {
                 }
                 Ok(json!({"provider_incarnation":self.provider.incarnation()}))
             }
+            Request::LimiterTargetCapabilitiesV1 {} => {
+                Ok(json!({"version":1,"supported":self.provider.supports_limiter_target_v1()}))
+            }
+            Request::AttestLimiterTargetV1 { request } => request.validate().and_then(|()| {
+                if !self.provider.supports_limiter_target_v1() {
+                    return Err("unsupported");
+                }
+                if self.provider.incarnation() != request.provider_incarnation {
+                    return Err("stale_provider_incarnation");
+                }
+                let assertion = self.provider.attest_limiter_target(&identity, &request)?;
+                assertion.validate_for(&request)?;
+                Ok(json!({"attestation":assertion}))
+            }),
             Request::Launch {
                 operation_id,
                 application_id,

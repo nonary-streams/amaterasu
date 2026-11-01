@@ -135,7 +135,8 @@ pub enum Operation {
         #[serde(default)]
         rtsp_operation_id: Option<String>,
         app_id: String,
-        catalog_revision: u64,
+        #[serde(default)]
+        catalog_revision: Option<u64>,
         #[serde(default)]
         policy_identity:
             Option<amaterasu_module_sdk::application_library::preflight::PolicyIdentity>,
@@ -220,9 +221,15 @@ impl Operation {
                 application_operation_id,
                 app_id,
                 rtsp_operation_id,
+                policy_identity,
+                catalog_revision,
                 ..
             } if !valid_operation_id(application_operation_id)
-                || !valid_app_id(app_id)
+                || !valid_limiter_policy_reference(
+                    app_id,
+                    *catalog_revision,
+                    policy_identity.as_ref(),
+                )
                 || rtsp_operation_id
                     .as_ref()
                     .is_some_and(|id| !valid_operation_id(id)) =>
@@ -2309,6 +2316,34 @@ fn valid_configured_command(command: &ConfiguredCommand) -> bool {
     command.environment.iter().all(|(key, value)| {
         valid_environment_binding(key, value) && keys.insert(key.to_ascii_uppercase())
     })
+}
+
+fn valid_limiter_policy_reference(
+    app_id: &str,
+    revision: Option<u64>,
+    identity: Option<&amaterasu_module_sdk::application_library::preflight::PolicyIdentity>,
+) -> bool {
+    use amaterasu_module_sdk::application_library::preflight::{
+        PolicyIdentity, application_scope_id,
+    };
+    match (revision, identity) {
+        (Some(_), Some(PolicyIdentity::Catalog { version: 1, .. })) => valid_app_id(app_id),
+        (Some(_), None) => valid_app_id(app_id),
+        (
+            None,
+            Some(
+                identity @ PolicyIdentity::Library {
+                    application,
+                    policy_source: Some(_),
+                    ..
+                },
+            ),
+        ) => {
+            identity.validate().is_ok()
+                && application_scope_id(application).ok().as_deref() == Some(app_id)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]

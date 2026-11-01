@@ -67,6 +67,37 @@ fn record_policy_matches(
     }
 }
 
+fn limiter_policy_matches(
+    record: &crate::records::Record,
+    app_id: &str,
+    catalog_revision: Option<u64>,
+    identity: Option<&amaterasu_module_sdk::application_library::preflight::PolicyIdentity>,
+    rtsp_operation_id: Option<&str>,
+) -> bool {
+    match record.catalog_selection {
+        CatalogSelection::Exported => {
+            record.app_id == app_id && record_policy_matches(record, catalog_revision, identity)
+        }
+        CatalogSelection::Library => {
+            let scope = record.library_selection.as_ref().and_then(|selection| {
+                amaterasu_module_sdk::application_library::preflight::application_scope_id(
+                    &selection.application,
+                )
+                .ok()
+            });
+            record.limiter_target_verified
+                && record.provider_ticket.is_some()
+                && record.generic_provider_incarnation.is_some()
+                && record_policy_matches(record, catalog_revision, identity)
+                && scope.as_deref() == Some(app_id)
+                && rtsp_operation_id
+                    .zip(record.display_admission.as_ref())
+                    .is_some_and(|(operation, admission)| operation == admission.rtsp_operation_id)
+        }
+        CatalogSelection::Initiator => false,
+    }
+}
+
 fn display_policy_snapshot(
     global_revision: Option<u64>,
     global_overrides: &BTreeMap<String, Value>,
@@ -451,9 +482,18 @@ fn stream_sequence(application_operation: &str, rtsp_operation: &str) -> Option<
     (application_nonce == stream_nonce && stream_sequence > application_sequence)
         .then_some(stream_sequence)
 }
+struct DeferredLimiterVerification {
+    request: u64,
+    caller: String,
+    initiator: String,
+    remaining_ms: u64,
+    operation: Operation,
+}
 pub struct Pipeline {
     records: Records,
     job: Option<Workflow>,
+    parked_job: Option<Workflow>,
+    deferred_limiter_verification: Option<DeferredLimiterVerification>,
     sequence: u64,
     monitor_after: u64,
     ingress_since_monitor: u8,
@@ -467,6 +507,8 @@ impl Pipeline {
         Ok(Self {
             records: Records::new()?,
             job: None,
+            parked_job: None,
+            deferred_limiter_verification: None,
             sequence: 0,
             monitor_after: 0,
             ingress_since_monitor: 0,
@@ -537,6 +579,9 @@ impl Pipeline {
             "launch_id":record.launch_id,"operation_id":operation_id})
     }
     pub fn tick(&mut self, mut send: impl FnMut(Command) -> Transport) -> ModuleResult<()> {
+        if self.job.is_none() {
+            self.job = self.parked_job.take();
+        }
         if let Some(mut job) = self.job.take() {
             if !job.cleanup && job.request.is_none() {
                 let has_readback = match self.poll_detached_readback(&mut job, &mut send) {
@@ -548,6 +593,17 @@ impl Pipeline {
                         return Err(error);
                     }
                 };
+                if let Some(deferred) = self.deferred_limiter_verification.take() {
+                    self.parked_job = Some(job);
+                    return self.receive(
+                        deferred.request,
+                        &deferred.caller,
+                        &deferred.initiator,
+                        deferred.remaining_ms,
+                        deferred.operation,
+                        &mut send,
+                    );
+                }
                 if has_readback {
                     self.ingress_since_monitor = self.ingress_since_monitor.saturating_add(1);
                     if !job.cleanup && self.ingress_since_monitor < 8 {
@@ -586,7 +642,15 @@ impl Pipeline {
                             record.cleanup_outcome = Outcome::Failed;
                         }
                         if self.settle_outstanding(job.launch_id, &mut send) {
-                            self.dependency_failed(&mut job, "dependency_unavailable", &mut send)?;
+                            if job.step == Step::VerifyActiveLimiterTarget {
+                                self.reject_limiter_verification(&job, &mut send)?;
+                            } else {
+                                self.dependency_failed(
+                                    &mut job,
+                                    "dependency_unavailable",
+                                    &mut send,
+                                )?;
+                            }
                         } else {
                             self.cleanup_failed(
                                 &job,
@@ -771,6 +835,15 @@ impl Pipeline {
                 job.begin_cleanup(record, outcome, None);
                 job.request = Some(id);
             }
+            Ok(operation @ Operation::VerifyFrameLimiterSnapshot {
+                policy_identity: Some(amaterasu_module_sdk::application_library::preflight::PolicyIdentity::Library { .. }),
+                ..
+            }) => {
+                self.deferred_limiter_verification = Some(DeferredLimiterVerification {
+                    request: id, caller, initiator, remaining_ms, operation,
+                });
+            }
+
             Ok(
                 operation @ (Operation::PrepareDisplayAdmission { .. }
                 | Operation::VerifyDisplayAdmission { .. }
@@ -987,11 +1060,7 @@ impl Pipeline {
                 {
                     return complete(send, request, error("preflight_mismatch"));
                 }
-                if frame_limiter_settings
-                    .get("settings")
-                    .and_then(|settings| settings.get("frame_limiter_enable"))
-                    != Some(&Value::Bool(false))
-                    || !valid_frame_limiter_snapshot(&frame_limiter_settings)
+                if !valid_frame_limiter_snapshot(&frame_limiter_settings)
                     || !valid_client_frame_limiter_overrides(&client_frame_limiter_overrides)
                     || !snapshot_matches_application_policy(
                         record,
@@ -1012,7 +1081,7 @@ impl Pipeline {
                         send,
                         request,
                         serde_json::json!({"ok":true,"accepted":true,
-                        "operation_id":operation_id,"policy_identity":policy_identity}),
+                        "operation_id":operation_id,"policy_identity":policy_identity,"executable_path":record.executable_path}),
                     );
                 }
                 let id = record.launch_id;
@@ -1121,7 +1190,9 @@ impl Pipeline {
                 if frame_limiter_settings
                     .get("settings")
                     .and_then(|settings| settings.get("frame_limiter_enable"))
-                    != Some(&Value::Bool(false))
+                    == Some(&Value::Bool(true))
+                    && (record.executable_path.is_none()
+                        || record.generic_provider_incarnation.is_none())
                 {
                     return complete(send, request, error("selected_library_limiter_unavailable"));
                 }
@@ -1616,19 +1687,18 @@ impl Pipeline {
                 let verified = caller == "amaterasu.rtsp"
                     && self.records.values.values().any(|record| {
                         record.owner == "amaterasu.nvhttp"
-                            && record.catalog_selection == CatalogSelection::Exported
+                            && limiter_policy_matches(
+                                record,
+                                &app_id,
+                                catalog_revision,
+                                policy_identity.as_ref(),
+                                rtsp_operation_id.as_deref(),
+                            )
                             && record.preflight_ready
                             && record.preflight_token.is_some()
                             && record.launch_started
                             && record.state == State::Active
                             && record.operation_id == application_operation_id
-                            && record.app_id == app_id
-                            && record.catalog_revision == Some(catalog_revision)
-                            && policy_identity.as_ref().is_none_or(|identity| {
-                                identity == &amaterasu_module_sdk::application_library::preflight::PolicyIdentity::Catalog {
-                                    version: 1, revision: catalog_revision,
-                                }
-                            })
                             && match (&rtsp_operation_id, &record.stream_limiter_snapshot) {
                                 (Some(id), Some(active)) => {
                                     active.rtsp_operation_id == *id
@@ -1657,8 +1727,25 @@ impl Pipeline {
                 if let Some(rtsp_operation_id) = rtsp_operation_id {
                     response["rtsp_operation_id"] = serde_json::json!(rtsp_operation_id);
                 }
+                let selected = matches!(policy_identity,Some(amaterasu_module_sdk::application_library::preflight::PolicyIdentity::Library { .. }));
                 if let Some(identity) = policy_identity {
                     response["policy_identity"] = serde_json::json!(identity);
+                }
+                if selected {
+                    let record = self
+                        .records
+                        .values
+                        .values_mut()
+                        .find(|record| {
+                            record.owner == "amaterasu.nvhttp"
+                                && record.operation_id == application_operation_id
+                        })
+                        .expect("verified selected record");
+                    record.pending_limiter_verification = Some(response);
+                    let mut workflow = Workflow::launch(record.launch_id, request, remaining_ms);
+                    workflow.step = Step::VerifyActiveLimiterTarget;
+                    self.job = Some(workflow);
+                    return Ok(());
                 }
                 complete(send, request, response)
             }
@@ -1817,6 +1904,19 @@ impl Pipeline {
             self.job = Some(workflow);
         }
     }
+    fn reject_limiter_verification(
+        &mut self,
+        job: &Workflow,
+        send: &mut impl FnMut(Command) -> Transport,
+    ) -> ModuleResult<()> {
+        if let Some(record) = self.records.values.get_mut(&job.launch_id) {
+            record.pending_limiter_verification = None;
+        }
+        if let Some(request) = job.request {
+            complete(send, request, error("frame_limiter_snapshot_denied"))?;
+        }
+        Ok(())
+    }
     fn dispatch(
         &mut self,
         job: &mut Workflow,
@@ -1832,12 +1932,18 @@ impl Pipeline {
             return self.finish(job, send);
         }
         if (job.cleanup || job.request.is_some()) && Instant::now() >= job.deadline {
+            if job.step == Step::VerifyActiveLimiterTarget {
+                return self.reject_limiter_verification(job, send);
+            }
             return self.dependency_failed(job, "deadline_exceeded", send);
         }
         if !job.cleanup
             && let Some(request) = job.request
             && !matches!(send(Command::CheckRequest { request }), Ok(Response::Ok))
         {
+            if job.step == Step::VerifyActiveLimiterTarget {
+                return self.reject_limiter_verification(job, send);
+            }
             job.begin_cleanup(
                 self.records
                     .values
@@ -1908,6 +2014,9 @@ impl Pipeline {
             return self.consume_cleanup(job, payload, send);
         }
         if payload["ok"] != true {
+            if job.step == Step::VerifyActiveLimiterTarget {
+                return self.reject_limiter_verification(job, send);
+            }
             if job.step == Step::Library {
                 return self.dependency_failed(job, crate::library::rejection_code(&payload), send);
             }
@@ -1994,14 +2103,121 @@ impl Pipeline {
                 {
                     return self.dependency_failed(job, "policy_revision_conflict", send);
                 }
-                record.streaming_policy_accepted = true;
+                if record
+                    .frame_limiter_settings
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.get("settings"))
+                    .and_then(|settings| settings.get("frame_limiter_enable"))
+                    == Some(&Value::Bool(true))
+                {
+                    job.step = Step::IdentifyLimiterProvider;
+                } else {
+                    record.streaming_policy_accepted = true;
+                    return complete(
+                        send,
+                        job.request.expect("streaming acceptance request"),
+                        serde_json::json!({"ok":true,"accepted":true,"operation_id":record.operation_id,"policy_identity":record.library_policy_identity,"executable_path":record.executable_path}),
+                    );
+                }
+            }
+            Step::IdentifyLimiterProvider => {
+                record.generic_provider_incarnation = Some(
+                    match crate::provider_evidence::provider_incarnation(&payload) {
+                        Ok(value) => value,
+                        Err(code) => return self.dependency_failed(job, code, send),
+                    },
+                );
+                job.step = Step::CheckLimiterCapability;
+            }
+            Step::CheckLimiterCapability => {
+                if payload["ok"] != true || payload["version"] != 1 || payload["supported"] != true
+                {
+                    return self.dependency_failed(
+                        job,
+                        "selected_library_limiter_unavailable",
+                        send,
+                    );
+                }
+                job.step = Step::ReserveLimiterTarget;
+            }
+            Step::VerifyActiveLimiterTarget => {
+                use amaterasu_module_sdk::application_library::limiter_target::{
+                    Attestation, Stage,
+                };
+                let expected = match crate::workflow::limiter_target_request(record, Stage::Verify)
+                {
+                    Ok(value) => value,
+                    Err(_) => return self.reject_limiter_verification(job, send),
+                };
+                let assertion: Attestation =
+                    match serde_json::from_value(payload["attestation"].clone()) {
+                        Ok(value) => value,
+                        Err(_) => return self.reject_limiter_verification(job, send),
+                    };
+                if record.state != State::Active
+                    || !record.limiter_target_verified
+                    || assertion.validate_for(&expected).is_err()
+                    || record.executable_path.as_deref() != Some(assertion.executable_path.as_str())
+                {
+                    return self.reject_limiter_verification(job, send);
+                }
+                let Some(response) = record.pending_limiter_verification.take() else {
+                    return self.reject_limiter_verification(job, send);
+                };
                 return complete(
                     send,
-                    job.request.expect("streaming acceptance request"),
-                    serde_json::json!({
-                    "ok":true,"accepted":true,"operation_id":record.operation_id,
-                    "policy_identity":record.library_policy_identity}),
+                    job.request.expect("limiter verification request"),
+                    response,
                 );
+            }
+            Step::ReserveLimiterTarget | Step::VerifyLimiterTarget => {
+                use amaterasu_module_sdk::application_library::limiter_target::{
+                    Attestation, Stage,
+                };
+                let stage = if job.step == Step::ReserveLimiterTarget {
+                    Stage::Reserve
+                } else {
+                    Stage::Running
+                };
+                let expected = crate::workflow::limiter_target_request(record, stage)?;
+                let attestation: Attestation =
+                    match serde_json::from_value(payload["attestation"].clone()) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            return self.dependency_failed(job, "limiter_target_unavailable", send);
+                        }
+                    };
+                if payload["ok"] != true
+                    || attestation.validate_for(&expected).is_err()
+                    || !crate::protocol::valid_native_path(&attestation.executable_path)
+                {
+                    return self.dependency_failed(job, "limiter_target_unavailable", send);
+                }
+                if job.step == Step::ReserveLimiterTarget {
+                    if record
+                        .preflight_deadline
+                        .is_none_or(|deadline| Instant::now() >= deadline)
+                    {
+                        return self.dependency_failed(job, "preflight_expired", send);
+                    }
+                    record.executable_path = Some(attestation.executable_path);
+                    record.streaming_policy_accepted = true;
+                    return complete(
+                        send,
+                        job.request.expect("streaming acceptance request"),
+                        serde_json::json!({"ok":true,"accepted":true,"operation_id":record.operation_id,"policy_identity":record.library_policy_identity,"executable_path":record.executable_path}),
+                    );
+                }
+                if record.executable_path.as_deref() != Some(attestation.executable_path.as_str()) {
+                    return self.dependency_failed(job, "limiter_target_mismatch", send);
+                }
+                record.limiter_target_verified = true;
+                if record.return_on_admission
+                    && let Some(request) = job.request.take()
+                {
+                    complete(send, request, record.response())?;
+                }
+                job.step = Step::Activate;
             }
             Step::StreamingPolicy => {
                 if !serde_json::to_vec(&payload).is_ok_and(|bytes| {
@@ -2419,12 +2635,18 @@ impl Pipeline {
                 }
             }
             Step::IdentifyProvider => {
-                record.generic_provider_incarnation = Some(
-                    match crate::provider_evidence::provider_incarnation(&payload) {
-                        Ok(incarnation) => incarnation,
-                        Err(code) => return self.dependency_failed(job, code, send),
-                    },
-                );
+                let incarnation = match crate::provider_evidence::provider_incarnation(&payload) {
+                    Ok(value) => value,
+                    Err(code) => return self.dependency_failed(job, code, send),
+                };
+                if record
+                    .generic_provider_incarnation
+                    .as_ref()
+                    .is_some_and(|reserved| reserved != &incarnation)
+                {
+                    return self.dependency_failed(job, "provider_incarnation_changed", send);
+                }
+                record.generic_provider_incarnation = Some(incarnation);
                 job.step = Step::StartProvider;
             }
             Step::StartProvider | Step::MonitorProvider => {
@@ -2442,12 +2664,18 @@ impl Pipeline {
                     ProviderState::Running
                         if job.step == Step::StartProvider || record.state == State::Starting =>
                     {
-                        if record.return_on_admission
-                            && let Some(request) = job.request.take()
+                        if record.catalog_selection == CatalogSelection::Library
+                            && record.executable_path.is_some()
                         {
-                            complete(send, request, record.response())?;
+                            job.step = Step::VerifyLimiterTarget;
+                        } else {
+                            if record.return_on_admission
+                                && let Some(request) = job.request.take()
+                            {
+                                complete(send, request, record.response())?;
+                            }
+                            job.step = Step::Activate;
                         }
-                        job.step = Step::Activate;
                     }
                     ProviderState::Running => return Ok(()),
                     ProviderState::Stopped | ProviderState::LaunchFailed if evidence.retired => {

@@ -249,23 +249,26 @@ its artwork bridge is not implemented.
 This is source work in progress, not evidence of a complete production streaming
 composition. Pairing and host-configuration revocation require the separate
 live authority fence/drain adapter and must not be replaced by the ordinary
-snapshot. The selected policy freezes global and application preparation together at
-admission, including per-application exclusion of global steps. It fails closed
-when an effective frame limiter is enabled because there is no generic
-executable-target limiter contract. A Linux composition test exercises the real
-NVHTTP router, Launch, RTSP, pairing and lifecycle entrypoints with independently
-built replacement library
-and policy implementations and synthetic hardware. It covers stale policy,
-foreign-owner tokens, display rejection, cancellation and preparation failure.
-It injects transport trust and does not test live pairing or host-configuration
-revocation; those authority-fence cases remain required before integration.
-The executor lifecycle observation currently reports an opaque application ID,
-provider incarnation and ticket, but no attested limiter target. The existing
-limiter verifier requires a numeric catalog revision and executable path. Selected
-limiting needs an additive executor target-attestation contract bound to the same
-source-qualified policy, operation, incarnation and ticket, plus tagged Launch
-and RTSP verification and replacement-provider coverage. A library ID or a
-client-supplied path cannot establish that target. Until that contract is wired,
-selected launches with an effective limiter are rejected before effects.
+snapshot. The selected policy freezes global and application preparation at
+admission, including per-application exclusion of global steps. For an enabled
+limiter, the selected executor must advertise the versioned target-attestation
+capability. It reserves an executable target for the exact operation, provider
+incarnation and tagged policy, then confirms the same target against the running
+execution ticket before Launch marks the application active. At stream
+activation, Launch rechecks the same running ticket and target with the executor
+before RTSP proceeds. The recheck is coordinator-self-initiated, so the selected
+executor must allow both the authenticated transport initiator and the Launch
+coordinator for this contract. Executors that do not implement the capability
+fail closed; native provider assertions remain trusted component assertions,
+not a sandbox.
+
+A Linux composition test exercises the real NVHTTP router, Launch, RTSP, pairing
+and lifecycle entrypoints with independently built library, policy and executor
+implementations and synthetic hardware. It covers attested limiter replacement,
+stale and mismatched targets, foreign-owner tokens, stale policy, display
+rejection, cancellation and preparation failure. It injects transport trust and
+does not test live pairing or host-configuration revocation; those
+security-fence cases remain required before integration. Selected-library resume
+and its new-stream display admission still require qualification.
 
 No installed grants or live settings are changed by this work.

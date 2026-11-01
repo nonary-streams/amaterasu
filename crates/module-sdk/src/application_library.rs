@@ -418,6 +418,8 @@ mod provider_tests {
 
 /// Startup-selected opaque artwork routing and shared wire validation.
 pub mod artwork;
+/// Executor-attested target for selected streaming limiter operations.
+pub mod limiter_target;
 /// Private, selected application-policy resolver profile.
 pub mod policy;
 pub mod preflight;

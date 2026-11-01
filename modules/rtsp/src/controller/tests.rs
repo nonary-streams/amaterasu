@@ -2258,6 +2258,8 @@ fn play_verifies_the_frozen_launch_snapshot_before_starting_the_stream() {
         "lifecycle_exact",
         "lifecycle_missing",
         "lifecycle_wrong",
+        "selected_exact",
+        "selected_wrong_identity",
     ] {
         let mut controller = Controller::new(Settings::default()).unwrap();
         let mut record = record(State::Ready);
@@ -2288,7 +2290,18 @@ fn play_verifies_the_frozen_launch_snapshot_before_starting_the_stream() {
         record.config.application_operation_id = Some("launch-one".into());
         record.config.app_id = Some("app-0000000000000001".into());
         record.config.catalog_revision = Some(7);
-        if case.starts_with("lifecycle_") {
+        if case.starts_with("selected_") {
+            let identity = json!({"source":"library","version":1,"application":{"library":"games","id":"opaque/game"},"entry_revision":"entry:opaque","policy_revision":"policy:opaque","policy_source":"primary","snapshot_id":"snapshot"});
+            record.config.policy_identity = Some(serde_json::from_value(identity).unwrap());
+            record.config.catalog_revision = None;
+            record.config.app_id = Some(
+                amaterasu_module_sdk::application_library::preflight::application_scope_id(
+                    &serde_json::from_value(json!({"library":"games","id":"opaque/game"})).unwrap(),
+                )
+                .unwrap(),
+            );
+        }
+        if case.starts_with("lifecycle_") || case.starts_with("selected_") {
             record.config.lifecycle_session_target = Some(serde_json::from_value(json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1})).unwrap());
             record.config.lifecycle_settings_revision = Some("7".into());
             record.config.lifecycle_intent = Some("resume".into());
@@ -2314,6 +2327,15 @@ fn play_verifies_the_frozen_launch_snapshot_before_starting_the_stream() {
             "frame_limiter_settings":snapshot,
             "frame_limiter_executable_path":"C:\\Games\\Example.exe",
         });
+        if case.starts_with("selected_") {
+            reply["app_id"] = json!(controller.records[&ticket].config.app_id);
+            reply["catalog_revision"] = Value::Null;
+            reply["policy_identity"] = json!(controller.records[&ticket].config.policy_identity);
+            reply["rtsp_operation_id"] = json!("caller-operation");
+            if case == "selected_wrong_identity" {
+                reply["policy_identity"]["snapshot_id"] = json!("foreign");
+            }
+        }
         match case {
             "wrong_operation" => reply["application_operation_id"] = json!("other-launch"),
             "wrong_app" => reply["app_id"] = json!("app-0000000000000002"),
@@ -2339,9 +2361,25 @@ fn play_verifies_the_frozen_launch_snapshot_before_starting_the_stream() {
         });
         let launch_request = launch_request.expect("Launch verification precedes stream start");
         assert_eq!(launch_request["action"], "verify_frame_limiter_snapshot");
-        assert_eq!(launch_request["app_id"], "app-0000000000000001");
-        assert_eq!(launch_request["catalog_revision"], 7);
-        if case.starts_with("lifecycle_") {
+        if case.starts_with("selected_") {
+            assert_eq!(
+                launch_request["app_id"],
+                controller.records[&ticket]
+                    .config
+                    .app_id
+                    .as_deref()
+                    .unwrap()
+            );
+            assert!(launch_request["catalog_revision"].is_null());
+            assert_eq!(
+                launch_request["policy_identity"],
+                json!(controller.records[&ticket].config.policy_identity)
+            );
+        } else {
+            assert_eq!(launch_request["app_id"], "app-0000000000000001");
+            assert_eq!(launch_request["catalog_revision"], 7);
+        }
+        if case.starts_with("lifecycle_") || case.starts_with("selected_") {
             assert_eq!(launch_request["rtsp_operation_id"], "caller-operation");
         } else {
             assert!(launch_request.get("rtsp_operation_id").is_none());
@@ -2354,7 +2392,7 @@ fn play_verifies_the_frozen_launch_snapshot_before_starting_the_stream() {
         if case != "unavailable" {
             controller.advance_job(&runtime, 2);
         }
-        if case == "lifecycle_exact" {
+        if case == "lifecycle_exact" || case == "selected_exact" {
             assert!(
                 controller
                     .job
@@ -2706,7 +2744,12 @@ fn selected_library_open_verifies_tagged_policy_before_preparing_stream() {
         controller.local = Some("127.0.0.1:47984".parse().unwrap());
         controller.locals = vec![controller.local.unwrap()];
         let mut config = attested_open();
-        config.app_id = Some("app-0000000000000001".into());
+        config.app_id = Some(
+            amaterasu_module_sdk::application_library::preflight::application_scope_id(
+                &serde_json::from_value(json!({"library":"games","id":"opaque/game"})).unwrap(),
+            )
+            .unwrap(),
+        );
         config.catalog_revision = None;
         config.policy_identity = Some(identity.clone());
         config.display_request = None;
@@ -2718,6 +2761,9 @@ fn selected_library_open_verifies_tagged_policy_before_preparing_stream() {
             .unwrap();
         snapshot.remove("catalog_revision");
         snapshot.insert("policy_identity".into(), json!(identity));
+        let mut foreign = config.clone();
+        foreign.app_id = Some("library-foreign".into());
+        assert_eq!(foreign.validate(false), Err("invalid_policy_identity"));
         config.validate(false).unwrap();
         let digest = config.display_request_sha256().unwrap();
         let mut endpoint = Endpoint {

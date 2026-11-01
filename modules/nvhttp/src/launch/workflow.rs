@@ -769,7 +769,16 @@ impl Controller {
                 || record.selected_application.is_some())
         {
             payload["application_operation_id"] = json!(record.application_operation);
-            payload["app_id"] = json!(app_id(record.request.app_id));
+            payload["app_id"] = if let Some(selected) = &record.selected_application {
+                json!(
+                    amaterasu_module_sdk::application_library::preflight::application_scope_id(
+                        &selected.application
+                    )
+                    .expect("validated selected application")
+                )
+            } else {
+                json!(app_id(record.request.app_id))
+            };
             if let Some(identity) = &record.policy_identity {
                 payload["policy_identity"] = json!(identity);
             } else {
@@ -1128,7 +1137,10 @@ impl Controller {
                     && payload["accepted"] == true
                     && payload["operation_id"] == record.application_operation
                     && payload.get("policy_identity") == Some(&json!(record.policy_identity))
+                    && accepted_limiter_target(record, &payload).is_ok()
                 {
+                    record.executable_path =
+                        accepted_limiter_target(record, &payload).expect("validated target");
                     record.stage = record
                         .streaming_next_stage
                         .take()
@@ -2415,6 +2427,30 @@ fn capture_source_for<'a>(
         return Err("invalid_capture_output");
     }
     Ok(source)
+}
+
+fn accepted_limiter_target(
+    record: &Record,
+    payload: &Value,
+) -> Result<Option<String>, &'static str> {
+    let enabled = record
+        .frame_limiter_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.get("settings"))
+        .and_then(|settings| settings.get("frame_limiter_enable"))
+        == Some(&Value::Bool(true));
+    match payload.get("executable_path") {
+        None | Some(Value::Null) if !enabled => Ok(None),
+        Some(Value::String(path))
+            if enabled
+                && path.len() <= 1024
+                && !path.chars().any(char::is_control)
+                && std::path::Path::new(path).is_absolute() =>
+        {
+            Ok(Some(path.clone()))
+        }
+        _ => Err("invalid_limiter_target"),
+    }
 }
 
 #[cfg(test)]

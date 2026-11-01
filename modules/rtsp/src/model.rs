@@ -782,19 +782,22 @@ impl Open {
                     revision,
                 } => Some(*revision) == self.catalog_revision,
                 PolicyIdentity::Library {
+                    application,
                     policy_source: Some(_),
                     ..
-                } => {
-                    self.catalog_revision.is_none()
-                        && self.frame_limiter_settings.is_none()
-                        && self
-                            .display_policy_snapshot
-                            .as_ref()
-                            .is_some_and(|snapshot| {
-                                snapshot.get("policy_identity")
-                                    == Some(&serde_json::json!(identity))
-                            })
-                }
+                } => self.catalog_revision.is_none()
+                    && amaterasu_module_sdk::application_library::preflight::application_scope_id(
+                        application,
+                    )
+                    .ok()
+                    .as_deref()
+                        == self.app_id.as_deref()
+                    && self
+                        .display_policy_snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| {
+                            snapshot.get("policy_identity") == Some(&serde_json::json!(identity))
+                        }),
                 _ => false,
             };
             if identity.validate().is_err() || !consistent {
@@ -824,6 +827,13 @@ impl Open {
                         .is_some_and(|snapshot| {
                             snapshot["catalog_revision"].as_u64() == Some(revision)
                         }) => {}
+            (Some(_), Some(app_id), None)
+                if valid_name(app_id)
+                    && self
+                        .application_operation_id
+                        .as_deref()
+                        .is_some_and(valid_name)
+                    && matches!(self.policy_identity, Some(PolicyIdentity::Library { .. })) => {}
             (None, Some(app_id), None)
                 if self.display_admission_required()
                     && valid_name(app_id)

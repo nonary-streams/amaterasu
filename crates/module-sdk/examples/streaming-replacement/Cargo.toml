@@ -13,3 +13,4 @@ crate-type = ["cdylib"]
 amaterasu-module-sdk = { path = "../.." }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+getrandom = "0.3"
