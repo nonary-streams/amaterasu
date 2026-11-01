@@ -77,6 +77,7 @@ enum ChildOutcome {
 pub struct Pipeline {
     trusted_root: Result<PathBuf, String>,
     pending: Option<Pending>,
+    concurrent_read: Option<Pending>,
 }
 
 impl Pipeline {
@@ -84,6 +85,7 @@ impl Pipeline {
         Self {
             trusted_root,
             pending: None,
+            concurrent_read: None,
         }
     }
 
@@ -91,13 +93,31 @@ impl Pipeline {
         if let Some(pending) = self.pending.take() {
             self.advance(pending, &mut send)?;
         }
-        if self.pending.is_none() {
-            self.receive(&mut send)?;
+        let primary = self.pending.take();
+        if let Some(read) = self.concurrent_read.take() {
+            self.advance(read, &mut send)?;
+            self.concurrent_read = self.pending.take();
+        }
+        self.pending = primary;
+        if self.concurrent_read.is_none() {
+            if self.pending.is_some() {
+                let primary = self.pending.take();
+                let result = self.receive(true, &mut send);
+                self.concurrent_read = self.pending.take();
+                self.pending = primary;
+                result?;
+            } else {
+                self.receive(false, &mut send)?;
+            }
         }
         Ok(())
     }
 
-    fn receive(&mut self, send: &mut impl FnMut(Command) -> TransportResult) -> ModuleResult<()> {
+    fn receive(
+        &mut self,
+        read_only: bool,
+        send: &mut impl FnMut(Command) -> TransportResult,
+    ) -> ModuleResult<()> {
         match send(Command::Poll {})? {
             Response::Pending => Ok(()),
             Response::Request {
@@ -131,6 +151,9 @@ impl Pipeline {
                             "only amaterasu.management may update host configuration",
                         ),
                     );
+                }
+                if read_only && matches!(operation, Operation::Update { .. }) {
+                    return complete(send, id, error("busy", "configuration update is pending"));
                 }
                 if let Some(settings) = operation.settings()
                     && let Err(message) = settings.validate()

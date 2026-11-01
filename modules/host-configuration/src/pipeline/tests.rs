@@ -1051,3 +1051,135 @@ fn preflight_rejects_later_unready_and_malformed_diagnostics_status() {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[test]
+fn real_broker_reads_authoritative_configuration_while_update_waits() {
+    use amaterasu_contracts::{Grants, RuntimeConfig};
+    use amaterasu_runtime::Broker;
+    use amaterasu_state::test_support::TestStateStore;
+
+    let root = test_root();
+    let state = TestStateStore::open(root.join("state")).unwrap();
+    let mut config = RuntimeConfig::default();
+    for (principal, provides, calls) in [
+        (
+            "amaterasu.host-configuration",
+            vec![crate::SERVICE],
+            vec![crate::STATE_SERVICE, DIAGNOSTICS_SERVICE],
+        ),
+        ("state", vec![crate::STATE_SERVICE], vec![]),
+        ("diagnostics", vec![DIAGNOSTICS_SERVICE], vec![]),
+        (
+            "amaterasu.management",
+            vec![],
+            vec![crate::SERVICE, crate::STATE_SERVICE, DIAGNOSTICS_SERVICE],
+        ),
+        (
+            "amaterasu.pairing",
+            vec![],
+            vec![crate::SERVICE, crate::STATE_SERVICE],
+        ),
+    ] {
+        config.principals.insert(
+            principal.into(),
+            Grants {
+                provide: provides.into_iter().map(str::to_owned).collect(),
+                call: calls.into_iter().map(str::to_owned).collect(),
+                ..Default::default()
+            },
+        );
+    }
+    let mut broker = Broker::new(config).unwrap();
+    for (provider, service) in [
+        ("amaterasu.host-configuration", crate::SERVICE),
+        ("state", crate::STATE_SERVICE),
+        ("diagnostics", DIAGNOSTICS_SERVICE),
+    ] {
+        assert!(matches!(
+            broker.dispatch(
+                provider,
+                Command::Register {
+                    service: service.into()
+                }
+            ),
+            Response::Ok
+        ));
+    }
+    let submit = |payload: Value, operation: &str| Command::Request {
+        service: crate::SERVICE.into(),
+        payload,
+        timeout_ms: 30_000,
+        operation_id: operation.into(),
+        parent: None,
+    };
+    let Response::Accepted { id: update } = broker.dispatch(
+        "amaterasu.management",
+        submit(
+            json!({
+                "action":"update","expected_revision":0,
+                "file_state":"state.json","vibeshine_file_state":"legacy.json",
+                "credentials_file":"","pkey":"key.pem","cert":"cert.pem",
+                "log_path":"service.log","min_log_level":"warning"
+            }),
+            "pending-update",
+        ),
+    ) else {
+        panic!("update not accepted")
+    };
+    let mut pipeline = Pipeline::new(Ok(root.clone()));
+    let tick = |pipeline: &mut Pipeline, broker: &mut Broker| {
+        pipeline
+            .tick(|command| Ok(broker.dispatch("amaterasu.host-configuration", command)))
+            .unwrap()
+    };
+    let serve_state = |broker: &mut Broker| {
+        let Response::Request {
+            id,
+            caller,
+            payload,
+            ..
+        } = broker.dispatch("state", Command::Poll {})
+        else {
+            panic!("state request not delivered")
+        };
+        let payload = state.handle(&caller, payload);
+        assert!(matches!(
+            broker.dispatch(
+                "state",
+                Command::Complete {
+                    request: id,
+                    payload
+                }
+            ),
+            Response::Ok
+        ));
+    };
+    tick(&mut pipeline, &mut broker);
+    serve_state(&mut broker);
+    tick(&mut pipeline, &mut broker);
+    assert!(matches!(
+        broker.dispatch("diagnostics", Command::Poll {}),
+        Response::Request { .. }
+    ));
+    let Response::Accepted { id: read } = broker.dispatch(
+        "amaterasu.pairing",
+        submit(json!({"action":"get"}), "concurrent-read"),
+    ) else {
+        panic!("read not accepted")
+    };
+    tick(&mut pipeline, &mut broker);
+    serve_state(&mut broker);
+    tick(&mut pipeline, &mut broker);
+    assert!(
+        matches!(broker.dispatch("amaterasu.pairing", Command::TakeResult { request: read }), Response::Result { payload } if payload["ok"] == true && payload["revision"] == 0)
+    );
+    assert!(matches!(
+        broker.dispatch(
+            "amaterasu.management",
+            Command::TakeResult { request: update }
+        ),
+        Response::Pending
+    ));
+    drop(state);
+    std::fs::remove_dir_all(root).unwrap();
+}

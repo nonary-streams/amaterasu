@@ -419,7 +419,10 @@ dependencies = [
 name = "amaterasu-host-configuration"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-contracts",
  "amaterasu-module-sdk",
+ "amaterasu-runtime",
+ "amaterasu-state",
  "serde",
  "serde_json",
 ]
