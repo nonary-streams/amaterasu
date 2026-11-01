@@ -491,7 +491,12 @@ impl EffectGate {
         }
         Ok((
             &admission.ticket,
-            self.fenced || self.retired_sources.contains_key(source),
+            self.fenced
+                || self.retired_sources.contains_key(source)
+                || self
+                    .lease_receipts
+                    .values()
+                    .any(|receipt| receipt_matches_transport(receipt, scope)),
         ))
     }
 

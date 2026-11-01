@@ -5322,3 +5322,114 @@ fn nvhttp_reconciles_wide_owner_operation_ids_through_real_broker() {
         assert!(retired);
     }
 }
+
+#[test]
+fn broker_lost_lease_lookup_reports_shared_transport_retirement() {
+    let (mut pipeline, _state, _certificate, epoch, first, first_scope) =
+        authorized_feedback_for_test();
+    let mut broker = authority_broker();
+    let mut next = 0_u64;
+    let mut call = |pipeline: &mut Pipeline, caller: &str, payload: Value| {
+        next += 1;
+        let Response::Accepted { id } = broker.dispatch(
+            caller,
+            Command::Request {
+                service: EFFECT_SERVICE.into(),
+                payload,
+                timeout_ms: 30_000,
+                operation_id: format!("retired-transport-lookup-{next}"),
+                parent: None,
+            },
+        ) else {
+            panic!("request rejected")
+        };
+        pipeline
+            .tick_at(now(), |command| Ok(broker.dispatch("pairing", command)))
+            .unwrap();
+        let Response::Result { payload } =
+            broker.dispatch(caller, Command::TakeResult { request: id })
+        else {
+            panic!("missing result")
+        };
+        assert!(matches!(
+            broker.dispatch(caller, Command::ReleaseResult { request: id }),
+            Response::Ok
+        ));
+        payload
+    };
+    let mut second = first.clone();
+    second["id"] = json!("b".repeat(32));
+    second["device"] = json!("second");
+    let mut second_scope = first_scope.clone();
+    second_scope["controller_slot"] = json!(1);
+    let mut other = first.clone();
+    other["id"] = json!("d".repeat(32));
+    other["device"] = json!("other");
+    let mut other_scope = first_scope.clone();
+    other_scope["controller_slot"] = json!(2);
+    other_scope["transport_stream"] = json!(8);
+    for (source, scope) in [(&second, &second_scope), (&other, &other_scope)] {
+        assert_eq!(
+            call(
+                &mut pipeline,
+                "nvhttp",
+                json!({"action":"bind_stream","epoch":epoch,"certificate_pem":CLIENT_CERT,"source":source,"scope":scope})
+            )["ok"],
+            true
+        );
+    }
+    let first_lease = call(
+        &mut pipeline,
+        "input",
+        json!({"action":"admit_stream_lease","epoch":epoch,"source":first,"scope":first_scope,"operation_id":"first-lease","sequence":1}),
+    );
+    let second_lease = call(
+        &mut pipeline,
+        "input",
+        json!({"action":"admit_stream_lease","epoch":epoch,"source":second,"scope":second_scope,"operation_id":"second-lease","sequence":2}),
+    );
+    let other_lease = call(
+        &mut pipeline,
+        "input",
+        json!({"action":"admit_stream_lease","epoch":epoch,"source":other,"scope":other_scope,"operation_id":"other-lease","sequence":3}),
+    );
+    let receipt = json!({"ok":true,"service":"amaterasu.control-transport/1","stream":7,"provider_epoch":"c".repeat(32),"operation_id":"transport-retire","scope":"whole_control_stream","state":"retired"});
+    assert_eq!(
+        call(
+            &mut pipeline,
+            "input",
+            json!({"action":"complete_stream_lease","epoch":epoch,"operation_id":"first-lease","ticket":first_lease["ticket"],"retirement":receipt})
+        )["ok"],
+        true
+    );
+    let lookup = call(
+        &mut pipeline,
+        "input",
+        json!({"action":"lookup_stream_lease","epoch":epoch,"source":second,"scope":second_scope,"operation_id":"second-lease"}),
+    );
+    assert_eq!(lookup["ticket"], second_lease["ticket"]);
+    assert_eq!(lookup["fenced"], true);
+    let lookup_other = call(
+        &mut pipeline,
+        "input",
+        json!({"action":"lookup_stream_lease","epoch":epoch,"source":other,"scope":other_scope,"operation_id":"other-lease"}),
+    );
+    assert_eq!(lookup_other["ticket"], other_lease["ticket"]);
+    assert_eq!(lookup_other["fenced"], false);
+    assert_eq!(
+        call(
+            &mut pipeline,
+            "input",
+            json!({"action":"complete_stream_lease","epoch":epoch,"operation_id":"second-lease","ticket":second_lease["ticket"],"retirement":receipt})
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        call(
+            &mut pipeline,
+            "input",
+            json!({"action":"acknowledge","epoch":epoch,"operation_id":"second-lease","ticket":second_lease["ticket"]})
+        )["ok"],
+        true
+    );
+}
