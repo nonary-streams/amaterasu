@@ -261,6 +261,19 @@ pub trait ManagedModule: Sized {
     }
 }
 
+/// Opt-in worker retirement. Complete is valid only after every worker and
+/// callback has joined and this instance can never admit more work. A pending
+/// poll must be bounded and nonblocking; external cleanup is independent.
+pub trait RetirableModule: ManagedModule {
+    fn poll_retirement(&mut self) -> ModuleResult<RetirementProgress>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetirementProgress {
+    Pending,
+    Complete,
+}
+
 /// Exports the common lifecycle table; module authors implement ordinary Rust methods.
 #[macro_export]
 macro_rules! export_module {
@@ -277,6 +290,72 @@ macro_rules! export_module {
             &API
         }
     };
+}
+
+/// Export the standard module table and the optional retirement capability.
+#[macro_export]
+macro_rules! export_retirable_module {
+    ($module:ty) => {
+        $crate::export_module!($module);
+        #[unsafe(no_mangle)]
+        pub extern "C" fn amaterasu_module_retirement_v1() -> *const $crate::abi::ModuleRetirementApi {
+            static API: $crate::abi::ModuleRetirementApi = $crate::abi::ModuleRetirementApi {
+                header: $crate::abi::AbiHeader::of::<$crate::abi::ModuleRetirementApi>(),
+                poll_retirement: $crate::exports::poll_retirement::<$module>,
+                destroy_retired: $crate::exports::destroy_retired::<$module>,
+            };
+            &API
+        }
+    };
+}
+
+#[cfg(test)]
+mod retirement_export_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    struct Fixture {
+        polls: usize,
+    }
+    impl ManagedModule for Fixture {
+        fn start(_: RuntimeClient) -> ModuleResult<Self> {
+            Err("not needed by fixture".into())
+        }
+        fn tick(&mut self) -> ModuleResult<()> {
+            Ok(())
+        }
+    }
+    impl RetirableModule for Fixture {
+        fn poll_retirement(&mut self) -> ModuleResult<RetirementProgress> {
+            self.polls += 1;
+            Ok(if self.polls == 1 {
+                RetirementProgress::Pending
+            } else {
+                RetirementProgress::Complete
+            })
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    export_retirable_module!(Fixture);
+
+    #[test]
+    fn exported_optional_table_reports_progress_and_consumes_instance_once() {
+        let table = amaterasu_module_retirement_v1();
+        // SAFETY: the exported static table and owned fixture remain live for
+        // both polls; the checked destructor consumes the fixture exactly once.
+        unsafe {
+            assert!((*table).header.supports::<abi::ModuleRetirementApi>());
+            let instance = Box::into_raw(Box::new(Fixture { polls: 0 })).cast();
+            assert_eq!(((*table).poll_retirement)(instance), abi::STATUS_PENDING);
+            assert_eq!(((*table).poll_retirement)(instance), abi::STATUS_OK);
+            assert_eq!(((*table).destroy_retired)(instance), abi::STATUS_OK);
+        }
+        assert_eq!(DROPS.load(Ordering::SeqCst), 1);
+    }
 }
 
 #[cfg(test)]

@@ -9,6 +9,8 @@ pub type Status = i32;
 pub const STATUS_OK: Status = 0;
 pub const STATUS_INVALID_ARGUMENT: Status = 1;
 pub const STATUS_INTERNAL_ERROR: Status = 2;
+/// A nonblocking retirement operation has not joined all workers yet.
+pub const STATUS_PENDING: Status = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -120,6 +122,20 @@ pub struct ModuleApi {
     pub destroy: unsafe extern "C" fn(*mut c_void),
 }
 
+/// Optional separately exported v1 capability. `poll_retirement` must be
+/// bounded and nonblocking. `STATUS_OK` means admission is permanently closed
+/// and all module-owned workers/callbacks have actually joined. It does not
+/// prove external effect cleanup. Other errors permanently deny a receipt.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ModuleRetirementApi {
+    pub header: AbiHeader,
+    pub poll_retirement: unsafe extern "C" fn(*mut c_void) -> Status,
+    /// Consumes the instance on every return. OK confirms destruction completed
+    /// without a swallowed panic; never call ModuleApi.destroy afterwards.
+    pub destroy_retired: unsafe extern "C" fn(*mut c_void) -> Status,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RuntimeApi {
@@ -131,6 +147,7 @@ pub struct RuntimeApi {
 }
 
 pub type ModuleEntry = unsafe extern "C" fn() -> *const ModuleApi;
+pub type ModuleRetirementEntry = unsafe extern "C" fn() -> *const ModuleRetirementApi;
 pub type RuntimeEntry = unsafe extern "C" fn() -> *const RuntimeApi;
 
 #[cfg(test)]
@@ -155,6 +172,7 @@ mod tests {
         assert_eq!(size_of::<ReplySink>(), 16);
         assert_eq!(size_of::<HostApi>(), 32);
         assert_eq!(size_of::<ModuleApi>(), 48);
+        assert_eq!(size_of::<ModuleRetirementApi>(), 32);
         assert_eq!(size_of::<RuntimeApi>(), 40);
         assert_eq!(size_of::<NativeInterface>(), 32);
         assert_eq!(size_of::<NativeInterfaceQuery>(), 24);
@@ -162,6 +180,14 @@ mod tests {
         assert_eq!(std::mem::offset_of!(NativeInterface, context), 16);
         assert_eq!(std::mem::offset_of!(NativeServiceFactory, bind), 24);
         assert_eq!(std::mem::offset_of!(ModuleApi, create), 16);
+        assert_eq!(
+            std::mem::offset_of!(ModuleRetirementApi, poll_retirement),
+            16
+        );
+        assert_eq!(
+            std::mem::offset_of!(ModuleRetirementApi, destroy_retired),
+            24
+        );
     }
 }
 

@@ -13,6 +13,7 @@ extern "C" {
 #define AMATERASU_STATUS_OK 0
 #define AMATERASU_STATUS_INVALID_ARGUMENT 1
 #define AMATERASU_STATUS_INTERNAL_ERROR 2
+#define AMATERASU_STATUS_PENDING 3
 
 typedef int32_t AmaterasuStatus;
 
@@ -52,6 +53,16 @@ typedef struct {
     void (*destroy)(void *instance);
 } AmaterasuModuleApi;
 
+/* Optional, independently exported capability. Poll must be bounded and
+ * nonblocking; OK means all workers and callbacks joined and future work is
+ * permanently disabled. External effect cleanup remains a separate obligation. */
+typedef struct {
+    AmaterasuAbiHeader header;
+    AmaterasuStatus (*poll_retirement)(void *instance);
+    /* Consumes instance even on error. Never call the regular destroy after it. */
+    AmaterasuStatus (*destroy_retired)(void *instance);
+} AmaterasuModuleRetirementApi;
+
 typedef struct {
     AmaterasuAbiHeader header;
     AmaterasuStatus (*create)(AmaterasuBorrowedBytes configuration, void **instance);
@@ -86,6 +97,8 @@ typedef struct {
 } AmaterasuNativeServiceFactory;
 
 const AmaterasuModuleApi *amaterasu_module_v1(void);
+/* Optional symbol, absent for modules without verifiable retirement. */
+const AmaterasuModuleRetirementApi *amaterasu_module_retirement_v1(void);
 const AmaterasuRuntimeApi *amaterasu_runtime_v1(void);
 
 #ifdef __cplusplus

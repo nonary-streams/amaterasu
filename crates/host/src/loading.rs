@@ -1,7 +1,7 @@
 //! Library ownership stays here; policy and feature behavior stay in managed libraries.
 use amaterasu_abi::{
-    AbiHeader, BorrowedBytes, HostApi, ModuleApi, ModuleEntry, RuntimeApi, RuntimeEntry, STATUS_OK,
-    Status,
+    AbiHeader, BorrowedBytes, HostApi, ModuleApi, ModuleEntry, ModuleRetirementApi,
+    ModuleRetirementEntry, RuntimeApi, RuntimeEntry, STATUS_OK, STATUS_PENDING, Status,
 };
 use amaterasu_contracts::{
     Command, HOST_LIFECYCLE_CONTROL_PRINCIPAL, HOST_LOG_SERVICE, HostLifecycleAction, HostLogEvent,
@@ -17,6 +17,8 @@ use std::mem::MaybeUninit;
 use std::path::Path;
 
 pub(crate) mod management_tls;
+#[cfg(test)]
+mod retirement_tests;
 #[cfg(test)]
 mod teardown_tests;
 
@@ -94,10 +96,22 @@ pub struct LoadedComponents {
     pending_log_policy: Option<HostLogEvent>,
     lifecycle_endpoint: HostApi,
     runtime: RuntimeLibrary,
+    retirement_providers: Vec<(
+        String,
+        amaterasu_contracts::effect_fence::ProviderIncarnation,
+    )>,
+    retirement_state_provider: Option<String>,
 }
 
 impl Drop for LoadedComponents {
     fn drop(&mut self) {
+        // The optional capability is polled only during shutdown, with a
+        // bounded host deadline. Failure intentionally produces no receipt;
+        // ordinary ABI destruction still runs in dependency order.
+        if !self.retirement_providers.is_empty() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let _ = self.retire_effect_providers(deadline);
+        }
         while let Some(module) = self.modules.pop() {
             drop(module);
         }
@@ -150,6 +164,41 @@ impl LoadedComponents {
                 .filter(|component| !component.runtime)
                 .map(|component| component.id.as_str()),
         )?;
+        let retirement_providers = runtime_config
+            .effect_fence
+            .as_ref()
+            .filter(|policy| policy.source_slots)
+            .map(|policy| {
+                policy
+                    .methods
+                    .iter()
+                    .filter_map(|method| {
+                        let selected = runtime_config.api_methods.iter().find(|approval| {
+                            approval.method.service == method.service
+                                && approval.method.method == method.method
+                                && approval.method.interface_major == method.interface_major
+                        })?;
+                        Some((
+                            selected.provider.clone(),
+                            runtime_config
+                                .host_context
+                                .provider_incarnations
+                                .get(&selected.provider)?
+                                .clone(),
+                        ))
+                    })
+                    .collect::<BTreeMap<_, _>>()
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default();
+        let retirement_state_provider = runtime_config
+            .service_selections
+            .broker
+            .get("amaterasu.state/1")
+            .and_then(Option::as_ref)
+            .filter(|selected| selected.contract == "amaterasu.state/1")
+            .map(|selected| selected.provider.clone());
         #[cfg(target_os = "linux")]
         crate::capture_authority::inject(package, &mut runtime_config.settings)?;
         if package
@@ -190,7 +239,7 @@ impl LoadedComponents {
             RuntimeLibrary::load(&directory.join(&runtime_component.file), &configuration)?;
         let components = ordered_components(&package.manifest.components)?;
         let lifecycle_endpoint = runtime.endpoint(HOST_LIFECYCLE_CONTROL_PRINCIPAL)?;
-        Self::load_features(
+        let mut loaded = Self::load_features(
             runtime,
             product_logger,
             lifecycle_endpoint,
@@ -203,7 +252,10 @@ impl LoadedComponents {
                 FeatureLibrary::load(&directory.join(&component.file), &component.id, &endpoint)
             },
             progress,
-        )
+        )?;
+        loaded.retirement_providers = retirement_providers;
+        loaded.retirement_state_provider = retirement_state_provider;
+        Ok(loaded)
     }
 
     fn load_features<Component>(
@@ -225,6 +277,8 @@ impl LoadedComponents {
             pending_log_policy: None,
             lifecycle_endpoint,
             runtime,
+            retirement_providers: Vec::new(),
+            retirement_state_provider: None,
         };
         progress(1)?;
         for (index, component) in components.into_iter().enumerate() {
@@ -241,6 +295,250 @@ impl LoadedComponents {
         }
         self.drain_log_events();
         self.service_host_logs();
+        Ok(())
+    }
+
+    /// Attempt only explicitly supported provider retirements. A timeout,
+    /// unavailable State provider, malformed response, or failed poll leaves
+    /// the effect fenced without manufacturing any retirement evidence.
+    pub(crate) fn retire_effect_providers(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> PackageResult<()> {
+        use amaterasu_contracts::effect_fence::EffectFenceCommand;
+        let providers = self.retirement_providers.clone();
+        let mut failures = false;
+        // Preserve the same reverse dependency order as ordinary destruction.
+        // In particular, no consumer can retain a native provider guard when
+        // that provider's checked destructor is invoked.
+        while let Some(mut module) = self.modules.pop() {
+            let Some((provider, incarnation)) = providers
+                .iter()
+                .find(|(provider, _)| *provider == module.id)
+                .cloned()
+            else {
+                drop(module);
+                continue;
+            };
+            if module.retirement.is_none()
+                || self.retirement_state_provider.as_deref() == Some(&provider)
+            {
+                failures = true;
+                drop(module);
+                continue;
+            }
+            let command = Command::EffectFence {
+                command: Box::new(EffectFenceCommand::HostProviderRetiring {
+                    provider: provider.clone(),
+                    provider_incarnation: incarnation.clone(),
+                }),
+            };
+            if !matches!(
+                crate::worker::invoke(&self.lifecycle_endpoint, &command),
+                Ok(Response::Ok)
+            ) {
+                failures = true;
+                drop(module);
+                continue;
+            }
+            let joined = loop {
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                let result = module.poll_retirement();
+                if std::time::Instant::now() >= deadline {
+                    break false;
+                }
+                match result {
+                    Ok(true) => break true,
+                    Ok(false) => {
+                        if self.tick_retirement_state_provider().is_err() {
+                            break false;
+                        }
+                        std::thread::sleep(crate::timing::TICK_INTERVAL);
+                    }
+                    Err(_) => break false,
+                }
+            };
+            if !joined {
+                module.retirement_failed = true;
+                failures = true;
+                drop(module);
+                continue;
+            }
+            // The optional checked destructor consumes the instance even on a
+            // panic. Only its explicit success can support a host receipt.
+            if module.destroy_retired().is_err() || std::time::Instant::now() >= deadline {
+                failures = true;
+                drop(module);
+                continue;
+            }
+            let command = Command::EffectFence {
+                command: Box::new(EffectFenceCommand::HostProviderJoined {
+                    provider: provider.clone(),
+                    provider_incarnation: incarnation.clone(),
+                }),
+            };
+            if !matches!(
+                crate::worker::invoke(&self.lifecycle_endpoint, &command),
+                Ok(Response::Ok)
+            ) {
+                failures = true;
+                drop(module);
+                continue;
+            }
+            if self
+                .persist_provider_retirements(&provider, &incarnation, deadline)
+                .is_err()
+            {
+                failures = true;
+            }
+            drop(module);
+        }
+        if failures {
+            Err("one or more provider retirements remain unconfirmed".into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn tick_retirement_state_provider(&mut self) -> PackageResult<()> {
+        let provider = self
+            .retirement_state_provider
+            .as_deref()
+            .ok_or("retirement State provider is unavailable")?;
+        self.modules
+            .iter_mut()
+            .find(|module| module.id == provider)
+            .ok_or("retirement State provider is not loaded")?
+            .tick()
+    }
+
+    fn retirement_state_request(
+        &mut self,
+        payload: serde_json::Value,
+        deadline: std::time::Instant,
+        retain: bool,
+    ) -> PackageResult<(serde_json::Value, u64)> {
+        let operation_id = format!(
+            "host.retirement.{}",
+            amaterasu_package::random_identifier()?
+        );
+        let command = Command::Request {
+            service: "amaterasu.state/1".into(),
+            payload,
+            timeout_ms: 30_000,
+            operation_id,
+            parent: None,
+        };
+        let Response::Accepted { id } = crate::worker::invoke(&self.lifecycle_endpoint, &command)?
+        else {
+            return Err("retirement State request was denied".into());
+        };
+        loop {
+            if std::time::Instant::now() >= deadline {
+                return Err("retirement State request timed out".into());
+            }
+            self.tick_retirement_state_provider()?;
+            match crate::worker::invoke(
+                &self.lifecycle_endpoint,
+                &Command::TakeResult { request: id },
+            )? {
+                Response::Pending => std::thread::sleep(crate::timing::TICK_INTERVAL),
+                Response::Result { payload } => {
+                    if payload.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+                        return Err("retirement State operation failed".into());
+                    }
+                    if !retain
+                        && !matches!(
+                            crate::worker::invoke(
+                                &self.lifecycle_endpoint,
+                                &Command::ReleaseResult { request: id }
+                            )?,
+                            Response::Ok
+                        )
+                    {
+                        return Err("retirement State result release failed".into());
+                    }
+                    return Ok((payload, id));
+                }
+                _ => return Err("retirement State operation failed".into()),
+            }
+        }
+    }
+
+    fn persist_provider_retirements(
+        &mut self,
+        provider: &str,
+        incarnation: &amaterasu_contracts::effect_fence::ProviderIncarnation,
+        deadline: std::time::Instant,
+    ) -> PackageResult<()> {
+        use amaterasu_contracts::effect_fence::EffectFenceCommand;
+        for slot in 0..64_u8 {
+            if std::time::Instant::now() >= deadline {
+                return Err("retirement persistence timed out".into());
+            }
+            let command = Command::EffectFence {
+                command: Box::new(EffectFenceCommand::HostProviderSlotReceipts {
+                    provider: provider.into(),
+                    provider_incarnation: incarnation.clone(),
+                    slot,
+                }),
+            };
+            let Response::Result { payload } =
+                crate::worker::invoke(&self.lifecycle_endpoint, &command)?
+            else {
+                return Err("retirement receipts unavailable".into());
+            };
+            let current = payload
+                .get("receipts")
+                .and_then(serde_json::Value::as_array)
+                .ok_or("invalid retirement receipts")?;
+            if current.is_empty() {
+                continue;
+            }
+            let key = format!("host/effect-retirement/v1/{slot:02}");
+            let (lookup, read) =
+                self.retirement_state_request(json!({"action":"get","key":key}), deadline, true)?;
+            let revision = lookup
+                .get("revision")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or("invalid State revision")?;
+            let mut receipts = match lookup.get("found").and_then(serde_json::Value::as_bool) {
+                Some(false) => Vec::new(),
+                Some(true)
+                    if lookup
+                        .pointer("/value/version")
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(1) =>
+                {
+                    lookup
+                        .pointer("/value/receipts")
+                        .and_then(serde_json::Value::as_array)
+                        .ok_or("invalid saved retirement records")?
+                        .clone()
+                }
+                _ => return Err("invalid saved retirement records".into()),
+            };
+            for receipt in current {
+                if !receipts.contains(receipt) {
+                    receipts.push(receipt.clone());
+                }
+            }
+            if receipts.len() > 32 {
+                return Err("retirement receipt slot is full".into());
+            }
+            self.retirement_state_request(json!({"action":"set","key":key,"value":{"version":1,"receipts":receipts},"expected_revision":revision}), deadline, false)?;
+            if !matches!(
+                crate::worker::invoke(
+                    &self.lifecycle_endpoint,
+                    &Command::ReleaseResult { request: read }
+                )?,
+                Response::Ok
+            ) {
+                return Err("retirement State read release failed".into());
+            }
+        }
         Ok(())
     }
 
@@ -600,6 +898,9 @@ impl Drop for RuntimeLibrary {
 struct FeatureLibrary {
     id: String,
     api: ModuleApi,
+    retirement: Option<ModuleRetirementApi>,
+    retirement_failed: bool,
+    retirement_complete: bool,
     instance: *mut c_void,
     _library: Library,
 }
@@ -614,6 +915,14 @@ impl FeatureLibrary {
                 .map_err(|error| error.to_string())?;
             read_api_table(entry())?
         };
+        // SAFETY: an optional symbol, when present, must expose a stable ABI
+        // table while this verified library remains loaded.
+        let retirement = unsafe {
+            match library.get::<ModuleRetirementEntry>(b"amaterasu_module_retirement_v1\0") {
+                Ok(entry) => Some(read_api_table(entry())?),
+                Err(_) => None,
+            }
+        };
         let mut instance = std::ptr::null_mut();
         // SAFETY: the module borrows the table during creation and copies it if needed later.
         let status = unsafe { (api.create)(endpoint, &mut instance) };
@@ -624,15 +933,64 @@ impl FeatureLibrary {
         Ok(Self {
             id: id.to_owned(),
             api,
+            retirement,
+            retirement_failed: false,
+            retirement_complete: false,
             instance,
             _library: library,
         })
     }
 
     fn tick(&mut self) -> PackageResult<()> {
+        if self.retirement_complete {
+            return Err("retired module cannot tick".into());
+        }
         // SAFETY: this instance is exclusively borrowed, live, and owned by this library.
         let status = unsafe { (self.api.tick)(self.instance) };
         require_success(status, &format!("tick {}", self.id))
+    }
+
+    fn poll_retirement(&mut self) -> PackageResult<bool> {
+        if self.retirement_failed {
+            return Err("module retirement previously failed".into());
+        }
+        if self.retirement_complete {
+            return Ok(true);
+        }
+        let api = self
+            .retirement
+            .ok_or("module has no retirement capability")?;
+        // SAFETY: the host owns the live instance, serializes lifecycle calls,
+        // and the capability must not block or retain the borrowed instance.
+        match unsafe { (api.poll_retirement)(self.instance) } {
+            STATUS_PENDING => Ok(false),
+            STATUS_OK => {
+                self.retirement_complete = true;
+                Ok(true)
+            }
+            _ => {
+                self.retirement_failed = true;
+                Err("module retirement failed".into())
+            }
+        }
+    }
+
+    fn destroy_retired(&mut self) -> PackageResult<()> {
+        if !self.retirement_complete || self.retirement_failed || self.instance.is_null() {
+            return Err("module retirement is not complete".into());
+        }
+        let api = self
+            .retirement
+            .ok_or("module has no retirement capability")?;
+        // The checked ABI consumes the instance even if its destructor panics.
+        let instance = std::mem::replace(&mut self.instance, std::ptr::null_mut());
+        // SAFETY: successful polling joined workers and ownership transfers once.
+        let status = unsafe { (api.destroy_retired)(instance) };
+        if status != STATUS_OK {
+            self.retirement_failed = true;
+            return Err("checked module destruction failed".into());
+        }
+        Ok(())
     }
 
     fn health(&self) -> PackageResult<()> {
@@ -644,8 +1002,10 @@ impl FeatureLibrary {
 
 impl Drop for FeatureLibrary {
     fn drop(&mut self) {
-        // SAFETY: the host relinquishes this instance exactly once before unloading its library.
-        unsafe { (self.api.destroy)(self.instance) };
+        if !self.instance.is_null() {
+            // SAFETY: the host relinquishes this instance exactly once before unloading its library.
+            unsafe { (self.api.destroy)(self.instance) };
+        }
     }
 }
 

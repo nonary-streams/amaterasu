@@ -101,6 +101,10 @@ until `ConfirmHistoricalCleanup` verifies a fresh journal entry with pairing's
 durable `cleanup_confirmed` flag. Pairing must set that flag only after its own
 independent cleanup proof; the broker does not perform that cleanup.
 
+The host currently generates 128-bit random incarnation IDs and rejects
+duplicates within a load. Their cross-restart uniqueness is probabilistic; the
+format does not claim a deterministic, durable uniqueness guarantee.
+
 The reserved host endpoint may read and CAS-write its own State namespace at
 `host/effect-retirement/v1/{slot:02}`, using `{version:1, receipts:[...]}` with
 at most 32 records. A new receipt must be constructed by the live broker after
@@ -109,11 +113,16 @@ current authenticated read of the same host-owned key. After restart,
 `HostRecoverHistorical` requires a retained host-namespace State Get containing
 the exact old receipt in addition to the pairing-journal read. The host must
 preserve unresolved records until its lifecycle and pairing cleanup complete.
+Automatic removal after confirmed pairing cleanup and slot close is not yet
+wired. A full 32-record slot fails closed until a trusted coordinator verifies
+which receipts are safe to remove; the host must not evict them by age.
 
-The host currently has no production caller that persists or replays these
-receipts. In particular, do not derive a join receipt merely from a generic
-module destroy call: the current SDK catches destructor panics without reporting
-whether every join completed. A missing host receipt or cleanup proof leaves the
-historical source fenced. `ProviderRetiredInIncarnation` separately binds a live
-provider's acknowledgment to the host-issued instance; providers must emit it
-only after their actual worker retirement.
+On shutdown, the host first fences a protected provider and polls its optional
+`amaterasu_module_retirement_v1` capability. Only an explicit successful result
+before the deadline permits `HostProviderJoined` and receipt persistence. An
+absent capability, failure, panic or timeout leaves recovery fenced. The poll
+must be bounded and nonblocking; native modules are trusted to honor that ABI.
+The generic module destroy call alone is not proof because the SDK catches
+destructor panics without reporting whether joins completed. Startup pairing
+replay and external cleanup remain separate integration work. A missing receipt
+or cleanup proof leaves the historical source fenced.
