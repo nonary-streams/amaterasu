@@ -9,7 +9,7 @@ use crate::protocol::{Document, EffectAuthoritySettings, Identity, Operation, Se
 use crate::{EFFECT_SERVICE, SERVICE, STATE_SERVICE};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::{Map, Value, json};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use x509_cert::der::Encode;
@@ -77,10 +77,7 @@ pub struct Pipeline {
     effect_gate: Option<EffectGate>,
     effect_authority: Option<EffectAuthoritySettings>,
     effect_bindings: BTreeMap<EffectSource, (Arc<Snapshot>, Vec<u8>)>,
-    protocol_capabilities: BTreeMap<
-        EffectSource,
-        BTreeSet<amaterasu_module_sdk::effect_authority::ProtocolCapability>,
-    >,
+    protocol_capabilities: BTreeMap<EffectSource, protocol_admission::ProtocolAttestation>,
     deferred_effect_mutation: Option<(Request, Operation)>,
     identity_generation: Option<IdentityGeneration>,
     #[cfg(test)]
@@ -996,7 +993,10 @@ impl Pipeline {
         if !matches!(send(Command::CheckRequest { request: id })?, Response::Ok) {
             return complete(send, id, error("request_ended"));
         }
-        if payload["action"] == "admit_protocol_effect" {
+        if matches!(
+            payload["action"].as_str(),
+            Some("admit_protocol_effect" | "admit_protocol_effect_v2")
+        ) {
             return self.handle_protocol_admission(id, caller, initiator, payload, now, send);
         }
         let response = self.apply_effect_request(caller, initiator, payload, now);
@@ -1089,6 +1089,9 @@ impl Pipeline {
                 self.admit_protocol_effect(version, epoch, source, *effect, caller, now)?;
                 return Err("protocol_authority_unavailable");
             }
+            EffectRequest::AdmitProtocolEffectV2 { .. } => {
+                return Err("protocol_authority_unavailable");
+            }
             _ => {}
         }
         let gate = self.effect_gate.as_mut().ok_or("authority_unavailable")?;
@@ -1103,7 +1106,8 @@ impl Pipeline {
             EffectRequest::Bind { .. }
             | EffectRequest::BindStream { .. }
             | EffectRequest::AttestProtocolCapabilities { .. }
-            | EffectRequest::AdmitProtocolEffect { .. } => {
+            | EffectRequest::AdmitProtocolEffect { .. }
+            | EffectRequest::AdmitProtocolEffectV2 { .. } => {
                 unreachable!("handled above")
             }
             EffectRequest::AdmitStreamLease {

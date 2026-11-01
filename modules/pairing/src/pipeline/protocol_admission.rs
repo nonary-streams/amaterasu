@@ -13,7 +13,13 @@ use amaterasu_module_sdk::{
     protocol::PendingEffect,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+
+pub(super) struct ProtocolAttestation {
+    capabilities: BTreeSet<ProtocolCapability>,
+    issuer_epoch: String,
+}
 
 impl Pipeline {
     /// Check the real broker selection after source and client policy. A v1
@@ -40,17 +46,54 @@ impl Pipeline {
             }
             let request: amaterasu_module_sdk::effect_authority::Request =
                 serde_json::from_value(payload).map_err(|_| "invalid_request")?;
-            let amaterasu_module_sdk::effect_authority::Request::AdmitProtocolEffect {
-                version,
-                epoch,
-                source,
-                effect,
-            } = request
-            else {
-                return Err("invalid_request");
+            use amaterasu_module_sdk::effect_authority::Request;
+            let selected = match request {
+                Request::AdmitProtocolEffect {
+                    version,
+                    epoch,
+                    source,
+                    effect,
+                } => self.admit_protocol_effect(version, epoch, source, *effect, caller, now)?,
+                Request::AdmitProtocolEffectV2 {
+                    version,
+                    epoch,
+                    source,
+                    effect,
+                    sequence,
+                    payload,
+                    cleanup,
+                } => {
+                    if version != 2
+                        || payload.len() > amaterasu_module_sdk::protocol::MAX_MESSAGE_BYTES
+                        || amaterasu_module_sdk::protocol_state::CleanupReference::new(cleanup.id)
+                            .is_err()
+                        || format!("{:x}", Sha256::digest(&payload)) != effect.payload_sha256
+                    {
+                        return Err("invalid_protocol_effect");
+                    }
+                    // The existing sequence key does not include the full
+                    // device source. This check is provisional only: v2 stays
+                    // closed until a source-qualified journal is available.
+                    let source_sequence =
+                        amaterasu_module_sdk::protocol_sequence::SequencedSource::new(
+                            caller,
+                            &effect.context,
+                        )
+                        .map_err(|_| "invalid_protocol_effect")?;
+                    if source_sequence.operation_id(sequence).ok().as_deref()
+                        != Some(effect.operation_id.as_str())
+                    {
+                        return Err("invalid_protocol_effect");
+                    }
+                    let selected =
+                        self.admit_protocol_effect(1, epoch, source, *effect, caller, now)?;
+                    if payload.len() > selected.max_payload_bytes {
+                        return Err("invalid_protocol_effect");
+                    }
+                    selected
+                }
+                _ => return Err("invalid_request"),
             };
-            let selected =
-                self.admit_protocol_effect(version, epoch, source, *effect, caller, now)?;
             let query = Command::EffectFence {
                 command: Box::new(EffectFenceCommand::SelectedMethod {
                     method: ProtectedMethod {
@@ -123,13 +166,29 @@ impl Pipeline {
         if self
             .protocol_capabilities
             .get(&source)
-            .is_some_and(|previous| previous != &capabilities)
+            .is_some_and(|previous| previous.capabilities != capabilities)
         {
             return Err("protocol_attestation_conflict");
         }
-        self.protocol_capabilities
-            .insert(source.clone(), capabilities);
-        Ok(json!({"ok":true,"version":1,"epoch":epoch,"source":source}))
+        let issuer_epoch = if let Some(previous) = self.protocol_capabilities.get(&source) {
+            previous.issuer_epoch.clone()
+        } else {
+            let mut bytes = [0_u8; 16];
+            getrandom::fill(&mut bytes).map_err(|_| "entropy_unavailable")?;
+            let issuer_epoch = bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            self.protocol_capabilities.insert(
+                source.clone(),
+                ProtocolAttestation {
+                    capabilities,
+                    issuer_epoch: issuer_epoch.clone(),
+                },
+            );
+            issuer_epoch
+        };
+        Ok(json!({"ok":true,"version":1,"epoch":epoch,"source":source,"issuer_epoch":issuer_epoch}))
     }
 
     pub(super) fn admit_protocol_effect(
@@ -166,7 +225,10 @@ impl Pipeline {
         if !self
             .protocol_capabilities
             .get(&source)
-            .is_some_and(|caps| caps.contains(&capability))
+            .is_some_and(|attestation| {
+                attestation.capabilities.contains(&capability)
+                    && attestation.issuer_epoch == effect.issuer_epoch
+            })
             || effect.caller != caller
             || effect.context.authority_epoch != epoch
             || effect.context.effect_owner_epoch != source.effect_owner_epoch

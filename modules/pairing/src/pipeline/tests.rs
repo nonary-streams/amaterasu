@@ -5626,19 +5626,31 @@ fn broker_protocol_attestation_requires_paired_source_and_exact_client_grant() {
         call(&mut pipeline, "nvhttp", unknown)["code"],
         "scope_denied"
     );
-    assert_eq!(call(&mut pipeline, "nvhttp", attest.clone())["ok"], true);
+    let attested = call(&mut pipeline, "nvhttp", attest.clone());
+    assert_eq!(attested["ok"], true);
+    let issuer_epoch = attested["issuer_epoch"].as_str().unwrap().to_owned();
+    assert_eq!(
+        call(&mut pipeline, "nvhttp", attest.clone())["issuer_epoch"],
+        issuer_epoch
+    );
     let mut expanded = attest.clone();
     expanded["capabilities"] = json!([]);
     assert_eq!(
         call(&mut pipeline, "nvhttp", expanded)["code"],
         "protocol_attestation_conflict"
     );
-    let effect = json!({"caller":"input","operation_id":"effect.1","issuer_epoch":"issuer-epoch",
+    let effect = json!({"caller":"input","operation_id":"effect.1","issuer_epoch":issuer_epoch,
         "context":{"authority_epoch":epoch,"effect_owner_epoch":"owner","target":{"kind":"stream","host_epoch":source["host_epoch"],
             "session_id":source["session_id"],"stream_id":source["stream_id"],"generation":source["stream_generation"]},"peer_ref":source["id"]},
         "message_type":21818,"capability":"example.control/1","provider":"provider","method":method,"cleanup":cleanup,
         "payload_sha256":"c".repeat(64),"timeout_ms":1000,"parent":null});
     let request = json!({"action":"admit_protocol_effect","version":1,"epoch":epoch,"source":source,"effect":effect});
+    let mut forged_issuer = request.clone();
+    forged_issuer["effect"]["issuer_epoch"] = json!("forged");
+    assert_eq!(
+        call(&mut pipeline, "input", forged_issuer)["code"],
+        "scope_denied"
+    );
     let mut forbidden = request.clone();
     forbidden["effect"]["capability"] = json!("example.usb/1");
     assert_eq!(
@@ -5652,6 +5664,47 @@ fn broker_protocol_attestation_requires_paired_source_and_exact_client_grant() {
         call(&mut pipeline, "input", request.clone())["code"],
         "protocol_authority_unavailable"
     );
+    {
+        use sha2::Digest;
+        let payload = vec![1_u8, 2, 3];
+        let mut effect = request["effect"].clone();
+        let context = serde_json::from_value(effect["context"].clone()).unwrap();
+        let sequence =
+            amaterasu_module_sdk::protocol_sequence::SequencedSource::new("input", &context)
+                .unwrap();
+        effect["operation_id"] = json!(sequence.operation_id(1).unwrap());
+        effect["payload_sha256"] = json!(format!("{:x}", sha2::Sha256::digest(&payload)));
+        let request_v2 = json!({"action":"admit_protocol_effect_v2","version":2,"epoch":epoch,"source":source,
+            "effect":effect,"sequence":1,"payload":payload,"cleanup":{"id":"d".repeat(64)}});
+        assert_eq!(
+            call(&mut pipeline, "input", request_v2.clone())["code"],
+            "protocol_authority_unavailable"
+        );
+        let mut bad_digest = request_v2.clone();
+        bad_digest["payload"][0] = json!(9);
+        assert_eq!(
+            call(&mut pipeline, "input", bad_digest)["code"],
+            "invalid_protocol_effect"
+        );
+        let mut bad_cleanup = request_v2.clone();
+        bad_cleanup["cleanup"]["id"] = json!("forged");
+        assert_eq!(
+            call(&mut pipeline, "input", bad_cleanup)["code"],
+            "invalid_protocol_effect"
+        );
+        let mut bad_sequence = request_v2.clone();
+        bad_sequence["sequence"] = json!(2);
+        assert_eq!(
+            call(&mut pipeline, "input", bad_sequence)["code"],
+            "invalid_protocol_effect"
+        );
+        let mut bad_issuer = request_v2;
+        bad_issuer["effect"]["issuer_epoch"] = json!("forged");
+        assert_eq!(
+            call(&mut pipeline, "input", bad_issuer)["code"],
+            "scope_denied"
+        );
+    }
     pipeline
         .effect_authority
         .as_mut()
@@ -5858,11 +5911,10 @@ fn real_state_pairing_and_broker_keep_protocol_admission_closed_across_restart()
         call(&mut pairing, "input", EFFECT_SERVICE, attestation.clone())["code"],
         "forbidden"
     );
-    assert_eq!(
-        call(&mut pairing, "nvhttp", EFFECT_SERVICE, attestation)["ok"],
-        true
-    );
-    let effect = json!({"caller":"input","operation_id":"effect.1","issuer_epoch":"issuer-epoch",
+    let attested = call(&mut pairing, "nvhttp", EFFECT_SERVICE, attestation);
+    assert_eq!(attested["ok"], true);
+    let issuer_epoch = attested["issuer_epoch"].as_str().unwrap();
+    let effect = json!({"caller":"input","operation_id":"effect.1","issuer_epoch":issuer_epoch,
         "context":{"authority_epoch":epoch,"effect_owner_epoch":"owner","target":{"kind":"stream","host_epoch":source["host_epoch"],
             "session_id":source["session_id"],"stream_id":source["stream_id"],"generation":source["stream_generation"]},"peer_ref":source["id"]},
         "message_type":21818,"capability":"example.control/1","provider":"provider","method":method,"cleanup":cleanup,

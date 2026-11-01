@@ -400,6 +400,17 @@ pub enum Request {
         source: Source,
         effect: Box<crate::protocol::PendingEffect>,
     },
+    /// Exact request for durable broker-slot admission. Payload bytes are
+    /// transient and bounded; only their digest and cleanup identity persist.
+    AdmitProtocolEffectV2 {
+        version: u8,
+        epoch: String,
+        source: Source,
+        effect: Box<crate::protocol::PendingEffect>,
+        sequence: u64,
+        payload: Vec<u8>,
+        cleanup: crate::protocol_state::CleanupReference,
+    },
     AdmitStreamLease {
         epoch: String,
         source: Source,

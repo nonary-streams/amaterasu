@@ -4,6 +4,57 @@ use crate::effect_authority::{Request, Source, response_matches, response_ticket
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+/// Validated reply from the selected pairing authority, obtained only after
+/// the trusted protocol owner attests the authenticated session negotiation.
+/// This opaque epoch identifies an issuer incarnation; it is not a grant.
+pub struct AttestedProtocolSource {
+    issuer_epoch: String,
+}
+impl AttestedProtocolSource {
+    pub fn from_authority_response(
+        response: &Value,
+        epoch: &str,
+        source: &Source,
+    ) -> Result<Self, &'static str> {
+        let issuer_epoch = response
+            .get("issuer_epoch")
+            .and_then(Value::as_str)
+            .filter(|value| {
+                value.len() == 32
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+            .ok_or("invalid_protocol_attestation")?;
+        if !source.valid()
+            || epoch.is_empty()
+            || epoch.len() > 128
+            || epoch.chars().any(char::is_control)
+            || response.get("ok").and_then(Value::as_bool) != Some(true)
+            || response.get("version").and_then(Value::as_u64) != Some(1)
+            || response.get("epoch").and_then(Value::as_str) != Some(epoch)
+            || serde_json::from_value::<Source>(
+                response
+                    .get("source")
+                    .cloned()
+                    .ok_or("invalid_protocol_attestation")?,
+            )
+            .ok()
+            .as_ref()
+                != Some(source)
+        {
+            return Err("invalid_protocol_attestation");
+        }
+        Ok(Self {
+            issuer_epoch: issuer_epoch.into(),
+        })
+    }
+
+    pub fn issuer_epoch(&self) -> &str {
+        &self.issuer_epoch
+    }
+}
+
 /// Construct only after trusted protocol-to-lifecycle binding and route-specific
 /// permission/negotiation. The selected effect owner must drive all requests and
 /// keep the ticket through the final effect and any required transport drain.
@@ -217,6 +268,29 @@ mod tests {
             device_generation: 1,
             effect_owner_epoch: "owner".into(),
         }
+    }
+    #[test]
+    fn attestation_receipt_requires_exact_source_epoch_and_opaque_issuer() {
+        let source = source();
+        let mut response = json!({"ok":true,"version":1,"epoch":"epoch","source":source,"issuer_epoch":"b".repeat(32)});
+        assert_eq!(
+            AttestedProtocolSource::from_authority_response(&response, "epoch", &source)
+                .unwrap()
+                .issuer_epoch(),
+            "b".repeat(32)
+        );
+        assert!(
+            AttestedProtocolSource::from_authority_response(&response, "other", &source).is_err()
+        );
+        response["issuer_epoch"] = json!("not-an-issuer");
+        assert!(
+            AttestedProtocolSource::from_authority_response(&response, "epoch", &source).is_err()
+        );
+        response["issuer_epoch"] = json!("b".repeat(32));
+        response["source"]["device_generation"] = json!(2);
+        assert!(
+            AttestedProtocolSource::from_authority_response(&response, "epoch", &source).is_err()
+        );
     }
     #[test]
     fn tickets_are_caller_scoped_fenced_and_retained_through_completion() {
