@@ -58,6 +58,7 @@ enum Stage {
         response: Value,
         snapshot: Option<Arc<Snapshot>>,
         expected_ack_revision: u64,
+        keep_identity_fenced: bool,
     },
 }
 
@@ -940,8 +941,11 @@ impl Pipeline {
                 if let Err(code) = self.engine.admit(&caller, &operation) {
                     return complete(&mut send, id, error(code));
                 }
-                if (self.protocol_claim_recovery_required || self.retained_protocol_claim.is_some())
+                let protocol_reconciliation =
+                    self.protocol_claim_recovery_required || self.retained_protocol_claim.is_some();
+                if protocol_reconciliation
                     && operation.may_write()
+                    && !is_client_configuration_update(&operation)
                 {
                     return complete(&mut send, id, error("protocol_reconciliation_required"));
                 }
@@ -969,7 +973,7 @@ impl Pipeline {
                 };
                 if operation.may_write()
                     && (!is_client_configuration_update(&operation)
-                        || self.effect_authority.is_some())
+                        || (self.effect_authority.is_some() && !protocol_reconciliation))
                 {
                     if self.effect_authority.is_some() && self.effect_gate.is_none() {
                         return complete(&mut send, id, error("authority_unavailable"));
@@ -1029,6 +1033,43 @@ impl Pipeline {
                 ) =>
             {
                 self.handle_effect_request(id, &caller, &initiator, payload, now, send)
+            }
+            Response::Request {
+                id,
+                caller,
+                service,
+                payload,
+                remaining_ms,
+                ..
+            } if service == SERVICE
+                && (self.protocol_claim_recovery_required
+                    || self.retained_protocol_claim.is_some())
+                && self.deferred_effect_mutation.is_none()
+                && payload["action"] == "update_client_config_overrides" =>
+            {
+                if !matches!(send(Command::CheckRequest { request: id })?, Response::Ok) {
+                    return complete(send, id, error("request_ended"));
+                }
+                if serde_json::to_vec(&payload).map_or(true, |bytes| bytes.len() > 12_000) {
+                    return complete(send, id, error("invalid_request"));
+                }
+                let Ok(operation) = serde_json::from_value::<Operation>(payload) else {
+                    return complete(send, id, error("invalid_request"));
+                };
+                if let Err(code) = self.engine.admit(&caller, &operation) {
+                    return complete(send, id, error(code));
+                }
+                let request = Request {
+                    id,
+                    caller,
+                    deadline: Instant::now() + Duration::from_millis(remaining_ms.min(30_000)),
+                };
+                self.submit(
+                    request,
+                    Stage::Loading(Box::new(operation)),
+                    json!({"action":"get","key":STATE_KEY}),
+                    send,
+                )
             }
             Response::Request { id, .. } => complete(send, id, error("authority_draining")),
             _ => Err("pairing poll failure".into()),
@@ -1362,14 +1403,19 @@ impl Pipeline {
                         response,
                         snapshot,
                         expected_ack_revision,
+                        keep_identity_fenced,
                     } => {
                         if payload["revision"].as_u64() != Some(expected_ack_revision) {
                             self.invalidate_identity();
                             self.recovery_needed = true;
                             return complete(send, pending.request.id, error("state_unavailable"));
                         }
-                        self.publish_identity(expected_ack_revision, snapshot)?;
-                        self.recovery_needed = false;
+                        if keep_identity_fenced {
+                            self.recovery_needed = true;
+                        } else {
+                            self.publish_identity(expected_ack_revision, snapshot)?;
+                            self.recovery_needed = false;
+                        }
                         complete(send, pending.request.id, response)
                     }
                     Stage::Loading(operation) => {
@@ -1597,9 +1643,16 @@ impl Pipeline {
         // Only this operation replaces configuration on an existing certificate.
         // Publish the validated durable base while its CAS is pending; trust and
         // identity mutations retain their fail-closed invalidation boundary.
-        let configuration_only =
-            is_client_configuration_update(&operation) && self.effect_authority.is_none();
-        if configuration_only {
+        let protocol_reconciliation =
+            self.protocol_claim_recovery_required || self.retained_protocol_claim.is_some();
+        let held_tuning =
+            protocol_reconciliation && is_snapshot_tuning_update(&operation, &document);
+        if protocol_reconciliation && is_client_configuration_update(&operation) && !held_tuning {
+            return complete(send, request.id, error("protocol_reconciliation_required"));
+        }
+        let configuration_only = is_client_configuration_update(&operation)
+            && (self.effect_authority.is_none() || held_tuning);
+        if configuration_only && !held_tuning {
             self.publish_identity(revision, loaded.clone())?;
         }
         if self.configured_identity().is_some()
@@ -1609,7 +1662,9 @@ impl Pipeline {
                 Operation::Initialize {} | Operation::ImportIdentity { .. }
             )
         {
-            self.publish_identity(revision, loaded)?;
+            if !held_tuning {
+                self.publish_identity(revision, loaded)?;
+            }
             return complete(send, request.id, error("not_initialized"));
         }
         let expected_revision = match &operation {
@@ -1634,7 +1689,9 @@ impl Pipeline {
             _ => None,
         };
         if expected_revision.is_some_and(|expected| expected != revision) {
-            self.publish_identity(revision, loaded)?;
+            if !held_tuning {
+                self.publish_identity(revision, loaded)?;
+            }
             return complete(
                 send,
                 request.id,
@@ -1705,6 +1762,7 @@ impl Pipeline {
                             response,
                             snapshot,
                             expected_ack_revision,
+                            keep_identity_fenced: false,
                         },
                         json!({
                             "action":"set",
@@ -1715,8 +1773,10 @@ impl Pipeline {
                         send,
                     );
                 }
-                self.publish_identity(revision, loaded)?;
-                self.recovery_needed = false;
+                if !held_tuning {
+                    self.publish_identity(revision, loaded)?;
+                    self.recovery_needed = false;
+                }
                 complete(send, request.id, response)
             }
             Ok(Change::Write {
@@ -1759,6 +1819,7 @@ impl Pipeline {
                         response,
                         snapshot,
                         expected_ack_revision,
+                        keep_identity_fenced: held_tuning,
                     },
                     json!({
                         "action":"set",
@@ -1770,8 +1831,10 @@ impl Pipeline {
                 )
             }
             Err(code) => {
-                self.publish_identity(revision, loaded)?;
-                self.recovery_needed = false;
+                if !held_tuning {
+                    self.publish_identity(revision, loaded)?;
+                    self.recovery_needed = false;
+                }
                 complete(send, request.id, error(code))
             }
         }
@@ -1937,6 +2000,22 @@ fn source_join_available() -> bool {
 
 fn is_client_configuration_update(operation: &Operation) -> bool {
     matches!(operation, Operation::UpdateClientConfigOverrides { .. })
+}
+
+fn is_snapshot_tuning_update(operation: &Operation, document: &Document) -> bool {
+    let Operation::UpdateClientConfigOverrides {
+        certificate_id,
+        config_overrides,
+        ..
+    } = operation
+    else {
+        return false;
+    };
+    document
+        .clients
+        .iter()
+        .find(|client| &client.certificate_id == certificate_id)
+        .is_some_and(|client| client.config_overrides.same_effect_policy(config_overrides))
 }
 
 fn read_document(

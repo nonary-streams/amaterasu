@@ -49,7 +49,7 @@ fn settings() -> Settings {
 }
 
 pub(super) struct Harness {
-    document: Option<Value>,
+    pub(super) document: Option<Value>,
     revision: u64,
     incoming: Option<Response>,
     state_reply: Option<Response>,

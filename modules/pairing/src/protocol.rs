@@ -494,6 +494,50 @@ pub struct ClientConfigOverrides {
 }
 
 impl ClientConfigOverrides {
+    pub fn same_effect_policy(&self, other: &Self) -> bool {
+        fn remove_tuning(value: &mut ClientConfigOverrides) {
+            value.sw_preset = None;
+            value.sw_tune = None;
+            value.encoder = None;
+            value.min_threads = None;
+            value.qp = None;
+            value.display_mode = None;
+            value.fec_percentage = None;
+            value.max_bitrate = None;
+            value.minimum_fps_target = None;
+            value.video_max_batch_size_kb = None;
+            value.dd_mode_remapping = None;
+            value.dd_resolution_option = None;
+            value.dd_manual_resolution = None;
+            value.dd_refresh_rate_option = None;
+            value.dd_manual_refresh_rate = None;
+            value.dd_hdr_option = None;
+            value.dd_configuration_option = None;
+            value.dd_hdr_request_override = None;
+            value.frame_limiter_fps_limit = None;
+            value.frame_limiter_enable = None;
+            value.frame_limiter_provider = None;
+            value.frame_limiter_disable_vsync = None;
+            value.frame_limiter_auto_virtual_framegen = None;
+            value.rtss_frame_limit_type = None;
+            value.nvenc_spatial_aq = None;
+            value.nvenc_preset = None;
+            value.nvenc_h264_cavlc = None;
+            value.nvenc_twopass = None;
+            value.nvenc_vbv_increase = None;
+            value.nvenc_split_encode = None;
+            value.nvenc_realtime_hags = None;
+            value.nvenc_opengl_vulkan_on_dxgi = None;
+            value.nvenc_latency_over_power = None;
+            value.vaapi_strict_rc_buffer = None;
+        }
+        let mut left = self.clone();
+        let mut right = other.clone();
+        remove_tuning(&mut left);
+        remove_tuning(&mut right);
+        left == right
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         amaterasu_module_sdk::validate_software_options(
             self.sw_preset.as_deref(),

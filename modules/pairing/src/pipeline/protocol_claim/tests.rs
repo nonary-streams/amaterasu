@@ -360,8 +360,9 @@ fn pairing_actor_drives_real_state_claim_and_fences_future_trust_changes() {
     let path = directory();
     let store = TestStateStore::open(path.clone()).unwrap();
     let mut broker = broker();
-    let (mut pairing, _fixture, _certificate, epoch, source, _scope) =
+    let (mut pairing, fixture, certificate, epoch, source, _scope) =
         super::super::tests::authorized_feedback_for_test();
+    assert_eq!(store.handle("pairing",json!({"action":"set","key":"pairing/v1","value":fixture.document.unwrap(),"expected_revision":0}))["revision"],1);
     pairing.effect_authority.as_mut().unwrap().effect_owner = "issuer".into();
     let method = json!({"service":"example.effects/1","method":"apply","interface_major":1,"interface_minor":0,"schema_revision":1});
     let cleanup = json!({"service":"example.effects/1","method":"cleanup","interface_major":1,"interface_minor":0,"schema_revision":1});
@@ -464,6 +465,48 @@ fn pairing_actor_drives_real_state_claim_and_fences_future_trust_changes() {
         broker.dispatch("state", Command::Poll {}),
         Response::Pending
     ));
+    let config_update = |overrides: Value,
+                         revision: u64,
+                         operation: &str,
+                         pairing: &mut super::super::Pipeline,
+                         broker: &mut Broker|
+     -> Value {
+        let Response::Accepted{id}=broker.dispatch("console",Command::Request {service:"amaterasu.pairing/1".into(),
+            payload:json!({"action":"update_client_config_overrides","certificate_id":certificate,"config_overrides":overrides,"expected_revision":revision}),
+            timeout_ms:30_000,operation_id:operation.into(),parent:None}) else {panic!("config request")};
+        for _ in 0..30 {
+            pairing
+                .tick_at(super::super::tests::now(), |command| {
+                    Ok(broker.dispatch("pairing", command))
+                })
+                .unwrap();
+            if let Some(state) = service_one(broker, &store) {
+                finish_state(broker, state);
+            }
+            if let Response::Result { payload } =
+                broker.dispatch("console", Command::TakeResult { request: id })
+            {
+                return payload;
+            }
+        }
+        panic!("config request pending")
+    };
+    let tuning = config_update(
+        json!({"fec_percentage":10}),
+        2,
+        "tuning",
+        &mut pairing,
+        &mut broker,
+    );
+    assert_eq!(tuning["ok"], true);
+    let security = config_update(
+        json!({"fec_percentage":10,"controller":false}),
+        3,
+        "controller-policy",
+        &mut pairing,
+        &mut broker,
+    );
+    assert_eq!(security["code"], "protocol_reconciliation_required");
     drop(store);
     std::fs::remove_dir_all(path).unwrap();
 }
