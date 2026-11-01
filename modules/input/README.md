@@ -5,6 +5,10 @@
 grant. It uses `amaterasu.configuration/1` for durable product settings. Native modules are trusted code;
 API grants are not a native-code sandbox.
 
+The provider advertises mixed input batches in its active lease response. See
+the [input batch contract](../../docs/input-batch-contract.md) for ordering,
+capability negotiation and partial-failure behavior.
+
 Startup settings:
 
 ```json

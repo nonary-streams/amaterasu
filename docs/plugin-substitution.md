@@ -51,6 +51,11 @@ through native binding, cleanup and restart recovery. Custom native roles must
 acknowledge their expected contract before the table is used. Refer to the
 stream-session README for exact keys and the required delegated call grants.
 
+The selected `amaterasu.input/1` provider may advertise ordered mixed-event
+batches per lease. The shared [input batch contract](input-batch-contract.md)
+and SDK describe capability negotiation and partial failure; an older provider
+without that capability continues to receive homogeneous batches.
+
 ## Replacement acceptance
 
 A boundary is qualified only when the ordinary consumer exercises an alternate

@@ -87,6 +87,7 @@ pub struct Broker {
     pub input_expires_in_ms: Option<u64>,
     pub input_absolute_pointer: Option<Value>,
     pub input_controller_supported: Option<Value>,
+    pub input_mixed_batch_supported: Option<Value>,
     pub input_pen_touch_supported: Option<Value>,
     pub input_native_pen_touch: Option<Value>,
     pub history_available: bool,
@@ -1146,6 +1147,9 @@ impl Broker {
         }
         if let Some(supported) = &self.input_controller_supported {
             reply["controller_input"] = supported.clone();
+        }
+        if let Some(supported) = &self.input_mixed_batch_supported {
+            reply["mixed_input_batches"] = supported.clone();
         }
         if let Some(supported) = &self.input_pen_touch_supported {
             reply["pen_touch_supported"] = supported.clone();

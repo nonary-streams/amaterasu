@@ -7,6 +7,10 @@ use amaterasu_gamestream::control::{
     PointerEvent, ScrollAxis, TranslatedKeyState, TranslationError,
 };
 use amaterasu_media::CaptureGeometry;
+use amaterasu_module_sdk::input::{
+    InputBatchCapabilities, InputBatchOutcome, MAX_BATCH_EVENTS, decode_batch_outcome,
+    lease_from_reply,
+};
 use serde_json::{Value, json};
 
 #[derive(Clone, Copy, Debug)]
@@ -52,7 +56,6 @@ impl TouchPort {
 }
 
 const MAX_QUEUED_EVENTS: usize = 128;
-pub(super) const MAX_BATCH_EVENTS: usize = 64;
 const FEEDBACK_POLL_INTERVAL_MS: u64 = 20;
 const MAX_FEEDBACK_PEEK: usize = 16;
 
@@ -139,6 +142,9 @@ pub(super) fn accept_feedback_ack(
 }
 
 pub(super) fn next_input_batch_size(record: &Record) -> usize {
+    if record.input_mixed_batch_supported {
+        return record.input_events.len().min(MAX_BATCH_EVENTS);
+    }
     let Some(first) = record.input_events.front() else {
         return 0;
     };
@@ -361,8 +367,11 @@ pub(super) fn accept_input_lease(
         None => false,
         Some(_) => return Err("invalid_input_response"),
     };
+    let batch_capabilities = InputBatchCapabilities::from_lease_response(payload)
+        .map_err(|_| "invalid_input_response")?;
     record.input_lease = Some(lease.to_owned());
     record.input_controller_supported = controller_input_supported;
+    record.input_mixed_batch_supported = batch_capabilities.mixed_events;
     record.rumble_poll_at = now.saturating_add(40);
     record.input_pen_touch_supported = optional_bool(payload, "pen_touch_supported")?;
     record.input_native_pen_touch = optional_bool(payload, "native_pen_touch")?;
@@ -430,11 +439,14 @@ pub(super) fn adopt_input_for_cleanup(
 }
 
 pub(super) fn accept_input_batch(record: &mut Record, payload: &Value) -> Result<(), &'static str> {
-    if record.input_inflight == 0
-        || payload["ok"] != true
-        || payload["lease"] != json!(record.input_lease)
-        || payload["accepted"] != record.input_inflight
-    {
+    if !matches!(
+        decode_batch_outcome(
+            payload,
+            record.input_lease.as_deref(),
+            record.input_inflight
+        ),
+        Ok(InputBatchOutcome::Complete)
+    ) {
         return Err("input_batch_failed");
     }
     for _ in 0..record.input_inflight {
@@ -452,21 +464,23 @@ pub(super) fn accept_controller_batch_failure(
     record: &mut Record,
     payload: &Value,
 ) -> Result<(), &'static str> {
-    let accepted = payload["accepted"]
-        .as_u64()
-        .and_then(|accepted| usize::try_from(accepted).ok())
-        .filter(|accepted| *accepted < record.input_inflight)
-        .ok_or("input_batch_failed")?;
-    if record.input_inflight == 0
-        || !record.input_controller_supported
-        || payload["lease"] != json!(record.input_lease)
-        || payload["partial_event_possible"] != true
-        || payload["error"]["code"] != "controller_unavailable"
+    let accepted = match decode_batch_outcome(
+        payload,
+        record.input_lease.as_deref(),
+        record.input_inflight,
+    ) {
+        Ok(InputBatchOutcome::Partial {
+            accepted,
+            partial_event_possible: true,
+            code: "controller_unavailable",
+        }) => accepted,
+        _ => return Err("input_batch_failed"),
+    };
+    if !record.input_controller_supported
         || record
             .input_events
-            .iter()
-            .take(record.input_inflight)
-            .any(|event| !is_controller_payload(event))
+            .get(accepted)
+            .is_none_or(|event| !is_controller_payload(event))
     {
         return Err("input_batch_failed");
     }
@@ -526,6 +540,7 @@ pub(super) fn clear_input(record: &mut Record) {
     record.feedback_ack_through = None;
     record.input_absolute_pointer = false;
     record.input_controller_supported = false;
+    record.input_mixed_batch_supported = false;
     record.client_haptics_requested = false;
     record.input_pen_touch_supported = false;
     record.input_native_pen_touch = false;
@@ -838,15 +853,7 @@ pub(super) fn configure_translator(
 }
 
 fn input_lease(payload: &Value) -> Result<&str, &'static str> {
-    payload["lease"]
-        .as_str()
-        .filter(|token| {
-            token.len() == 32
-                && token
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        })
-        .ok_or("invalid_input_response")
+    lease_from_reply(payload).map_err(|_| "invalid_input_response")
 }
 
 fn valid_label(value: &str, maximum: usize) -> bool {

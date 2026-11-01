@@ -1339,9 +1339,14 @@ impl<B: Backend> Controller<B> {
                     // drop this gamepad packet. The backend retains any virtual
                     // device whose neutral release or destroy still needs retry.
                     let mut reply = self.failure(error);
-                    reply["lease"] = json!(token);
-                    reply["accepted"] = accepted.into();
-                    reply["partial_event_possible"] = true.into();
+                    amaterasu_module_sdk::input::record_batch_failure(
+                        &mut reply,
+                        token,
+                        events.len(),
+                        accepted,
+                        true,
+                    )
+                    .expect("validated nonempty batch and controller error");
                     return reply;
                 }
                 let _ = self.finish_lease(Instant::now(), "failed");
@@ -2083,7 +2088,7 @@ impl<B: Backend> Drop for Controller<B> {
 }
 
 fn active_lease<B: Backend>(lease: &Lease, now: Instant, backend: &B) -> Value {
-    json!({
+    let mut response = json!({
         "ok": true,
         "state": "active",
         "operation_id": lease.operation_id,
@@ -2111,7 +2116,11 @@ fn active_lease<B: Backend>(lease: &Lease, now: Instant, backend: &B) -> Value {
         "effective_gamepad_profile": backend.effective_gamepad_profile(),
         "gamepad_unavailable_reason": backend.gamepad_unavailable_reason(),
         "cleanup_required": lease.cleanup_required,
-    })
+    });
+    amaterasu_module_sdk::input::InputBatchCapabilities { mixed_events: true }
+        .write_lease_response(&mut response)
+        .expect("active lease response is a JSON object");
+    response
 }
 
 fn repeat_period(frequency_hz: f64) -> Duration {

@@ -3,7 +3,7 @@ use amaterasu_input_policy::KeyBindings;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub const MAX_EVENTS: usize = 64;
+pub const MAX_EVENTS: usize = amaterasu_module_sdk::input::MAX_BATCH_EVENTS;
 pub const MAX_PRESSED: usize = 128;
 pub const MAX_PEN_TOUCH_CONTACTS: usize = 16;
 pub const MAX_QUEUED_REQUESTS: usize = 128;

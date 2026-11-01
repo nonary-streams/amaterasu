@@ -711,6 +711,11 @@ reference counts.
 
 ## Implementation sequence
 
+The current `amaterasu.input/1` broker batch contract has Rust SDK helpers and
+C constants for capability negotiation and partial results. Those incremental
+additions do not implement the native provider, middleware or receipt APIs
+proposed below.
+
 | Increment | Task-owned areas and outcome | Acceptance gate |
 | --- | --- | --- |
 | 1. Publish the domain contract | New `crates/input-api`, `sdk/include/amaterasu_input.h`, and `crates/module-sdk/src/input/`; public replacement-service, provider and middleware contracts with `Pass` / `Replace(events)` / `Consume`, coordinator dispatch, schema validation, identities, capabilities, receipts, feedback, and optional queue/lifecycle helpers. Keep protocol serialization separate. | Rust/C layout checks, unknown-version/size tests, finite/bounded payload validation, independently compiled fixtures using public dependencies only. |

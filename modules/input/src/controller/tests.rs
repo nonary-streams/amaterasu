@@ -1908,6 +1908,44 @@ fn unavailable_gamepad_keeps_the_input_lease_for_other_events_and_cleanup() {
 }
 
 #[test]
+fn mixed_batch_reports_the_accepted_prefix_before_a_controller_failure() {
+    let mut controller = Controller::new(
+        FakeBackend {
+            controller_input_supported: true,
+            fail_controller_input: true,
+            ..Default::default()
+        },
+        true,
+    );
+    let token = acquire(&mut controller, Instant::now());
+    let pointer = Event::Relative { dx: 2, dy: -3 };
+    let key_down = key(30, KeyState::Down);
+    let failure = batch(
+        &mut controller,
+        &token,
+        vec![pointer.clone(), controller_event(), key_down.clone()],
+    );
+    assert_eq!(
+        amaterasu_module_sdk::input::decode_batch_outcome(&failure, Some(&token), 3),
+        Ok(amaterasu_module_sdk::input::InputBatchOutcome::Partial {
+            accepted: 1,
+            partial_event_possible: true,
+            code: "controller_unavailable",
+        })
+    );
+    assert_eq!(
+        controller.backend.trace.borrow().as_slice(),
+        &[pointer, controller_event()]
+    );
+    assert!(controller.lease.is_some());
+    assert_eq!(
+        batch(&mut controller, &token, vec![key_down.clone()])["ok"],
+        true
+    );
+    assert_eq!(controller.backend.trace.borrow().last(), Some(&key_down));
+}
+
+#[test]
 fn controller_policy_live_disables_slots_without_stopping_keyboard_or_mouse() {
     let mut controller = Controller::new(
         FakeBackend {

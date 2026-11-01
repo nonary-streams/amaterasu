@@ -1321,6 +1321,34 @@ fn queue_overflow_stops_session_and_releases_input() {
 }
 
 #[test]
+fn sustained_interleaved_pointer_and_controller_input_preserves_order() {
+    let mut host = Harness::new();
+    enable_input(&mut host);
+    host.broker.input_controller_supported = Some(json!(true));
+    host.broker.input_mixed_batch_supported = Some(json!(true));
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+
+    for tick in 0..400 {
+        if tick % 4 == 0 {
+            host.plane
+                .borrow_mut()
+                .controls
+                .extend([relative(tick * 2 + 1), controller_packet(tick * 2 + 2)]);
+        }
+        host.tick();
+        assert_eq!(host.pipeline.records[&id].state, State::Active);
+    }
+    host.idle();
+    assert_eq!(host.pipeline.records[&id].state, State::Active);
+    assert_eq!(host.broker.input_events.len(), 200);
+    for pair in host.broker.input_events.as_chunks::<2>().0 {
+        assert_eq!(pair[0]["kind"], "relative");
+        assert_eq!(pair[1]["kind"], "controller");
+    }
+}
+
+#[test]
 fn renewal_uses_its_submission_clock_and_expiry_stops_input() {
     let mut renewed = Harness::new();
     enable_input(&mut renewed);
