@@ -14,6 +14,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use x509_cert::der::Encode;
 
+mod source_retirement;
+
 const STATE_KEY: &str = "pairing/v1";
 const SYSTEM_TRAY_SERVICE: &str = "amaterasu.system-tray/1";
 const HOST_CONFIGURATION_SERVICE: &str = "amaterasu.host-configuration/1";
@@ -960,6 +962,11 @@ impl Pipeline {
                             | "status"
                             | "drain"
                             | "recover"
+                            | "fence_protocol_restart"
+                            | "fence_source"
+                            | "complete_source_retirement"
+                            | "lookup_source_retirement"
+                            | "lookup_current_source_retirement"
                     )
                 ) =>
             {
@@ -1008,6 +1015,9 @@ impl Pipeline {
             || !serde_json::to_vec(&payload).is_ok_and(|bytes| bytes.len() <= 12_000)
         {
             return Err("forbidden");
+        }
+        if source_retirement::is_source_retirement(&payload) {
+            return self.apply_source_retirement(caller, payload);
         }
         let request: EffectRequest =
             serde_json::from_value(payload).map_err(|_| "invalid_request")?;
@@ -1103,7 +1113,7 @@ impl Pipeline {
             }
             EffectRequest::Admit { .. } => Err("scope_required"),
             EffectRequest::Status {} => Ok(
-                json!({"ok":true,"epoch":gate.epoch(),"owner_epoch":gate.owner_epoch(),"startup_recovery_required":gate.startup_recovery_required(),"fence_generation":gate.fence_generation(),"drain_required":gate.drain_required(),"in_flight":gate.in_flight()}),
+                json!({"ok":true,"epoch":gate.epoch(),"owner_epoch":gate.owner_epoch(),"startup_recovery_required":gate.startup_recovery_required(),"fence_generation":gate.fence_generation(),"fenced":gate.fenced(),"drain_required":gate.drain_required(),"in_flight":gate.in_flight(),"bound_sources":gate.bound_sources(),"pending_source_retirements":gate.pending_source_retirements()}),
             ),
             EffectRequest::Drain {
                 epoch,

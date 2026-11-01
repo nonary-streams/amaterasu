@@ -21,6 +21,14 @@ mod wire;
 pub use product_settings::{default_document, validate_document};
 pub use settings::Settings;
 
+/// In-process state-machine access for cross-provider tests only.
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    pub use crate::source_join::recovery::{
+        Outcome as SourceRecoveryOutcome, Recovery as SourceRecovery,
+    };
+}
+
 use amaterasu_module_sdk::{
     Command, LogLevel, ManagedModule, ModuleResult, Response, RuntimeClient,
 };
@@ -95,6 +103,12 @@ fn apply_listener_target(
 enum Operation {
     Status,
     BindFeedbackSource {
+        authority_epoch: String,
+        source: amaterasu_module_sdk::effect_authority::Source,
+        scope: amaterasu_module_sdk::effect_authority::StreamScope,
+        input_boot_epoch: String,
+    },
+    ReconcileFeedbackSource {
         authority_epoch: String,
         source: amaterasu_module_sdk::effect_authority::Source,
         scope: amaterasu_module_sdk::effect_authority::StreamScope,
@@ -289,7 +303,8 @@ struct NvhttpModule {
     listener_rebind_delay: Duration,
     audio_driver_install: audio_driver_install::AudioDriverInstallSync,
     source_join: Option<source_join::Join>,
-    source_join_recovery_required: bool,
+    source_join_recovery: Option<source_join::recovery::Recovery>,
+    source_join_startup: Option<source_join::startup::Startup>,
 }
 
 impl ManagedModule for NvhttpModule {
@@ -360,6 +375,14 @@ impl ManagedModule for NvhttpModule {
             "nvhttp",
             "control and pairing module initialized",
         );
+        let source_join_startup = if source_join_available() {
+            settings
+                .effect_source_join
+                .as_ref()
+                .map(|_| source_join::startup::Startup::new())
+        } else {
+            None
+        };
         Ok(Self {
             runtime,
             startup_settings: settings,
@@ -379,7 +402,8 @@ impl ManagedModule for NvhttpModule {
             listener_rebind_delay: Duration::from_secs(1),
             audio_driver_install: audio_driver_install::AudioDriverInstallSync::default(),
             source_join: None,
-            source_join_recovery_required: false,
+            source_join_recovery: None,
+            source_join_startup,
         })
     }
 
@@ -619,12 +643,22 @@ impl ManagedModule for NvhttpModule {
                 }
             }
         }
+        self.advance_source_startup();
+        self.advance_source_recovery()?;
         self.advance_source_join()?;
         self.poll_control()
     }
 }
 
 impl NvhttpModule {
+    fn advance_source_startup(&mut self) {
+        if let Some(startup) = &mut self.source_join_startup
+            && startup.advance(|command| self.runtime.send(command))
+        {
+            self.source_join_startup = None;
+        }
+    }
+
     fn advance_source_join(&mut self) -> ModuleResult<()> {
         let Some(mut join) = self.source_join.take() else {
             return Ok(());
@@ -642,19 +676,49 @@ impl NvhttpModule {
                     payload,
                 }) {
                     Ok(Response::Ok) => {}
-                    _ if binding_succeeded => self.source_join_recovery_required = true,
+                    _ if binding_succeeded => {
+                        self.source_join_recovery = Some(join.into_recovery())
+                    }
                     Ok(Response::Error { code, .. })
                         if code == "request_ended" || code == "not_found" => {}
                     _ => return Err("nvhttp response unavailable".into()),
                 }
             }
             source_join::Outcome::RecoveryRequired => {
-                self.source_join_recovery_required = true;
+                self.source_join_recovery = Some(join.into_recovery());
+            }
+        }
+        Ok(())
+    }
+
+    fn advance_source_recovery(&mut self) -> ModuleResult<()> {
+        use source_join::recovery::Outcome;
+        let Some(mut recovery) = self.source_join_recovery.take() else {
+            return Ok(());
+        };
+        match recovery.advance(|command| self.runtime.send(command)) {
+            Outcome::Pending => self.source_join_recovery = Some(recovery),
+            Outcome::FenceSettled {
+                original_request,
+                operation_id,
+                fence_confirmed,
+            } => {
+                self.source_join_recovery = Some(recovery);
                 complete_control(
                     &self.runtime,
-                    join.request_id(),
-                    json!({"ok":false,"code":"recovery_required"}),
+                    original_request,
+                    json!({"ok":false,"code":"recovery_required","retirement_operation_id":operation_id,"fence_confirmed":fence_confirmed}),
                 )?;
+            }
+            Outcome::Reply {
+                request,
+                payload,
+                retired,
+            } => {
+                if !retired {
+                    self.source_join_recovery = Some(recovery);
+                }
+                complete_control(&self.runtime, request, payload)?;
             }
         }
         Ok(())
@@ -782,7 +846,10 @@ impl NvhttpModule {
                                 json!({"ok":false,"code":"source_attestation_unavailable"}),
                             );
                         }
-                        if self.source_join_recovery_required || self.source_join.is_some() {
+                        if self.source_join_startup.is_some()
+                            || self.source_join_recovery.is_some()
+                            || self.source_join.is_some()
+                        {
                             return complete_control(
                                 &self.runtime,
                                 id,
@@ -825,6 +892,47 @@ impl NvhttpModule {
                                 self.source_join = Some(join);
                                 Ok(())
                             }
+                            Err(code) => {
+                                complete_control(&self.runtime, id, json!({"ok":false,"code":code}))
+                            }
+                        }
+                    }
+                    Operation::ReconcileFeedbackSource {
+                        authority_epoch,
+                        source,
+                        scope,
+                        input_boot_epoch,
+                    } => {
+                        let Some(selection) = self.startup_settings.effect_source_join.as_ref()
+                        else {
+                            return complete_control(
+                                &self.runtime,
+                                id,
+                                json!({"ok":false,"code":"permission_denied"}),
+                            );
+                        };
+                        if !selection.admits(&caller, &initiator) {
+                            return complete_control(
+                                &self.runtime,
+                                id,
+                                json!({"ok":false,"code":"permission_denied"}),
+                            );
+                        }
+                        let Some(recovery) = self.source_join_recovery.as_mut() else {
+                            return complete_control(
+                                &self.runtime,
+                                id,
+                                json!({"ok":false,"code":"unknown_source_retirement"}),
+                            );
+                        };
+                        let request = amaterasu_module_sdk::nvhttp_source::BindFeedbackSource {
+                            authority_epoch,
+                            source,
+                            scope,
+                            input_boot_epoch,
+                        };
+                        match recovery.begin_lookup(id, &request) {
+                            Ok(()) => Ok(()),
                             Err(code) => {
                                 complete_control(&self.runtime, id, json!({"ok":false,"code":code}))
                             }
@@ -1068,6 +1176,7 @@ impl NvhttpModule {
                             }
                             Operation::Status
                             | Operation::BindFeedbackSource { .. }
+                            | Operation::ReconcileFeedbackSource { .. }
                             | Operation::ManagementLaunchStatus { .. }
                             | Operation::ManagementStopLaunch { .. } => unreachable!(),
                         };
@@ -1197,7 +1306,23 @@ impl WarmIdentity {
     }
 }
 
+#[cfg(not(feature = "test-support"))]
 amaterasu_module_sdk::export_module!(NvhttpModule);
+
+/// The in-process test feature uses a distinct Rust symbol so it can link
+/// alongside another native module without exporting a second ABI entrypoint.
+#[cfg(feature = "test-support")]
+pub fn test_module_api() -> *const amaterasu_module_sdk::abi::ModuleApi {
+    use amaterasu_module_sdk::{abi, exports};
+    static API: abi::ModuleApi = abi::ModuleApi {
+        header: abi::AbiHeader::of::<abi::ModuleApi>(),
+        create: exports::create::<NvhttpModule>,
+        tick: exports::tick::<NvhttpModule>,
+        health: exports::health::<NvhttpModule>,
+        destroy: exports::destroy::<NvhttpModule>,
+    };
+    &API
+}
 
 #[cfg(test)]
 mod tests {

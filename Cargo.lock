@@ -704,6 +704,7 @@ dependencies = [
  "amaterasu-identity",
  "amaterasu-input-policy",
  "amaterasu-module-sdk",
+ "amaterasu-nvhttp",
  "amaterasu-runtime",
  "amaterasu-storage",
  "getrandom 0.3.4",

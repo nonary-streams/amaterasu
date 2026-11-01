@@ -4395,6 +4395,21 @@ fn authority_broker() -> amaterasu_runtime::Broker {
     configuration.principals.insert(
         "input".into(),
         Grants {
+            call: [EFFECT_SERVICE.into(), "amaterasu.nvhttp/1".into()].into(),
+            ..Default::default()
+        },
+    );
+    configuration.principals.insert(
+        "nvhttp".into(),
+        Grants {
+            provide: ["amaterasu.nvhttp/1".into()].into(),
+            call: [EFFECT_SERVICE.into()].into(),
+            ..Default::default()
+        },
+    );
+    configuration.principals.insert(
+        "foreign".into(),
+        Grants {
             call: [EFFECT_SERVICE.into()].into(),
             ..Default::default()
         },
@@ -4404,6 +4419,7 @@ fn authority_broker() -> amaterasu_runtime::Broker {
         ("pairing", SERVICE),
         ("pairing", EFFECT_SERVICE),
         ("state", STATE_SERVICE),
+        ("nvhttp", "amaterasu.nvhttp/1"),
     ] {
         assert!(matches!(
             broker.dispatch(
@@ -4416,6 +4432,432 @@ fn authority_broker() -> amaterasu_runtime::Broker {
         ));
     }
     broker
+}
+
+#[test]
+fn real_pairing_broker_fences_one_source_until_owner_retirement() {
+    let (mut pipeline, _harness, _certificate, epoch, source, scope) =
+        authorized_feedback_for_test();
+    let mut broker = authority_broker();
+    let mut sequence = 0_u64;
+    let mut call = |pipeline: &mut Pipeline, caller: &str, payload: Value| {
+        sequence += 1;
+        let Response::Accepted { id } = broker.dispatch(
+            caller,
+            Command::Request {
+                service: EFFECT_SERVICE.into(),
+                payload,
+                timeout_ms: 30_000,
+                operation_id: format!("broker-source-retirement-{sequence}"),
+                parent: None,
+            },
+        ) else {
+            panic!("request not accepted");
+        };
+        pipeline
+            .tick_at(now(), |command| Ok(broker.dispatch("pairing", command)))
+            .unwrap();
+        let Response::Result { payload } =
+            broker.dispatch(caller, Command::TakeResult { request: id })
+        else {
+            panic!("no response");
+        };
+        assert!(matches!(
+            broker.dispatch(caller, Command::ReleaseResult { request: id }),
+            Response::Ok
+        ));
+        payload
+    };
+    let admitted = call(
+        &mut pipeline,
+        "input",
+        json!({"action":"admit_stream_lease","epoch":epoch,"source":source,"scope":scope,"operation_id":"lease-one","sequence":1}),
+    );
+    let ticket = admitted["ticket"].as_str().unwrap();
+    let fence = json!({"action":"fence_source","epoch":epoch,"source":source,"scope":scope,"operation_id":"retire-one"});
+    assert_eq!(
+        call(&mut pipeline, "foreign", fence.clone())["code"],
+        "forbidden"
+    );
+    assert_eq!(
+        call(&mut pipeline, "nvhttp", fence.clone())["state"],
+        "fenced"
+    );
+    assert_eq!(call(&mut pipeline, "nvhttp", fence)["state"], "fenced");
+    let discovered = call(
+        &mut pipeline,
+        "nvhttp",
+        json!({"action":"lookup_current_source_retirement","epoch":epoch,"source":source,"scope":scope}),
+    );
+    assert_eq!(discovered["operation_id"], "retire-one");
+    assert_eq!(discovered["state"], "fenced");
+    let late = call(
+        &mut pipeline,
+        "nvhttp",
+        json!({"action":"bind_stream","epoch":epoch,"certificate_pem":CLIENT_CERT,"source":source,"scope":scope}),
+    );
+    assert_eq!(late["code"], "source_denied");
+    let late_admit = call(
+        &mut pipeline,
+        "input",
+        json!({"action":"admit_stream_lease","epoch":epoch,"source":source,"scope":scope,"operation_id":"late","sequence":2}),
+    );
+    assert_eq!(late_admit["code"], "source_denied");
+    let finish = json!({"action":"complete_source_retirement","epoch":epoch,"source":source,"scope":scope,"operation_id":"retire-one","retirement":null});
+    assert_eq!(
+        call(&mut pipeline, "nvhttp", finish.clone())["code"],
+        "forbidden"
+    );
+    assert_eq!(
+        call(&mut pipeline, "input", finish.clone())["code"],
+        "effects_in_flight"
+    );
+    let retirement = json!({"ok":true,"service":"amaterasu.control-transport/1","stream":7,
+        "provider_epoch":"c".repeat(32),"operation_id":"transport-retire","scope":"whole_control_stream","state":"retired"});
+    assert_eq!(
+        call(
+            &mut pipeline,
+            "input",
+            json!({"action":"complete_stream_lease","epoch":epoch,"operation_id":"lease-one","ticket":ticket,"retirement":retirement})
+        )["ok"],
+        true
+    );
+    assert_eq!(
+        call(&mut pipeline, "input", finish)["code"],
+        "lease_acknowledgment_pending"
+    );
+    assert_eq!(
+        call(
+            &mut pipeline,
+            "input",
+            json!({"action":"acknowledge","epoch":epoch,"operation_id":"lease-one","ticket":ticket})
+        )["ok"],
+        true
+    );
+    let finish = json!({"action":"complete_source_retirement","epoch":epoch,"source":source,"scope":scope,"operation_id":"retire-one","retirement":null});
+    assert_eq!(
+        call(&mut pipeline, "input", finish)["code"],
+        "retirement_mismatch"
+    );
+    let finish = json!({"action":"complete_source_retirement","epoch":epoch,"source":source,"scope":scope,"operation_id":"retire-one","retirement":retirement});
+    assert_eq!(
+        call(&mut pipeline, "input", finish.clone())["state"],
+        "retired"
+    );
+    assert_eq!(call(&mut pipeline, "input", finish)["state"], "retired");
+    let lookup = call(
+        &mut pipeline,
+        "nvhttp",
+        json!({"action":"lookup_source_retirement","epoch":epoch,"source":source,"scope":scope,"operation_id":"retire-one"}),
+    );
+    assert_eq!(lookup["state"], "retired");
+    assert!(lookup.get("certificate_pem").is_none());
+    let restart = call(
+        &mut pipeline,
+        "nvhttp",
+        json!({"action":"fence_protocol_restart","epoch":epoch,"operation_id":"restart-test"}),
+    );
+    assert_eq!(restart["state"], "fenced");
+    let after = call(
+        &mut pipeline,
+        "input",
+        json!({"action":"recover","epoch":epoch,"owner_epoch":"new-owner"}),
+    );
+    assert_eq!(after["ok"], true);
+    assert_ne!(after["epoch"], epoch);
+    assert_eq!(
+        call(
+            &mut pipeline,
+            "nvhttp",
+            json!({"action":"lookup_source_retirement","epoch":epoch,"source":source,"scope":scope,"operation_id":"retire-one"})
+        )["code"],
+        "stale_epoch"
+    );
+    let receipt: amaterasu_module_sdk::effect_source_retirement::Receipt =
+        serde_json::from_value(lookup).unwrap();
+    assert!(receipt.matches(
+        &epoch,
+        &serde_json::from_value(source).unwrap(),
+        &serde_json::from_value(scope).unwrap(),
+        "retire-one"
+    ));
+}
+
+#[test]
+fn real_nvhttp_recovery_and_pairing_reconcile_a_cancelled_bind_through_broker() {
+    use amaterasu_nvhttp::test_support::{SourceRecovery, SourceRecoveryOutcome};
+    let (mut pairing, _state, _certificate, epoch, source, scope) = authorized_feedback_for_test();
+    let mut broker = authority_broker();
+    let request = amaterasu_module_sdk::nvhttp_source::BindFeedbackSource {
+        authority_epoch: epoch.clone(),
+        source: serde_json::from_value(source.clone()).unwrap(),
+        scope: serde_json::from_value(scope.clone()).unwrap(),
+        input_boot_epoch: "input-boot".into(),
+    };
+    let operation = request.retirement_operation_id();
+    let Response::Accepted{id:lease}=broker.dispatch("input",Command::Request{service:EFFECT_SERVICE.into(),
+        payload:json!({"action":"admit_stream_lease","epoch":epoch,"source":source,"scope":scope,"operation_id":"combined-lease","sequence":1}),
+        timeout_ms:30000,operation_id:"combined-lease-admission".into(),parent:None}) else {panic!("lease rejected")};
+    pairing
+        .tick_at(now(), |command| Ok(broker.dispatch("pairing", command)))
+        .unwrap();
+    let Response::Result { payload } =
+        broker.dispatch("input", Command::TakeResult { request: lease })
+    else {
+        panic!("no lease response")
+    };
+    let ticket = payload["ticket"].as_str().unwrap().to_owned();
+    let Response::Accepted { id: origin } = broker.dispatch(
+        "input",
+        Command::Request {
+            service: "amaterasu.nvhttp/1".into(),
+            payload: request.payload(),
+            timeout_ms: 30000,
+            operation_id: "uncertain-original".into(),
+            parent: None,
+        },
+    ) else {
+        panic!("original rejected")
+    };
+    assert!(matches!(
+        broker.dispatch("nvhttp", Command::Poll {}),
+        Response::Request { .. }
+    ));
+    assert!(matches!(
+        broker.dispatch("input", Command::Cancel { request: origin }),
+        Response::Ok
+    ));
+    let mut recovery = SourceRecovery::new(origin, request.clone());
+    let mut fenced = false;
+    for _ in 0..20 {
+        if let SourceRecoveryOutcome::FenceSettled {
+            fence_confirmed,
+            operation_id,
+            ..
+        } = recovery.advance(|command| Ok(broker.dispatch("nvhttp", command)))
+        {
+            assert!(fence_confirmed);
+            assert_eq!(operation_id, operation);
+            fenced = true;
+            break;
+        }
+        pairing
+            .tick_at(now(), |command| Ok(broker.dispatch("pairing", command)))
+            .unwrap();
+    }
+    assert!(fenced);
+    let retirement = json!({"ok":true,"service":"amaterasu.control-transport/1","stream":7,"provider_epoch":"c".repeat(32),
+        "operation_id":"real-owner-fixture-retire","scope":"whole_control_stream","state":"retired"});
+    let Response::Accepted{id:completed_lease}=broker.dispatch("input",Command::Request{service:EFFECT_SERVICE.into(),
+        payload:json!({"action":"complete_stream_lease","epoch":epoch,"operation_id":"combined-lease","ticket":ticket,"retirement":retirement}),
+        timeout_ms:30000,operation_id:"combined-lease-completion".into(),parent:None}) else {panic!("lease completion rejected")};
+    pairing
+        .tick_at(now(), |command| Ok(broker.dispatch("pairing", command)))
+        .unwrap();
+    assert!(matches!(
+        broker.dispatch(
+            "input",
+            Command::TakeResult {
+                request: completed_lease
+            }
+        ),
+        Response::Result { .. }
+    ));
+    let Response::Accepted{id:ack}=broker.dispatch("input",Command::Request{service:EFFECT_SERVICE.into(),
+        payload:json!({"action":"acknowledge","epoch":epoch,"operation_id":"combined-lease","ticket":ticket}),
+        timeout_ms:30000,operation_id:"combined-lease-ack".into(),parent:None}) else {panic!("lease ack rejected")};
+    pairing
+        .tick_at(now(), |command| Ok(broker.dispatch("pairing", command)))
+        .unwrap();
+    assert!(matches!(
+        broker.dispatch("input", Command::TakeResult { request: ack }),
+        Response::Result { .. }
+    ));
+    let Response::Accepted{id:completion}=broker.dispatch("input",Command::Request{service:EFFECT_SERVICE.into(),
+        payload:json!({"action":"complete_source_retirement","epoch":epoch,"source":source,"scope":scope,"operation_id":operation,"retirement":retirement}),
+        timeout_ms:30000,operation_id:"owner-retire-source".into(),parent:None}) else {panic!("completion rejected")};
+    pairing
+        .tick_at(now(), |command| Ok(broker.dispatch("pairing", command)))
+        .unwrap();
+    let Response::Result { payload } = broker.dispatch(
+        "input",
+        Command::TakeResult {
+            request: completion,
+        },
+    ) else {
+        panic!("no retirement result")
+    };
+    assert_eq!(payload["state"], "retired");
+    let Response::Accepted { id: reconcile } = broker.dispatch(
+        "input",
+        Command::Request {
+            service: "amaterasu.nvhttp/1".into(),
+            payload: request.reconciliation_payload(),
+            timeout_ms: 30000,
+            operation_id: "owner-reconcile-source".into(),
+            parent: None,
+        },
+    ) else {
+        panic!("reconcile rejected")
+    };
+    assert!(matches!(
+        broker.dispatch("nvhttp", Command::Poll {}),
+        Response::Request { .. }
+    ));
+    recovery.begin_lookup(reconcile, &request).unwrap();
+    let mut verified = false;
+    for _ in 0..20 {
+        if let SourceRecoveryOutcome::Reply {
+            retired: true,
+            payload,
+            ..
+        } = recovery.advance(|command| Ok(broker.dispatch("nvhttp", command)))
+        {
+            assert!(request.accepts_retirement_confirmation(&payload, &operation));
+            verified = true;
+            break;
+        }
+        pairing
+            .tick_at(now(), |command| Ok(broker.dispatch("pairing", command)))
+            .unwrap();
+    }
+    assert!(verified);
+    assert_eq!(pairing.apply_effect_request("nvhttp","nvhttp",json!({"action":"bind_stream","epoch":epoch,"certificate_pem":CLIENT_CERT,"source":source,"scope":scope}),now()),Err("source_denied"));
+}
+
+#[test]
+fn protocol_restart_requires_old_owner_drain_before_epoch_rotation() {
+    let (mut pipeline, _harness, _certificate, epoch, source, scope) =
+        authorized_feedback_for_test();
+    let admitted=pipeline.apply_effect_request("input","input",json!({"action":"admit_stream_lease","epoch":epoch,"source":source,"scope":scope,"operation_id":"restart-lease","sequence":1}),now()).unwrap();
+    let ticket = admitted["ticket"].as_str().unwrap();
+    let fence =
+        json!({"action":"fence_protocol_restart","epoch":epoch,"operation_id":"restart-op"});
+    assert_eq!(
+        pipeline.apply_effect_request("input", "input", fence.clone(), now()),
+        Err("forbidden")
+    );
+    let first = pipeline
+        .apply_effect_request("nvhttp", "nvhttp", fence.clone(), now())
+        .unwrap();
+    assert_eq!(first["state"], "fenced");
+    assert_eq!(
+        pipeline
+            .apply_effect_request("nvhttp", "nvhttp", fence, now())
+            .unwrap(),
+        first
+    );
+    assert_eq!(
+        pipeline.apply_effect_request(
+            "input",
+            "input",
+            json!({"action":"recover","epoch":epoch,"owner_epoch":"new-owner"}),
+            now()
+        ),
+        Err("recovery_required")
+    );
+    let retirement = json!({"ok":true,"service":"amaterasu.control-transport/1","stream":7,
+        "provider_epoch":"c".repeat(32),"operation_id":"restart-retire","scope":"whole_control_stream","state":"retired"});
+    assert_eq!(pipeline.apply_effect_request("input","input",json!({"action":"complete_stream_lease","epoch":epoch,"operation_id":"restart-lease","ticket":ticket,"retirement":retirement}),now()).unwrap()["ok"],true);
+    let generation = pipeline.effect_gate.as_ref().unwrap().fence_generation();
+    assert_eq!(
+        pipeline
+            .apply_effect_request(
+                "input",
+                "input",
+                json!({"action":"drain","epoch":epoch,"fence_generation":generation}),
+                now()
+            )
+            .unwrap()["ok"],
+        true
+    );
+    let next = pipeline
+        .apply_effect_request(
+            "input",
+            "input",
+            json!({"action":"recover","epoch":epoch,"owner_epoch":"new-owner"}),
+            now(),
+        )
+        .unwrap()["epoch"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(next, epoch);
+    assert_eq!(
+        pipeline.apply_effect_request(
+            "nvhttp",
+            "nvhttp",
+            json!({"action":"fence_protocol_restart","epoch":epoch,"operation_id":"old"}),
+            now()
+        ),
+        Err("stale_epoch")
+    );
+}
+
+#[test]
+fn delivered_then_cancelled_source_fence_and_completion_do_not_mutate_authority() {
+    let (mut pipeline, _harness, _certificate, epoch, source, scope) =
+        authorized_feedback_for_test();
+    let mut broker = authority_broker();
+    let fence = json!({"action":"fence_source","epoch":epoch,"source":source,"scope":scope,"operation_id":"cancelled-fence"});
+    let Response::Accepted { id } = broker.dispatch(
+        "nvhttp",
+        Command::Request {
+            service: EFFECT_SERVICE.into(),
+            payload: fence.clone(),
+            timeout_ms: 30000,
+            operation_id: "cancel-fence-delivered".into(),
+            parent: None,
+        },
+    ) else {
+        panic!("not accepted")
+    };
+    pipeline
+        .tick_at(now(), |command| {
+            let result = broker.dispatch("pairing", command);
+            if matches!(&result,Response::Request{id:delivered,..} if *delivered==id) {
+                assert!(matches!(
+                    broker.dispatch("nvhttp", Command::Cancel { request: id }),
+                    Response::Ok
+                ));
+            }
+            Ok(result)
+        })
+        .unwrap();
+    assert_eq!(pipeline.apply_effect_request("nvhttp","nvhttp",json!({"action":"lookup_source_retirement","epoch":epoch,"source":source,"scope":scope,"operation_id":"cancelled-fence"}),now()),Err("unknown_source_retirement"));
+    assert_eq!(
+        pipeline
+            .apply_effect_request("nvhttp", "nvhttp", fence, now())
+            .unwrap()["state"],
+        "fenced"
+    );
+    let complete = json!({"action":"complete_source_retirement","epoch":epoch,"source":source,"scope":scope,"operation_id":"cancelled-fence","retirement":null});
+    let Response::Accepted { id } = broker.dispatch(
+        "input",
+        Command::Request {
+            service: EFFECT_SERVICE.into(),
+            payload: complete,
+            timeout_ms: 30000,
+            operation_id: "cancel-completion-delivered".into(),
+            parent: None,
+        },
+    ) else {
+        panic!("not accepted")
+    };
+    pipeline
+        .tick_at(now(), |command| {
+            let result = broker.dispatch("pairing", command);
+            if matches!(&result,Response::Request{id:delivered,..} if *delivered==id) {
+                assert!(matches!(
+                    broker.dispatch("input", Command::Cancel { request: id }),
+                    Response::Ok
+                ));
+            }
+            Ok(result)
+        })
+        .unwrap();
+    let lookup=pipeline.apply_effect_request("input","input",json!({"action":"lookup_source_retirement","epoch":epoch,"source":source,"scope":scope,"operation_id":"cancelled-fence"}),now()).unwrap();
+    assert_eq!(lookup["state"], "fenced");
 }
 
 #[test]

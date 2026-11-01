@@ -10,6 +10,9 @@ use amaterasu_module_sdk::{
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
+pub mod recovery;
+pub mod startup;
+
 const LIFECYCLE: &str = "amaterasu.session-lifecycle/1";
 const PAIRING: &str = "amaterasu.pairing-effects/1";
 
@@ -47,6 +50,10 @@ pub enum Outcome {
 impl Join {
     pub fn request_id(&self) -> u64 {
         self.request_id
+    }
+
+    pub fn into_recovery(self) -> recovery::Recovery {
+        recovery::Recovery::new(self.request_id, self.request)
     }
     pub fn start(
         request_id: u64,
@@ -531,5 +538,235 @@ mod tests {
             tick(&mut join, &mut broker, true),
             Outcome::RecoveryRequired
         ));
+    }
+
+    #[test]
+    fn uncertain_bind_is_fenced_and_reconciled_only_after_owner_retirement() {
+        use recovery::{Outcome as RecoveryOutcome, Recovery};
+        let (mut broker, original) = broker();
+        let request = request();
+        let operation = request.retirement_operation_id();
+        let mut recovery = Recovery::new(original, request.clone());
+        assert!(matches!(
+            recovery.advance(|command| Ok(broker.dispatch("amaterasu.nvhttp", command))),
+            RecoveryOutcome::Pending
+        ));
+        let fence_receipt = json!({"ok":true,"epoch":request.authority_epoch,"source":request.source,"scope":request.scope,"operation_id":operation,"state":"fenced"});
+        let fence = answer(&mut broker, "pairing", fence_receipt.clone());
+        assert_eq!(fence["action"], "fence_source");
+        assert!(matches!(
+            recovery.advance(|command| Ok(broker.dispatch("amaterasu.nvhttp", command))),
+            RecoveryOutcome::Pending
+        ));
+        assert!(matches!(
+            recovery.advance(|command| Ok(broker.dispatch("amaterasu.nvhttp", command))),
+            RecoveryOutcome::FenceSettled { .. }
+        ));
+        let mut forged = request.clone();
+        forged.source.session_id = "other".into();
+        assert_eq!(
+            recovery.begin_lookup(123, &forged),
+            Err("source_retirement_conflict")
+        );
+        let Response::Accepted { id } = broker.dispatch(
+            "owner",
+            Command::Request {
+                service: "amaterasu.nvhttp/1".into(),
+                payload: request.reconciliation_payload(),
+                timeout_ms: 30000,
+                operation_id: "reconcile-1".into(),
+                parent: None,
+            },
+        ) else {
+            panic!("not accepted")
+        };
+        assert!(matches!(
+            broker.dispatch("amaterasu.nvhttp", Command::Poll {}),
+            Response::Request { .. }
+        ));
+        recovery.begin_lookup(id, &request).unwrap();
+        assert!(matches!(
+            recovery.advance(|command| Ok(broker.dispatch("amaterasu.nvhttp", command))),
+            RecoveryOutcome::Pending
+        ));
+        assert_eq!(
+            answer(&mut broker, "pairing", fence_receipt.clone())["action"],
+            "lookup_source_retirement"
+        );
+        assert!(matches!(
+            recovery.advance(|command| Ok(broker.dispatch("amaterasu.nvhttp", command))),
+            RecoveryOutcome::Pending
+        ));
+        let RecoveryOutcome::Reply {
+            retired: false,
+            payload,
+            ..
+        } = recovery.advance(|command| Ok(broker.dispatch("amaterasu.nvhttp", command)))
+        else {
+            panic!("must remain fenced")
+        };
+        assert_eq!(payload["code"], "source_retirement_pending");
+        let Response::Accepted { id } = broker.dispatch(
+            "owner",
+            Command::Request {
+                service: "amaterasu.nvhttp/1".into(),
+                payload: request.reconciliation_payload(),
+                timeout_ms: 30000,
+                operation_id: "reconcile-2".into(),
+                parent: None,
+            },
+        ) else {
+            panic!("not accepted")
+        };
+        assert!(matches!(
+            broker.dispatch("amaterasu.nvhttp", Command::Poll {}),
+            Response::Request { .. }
+        ));
+        recovery.begin_lookup(id, &request).unwrap();
+        assert!(matches!(
+            recovery.advance(|command| Ok(broker.dispatch("amaterasu.nvhttp", command))),
+            RecoveryOutcome::Pending
+        ));
+        let mut retired = fence_receipt;
+        retired["state"] = json!("retired");
+        let _ = answer(&mut broker, "pairing", retired);
+        assert!(matches!(
+            recovery.advance(|command| Ok(broker.dispatch("amaterasu.nvhttp", command))),
+            RecoveryOutcome::Pending
+        ));
+        let RecoveryOutcome::Reply {
+            retired: true,
+            payload,
+            ..
+        } = recovery.advance(|command| Ok(broker.dispatch("amaterasu.nvhttp", command)))
+        else {
+            panic!("retirement unconfirmed")
+        };
+        assert!(request.accepts_retirement_confirmation(&payload, &operation));
+    }
+
+    #[test]
+    fn uncertain_bind_reconciles_after_pairing_restart_only_with_drained_new_epoch() {
+        use recovery::{Outcome as RecoveryOutcome, Recovery};
+        let (mut broker, original) = broker();
+        let request = request();
+        let op = request.retirement_operation_id();
+        let mut recovery = Recovery::new(original, request.clone());
+        assert!(matches!(
+            recovery.advance(|command| Ok(broker.dispatch("amaterasu.nvhttp", command))),
+            RecoveryOutcome::Pending
+        ));
+        let _ = answer(
+            &mut broker,
+            "pairing",
+            json!({"ok":true,"epoch":request.authority_epoch,
+            "source":request.source,"scope":request.scope,"operation_id":op,"state":"fenced"}),
+        );
+        assert!(matches!(
+            recovery.advance(|command| Ok(broker.dispatch("amaterasu.nvhttp", command))),
+            RecoveryOutcome::Pending
+        ));
+        assert!(matches!(
+            recovery.advance(|command| Ok(broker.dispatch("amaterasu.nvhttp", command))),
+            RecoveryOutcome::FenceSettled { .. }
+        ));
+        let Response::Accepted { id } = broker.dispatch(
+            "owner",
+            Command::Request {
+                service: "amaterasu.nvhttp/1".into(),
+                payload: request.reconciliation_payload(),
+                timeout_ms: 30000,
+                operation_id: "restart-reconcile".into(),
+                parent: None,
+            },
+        ) else {
+            panic!("not accepted")
+        };
+        assert!(matches!(
+            broker.dispatch("amaterasu.nvhttp", Command::Poll {}),
+            Response::Request { .. }
+        ));
+        recovery.begin_lookup(id, &request).unwrap();
+        assert!(matches!(
+            recovery.advance(|command| Ok(broker.dispatch("amaterasu.nvhttp", command))),
+            RecoveryOutcome::Pending
+        ));
+        let _ = answer(
+            &mut broker,
+            "pairing",
+            json!({"ok":false,"code":"stale_epoch"}),
+        );
+        for _ in 0..3 {
+            assert!(matches!(
+                recovery.advance(|command| Ok(broker.dispatch("amaterasu.nvhttp", command))),
+                RecoveryOutcome::Pending
+            ));
+        }
+        let _ = answer(
+            &mut broker,
+            "pairing",
+            json!({"ok":true,"epoch":"d".repeat(32),"owner_epoch":"new-owner",
+            "startup_recovery_required":false,"fenced":false,"drain_required":false,
+            "in_flight":0,"bound_sources":0,"pending_source_retirements":0}),
+        );
+        assert!(matches!(
+            recovery.advance(|command| Ok(broker.dispatch("amaterasu.nvhttp", command))),
+            RecoveryOutcome::Pending
+        ));
+        let RecoveryOutcome::Reply {
+            retired: true,
+            payload,
+            ..
+        } = recovery.advance(|command| Ok(broker.dispatch("amaterasu.nvhttp", command)))
+        else {
+            panic!("retirement unconfirmed")
+        };
+        assert_eq!(payload["reconciled_by"], "authority_epoch");
+        assert!(request.accepts_retirement_confirmation(&payload, &op));
+        let mut forged = payload;
+        forged["current_epoch"] = json!(request.authority_epoch);
+        assert!(!request.accepts_retirement_confirmation(&forged, &op));
+    }
+
+    #[test]
+    fn uncertain_bind_discovers_an_existing_owner_fence() {
+        use recovery::{Outcome as RecoveryOutcome, Recovery};
+        let (mut broker, original) = broker();
+        let request = request();
+        let mut recovery = Recovery::new(original, request.clone());
+        assert!(matches!(
+            recovery.advance(|command| Ok(broker.dispatch("amaterasu.nvhttp", command))),
+            RecoveryOutcome::Pending
+        ));
+        let _ = answer(
+            &mut broker,
+            "pairing",
+            json!({"ok":false,"code":"source_retirement_conflict"}),
+        );
+        for _ in 0..3 {
+            assert!(matches!(
+                recovery.advance(|command| Ok(broker.dispatch("amaterasu.nvhttp", command))),
+                RecoveryOutcome::Pending
+            ));
+        }
+        let existing = json!({"ok":true,"epoch":request.authority_epoch,"source":request.source,"scope":request.scope,
+            "operation_id":"owner-created-fence","state":"retired"});
+        assert_eq!(
+            answer(&mut broker, "pairing", existing)["action"],
+            "lookup_current_source_retirement"
+        );
+        assert!(matches!(
+            recovery.advance(|command| Ok(broker.dispatch("amaterasu.nvhttp", command))),
+            RecoveryOutcome::Pending
+        ));
+        let RecoveryOutcome::FenceSettled {
+            operation_id,
+            fence_confirmed: true,
+            ..
+        } = recovery.advance(|command| Ok(broker.dispatch("amaterasu.nvhttp", command)))
+        else {
+            panic!("fence undiscovered")
+        };
+        assert_eq!(operation_id, "owner-created-fence");
     }
 }
