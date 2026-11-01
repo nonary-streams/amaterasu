@@ -469,12 +469,53 @@ pub struct StreamingConfig {
     pub profile: StreamProfile,
     #[serde(default)]
     pub desktop: DesktopSettings,
+    /// Startup-owned Moonlight aliases. A nonempty list selects this explicit
+    /// library profile instead of the legacy catalog profile.
+    #[serde(default)]
+    pub selected_applications: Vec<SelectedApplication>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SelectedApplication {
+    pub id: u32,
+    pub name: String,
+    pub application: amaterasu_module_sdk::application_library::v2::ApplicationReference,
+    pub entry_revision: String,
+    pub certificates: std::collections::BTreeSet<String>,
 }
 
 impl StreamingConfig {
     pub fn validate(&self) -> Result<(), &'static str> {
         self.capture.validate()?;
-        self.profile.validate()
+        self.profile.validate()?;
+        let mut ids = std::collections::BTreeSet::new();
+        if self.selected_applications.len() > 256
+            || self.selected_applications.iter().any(|entry| {
+                entry.id == 0
+                    || entry.id > i32::MAX as u32
+                    || entry.id == DESKTOP_APP_ID
+                    || !ids.insert(entry.id)
+                    || entry.name.trim().is_empty()
+                    || entry.name.len() > 160
+                    || entry.name.chars().any(char::is_control)
+                    || entry.application.validate().is_err()
+                    || entry.entry_revision.trim().is_empty()
+                    || entry.entry_revision.len() > 128
+                    || entry.entry_revision.chars().any(char::is_control)
+                    || entry.certificates.is_empty()
+                    || entry.certificates.len() > 64
+                    || entry.certificates.iter().any(|id| {
+                        id.len() != 64
+                            || !id
+                                .bytes()
+                                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    })
+            })
+        {
+            return Err("invalid_selected_applications");
+        }
+        Ok(())
     }
 }
 
@@ -916,6 +957,25 @@ impl Controller {
         self.device_name = device_name.to_owned();
     }
 
+    pub(crate) fn selected_applications_for(
+        &self,
+        certificate: &[u8],
+    ) -> Option<Vec<SelectedApplication>> {
+        let config = self.config.as_ref()?;
+        if config.selected_applications.is_empty() {
+            return None;
+        }
+        let certificate_id = fingerprint(certificate);
+        Some(
+            config
+                .selected_applications
+                .iter()
+                .filter(|entry| entry.certificates.contains(&certificate_id))
+                .cloned()
+                .collect(),
+        )
+    }
+
     pub fn busy(&self) -> bool {
         self.records.values().any(|record| !record.state.terminal())
     }
@@ -1089,6 +1149,26 @@ impl Controller {
         {
             return Some(private_error(400, "unsupported streaming request"));
         }
+        let selected_application = if !desktop && !config.selected_applications.is_empty() {
+            let Some(selected) = config.selected_applications.iter().find(|entry| {
+                entry.id == request.app_id
+                    && peer
+                        .certificate_id
+                        .as_ref()
+                        .is_some_and(|id| entry.certificates.contains(id))
+            }) else {
+                return Some(private_error(403, "application is not authorized"));
+            };
+            if !self.session_lifecycle_required {
+                return Some(private_error(
+                    503,
+                    "selected library requires lifecycle authority",
+                ));
+            }
+            Some(selected.clone())
+        } else {
+            None
+        };
         let device_name = request
             .device_name
             .as_deref()
@@ -1206,6 +1286,7 @@ impl Controller {
             connection,
             now + INITIAL_DEADLINE,
         );
+        record.selected_application = selected_application;
         record.requested_capture_output = requested_capture_output;
         record.lifecycle_required = self.session_lifecycle_required;
         record.desktop = desktop;

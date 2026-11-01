@@ -32,6 +32,23 @@ pub enum Operation {
         revision: String,
     },
     #[serde(skip)]
+    PreflightStreamingLibrary {
+        operation_id: String,
+        application: amaterasu_module_sdk::application_library::v2::ApplicationReference,
+        revision: String,
+        certificate_id: String,
+        global_preparation: Vec<PreparationStep>,
+        legacy_global_preparation: Vec<LegacyPreparationCommand>,
+    },
+    #[serde(skip)]
+    AdmitStreamingLibrary {
+        request: amaterasu_module_sdk::application_library::preflight::Request,
+    },
+    #[serde(skip)]
+    AcceptStreamingLibrary {
+        request: amaterasu_module_sdk::application_library::preflight::Request,
+    },
+    #[serde(skip)]
     LaunchLibrary {
         operation_id: String,
         application: amaterasu_module_sdk::application_library::v2::ApplicationReference,
@@ -85,7 +102,11 @@ pub enum Operation {
         application_operation_id: String,
         global_revision: Option<u64>,
         global_overrides: BTreeMap<String, Value>,
-        catalog_revision: u64,
+        #[serde(default)]
+        catalog_revision: Option<u64>,
+        #[serde(default)]
+        policy_identity:
+            Option<amaterasu_module_sdk::application_library::preflight::PolicyIdentity>,
         application_display_overrides: BTreeMap<String, Value>,
         #[serde(default)]
         application_display_settings: Option<ApplicationDisplaySettings>,
@@ -103,7 +124,8 @@ pub enum Operation {
         request_sha256: String,
         display_policy_snapshot: Value,
         certificate_id: String,
-        catalog_revision: u64,
+        #[serde(default)]
+        catalog_revision: Option<u64>,
         #[serde(default)]
         policy_identity:
             Option<amaterasu_module_sdk::application_library::preflight::PolicyIdentity>,
@@ -226,6 +248,7 @@ impl Operation {
                 application_display_overrides,
                 certificate_id,
                 client_display_overrides,
+                policy_identity,
                 rtsp_operation_id,
                 request_sha256,
                 ..
@@ -234,6 +257,9 @@ impl Operation {
                     || !valid_operation_id(rtsp_operation_id)
                     || !valid_sha256(certificate_id)
                     || !valid_sha256(request_sha256)
+                    || policy_identity
+                        .as_ref()
+                        .is_some_and(|identity| identity.validate().is_err())
                     || !valid_application_display_overrides(global_overrides)
                     || !valid_application_display_overrides(application_display_overrides)
                     || !valid_application_display_overrides(client_display_overrides)
@@ -491,16 +517,7 @@ pub use amaterasu_module_sdk::application_library::policy::{
     CommandSpec as ConfiguredCommand, PreparationStep,
 };
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct LegacyPreparationCommand {
-    #[serde(default, rename = "do")]
-    pub do_command: String,
-    #[serde(default)]
-    pub undo: String,
-    #[serde(default)]
-    pub elevated: bool,
-}
+pub use amaterasu_module_sdk::application_library::preflight::LegacyPreparationCommand;
 
 /// Application-facing preparation preserves structured plans and the raw
 /// Vibeshine command strings as distinct, untagged wire variants.
@@ -1013,7 +1030,9 @@ pub(crate) fn merge_preparation_plan(
     Ok(plan)
 }
 
-fn validate_legacy_preparation(steps: &[LegacyPreparationCommand]) -> Result<(), &'static str> {
+pub(crate) fn validate_legacy_preparation(
+    steps: &[LegacyPreparationCommand],
+) -> Result<(), &'static str> {
     if steps.len() > MAX_PREPARATION_STEPS
         || steps.iter().any(|step| {
             [step.do_command.as_str(), step.undo.as_str()]
@@ -2142,10 +2161,9 @@ impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
         crate::library::validate_routes(&self.library_routes)?;
         if self.enable_library_preflight
-            && !self
-                .library_routes
-                .values()
-                .any(|route| route.policy_service.is_some())
+            && !self.library_routes.values().any(|route| {
+                route.policy_service.is_some() || route.streaming_policy_service.is_some()
+            })
         {
             return Err("invalid_launch_settings");
         }
@@ -2247,7 +2265,7 @@ pub(crate) fn valid_preparation(steps: &[PreparationStep]) -> bool {
         })
 }
 
-fn validate_preparation(steps: &[PreparationStep]) -> Result<(), &'static str> {
+pub(crate) fn validate_preparation(steps: &[PreparationStep]) -> Result<(), &'static str> {
     if steps.len() > MAX_PREPARATION_STEPS {
         return Err("preparation_limit_exceeded");
     }

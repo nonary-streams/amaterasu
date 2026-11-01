@@ -12,6 +12,7 @@ pub(super) fn config() -> StreamingConfig {
             audio_endpoint: "default".into(),
         },
         desktop: DesktopSettings::default(),
+        selected_applications: vec![],
         profile: StreamProfile {
             codec: amaterasu_media::VideoCodec::H264,
             max_width: 1920,
@@ -6068,4 +6069,92 @@ fn external_capture_alias_rejects_invalid_names_and_builtin_override_works() {
     let external = CaptureProvider::External("acme".into());
     assert_eq!(CaptureMode::Auto.resolve(external.clone()), (external.clone(), false));
     assert_eq!(CaptureMode::Wgcc.resolve(external), (CaptureProvider::Wgc, true));
+}
+
+#[test]
+fn selected_library_aliases_are_certificate_scoped_and_require_lifecycle() {
+    let cert_one = fingerprint(&[1; 32]);
+    let cert_two = fingerprint(&[2; 32]);
+    let mut streaming = config();
+    streaming.selected_applications = vec![
+        SelectedApplication { id: 1, name: "First".into(),
+            application: amaterasu_module_sdk::application_library::v2::ApplicationReference {
+                library:"first".into(), id:"opaque/one".into() },
+            entry_revision:"entry:one".into(), certificates:[cert_one].into() },
+        SelectedApplication { id: 2, name: "Second".into(),
+            application: amaterasu_module_sdk::application_library::v2::ApplicationReference {
+                library:"second".into(), id:"opaque/two".into() },
+            entry_revision:"entry:two".into(), certificates:[cert_two].into() },
+    ];
+    let mut controller = Controller::new(Some(streaming)).unwrap();
+    assert_eq!(controller.selected_applications_for(&[1; 32]).unwrap()[0].id, 1);
+    assert_eq!(controller.selected_applications_for(&[2; 32]).unwrap()[0].id, 2);
+    assert!(controller.selected_applications_for(&[3; 32]).unwrap().is_empty());
+    let now = Instant::now();
+    assert_eq!(controller.launch(1, request(1), peer(1), now).unwrap().status, 503);
+    controller.set_session_lifecycle_required(true);
+    let mut foreign = request(2);
+    foreign.app_id = 2;
+    assert_eq!(controller.launch(2, foreign, peer(1), now).unwrap().status, 403);
+    assert!(controller.records.is_empty());
+    assert!(controller.launch(3, request(1), peer(1), now).is_none());
+    let record = controller.records.values().next().unwrap();
+    assert_eq!(record.selected_application.as_ref().unwrap().application.library, "first");
+}
+
+#[test]
+fn selected_library_coordinator_freezes_each_authorized_source_before_lifecycle() {
+    for (marker, library, policy_source) in [(1, "first", "policy.first"), (2, "second", "policy.second")] {
+        let mut streaming = config();
+        streaming.selected_applications = vec![SelectedApplication {
+            id:1, name:"Game".into(), application:amaterasu_module_sdk::application_library::v2::ApplicationReference {
+                library:library.into(), id:"opaque/game".into(),
+            }, entry_revision:"entry:opaque".into(), certificates:[fingerprint(&[marker; 32])].into(),
+        }];
+        let mut controller = Controller::new(Some(streaming)).unwrap();
+        controller.set_session_lifecycle_required(true);
+        controller.set_global_display_policy(7, json!({}));
+        let mut broker = Broker::default();
+        let now = Instant::now();
+        assert!(controller.launch(10, request(marker), peer(marker), now).is_none());
+        for tick in 0..200 {
+            controller.poll(now + Duration::from_millis(tick * 100), &mut |command| {
+                if let Command::Request { service, payload, .. } = &command
+                    && service == "amaterasu.launch/3" {
+                    let response = match payload["action"].as_str().unwrap() {
+                        "prepare_streaming" => json!({"ok":true,"admission_capable":true,
+                            "preflight_token":"ab".repeat(32), "policy_identity":{"source":"library","version":1,
+                            "application":payload["application"],"entry_revision":payload["entry_revision"],
+                            "policy_revision":"policy:opaque","policy_source":policy_source,"snapshot_id":"snapshot"},
+                            "config_overrides":{},"application_display_settings":null,
+                            "executable_path":null,"cleanup_budget_ms":20_000}),
+                        "accept_streaming" => json!({"ok":true,"accepted":true,
+                            "operation_id":payload["operation_id"],"policy_identity":payload["policy_identity"]}),
+                        other => panic!("unexpected selected action {other}"),
+                    };
+                    broker.commands.push(command);
+                    broker.next += 1;
+                    broker.results.insert(broker.next, response);
+                    return Ok(Response::Accepted { id:broker.next });
+                }
+                broker.send(command)
+            });
+            if broker.commands.iter().any(|command| matches!(command,
+                Command::Request { service, payload, .. } if service == "amaterasu.session-lifecycle/1" && payload["operation"] == "prepare")) { break; }
+        }
+        let selected: Vec<_> = broker.commands.iter().filter_map(|command| match command {
+            Command::Request { service, payload, .. } if service == "amaterasu.launch/3" => Some(payload), _ => None,
+        }).collect();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected[0]["action"], "prepare_streaming");
+        assert_eq!(selected[1]["action"], "accept_streaming");
+        assert_eq!(selected[1]["policy_identity"]["policy_source"], policy_source);
+        assert_eq!(selected[1]["certificate_id"], fingerprint(&[marker;32]));
+        let lifecycle = broker.commands.iter().find_map(|command| match command {
+            Command::Request { service, payload, .. } if service == "amaterasu.session-lifecycle/1" && payload["operation"] == "prepare" => Some(payload), _ => None,
+        }).expect("lifecycle follows selected policy acceptance");
+        assert_eq!(lifecycle["application_ref"]["policy_identity"], selected[1]["policy_identity"]);
+        assert!(!broker.actions().contains(&("amaterasu.rtsp/1", "open")));
+        assert!(!broker.actions().contains(&("amaterasu.launch/3", "admit_streaming")));
+    }
 }

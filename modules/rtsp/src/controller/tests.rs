@@ -2688,3 +2688,77 @@ fn absent_stream_session_cannot_confirm_unresolved_lifecycle_retirement() {
         );
     }
 }
+
+#[test]
+fn selected_library_open_verifies_tagged_policy_before_preparing_stream() {
+    use amaterasu_module_sdk::application_library::preflight::PolicyIdentity;
+    let settings: Settings = serde_json::from_value(json!({
+        "enabled":false,"bind":"127.0.0.1:0","allowed_principals":["amaterasu.nvhttp"]
+    }))
+    .unwrap();
+    let identity: PolicyIdentity = serde_json::from_value(json!({"source":"library","version":1,
+        "application":{"library":"games","id":"opaque/game"},"entry_revision":"entry:opaque",
+        "policy_revision":"policy:opaque","policy_source":"primary","snapshot_id":"snapshot"}))
+    .unwrap();
+    for allow in [false, true] {
+        let mut controller = Controller::new(settings.clone()).unwrap();
+        controller.settings.enabled = true;
+        controller.local = Some("127.0.0.1:47984".parse().unwrap());
+        controller.locals = vec![controller.local.unwrap()];
+        let mut config = attested_open();
+        config.app_id = Some("app-0000000000000001".into());
+        config.catalog_revision = None;
+        config.policy_identity = Some(identity.clone());
+        config.display_request = None;
+        let snapshot = config
+            .display_policy_snapshot
+            .as_mut()
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        snapshot.remove("catalog_revision");
+        snapshot.insert("policy_identity".into(), json!(identity));
+        config.validate(false).unwrap();
+        let digest = config.display_request_sha256().unwrap();
+        let mut endpoint = Endpoint {
+            active_request: true,
+            verifier_reply: Some(json!({
+            "ok":allow,"verified":allow,"rtsp_operation_id":"rtsp-one","request_sha256":digest,
+            "preflight_remaining_ms":10_000})),
+            ..Endpoint::default()
+        };
+        let runtime = client(&mut endpoint);
+        controller.open(
+            OpenRequest {
+                request: 19,
+                caller: "amaterasu.nvhttp".into(),
+                config,
+                deadline: 5_000,
+                display_preflight_deadline: None,
+            },
+            0,
+            &runtime,
+            false,
+        );
+        assert!(controller.records.is_empty());
+        for now in 1..=3 {
+            controller.advance_display_admission(&runtime, now);
+        }
+        let verify = endpoint
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                Command::Request {
+                    service, payload, ..
+                } if service == "amaterasu.launch/1" => Some(payload),
+                _ => None,
+            })
+            .expect("Launch verifies selected policy before preparing the stream");
+        assert_eq!(verify["policy_identity"], json!(identity));
+        assert!(verify.get("catalog_revision").is_none());
+        assert_eq!(!controller.records.is_empty(), allow);
+        if !allow {
+            assert!(controller.job.is_none());
+        }
+    }
+}

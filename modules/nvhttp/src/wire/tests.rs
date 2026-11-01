@@ -280,6 +280,7 @@ fn streaming_router() -> Router {
                 audio_endpoint: "default".into(),
             },
             desktop: crate::launch::DesktopSettings::default(),
+            selected_applications: vec![],
             profile: StreamProfile {
                 codec: amaterasu_media::VideoCodec::H264,
                 max_width: 1920,

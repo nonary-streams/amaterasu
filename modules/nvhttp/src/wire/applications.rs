@@ -230,6 +230,35 @@ impl Router {
         if !peer.list_allowed {
             return Some(xml::error(403, "application list permission denied"));
         }
+        if let Some(entries) = self.launches.selected_applications_for(
+            peer.peer_certificate
+                .as_deref()
+                .expect("trusted certificate"),
+        ) {
+            let mut body = PREFIX.to_owned();
+            let hdr = self.launches.codec_advertisement().codec_mode_support & 0x20200 != 0;
+            for entry in entries {
+                body.push_str(&format!("<App><AppTitle>{}</AppTitle><ID>{}</ID><IsHdrSupported>{}</IsHdrSupported></App>",
+                    xml::escape(&entry.name), entry.id, u8::from(hdr)));
+            }
+            if self.launches.desktop_enabled() {
+                body.push_str(&desktop_xml());
+            }
+            body.push_str(SUFFIX);
+            if body.len() > MAX_XML_BYTES {
+                return Some(xml::error(
+                    413,
+                    "application list exceeds the Moonlight reply limit",
+                ));
+            }
+            return Some(Reply {
+                status: 200,
+                content_type: "application/xml; charset=utf-8",
+                body: body.into_bytes(),
+                requires_paired_tls: true,
+                permission: Some(Permission::List),
+            });
+        }
         if self
             .jobs
             .values()

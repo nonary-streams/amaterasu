@@ -593,6 +593,12 @@ impl Harness {
                         "id":payload["id"],"revision":payload["revision"],
                         "executor":"runner","application_id":"fixture-game"
                     }}),
+                    "selected.policy/2" => self.policy_reply.clone().unwrap_or_else(|| json!({"ok":true,"admission":{
+                        "certificate_id":payload["certificate_id"],"policy":{
+                            "application":payload["application"],"entry_revision":payload["entry_revision"],
+                            "policy_revision":"policy:opaque-v1","preparation":[]},
+                        "config_overrides":{},"application_display_settings":null
+                    }})),
                     "selected.policy/1" => self.policy_reply.clone().unwrap_or_else(|| json!({"ok":true,"policy":{
                         "application":payload["application"],"entry_revision":payload["entry_revision"],
                         "policy_revision":"policy:opaque-v1","preparation":[{"run":{"executable":std::env::current_exe().unwrap()}}]
@@ -5349,6 +5355,7 @@ fn independently_selected_policy_is_frozen_before_session_and_provider_effects()
         entry_revision,
         policy_revision,
         snapshot_id,
+        ..
     } = identity
     else {
         panic!("expected library policy identity")
@@ -5538,4 +5545,328 @@ fn library_preview_rejects_stale_policy_before_effects() {
     assert!(harness.sessions.is_empty());
     assert!(harness.preparations.is_empty());
     assert!(!harness.generic_started);
+}
+
+#[test]
+fn streaming_admission_revalidates_policy_and_requires_matching_display_capability() {
+    let mut harness = Harness::new();
+    let mut pipeline = pipeline();
+    pipeline.set_library_routes(serde_json::from_value(json!({"games":{
+        "service":"selected.library/2","callers":["amaterasu.nvhttp"],
+        "executors":{"runner":"example.provider/1"}, "streaming_policy_service":"selected.policy/2", "streaming_policy_source":"primary"
+    }})).unwrap());
+    let operation = format!("ale1:{}:stream", pipeline.records.operation_epoch());
+    let cert = "ab".repeat(32);
+    let service = amaterasu_module_sdk::application_library::preflight::SERVICE;
+    let prepare = json!({"action":"prepare_streaming","operation_id":operation,
+        "application":{"library":"games","id":"opaque/game"},"entry_revision":"v1","certificate_id":cert});
+    let preflight = harness.request_service(
+        &mut pipeline,
+        service,
+        "amaterasu.nvhttp",
+        "amaterasu.nvhttp",
+        prepare,
+    );
+    assert_eq!(preflight["admission_capable"], true, "{preflight}");
+    let mut limiter = frame_limiter_snapshot();
+    limiter["settings"]["frame_limiter_enable"] = json!(false);
+    let mut accept = json!({"action":"accept_streaming","operation_id":operation,
+        "application":{"library":"games","id":"opaque/game"},"entry_revision":"v1","certificate_id":cert,
+        "preflight_token":preflight["preflight_token"],"policy_identity":preflight["policy_identity"],
+        "frame_limiter_settings":limiter,"client_frame_limiter_overrides":{}});
+    let mut forged = accept.clone();
+    forged["certificate_id"] = json!("cd".repeat(32));
+    assert_eq!(
+        harness.request_service(
+            &mut pipeline,
+            service,
+            "amaterasu.nvhttp",
+            "amaterasu.nvhttp",
+            forged
+        )["code"],
+        "preflight_mismatch"
+    );
+    let mut forged = accept.clone();
+    forged["policy_identity"]["policy_revision"] = json!("different");
+    assert_eq!(
+        harness.request_service(
+            &mut pipeline,
+            service,
+            "amaterasu.nvhttp",
+            "amaterasu.nvhttp",
+            forged
+        )["code"],
+        "preflight_mismatch"
+    );
+    assert_eq!(
+        harness.request_service(&mut pipeline, service, "other", "other", accept.clone())["code"],
+        "permission_denied"
+    );
+    let deadline = pipeline
+        .records
+        .values
+        .values()
+        .next()
+        .unwrap()
+        .preflight_deadline;
+    pipeline
+        .records
+        .values
+        .values_mut()
+        .next()
+        .unwrap()
+        .preflight_deadline = Some(Instant::now() - Duration::from_millis(1));
+    assert_eq!(
+        harness.request_service(
+            &mut pipeline,
+            service,
+            "amaterasu.nvhttp",
+            "amaterasu.nvhttp",
+            accept.clone()
+        )["code"],
+        "preflight_mismatch"
+    );
+    pipeline
+        .records
+        .values
+        .values_mut()
+        .next()
+        .unwrap()
+        .preflight_deadline = deadline;
+    let accepted = harness.request_service(
+        &mut pipeline,
+        service,
+        "amaterasu.nvhttp",
+        "amaterasu.nvhttp",
+        accept.clone(),
+    );
+    assert_eq!(accepted["accepted"], true, "{accepted}");
+    assert!(harness.sessions.is_empty());
+    let mut bypass = accept.clone();
+    bypass["action"] = json!("admit_streaming");
+    bypass["display_admission_token"] = Value::Null;
+    bypass["application_display_overrides"] = json!({});
+    bypass["application_display_settings"] = Value::Null;
+    bypass["virtual_display_intent"] = Value::Null;
+    bypass["proton_dualsense_compatibility"] = json!(false);
+    bypass["return_on_admission"] = json!(false);
+    assert_eq!(
+        harness.request_service(
+            &mut pipeline,
+            service,
+            "amaterasu.nvhttp",
+            "amaterasu.nvhttp",
+            bypass
+        )["code"],
+        "display_admission_denied"
+    );
+    let display = harness.request(&mut pipeline, "amaterasu.nvhttp", json!({
+        "action":"prepare_display_admission","application_operation_id":operation,"global_revision":1,
+        "global_overrides":{},"policy_identity":preflight["policy_identity"],"application_display_overrides":{},
+        "certificate_id":cert,"client_display_overrides":{},"rtsp_operation_id":"stream-rtsp","request_sha256":"aa".repeat(32)
+    }));
+    assert_eq!(display["ok"], true, "{display}");
+    accept["action"] = json!("admit_streaming");
+    accept["display_admission_token"] = display["display_admission_token"].clone();
+    accept["application_display_overrides"] = json!({});
+    accept["application_display_settings"] = Value::Null;
+    accept["virtual_display_intent"] = Value::Null;
+    accept["proton_dualsense_compatibility"] = json!(false);
+    accept["return_on_admission"] = json!(false);
+    let mut wrong = accept.clone();
+    wrong["display_admission_token"] = json!("ff".repeat(32));
+    assert_eq!(
+        harness.request_service(
+            &mut pipeline,
+            service,
+            "amaterasu.nvhttp",
+            "amaterasu.nvhttp",
+            wrong
+        )["code"],
+        "display_admission_denied"
+    );
+    let started = harness.request_service(
+        &mut pipeline,
+        service,
+        "amaterasu.nvhttp",
+        "amaterasu.nvhttp",
+        accept,
+    );
+    assert_eq!(started["launch"]["state"], "active", "{started}");
+    assert_eq!(
+        started["launch"]["library_policy_identity"],
+        preflight["policy_identity"]
+    );
+}
+
+#[test]
+fn streaming_acceptance_rejects_changed_policy_before_effects() {
+    let mut harness = Harness::new();
+    let mut pipeline = pipeline();
+    pipeline.set_library_routes(serde_json::from_value(json!({"games":{
+        "service":"selected.library/2","callers":["amaterasu.nvhttp"],
+        "executors":{"runner":"example.provider/1"}, "streaming_policy_service":"selected.policy/2",
+        "streaming_policy_source":"primary"
+    }})).unwrap());
+    let operation = format!("ale1:{}:changed", pipeline.records.operation_epoch());
+    let cert = "ab".repeat(32);
+    let service = amaterasu_module_sdk::application_library::preflight::SERVICE;
+    let application = json!({"library":"games","id":"opaque/game"});
+    let preflight = harness.request_service(
+        &mut pipeline,
+        service,
+        "amaterasu.nvhttp",
+        "amaterasu.nvhttp",
+        json!({
+            "action":"prepare_streaming","operation_id":operation,"application":application,
+            "entry_revision":"v1","certificate_id":cert
+        }),
+    );
+    assert_eq!(preflight["ok"], true, "{preflight}");
+    harness.policy_reply = Some(
+        json!({"ok":true,"admission":{"certificate_id":cert,"policy":{
+        "application":application,"entry_revision":"v1","policy_revision":"changed","preparation":[]},
+        "config_overrides":{},"application_display_settings":null}}),
+    );
+    let mut limiter = frame_limiter_snapshot();
+    limiter["settings"]["frame_limiter_enable"] = json!(false);
+    let result = harness.request_service(&mut pipeline, service, "amaterasu.nvhttp", "amaterasu.nvhttp", json!({
+        "action":"accept_streaming","operation_id":operation,"application":application,"entry_revision":"v1",
+        "certificate_id":cert,"preflight_token":preflight["preflight_token"],"policy_identity":preflight["policy_identity"],
+        "frame_limiter_settings":limiter,"client_frame_limiter_overrides":{}
+    }));
+    assert_eq!(result["code"], "policy_revision_conflict", "{result}");
+    assert!(harness.sessions.is_empty());
+    assert!(harness.preparations.is_empty());
+    assert!(!harness.generic_started);
+}
+
+fn selected_stream_with_preparation(
+    harness: &mut Harness,
+    pipeline: &mut Pipeline,
+    exclude_global: bool,
+) -> Value {
+    pipeline.set_library_routes(serde_json::from_value(json!({"games":{
+        "service":"selected.library/2","callers":["amaterasu.nvhttp"],
+        "executors":{"runner":"example.provider/1"},"streaming_policy_service":"selected.policy/2",
+        "streaming_policy_source":"primary"
+    }})).unwrap());
+    let operation = format!("ale1:{}:cleanup", pipeline.records.operation_epoch());
+    let cert = "ab".repeat(32);
+    let application = json!({"library":"games","id":"opaque/game"});
+    harness.policy_reply = Some(json!({"ok":true,"admission":{"certificate_id":cert,
+        "policy":{"application":application,"entry_revision":"v1","policy_revision":"policy",
+            "preparation":[{"run":{"executable":std::env::current_exe().unwrap()}}]},
+        "config_overrides":{},"application_display_settings":null,"exclude_global_preparation":exclude_global}}));
+    let service = amaterasu_module_sdk::application_library::preflight::SERVICE;
+    let preflight = harness.request_service(
+        pipeline,
+        service,
+        "amaterasu.nvhttp",
+        "amaterasu.nvhttp",
+        json!({
+        "action":"prepare_streaming","operation_id":operation,"application":application,
+        "entry_revision":"v1","certificate_id":cert,
+        "global_preparation":[{"run":{"executable":std::env::current_exe().unwrap(),"args":["global"]}}],
+        "legacy_global_preparation":[{"do":"echo global","undo":"echo undo","elevated":false}]}),
+    );
+    assert_eq!(preflight["ok"], true, "{preflight}");
+    let mut limiter = frame_limiter_snapshot();
+    limiter["settings"]["frame_limiter_enable"] = json!(false);
+    let mut request = json!({"action":"accept_streaming","operation_id":operation,"application":application,
+        "entry_revision":"v1","certificate_id":cert,"preflight_token":preflight["preflight_token"],
+        "policy_identity":preflight["policy_identity"],"frame_limiter_settings":limiter,"client_frame_limiter_overrides":{}});
+    assert_eq!(
+        harness.request_service(
+            pipeline,
+            service,
+            "amaterasu.nvhttp",
+            "amaterasu.nvhttp",
+            request.clone()
+        )["accepted"],
+        true
+    );
+    let display = harness.request(pipeline, "amaterasu.nvhttp", json!({"action":"prepare_display_admission",
+        "application_operation_id":operation,"global_revision":1,"global_overrides":{},
+        "policy_identity":preflight["policy_identity"],"application_display_overrides":{},"certificate_id":cert,
+        "client_display_overrides":{},"rtsp_operation_id":"rtsp-cleanup","request_sha256":"aa".repeat(32)}));
+    assert_eq!(display["ok"], true, "{display}");
+    request["action"] = json!("admit_streaming");
+    request["display_admission_token"] = display["display_admission_token"].clone();
+    request["application_display_overrides"] = json!({});
+    request["application_display_settings"] = Value::Null;
+    request["virtual_display_intent"] = Value::Null;
+    request["proton_dualsense_compatibility"] = json!(false);
+    request["return_on_admission"] = json!(false);
+    request
+}
+
+#[test]
+fn selected_stream_failed_preparation_and_cancellation_retire_owned_resources() {
+    for cancel in [false, true] {
+        let mut harness = Harness::new();
+        let mut pipeline = pipeline();
+        let request = selected_stream_with_preparation(&mut harness, &mut pipeline, false);
+        harness.fail_global_preparation = !cancel;
+        harness.cancel_after_preparation = cancel;
+        let response = harness.request_service(
+            &mut pipeline,
+            amaterasu_module_sdk::application_library::preflight::SERVICE,
+            "amaterasu.nvhttp",
+            "amaterasu.nvhttp",
+            request,
+        );
+        if !cancel {
+            assert_eq!(response["launch"]["state"], "failed", "{response}");
+        }
+        assert!(!harness.generic_started);
+        assert!(harness.commands.iter().any(|(service, payload, _)| service
+            == crate::workflow::APPLICATION
+            && payload["action"] == "preparation_stop"));
+        assert!(
+            harness
+                .sessions
+                .iter()
+                .all(|session| session.lease.is_none())
+        );
+    }
+}
+
+#[test]
+fn selected_stream_freezes_global_preparation_and_honors_application_exclusion() {
+    for exclude in [false, true] {
+        let mut harness = Harness::new();
+        let mut pipeline = pipeline();
+        let request = selected_stream_with_preparation(&mut harness, &mut pipeline, exclude);
+        let started = harness.request_service(
+            &mut pipeline,
+            amaterasu_module_sdk::application_library::preflight::SERVICE,
+            "amaterasu.nvhttp",
+            "amaterasu.nvhttp",
+            request,
+        );
+        assert_eq!(started["launch"]["state"], "active", "{started}");
+        let plan = harness.preparations[0].plan.as_array().unwrap();
+        assert_eq!(plan.len(), if exclude { 1 } else { 3 });
+        if !exclude {
+            assert_eq!(plan[0]["run"]["args"], json!(["global"]));
+            assert_eq!(plan[1]["do"], "echo global");
+        }
+        assert_eq!(
+            plan.last().unwrap()["run"]["executable"],
+            json!(std::env::current_exe().unwrap())
+        );
+        let stopped = harness.request(
+            &mut pipeline,
+            "amaterasu.nvhttp",
+            json!({"action":"stop","launch_id":started["launch"]["launch_id"]}),
+        );
+        assert_eq!(stopped["launch"]["state"], "stopped", "{stopped}");
+        assert!(
+            harness
+                .sessions
+                .iter()
+                .all(|session| session.lease.is_none())
+        );
+    }
 }

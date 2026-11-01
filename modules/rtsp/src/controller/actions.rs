@@ -201,8 +201,10 @@ impl Controller {
                 "request_sha256":digest,
                 "display_policy_snapshot":snapshot,
                 "certificate_id":snapshot["certificate_id"],
-                "catalog_revision":snapshot["catalog_revision"],
             });
+            if let Some(revision) = snapshot.get("catalog_revision") {
+                payload["catalog_revision"] = revision.clone();
+            }
             if let Some(identity) = &config.policy_identity {
                 payload["policy_identity"] = json!(identity);
             }

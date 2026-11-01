@@ -123,6 +123,18 @@ impl Router {
         if !peer.list_allowed {
             return Some(xml::error(403, "application list permission denied"));
         }
+        if self
+            .launches
+            .selected_applications_for(
+                peer.peer_certificate
+                    .as_deref()
+                    .expect("trusted certificate"),
+            )
+            .is_some()
+        {
+            return Some(xml::error(404, "application artwork is unavailable"));
+        }
+
         let app_id = match query
             .required("appid")
             .ok()

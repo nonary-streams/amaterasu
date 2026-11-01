@@ -248,6 +248,15 @@ impl Coordinator {
                 }
                 Some(_) => return Err("invalid_source_attestation".into()),
             };
+            if let Some(application_ref) = payload.get("application_ref")
+                && application_ref.get("policy_identity").is_some()
+                && (caller != "amaterasu.nvhttp"
+                    || initiator != caller
+                    || !paired_source_attested
+                    || !super::settings_scope::valid_selected_application_ref(application_ref))
+            {
+                return Err("invalid_application_reference".into());
+            }
             let application_operation_id = payload
                 .get("application_operation_id")
                 .map(|value| {
