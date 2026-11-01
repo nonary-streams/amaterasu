@@ -206,7 +206,8 @@ fn real_providers_hold_host_identity_write_until_owner_retires_stream() {
     fs::write(root.join("credentials/third-key.pem"), HOST_KEY).unwrap();
     let root = root.canonicalize().unwrap();
     let state = TestStateStore::open(root.join("state")).unwrap();
-    let (mut pairing, harness, _, epoch, source, scope) = authorized_feedback_for_test();
+    let (mut pairing, harness, certificate_id, epoch, source, scope) =
+        authorized_feedback_for_test();
     pairing
         .effect_authority
         .as_mut()
@@ -252,6 +253,7 @@ fn real_providers_hold_host_identity_write_until_owner_retires_stream() {
             ],
         ),
         ("input", vec![], vec![EFFECT_SERVICE]),
+        ("console", vec![], vec![SERVICE, STATE_SERVICE]),
         ("stranger", vec![], vec![HOST_CONFIGURATION_SERVICE]),
     ] {
         config.principals.insert(
@@ -560,6 +562,37 @@ fn real_providers_hold_host_identity_write_until_owner_retires_stream() {
     assert!(pairing.identity.current(&snapshot, now()));
     assert_eq!(pairing.effect_gate.as_ref().unwrap().in_flight(), 1);
     assert!(!pairing.effect_gate.as_ref().unwrap().drain_required());
+    let trust_revision = pairing.identity.revisions().unwrap().unwrap().0;
+    let Response::Accepted { id: client_tuning } = broker.dispatch("console", Command::Request {
+        service: SERVICE.into(), timeout_ms: 30_000, operation_id: "client-display-tuning".into(), parent: None,
+        payload: json!({"action":"update_client_config_overrides","certificate_id":certificate_id,
+            "expected_revision":trust_revision,"config_overrides":{"display_mode":"1920x1080x60","sw_preset":"fast"}}),
+    }) else { panic!("client tuning rejected") };
+    let mut client_result = None;
+    for _ in 0..200 {
+        pump_configuration_fence(&mut pairing, &mut configuration, &state, &mut broker);
+        if let Response::Result { payload } = broker.dispatch(
+            "console",
+            Command::TakeResult {
+                request: client_tuning,
+            },
+        ) {
+            client_result = Some(payload);
+            break;
+        }
+    }
+    assert_eq!(
+        client_result.as_ref().map(|value| &value["ok"]),
+        Some(&json!(true)),
+        "{client_result:?}"
+    );
+    assert_eq!(
+        pairing.identity.revisions().unwrap().unwrap().0,
+        trust_revision + 1
+    );
+    assert!(pairing.identity.current(&snapshot, now()));
+    assert_eq!(pairing.effect_gate.as_ref().unwrap().in_flight(), 1);
+    assert!(!pairing.effect_gate.as_ref().unwrap().drain_required());
     let Response::Accepted { id: cancelled } = broker.dispatch("amaterasu.management", Command::Request {
         service: HOST_CONFIGURATION_SERVICE.into(), timeout_ms:30_000, operation_id:"cancelled-identity-update".into(), parent:None,
         payload:json!({"action":"update","expected_revision":2,"file_state":"sunshine_state.json","vibeshine_file_state":"vibeshine_state.json","credentials_file":"","pkey":"credentials/third-key.pem","cert":"credentials/third-cert.pem","log_path":"other.log","min_log_level":"info"}),
@@ -718,6 +751,10 @@ fn real_providers_hold_host_identity_write_until_owner_retires_stream() {
     assert_eq!(after_abort["value"]["revision"], 2);
     assert_eq!(after_abort["value"]["cert"], "credentials/new-cert.pem");
     assert!(after_abort["value"].get("transaction").is_none());
+    assert_eq!(
+        state.handle(&delayed_caller, delayed_payload.clone())["error"]["code"],
+        "revision_conflict"
+    );
     let third_epoch = pairing
         .apply_effect_request(
             "input",

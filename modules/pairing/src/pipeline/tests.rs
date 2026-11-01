@@ -4924,9 +4924,14 @@ fn feedback_grant_and_controller_revocation_wait_for_lease_retirement() {
         };
         let writes = harness.writes;
         harness.enqueue("console", write);
-        pipeline
-            .tick_at(now(), |command| harness.send(command))
-            .unwrap();
+        for _ in 0..3 {
+            pipeline
+                .tick_at(now(), |command| harness.send(command))
+                .unwrap();
+            if pipeline.deferred_effect_mutation.is_some() {
+                break;
+            }
+        }
         assert_eq!(harness.writes, writes, "{change}");
         assert!(pipeline.deferred_effect_mutation.is_some(), "{change}");
         let retirement = json!({"ok":true,"service":"amaterasu.control-transport/1","stream":7,"provider_epoch":"c".repeat(32),"operation_id":"retire","scope":"whole_control_stream","state":"retired"});

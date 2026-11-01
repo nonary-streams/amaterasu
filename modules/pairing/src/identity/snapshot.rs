@@ -340,6 +340,42 @@ pub struct Shared {
     latest_time: AtomicU64,
 }
 impl Shared {
+    /// Retag the current snapshot only when it belongs to the validated prior
+    /// configured identity; the caller has compared the effective TLS material.
+    pub fn advance_configuration_revision(
+        &self,
+        expected: u64,
+        next: u64,
+    ) -> Result<(), &'static str> {
+        let mut current = self
+            .snapshot
+            .write()
+            .map_err(|_| "identity_cache_unavailable")?;
+        if let Some(entry) = current
+            .as_mut()
+            .filter(|entry| entry.configuration_revision == expected)
+        {
+            entry.configuration_revision = next;
+        }
+        Ok(())
+    }
+    /// Advance the durable pairing revision without replacing an admitted
+    /// snapshot whose identity, permissions, and effect policy are unchanged.
+    pub fn advance_pairing_revision(&self, expected: u64, next: u64) -> Result<(), &'static str> {
+        if expected.checked_add(1) != Some(next) {
+            return Err("revision_conflict");
+        }
+        let mut current = self
+            .snapshot
+            .write()
+            .map_err(|_| "identity_cache_unavailable")?;
+        let entry = current
+            .as_mut()
+            .filter(|entry| entry.pairing_revision == expected && entry.snapshot.is_some())
+            .ok_or("identity_cache_unavailable")?;
+        entry.pairing_revision = next;
+        Ok(())
+    }
     pub fn revisions(&self) -> Result<Option<(u64, u64)>, &'static str> {
         let current = self
             .snapshot

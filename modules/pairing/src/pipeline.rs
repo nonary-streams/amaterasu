@@ -63,6 +63,7 @@ enum Stage {
         response: Value,
         snapshot: Option<Arc<Snapshot>>,
         expected_ack_revision: u64,
+        preserve_base_revision: Option<u64>,
     },
 }
 
@@ -483,6 +484,10 @@ impl Pipeline {
                     {
                         // A configuration revision can change for logging or
                         // tuning without changing this admitted identity.
+                        self.identity.advance_configuration_revision(
+                            previous.provider_revision,
+                            identity.provider_revision,
+                        )?;
                         Arc::new(identity)
                     }
                     Some(_) => {
@@ -951,10 +956,7 @@ impl Pipeline {
                     caller,
                     deadline: Instant::now() + Duration::from_millis(remaining_ms.min(30_000)),
                 };
-                if operation.may_write()
-                    && (!is_client_configuration_update(&operation)
-                        || self.effect_authority.is_some())
-                {
+                if operation.may_write() && !is_client_configuration_update(&operation) {
                     if self.effect_authority.is_some() && self.effect_gate.is_none() {
                         return complete(&mut send, id, error("authority_unavailable"));
                     }
@@ -1417,13 +1419,30 @@ impl Pipeline {
                         response,
                         snapshot,
                         expected_ack_revision,
+                        preserve_base_revision,
                     } => {
                         if payload["revision"].as_u64() != Some(expected_ack_revision) {
                             self.invalidate_identity();
                             self.recovery_needed = true;
                             return complete(send, pending.request.id, error("state_unavailable"));
                         }
-                        self.publish_identity(expected_ack_revision, snapshot)?;
+                        if let Some(base_revision) = preserve_base_revision {
+                            if self
+                                .identity
+                                .advance_pairing_revision(base_revision, expected_ack_revision)
+                                .is_err()
+                            {
+                                self.invalidate_identity();
+                                self.recovery_needed = true;
+                                return complete(
+                                    send,
+                                    pending.request.id,
+                                    error("state_unavailable"),
+                                );
+                            }
+                        } else {
+                            self.publish_identity(expected_ack_revision, snapshot)?;
+                        }
                         self.recovery_needed = false;
                         complete(send, pending.request.id, response)
                     }
@@ -1652,7 +1671,7 @@ impl Pipeline {
         // Only this operation replaces configuration on an existing certificate.
         // Publish the validated durable base while its CAS is pending; trust and
         // identity mutations retain their fail-closed invalidation boundary.
-        let configuration_only =
+        let mut configuration_only =
             is_client_configuration_update(&operation) && self.effect_authority.is_none();
         if configuration_only {
             self.publish_identity(revision, loaded.clone())?;
@@ -1692,6 +1711,19 @@ impl Pipeline {
                 request.id,
                 json!({"ok":false,"code":"revision_conflict","current_revision":revision}),
             );
+        }
+        if self.effect_authority.is_some() && is_client_configuration_update(&operation) {
+            let current_trust_revision = self.identity.revisions()?.map(|(trust, _)| trust);
+            configuration_only = current_trust_revision == Some(revision)
+                && is_snapshot_tuning_update(&operation, &document);
+            if !configuration_only {
+                self.invalidate_identity();
+                self.recovery_needed = true;
+                if self.effect_gate.as_ref().is_none_or(|gate| !gate.drained()) {
+                    self.deferred_effect_mutation = Some((request, operation));
+                    return Ok(());
+                }
+            }
         }
         let include_revision = matches!(&operation, Operation::ListClients {});
         let initialize = matches!(&operation, Operation::Initialize {});
@@ -1757,6 +1789,7 @@ impl Pipeline {
                             response,
                             snapshot,
                             expected_ack_revision,
+                            preserve_base_revision: None,
                         },
                         json!({
                             "action":"set",
@@ -1811,6 +1844,9 @@ impl Pipeline {
                         response,
                         snapshot,
                         expected_ack_revision,
+                        preserve_base_revision: (configuration_only
+                            && self.effect_authority.is_some())
+                        .then_some(revision),
                     },
                     json!({
                         "action":"set",
@@ -2002,6 +2038,22 @@ fn source_join_available() -> bool {
 
 fn is_client_configuration_update(operation: &Operation) -> bool {
     matches!(operation, Operation::UpdateClientConfigOverrides { .. })
+}
+
+fn is_snapshot_tuning_update(operation: &Operation, document: &Document) -> bool {
+    let Operation::UpdateClientConfigOverrides {
+        certificate_id,
+        config_overrides,
+        ..
+    } = operation
+    else {
+        return false;
+    };
+    document
+        .clients
+        .iter()
+        .find(|client| &client.certificate_id == certificate_id)
+        .is_some_and(|client| client.config_overrides.same_effect_policy(config_overrides))
 }
 
 fn read_document(
