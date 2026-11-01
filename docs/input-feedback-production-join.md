@@ -166,13 +166,13 @@ remain fenced. The authority worker is repairing terminal lease replay,
 controller-specific operation identities and shared-transport receipt agreement;
 these must be covered with the combined real-provider test before activation.
 
-The stream pipeline currently returns immediately after advancing an active
-workflow and does not poll the service while that workflow is pending. A
-lifecycle-triggered input revoke can therefore deadlock if its stream cleanup
-workflow is waiting for input retirement. The receiving side must service
-retirement requests independently of that workflow, fence the exact admitted
-source registry, and drive selected transport and authority cleanup without
-allowing later sends. A standalone acknowledgment fixture does not prove this
+The stream pipeline now has an opt-in, bounded retirement ingress that is
+serviced while another workflow is active. It checks the startup-selected direct
+input principal, holds exact requests without acknowledging, and bounds other
+requests deferred while the active workflow runs. This removes the ingress
+scheduling obstacle, but no drain worker consumes the held requests yet. The
+receiving side must fence the exact admitted source registry and drive selected
+transport and authority cleanup without allowing later sends. A standalone acknowledgment fixture does not prove this
 join. Authority repair `200f5aa0681df533f1630f960a189ddffe855ef7` must be
 incorporated and its terminal replay, distinct-controller identity, and shared
 receipt cases included in the combined real-provider test.

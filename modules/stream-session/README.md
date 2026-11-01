@@ -61,6 +61,20 @@ capture likewise remains WGC-specific because the current start contract has no
 provider-neutral timing/pacing capability handshake. Capture table version alone
 does not prove that behavior.
 
+## Feedback retirement ingress
+
+The optional startup `feedback_retirement_input_principal` selects the only
+direct input owner allowed to submit version-1 `retire_input_feedback` requests.
+It requires `enable_input`. The receiver and its deferred ordinary-request queue
+are bounded and are serviced while a stream workflow is active. Identical retries
+may share a pending request; changed payloads with the same operation ID are
+rejected. Unstarted requests whose callers cancel can be removed safely.
+
+This ingress currently holds requests without acknowledging retirement. It is
+not connected to the pairing source registry, transport retirement or drain
+receipt, and must not be enabled in a deployed composition. The default remains
+disabled. Native code is trusted and broker identity is not a sandbox.
+
 ## Lifecycle
 
 1. `prepare` allocates a session record, a stereo Opus encoder, media UDP sockets
