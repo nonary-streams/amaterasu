@@ -12,6 +12,7 @@ struct Encoder {
     busy_once: bool,
     busy_count: u32,
     pending_discontinuity: bool,
+    discarded_frames: u64,
     selection: Option<AudioInputSelectionV2>,
     output: Option<(u64, u64)>,
     buffered_frames: u32,
@@ -123,24 +124,35 @@ unsafe extern "C" fn accept(
     if encoder.output.is_some() {
         return MEDIA_BUSY;
     }
-    if frame.frame.flags & AUDIO_DISCONTINUITY != 0 {
-        if encoder.buffered_frames != 0 {
-            return MEDIA_UNSUPPORTED;
-        }
-        encoder.pending_discontinuity = true;
-    }
-    let start = encoder
-        .buffered_timestamp
-        .unwrap_or(frame.frame.timestamp_us);
-    if encoder.buffered_frames > 0
-        && start + u64::from(encoder.buffered_frames) * 1_000_000 / 48_000
-            != frame.frame.timestamp_us
+    let discontinuity = frame.frame.flags & AUDIO_DISCONTINUITY != 0;
+    let old_frames = if discontinuity {
+        0
+    } else {
+        encoder.buffered_frames
+    };
+    let start = if discontinuity {
+        frame.frame.timestamp_us
+    } else {
+        encoder
+            .buffered_timestamp
+            .unwrap_or(frame.frame.timestamp_us)
+    };
+    if old_frames > 0
+        && start + u64::from(old_frames) * 1_000_000 / 48_000 != frame.frame.timestamp_us
     {
         return MEDIA_UNSUPPORTED;
     }
-    let total = encoder.buffered_frames + frame.frame.frames;
+    let total = old_frames + frame.frame.frames;
     if total >= 3072 {
         return MEDIA_UNSUPPORTED;
+    }
+    if discontinuity {
+        // No access unit may combine samples across a capture gap. Complete
+        // pending output was already delivered; discard only the old partial.
+        encoder.discarded_frames += u64::from(encoder.buffered_frames);
+        encoder.buffered_frames = 0;
+        encoder.buffered_timestamp = None;
+        encoder.pending_discontinuity = true;
     }
     if total >= 1536 {
         encoder.output = Some((start, encoder.serial));
@@ -180,7 +192,17 @@ unsafe extern "C" fn take(
             encoder.serial += 1;
             encoder.buffered_frames = 0;
             encoder.output = Some((timestamp, sequence));
-            (0, 1536, timestamp, sequence, &[0xe2, 0x22, 0x66, 0x77])
+            (
+                if encoder.pending_discontinuity {
+                    AUDIO_PACKET_DISCONTINUITY
+                } else {
+                    0
+                },
+                1536,
+                timestamp,
+                sequence,
+                &[0xe2, 0x22, 0x66, 0x77],
+            )
         }
         None if encoder.draining && !encoder.ended => {
             (AUDIO_PACKET_END_OF_STREAM, 0, 0, encoder.serial, &[])
@@ -249,6 +271,7 @@ pub extern "C" fn fixture_create_v2_channels(channels: u32) -> *mut OrderedAudio
         busy_once: false,
         busy_count: 0,
         pending_discontinuity: false,
+        discarded_frames: 0,
         selection: None,
         output: None,
         buffered_frames: 0,
@@ -295,4 +318,13 @@ pub unsafe extern "C" fn fixture_busy_once_v2(pointer: *mut OrderedAudioEncoderA
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fixture_busy_count_v2(pointer: *mut OrderedAudioEncoderApiV2) -> u32 {
     unsafe { (*pointer.cast::<Encoder>()).busy_count }
+}
+
+/// # Safety
+/// The fixture table is live and no native calls are in progress.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fixture_discarded_frames_v2(
+    pointer: *mut OrderedAudioEncoderApiV2,
+) -> u64 {
+    unsafe { (*pointer.cast::<Encoder>()).discarded_frames }
 }

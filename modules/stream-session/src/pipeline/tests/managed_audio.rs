@@ -151,6 +151,7 @@ struct Capture {
     busy: u32,
     reordered: bool,
     gap: bool,
+    partial_gap: bool,
     video_draining: bool,
     video_ended: bool,
     opus_draining: bool,
@@ -169,27 +170,33 @@ unsafe extern "C" fn capture(
         state.busy += 1;
         return MEDIA_BUSY;
     }
-    if state.sent >= 4 {
+    if state.sent >= if state.partial_gap { 8 } else { 4 } {
         return MEDIA_PENDING;
     }
     let mut lanes = [1, 2, 0, 0, 0, 0, 0, 0];
     if state.reordered {
         lanes.swap(0, 1);
     }
-    let frame = OrderedAudioFrameV2 {
-        size: size_of::<OrderedAudioFrameV2>() as u32,
-        version: AUDIO_ORDERED_VERSION,
-        stream,
-        generation: 1,
-        frame: AudioFrame {
-            sample_rate: 48_000,
-            channels: 2,
-            format: PCM_F32,
-            frames: 1536,
-            flags: AUDIO_TIMESTAMP_ESTIMATED,
-            data: state.samples.as_ptr(),
-            len: state.samples.len(),
-            timestamp_us: (100_000i64
+    let (frames, timestamp_us, flags) = if state.partial_gap {
+        let jitter = [0, 1, -1, 2][state.sent as usize % 4];
+        let gap = state.sent >= 4;
+        (
+            480,
+            (100_000i64
+                + i64::from(state.sent) * 10_000
+                + if state.sent == 4 { 0 } else { jitter }
+                + if gap { 16_000 } else { 0 }) as u64,
+            AUDIO_TIMESTAMP_ESTIMATED
+                | if state.sent == 4 {
+                    AUDIO_DISCONTINUITY
+                } else {
+                    0
+                },
+        )
+    } else {
+        (
+            1536,
+            (100_000i64
                 + i64::from(state.sent) * 32_000
                 + if state.gap && state.sent == 2 {
                     0
@@ -201,6 +208,23 @@ unsafe extern "C" fn capture(
                 } else {
                     0
                 }) as u64,
+            AUDIO_TIMESTAMP_ESTIMATED,
+        )
+    };
+    let frame = OrderedAudioFrameV2 {
+        size: size_of::<OrderedAudioFrameV2>() as u32,
+        version: AUDIO_ORDERED_VERSION,
+        stream,
+        generation: 1,
+        frame: AudioFrame {
+            sample_rate: 48_000,
+            channels: 2,
+            format: PCM_F32,
+            frames,
+            flags,
+            data: state.samples.as_ptr(),
+            len: frames as usize * 2 * 4,
+            timestamp_us,
             sequence: u64::from(state.sent),
         },
         layout: AudioChannelLayoutV2 {
@@ -249,6 +273,12 @@ impl Provider {
     fn busy_count(&self) -> u32 {
         let get: unsafe extern "C" fn(*mut OrderedAudioEncoderApiV2) -> u32 =
             unsafe { *self.library.get(b"fixture_busy_count_v2\0").unwrap() };
+        unsafe { get(self.table) }
+    }
+    fn discarded_frames(&self) -> u64 {
+        let get: unsafe extern "C" fn(*mut OrderedAudioEncoderApiV2) -> u64 =
+            unsafe { *self.library.get(b"fixture_discarded_frames_v2\0").unwrap() };
+        // SAFETY: the fixture is live and the single-threaded test is outside a callback.
         unsafe { get(self.table) }
     }
     fn offer(&self, generation: u64, fixed_bytes: u32) {
@@ -358,6 +388,41 @@ impl Host {
                 result => panic!("unexpected {result:?}"),
             }
             assert!(Instant::now() < deadline, "request {op} timed out");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+    fn media_request(&mut self, operation: &str, payload: Value) -> Value {
+        let Response::Accepted { id } = self
+            .consumer
+            .send(Command::Request {
+                service: MEDIA.into(),
+                payload,
+                operation_id: operation.into(),
+                timeout_ms: 5000,
+                parent: None,
+            })
+            .unwrap()
+        else {
+            panic!("media request rejected")
+        };
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            self.tick();
+            match self
+                .consumer
+                .send(Command::TakeResult { request: id })
+                .unwrap()
+            {
+                Response::Result { payload } => {
+                    self.consumer
+                        .require_success(Command::ReleaseResult { request: id })
+                        .unwrap();
+                    return payload;
+                }
+                Response::Pending => (),
+                result => panic!("unexpected media result {result:?}"),
+            }
+            assert!(Instant::now() < deadline, "media request timed out");
             std::thread::sleep(Duration::from_millis(1));
         }
     }
@@ -487,6 +552,7 @@ fn fixture(path: &str, codec: &str) -> Host {
         busy: 0,
         reordered: false,
         gap: false,
+        partial_gap: false,
         video_draining: false,
         video_ended: false,
         opus_draining: false,
@@ -734,10 +800,12 @@ fn exchange(
     );
     if accept {
         let deadline = Instant::now() + Duration::from_secs(4);
-        let expected_times = if host.capture.gap {
-            [0u32, 32, 80, 112]
+        let expected_times: &[u32] = if host.capture.partial_gap {
+            &[0, 56]
+        } else if host.capture.gap {
+            &[0, 32, 80, 112]
         } else {
-            [0u32, 32, 64, 96]
+            &[0, 32, 64, 96]
         };
         let mut received = 0;
         while received < expected_times.len() {
@@ -746,6 +814,12 @@ fn exchange(
             match audio.recv(&mut packet) {
                 Ok(n) => {
                     assert_eq!(&packet[12..n], marker);
+                    if host.capture.partial_gap {
+                        assert_eq!(
+                            u16::from_be_bytes(packet[2..4].try_into().unwrap()),
+                            if received == 0 { 0 } else { 4 }
+                        );
+                    }
                     assert_eq!(
                         u32::from_be_bytes(packet[4..8].try_into().unwrap()),
                         expected_times[received]
@@ -759,8 +833,15 @@ fn exchange(
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(host.capture.busy, 1);
-        assert_eq!(host.capture.sent, 4);
+        assert_eq!(
+            host.capture.sent,
+            if host.capture.partial_gap { 8 } else { 4 }
+        );
         assert_eq!(host.encoder.busy_count(), 1);
+        assert_eq!(
+            host.encoder.discarded_frames(),
+            if host.capture.partial_gap { 384 } else { 0 }
+        );
         if let Some(generation) = stale {
             let record = host
                 .session
@@ -797,14 +878,33 @@ fn exchange(
         }
         assert_eq!(host.capture.sent, 0);
     }
-    let media_stream = host
+    let record = host
         .session
         .pipeline
         .records
         .values()
         .find(|record| record.state == State::Active)
-        .unwrap()
-        .resources[&Resource::Media];
+        .unwrap();
+    let media_stream = record.resources[&Resource::Media];
+    let media_operation = record.operation(Resource::Media);
+    let status = host.media_request(
+        &format!("{launch}-media-before"),
+        json!({"action":"status","stream":media_stream}),
+    );
+    assert_eq!(status["streams"].as_array().unwrap().len(), 1, "{status}");
+    assert_eq!(status["streams"][0]["stream"], media_stream);
+    if host.capture.partial_gap {
+        assert_eq!(
+            status["streams"][0]["discarded_audio_fec_shards"], 1,
+            "{status}"
+        );
+        assert_eq!(status["streams"][0]["audio"]["packet_ms"], 32, "{status}");
+    }
+    let lookup = host.media_request(
+        &format!("{launch}-lookup-before"),
+        json!({"action":"lookup","operation_id":media_operation}),
+    );
+    assert_eq!(lookup["stream"], media_stream, "{lookup}");
     send(
         host,
         &mut sealer,
@@ -817,6 +917,17 @@ fn exchange(
             .iter()
             .any(|call| call.service == ENCODER && call.payload["action"] == "close")
     );
+    let status = host.media_request(
+        &format!("{launch}-media-after"),
+        json!({"action":"status","stream":media_stream}),
+    );
+    assert_eq!(status["ok"], true, "{status}");
+    assert!(status["streams"].as_array().unwrap().is_empty(), "{status}");
+    let lookup = host.media_request(
+        &format!("{launch}-lookup-after"),
+        json!({"action":"lookup","operation_id":media_operation}),
+    );
+    assert_eq!(lookup["code"], "stream_not_found", "{lookup}");
     let binding =
         unsafe { amaterasu_module_sdk::audio::bind_ordered_transport(&host.consumer, TRANSPORT) }
             .unwrap();
@@ -882,6 +993,115 @@ fn rejected_offer(host: &mut Host, unsupported_layout: bool) {
     );
     assert_eq!(closed["state"], "closed", "{closed}");
 }
+/// Exercise rejection and a BUSY sink during a partial post-gap drain. The
+/// provider artifact is retained until every synchronous callback completes.
+fn partial_discontinuity_retry(path: &str, generation: u64, offer: u64) {
+    struct Sink {
+        busy: bool,
+        deliveries: Vec<(u32, u64, u64)>,
+    }
+    unsafe extern "C" fn receive(
+        context: *mut c_void,
+        packet: *const NegotiatedAudioPacket,
+    ) -> Status {
+        // SAFETY: the test owns the sink and the provider lends the packet only
+        // for this synchronous callback; retain scalar metadata only.
+        let sink = unsafe { &mut *context.cast::<Sink>() };
+        let packet = unsafe { &*packet };
+        sink.deliveries
+            .push((packet.flags, packet.timestamp_us, packet.sequence));
+        if sink.busy {
+            sink.busy = false;
+            MEDIA_BUSY
+        } else {
+            STATUS_OK
+        }
+    }
+    let provider = Provider::load(path);
+    let layout = AudioChannelLayoutV2 {
+        size: size_of::<AudioChannelLayoutV2>() as u32,
+        version: AUDIO_ORDERED_VERSION,
+        channels: 2,
+        reserved: 0,
+        mask: 3,
+        lanes: [1, 2, 0, 0, 0, 0, 0, 0],
+    };
+    let selection = AudioInputSelectionV2 {
+        size: size_of::<AudioInputSelectionV2>() as u32,
+        version: AUDIO_ORDERED_VERSION,
+        stream: 20,
+        generation: 1,
+        layout,
+    };
+    // SAFETY: copy the callbacks while the fixture table is live; no shared
+    // table reference remains when the callbacks mutably access provider state.
+    let (context, configure, submit, drain, take) = unsafe {
+        let table = &*provider.table;
+        (
+            table.base.context,
+            table.configure,
+            table.submit,
+            table.drain,
+            table.receive,
+        )
+    };
+    assert_eq!(
+        unsafe { configure(context, 19, generation, offer, &selection) },
+        STATUS_OK
+    );
+    let samples = vec![0u8; 4800 * 2 * 4];
+    let frame = |sequence: u64, timestamp_us: u64, frames: u32, flags: u32| OrderedAudioFrameV2 {
+        size: size_of::<OrderedAudioFrameV2>() as u32,
+        version: AUDIO_ORDERED_VERSION,
+        stream: 20,
+        generation: 1,
+        frame: AudioFrame {
+            sample_rate: 48_000,
+            channels: 2,
+            format: PCM_F32,
+            frames,
+            flags,
+            data: samples.as_ptr(),
+            len: frames as usize * 2 * 4,
+            timestamp_us,
+            sequence,
+        },
+        layout,
+    };
+    for input in [frame(0, 100_000, 480, 0), frame(1, 110_000, 480, 0)] {
+        assert_eq!(unsafe { submit(context, 19, &input) }, STATUS_OK);
+    }
+    let oversized = frame(2, 150_000, 4800, AUDIO_DISCONTINUITY);
+    assert_eq!(
+        unsafe { submit(context, 19, &oversized) },
+        MEDIA_UNSUPPORTED
+    );
+    assert_eq!(
+        provider.discarded_frames(),
+        0,
+        "rejected input changed buffered ownership"
+    );
+    let resumed = frame(2, 150_000, 480, AUDIO_DISCONTINUITY);
+    assert_eq!(unsafe { submit(context, 19, &resumed) }, STATUS_OK);
+    assert_eq!(provider.discarded_frames(), 960);
+    assert_eq!(unsafe { drain(context, 19) }, STATUS_OK);
+    let mut output = Sink {
+        busy: true,
+        deliveries: Vec::new(),
+    };
+    let sink = NegotiatedAudioPacketSink {
+        context: (&mut output as *mut Sink).cast(),
+        write: receive,
+    };
+    assert_eq!(unsafe { take(context, 19, sink) }, MEDIA_BUSY);
+    assert_eq!(unsafe { take(context, 19, sink) }, STATUS_OK);
+    assert_eq!(
+        output.deliveries,
+        [(AUDIO_PACKET_DISCONTINUITY, 150_000, 0); 2]
+    );
+    assert_eq!(unsafe { take(context, 19, sink) }, STATUS_OK);
+    assert_eq!(output.deliveries[2].0, AUDIO_PACKET_END_OF_STREAM);
+}
 #[test]
 #[ignore = "requires separately built synthetic encoder libraries and loopback sockets"]
 fn broker_managed_rtsp_audio_route_uses_independent_providers() {
@@ -891,6 +1111,7 @@ fn broker_managed_rtsp_audio_route_uses_independent_providers() {
     ] {
         let path = std::env::var(variable).unwrap();
         let generation = if codec == "AC3" { 101 } else { 202 };
+        partial_discontinuity_retry(&path, generation, if codec == "AC3" { 11 } else { 22 });
         let mut host = fixture(&path, codec);
         host.encoder.busy_once();
         exchange(&mut host, codec, marker, true, "first", None);
@@ -926,6 +1147,10 @@ fn broker_managed_rtsp_audio_route_uses_independent_providers() {
         gap.capture.gap = true;
         gap.encoder.busy_once();
         exchange(&mut gap, codec, marker, true, "gap", None);
+        let mut partial_gap = fixture(&path, codec);
+        partial_gap.capture.partial_gap = true;
+        partial_gap.encoder.busy_once();
+        exchange(&mut partial_gap, codec, marker, true, "partial-gap", None);
         let mut fallback = fixture(&path, codec);
         exchange(&mut fallback, codec, marker, false, "fallback", None);
         let mut layout = fixture(&path, codec);

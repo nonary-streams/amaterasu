@@ -12,6 +12,7 @@ struct Provider {
     busy_once: bool,
     busy_count: u32,
     pending_discontinuity: bool,
+    discarded_frames: u64,
     input: Option<AudioInputSelectionV2>,
     pending_timestamp: Option<u64>,
     buffered_frames: u32,
@@ -120,24 +121,35 @@ unsafe extern "C" fn submit(
     if provider.pending_timestamp.is_some() {
         return MEDIA_BUSY;
     }
-    if frame.frame.flags & AUDIO_DISCONTINUITY != 0 {
-        if provider.buffered_frames != 0 {
-            return MEDIA_UNSUPPORTED;
-        }
-        provider.pending_discontinuity = true;
-    }
-    let start = provider
-        .buffered_timestamp
-        .unwrap_or(frame.frame.timestamp_us);
-    if provider.buffered_frames > 0
-        && start + u64::from(provider.buffered_frames) * 1_000_000 / 48_000
-            != frame.frame.timestamp_us
+    let discontinuity = frame.frame.flags & AUDIO_DISCONTINUITY != 0;
+    let old_frames = if discontinuity {
+        0
+    } else {
+        provider.buffered_frames
+    };
+    let start = if discontinuity {
+        frame.frame.timestamp_us
+    } else {
+        provider
+            .buffered_timestamp
+            .unwrap_or(frame.frame.timestamp_us)
+    };
+    if old_frames > 0
+        && start + u64::from(old_frames) * 1_000_000 / 48_000 != frame.frame.timestamp_us
     {
         return MEDIA_UNSUPPORTED;
     }
-    let total = provider.buffered_frames + frame.frame.frames;
+    let total = old_frames + frame.frame.frames;
     if total >= 3072 {
         return MEDIA_UNSUPPORTED;
+    }
+    if discontinuity {
+        // No access unit may combine samples across a capture gap. Complete
+        // pending output was already delivered; discard only the old partial.
+        provider.discarded_frames += u64::from(provider.buffered_frames);
+        provider.buffered_frames = 0;
+        provider.buffered_timestamp = None;
+        provider.pending_discontinuity = true;
     }
     if total >= 1536 {
         provider.pending_timestamp = Some(start);
@@ -173,7 +185,11 @@ unsafe extern "C" fn receive(
             provider.pending_timestamp = provider.buffered_timestamp.take();
             provider.buffered_frames = 0;
             (
-                0,
+                if provider.pending_discontinuity {
+                    AUDIO_PACKET_DISCONTINUITY
+                } else {
+                    0
+                },
                 1536,
                 provider.pending_timestamp.unwrap(),
                 &[0xa1, 0x11, 0x33, 0x44],
@@ -245,6 +261,7 @@ pub extern "C" fn fixture_create_v2_channels(channels: u32) -> *mut OrderedAudio
         busy_once: false,
         busy_count: 0,
         pending_discontinuity: false,
+        discarded_frames: 0,
         input: None,
         pending_timestamp: None,
         buffered_frames: 0,
@@ -291,4 +308,13 @@ pub unsafe extern "C" fn fixture_busy_once_v2(pointer: *mut OrderedAudioEncoderA
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fixture_busy_count_v2(pointer: *mut OrderedAudioEncoderApiV2) -> u32 {
     unsafe { (*pointer.cast::<Provider>()).busy_count }
+}
+
+/// # Safety
+/// The fixture table is live and no native calls are in progress.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fixture_discarded_frames_v2(
+    pointer: *mut OrderedAudioEncoderApiV2,
+) -> u64 {
+    unsafe { (*pointer.cast::<Provider>()).discarded_frames }
 }
