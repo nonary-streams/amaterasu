@@ -1,3 +1,6 @@
+pub use amaterasu_module_sdk::effect_authority::{
+    ConfigurationTransaction, ConfigurationTransactionState,
+};
 use serde::{Deserialize, Serialize};
 
 pub const DOCUMENT_VERSION: u32 = 1;
@@ -134,6 +137,8 @@ pub struct Document {
     pub cert: String,
     pub log_path: String,
     pub min_log_level: MinLogLevel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transaction: Option<ConfigurationTransaction>,
 }
 
 impl Default for Document {
@@ -154,6 +159,7 @@ impl Document {
             cert: settings.cert,
             log_path: settings.log_path,
             min_log_level: settings.min_log_level,
+            transaction: None,
         }
     }
 
@@ -172,6 +178,13 @@ impl Document {
     pub fn validate(&self) -> Result<(), String> {
         if self.version != DOCUMENT_VERSION {
             return Err(format!("unsupported document version {}", self.version));
+        }
+        if self
+            .transaction
+            .as_ref()
+            .is_some_and(|transaction| !transaction.valid_for_configuration_revision(self.revision))
+        {
+            return Err("invalid configuration transaction".into());
         }
         self.settings().validate()
     }

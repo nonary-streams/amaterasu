@@ -7,6 +7,10 @@ use serde_json::{Value, json};
 pub enum Operation {
     Readiness {},
     Get {},
+    TransactionStatus {},
+    ReconcileTransaction {
+        change: amaterasu_module_sdk::effect_authority::ConfigurationChange,
+    },
     Update {
         expected_revision: u64,
         file_state: String,
@@ -40,7 +44,10 @@ impl Operation {
                 log_path: log_path.clone(),
                 min_log_level: *min_log_level,
             }),
-            Self::Readiness {} | Self::Get {} => None,
+            Self::Readiness {}
+            | Self::Get {}
+            | Self::TransactionStatus {}
+            | Self::ReconcileTransaction { .. } => None,
         }
     }
 }

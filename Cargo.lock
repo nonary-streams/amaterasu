@@ -423,6 +423,7 @@ dependencies = [
  "amaterasu-module-sdk",
  "amaterasu-runtime",
  "amaterasu-state",
+ "getrandom 0.3.4",
  "serde",
  "serde_json",
 ]
@@ -705,11 +706,13 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "amaterasu-contracts",
+ "amaterasu-host-configuration",
  "amaterasu-identity",
  "amaterasu-input-policy",
  "amaterasu-module-sdk",
  "amaterasu-nvhttp",
  "amaterasu-runtime",
+ "amaterasu-state",
  "amaterasu-storage",
  "getrandom 0.3.4",
  "rand_chacha 0.3.1",

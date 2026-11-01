@@ -340,6 +340,19 @@ pub struct Shared {
     latest_time: AtomicU64,
 }
 impl Shared {
+    pub fn revisions(&self) -> Result<Option<(u64, u64)>, &'static str> {
+        let current = self
+            .snapshot
+            .read()
+            .map_err(|_| "identity_cache_unavailable")?;
+        Ok(current.as_ref().and_then(|entry| {
+            entry
+                .snapshot
+                .as_ref()
+                .map(|_| (entry.pairing_revision, entry.configuration_revision))
+        }))
+    }
+
     pub fn invalidate(&self) {
         if let Ok(mut snapshot) = self.snapshot.write() {
             *snapshot = None;

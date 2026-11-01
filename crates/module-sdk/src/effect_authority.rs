@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 
 pub const SERVICE: &str = "amaterasu.pairing-effects/1";
 pub const ADMINISTRATION_SERVICE: &str = "amaterasu.pairing/1";
+pub const HOST_CONFIGURATION_SERVICE: &str = "amaterasu.host-configuration/1";
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq, Ord, PartialOrd)]
 #[serde(deny_unknown_fields)]
@@ -273,6 +274,136 @@ pub struct StreamRetirement {
     pub scope: String,
     pub state: String,
 }
+
+/// Exact identity of a host configuration mutation. The broker authenticates
+/// the owner; callers cannot select an owner through this structure.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigurationChange {
+    pub version: u8,
+    pub authority_epoch: String,
+    pub operation_id: String,
+    pub expected_configuration_revision: u64,
+    pub expected_trust_revision: u64,
+}
+
+impl ConfigurationChange {
+    pub fn valid(&self) -> bool {
+        self.version == 1 && hex(&self.authority_epoch, 32) && token(&self.operation_id)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ConfigurationChangeOutcome {
+    Committed { configuration_revision: u64 },
+    Aborted {},
+}
+
+/// Durable transaction metadata returned by the selected host configuration
+/// provider. `settled` means its namespace CAS fenced the preceding writer.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigurationTransaction {
+    pub change: ConfigurationChange,
+    pub state: ConfigurationTransactionState,
+    pub expected_state_revision: u64,
+    pub settled: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(tag = "phase", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ConfigurationTransactionState {
+    Prepared {},
+    Committed { configuration_revision: u64 },
+    Aborted { configuration_revision: u64 },
+}
+
+impl ConfigurationTransaction {
+    pub fn valid_for_configuration_revision(&self, revision: u64) -> bool {
+        self.change.valid()
+            && self.expected_state_revision != 0
+            && match self.state {
+                ConfigurationTransactionState::Prepared {} => {
+                    !self.settled && revision == self.change.expected_configuration_revision
+                }
+                ConfigurationTransactionState::Committed {
+                    configuration_revision,
+                } => {
+                    revision == configuration_revision
+                        && self.change.expected_configuration_revision.checked_add(1)
+                            == Some(configuration_revision)
+                }
+                ConfigurationTransactionState::Aborted {
+                    configuration_revision,
+                } => {
+                    revision == configuration_revision
+                        && (configuration_revision == self.change.expected_configuration_revision
+                            || self.change.expected_configuration_revision.checked_add(2)
+                                == Some(configuration_revision))
+                }
+            }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HostConfigurationTransactionStatus {
+    pub ok: bool,
+    pub configuration_revision: u64,
+    #[serde(deserialize_with = "required_transaction")]
+    pub transaction: Option<ConfigurationTransaction>,
+}
+
+fn required_transaction<'de, D>(
+    deserializer: D,
+) -> Result<Option<ConfigurationTransaction>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::deserialize(deserializer)
+}
+
+impl HostConfigurationTransactionStatus {
+    pub fn valid(&self) -> bool {
+        self.ok
+            && self.transaction.as_ref().is_none_or(|transaction| {
+                transaction.valid_for_configuration_revision(self.configuration_revision)
+            })
+    }
+}
+
+/// Direct pairing and management calls to the selected configuration provider.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HostConfigurationTransactionRequest {
+    TransactionStatus {},
+    ReconcileTransaction { change: ConfigurationChange },
+}
+
+impl HostConfigurationTransactionRequest {
+    pub fn submit(
+        &self,
+        runtime: &crate::RuntimeClient,
+        timeout_ms: u64,
+        operation_id: &str,
+    ) -> crate::ModuleResult<u64> {
+        if let Self::ReconcileTransaction { change } = self
+            && !change.valid()
+        {
+            return Err("invalid configuration change".into());
+        }
+        runtime.request_serialized(
+            crate::requests::RequestOptions {
+                service: HOST_CONFIGURATION_SERVICE,
+                timeout_ms,
+                operation_id,
+                parent: None,
+            },
+            self,
+        )
+    }
+}
 impl StreamRetirement {
     pub fn matches(&self, scope: &StreamScope) -> bool {
         self.service == scope.transport_service
@@ -292,6 +423,17 @@ impl StreamRetirement {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    BeginConfigurationChange {
+        change: ConfigurationChange,
+    },
+    FinishConfigurationChange {
+        change: ConfigurationChange,
+        result: ConfigurationChangeOutcome,
+    },
+    ReconcileConfigurationChange {
+        change: ConfigurationChange,
+        current_authority_epoch: String,
+    },
     Recover {
         epoch: String,
         owner_epoch: String,
@@ -586,6 +728,39 @@ mod tests {
             "epoch",
             "operation"
         ));
+    }
+
+    #[test]
+    fn transaction_status_requires_an_explicit_valid_marker() {
+        assert!(
+            serde_json::from_value::<HostConfigurationTransactionStatus>(
+                json!({"ok":true,"configuration_revision":0})
+            )
+            .is_err()
+        );
+        let empty: HostConfigurationTransactionStatus = serde_json::from_value(
+            json!({"ok":true,"configuration_revision":0,"transaction":null}),
+        )
+        .unwrap();
+        assert!(empty.valid());
+        let marker = json!({"ok":true,"configuration_revision":4,"transaction":{
+            "change":{"version":1,"authority_epoch":"a".repeat(32),"operation_id":"operation",
+                "expected_configuration_revision":3,"expected_trust_revision":7},
+            "state":{"phase":"committed","configuration_revision":4},
+            "expected_state_revision":8,"settled":true
+        }});
+        assert!(
+            serde_json::from_value::<HostConfigurationTransactionStatus>(marker.clone())
+                .unwrap()
+                .valid()
+        );
+        let mut malformed = marker;
+        malformed["transaction"]["change"]["version"] = json!(2);
+        assert!(
+            !serde_json::from_value::<HostConfigurationTransactionStatus>(malformed)
+                .unwrap()
+                .valid()
+        );
     }
 
     #[test]

@@ -19,7 +19,8 @@ The module validates that it names an existing canonical directory without a
 symlink or reparse point. Until a valid root is available, reads and updates
 return `configuration_unavailable`, and readiness returns `ready:false`.
 
-The stored value is one document with exactly these fields:
+The stored value has these configuration fields and may also contain an
+internal transaction marker while an identity change is being reconciled:
 
 ```json
 {
@@ -48,6 +49,43 @@ Every request rejects unknown fields. The provider accepts `readiness` and
 authenticated immediate caller `amaterasu.management`. The management module
 must verify the signed administrator request before making this internal call;
 the provider does not treat native modules or API grants as a sandbox.
+
+Trusted startup composition may explicitly select the pairing effect authority
+with `pairing_effect_authority: {"principal":"selected.pairing"}`; no grant or
+selection is installed by this library. In that mode identity-path changes persist a transaction marker,
+wait for pairing's owner-acknowledged stream drain, then perform the State CAS.
+Logging-only changes retain the admitted identity snapshot and do not request
+that drain. A lost or cancelled write remains fenced until management calls
+`reconcile_transaction` with the exact `transaction.change` returned by
+`transaction_status`.
+Only direct `amaterasu.management` and the selected pairing principal can read
+the status; reconciliation requires direct management. An abort is confirmed only
+after a successful CAS advances the same State namespace revision, so a late
+write at the old revision conflicts. Reconciliation reports logging as
+`unconfirmed` because settling identity does not prove logging application.
+If pairing receives an older status containing a marker after host configuration
+has cleared that marker, pairing can retain a hold that the current
+`reconcile_transaction` operation reports as unknown. That case stays fenced;
+there is not yet a durable terminal receipt that proves the cleared outcome to
+the restarted pairing provider.
+
+The input/control join remains closed until the selected owner can fence local
+producers, join workers, obtain the selected control provider's exact
+`whole_control_stream` / `retired` receipt for each lease, complete those
+pairing leases, and acknowledge pairing's current fence generation. That
+receipt proves local retirement, not remote packet delivery.
+
+The selected owner obtains the current `epoch` and `fence_generation` from
+`amaterasu.pairing-effects/1` `status`. For every admitted lease it sends
+`complete_stream_lease` with the original `operation_id` and `ticket` plus the
+retirement receipt containing `service`, `stream`, `provider_epoch`, retirement
+`operation_id`, `scope: "whole_control_stream"`, and `state: "retired"`. It
+then sends `acknowledge` for that lease and `drain` with the exact epoch and
+generation. After owner or pairing restart, `recover` is an owner attestation
+that prior workers have been retired; while a configuration marker is present,
+recovery keeps admission fenced and reconciliation uses the new authority
+epoch. The owner must verify each receipt with the selected transport provider;
+the JSON fields alone are not proof.
 
 ```json
 {"action":"readiness"}

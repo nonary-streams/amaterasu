@@ -1,3 +1,5 @@
+mod configuration_hold;
+
 use crate::effect_gate::{EffectGate, Request as EffectRequest, Source as EffectSource};
 use crate::engine::{Change, Engine};
 use crate::identity::{
@@ -7,6 +9,7 @@ use crate::identity::{
 use crate::identity_generation::{Generator, IdentityWorker};
 use crate::protocol::{Document, EffectAuthoritySettings, Identity, Operation, Settings, error};
 use crate::{EFFECT_SERVICE, SERVICE, STATE_SERVICE};
+use amaterasu_module_sdk::effect_authority::{ConfigurationChange, ConfigurationChangeOutcome};
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -29,6 +32,10 @@ struct Request {
     id: u64,
     caller: String,
     deadline: Instant,
+}
+struct EffectCaller<'a> {
+    caller: &'a str,
+    initiator: &'a str,
 }
 struct Pending {
     request: Request,
@@ -71,10 +78,28 @@ struct IdentityGeneration {
     initialization: Option<Initialization>,
 }
 
+struct ConfigurationHold {
+    owner: String,
+    change: ConfigurationChange,
+}
+
+struct HoldConfirmation {
+    request_id: u64,
+    change: ConfigurationChange,
+    outcome: Option<ConfigurationChangeOutcome>,
+    status_request: Option<u64>,
+    verified_revision: Option<u64>,
+}
+
 pub struct Pipeline {
     engine: Engine,
     effect_gate: Option<EffectGate>,
     effect_authority: Option<EffectAuthoritySettings>,
+    configuration_hold: Option<ConfigurationHold>,
+    configuration_reconciled: bool,
+    configuration_status_request: Option<u64>,
+    hold_confirmation: Option<HoldConfirmation>,
+    completed_configuration_hold: Option<(String, ConfigurationChange, ConfigurationChangeOutcome)>,
     effect_bindings: BTreeMap<EffectSource, (Arc<Snapshot>, Vec<u8>)>,
     deferred_effect_mutation: Option<(Request, Operation)>,
     identity_generation: Option<IdentityGeneration>,
@@ -146,10 +171,18 @@ impl Pipeline {
             HostConfigurationState::Disabled
         };
         let effect_authority = settings.effect_authority.clone();
+        let configuration_reconciled = effect_authority
+            .as_ref()
+            .is_none_or(|policy| policy.configuration_owner.is_none());
         Self {
             engine: Engine::new(settings),
             effect_gate: EffectGate::new().ok(),
             effect_authority,
+            configuration_hold: None,
+            configuration_reconciled,
+            configuration_status_request: None,
+            hold_confirmation: None,
+            completed_configuration_hold: None,
             effect_bindings: BTreeMap::new(),
             deferred_effect_mutation: None,
             identity_generation: None,
@@ -172,7 +205,9 @@ impl Pipeline {
     }
 
     pub fn authority_available(&self) -> bool {
-        self.effect_authority.is_none() || self.effect_gate.is_some()
+        (self.effect_authority.is_none() || self.effect_gate.is_some())
+            && (self.configuration_reconciled
+                || !matches!(self.host_configuration, HostConfigurationState::Disabled))
     }
 
     pub fn invalidate_identity(&mut self) {
@@ -236,6 +271,8 @@ impl Pipeline {
         mut send: impl FnMut(Command) -> Transport,
     ) -> ModuleResult<()> {
         self.progress_pairing_notice(&mut send);
+        self.progress_configuration_reconciliation(&mut send)?;
+        self.progress_hold_confirmation(&mut send)?;
         if self.identity_generation.is_some() {
             let result = self.advance_identity_generation(now, &mut send);
             if result.is_err() {
@@ -355,14 +392,6 @@ impl Pipeline {
                     self.fail_host_configuration(now);
                     return Ok(false);
                 };
-                if self
-                    .refresh_identity
-                    .as_ref()
-                    .is_some_and(|previous| previous.provider_revision != revision)
-                {
-                    self.invalidate_identity();
-                    self.recovery_needed = true;
-                }
                 if payload["ok"] != true || payload["ready"] != true {
                     self.fail_host_configuration(now);
                     return Ok(false);
@@ -447,6 +476,14 @@ impl Pipeline {
                             && previous.private_key_pem == identity.private_key_pem =>
                     {
                         previous
+                    }
+                    Some(previous)
+                        if previous.certificate_pem == identity.certificate_pem
+                            && previous.private_key_pem == identity.private_key_pem =>
+                    {
+                        // A configuration revision can change for logging or
+                        // tuning without changing this admitted identity.
+                        Arc::new(identity)
                     }
                     Some(_) => {
                         self.invalidate_identity();
@@ -887,6 +924,11 @@ impl Pipeline {
                 if let Err(code) = self.engine.admit(&caller, &operation) {
                     return complete(&mut send, id, error(code));
                 }
+                if operation.may_write()
+                    && (!self.configuration_reconciled || self.configuration_hold.is_some())
+                {
+                    return complete(&mut send, id, error("configuration_change_pending"));
+                }
                 if let (
                     Some(configured_identity),
                     Operation::ImportIdentity {
@@ -967,6 +1009,9 @@ impl Pipeline {
                             | "complete_source_retirement"
                             | "lookup_source_retirement"
                             | "lookup_current_source_retirement"
+                            | "begin_configuration_change"
+                            | "finish_configuration_change"
+                            | "reconcile_configuration_change"
                     )
                 ) =>
             {
@@ -988,6 +1033,34 @@ impl Pipeline {
     ) -> ModuleResult<()> {
         if !matches!(send(Command::CheckRequest { request: id })?, Response::Ok) {
             return complete(send, id, error("request_ended"));
+        }
+        if let Ok(request) = serde_json::from_value::<EffectRequest>(payload.clone()) {
+            match request {
+                EffectRequest::FinishConfigurationChange { change, result } => {
+                    return self.start_hold_confirmation(
+                        id,
+                        EffectCaller { caller, initiator },
+                        change,
+                        Some(result),
+                        None,
+                        send,
+                    );
+                }
+                EffectRequest::ReconcileConfigurationChange {
+                    change,
+                    current_authority_epoch,
+                } => {
+                    return self.start_hold_confirmation(
+                        id,
+                        EffectCaller { caller, initiator },
+                        change,
+                        None,
+                        Some(current_authority_epoch),
+                        send,
+                    );
+                }
+                _ => {}
+            }
         }
         let response = self.apply_effect_request(caller, initiator, payload, now);
         complete(
@@ -1022,16 +1095,41 @@ impl Pipeline {
         let request: EffectRequest =
             serde_json::from_value(payload).map_err(|_| "invalid_request")?;
         let permitted = match request {
+            EffectRequest::BeginConfigurationChange { .. }
+            | EffectRequest::FinishConfigurationChange { .. }
+            | EffectRequest::ReconcileConfigurationChange { .. } => {
+                policy.configuration_owner.as_deref() == Some(caller)
+            }
             EffectRequest::Bind { .. } | EffectRequest::BindStream { .. } => {
                 caller == policy.protocol_owner
             }
             EffectRequest::Status {} => {
-                caller == policy.protocol_owner || caller == policy.effect_owner
+                caller == policy.protocol_owner
+                    || caller == policy.effect_owner
+                    || policy.configuration_owner.as_deref() == Some(caller)
             }
             _ => caller == policy.effect_owner,
         };
         if !permitted {
             return Err("forbidden");
+        }
+        if let EffectRequest::Recover { epoch, owner_epoch } = &request {
+            if !self.configuration_reconciled {
+                return Err("configuration_change_pending");
+            }
+            if self.configuration_hold.is_some() {
+                let gate = self.effect_gate.as_mut().ok_or("authority_unavailable")?;
+                if !gate.startup_recovery_required() {
+                    return Err("configuration_change_pending");
+                }
+                gate.require_epoch(epoch)?;
+                gate.recover(owner_epoch)?;
+                gate.fence();
+                self.effect_bindings.clear();
+                return Ok(
+                    json!({"ok":true,"epoch":gate.epoch(),"held":true,"fence_generation":gate.fence_generation()}),
+                );
+            }
         }
         // Recovery reopens admission. While the authoritative host identity is
         // being loaded or refreshed, the old snapshot cannot authorize that
@@ -1045,6 +1143,59 @@ impl Pipeline {
             return Err("host_configuration_unavailable");
         }
         match request {
+            EffectRequest::BeginConfigurationChange { change } => {
+                if !change.valid() {
+                    return Err("invalid_request");
+                }
+                if let Some(hold) = &self.configuration_hold {
+                    if hold.owner != caller || hold.change != change {
+                        return Err("configuration_change_pending");
+                    }
+                } else {
+                    if !self.configuration_reconciled {
+                        return Err("configuration_change_pending");
+                    }
+                    let revisions = self.current_identity_revisions()?;
+                    if revisions
+                        != Some((
+                            change.expected_trust_revision,
+                            change.expected_configuration_revision,
+                        ))
+                    {
+                        return Err("revision_conflict");
+                    }
+                    let gate = self.effect_gate.as_mut().ok_or("authority_unavailable")?;
+                    gate.require_epoch(&change.authority_epoch)?;
+                    gate.fence_for_configuration_change()?;
+                    self.effect_bindings.clear();
+                    self.configuration_hold = Some(ConfigurationHold {
+                        owner: caller.into(),
+                        change: change.clone(),
+                    });
+                }
+                let gate = self.effect_gate.as_ref().ok_or("authority_unavailable")?;
+                return Ok(json!({
+                    "ok": true,
+                    "state": if gate.drained() { "drained" } else { "pending" },
+                    "epoch": gate.epoch(),
+                    "fence_generation": gate.fence_generation(),
+                    "operation_id": change.operation_id,
+                }));
+            }
+            EffectRequest::FinishConfigurationChange { change, .. }
+            | EffectRequest::ReconcileConfigurationChange { change, .. } => {
+                if !change.valid() {
+                    return Err("invalid_request");
+                }
+                if self
+                    .configuration_hold
+                    .as_ref()
+                    .is_none_or(|hold| hold.owner != caller || hold.change != change)
+                {
+                    return Err("configuration_change_unknown");
+                }
+                return Ok(json!({"ok":true,"state":"pending"}));
+            }
             EffectRequest::Bind {
                 epoch,
                 certificate_pem,
@@ -1058,8 +1209,12 @@ impl Pipeline {
             } => return self.bind_effect_source(epoch, certificate_pem, source, Some(scope), now),
             _ => {}
         }
+        let revisions = self.current_identity_revisions()?;
         let gate = self.effect_gate.as_mut().ok_or("authority_unavailable")?;
         match request {
+            EffectRequest::BeginConfigurationChange { .. }
+            | EffectRequest::FinishConfigurationChange { .. }
+            | EffectRequest::ReconcileConfigurationChange { .. } => unreachable!("handled above"),
             EffectRequest::Recover { epoch, owner_epoch } => {
                 gate.require_epoch(&epoch)?;
                 gate.recover(&owner_epoch)?;
@@ -1113,7 +1268,7 @@ impl Pipeline {
             }
             EffectRequest::Admit { .. } => Err("scope_required"),
             EffectRequest::Status {} => Ok(
-                json!({"ok":true,"epoch":gate.epoch(),"owner_epoch":gate.owner_epoch(),"startup_recovery_required":gate.startup_recovery_required(),"fence_generation":gate.fence_generation(),"fenced":gate.fenced(),"drain_required":gate.drain_required(),"in_flight":gate.in_flight(),"bound_sources":gate.bound_sources(),"pending_source_retirements":gate.pending_source_retirements()}),
+                json!({"ok":true,"epoch":gate.epoch(),"owner_epoch":gate.owner_epoch(),"startup_recovery_required":gate.startup_recovery_required(),"fence_generation":gate.fence_generation(),"fenced":gate.fenced(),"drain_required":gate.drain_required(),"in_flight":gate.in_flight(),"bound_sources":gate.bound_sources(),"pending_source_retirements":gate.pending_source_retirements(),"revisions":revisions.map(|(trust, configuration)| json!({"trust":trust,"configuration":configuration}))}),
             ),
             EffectRequest::Drain {
                 epoch,
@@ -1763,6 +1918,19 @@ impl Pipeline {
             } => Some(configured_identity),
             _ => None,
         }
+    }
+
+    fn current_identity_revisions(&self) -> Result<Option<(u64, u64)>, &'static str> {
+        Ok(self
+            .identity
+            .revisions()?
+            .map(|(trust_revision, snapshot_revision)| {
+                (
+                    trust_revision,
+                    self.configured_identity()
+                        .map_or(snapshot_revision, |identity| identity.provider_revision),
+                )
+            }))
     }
 
     fn publish_identity(

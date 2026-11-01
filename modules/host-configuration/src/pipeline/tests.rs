@@ -1075,7 +1075,7 @@ fn real_broker_reads_authoritative_configuration_while_update_waits() {
             vec![crate::SERVICE, crate::STATE_SERVICE, DIAGNOSTICS_SERVICE],
         ),
         (
-            "amaterasu.pairing",
+            "example.replacement-pairing",
             vec![],
             vec![crate::SERVICE, crate::STATE_SERVICE],
         ),
@@ -1127,6 +1127,7 @@ fn real_broker_reads_authoritative_configuration_while_update_waits() {
         panic!("update not accepted")
     };
     let mut pipeline = Pipeline::new(Ok(root.clone()));
+    pipeline.enable_effect_authority("example.replacement-pairing".into());
     let tick = |pipeline: &mut Pipeline, broker: &mut Broker| {
         pipeline
             .tick(|command| Ok(broker.dispatch("amaterasu.host-configuration", command)))
@@ -1162,7 +1163,7 @@ fn real_broker_reads_authoritative_configuration_while_update_waits() {
         Response::Request { .. }
     ));
     let Response::Accepted { id: read } = broker.dispatch(
-        "amaterasu.pairing",
+        "example.replacement-pairing",
         submit(json!({"action":"get"}), "concurrent-read"),
     ) else {
         panic!("read not accepted")
@@ -1171,7 +1172,7 @@ fn real_broker_reads_authoritative_configuration_while_update_waits() {
     serve_state(&mut broker);
     tick(&mut pipeline, &mut broker);
     assert!(
-        matches!(broker.dispatch("amaterasu.pairing", Command::TakeResult { request: read }), Response::Result { payload } if payload["ok"] == true && payload["revision"] == 0)
+        matches!(broker.dispatch("example.replacement-pairing", Command::TakeResult { request: read }), Response::Result { payload } if payload["ok"] == true && payload["revision"] == 0)
     );
     assert!(matches!(
         broker.dispatch(
@@ -1180,6 +1181,42 @@ fn real_broker_reads_authoritative_configuration_while_update_waits() {
         ),
         Response::Pending
     ));
+    let request = amaterasu_module_sdk::effect_authority::HostConfigurationTransactionRequest::TransactionStatus {};
+    let payload = serde_json::to_value(request).unwrap();
+    let Response::Accepted { id: status } = broker.dispatch(
+        "example.replacement-pairing",
+        submit(payload, "concurrent-status"),
+    ) else {
+        panic!("transaction status not accepted")
+    };
+    tick(&mut pipeline, &mut broker);
+    serve_state(&mut broker);
+    tick(&mut pipeline, &mut broker);
+    let Response::Result { payload } = broker.dispatch(
+        "example.replacement-pairing",
+        Command::TakeResult { request: status },
+    ) else {
+        panic!("transaction status missing")
+    };
+    let consume = |payload: Value| {
+        let decoded: amaterasu_module_sdk::effect_authority::HostConfigurationTransactionStatus =
+            serde_json::from_value(payload).unwrap();
+        assert!(decoded.valid());
+        assert_eq!(decoded.configuration_revision, 0);
+        assert!(decoded.transaction.is_none());
+    };
+    consume(payload);
+    // The unchanged SDK consumer also accepts an independently implemented provider.
+    let replacement =
+        |request: amaterasu_module_sdk::effect_authority::HostConfigurationTransactionRequest| {
+            match request {
+            amaterasu_module_sdk::effect_authority::HostConfigurationTransactionRequest::TransactionStatus {} => {
+                json!({"ok":true,"configuration_revision":0,"transaction":null})
+            }
+            _ => panic!("unexpected replacement request"),
+        }
+        };
+    consume(replacement(amaterasu_module_sdk::effect_authority::HostConfigurationTransactionRequest::TransactionStatus {}));
     drop(state);
     std::fs::remove_dir_all(root).unwrap();
 }

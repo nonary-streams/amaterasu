@@ -3393,6 +3393,7 @@ fn pairing_mutation_fences_and_waits_for_effect_owner_completion() {
 fn host_configuration_refresh_prevents_reopening_effect_admission() {
     let mut configured = settings();
     configured.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        configuration_owner: None,
         protocol_owner: "nvhttp".into(),
         effect_owner: "input".into(),
         feedback_policies: vec![],
@@ -3438,6 +3439,7 @@ fn host_configuration_refresh_prevents_reopening_effect_admission() {
 fn pairing_effect_service_checks_broker_identity_and_current_certificate() {
     let (mut pipeline, _harness, _) = paired_native_client();
     pipeline.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        configuration_owner: None,
         protocol_owner: "nvhttp".into(),
         effect_owner: "input".into(),
         feedback_policies: vec![],
@@ -3580,6 +3582,7 @@ fn configured_authority_restart_requires_owner_retirement_before_unpair_commit()
     let (_old, mut harness, certificate_id) = paired_native_client();
     let mut configured = settings();
     configured.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        configuration_owner: None,
         protocol_owner: "nvhttp".into(),
         effect_owner: "input".into(),
         feedback_policies: vec![],
@@ -3633,6 +3636,7 @@ fn configured_authority_restart_requires_owner_retirement_before_unpair_commit()
 fn unavailable_configured_authority_cannot_bypass_unpair_fence() {
     let (mut pipeline, mut harness, certificate_id) = paired_native_client();
     pipeline.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        configuration_owner: None,
         protocol_owner: "nvhttp".into(),
         effect_owner: "input".into(),
         feedback_policies: vec![],
@@ -3652,6 +3656,7 @@ fn unavailable_configured_authority_cannot_bypass_unpair_fence() {
 fn request_canceled_after_delivery_cannot_fence_a_trust_mutation() {
     let (mut pipeline, mut harness, certificate_id) = paired_native_client();
     pipeline.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        configuration_owner: None,
         protocol_owner: "nvhttp".into(),
         effect_owner: "input".into(),
         feedback_policies: vec![],
@@ -3752,6 +3757,7 @@ fn real_broker_startup_recovery_blocks_pairing_mutation_until_owner_retires() {
     let mut revision = harness.revision;
     let mut configured = settings();
     configured.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        configuration_owner: None,
         protocol_owner: "nvhttp".into(),
         effect_owner: "input".into(),
         feedback_policies: vec![],
@@ -3835,6 +3841,7 @@ fn real_broker_startup_recovery_blocks_pairing_mutation_until_owner_retires() {
 fn real_broker_cancel_between_delivery_and_check_preserves_open_authority() {
     let (mut pipeline, _harness, certificate_id) = paired_native_client();
     pipeline.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        configuration_owner: None,
         protocol_owner: "nvhttp".into(),
         effect_owner: "input".into(),
         feedback_policies: vec![],
@@ -3952,6 +3959,7 @@ fn real_broker_cancelled_effect_requests_cannot_admit_or_acknowledge_drain() {
 fn trust_mutation_waits_for_stream_lease_retirement_and_owner_drain() {
     let (mut pipeline, mut harness, certificate_id) = paired_native_client();
     pipeline.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        configuration_owner: None,
         protocol_owner: "nvhttp".into(),
         effect_owner: "input".into(),
         feedback_policies: vec![],
@@ -4189,6 +4197,7 @@ fn policy_for_feedback(
     required_permission: crate::protocol::FeedbackPermission,
 ) -> crate::protocol::EffectAuthoritySettings {
     crate::protocol::EffectAuthoritySettings {
+        configuration_owner: None,
         protocol_owner: "nvhttp".into(),
         effect_owner: "input".into(),
         feedback_policies: schemas
@@ -4864,6 +4873,7 @@ fn delivered_then_cancelled_source_fence_and_completion_do_not_mutate_authority(
 fn real_broker_rejects_recovery_while_host_configuration_is_unavailable() {
     let mut configured = settings();
     configured.effect_authority = Some(crate::protocol::EffectAuthoritySettings {
+        configuration_owner: None,
         protocol_owner: "nvhttp".into(),
         effect_owner: "input".into(),
         feedback_policies: vec![],
@@ -5096,3 +5106,183 @@ fn real_broker_view_only_client_cannot_expand_beyond_explicit_feedback_grant() {
 }
 
 mod stream_consumer_broker;
+
+#[test]
+fn configuration_hold_waits_for_stream_retirement_and_cannot_be_self_released() {
+    let (mut pipeline, _, _, epoch, source, scope) = authorized_feedback_for_test();
+    pipeline
+        .effect_authority
+        .as_mut()
+        .unwrap()
+        .configuration_owner = Some("configuration".into());
+    let (trust_revision, configuration_revision) = pipeline.identity.revisions().unwrap().unwrap();
+    let admitted = pipeline
+        .apply_effect_request(
+            "input",
+            "input",
+            json!({
+                "action":"admit_stream_lease","epoch":epoch,"source":source,"scope":scope,
+                "operation_id":"lease-for-config","sequence":1
+            }),
+            now(),
+        )
+        .unwrap();
+    let change = json!({"version":1,"authority_epoch":epoch,"operation_id":"change-1",
+        "expected_configuration_revision":configuration_revision,"expected_trust_revision":trust_revision});
+    let begin = json!({"action":"begin_configuration_change","change":change});
+    assert_eq!(
+        pipeline.apply_effect_request("input", "input", begin.clone(), now()),
+        Err("forbidden")
+    );
+    assert_eq!(
+        pipeline.apply_effect_request("configuration", "other", begin.clone(), now()),
+        Err("forbidden")
+    );
+    let mut stale = begin.clone();
+    stale["change"]["expected_trust_revision"] = json!(trust_revision + 1);
+    assert_eq!(
+        pipeline.apply_effect_request("configuration", "configuration", stale, now()),
+        Err("revision_conflict")
+    );
+    let mut stale_epoch = begin.clone();
+    stale_epoch["change"]["authority_epoch"] = json!("f".repeat(32));
+    assert_eq!(
+        pipeline.apply_effect_request("configuration", "configuration", stale_epoch, now()),
+        Err("stale_epoch")
+    );
+    let first = pipeline
+        .apply_effect_request("configuration", "configuration", begin.clone(), now())
+        .unwrap();
+    assert_eq!(first["state"], "pending");
+    assert_eq!(
+        pipeline
+            .apply_effect_request("configuration", "configuration", begin.clone(), now())
+            .unwrap(),
+        first
+    );
+    let mut replay = begin.clone();
+    replay["change"]["operation_id"] = json!("another-operation");
+    assert_eq!(
+        pipeline.apply_effect_request("configuration", "configuration", replay, now()),
+        Err("configuration_change_pending")
+    );
+    assert_eq!(
+        pipeline.apply_effect_request(
+            "input",
+            "input",
+            json!({"action":"recover","epoch":epoch,"owner_epoch":"owner-2"}),
+            now()
+        ),
+        Err("configuration_change_pending")
+    );
+    let retirement = json!({"ok":true,"service":"amaterasu.control-transport/1","stream":7,"provider_epoch":"c".repeat(32),"operation_id":"retire","scope":"whole_control_stream","state":"retired"});
+    pipeline.apply_effect_request("input", "input", json!({"action":"fence_source","epoch":epoch,"source":source,"scope":scope,"operation_id":"config-source"}), now()).unwrap();
+    pipeline.apply_effect_request("input", "input", json!({"action":"complete_stream_lease","epoch":epoch,"operation_id":"lease-for-config","ticket":admitted["ticket"],"retirement":retirement}), now()).unwrap();
+    assert_eq!(
+        pipeline
+            .apply_effect_request("configuration", "configuration", begin.clone(), now())
+            .unwrap()["state"],
+        "pending"
+    );
+    pipeline.apply_effect_request("input", "input", json!({"action":"acknowledge","epoch":epoch,"operation_id":"lease-for-config","ticket":admitted["ticket"]}), now()).unwrap();
+    assert_eq!(
+        pipeline.apply_effect_request(
+            "input",
+            "input",
+            json!({"action":"drain","epoch":epoch,"fence_generation":first["fence_generation"]}),
+            now()
+        ),
+        Err("source_retirement_pending")
+    );
+    pipeline.apply_effect_request("input", "input", json!({"action":"complete_source_retirement","epoch":epoch,"source":source,"scope":scope,"operation_id":"config-source","retirement":retirement}), now()).unwrap();
+    pipeline
+        .apply_effect_request(
+            "input",
+            "input",
+            json!({"action":"drain","epoch":epoch,"fence_generation":first["fence_generation"]}),
+            now(),
+        )
+        .unwrap();
+    assert_eq!(
+        pipeline
+            .apply_effect_request("configuration", "configuration", begin, now())
+            .unwrap()["state"],
+        "drained"
+    );
+    let finish = json!({"action":"finish_configuration_change","change":change,"result":{"outcome":"aborted"}});
+    assert_eq!(
+        pipeline
+            .apply_effect_request("configuration", "configuration", finish, now())
+            .unwrap()["state"],
+        "pending"
+    );
+    assert_eq!(
+        pipeline.apply_effect_request(
+            "input",
+            "input",
+            json!({"action":"recover","epoch":epoch,"owner_epoch":"owner-2"}),
+            now()
+        ),
+        Err("configuration_change_pending")
+    );
+}
+
+mod configuration_transaction_tests;
+
+#[test]
+fn cancelled_finish_does_not_release_verified_hold() {
+    let (mut pipeline, _, _, epoch, source, scope) = authorized_feedback_for_test();
+    pipeline
+        .effect_authority
+        .as_mut()
+        .unwrap()
+        .configuration_owner = Some("configuration".into());
+    let (trust_revision, configuration_revision) = pipeline.identity.revisions().unwrap().unwrap();
+    let change = ConfigurationChange {
+        version: 1,
+        authority_epoch: epoch.clone(),
+        operation_id: "cancel-finish".into(),
+        expected_configuration_revision: configuration_revision,
+        expected_trust_revision: trust_revision,
+    };
+    let gate = pipeline.effect_gate.as_mut().unwrap();
+    gate.fence_for_configuration_change().unwrap();
+    let source = serde_json::from_value(source).unwrap();
+    let scope = serde_json::from_value(scope).unwrap();
+    gate.fence_source(&epoch, &source, &scope, "cancel-source")
+        .unwrap();
+    gate.complete_source_retirement(&epoch, &source, &scope, "cancel-source", None)
+        .unwrap();
+    gate.acknowledge_drain(&epoch, gate.fence_generation())
+        .unwrap();
+    pipeline.configuration_hold = Some(ConfigurationHold {
+        owner: "configuration".into(),
+        change: change.clone(),
+    });
+    pipeline.hold_confirmation = Some(HoldConfirmation {
+        request_id: 42,
+        change,
+        outcome: Some(ConfigurationChangeOutcome::Aborted {}),
+        status_request: None,
+        verified_revision: Some(configuration_revision),
+    });
+    pipeline
+        .progress_hold_confirmation(&mut |command| match command {
+            Command::CheckRequest { request: 42 } => {
+                Ok(Response::error("request_ended", "cancelled"))
+            }
+            command => panic!("unexpected command: {command:?}"),
+        })
+        .unwrap();
+    assert!(pipeline.configuration_hold.is_some());
+    assert!(pipeline.hold_confirmation.is_none());
+    assert_eq!(
+        pipeline.apply_effect_request(
+            "input",
+            "input",
+            json!({"action":"recover","epoch":epoch,"owner_epoch":"another-owner"}),
+            now()
+        ),
+        Err("configuration_change_pending")
+    );
+}

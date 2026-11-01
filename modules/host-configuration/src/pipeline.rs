@@ -1,6 +1,10 @@
+mod transaction;
+use transaction::state_mutation_revision;
+
 use crate::path::{effective_as_value, effective_settings};
 use crate::protocol::{Operation, error, unavailable};
-use crate::settings::Document;
+use crate::settings::{ConfigurationTransaction, ConfigurationTransactionState, Document};
+use amaterasu_module_sdk::effect_authority::ConfigurationChange;
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -30,6 +34,15 @@ struct UpdateToSave {
     allow_unready_bootstrap: bool,
 }
 
+struct HoldCompletion {
+    request_id: u64,
+    deadline: Instant,
+    expected_state_revision: u64,
+    document: Document,
+    response: Value,
+    current_authority_epoch: Option<String>,
+}
+
 struct Pending {
     request_id: u64,
     deadline: Instant,
@@ -41,6 +54,38 @@ struct Pending {
 enum Stage {
     Loading(Operation),
     Preflighting(UpdateToSave),
+    SelectingAuthority(UpdateToSave),
+    PreparingHold {
+        update: UpdateToSave,
+        change: ConfigurationChange,
+    },
+    BeginningHold {
+        update: UpdateToSave,
+        change: ConfigurationChange,
+    },
+    ConfirmingHold {
+        response: Value,
+        document: Document,
+        expected_state_revision: u64,
+    },
+    FinishingHold {
+        response: Value,
+        document: Document,
+        expected_state_revision: u64,
+        current_authority_epoch: Option<String>,
+    },
+    ClearingHold {
+        response: Value,
+        expected_state_revision: u64,
+    },
+    ReconcilingHold {
+        document: Document,
+        expected_state_revision: u64,
+    },
+    SelectingReconcile {
+        document: Document,
+        state_revision: u64,
+    },
     Saving {
         expected_state_revision: u64,
         response: Value,
@@ -78,15 +123,29 @@ pub struct Pipeline {
     trusted_root: Result<PathBuf, String>,
     pending: Option<Pending>,
     concurrent_read: Option<Pending>,
+    effect_authority_owner: Option<String>,
+    detached_sequence: u64,
+    transaction_epoch: Option<String>,
 }
 
 impl Pipeline {
     pub fn new(trusted_root: Result<PathBuf, String>) -> Self {
+        let mut nonce = [0_u8; 16];
+        let transaction_epoch = getrandom::fill(&mut nonce)
+            .ok()
+            .map(|()| nonce.iter().map(|byte| format!("{byte:02x}")).collect());
         Self {
             trusted_root,
             pending: None,
             concurrent_read: None,
+            effect_authority_owner: None,
+            detached_sequence: 0,
+            transaction_epoch,
         }
+    }
+
+    pub fn enable_effect_authority(&mut self, owner: String) {
+        self.effect_authority_owner = Some(owner);
     }
 
     pub fn tick(&mut self, mut send: impl FnMut(Command) -> TransportResult) -> ModuleResult<()> {
@@ -126,6 +185,7 @@ impl Pipeline {
             Response::Request {
                 id,
                 caller,
+                initiator,
                 service,
                 payload,
                 remaining_ms,
@@ -144,6 +204,32 @@ impl Pipeline {
                         return complete(send, id, error("invalid_request", failure.to_string()));
                     }
                 };
+                if matches!(operation, Operation::TransactionStatus {})
+                    && ((caller != "amaterasu.management"
+                        && self.effect_authority_owner.as_deref() != Some(caller.as_str()))
+                        || initiator != caller)
+                {
+                    return complete(
+                        send,
+                        id,
+                        error(
+                            "permission_denied",
+                            "transaction status is restricted to pairing",
+                        ),
+                    );
+                }
+                if matches!(operation, Operation::ReconcileTransaction { .. })
+                    && (caller != "amaterasu.management" || initiator != caller)
+                {
+                    return complete(
+                        send,
+                        id,
+                        error(
+                            "permission_denied",
+                            "only management may reconcile configuration transactions",
+                        ),
+                    );
+                }
                 if matches!(operation, Operation::Update { .. }) && caller != "amaterasu.management"
                 {
                     return complete(
@@ -247,6 +333,17 @@ impl Pipeline {
                 }
                 Stage::Preflighting(_) => unavailable(
                     "diagnostics status preflight expired before configuration was saved",
+                ),
+                Stage::SelectingAuthority(_)
+                | Stage::PreparingHold { .. }
+                | Stage::BeginningHold { .. }
+                | Stage::ConfirmingHold { .. }
+                | Stage::FinishingHold { .. }
+                | Stage::ClearingHold { .. }
+                | Stage::ReconcilingHold { .. }
+                | Stage::SelectingReconcile { .. } => error(
+                    "configuration_transaction_unconfirmed",
+                    "configuration transaction requires reconciliation",
                 ),
             };
             return complete(send, pending.request_id, response);
@@ -381,6 +478,21 @@ impl Pipeline {
                         "diagnostics status preflight failed ({code}): {message}"
                     )),
                 ),
+                Stage::SelectingAuthority(_)
+                | Stage::PreparingHold { .. }
+                | Stage::BeginningHold { .. }
+                | Stage::ConfirmingHold { .. }
+                | Stage::FinishingHold { .. }
+                | Stage::ClearingHold { .. }
+                | Stage::ReconcilingHold { .. }
+                | Stage::SelectingReconcile { .. } => complete(
+                    send,
+                    pending.request_id,
+                    error(
+                        "configuration_transaction_unconfirmed",
+                        "configuration transaction requires reconciliation",
+                    ),
+                ),
                 _ => self.finish_child_failure(pending.request_id, code, message, send),
             },
             ChildOutcome::Payload(payload) => {
@@ -435,6 +547,21 @@ impl Pipeline {
                             pending.request_id,
                             unavailable("diagnostics status preflight did not confirm readiness"),
                         ),
+                        Stage::SelectingAuthority(_)
+                        | Stage::PreparingHold { .. }
+                        | Stage::BeginningHold { .. }
+                        | Stage::ConfirmingHold { .. }
+                        | Stage::FinishingHold { .. }
+                        | Stage::ClearingHold { .. }
+                        | Stage::ReconcilingHold { .. }
+                        | Stage::SelectingReconcile { .. } => complete(
+                            send,
+                            pending.request_id,
+                            error(
+                                "configuration_transaction_unconfirmed",
+                                "configuration transaction requires reconciliation",
+                            ),
+                        ),
                         _ => complete(send, pending.request_id, unavailable(message)),
                     };
                 }
@@ -466,7 +593,277 @@ impl Pipeline {
                             unavailable("diagnostics status preflight is not ready"),
                         );
                     }
+                    if self.effect_authority_owner.is_some()
+                        && identity_settings_changed(&update.previous, &update.document)
+                    {
+                        return self.select_authority(update, send);
+                    }
                     return self.save(update, send);
+                }
+                if let Stage::SelectingAuthority(update) = pending.stage {
+                    let Some(epoch) = payload["epoch"].as_str() else {
+                        return complete(
+                            send,
+                            pending.request_id,
+                            unavailable("effect authority omitted its epoch"),
+                        );
+                    };
+                    let Some(trust_revision) = payload["revisions"]["trust"].as_u64() else {
+                        return complete(
+                            send,
+                            pending.request_id,
+                            unavailable("effect authority omitted its trust revision"),
+                        );
+                    };
+                    if payload["revisions"]["configuration"].as_u64()
+                        != Some(update.previous.revision)
+                    {
+                        return complete(
+                            send,
+                            pending.request_id,
+                            error(
+                                "revision_conflict",
+                                "pairing identity has not observed the expected configuration",
+                            ),
+                        );
+                    }
+                    let change = ConfigurationChange {
+                        version: 1,
+                        authority_epoch: epoch.to_owned(),
+                        operation_id: format!("host-configuration.{}", update.request_id),
+                        expected_configuration_revision: update.previous.revision,
+                        expected_trust_revision: trust_revision,
+                    };
+                    if !change.valid() {
+                        return complete(
+                            send,
+                            pending.request_id,
+                            unavailable("effect authority returned an invalid epoch"),
+                        );
+                    }
+                    return self.prepare_hold(update, change, send);
+                }
+                if let Stage::PreparingHold { mut update, change } = pending.stage {
+                    let expected = update.state_revision.checked_add(1);
+                    if state_mutation_revision(&payload) != expected {
+                        return complete(
+                            send,
+                            pending.request_id,
+                            error(
+                                "configuration_transaction_unconfirmed",
+                                "transaction marker write was not confirmed",
+                            ),
+                        );
+                    }
+                    update.state_revision = expected.unwrap();
+                    let marker = ConfigurationTransaction {
+                        change: change.clone(),
+                        state: ConfigurationTransactionState::Prepared {},
+                        expected_state_revision: update.state_revision,
+                        settled: false,
+                    };
+                    update.previous.transaction = Some(marker.clone());
+                    update.document.transaction = Some(ConfigurationTransaction {
+                        state: ConfigurationTransactionState::Committed {
+                            configuration_revision: update.document.revision,
+                        },
+                        ..marker
+                    });
+                    return self.begin_hold(update, change, send);
+                }
+                if let Stage::BeginningHold { update, change } = pending.stage {
+                    if payload["epoch"].as_str() != Some(change.authority_epoch.as_str())
+                        || payload["operation_id"].as_str() != Some(change.operation_id.as_str())
+                    {
+                        return complete(
+                            send,
+                            pending.request_id,
+                            error(
+                                "configuration_transaction_unconfirmed",
+                                "effect authority returned a mismatched hold",
+                            ),
+                        );
+                    }
+                    if payload["state"] == "pending" {
+                        return self.begin_hold(update, change, send);
+                    }
+                    if payload["state"] != "drained" {
+                        return complete(
+                            send,
+                            pending.request_id,
+                            error(
+                                "configuration_transaction_unconfirmed",
+                                "effect authority did not confirm retirement",
+                            ),
+                        );
+                    }
+                    if !matches!(
+                        send(Command::CheckRequest {
+                            request: update.request_id
+                        })?,
+                        Response::Ok
+                    ) {
+                        return complete(
+                            send,
+                            update.request_id,
+                            error(
+                                "configuration_transaction_unconfirmed",
+                                "request ended while the transaction was held",
+                            ),
+                        );
+                    }
+                    return self.save(update, send);
+                }
+                if let Stage::ConfirmingHold {
+                    response,
+                    document,
+                    expected_state_revision,
+                } = pending.stage
+                {
+                    if state_mutation_revision(&payload) != expected_state_revision.checked_add(1) {
+                        return complete(
+                            send,
+                            pending.request_id,
+                            error(
+                                "configuration_transaction_unconfirmed",
+                                "commit fence was not confirmed",
+                            ),
+                        );
+                    }
+                    return self.finish_hold(
+                        HoldCompletion {
+                            request_id: pending.request_id,
+                            deadline: pending.deadline,
+                            expected_state_revision: expected_state_revision + 1,
+                            document,
+                            response,
+                            current_authority_epoch: None,
+                        },
+                        send,
+                    );
+                }
+                if let Stage::FinishingHold {
+                    response,
+                    document,
+                    expected_state_revision,
+                    current_authority_epoch,
+                } = pending.stage
+                {
+                    let Some(transaction) = document.transaction.as_ref() else {
+                        return complete(
+                            send,
+                            pending.request_id,
+                            error(
+                                "configuration_transaction_unconfirmed",
+                                "transaction marker is missing",
+                            ),
+                        );
+                    };
+                    if payload["state"] == "pending"
+                        && payload["operation_id"].as_str()
+                            == Some(transaction.change.operation_id.as_str())
+                    {
+                        return self.finish_hold(
+                            HoldCompletion {
+                                request_id: pending.request_id,
+                                deadline: pending.deadline,
+                                expected_state_revision,
+                                document,
+                                response,
+                                current_authority_epoch,
+                            },
+                            send,
+                        );
+                    }
+                    if payload["state"] != "released"
+                        || payload["operation_id"].as_str()
+                            != Some(transaction.change.operation_id.as_str())
+                    {
+                        return complete(
+                            send,
+                            pending.request_id,
+                            error(
+                                "configuration_transaction_unconfirmed",
+                                "pairing did not confirm the committed identity",
+                            ),
+                        );
+                    }
+                    return self.clear_hold(
+                        pending.request_id,
+                        pending.deadline,
+                        expected_state_revision,
+                        document,
+                        response,
+                        send,
+                    );
+                }
+                if let Stage::ClearingHold {
+                    response,
+                    expected_state_revision,
+                } = pending.stage
+                {
+                    if state_mutation_revision(&payload) != expected_state_revision.checked_add(1) {
+                        return complete(
+                            send,
+                            pending.request_id,
+                            error(
+                                "configuration_transaction_unconfirmed",
+                                "transaction marker removal was not confirmed",
+                            ),
+                        );
+                    }
+                    return complete(send, pending.request_id, response);
+                }
+                if let Stage::ReconcilingHold {
+                    document,
+                    expected_state_revision,
+                } = pending.stage
+                {
+                    if state_mutation_revision(&payload) != expected_state_revision.checked_add(1) {
+                        return complete(
+                            send,
+                            pending.request_id,
+                            error(
+                                "configuration_transaction_unconfirmed",
+                                "reconciliation CAS was not confirmed",
+                            ),
+                        );
+                    }
+                    return self.select_reconcile_authority(
+                        pending.request_id,
+                        pending.deadline,
+                        expected_state_revision + 1,
+                        document,
+                        send,
+                    );
+                }
+                if let Stage::SelectingReconcile {
+                    document,
+                    state_revision,
+                } = pending.stage
+                {
+                    let Some(epoch) = payload["epoch"].as_str() else {
+                        return complete(
+                            send,
+                            pending.request_id,
+                            error(
+                                "configuration_transaction_unconfirmed",
+                                "current authority epoch is unavailable",
+                            ),
+                        );
+                    };
+                    let response = json!({"ok":true,"state":"reconciled","configuration_revision":document.revision,"logging":"unconfirmed"});
+                    return self.finish_hold(
+                        HoldCompletion {
+                            request_id: pending.request_id,
+                            deadline: pending.deadline,
+                            expected_state_revision: state_revision,
+                            document,
+                            response,
+                            current_authority_epoch: Some(epoch.to_owned()),
+                        },
+                        send,
+                    );
                 }
                 if let Stage::Applying {
                     response,
@@ -484,6 +881,16 @@ impl Pipeline {
                             "applied_revision":saved_revision,
                             "status":"applied"
                         });
+                        if previous.transaction.is_some() {
+                            return self.confirm_hold(
+                                pending.request_id,
+                                pending.deadline,
+                                saved_state_revision,
+                                previous,
+                                response,
+                                send,
+                            );
+                        }
                         return complete(send, pending.request_id, response);
                     }
                     let _ = (previous, saved_state_revision);
@@ -610,6 +1017,14 @@ impl Pipeline {
                     }
                     Stage::Applying { .. } => unreachable!(),
                     Stage::Preflighting(_) => unreachable!(),
+                    Stage::SelectingAuthority(_)
+                    | Stage::PreparingHold { .. }
+                    | Stage::BeginningHold { .. }
+                    | Stage::ConfirmingHold { .. }
+                    | Stage::FinishingHold { .. }
+                    | Stage::ClearingHold { .. }
+                    | Stage::ReconcilingHold { .. }
+                    | Stage::SelectingReconcile { .. } => unreachable!(),
                     Stage::Compensating { .. } => unreachable!(),
                 }
             }
@@ -638,6 +1053,25 @@ impl Pipeline {
             }
         };
         match operation {
+            Operation::TransactionStatus {} => {
+                let status =
+                    amaterasu_module_sdk::effect_authority::HostConfigurationTransactionStatus {
+                        ok: true,
+                        configuration_revision: document.revision,
+                        transaction: document.transaction,
+                    };
+                let payload = serde_json::to_value(status)
+                    .map_err(|_| "transaction status serialization failed")?;
+                complete(send, request_id, payload)
+            }
+            Operation::ReconcileTransaction { change } => self.reconcile_transaction(
+                request_id,
+                deadline,
+                state_revision,
+                document,
+                change,
+                send,
+            ),
             Operation::Readiness {} => match build_read_response(&document, root) {
                 Ok(_) => complete(
                     send,
@@ -660,6 +1094,16 @@ impl Pipeline {
             Operation::Update {
                 expected_revision, ..
             } => {
+                if document.transaction.is_some() {
+                    return complete(
+                        send,
+                        request_id,
+                        error(
+                            "configuration_change_pending",
+                            "a configuration transaction requires reconciliation",
+                        ),
+                    );
+                }
                 if document.revision != expected_revision {
                     return complete(send, request_id, revision_conflict(document.revision));
                 }
@@ -868,6 +1312,12 @@ impl Pipeline {
         previous.revision = saved_revision
             .checked_add(1)
             .ok_or("configuration revision exhausted during rollback")?;
+        if let Some(transaction) = &mut previous.transaction {
+            transaction.state = ConfigurationTransactionState::Aborted {
+                configuration_revision: previous.revision,
+            };
+            transaction.settled = false;
+        }
         let restored_configuration = self
             .trusted_root
             .as_ref()
@@ -1027,6 +1477,14 @@ impl Pipeline {
     }
 }
 
+fn identity_settings_changed(previous: &Document, next: &Document) -> bool {
+    previous.file_state != next.file_state
+        || previous.vibeshine_file_state != next.vibeshine_file_state
+        || previous.credentials_file != next.credentials_file
+        || previous.pkey != next.pkey
+        || previous.cert != next.cert
+}
+
 fn submit_state(
     send: &mut impl FnMut(Command) -> TransportResult,
     parent: u64,
@@ -1156,6 +1614,19 @@ fn read_document(payload: &Value) -> Result<Document, Value> {
             document.validate().map_err(|message| {
                 unavailable(format!("persisted configuration is invalid: {message}"))
             })?;
+            if let Some(transaction) = &document.transaction {
+                let Some(state_revision) = payload.get("revision").and_then(Value::as_u64) else {
+                    return Err(unavailable("state lookup omitted the transaction revision"));
+                };
+                if state_revision < transaction.expected_state_revision
+                    || (transaction.settled
+                        && state_revision == transaction.expected_state_revision)
+                {
+                    return Err(unavailable(
+                        "configuration transaction revision is inconsistent",
+                    ));
+                }
+            }
             if !document_fits(&document) {
                 return Err(unavailable(
                     "persisted configuration exceeds its size limit",

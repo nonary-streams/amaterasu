@@ -25,6 +25,30 @@ On startup with the optional source join selected, NVHTTP obtains the pairing au
 
 Production NVHTTP and built-in pairing source-binding gates remain closed. The selected stream owner still needs to produce the validated source/device/slot/transport/negotiated scope, connect its final-send and retirement path, and pass combined real-provider race and restart tests. Host-configuration trust changes also require the separate transaction fence.
 
+## Host-configuration transaction holds
+
+When trusted startup composition selects the direct `configuration_owner` and
+enables the corresponding host-configuration authority, a v1 configuration
+change first persists its caller-bound transaction marker and begins the
+pairing hold. The owner must fence every scoped source captured by that global
+fence, including every source sharing a control transport. It must complete and
+acknowledge each lease, complete each source retirement with the same verified
+whole-stream receipt, and finally acknowledge the current global fence
+generation. The configuration hold remains pending until all captured sources
+are retired and the selected owner acknowledges the drain. A source without an
+admitted lease still needs its source-retirement completion; an empty ledger
+still needs the selected owner's drain acknowledgement.
+
+The hold remains fenced through State commit and validated identity reload, or
+until reconciliation has advanced the same State namespace revision to prove
+an abort. Pairing restart checks the host-configuration marker before reopening
+admission. If the owner recovers an epoch while a marker is pending, pairing
+keeps the new epoch fenced and uses reconciliation to settle the original
+operation. Host configuration exposes bounded direct status reads while its
+update is pending, so this verification does not wait behind the held update.
+This barrier covers the selected feedback leases and source retirements; it
+does not prove retirement of arbitrary protocol effects.
+
 ## Generic protocol effects
 
 The source tombstone currently covers feedback stream leases only. Its `StreamScope` describes client-bound controller feedback, and pairing still denies the old unscoped `admit` operation with `scope_required`. A protocol journal must not treat this receipt alone as evidence that arbitrary custom protocol effects have retired. In particular, `protocol_authority::EffectOperation::admit` currently sends that denied unscoped operation. Reusing this authority for those effects requires an additive purpose-specific scope, a trusted mapping from the exact effect to its source and issuer incarnation, and selected per-capability client policy. The runtime-owned primitive must serialize that authority and its durable exact-effect fence with the actual broker `CallApi` admission, then retain and drain every tracked provider effect before journal compaction. Pairing's asynchronous source-fence request followed by a separate `CallApi` is not that primitive. Pairing's volatile source tombstones also do not replace the protocol journal's durable fence after restart. No generic protocol ingress is enabled by these feedback operations.

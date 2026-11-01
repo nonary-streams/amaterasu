@@ -20,6 +20,9 @@ pub struct Settings {
 pub struct EffectAuthoritySettings {
     pub protocol_owner: String,
     pub effect_owner: String,
+    /// Trusted startup composition selects the configuration owner explicitly.
+    #[serde(default)]
+    pub configuration_owner: Option<String>,
     #[serde(default)]
     pub feedback_policies: Vec<FeedbackPolicy>,
 }
@@ -35,6 +38,11 @@ impl Settings {
                 || !identifier(&settings.effect_owner, 128)
                 || !self.transport_principals.contains(&settings.protocol_owner)
                 || settings.protocol_owner == settings.effect_owner
+                || settings.configuration_owner.as_ref().is_some_and(|owner| {
+                    !identifier(owner, 128)
+                        || owner == &settings.protocol_owner
+                        || owner == &settings.effect_owner
+                })
                 || settings.feedback_policies.len() > 32
                 || settings
                     .feedback_policies

@@ -31,6 +31,8 @@ subtle = "2.6"
 amaterasu-contracts.workspace = true
 amaterasu-runtime = { path = "../../crates/runtime" }
 amaterasu-nvhttp = { path = "../nvhttp", features = ["test-support"] }
+amaterasu-state = { path = "../state", features = ["test-support"] }
+amaterasu-host-configuration = { path = "../host-configuration", features = ["test-support"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

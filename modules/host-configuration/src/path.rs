@@ -14,6 +14,7 @@ pub struct EffectiveSettings {
     pub min_log_level: crate::settings::MinLogLevel,
 }
 
+#[cfg(not(feature = "test-support"))]
 pub fn trusted_root_from_settings(settings: &Value) -> Result<PathBuf, String> {
     let root = settings
         .get("host_state_root")

@@ -46,6 +46,8 @@ pub struct EffectGate {
     lease_admissions: BTreeMap<Source, String>,
     lease_receipts: BTreeMap<Source, StreamRetirement>,
     retired_sources: BTreeMap<Source, SourceRetirement>,
+    configuration_sources: BTreeMap<Source, StreamScope>,
+    fenced_scoped_sources: BTreeMap<Source, StreamScope>,
     highwater: u64,
     fenced: bool,
     fence_generation: u64,
@@ -65,6 +67,8 @@ impl EffectGate {
             lease_admissions: BTreeMap::new(),
             lease_receipts: BTreeMap::new(),
             retired_sources: BTreeMap::new(),
+            configuration_sources: BTreeMap::new(),
+            fenced_scoped_sources: BTreeMap::new(),
             highwater: 0,
             fenced: true,
             fence_generation: 0,
@@ -112,6 +116,8 @@ impl EffectGate {
         self.lease_admissions.clear();
         self.lease_receipts.clear();
         self.retired_sources.clear();
+        self.configuration_sources.clear();
+        self.fenced_scoped_sources.clear();
         self.highwater = 0;
         self.fence_generation = 0;
         self.drain_required = false;
@@ -297,6 +303,15 @@ impl EffectGate {
             } else {
                 Err("source_retirement_conflict")
             };
+        }
+        if self
+            .configuration_sources
+            .iter()
+            .any(|(other, other_scope)| {
+                same_transport(scope, other_scope) && !self.retired_sources.contains_key(other)
+            })
+        {
+            return Err("shared_transport_active");
         }
         if self.sources.iter().any(|(other, bound)| {
             other != source
@@ -561,8 +576,47 @@ impl EffectGate {
             self.drain_required = !self.sources.is_empty() || self.in_flight() != 0;
             self.fence_generation = self.fence_generation.saturating_add(1);
         }
+        for (source, scope) in &self.sources {
+            if let Some(scope) = scope {
+                self.fenced_scoped_sources
+                    .insert(source.clone(), scope.clone());
+            }
+        }
         self.fenced = true;
         self.sources.clear();
+    }
+
+    /// A configuration transaction requires the selected owner's explicit
+    /// acknowledgement even when the local ledger currently has no sources.
+    pub fn fence_for_configuration_change(&mut self) -> Result<(), &'static str> {
+        self.configuration_sources
+            .extend(self.fenced_scoped_sources.clone());
+        for (source, scope) in &self.sources {
+            if let Some(scope) = scope {
+                self.configuration_sources
+                    .insert(source.clone(), scope.clone());
+            }
+        }
+        for admission in self.operations.values() {
+            if let Some(scope) = &admission.scope {
+                self.configuration_sources
+                    .insert(admission.source.clone(), scope.clone());
+            }
+        }
+        let already_fenced = self.fenced;
+        if self.fence_generation == u64::MAX {
+            self.fence();
+            self.drain_required = true;
+            return Err("fence_exhausted");
+        }
+        self.fence();
+        if already_fenced {
+            self.fence_generation += 1;
+        }
+        if self.owner_epoch.is_some() {
+            self.drain_required = true;
+        }
+        Ok(())
     }
     pub fn fence_generation(&self) -> u64 {
         self.fence_generation
@@ -591,6 +645,9 @@ impl EffectGate {
         if self.in_flight() != 0 {
             return Err("effects_in_flight");
         }
+        if !self.configuration_sources_retired() {
+            return Err("source_retirement_pending");
+        }
         self.drain_required = false;
         Ok(())
     }
@@ -606,12 +663,150 @@ impl EffectGate {
                 .retired_sources
                 .values()
                 .all(|retirement| retirement.complete)
+            && self.configuration_sources_retired()
+    }
+
+    fn configuration_sources_retired(&self) -> bool {
+        self.configuration_sources.iter().all(|(source, scope)| {
+            self.retired_sources
+                .get(source)
+                .is_some_and(|retirement| retirement.complete && &retirement.scope == scope)
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configuration_hold_requires_fresh_owner_ack_even_without_sources() {
+        let mut gate = EffectGate::new().unwrap();
+        gate.recover("owner").unwrap();
+        gate.fence_for_configuration_change().unwrap();
+        assert!(!gate.drained());
+        let epoch = gate.epoch().to_owned();
+        let generation = gate.fence_generation();
+        gate.acknowledge_drain(&epoch, generation).unwrap();
+        assert!(gate.drained());
+        gate.fence_for_configuration_change().unwrap();
+        assert_eq!(gate.fence_generation(), generation + 1);
+        assert_eq!(
+            gate.acknowledge_drain(&epoch, generation),
+            Err("stale_fence")
+        );
+        gate.fence_generation = u64::MAX;
+        assert_eq!(
+            gate.fence_for_configuration_change(),
+            Err("fence_exhausted")
+        );
+        assert!(!gate.drained());
+    }
+
+    #[test]
+    fn configuration_hold_requires_each_shared_transport_source_retired() {
+        let mut gate = EffectGate::new().unwrap();
+        gate.recover("owner").unwrap();
+        let first = source();
+        let mut second = source();
+        second.id = "b".repeat(32);
+        second.device = "other".into();
+        let first_scope = stream_scope();
+        let mut second_scope = first_scope.clone();
+        second_scope.controller_slot += 1;
+        gate.bind_scoped(first.clone(), Some(first_scope.clone()))
+            .unwrap();
+        gate.bind_scoped(second.clone(), Some(second_scope.clone()))
+            .unwrap();
+        let first_ticket = gate
+            .admit_stream_lease(&first, "first", 1, first_scope.clone())
+            .unwrap()
+            .to_owned();
+        let second_ticket = gate
+            .admit_stream_lease(&second, "second", 2, second_scope.clone())
+            .unwrap()
+            .to_owned();
+        let epoch = gate.epoch().to_owned();
+        gate.fence_for_configuration_change().unwrap();
+        gate.fence_source(&epoch, &first, &first_scope, "retire-first")
+            .unwrap();
+        let receipt = StreamRetirement {
+            ok: true,
+            service: first_scope.transport_service.clone(),
+            stream: first_scope.transport_stream,
+            provider_epoch: first_scope.transport_epoch.clone(),
+            operation_id: "retire-transport".into(),
+            scope: "whole_control_stream".into(),
+            state: "retired".into(),
+        };
+        gate.complete_stream_lease(&epoch, "first", &first_ticket, &receipt)
+            .unwrap();
+        gate.acknowledge(&epoch, "first", &first_ticket).unwrap();
+        assert_eq!(
+            gate.complete_source_retirement(
+                &epoch,
+                &first,
+                &first_scope,
+                "retire-first",
+                Some(&receipt)
+            ),
+            Err("shared_transport_active")
+        );
+        gate.fence_source(&epoch, &second, &second_scope, "retire-second")
+            .unwrap();
+        gate.complete_stream_lease(&epoch, "second", &second_ticket, &receipt)
+            .unwrap();
+        gate.acknowledge(&epoch, "second", &second_ticket).unwrap();
+        gate.complete_source_retirement(
+            &epoch,
+            &first,
+            &first_scope,
+            "retire-first",
+            Some(&receipt),
+        )
+        .unwrap();
+        assert_eq!(
+            gate.acknowledge_drain(&epoch, gate.fence_generation()),
+            Err("source_retirement_pending")
+        );
+        gate.complete_source_retirement(
+            &epoch,
+            &second,
+            &second_scope,
+            "retire-second",
+            Some(&receipt),
+        )
+        .unwrap();
+        gate.acknowledge_drain(&epoch, gate.fence_generation())
+            .unwrap();
+        assert!(gate.drained());
+    }
+
+    #[test]
+    fn configuration_hold_retains_scoped_sources_from_an_earlier_global_fence() {
+        let mut gate = EffectGate::new().unwrap();
+        gate.recover("owner").unwrap();
+        let source = source();
+        let scope = stream_scope();
+        gate.bind_scoped(source.clone(), Some(scope.clone()))
+            .unwrap();
+        let epoch = gate.epoch().to_owned();
+        gate.fence();
+        gate.acknowledge_drain(&epoch, gate.fence_generation())
+            .unwrap();
+        gate.fence_for_configuration_change().unwrap();
+        assert_eq!(
+            gate.acknowledge_drain(&epoch, gate.fence_generation()),
+            Err("source_retirement_pending")
+        );
+        gate.fence_source(&epoch, &source, &scope, "retire-after-global-fence")
+            .unwrap();
+        gate.complete_source_retirement(&epoch, &source, &scope, "retire-after-global-fence", None)
+            .unwrap();
+        gate.acknowledge_drain(&epoch, gate.fence_generation())
+            .unwrap();
+        assert!(gate.drained());
+    }
     fn source() -> Source {
         Source {
             version: 1,
