@@ -2874,7 +2874,24 @@ fn selected_library_open_verifies_tagged_policy_before_preparing_stream() {
         assert_eq!(verify["policy_identity"], json!(identity));
         assert!(verify.get("catalog_revision").is_none());
         assert_eq!(!controller.records.is_empty(), allow);
-        if !allow {
+        if allow {
+            let record = controller.records.values().next().unwrap();
+            assert_eq!(record.display_lease_ready_until, Some(5_000));
+            assert_eq!(record.display_prepare_timeout_ms, None);
+            controller.advance_job(&runtime, 4);
+            let prepare = endpoint
+                .commands
+                .iter()
+                .find_map(|command| match command {
+                    Command::Request {
+                        service, payload, ..
+                    } if service == "amaterasu.stream-session/1" => Some(payload),
+                    _ => None,
+                })
+                .expect("selected stream prepare");
+            assert!(prepare.get("display_prepare_timeout_ms").is_none());
+            assert!(prepare.get("display_request").is_none());
+        } else {
             assert!(controller.job.is_none());
         }
     }
