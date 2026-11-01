@@ -35,10 +35,14 @@ struct RequestRecord {
 }
 
 impl RequestRecord {
+    fn state_read_only(&self) -> bool {
+        matches!(
+            self.options.payload.get("action").and_then(Value::as_str),
+            Some("get" | "snapshot" | "collection_get" | "collection_page")
+        )
+    }
     fn uncertain_state_mutation(&self) -> bool {
-        self.delivered
-            && self.options.service == "amaterasu.state/1"
-            && self.options.payload.get("action").and_then(Value::as_str) != Some("get")
+        self.delivered && self.options.service == "amaterasu.state/1" && !self.state_read_only()
     }
     fn finish(&mut self, result: Response, now: Instant) {
         self.result = Some(result);
@@ -63,6 +67,15 @@ pub(super) struct RequestRouter {
 }
 
 impl RequestRouter {
+    /// Host retirement closes the whole provider, including cleanup aliases.
+    /// Never leave queued work deliverable after the host starts joining it.
+    pub fn cancel_undelivered_to_provider(&mut self, provider: &str, now: Instant) {
+        for request in self.requests.values_mut() {
+            if request.provider == provider && !request.delivered && request.result.is_none() {
+                request.finish(Response::error("cancelled", "provider is retiring"), now);
+            }
+        }
+    }
     pub fn retained_state_value_contains(
         &self,
         caller: &str,
@@ -115,8 +128,7 @@ impl RequestRouter {
                         other.caller == authority
                             && other.options.service == "amaterasu.state/1"
                             && other.result.is_none()
-                            && other.options.payload.get("action").and_then(Value::as_str)
-                                != Some("get")
+                            && !other.state_read_only()
                     })
                 {
                     return None;
@@ -401,11 +413,38 @@ impl RequestRouter {
         .then(|| payload.get("revision").and_then(Value::as_u64))
         .flatten()
         .map(|revision| (request.caller.clone(), revision));
-        if request.uncertain_state_mutation() && state_revision.is_none() {
+        let definitive_conflict = payload.get("ok").and_then(Value::as_bool) == Some(false)
+            && payload.pointer("/error/code").and_then(Value::as_str) == Some("revision_conflict")
+            && payload
+                .pointer("/error/current_revision")
+                .and_then(Value::as_u64)
+                .is_some();
+        let conflict_revision = (definitive_conflict
+            && request.options.service == "amaterasu.state/1"
+            && matches!(
+                request
+                    .options
+                    .payload
+                    .get("action")
+                    .and_then(Value::as_str),
+                Some("set" | "delete")
+            ))
+        .then(|| {
+            payload
+                .pointer("/error/current_revision")
+                .and_then(Value::as_u64)
+        })
+        .flatten()
+        .map(|revision| (request.caller.clone(), revision));
+        if request.uncertain_state_mutation() && state_revision.is_none() && !definitive_conflict {
             self.uncertain_state_writers.insert(request.caller.clone());
         }
         request.finish(Response::Result { payload }, now);
         if let Some((caller, revision)) = state_revision {
+            let observed = self.state_revisions.entry(caller).or_default();
+            *observed = (*observed).max(revision);
+        }
+        if let Some((caller, revision)) = conflict_revision {
             let observed = self.state_revisions.entry(caller).or_default();
             *observed = (*observed).max(revision);
         }
@@ -584,4 +623,103 @@ fn validate_options(options: &RequestOptions) -> Result<(), Response> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod state_freshness_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn definitive_conflict_advances_observed_revision_without_poisoning_fresh_reads() {
+        let now = Instant::now();
+        let mut router = RequestRouter::default();
+        let provider = Grants {
+            provide: ["amaterasu.state/1".into()].into(),
+            ..Grants::default()
+        };
+        let caller = Grants {
+            call: ["amaterasu.state/1".into()].into(),
+            ..Grants::default()
+        };
+        assert!(matches!(
+            router.register_service("state", &provider, "amaterasu.state/1".into()),
+            Response::Ok
+        ));
+        let submit = |router: &mut RequestRouter, operation: &str, payload: Value| {
+            let Response::Accepted { id } = router.submit(
+                "authority",
+                &caller,
+                RequestOptions {
+                    service: "amaterasu.state/1".into(),
+                    payload,
+                    timeout_ms: 1000,
+                    operation_id: operation.into(),
+                    parent: None,
+                    response_schema: None,
+                },
+                now,
+            ) else {
+                panic!()
+            };
+            assert!(matches!(
+                router.poll("state", now),
+                Response::Request { .. }
+            ));
+            id
+        };
+        let old = submit(&mut router, "read.old", json!({"action":"get","key":"key"}));
+        assert!(matches!(
+            router.complete(
+                "state",
+                old,
+                json!({"ok":true,"found":true,"revision":1,"value":{}}),
+                now
+            ),
+            Response::Ok
+        ));
+        assert!(
+            router
+                .selected_state_read("authority", "state", old)
+                .is_some()
+        );
+        let conflict = submit(
+            &mut router,
+            "write.conflict",
+            json!({"action":"set","key":"key","value":{},"expected_revision":0}),
+        );
+        assert!(matches!(
+            router.complete(
+                "state",
+                conflict,
+                json!({"ok":false,"error":{"code":"revision_conflict","current_revision":2}}),
+                now
+            ),
+            Response::Ok
+        ));
+        assert!(
+            router
+                .selected_state_read("authority", "state", old)
+                .is_none()
+        );
+        let fresh = submit(
+            &mut router,
+            "read.fresh",
+            json!({"action":"get","key":"key"}),
+        );
+        assert!(matches!(
+            router.complete(
+                "state",
+                fresh,
+                json!({"ok":true,"found":true,"revision":2,"value":{}}),
+                now
+            ),
+            Response::Ok
+        ));
+        assert!(
+            router
+                .selected_state_read("authority", "state", fresh)
+                .is_some()
+        );
+    }
 }

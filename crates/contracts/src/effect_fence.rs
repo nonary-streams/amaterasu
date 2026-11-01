@@ -220,6 +220,11 @@ pub enum EffectFenceCommand {
     SelectedMethod {
         method: ProtectedMethod,
     },
+    /// Authority-only discovery of an explicitly configured cleanup approval.
+    /// This does not grant either principal permission to call it.
+    SelectedCleanupMethod {
+        method: ProtectedMethod,
+    },
     /// Bind the authority's provider and full API schema to admission under the
     /// broker lock. Required when recyclable source slots are enabled.
     ArmSelected {
@@ -295,6 +300,19 @@ pub enum EffectFenceCommand {
         provider: String,
         provider_incarnation: ProviderIncarnation,
     },
+    /// Reserved host endpoint: stop admission and cancel undelivered work
+    /// before polling the exact provider's optional retirement capability.
+    HostProviderRetiring {
+        provider: String,
+        provider_incarnation: ProviderIncarnation,
+    },
+    /// Enumerate exact broker-constructed receipts for one joined provider and
+    /// slot. A full response must fit the broker's normal bounded payload.
+    HostProviderSlotReceipts {
+        provider: String,
+        provider_incarnation: ProviderIncarnation,
+        slot: u8,
+    },
     /// Reserved host endpoint: build a local-worker retirement record for an
     /// exact retained effect after the original provider instance has joined.
     HostRetirementReceipt {
@@ -316,6 +334,13 @@ pub enum EffectFenceCommand {
     /// persist the slot incarnation as retired, including on an uncertain reply.
     /// Never treat this as a worker-retirement proof.
     FinishCloseSlot {
+        lease: SourceSlotLease,
+        scope: EffectScope,
+        retired_through: u64,
+    },
+    /// Authority-only readiness before persisting the retired slot floor. This
+    /// does not close the slot or establish that the State write completed.
+    CloseReady {
         lease: SourceSlotLease,
         scope: EffectScope,
         retired_through: u64,

@@ -49,6 +49,18 @@ impl ApiRegistry {
     pub fn owns_service(&self, service: &str) -> bool {
         self.approved.keys().any(|key| key.0 == service)
     }
+    pub fn registered_approval(
+        &self,
+        service: &str,
+        method: &str,
+        major: u32,
+    ) -> Option<&ApiMethodApproval> {
+        let key = (service.to_owned(), method.to_owned(), major);
+        self.registered
+            .contains(&key)
+            .then(|| self.approved.get(&key))
+            .flatten()
+    }
 
     pub fn selected_for<'a>(
         &'a self,
