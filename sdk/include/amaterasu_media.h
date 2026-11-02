@@ -584,6 +584,15 @@ typedef struct {
 /* HDR metadata is tied to a completed capture presentation. Fields: RGB xy,
  * white xy (1/50000), max nits, min 1/10000 nit, MaxCLL and MaxFALL. */
 typedef struct { uint32_t enabled; uint16_t fields[12]; uint32_t reserved; } AmaterasuHdrMetadata;
+/* GPU processor v1.1: output metadata, independent of the capture source.
+ * OK initializes output (enabled=0 is SDR); UNSUPPORTED is unspecified.
+ * This query must not start GPU work. The complete v1.0 prefix is preserved. */
+#define AMATERASU_GPU_PROCESSOR_METADATA_INTERFACE_MINOR 1u
+typedef struct {
+    AmaterasuGpuProcessorApi base;
+    AmaterasuStatus (*hdr_metadata)(void *, uint64_t, AmaterasuHdrMetadata *);
+} AmaterasuGpuProcessorApiV1_1;
+#define AMATERASU_GPU_PROCESSOR_API_V1_1_SIZE ((uint32_t)sizeof(AmaterasuGpuProcessorApiV1_1))
 typedef struct {
     AmaterasuCaptureApiV1_8 base;
     AmaterasuStatus (*hdr_metadata)(void *, uint64_t, AmaterasuHdrMetadata *);

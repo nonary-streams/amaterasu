@@ -1,0 +1,159 @@
+//! Synchronous GPU processor consumer, shared by built-in and external plugins.
+use crate::abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
+use amaterasu_media::{DmaBufFrameLease, DmaBufLeaseSink, GpuProcessorApi, MEDIA_BUSY};
+use std::{
+    ffi::c_void,
+    panic::{AssertUnwindSafe, catch_unwind},
+};
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ProcessingOutcome {
+    Accepted,
+    Busy,
+    Failed(Status),
+    ProtocolViolation,
+}
+
+/// A synchronous reference whose release necessarily occurs before the caller
+/// can drop the native binding. This guard intentionally cannot escape a pump.
+pub struct ScopedGpuFrame<'a> {
+    lease: &'a DmaBufFrameLease,
+}
+
+impl<'a> ScopedGpuFrame<'a> {
+    /// # Safety
+    /// The provider binding and borrowed owner must outlive this guard.
+    pub unsafe fn retain(lease: &'a DmaBufFrameLease) -> Result<Self, Status> {
+        lease.validate()?;
+        // SAFETY: validation checked the callback; caller retains its binding.
+        let status = unsafe { lease.retain.unwrap()(lease.context) };
+        if status == STATUS_OK {
+            Ok(Self { lease })
+        } else {
+            Err(status)
+        }
+    }
+
+    pub fn descriptor(&self) -> &DmaBufFrameLease {
+        self.lease
+    }
+}
+
+impl Drop for ScopedGpuFrame<'_> {
+    fn drop(&mut self) {
+        // SAFETY: one successful retain is released while its binding is live;
+        // no asynchronous GPU operation is owned by this synchronous guard.
+        unsafe { self.lease.release.unwrap()(self.lease.context, -1) };
+    }
+}
+
+struct Delivery<'a, F> {
+    submit: &'a mut F,
+    sequence: u64,
+    timestamp_us: u64,
+    freshness: u32,
+    count: usize,
+    result: Status,
+    invalid: bool,
+}
+
+unsafe extern "C" fn deliver<F>(
+    context: *mut c_void,
+    lease: *const DmaBufFrameLease,
+    freshness: u32,
+) -> Status
+where
+    F: FnMut(&DmaBufFrameLease) -> Status,
+{
+    if context.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: dispatch owns this stack context for the entire synchronous call.
+    let delivery = unsafe { &mut *context.cast::<Delivery<'_, F>>() };
+    delivery.count += 1;
+    if delivery.count != 1 || lease.is_null() {
+        delivery.invalid = true;
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: the trusted provider keeps the descriptor live during its callback.
+    let lease = unsafe { &*lease };
+    if lease.validate().is_err()
+        || lease.frame.sequence != delivery.sequence
+        || lease.frame.timestamp_us != delivery.timestamp_us
+        || freshness != delivery.freshness
+    {
+        delivery.invalid = true;
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: all provider bindings outlive this dispatch. Retention is local
+    // and paired by Drop before returning to the provider.
+    let retained = match unsafe { ScopedGpuFrame::retain(lease) } {
+        Ok(retained) => retained,
+        Err(status) => {
+            delivery.result = status;
+            return status;
+        }
+    };
+    // External consumer code must not unwind through this extern-C callback.
+    delivery.result = catch_unwind(AssertUnwindSafe(|| {
+        (delivery.submit)(retained.descriptor())
+    }))
+    .unwrap_or(crate::abi::STATUS_INTERNAL_ERROR);
+    delivery.result
+}
+
+/// Processes one GPU frame, allowing only one synchronous output with unchanged
+/// capture identity. The downstream encoder retains its own reference before
+/// returning if GPU reads will continue asynchronously.
+///
+/// # Safety
+/// Input ownership callbacks and both native bindings must remain live for this
+/// call. Neither this function nor its submit callback keeps a lease afterward.
+pub unsafe fn process_gpu<F>(
+    api: &GpuProcessorApi,
+    stream: u64,
+    lease: &DmaBufFrameLease,
+    freshness: u32,
+    mut submit: F,
+) -> ProcessingOutcome
+where
+    F: FnMut(&DmaBufFrameLease) -> Status,
+{
+    if lease.validate().is_err()
+        || !matches!(
+            freshness,
+            amaterasu_media::CAPTURE_FRAME_FRESH | amaterasu_media::CAPTURE_FRAME_CACHED_REUSE
+        )
+    {
+        return ProcessingOutcome::Failed(STATUS_INVALID_ARGUMENT);
+    }
+    let mut delivery = Delivery {
+        submit: &mut submit,
+        sequence: lease.frame.sequence,
+        timestamp_us: lease.frame.timestamp_us,
+        freshness,
+        count: 0,
+        result: STATUS_OK,
+        invalid: false,
+    };
+    let sink = DmaBufLeaseSink {
+        context: (&mut delivery as *mut Delivery<'_, F>).cast(),
+        write: deliver::<F>,
+    };
+    // SAFETY: lease, sink, callbacks and native bindings are live for the call.
+    let status = unsafe { (api.process)(api.base.context, stream, lease, freshness, sink) };
+    if delivery.invalid
+        || delivery.count > 1
+        || (delivery.count == 1 && status != delivery.result)
+        || (delivery.count == 0 && status == STATUS_OK)
+    {
+        return ProcessingOutcome::ProtocolViolation;
+    }
+    if status == STATUS_OK {
+        ProcessingOutcome::Accepted
+    } else if status == MEDIA_BUSY {
+        ProcessingOutcome::Busy
+    } else {
+        ProcessingOutcome::Failed(status)
+    }
+}

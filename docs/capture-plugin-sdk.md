@@ -306,6 +306,12 @@ the capture and encoder lease APIs and cannot be combined with
 Legacy providers retain their existing borrowed-frame route. See
 `docs/media-interfaces.md` for format and clock details.
 
+The [Processing SDK](gpu-processing-sdk.md) supplies host-invoked effect
+factories, provider adapters and the same consumer dispatch used by video.
+Processor v1.1 optionally describes processed HDR metadata independently of the
+capture source. [RTX HDR](../modules/rtx-hdr/README.md) is a separately built
+implementation selected through the existing GPU processor setting.
+
 ## Virtual-screen capture
 
 `amaterasu.capture-vkms/1` is an independently built provider for the existing

@@ -110,3 +110,16 @@ pub struct GpuProcessorApi {
 }
 
 pub const GPU_PROCESSOR_API_V1_0_SIZE: u32 = size_of::<GpuProcessorApi>() as u32;
+
+/// v1.1 describes the processed output's HDR10 metadata, independently of the
+/// capture source. STATUS_OK initializes metadata (enabled=0 means SDR);
+/// UNSUPPORTED means unspecified, never an inferred color space. Query before
+/// processing to reject an incompatible stream; queries must not start GPU work.
+#[repr(C)]
+pub struct GpuProcessorApiV1_1 {
+    pub base: GpuProcessorApi,
+    pub hdr_metadata: unsafe extern "C" fn(*mut c_void, u64, *mut crate::HdrMetadata) -> Status,
+}
+
+pub const GPU_PROCESSOR_METADATA_INTERFACE_MINOR: u32 = 1;
+pub const GPU_PROCESSOR_API_V1_1_SIZE: u32 = size_of::<GpuProcessorApiV1_1>() as u32;

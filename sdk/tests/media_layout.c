@@ -65,6 +65,8 @@ _Static_assert(offsetof(AmaterasuDmaBufFrameLease, retain) == 120, "GPU lease re
 _Static_assert(offsetof(AmaterasuDmaBufFrameLease, release) == 128, "GPU lease release");
 _Static_assert(sizeof(AmaterasuDmaBufLeaseSink) == 16, "GPU lease sink");
 _Static_assert(sizeof(AmaterasuGpuProcessorApi) == 48, "GPU processor layout");
+_Static_assert(sizeof(AmaterasuGpuProcessorApiV1_1) == 56, "GPU processor v1.1 layout");
+_Static_assert(offsetof(AmaterasuGpuProcessorApiV1_1, hdr_metadata) == sizeof(AmaterasuGpuProcessorApi), "GPU processor v1.0 prefix preserved");
 _Static_assert(offsetof(AmaterasuGpuProcessorApi, cancel_dmabuf_leases) == 40, "GPU processor cancel offset");
 _Static_assert(AMATERASU_CAPTURE_API_V1_6_SIZE == 88, "capture v1.6 layout");
 _Static_assert(offsetof(AmaterasuCaptureApiV1_6, read_dmabuf_frame_leased) == 80, "capture lease offset");

@@ -76,6 +76,7 @@ members = [
     "modules/encode",
     "modules/video",
     "modules/frame-limiter",
+    "modules/rtx-hdr",
 ]
 
 [workspace.package]
