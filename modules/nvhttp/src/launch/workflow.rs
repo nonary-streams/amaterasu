@@ -170,6 +170,11 @@ impl Controller {
                         | Phase::VerifyResumeSession
                         | Phase::VerifyResumeApplication
                         | Phase::RefreshResumePolicy
+                        | Phase::AwaitApplication
+                        | Phase::MonitorApplication
+                        | Phase::MonitorRtsp
+                        | Phase::VerifyRtspStopped
+                        | Phase::VerifyApplicationStopped
                 ) && !job.call.release_result(send)
                 {
                     let record = self.records.get_mut(&job.record).expect("workflow record");
@@ -771,8 +776,8 @@ impl Controller {
             }
             Phase::EndLifecycle => {
                 if payload["target"] == json!(record.lifecycle_session_target)
-                    && payload["fenced"] == true
-                    && matches!(payload["status"].as_str(), Some("pending" | "succeeded"))
+                    && (payload["status"] == "succeeded"
+                        || (payload["status"] == "pending" && payload["fenced"] == true))
                 {
                     record.lifecycle_end_fenced = true;
                 } else {

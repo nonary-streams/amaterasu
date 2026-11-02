@@ -341,7 +341,7 @@ fn native_limiter_prepares_through_unchanged_coordinator_and_broker() {
     };
     let admitted = call(
         json!({"operation":"prepare","operation_id":"limiter-session","application_operation_id":"launch-one","application_ref":{"kind":"desktop","properties":if automatic {json!({"frame_generation_mode":"game-provided"})} else {Value::Null}},
-        "client_context":{"client_ref":"client","display_mode":{"width":1920,"height":1080,"refresh_millihz":59940}},
+        "client_context":{"client_ref":"client","display_mode":{"width":1920,"height":1080,"refresh_millihz":59940},"properties":{"stream_audio":null}},
         "requested_video":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false}}),
         1,
         &mut coordinator,
@@ -425,7 +425,7 @@ fn native_limiter_prepares_through_unchanged_coordinator_and_broker() {
             json!({"operation":"prepare_stream","operation_id":operation,
             "target":admitted["target"],"intent":if cycle == 0 { "initial" } else { "resume" },
             "consumer_requirements":["capture"],
-            "client_context":{"client_ref":"client","display_mode":null},
+            "client_context":{"client_ref":"client","display_mode":null,"properties":{"stream_audio":null}},
             "requested_video":{"width":1920,"height":1080,"refresh_millihz":refresh,"hdr":false}}),
             id,
             &mut coordinator,

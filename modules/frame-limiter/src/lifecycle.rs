@@ -327,7 +327,8 @@ impl Bridge {
                     parent: None,
                 }) {
                     Ok(Response::Accepted { id }) => pending.stage = Stage::Wait(id),
-                    Ok(Response::Error { .. }) => {
+                    Ok(Response::Error { code, .. }) => {
+                        eprintln!("frame limiter context request rejected code={code}");
                         completion =
                             Some(json!({"status":"rejected","reason":"context_unavailable"}))
                     }
@@ -428,8 +429,23 @@ impl Bridge {
     ) -> Value {
         #[cfg(not(any(target_os = "linux", windows)))]
         let _ = remaining_ms;
-        let Ok(context) = serde_json::from_value::<ProviderContextResponse>(payload) else {
-            return json!({"status":"rejected","reason":"context_unavailable"});
+        let context = match serde_json::from_value::<ProviderContextResponse>(payload.clone()) {
+            Ok(context) => context,
+            Err(_) => {
+                let reason = payload
+                    .get("reason")
+                    .or_else(|| payload.get("code"))
+                    .and_then(Value::as_str)
+                    .filter(|reason| {
+                        reason.len() <= 64
+                            && reason
+                                .bytes()
+                                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                    })
+                    .unwrap_or("invalid_context_response");
+                eprintln!("frame limiter context response rejected reason={reason}");
+                return json!({"status":"rejected","reason":"context_unavailable"});
+            }
         };
         if context.status != "succeeded"
             || context.context.target != request.target

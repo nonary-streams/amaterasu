@@ -1685,7 +1685,11 @@ impl Coordinator {
                 &mut writer,
                 send,
             );
-            if result.is_err() {
+            if let Err(error) = result {
+                eprintln!(
+                    "lifecycle provider advancement failed provider={provider} phase={:?} reason={error}",
+                    work.phase
+                );
                 // The dispatcher records whether submission crossed its durable
                 // effect boundary. An uncertain call is fenced, never replayed.
                 if matches!(

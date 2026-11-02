@@ -53,6 +53,7 @@ pub(super) struct RequestRouter {
     requests: BTreeMap<u64, RequestRecord>,
     provider_queues: BTreeMap<String, VecDeque<u64>>,
     next_request_id: u64,
+    last_capacity_report: Option<Instant>,
 }
 
 impl RequestRouter {
@@ -203,6 +204,26 @@ impl RequestRouter {
         internal_hook: bool,
     ) -> Response {
         if self.requests.len() >= MAX_RETAINED_REQUESTS {
+            let now = Instant::now();
+            if self
+                .last_capacity_report
+                .is_none_or(|previous| now.duration_since(previous) >= Duration::from_secs(5))
+            {
+                let mut counts = BTreeMap::new();
+                for record in self.requests.values() {
+                    *counts
+                        .entry((
+                            &record.caller,
+                            &record.options.service,
+                            record.result.is_some(),
+                        ))
+                        .or_insert(0_u32) += 1;
+                }
+                eprintln!(
+                    "runtime request capacity reached caller={caller} retained_by_caller_service_completed={counts:?}"
+                );
+                self.last_capacity_report = Some(now);
+            }
             return capacity_exhausted();
         }
 
