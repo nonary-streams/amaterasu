@@ -240,3 +240,55 @@ fn restart_keeps_virtual_display_reference_when_topology_restore_is_unconfirmed(
             || (call.service == "amaterasu.display/1" && call.payload["action"] == "restore")
     }));
 }
+
+#[test]
+fn restart_retires_native_resources_before_reconciling_external_lifecycle() {
+    let mut document = journal_with_owned_session(0xabcd);
+    document["entries"]["43981"]["attempted_resources"] = json!(["session", "video"]);
+    document["entries"]["43981"]["lifecycle_recovery"] = json!({"version":1,
+        "session_target":{"kind":"session","host_epoch":"old","session_id":"session","generation":1},
+        "stream_target":{"kind":"stream","host_epoch":"old","session_id":"session","stream_id":"stream","generation":1},"plan_revision":null});
+    let mut host = Harness::with_restart_state(document, 7);
+    host.broker.lifecycle_success = true;
+    host.broker.seed_session("ss-abcd-session");
+    host.idle();
+    assert_eq!(
+        host.broker.state_value.as_ref().unwrap()["entries"],
+        json!({})
+    );
+    let recovery = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.payload["restart_recovery"] == true)
+        .unwrap();
+    assert_eq!(recovery.payload["operation"], "retire_stream");
+    assert_eq!(
+        recovery.payload["retirement_receipt"]["response"]["code"],
+        "not_found"
+    );
+    assert!(
+        host.broker
+            .session_is_stopped_without_leases("ss-abcd-session")
+    );
+    assert_eq!(host.response(1, prepare())["state"], "prepared");
+}
+
+#[test]
+fn rejected_restart_lifecycle_cleanup_keeps_the_original_journal_and_blocks_relaunch() {
+    let mut document = journal_with_owned_session(0xabcd);
+    document["entries"]["43981"]["attempted_resources"] = json!([]);
+    document["entries"]["43981"]["lifecycle_recovery"] = json!({"version":1,
+        "session_target":{"kind":"session","host_epoch":"old","session_id":"session","generation":1},
+        "stream_target":{"kind":"stream","host_epoch":"old","session_id":"session","stream_id":"stream","generation":1},"plan_revision":null});
+    let original = document.clone();
+    let mut host = Harness::with_restart_state(document, 7);
+    host.broker.lifecycle_success = true;
+    host.broker.lifecycle_reject_operation = Some("retire_stream".into());
+    host.idle();
+    assert_eq!(host.broker.state_value, Some(original));
+    assert_eq!(
+        host.response(1, prepare())["code"],
+        "restart_recovery_unconfirmed"
+    );
+}

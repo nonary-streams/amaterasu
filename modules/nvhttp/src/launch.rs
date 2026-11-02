@@ -1544,6 +1544,18 @@ impl Controller {
         close
     }
 
+    pub fn quiesce(&mut self, now: Instant) -> bool {
+        self.pending_resume = None;
+        for record in self.records.values_mut() {
+            if !record.state.terminal()
+                && !matches!(record.state, State::Stopping | State::CleanupFailed)
+            {
+                record.request_cleanup(Some("host_stopping"), now);
+            }
+        }
+        self.job.is_none() && self.records.values().all(|record| record.state.terminal())
+    }
+
     pub fn shutdown(&mut self, send: &mut Send<'_>) {
         if let Some(job) = self.job.as_mut() {
             job.call.shutdown(send);

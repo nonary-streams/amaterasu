@@ -241,6 +241,13 @@ pub trait ManagedModule: Sized {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self>;
     fn tick(&mut self) -> ModuleResult<()>;
 
+    /// Begin or poll shutdown while dependencies continue receiving ticks.
+    /// Stop admitting new work, release owned effects, then return true. A false
+    /// result keeps the instance and all providers alive for another host tick.
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        Ok(true)
+    }
+
     fn health(&self) -> ModuleResult<()> {
         Ok(())
     }
@@ -258,6 +265,14 @@ macro_rules! export_module {
                 tick: $crate::exports::tick::<$module>,
                 health: $crate::exports::health::<$module>,
                 destroy: $crate::exports::destroy::<$module>,
+            };
+            &API
+        }
+        #[unsafe(no_mangle)]
+        pub extern "C" fn amaterasu_module_quiesce_v1() -> *const $crate::abi::ModuleQuiesceApi {
+            static API: $crate::abi::ModuleQuiesceApi = $crate::abi::ModuleQuiesceApi {
+                header: $crate::abi::AbiHeader::of::<$crate::abi::ModuleQuiesceApi>(),
+                poll: $crate::exports::quiesce::<$module>,
             };
             &API
         }

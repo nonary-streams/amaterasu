@@ -129,6 +129,8 @@ pub struct Record {
     pub application_properties: Option<Value>,
     /// Validated cleanup budget frozen by launch preflight before provider effects.
     pub application_cleanup_budget_ms: Option<u64>,
+    /// Frozen application-provider lifetime policy, independent of stream pause support.
+    pub stop_on_stream_end: bool,
     pub executable_path: Option<String>,
     pub resolved_virtual_sink: Option<String>,
     pub capture_sink_without_routing: bool,
@@ -315,6 +317,7 @@ impl Record {
             application_catalog_revision: None,
             application_properties: None,
             application_cleanup_budget_ms: None,
+            stop_on_stream_end: false,
             executable_path: None,
             resolved_virtual_sink: None,
             capture_sink_without_routing: false,

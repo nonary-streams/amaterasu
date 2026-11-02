@@ -853,7 +853,7 @@ impl Worker {
         &mut self,
         action: HostLifecycleAction,
     ) -> PackageResult<HostLifecycleAction> {
-        let deadline = Instant::now() + LIVENESS_TIMEOUT;
+        let deadline = Instant::now() + Duration::from_secs(25);
         loop {
             if let Some(status) = self.child.try_wait().map_err(|error| error.to_string())? {
                 return crate::protocol::acknowledge_host_action(action, status.success());

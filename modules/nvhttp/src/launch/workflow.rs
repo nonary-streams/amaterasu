@@ -654,7 +654,7 @@ impl Controller {
         Call::new(service, payload, operation, timeout_ms)
     }
 
-    fn consume(
+    pub(super) fn consume(
         &mut self,
         job: &Job,
         payload: Value,
@@ -891,6 +891,7 @@ impl Controller {
                     application_display_settings,
                     executable_path,
                     cleanup_budget_ms,
+                    stop_on_stream_end,
                 }) if record.state == State::Starting => {
                     let selected_capture_mode = record
                         .peer
@@ -901,6 +902,7 @@ impl Controller {
                     record.application_catalog_revision = Some(catalog_revision);
                     record.application_properties = payload.get("config_overrides").cloned();
                     record.application_cleanup_budget_ms = Some(cleanup_budget_ms);
+                    record.stop_on_stream_end = stop_on_stream_end;
                     record.executable_path = executable_path;
                     record.application_preflight_overrides = Some(application_overrides);
                     record.application_display_overrides = Some(application_display_overrides(
@@ -1143,6 +1145,7 @@ impl Controller {
                 Ok((_, _, "ready" | "arming" | "playing", true)) => record.monitored(now),
                 Ok((_, _, "closed" | "failed", true))
                     if record.lifecycle_required
+                        && !record.stop_on_stream_end
                         && matches!(
                             payload["authenticated_disconnect_reason"].as_str(),
                             Some("peer_disconnected" | "authenticated_peer_idle" | "peer_timeout")
@@ -2820,6 +2823,13 @@ fn application_response<'a>(
     {
         return Err("invalid_application_response");
     }
+    if launch
+        .get("stop_on_stream_end")
+        .map_or(Some(false), Value::as_bool)
+        != Some(record.stop_on_stream_end)
+    {
+        return Err("invalid_application_response");
+    }
     let state = launch["state"]
         .as_str()
         .filter(|state| {
@@ -3484,6 +3494,7 @@ struct ApplicationPreflight {
     application_display_settings: Option<Value>,
     executable_path: Option<String>,
     cleanup_budget_ms: u64,
+    stop_on_stream_end: bool,
 }
 
 fn proton_policy_response(payload: &Value) -> Result<bool, &'static str> {
@@ -3539,6 +3550,12 @@ fn application_preflight_response(
         application_display_settings,
         executable_path,
         cleanup_budget_ms,
+        stop_on_stream_end: match payload.get("stop_on_stream_end") {
+            None => false,
+            Some(value) => value
+                .as_bool()
+                .ok_or("invalid_application_preflight_response")?,
+        },
     })
 }
 

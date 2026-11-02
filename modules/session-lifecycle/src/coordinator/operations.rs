@@ -144,7 +144,7 @@ impl Coordinator {
         json!({"status":"ok","host_epoch":journal.host_epoch,"sessions":sessions})
     }
 
-    fn new_work(
+    pub(super) fn new_work(
         &self,
         phase: LifecyclePhase,
         target: LifecycleTarget,

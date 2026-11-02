@@ -140,10 +140,15 @@ pub fn random_display_admission_token() -> Result<String, &'static str> {
 }
 impl Record {
     pub fn response(&self) -> Value {
-        json!({"ok":true,"launch":self})
+        let mut response = json!({"ok":true,"launch":self});
+        response["launch"]["stop_on_stream_end"] = json!(self.stop_on_stream_end());
+        response
+    }
+    fn stop_on_stream_end(&self) -> bool {
+        matches!(&self.target, Some(crate::protocol::LaunchTarget::Executable(executable)) if executable.steam_id.is_some())
     }
     pub fn preflight_response(&self) -> Value {
-        json!({"ok":true,"preflight_token":self.preflight_token,"app_id":self.app_id,"catalog_revision":self.catalog_revision,"config_overrides":self.config_overrides.clone().unwrap_or_default(),"application_display_overrides":self.application_display_overrides,"application_display_settings":self.application_display_settings,"executable_path":self.executable_path,"cleanup_budget_ms":self.cleanup_budget_ms})
+        json!({"ok":true,"preflight_token":self.preflight_token,"stop_on_stream_end":self.stop_on_stream_end(),"app_id":self.app_id,"catalog_revision":self.catalog_revision,"config_overrides":self.config_overrides.clone().unwrap_or_default(),"application_display_overrides":self.application_display_overrides,"application_display_settings":self.application_display_settings,"executable_path":self.executable_path,"cleanup_budget_ms":self.cleanup_budget_ms})
     }
 }
 pub struct Records {

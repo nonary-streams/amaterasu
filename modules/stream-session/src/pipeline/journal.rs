@@ -209,11 +209,6 @@ impl Entry {
         if !self.validate() {
             return Err("invalid_lifecycle_journal_entry");
         }
-        // Old process handles and epochs cannot authorize lifecycle cleanup.
-        // Preserve this entry and block admission until the authority can reconcile it.
-        if self.lifecycle_recovery.is_some() {
-            return Err("lifecycle_reconciliation_required");
-        }
         let config: PrepareConfig = serde_json::from_value(json!({
             "peer_ip":"127.0.0.1",
             "key_hex":"00000000000000000000000000000000",
@@ -223,6 +218,25 @@ impl Entry {
         }))
         .map_err(|_| "invalid_lifecycle_journal_entry")?;
         let mut record = Record::new(self.record_id, self.owner.clone(), config, 30_000);
+        if let Some(recovery) = &self.lifecycle_recovery {
+            if recovery.version != 1
+                || recovery.plan_revision.is_some()
+                || recovery.stream_target.is_none()
+            {
+                return Err("lifecycle_reconciliation_required");
+            }
+            record.restart_lifecycle_target = recovery.stream_target.clone();
+            let mut nonce = [0u8; 16];
+            getrandom::fill(&mut nonce).map_err(|_| "entropy_unavailable")?;
+            record.restart_lifecycle_operation = Some(format!(
+                "ss-{:016x}-restart-retire-{:032x}",
+                self.record_id,
+                u128::from_le_bytes(nonce)
+            ));
+            // This is a retired-process cleanup marker, not a live binding fence.
+            // The coordinator verifies the old epoch and exact consumer scope.
+            record.lifecycle_fenced = true;
+        }
         record.providers = self.providers.clone();
         record.attempted = self
             .attempted_resources

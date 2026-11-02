@@ -52,6 +52,14 @@ typedef struct {
     void (*destroy)(void *instance);
 } AmaterasuModuleApi;
 
+/* Optional amaterasu_module_quiesce_v1() export, using the ModuleApi instance.
+ * poll is bounded/nonblocking and writes ready=0 or 1. All modules continue to
+ * receive ticks until every participant is ready, before reverse-order destroy. */
+typedef struct {
+    AmaterasuAbiHeader header;
+    AmaterasuStatus (*poll)(void *instance, uint8_t *ready);
+} AmaterasuModuleQuiesceApi;
+
 typedef struct {
     AmaterasuAbiHeader header;
     AmaterasuStatus (*create)(AmaterasuBorrowedBytes configuration, void **instance);

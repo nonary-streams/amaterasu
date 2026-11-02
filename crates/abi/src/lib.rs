@@ -120,6 +120,18 @@ pub struct ModuleApi {
     pub destroy: unsafe extern "C" fn(*mut c_void),
 }
 
+/// Optional cooperative shutdown contract, exported as amaterasu_module_quiesce_v1.
+/// The host continues ticking every component until all participants report ready.
+/// Calls are serialized with ModuleApi and borrow its existing live instance.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ModuleQuiesceApi {
+    pub header: AbiHeader,
+    /// Bounded, nonblocking progress. Writes 0 (pending) or 1 (safe to destroy).
+    pub poll: unsafe extern "C" fn(*mut c_void, *mut u8) -> Status,
+}
+pub type ModuleQuiesceEntry = unsafe extern "C" fn() -> *const ModuleQuiesceApi;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RuntimeApi {

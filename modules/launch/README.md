@@ -8,6 +8,11 @@ it does not imply capture, encoding, media transport, input delivery, or streami
 readiness. An optional [independent-library handoff](#optional-independent-library-handoff)
 also supports libraries that own their data outside Catalog.
 
+Steam executable launches advertise `stop_on_stream_end: true` in preflight and
+launch status. NVHTTP freezes that policy before launch and stops the owned game
+on an authenticated stream disconnect. Other applications retain their existing
+pause/resume policy. Provider readback must preserve the frozen lifetime policy.
+
 Requests are strict JSON:
 
 ```json

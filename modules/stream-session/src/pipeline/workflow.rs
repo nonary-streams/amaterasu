@@ -33,6 +33,7 @@ pub(super) enum Step {
     StartLifecycle,
     PauseLifecycle,
     RetireLifecycle,
+    RecoverLifecycle,
     ObserveActiveBinding,
     ValidateActiveBinding,
     NotifyCaptureInvalidated,
@@ -273,12 +274,35 @@ impl Job {
         if record.attempted.contains(&Resource::Session) {
             return Some(Step::Find(Resource::Session));
         }
+        if record.restart_lifecycle_target.is_some() && !self.lifecycle_retire_tried {
+            if record.cleanup_error.is_some() || !record.attempted.is_empty() {
+                return None;
+            }
+            if record.lifecycle_retirement_receipt.is_none() {
+                return Some(Step::Find(Resource::Video));
+            }
+            return Some(Step::RecoverLifecycle);
+        }
         None
     }
 
     pub fn command(&self, record: &Record) -> (String, Value) {
         let session = || record.resources[&Resource::Session];
         match self.step {
+            Step::RecoverLifecycle => {
+                let operation_id = record
+                    .restart_lifecycle_operation
+                    .as_ref()
+                    .expect("restart operation identity");
+                let payload = if self.lifecycle_lookup {
+                    json!({"operation":"lookup","operation_id":operation_id})
+                } else {
+                    json!({"operation":"retire_stream","operation_id":operation_id,
+                    "restart_recovery":true,"target":record.restart_lifecycle_target,
+                    "retirement_receipt":record.lifecycle_retirement_receipt})
+                };
+                ("amaterasu.session-lifecycle/1".into(), payload)
+            }
             Step::ObserveLifecycleCapture | Step::ObserveActiveBinding => (
                 record.service(Resource::Video),
                 json!({"action":"observe_capture", "stream":record.resources[&Resource::Video]}),

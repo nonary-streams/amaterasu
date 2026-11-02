@@ -1,7 +1,7 @@
 //! Library ownership stays here; policy and feature behavior stay in managed libraries.
 use amaterasu_abi::{
-    AbiHeader, BorrowedBytes, HostApi, ModuleApi, ModuleEntry, RuntimeApi, RuntimeEntry, STATUS_OK,
-    Status,
+    AbiHeader, BorrowedBytes, HostApi, ModuleApi, ModuleEntry, ModuleQuiesceApi,
+    ModuleQuiesceEntry, RuntimeApi, RuntimeEntry, STATUS_OK, Status,
 };
 use amaterasu_contracts::{
     Command, HOST_LIFECYCLE_CONTROL_PRINCIPAL, HOST_LOG_SERVICE, HostLifecycleAction, HostLogEvent,
@@ -71,6 +71,9 @@ pub struct LoadedComponents {
 
 impl Drop for LoadedComponents {
     fn drop(&mut self) {
+        if let Err(error) = self.quiesce(std::time::Duration::from_secs(20)) {
+            eprintln!("cooperative module shutdown incomplete: {error}");
+        }
         while let Some(module) = self.modules.pop() {
             drop(module);
         }
@@ -188,6 +191,24 @@ impl LoadedComponents {
             progress(index + 2)?;
         }
         Ok(loaded)
+    }
+
+    fn quiesce(&mut self, budget: std::time::Duration) -> PackageResult<()> {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            let mut ready = true;
+            for module in self.modules.iter_mut().rev() {
+                ready &= module.quiesce()?;
+            }
+            if ready {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("module drain deadline elapsed".into());
+            }
+            self.tick()?;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 
     pub fn tick(&mut self) -> PackageResult<()> {
@@ -555,6 +576,7 @@ impl Drop for RuntimeLibrary {
 struct FeatureLibrary {
     id: String,
     api: ModuleApi,
+    quiesce_api: Option<ModuleQuiesceApi>,
     instance: *mut c_void,
     _library: Library,
 }
@@ -569,6 +591,14 @@ impl FeatureLibrary {
                 .map_err(|error| error.to_string())?;
             read_api_table(entry())?
         };
+        // SAFETY: An optional, named contract is read only after the signed
+        // library's header validates its version and complete table size.
+        let quiesce_api = unsafe {
+            match library.get::<ModuleQuiesceEntry>(b"amaterasu_module_quiesce_v1\0") {
+                Ok(entry) => Some(read_api_table(entry())?),
+                Err(_) => None,
+            }
+        };
         let mut instance = std::ptr::null_mut();
         // SAFETY: the module borrows the table during creation and copies it if needed later.
         let status = unsafe { (api.create)(endpoint, &mut instance) };
@@ -579,9 +609,26 @@ impl FeatureLibrary {
         Ok(Self {
             id: id.to_owned(),
             api,
+            quiesce_api,
             instance,
             _library: library,
         })
+    }
+
+    fn quiesce(&mut self) -> PackageResult<bool> {
+        let Some(api) = self.quiesce_api else {
+            return Ok(true);
+        };
+        let mut ready = 0;
+        // SAFETY: This table belongs to the same loaded library and live instance;
+        // lifecycle calls are serialized and the output byte lives for this call.
+        let status = unsafe { (api.poll)(self.instance, &mut ready) };
+        require_success(status, &format!("quiesce {}", self.id))?;
+        match ready {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(format!("invalid quiesce readiness from {}", self.id)),
+        }
     }
 
     fn tick(&mut self) -> PackageResult<()> {

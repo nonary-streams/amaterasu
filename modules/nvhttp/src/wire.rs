@@ -716,6 +716,10 @@ impl Router {
         self.launches.revoke_untrusted(Instant::now(), trusted)
     }
 
+    pub fn quiesce(&mut self) -> bool {
+        self.launches.quiesce(Instant::now())
+    }
+
     pub fn shutdown(&mut self, runtime: &RuntimeClient) {
         self.launches
             .shutdown(&mut |command| runtime.send_ephemeral(command));

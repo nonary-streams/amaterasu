@@ -216,6 +216,7 @@ where
 struct NvhttpModule {
     runtime: RuntimeClient,
     startup_settings: Settings,
+    quiescing: bool,
     server: Option<server::Server>,
     router: Option<wire::Router>,
     identity: Option<tls::Identity>,
@@ -305,6 +306,7 @@ impl ManagedModule for NvhttpModule {
         Ok(Self {
             runtime,
             startup_settings: settings,
+            quiescing: false,
             server,
             router,
             identity,
@@ -323,7 +325,25 @@ impl ManagedModule for NvhttpModule {
         })
     }
 
+    fn quiesce(&mut self) -> ModuleResult<bool> {
+        if !self.quiescing {
+            self.quiescing = true;
+            if let (Some(server), Some(router)) = (&mut self.server, &mut self.router) {
+                for id in server.close_all() {
+                    router.cancel(id, &self.runtime);
+                }
+            }
+        }
+        Ok(self.router.as_mut().is_none_or(wire::Router::quiesce))
+    }
+
     fn tick(&mut self) -> ModuleResult<()> {
+        if self.quiescing {
+            if let Some(router) = &mut self.router {
+                router.poll_with_trust(&self.runtime, |_, _| true);
+            }
+            return Ok(());
+        }
         self.update_active_listener_ports();
         if let Some(settings) = self.product_settings.tick(&self.runtime)? {
             if let Some(router) = &mut self.router {

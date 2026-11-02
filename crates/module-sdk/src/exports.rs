@@ -64,6 +64,25 @@ pub unsafe extern "C" fn health<M: ManagedModule>(instance: *mut c_void) -> Stat
 }
 
 /// # Safety
+/// `instance` is a live, exclusively borrowed M; `ready` is writable for this call.
+pub unsafe extern "C" fn quiesce<M: ManagedModule>(
+    instance: *mut c_void,
+    ready: *mut u8,
+) -> Status {
+    if instance.is_null() || ready.is_null() {
+        return STATUS_INVALID_ARGUMENT;
+    }
+    // SAFETY: The host lends the live instance and a writable result byte. Clear
+    // readiness before invoking product code so errors cannot authorize unload.
+    unsafe { *ready = 0 };
+    contain_failure(|| {
+        let complete = unsafe { &mut *instance.cast::<M>() }.quiesce()?;
+        unsafe { *ready = u8::from(complete) };
+        Ok(())
+    })
+}
+
+/// # Safety
 /// Consume a live M exactly once, after all its other calls have finished.
 pub unsafe extern "C" fn destroy<M: ManagedModule>(instance: *mut c_void) {
     if instance.is_null() {

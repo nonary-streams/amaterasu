@@ -5318,3 +5318,51 @@ fn external_capture_alias_rejects_invalid_names_and_builtin_override_works() {
     assert_eq!(CaptureMode::Auto.resolve(external.clone()), (external.clone(), false));
     assert_eq!(CaptureMode::Wgcc.resolve(external), (CaptureProvider::Wgc, true));
 }
+
+#[test]
+fn steam_lifetime_policy_closes_the_application_on_authenticated_disconnect() {
+    for close_application in [false, true] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        let mut broker = Broker::default();
+        assert!(controller.launch(10, request(1), peer(1), now).is_none());
+        poll_until_reply(&mut controller, &mut broker, now);
+        let record = controller.records.values_mut().next().unwrap();
+        record.lifecycle_required = true;
+        record.lifecycle_session_target = serde_json::from_value(json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1})).ok();
+        let lifecycle_target = record.lifecycle_session_target.clone();
+        record.stop_on_stream_end = close_application;
+        let id = record.id;
+        let ticket = record.rtsp_ticket.unwrap();
+        let mut payload = broker.response("amaterasu.rtsp/1", &json!({"action":"status","ticket":ticket}));
+        payload["lifecycle_session_target"] = json!(lifecycle_target);
+        payload["state"] = json!("closed");
+        payload["authenticated_disconnect_reason"] = json!("peer_disconnected");
+        payload["lifecycle_retired"] = json!(true);
+        payload["lifecycle_intent"] = json!("initial");
+        let job = workflow::Job {record:id, phase:workflow::Phase::MonitorRtsp,
+            call:call::Call::new("unused",json!({}),"unused".into(),1000), deadline:now+Duration::from_secs(5)};
+        controller.consume(&job, payload, now, &mut Vec::new());
+        let record = &controller.records[&id];
+        if close_application {
+            assert_eq!(record.state, State::Stopping);
+            assert_eq!(record.stage, Stage::Cleanup);
+        } else { assert!(matches!(record.stage, Stage::VerifyPaused | Stage::ReleasePausedHistory)); }
+    }
+}
+
+#[test]
+fn cooperative_shutdown_runs_owned_application_cleanup_before_reporting_ready() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    controller.launch(10, request(1), peer(1), now);
+    poll_until_reply(&mut controller, &mut broker, now);
+    assert!(!controller.quiesce(now));
+    for offset in 0..128 {
+        controller.poll(now+Duration::from_millis(offset*100), &mut |command| broker.send(command));
+        if controller.quiesce(now+Duration::from_millis(offset*100)) { break; }
+    }
+    assert!(controller.quiesce(now+Duration::from_secs(15)));
+    assert!(broker.actions().contains(&("amaterasu.launch/1", "stop")));
+}

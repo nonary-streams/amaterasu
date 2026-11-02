@@ -48,11 +48,12 @@ impl Pipeline {
                     record.cleanup_error = Some("lifecycle_fence_unconfirmed");
                 }
             }
-            Step::RetireLifecycle => {
+            Step::RetireLifecycle | Step::RecoverLifecycle => {
                 let target = record
                     .start
                     .as_ref()
-                    .and_then(|start| start.lifecycle_target.as_ref());
+                    .and_then(|start| start.lifecycle_target.as_ref())
+                    .or(record.restart_lifecycle_target.as_ref());
                 let plan_revision = record
                     .start
                     .as_ref()
@@ -365,6 +366,7 @@ impl Pipeline {
             && !record.display_attempted
             && record.display_lease.is_none()
             && !record.virtual_display_reference_owned
+            && (record.restart_lifecycle_target.is_none() || record.lifecycle_retired)
             && (record
                 .start
                 .as_ref()

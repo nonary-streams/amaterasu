@@ -2901,6 +2901,7 @@ fn persisted_steam_identity_and_install_directory_reach_application_launch() {
         })
         .map(|(_, payload, _)| payload)
         .expect("launch workflow sends an application launch request");
+    assert_eq!(started["launch"]["stop_on_stream_end"], true);
     assert_eq!(application_launch["steam_id"], "42");
     assert_eq!(application_launch["steam_install_dir"], "/games/space game");
 }

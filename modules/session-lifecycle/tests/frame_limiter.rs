@@ -229,6 +229,7 @@ fn native_limiter_prepares_through_unchanged_coordinator_and_broker() {
         "journal_path":root.join("lifecycle.json"),
         "capture_binding_mode":"external",
         "trusted_callers":["transport",PROVIDER],
+        "session_delegates":["transport"],
         "consumers":{"capture":["transport"]},
         "operation_grants":{"transport":["prepare","prepare_stream","ack_stream","start_stream","pause_stream","retire_stream","lookup","snapshot","end_session","application_retired","read_prepared_plans"],PROVIDER:["read_provider_context"]},
         "consumer_requirements":{"execution_domain":"seat","capture_providers":[],"selector_schemas":[]},
@@ -490,6 +491,43 @@ fn native_limiter_prepares_through_unchanged_coordinator_and_broker() {
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
+        if cycle == 0 && std::env::var_os("AMATERASU_LIMITER_TEST_RESTART").is_some() {
+            drop(coordinator);
+            coordinator = Coordinator::configured(&settings).unwrap();
+            module.restart();
+            id += 1;
+            let operation = "retire-after-process-restart";
+            let pending = call(
+                json!({"operation":"retire_stream","operation_id":operation,
+                "restart_recovery":true,"target":target,
+                "retirement_receipt":{"service":"video/1","operation_id":"native-video",
+                    "response":{"code":"not_found"}}}),
+                id,
+                &mut coordinator,
+                &mut module,
+            );
+            assert_eq!(pending["status"], "pending", "{pending}");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                id += 1;
+                let result = call(
+                    json!({"operation":"lookup","operation_id":operation}),
+                    id,
+                    &mut coordinator,
+                    &mut module,
+                );
+                if result["status"] != "pending" {
+                    assert_eq!(result["status"], "succeeded", "{result}");
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "restart cleanup stalled: {result}"
+                );
+            }
+            assert!(!root.join("amaterasu/frame-limiter/active.json").exists());
+            return;
+        }
         id += 1;
         let pause_id = format!("pause-{cycle}");
         let pause = call(
@@ -563,4 +601,20 @@ fn native_limiter_prepares_through_unchanged_coordinator_and_broker() {
         "rejected"
     );
     drop(module);
+}
+
+#[test]
+#[ignore = "requires the installed frame-limiter cdylib; uses disposable provider state"]
+fn native_limiter_reconciles_old_stream_context_after_coordinator_restart() {
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "native_limiter_prepares_through_unchanged_coordinator_and_broker",
+            "--nocapture",
+        ])
+        .env("AMATERASU_LIMITER_TEST_RESTART", "1")
+        .status()
+        .unwrap();
+    assert!(status.success());
 }

@@ -106,6 +106,7 @@ impl ResumeSnapshot {
         stream.global_display_revision = controller.global_display_revision;
         stream.global_display_policy = controller.global_display_policy.clone();
         stream.global_proton_dualsense_compatibility = Some(global_proton_dualsense_compatibility);
+        stream.stop_on_stream_end = retained.stop_on_stream_end;
         stream.application_preflight_overrides = retained.application_preflight_overrides.clone();
         stream.application_display_overrides = retained.application_display_overrides.clone();
         stream.application_display_settings = retained.application_display_settings.clone();

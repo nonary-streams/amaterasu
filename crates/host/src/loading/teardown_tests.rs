@@ -85,6 +85,7 @@ fn runtime(trace: &DestructionTrace) -> RuntimeLibrary {
 fn feature(name: &'static str, trace: &DestructionTrace) -> FeatureLibrary {
     FeatureLibrary {
         id: name.into(),
+        quiesce_api: None,
         api: ModuleApi {
             header: AbiHeader::of::<ModuleApi>(),
             create: create_module,
@@ -178,4 +179,55 @@ fn completed_load_retains_features_until_reverse_dependency_shutdown() {
     assert_eq!(progress, [1, 2, 3]);
     drop(loaded);
     assert_eq!(*trace.lock().unwrap(), ["consumer", "provider", "runtime"]);
+}
+
+#[test]
+fn cooperative_shutdown_keeps_providers_ticking_until_consumer_releases() {
+    unsafe extern "C" fn provider_tick(instance: *mut c_void) -> Status {
+        // SAFETY: the fixture lends its live instance for this serialized call.
+        let instance = unsafe { &*instance.cast::<FixtureInstance>() };
+        instance.trace.lock().unwrap().push("provider-progress");
+        STATUS_OK
+    }
+    unsafe extern "C" fn poll(instance: *mut c_void, ready: *mut u8) -> Status {
+        // SAFETY: the fixture owns the instance and host provides a writable byte.
+        let instance = unsafe { &*instance.cast::<FixtureInstance>() };
+        unsafe {
+            *ready = u8::from(
+                instance
+                    .trace
+                    .lock()
+                    .unwrap()
+                    .contains(&"provider-progress"),
+            )
+        };
+        STATUS_OK
+    }
+    let trace = DestructionTrace::default();
+    let loaded = LoadedComponents::load_features(
+        runtime(&trace),
+        None,
+        lifecycle_endpoint(),
+        false,
+        ["provider", "consumer"],
+        |_, name| {
+            let mut module = feature(name, &trace);
+            if name == "provider" {
+                module.api.tick = provider_tick;
+            } else {
+                module.quiesce_api = Some(amaterasu_abi::ModuleQuiesceApi {
+                    header: AbiHeader::of::<amaterasu_abi::ModuleQuiesceApi>(),
+                    poll,
+                });
+            }
+            Ok(module)
+        },
+        &mut |_| Ok(()),
+    )
+    .unwrap();
+    drop(loaded);
+    assert_eq!(
+        *trace.lock().unwrap(),
+        ["provider-progress", "consumer", "provider", "runtime"]
+    );
 }

@@ -106,6 +106,7 @@ impl Pipeline {
                             | Step::StartLifecycle
                             | Step::PauseLifecycle
                             | Step::RetireLifecycle
+                            | Step::RecoverLifecycle
                             | Step::ObserveActiveBinding
                             | Step::ValidateActiveBinding
                             | Step::NotifyCaptureInvalidated
@@ -157,7 +158,10 @@ impl Pipeline {
                             record.control_disconnect_checked = true;
                             return true;
                         }
-                        if matches!(job.step, Step::PauseLifecycle | Step::RetireLifecycle) {
+                        if matches!(
+                            job.step,
+                            Step::PauseLifecycle | Step::RetireLifecycle | Step::RecoverLifecycle
+                        ) {
                             if job.step == Step::PauseLifecycle {
                                 job.lifecycle_pause_tried = true;
                             } else {

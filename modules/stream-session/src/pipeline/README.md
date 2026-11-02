@@ -63,3 +63,21 @@ geometry. Logical Wayland desktop coordinates are kept separate from source imag
 pixels. The pointer is centered on the owned output after an authorized mouse
 lease is acquired; later topology updates refresh absolute pointer mapping before
 control packets are translated. Geometry is not inferred from client resolution.
+
+## Interrupted external-capture cleanup
+
+A restart first reconciles every recorded native resource using its original
+operation identity. For an external-capture lifecycle marker, a delegated capture
+consumer then sends `retire_stream` with `restart_recovery: true`, the old stream
+target, and confirmed native retirement evidence. The coordinator accepts only an
+exact old epoch/generation in recovery and runs its frozen provider release graph;
+it never replays prepare. The stream journal clears only after that cleanup is
+confirmed. Unknown outcomes and managed-capture markers remain fenced.
+
+## Cooperative host shutdown
+
+The optional SDK `amaterasu_module_quiesce_v1` contract keeps all providers ticking
+while consumers drain their owned work. NVHTTP stops admitting client work and
+runs stream, application, and lifecycle cleanup before reporting ready. The host
+bounds this drain to twenty seconds before reverse-order destruction; its worker
+supervisor allows twenty-five seconds. Timeout paths retain recovery evidence.
