@@ -10,6 +10,8 @@ mod model;
 mod native;
 mod platform;
 mod probe;
+#[cfg(feature = "pyrowave")]
+mod pyrowave;
 mod sessions;
 mod worker;
 use amaterasu_module_sdk::{
@@ -25,6 +27,9 @@ const SERVICE: &str = "amaterasu.encode/1";
 struct Settings {
     #[serde(default)]
     enabled: bool,
+    #[cfg(feature = "pyrowave")]
+    #[serde(default)]
+    pyrowave: Option<pyrowave::Settings>,
 }
 
 struct EncodeModule {
@@ -32,6 +37,8 @@ struct EncodeModule {
     shared: native::Shared,
     log_queue: LogQueue,
     _registration: Box<native::Registration>,
+    #[cfg(feature = "pyrowave")]
+    pyrowave: Option<pyrowave::Plugin>,
 }
 
 impl ManagedModule for EncodeModule {
@@ -41,6 +48,12 @@ impl ManagedModule for EncodeModule {
         };
         let settings: Settings =
             serde_json::from_value(payload).map_err(|_| "invalid encoder settings")?;
+        #[cfg(feature = "pyrowave")]
+        let pyrowave = settings
+            .pyrowave
+            .filter(|_| settings.enabled)
+            .map(|settings| pyrowave::Plugin::register(&runtime, settings))
+            .transpose()?;
         let (log_emitter, log_queue) = runtime.log_emitter();
         let shared = Arc::new(Mutex::new(sessions::Sessions::with_log_emitter(
             settings.enabled,
@@ -64,6 +77,8 @@ impl ManagedModule for EncodeModule {
             shared,
             log_queue,
             _registration: registration,
+            #[cfg(feature = "pyrowave")]
+            pyrowave,
         })
     }
     fn tick(&mut self) -> ModuleResult<()> {
@@ -83,9 +98,21 @@ impl ManagedModule for EncodeModule {
                 ) {
                     return Ok(());
                 }
+                #[cfg(feature = "pyrowave")]
+                let pyrowave_request = service == pyrowave::CONTROL_SERVICE;
                 let result = if service == SERVICE {
                     self.control(&caller, payload)
                 } else {
+                    #[cfg(feature = "pyrowave")]
+                    if pyrowave_request {
+                        self.pyrowave
+                            .as_ref()
+                            .ok_or("pyrowave_disabled")
+                            .and_then(|plugin| plugin.control(&caller, payload))
+                    } else {
+                        Err("invalid_service")
+                    }
+                    #[cfg(not(feature = "pyrowave"))]
                     Err("invalid_service")
                 };
                 let (payload, created) =
@@ -98,6 +125,13 @@ impl ManagedModule for EncodeModule {
                     Ok(Response::Ok)
                 ) && let Some(session) = created
                 {
+                    #[cfg(feature = "pyrowave")]
+                    if pyrowave_request {
+                        if let Some(plugin) = &self.pyrowave {
+                            plugin.close(&caller, session);
+                        }
+                        return Ok(());
+                    }
                     let _ = self
                         .shared
                         .lock()

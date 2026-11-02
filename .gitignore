@@ -1,4 +1,5 @@
 /target/
+/native-deps/
 /.local/
 *.dSYM/
 __pycache__/
