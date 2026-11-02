@@ -135,6 +135,8 @@ pub struct Broker {
     pub virtual_display_specification: Option<Value>,
     pub virtual_display_references: BTreeSet<String>,
     pub virtual_display_pending_statuses: u8,
+    pub virtual_display_removal_statuses: u8,
+    pub virtual_display_removing: bool,
     pub virtual_display_create_failure: Option<String>,
     pub virtual_display_remove_failure: bool,
     pub state_revision: u64,
@@ -889,10 +891,17 @@ impl Broker {
             "status" => {
                 let reference = payload["reference_id"].as_str().expect("reference ID");
                 let reference_owned = self.virtual_display_references.contains(reference);
+                if self.virtual_display_removing && self.virtual_display_removal_statuses == 0 {
+                    self.virtual_display_specification = None;
+                    self.virtual_display_removing = false;
+                }
                 let monitors = self.virtual_display_specification.as_ref().map_or_else(
                     Vec::new,
                     |specification| {
-                        let state = if self.virtual_display_pending_statuses > 0 {
+                        let state = if self.virtual_display_removing {
+                            self.virtual_display_removal_statuses -= 1;
+                            "removing"
+                        } else if self.virtual_display_pending_statuses > 0 {
                             "creating"
                         } else {
                             "ready"
@@ -914,6 +923,11 @@ impl Broker {
                 let released = self.virtual_display_references.remove(reference);
                 let reference_owned = self.virtual_display_references.contains(reference);
                 let removed = self.virtual_display_references.is_empty();
+                if removed && self.virtual_display_removal_statuses > 0 {
+                    self.virtual_display_removing = true;
+                    return json!({"ok":true,"removed":false,"reference_owned":false,
+                        "monitor":{"state":"removing"}});
+                }
                 if removed {
                     self.virtual_display_specification = None;
                 }

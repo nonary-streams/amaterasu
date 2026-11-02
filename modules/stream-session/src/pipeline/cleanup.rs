@@ -121,6 +121,16 @@ impl Pipeline {
             Step::StatusVirtualDisplay => {
                 use super::virtual_display::ReferenceStatus;
                 match super::virtual_display::accept_status(record, &payload) {
+                    ReferenceStatus::Pending if record.virtual_display_remove_attempted => {
+                        job.step = Step::StatusVirtualDisplay;
+                    }
+                    ReferenceStatus::Failed
+                        if record.virtual_display_remove_attempted
+                            && record.virtual_display_state == "cleanup_failed" =>
+                    {
+                        record.cleanup_error = Some("virtual_display_cleanup_failed");
+                        job.virtual_display_tried = true;
+                    }
                     ReferenceStatus::Missing if record.virtual_display_status_verified => {
                         record.virtual_display_attempted = false;
                         record.virtual_display_remove_attempted = false;

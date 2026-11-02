@@ -76,6 +76,25 @@ pub(super) fn accept_status(record: &mut Record, response: &Value) -> ReferenceS
         return ReferenceStatus::Failed;
     };
     if response["reference_owned"] != true {
+        if record.virtual_display_remove_attempted
+            && let Some(monitor) = response["monitors"].as_array().and_then(|monitors| {
+                monitors.iter().find(|monitor| {
+                    monitor["specification"]["identity"] == intent.identity
+                        && matches!(
+                            monitor["state"].as_str(),
+                            Some("removing" | "cleanup_failed")
+                        )
+                })
+            })
+        {
+            record.virtual_display_reference_owned = false;
+            record.virtual_display_state = monitor["state"].as_str().unwrap().into();
+            return if monitor["state"] == "removing" {
+                ReferenceStatus::Pending
+            } else {
+                ReferenceStatus::Failed
+            };
+        }
         record.virtual_display_reference_owned = false;
         record.virtual_display_status_verified = true;
         record.virtual_display_attempted = false;
@@ -136,6 +155,13 @@ pub(super) fn accept_status(record: &mut Record, response: &Value) -> ReferenceS
 }
 
 pub(super) fn accept_remove(record: &mut Record, response: &Value) -> bool {
+    if response["ok"] == true && response["monitor"]["state"] == "removing" {
+        record.virtual_display_reference_owned = false;
+        record.virtual_display_status_verified = false;
+        record.virtual_display_remove_attempted = true;
+        record.virtual_display_state = "removing".into();
+        return false;
+    }
     if response["ok"] == true
         && (response["reference_owned"] == false
             || response["reference_released"] == true

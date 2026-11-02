@@ -57,6 +57,30 @@ fn actions(host: &Harness, service: &str) -> Vec<String> {
 }
 
 #[test]
+fn stop_waits_for_final_virtual_display_removal() {
+    let mut host = Harness::new();
+    let prepared = host.response(
+        1,
+        prepare_with_intent(
+            "delayed-removal",
+            intent(
+                "session-1",
+                VirtualDisplayMode::PerClient,
+                VirtualDisplayLayout::Extended,
+            ),
+        ),
+    );
+    let id = prepared["session"].as_u64().unwrap();
+    host.broker.virtual_display_removal_statuses = 2;
+    let stopped = host.response(2, json!({"action":"stop","session":id}));
+    assert_eq!(stopped["state"], "stopped");
+    assert!(host.broker.virtual_display_specification.is_none());
+    let calls = actions(&host, "amaterasu.virtual-display/1");
+    let remove = calls.iter().position(|action| action == "remove").unwrap();
+    assert_eq!(&calls[remove + 1..], ["status", "status", "status"]);
+}
+
+#[test]
 fn ready_monitor_applies_snapshot_and_restores_before_releasing_reference() {
     let mut host = Harness::new();
     let original_topology = host.broker.display_topology.clone();
