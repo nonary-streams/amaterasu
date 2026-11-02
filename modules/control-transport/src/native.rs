@@ -156,6 +156,9 @@ unsafe fn with_controller(
 }
 
 fn guard(operation: impl FnOnce() -> Status) -> Status {
+    let _priority = amaterasu_module_sdk::threading::ScopedThreadPriority::best_effort(
+        amaterasu_module_sdk::threading::ThreadPriority::Critical,
+    );
     catch_unwind(AssertUnwindSafe(operation)).unwrap_or(MEDIA_BACKEND_ERROR)
 }
 

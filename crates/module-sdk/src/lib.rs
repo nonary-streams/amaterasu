@@ -13,6 +13,7 @@ pub mod network;
 pub mod network_http;
 pub mod requests;
 pub mod retained_options;
+pub mod threading;
 pub mod transport;
 pub mod video;
 mod work;

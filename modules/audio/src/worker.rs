@@ -130,6 +130,9 @@ impl Worker {
         let thread = thread::Builder::new()
             .name("amaterasu-loopback".into())
             .spawn(move || {
+                amaterasu_module_sdk::threading::configure_worker_priority(
+                    amaterasu_module_sdk::threading::ThreadPriority::Critical,
+                );
                 #[cfg(target_os = "linux")]
                 let opened = platform::Capture::open_with_bounded_retry(
                     &endpoint,

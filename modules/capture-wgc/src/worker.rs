@@ -41,6 +41,9 @@ mod implementation {
             let thread = thread::Builder::new()
                 .name("amaterasu-wgc".into())
                 .spawn(move || {
+                    amaterasu_module_sdk::threading::configure_worker_priority(
+                        amaterasu_module_sdk::threading::ThreadPriority::Critical,
+                    );
                     let (mut source, metadata) = match initialize() {
                         Ok(value) => value,
                         Err(error) => {

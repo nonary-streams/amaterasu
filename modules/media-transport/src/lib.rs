@@ -27,6 +27,9 @@ impl ManagedModule for MediaTransportModule {
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
+        let _priority = amaterasu_module_sdk::threading::ScopedThreadPriority::best_effort(
+            amaterasu_module_sdk::threading::ThreadPriority::High,
+        );
         self.controller
             .lock()
             .map_err(|_| "transport state unavailable")?

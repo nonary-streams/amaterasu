@@ -26,6 +26,9 @@ impl ManagedModule for ControlTransport {
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
+        let _priority = amaterasu_module_sdk::threading::ScopedThreadPriority::best_effort(
+            amaterasu_module_sdk::threading::ThreadPriority::Critical,
+        );
         self.controller
             .lock()
             .map_err(|_| "control state unavailable")?
