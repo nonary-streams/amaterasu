@@ -407,28 +407,9 @@ fn page(
 }
 
 pub(crate) fn config_override_capabilities() -> Value {
-    let frame_limiter_provider = if cfg!(windows) {
-        json!(["auto", "rtss", "nvidia-control-panel", "none"])
-    } else if cfg!(target_os = "linux") {
-        json!(["auto", "mangohud", "proton", "mangohud-proton", "none"])
-    } else {
-        json!(["auto"])
-    };
-    let rtss_frame_limit_type = if cfg!(windows) {
-        json!([
-            "async",
-            "front edge sync",
-            "back edge sync",
-            "nvidia reflex"
-        ])
-    } else {
-        json!([])
-    };
-
-    json!({
-        "frame_limiter_provider": frame_limiter_provider,
-        "rtss_frame_limit_type": rtss_frame_limit_type
-    })
+    // Preserve the legacy response envelope. Extension option definitions and
+    // platform availability are supplied by the selected providers' descriptors.
+    json!({})
 }
 
 fn page_steam_ids(

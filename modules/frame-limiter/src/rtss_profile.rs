@@ -1,4 +1,4 @@
-//! Compare-before-write transactions for existing RTSS profile files.
+//! Exclusive profile initialization and compare-before-write transactions.
 use crate::lease::{ProfileValues, ProviderError};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -263,6 +263,101 @@ fn update_locked_profile_file(
     }
 }
 
+fn initialize_new_profile_file(
+    file: &mut File,
+    values: ProfileValues,
+) -> Result<(), ProviderError> {
+    if file.metadata().map_err(|_| profile_format_error())?.len() != 0 {
+        return Err(ProviderError::CreationConflict(
+            "rtss_profile_already_exists",
+        ));
+    }
+    let content = format!(
+        "[Framerate]\r\nLimit={}\r\nLimitDenominator={}\r\nSyncLimiter={}\r\n",
+        values.frame_limit, values.frame_limit_denominator, values.sync_limiter
+    );
+    write_profile_file(file, content.as_bytes())
+        .map_err(|_| ProviderError::VerifyFailed("rtss_profile_initialization_failed"))?;
+    if read_profile_file(file)? != content.as_bytes() {
+        return Err(ProviderError::VerifyFailed(
+            "rtss_profile_initialization_failed",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(windows, target_pointer_width = "64"))]
+pub(crate) fn create_profile_file_verified(
+    path: &Path,
+    values: ProfileValues,
+) -> Result<(), ProviderError> {
+    use std::os::windows::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt},
+        io::FromRawHandle,
+    };
+    let parent = path
+        .parent()
+        .ok_or(ProviderError::Unavailable("rtss_profile_directory_invalid"))?;
+    // Pin the final directory against normal rename/delete while creating the file.
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(parent)
+        .map_err(|_| ProviderError::Unavailable("rtss_profile_directory_unavailable"))?;
+    let metadata = directory.metadata().map_err(|_| profile_format_error())?;
+    if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(ProviderError::Unavailable("rtss_profile_directory_invalid"));
+    }
+    let path: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: this UTF-16 path is terminated. CREATE_NEW never truncates an
+    // existing file; sharing is denied until initialization and verification finish.
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE | DELETE_ACCESS,
+            0,
+            std::ptr::null_mut(),
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(match std::io::Error::last_os_error().raw_os_error() {
+            Some(80 | 183) => ProviderError::CreationConflict("rtss_profile_already_exists"),
+            _ => ProviderError::Unavailable("rtss_profile_create_failed"),
+        });
+    }
+    // SAFETY: CreateFileW transferred this new, exclusively shared handle to us.
+    let mut file = unsafe { File::from_raw_handle(handle) };
+    let result = initialize_new_profile_file(&mut file, values);
+    if result.is_err() {
+        let delete = true;
+        // SAFETY: FILE_DISPOSITION_INFO contains one Windows BOOLEAN. This marks
+        // only our still-open newly created file, so a replacement path is never deleted.
+        let marked = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                4,
+                (&delete as *const bool).cast(),
+                std::mem::size_of::<bool>() as u32,
+            )
+        };
+        if marked == 0 {
+            return Err(ProviderError::VerifyFailed(
+                "rtss_profile_create_cleanup_unconfirmed",
+            ));
+        }
+    }
+    result
+}
+
 #[cfg(all(windows, target_pointer_width = "64"))]
 pub(crate) fn write_profile_file_verified(
     path: &Path,
@@ -289,9 +384,10 @@ impl LockedProfileFile {
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
-        // Keep read/write sharing so this can coordinate with an already-open
-        // RTSS profile handle. Omitting FILE_SHARE_DELETE prevents replacement
-        // while the byte-range lock protects ordinary read/write I/O.
+        // Deny write and delete sharing for the transaction. In particular,
+        // refuse a preexisting writer rather than depend solely on byte-lock
+        // enforcement (which differs in compatibility runtimes). Read-only
+        // handles remain compatible; the byte lock also serializes their I/O.
         // SAFETY: `path` is NUL-terminated UTF-16 and the remaining pointers are
         // either null optional attributes or a null template handle, as allowed
         // for OPEN_EXISTING. A successful handle is owned below by `File`.
@@ -299,7 +395,7 @@ impl LockedProfileFile {
             CreateFileW(
                 path.as_ptr(),
                 GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                FILE_SHARE_READ,
                 std::ptr::null_mut(),
                 OPEN_EXISTING,
                 FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -380,6 +476,14 @@ const GENERIC_READ: u32 = 0x8000_0000;
 #[cfg(all(windows, target_pointer_width = "64"))]
 const GENERIC_WRITE: u32 = 0x4000_0000;
 #[cfg(all(windows, target_pointer_width = "64"))]
+const DELETE_ACCESS: u32 = 0x0001_0000;
+#[cfg(all(windows, target_pointer_width = "64"))]
+const CREATE_NEW: u32 = 1;
+#[cfg(all(windows, target_pointer_width = "64"))]
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+#[cfg(all(windows, target_pointer_width = "64"))]
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+#[cfg(all(windows, target_pointer_width = "64"))]
 const FILE_SHARE_READ: u32 = 0x0000_0001;
 #[cfg(all(windows, target_pointer_width = "64"))]
 const FILE_SHARE_WRITE: u32 = 0x0000_0002;
@@ -401,6 +505,12 @@ const INVALID_HANDLE_VALUE: *mut std::ffi::c_void = -1_isize as *mut std::ffi::c
 #[cfg(all(windows, target_pointer_width = "64"))]
 #[link(name = "kernel32")]
 unsafe extern "system" {
+    fn SetFileInformationByHandle(
+        file: *mut std::ffi::c_void,
+        class: i32,
+        information: *const std::ffi::c_void,
+        size: u32,
+    ) -> i32;
     fn CreateFileW(
         file_name: *const u16,
         desired_access: u32,
@@ -429,7 +539,7 @@ unsafe extern "system" {
 
 #[cfg(test)]
 mod tests {
-    use super::{replace_profile_values, update_locked_profile_file};
+    use super::{initialize_new_profile_file, replace_profile_values, update_locked_profile_file};
     use crate::lease::{ProfileValues, ProviderError};
     use std::fs::{self, File, OpenOptions};
     use std::io::{Read, Seek, SeekFrom};
@@ -481,6 +591,9 @@ mod tests {
         }
 
         fn contents(&mut self) -> Vec<u8> {
+            if self.file.is_none() {
+                return fs::read(&self.path).unwrap();
+            }
             self.file_mut().seek(SeekFrom::Start(0)).unwrap();
             let mut content = Vec::new();
             self.file_mut().read_to_end(&mut content).unwrap();
@@ -496,6 +609,71 @@ mod tests {
     }
 
     const PROFILE: &[u8] = b"; retain this comment\r\n[Framerate]\r\nLimit=60\r\nLimitDenominator=1\r\nSyncLimiter=0\r\n[Compatibility]\r\nApp=game.exe\r\n";
+
+    #[test]
+    fn initialization_writes_a_complete_default_and_never_overwrites_existing_content() {
+        let mut fixture = ProfileFixture::new(b"");
+        initialize_new_profile_file(fixture.file_mut(), crate::lease::DEFAULT_PROFILE).unwrap();
+        assert_eq!(
+            fixture.contents(),
+            b"[Framerate]\r\nLimit=0\r\nLimitDenominator=1\r\nSyncLimiter=0\r\n"
+        );
+        let before = fixture.contents();
+        assert!(matches!(
+            initialize_new_profile_file(fixture.file_mut(), APPLIED_VALUES),
+            Err(ProviderError::CreationConflict(_))
+        ));
+        assert_eq!(fixture.contents(), before);
+    }
+
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    #[test]
+    fn create_new_refuses_a_racing_file_and_preserves_the_default_profile() {
+        let fixture = ProfileFixture::new(b"");
+        let path = fixture.directory.join("Global");
+        super::create_profile_file_verified(&path, crate::lease::DEFAULT_PROFILE).unwrap();
+        let before = fs::read(&path).unwrap();
+        assert!(matches!(
+            super::create_profile_file_verified(&path, APPLIED_VALUES),
+            Err(ProviderError::CreationConflict(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    #[test]
+    fn guarded_windows_update_preserves_other_settings_and_refuses_stale_values() {
+        let mut fixture = ProfileFixture::new(PROFILE);
+        drop(fixture.file.take());
+        super::write_profile_file_verified(&fixture.path, ORIGINAL_VALUES, APPLIED_VALUES).unwrap();
+        let applied = fixture.contents();
+        assert!(applied.ends_with(b"[Compatibility]\r\nApp=game.exe\r\n"));
+        assert_eq!(
+            super::write_profile_file_verified(&fixture.path, ORIGINAL_VALUES, ORIGINAL_VALUES),
+            Err(ProviderError::ProfileMismatch {
+                code: "rtss_profile_changed_before_write",
+                observed: APPLIED_VALUES,
+            })
+        );
+        assert_eq!(fixture.contents(), applied);
+        super::write_profile_file_verified(&fixture.path, APPLIED_VALUES, ORIGINAL_VALUES).unwrap();
+        assert_eq!(fixture.contents(), PROFILE);
+    }
+
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    #[test]
+    fn guarded_windows_file_cannot_be_replaced_while_the_transaction_is_open() {
+        let mut fixture = ProfileFixture::new(PROFILE);
+        drop(fixture.file.take());
+        let replacement = fixture.directory.join("replacement.cfg");
+        fs::write(&replacement, b"foreign configuration").unwrap();
+        let guard = super::LockedProfileFile::open(&fixture.path).unwrap();
+        assert!(fs::rename(&replacement, &fixture.path).is_err());
+        assert!(fs::remove_file(&fixture.path).is_err());
+        drop(guard);
+        assert_eq!(fixture.contents(), PROFILE);
+        assert_eq!(fs::read(&replacement).unwrap(), b"foreign configuration");
+    }
 
     #[test]
     fn verified_update_changes_only_rtss_framerate_values() {
@@ -548,22 +726,23 @@ mod tests {
 
     #[cfg(all(windows, target_pointer_width = "64"))]
     #[test]
-    fn exclusive_byte_lock_blocks_a_preexisting_writer_handle() {
+    fn write_guard_refuses_a_preexisting_writer_and_blocks_new_writers() {
         use super::{FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, LockedProfileFile};
-        use std::io::Write;
         use std::os::windows::fs::OpenOptionsExt;
 
         let mut fixture = ProfileFixture::new(PROFILE);
-        let mut external_writer = OpenOptions::new()
+        let external_writer = OpenOptions::new()
             .read(true)
             .write(true)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .open(&fixture.path)
             .unwrap();
-        let _lock = LockedProfileFile::open(&fixture.path).unwrap();
-        external_writer.seek(SeekFrom::Start(0)).unwrap();
-        assert!(external_writer.write_all(b"[Changed]").is_err());
-        drop(_lock);
+        assert!(LockedProfileFile::open(&fixture.path).is_err());
+        drop(external_writer);
+        drop(fixture.file.take());
+        let lock = LockedProfileFile::open(&fixture.path).unwrap();
+        assert!(OpenOptions::new().write(true).open(&fixture.path).is_err());
+        drop(lock);
         assert_eq!(fixture.contents(), PROFILE);
     }
 

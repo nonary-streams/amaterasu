@@ -40,9 +40,52 @@ pub struct MigrationPlan {
 #[serde(deny_unknown_fields)]
 pub struct Grant {
     pub caller: String,
-    pub scope: Scope,
+    pub scope: GrantedScope,
     pub read: bool,
     pub write: bool,
+}
+
+/// Installation-only permissions. Wildcards never appear in a stored layer or
+/// a settings request; they grant a trusted caller access to a class of scopes.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "id",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum GrantedScope {
+    Host,
+    Application(String),
+    PairedClient(String),
+    Session(String),
+    AllApplications,
+    AllPairedClients,
+    AllSessions,
+}
+
+impl GrantedScope {
+    pub(crate) fn matches(&self, scope: &Scope) -> bool {
+        match (self, scope) {
+            (Self::Host, Scope::Host) => true,
+            (Self::Application(granted), Scope::Application(requested))
+            | (Self::PairedClient(granted), Scope::PairedClient(requested))
+            | (Self::Session(granted), Scope::Session(requested)) => granted == requested,
+            (Self::AllApplications, Scope::Application(_))
+            | (Self::AllPairedClients, Scope::PairedClient(_))
+            | (Self::AllSessions, Scope::Session(_)) => true,
+            _ => false,
+        }
+    }
+
+    fn valid(&self) -> bool {
+        match self {
+            Self::Application(id) | Self::PairedClient(id) | Self::Session(id) => {
+                !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control)
+            }
+            _ => true,
+        }
+    }
 }
 
 impl Settings {
@@ -74,6 +117,7 @@ impl Settings {
                 if grant.caller.is_empty()
                     || grant.caller.len() > 128
                     || (!grant.read && !grant.write)
+                    || !grant.scope.valid()
                 {
                     return Err("invalid descriptor grant".into());
                 }
@@ -87,7 +131,7 @@ impl InstalledDescriptor {
     pub fn allows(&self, caller: &str, scope: &Scope, write: bool) -> bool {
         self.grants.iter().any(|grant| {
             grant.caller == caller
-                && &grant.scope == scope
+                && grant.scope.matches(scope)
                 && if write { grant.write } else { grant.read }
         })
     }
@@ -174,7 +218,7 @@ mod tests {
             migrations: vec![],
             grants: vec![Grant {
                 caller: "management".into(),
-                scope: Scope::Host,
+                scope: GrantedScope::Host,
                 read: true,
                 write: false,
             }],
@@ -183,5 +227,37 @@ mod tests {
         assert!(!item.allows("management", &Scope::Host, true));
         assert!(!item.allows("other", &Scope::Host, false));
         assert!(!item.allows("management", &Scope::Session("s".into()), false));
+    }
+
+    #[test]
+    fn class_grants_match_only_the_declared_kind_and_never_become_request_scopes() {
+        for (document, selected, other) in [
+            (
+                "all_applications",
+                Scope::Application("app".into()),
+                Scope::PairedClient("app".into()),
+            ),
+            (
+                "all_paired_clients",
+                Scope::PairedClient("client".into()),
+                Scope::Session("client".into()),
+            ),
+            (
+                "all_sessions",
+                Scope::Session("session".into()),
+                Scope::Application("session".into()),
+            ),
+        ] {
+            let value = json!({"kind":document});
+            let grant: GrantedScope = serde_json::from_value(value.clone()).unwrap();
+            assert!(grant.matches(&selected));
+            assert!(!grant.matches(&other));
+            assert!(!grant.matches(&Scope::Host));
+            assert!(serde_json::from_value::<Scope>(value).is_err());
+        }
+        assert!(
+            serde_json::from_value::<GrantedScope>(json!({"kind":"all_sessions","id":"ignored"}))
+                .is_err()
+        );
     }
 }

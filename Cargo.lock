@@ -393,9 +393,14 @@ dependencies = [
 name = "amaterasu-frame-limiter"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-configuration-schema",
  "amaterasu-module-sdk",
+ "getrandom 0.3.4",
+ "libc",
  "serde",
  "serde_json",
+ "sha2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -792,6 +797,7 @@ dependencies = [
  "amaterasu-module-sdk",
  "amaterasu-runtime",
  "amaterasu-storage",
+ "libloading",
  "serde",
  "serde_json",
  "sha2",

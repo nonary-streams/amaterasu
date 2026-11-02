@@ -19,6 +19,18 @@ development policy and cannot stage a Linux session package.
 Nothing here is a claim that a real client has streamed. See
 [Gaps and pending checks](#gaps-and-pending-checks).
 
+The default package selects the frame-limiter module through the generic
+extension registry and lifecycle contracts. Its settings appear in the extension
+settings editor and limiting starts disabled. The module owns the MangoHUD and
+Proton behavior; the session host supplies authorized client context and waits
+for generic preparation and cleanup receipts. Capture and input retain their
+existing providers.
+
+Tools assembling a separate reviewed extension graph use
+`init-linux-session --external-extension-composition`. This leaves registry and
+lifecycle selection to that tool. It is an initialization option for the
+explicit extension packaging workflow, not a migration of an existing root.
+
 ## Safe defaults
 
 * Every effect-bearing component starts disabled: `amaterasu.linux-session-video`

@@ -28,6 +28,17 @@ function editorEnvironment() {
 }
 const normalized = (value) => JSON.parse(JSON.stringify(value));
 
+test("enum choices show plugin labels while preserving wire values", () => {
+  const create = editorEnvironment().extensionFieldEditor;
+  const editor = create({ type: "enum", default: "early", options: ["early", "late"] }, "late", {
+    early: "Smooth pacing", late: "Lower latency",
+  });
+  assert.equal(editor.node.children[0].children[0], "Smooth pacing");
+  assert.equal(editor.node.children[0].value, "early");
+  assert.equal(editor.node.children[1].children[0], "Lower latency");
+  assert.equal(editor.value(), "late");
+});
+
 test("nested schema editors preserve false, zero and empty strings", () => {
   const create = editorEnvironment().extensionFieldEditor;
   const editor = create({ type: "object", default: {}, fields: {

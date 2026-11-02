@@ -15,12 +15,16 @@ pub mod options;
 #[cfg(test)]
 mod tests;
 
+use super::default_extensions::{
+    COORDINATOR_COMPONENT as SESSION_LIFECYCLE, PROVIDER_COMPONENT as LINUX_FRAME_LIMITER,
+    REGISTRY_COMPONENT as EXTENSION_REGISTRY,
+};
 use super::{
     APPLICATION, AUDIO, AUDIO_ENCODE, AUTHENTICATION, CAPTURE_KMS, CAPTURE_PIPEWIRE, CAPTURE_VKMS,
-    CATALOG, CONFIGURATION, CONTROL_TRANSPORT, ComponentDefinition, DISPLAY, ENCODE, FRAME_LIMITER,
-    HOST_METRICS, INPUT, LAUNCH, LIBRARY, LUTRIS, MANAGEMENT, MEDIA_TRANSPORT, NETWORK, NVHTTP,
-    PAIRING, RTSP, RUNTIME, RUNTIME_ID, SESSION, SESSION_HISTORY, STATE, STEAM, STREAM_SESSION,
-    VIDEO, VIRTUAL_DISPLAY, names,
+    CATALOG, CONFIGURATION, CONTROL_TRANSPORT, ComponentDefinition, DISPLAY, ENCODE, HOST_METRICS,
+    INPUT, LAUNCH, LIBRARY, LUTRIS, MANAGEMENT, MEDIA_TRANSPORT, NETWORK, NVHTTP, PAIRING, RTSP,
+    RUNTIME, RUNTIME_ID, SESSION, SESSION_HISTORY, STATE, STEAM, STREAM_SESSION, VIDEO,
+    VIRTUAL_DISPLAY, names,
 };
 use amaterasu_contracts::{Grants, RuntimeConfig};
 use amaterasu_package::{PackageResult, create_private_directory};
@@ -71,6 +75,9 @@ pub const CONSOLE_ID: &str = "amaterasu.console";
 /// Services the development console may call: pairing and catalog authoring,
 /// listener status, and the state and configuration calls they delegate.
 const CONSOLE_CALLS: &[&str] = &[
+    "amaterasu.extension-registry/1",
+    "amaterasu.session-lifecycle/1",
+    "nonary.frame-limiter/1",
     "amaterasu.authentication/1",
     "amaterasu.catalog/1",
     "amaterasu.configuration/1",
@@ -90,6 +97,7 @@ const LINUX_SESSION_PAIRING: ComponentDefinition = ComponentDefinition {
 /// Launch without Playnite; Steam and Lutris integrations remain available.
 const LINUX_SESSION_LAUNCH: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "amaterasu.session-lifecycle/1",
         "amaterasu.lutris/1",
         "amaterasu.catalog/1",
         "amaterasu.state/1",
@@ -97,6 +105,7 @@ const LINUX_SESSION_LAUNCH: ComponentDefinition = ComponentDefinition {
         "amaterasu.application/1",
     ],
     dependencies: &[
+        "amaterasu.session-lifecycle",
         "amaterasu.lutris",
         RUNTIME_ID,
         "amaterasu.catalog",
@@ -162,6 +171,9 @@ const LINUX_SESSION_LIBRARY: ComponentDefinition = ComponentDefinition {
 
 const LINUX_SESSION_NVHTTP: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "amaterasu.session-lifecycle/1",
+        "amaterasu.extension-registry/1",
+        "nonary.frame-limiter/1",
         "amaterasu.lutris/1",
         "amaterasu.configuration/1",
         "amaterasu.input/1",
@@ -206,6 +218,9 @@ const LINUX_SESSION_NVHTTP: ComponentDefinition = ComponentDefinition {
 
 const LINUX_SESSION_RTSP: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "amaterasu.session-lifecycle/1",
+        "amaterasu.extension-registry/1",
+        "nonary.frame-limiter/1",
         "amaterasu.input/1",
         "amaterasu.stream-session/1",
         "amaterasu.session/1",
@@ -228,6 +243,9 @@ const LINUX_SESSION_RTSP: ComponentDefinition = ComponentDefinition {
 
 const LINUX_SESSION_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "amaterasu.session-lifecycle/1",
+        "amaterasu.extension-registry/1",
+        "nonary.frame-limiter/1",
         "amaterasu.host-metrics/1",
         "amaterasu.input/1",
         "amaterasu.session/1",
@@ -244,9 +262,9 @@ const LINUX_SESSION_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
         "amaterasu.capture-vkms/1",
         "amaterasu.encode/1",
         "amaterasu.session-history/1",
-        "amaterasu.frame-limiter/1",
     ],
     dependencies: &[
+        "amaterasu.session-lifecycle",
         "amaterasu.host-metrics",
         "amaterasu.input",
         RUNTIME_ID,
@@ -267,6 +285,8 @@ const LINUX_SESSION_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
 
 const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "amaterasu.extension-registry/1",
+        "nonary.frame-limiter/1",
         "amaterasu.library/1",
         "amaterasu.host-logs/1",
         "amaterasu.steam/1",
@@ -341,6 +361,8 @@ pub const COMPONENTS: &[ComponentDefinition] = &[
     STATE,
     SESSION,
     CONFIGURATION,
+    SESSION_LIFECYCLE,
+    EXTENSION_REGISTRY,
     SESSION_HISTORY,
     HOST_METRICS,
     STEAM,
@@ -365,32 +387,11 @@ pub const COMPONENTS: &[ComponentDefinition] = &[
     LINUX_SESSION_VIDEO,
     MEDIA_TRANSPORT,
     CONTROL_TRANSPORT,
-    FRAME_LIMITER,
+    LINUX_FRAME_LIMITER,
     LINUX_SESSION_STREAM_SESSION,
     LINUX_SESSION_RTSP,
 ];
 
-/// Explicit session extension components; the ordinary Linux profile does not select them.
-const SESSION_LIFECYCLE: ComponentDefinition = ComponentDefinition {
-    id: "amaterasu.session-lifecycle",
-    library: "amaterasu_session_lifecycle",
-    provides: &["amaterasu.session-lifecycle/1"],
-    calls: &[],
-    publishes: &[],
-    dependencies: &[RUNTIME_ID],
-    native_provides: &[],
-    native_uses: &[],
-};
-const EXTENSION_REGISTRY: ComponentDefinition = ComponentDefinition {
-    id: "amaterasu.extension-registry",
-    library: "amaterasu_extension_registry",
-    provides: &["amaterasu.extension-registry/1"],
-    calls: &["amaterasu.state/1"],
-    publishes: &[],
-    dependencies: &[RUNTIME_ID, "amaterasu.state"],
-    native_provides: &[],
-    native_uses: &[],
-};
 const EXTENSION_ACTIONS: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.extension-actions",
     library: "amaterasu_extension_actions",
@@ -435,7 +436,7 @@ pub const EXTENSION_COMPONENTS: &[ComponentDefinition] = &[
     LINUX_SESSION_VIDEO,
     MEDIA_TRANSPORT,
     CONTROL_TRANSPORT,
-    FRAME_LIMITER,
+    LINUX_FRAME_LIMITER,
     LINUX_SESSION_STREAM_SESSION,
     LINUX_SESSION_RTSP,
 ];
@@ -449,6 +450,11 @@ pub fn linux_session_policy(
     options.validate().map_err(|error| error.to_string())?;
     let mut policy = RuntimeConfig::default();
     for component in COMPONENTS {
+        if options.external_extension_composition
+            && [SESSION_LIFECYCLE.id, EXTENSION_REGISTRY.id].contains(&component.id)
+        {
+            continue;
+        }
         if component.id != RUNTIME_ID {
             policy
                 .principals
@@ -476,6 +482,15 @@ pub fn linux_session_policy(
 
     let directories = PrivateStateDirectories::create(root)?;
     policy.settings = settings(options, &directories);
+    if !options.external_extension_composition {
+        super::default_extensions::install(
+            &mut policy,
+            &[include_str!(
+                "../../../../modules/frame-limiter/metadata/linux.json"
+            )],
+            &directories.lifecycle,
+        )?;
+    }
     Ok(policy)
 }
 
@@ -483,6 +498,7 @@ pub fn linux_session_policy(
 struct PrivateStateDirectories {
     state: std::path::PathBuf,
     session_history_database: std::path::PathBuf,
+    lifecycle: std::path::PathBuf,
 }
 
 impl PrivateStateDirectories {
@@ -491,9 +507,11 @@ impl PrivateStateDirectories {
         create_private_directory(&data)?;
         let state = canonical_private_directory(&data.join("state"))?;
         let history = canonical_private_directory(&state.join("session-history"))?;
+        let lifecycle = canonical_private_directory(&state.join("session-lifecycle"))?;
         Ok(Self {
             state,
             session_history_database: history.join("history.db"),
+            lifecycle,
         })
     }
 }

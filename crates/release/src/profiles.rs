@@ -5,7 +5,9 @@ use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+mod default_extensions;
 pub mod linux_session;
+mod platform_extensions;
 
 pub const RUNTIME_ID: &str = "amaterasu.runtime";
 
@@ -667,7 +669,6 @@ const STREAM_SESSION: ComponentDefinition = ComponentDefinition {
         "amaterasu.host-metrics/1",
         "amaterasu.updater/1",
         "amaterasu.system-tray/1",
-        "amaterasu.frame-limiter/1",
     ],
     publishes: &[],
     native_provides: &[],
@@ -857,7 +858,6 @@ const STREAM_SESSION_DXGI_SMOKE: ComponentDefinition = ComponentDefinition {
         "amaterasu.capture-dxgi/1",
         "amaterasu.encode/1",
         "amaterasu.session-history/1",
-        "amaterasu.frame-limiter/1",
     ],
     dependencies: &[
         "amaterasu.input",
@@ -948,7 +948,6 @@ const STREAM_SESSION_SOFTWARE_PROBE: ComponentDefinition = ComponentDefinition {
         "amaterasu.host-metrics/1",
         "amaterasu.updater/1",
         "amaterasu.system-tray/1",
-        "amaterasu.frame-limiter/1",
     ],
     dependencies: &[
         "amaterasu.input-probe",
@@ -1364,7 +1363,6 @@ const LINUX_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
         "amaterasu.encode/1",
         "amaterasu.session-history/1",
         "amaterasu.host-metrics/1",
-        "amaterasu.frame-limiter/1",
     ],
     dependencies: &[
         "amaterasu.input-probe",
@@ -1628,6 +1626,8 @@ impl PackageProfile {
                 UPDATER,
                 SYSTEM_TRAY,
                 CONFIGURATION,
+                platform_extensions::COORDINATOR,
+                platform_extensions::REGISTRY,
                 CATALOG,
                 LIBRARY,
                 APPLICATION,
@@ -1637,11 +1637,11 @@ impl PackageProfile {
                 PLAYNITE,
                 LUTRIS,
                 AUTHENTICATION,
-                MANAGEMENT,
+                platform_extensions::ADMIN,
                 PLATFORM_PAIRING,
-                NVHTTP,
+                platform_extensions::TRANSPORT,
                 DISPLAY,
-                LAUNCH,
+                platform_extensions::EXECUTOR,
                 INPUT,
                 VIRTUAL_DISPLAY,
                 CAPTURE_DXGI,
@@ -1653,9 +1653,9 @@ impl PackageProfile {
                 X11_VIDEO,
                 MEDIA_TRANSPORT,
                 CONTROL_TRANSPORT,
-                FRAME_LIMITER,
-                STREAM_SESSION,
-                RTSP,
+                platform_extensions::PROVIDER,
+                platform_extensions::STREAM,
+                platform_extensions::STREAM_CONTROL,
             ],
             Self::ExtensionExample => &[
                 RUNTIME,
@@ -1668,6 +1668,8 @@ impl PackageProfile {
                 UPDATER,
                 SYSTEM_TRAY,
                 CONFIGURATION,
+                platform_extensions::COORDINATOR,
+                platform_extensions::REGISTRY,
                 CATALOG,
                 LIBRARY,
                 APPLICATION,
@@ -1677,11 +1679,11 @@ impl PackageProfile {
                 PLAYNITE,
                 LUTRIS,
                 AUTHENTICATION,
-                MANAGEMENT_EXTENSION_EXAMPLE,
+                platform_extensions::EXAMPLE_ADMIN,
                 PLATFORM_PAIRING,
-                NVHTTP,
+                platform_extensions::TRANSPORT,
                 DISPLAY,
-                LAUNCH,
+                platform_extensions::EXECUTOR,
                 INPUT,
                 VIRTUAL_DISPLAY,
                 CAPTURE_DXGI,
@@ -1693,9 +1695,9 @@ impl PackageProfile {
                 X11_VIDEO,
                 MEDIA_TRANSPORT,
                 CONTROL_TRANSPORT,
-                FRAME_LIMITER,
-                STREAM_SESSION,
-                RTSP,
+                platform_extensions::PROVIDER,
+                platform_extensions::STREAM,
+                platform_extensions::STREAM_CONTROL,
             ],
         }
     }
@@ -1718,6 +1720,13 @@ impl ComponentDefinition {
 // generation whenever its administrator_principals or allowed_scopes change, including a
 // revert; TTL-only edits do not bump it.
 pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
+    development_policy_with_extensions(root, true)
+}
+
+fn development_policy_with_extensions(
+    root: &Path,
+    install_extensions: bool,
+) -> PackageResult<RuntimeConfig> {
     let mut policy = RuntimeConfig::default();
     let mut console = Grants::default();
 
@@ -1860,6 +1869,23 @@ pub fn development_policy(root: &Path) -> PackageResult<RuntimeConfig> {
     policy
         .principals
         .insert("amaterasu.pairing".into(), PLATFORM_PAIRING.grants());
+    if install_extensions {
+        // This development policy combines several qualification packages. Keep
+        // their grants and include the contracts selected by the product graph.
+        for component in PackageProfile::Platform.components() {
+            if let Some(grants) = policy.principals.get_mut(component.id) {
+                grants.call.extend(names(component.calls));
+                grants.provide.extend(names(component.provides));
+            }
+        }
+        let journal_directory = state_directory.join("session-lifecycle");
+        create_private_directory(&journal_directory)?;
+        default_extensions::install(
+            &mut policy,
+            &[platform_extensions::NATIVE_METADATA],
+            &journal_directory,
+        )?;
+    }
     Ok(policy)
 }
 
@@ -1873,7 +1899,7 @@ pub fn desktop_stream_smoke_policy(
     root: &Path,
     allow_remote: bool,
 ) -> PackageResult<RuntimeConfig> {
-    let mut policy = development_policy(root)?;
+    let mut policy = development_policy_with_extensions(root, false)?;
     let components = PackageProfile::DesktopStreamSmoke.components();
     let component_ids: BTreeSet<_> = components.iter().map(|component| component.id).collect();
     policy.principals.retain(|principal, _| {
@@ -2058,6 +2084,11 @@ pub fn installer_policy(
             json!({"enabled": false, "allow_remote": false, "address_family":"ipv4", "bind_address":"", "allowed_principals": []}),
         ),
     ]);
+    default_extensions::install_with_runtime_journal(
+        &mut policy,
+        &[platform_extensions::WINDOWS_METADATA],
+    )
+    .expect("bundled default extension metadata must be valid");
     policy
 }
 

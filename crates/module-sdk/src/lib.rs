@@ -12,6 +12,7 @@ pub mod network;
 #[cfg(feature = "network-http")]
 pub mod network_http;
 pub mod requests;
+pub mod retained_options;
 pub mod transport;
 pub mod video;
 pub mod virtual_display;

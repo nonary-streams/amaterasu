@@ -511,6 +511,8 @@ fn frozen_action_lineage_survives_restart_and_rejects_tampering() {
             ("stream-admission".into(), stream_target),
         ]
         .into(),
+        capture_binding_mode: Default::default(),
+        prepared_plan_ids: Default::default(),
         admission_phases: [
             ("session-admission".into(), LifecyclePhase::SessionPrepare),
             ("stream-admission".into(), LifecyclePhase::StreamPrepare),

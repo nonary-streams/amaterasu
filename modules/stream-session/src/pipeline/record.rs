@@ -141,9 +141,6 @@ pub(super) struct Record {
     pub input_attempted: bool,
     pub input_lookup_required: bool,
     pub input_lease: Option<String>,
-    pub limiter_attempted: bool,
-    pub limiter_lease: Option<String>,
-    pub limiter_state: String,
     pub virtual_display_attempted: bool,
     pub virtual_display_output: Option<String>,
     pub display_attempted: bool,
@@ -278,9 +275,6 @@ impl Record {
             input_attempted: false,
             input_lookup_required: false,
             input_lease: None,
-            limiter_attempted: false,
-            limiter_lease: None,
-            limiter_state: "not_requested".into(),
             virtual_display_attempted: false,
             virtual_display_output: None,
             display_attempted: false,
@@ -332,10 +326,6 @@ impl Record {
         self.display_operation_id
             .clone()
             .unwrap_or_else(|| format!("ss-{:x}-display", self.id))
-    }
-
-    pub fn limiter_session(&self) -> String {
-        format!("stream-{:016x}", self.id)
     }
 
     pub fn lease(&self, audio: bool) -> String {
@@ -406,6 +396,7 @@ impl Record {
             "ok": true,
             "session": self.id,
             "lifecycle_session_target": self.config.lifecycle_session_target,
+            "lifecycle_capture_mode": self.config.lifecycle_capture_mode,
             "lifecycle_input_required": self.lifecycle_input_required,
             "lifecycle_target": self.start.as_ref().and_then(|start| start.lifecycle_target.as_ref()),
             "lifecycle_retired": self.lifecycle_retired,
@@ -425,10 +416,6 @@ impl Record {
                 && self.state == State::Active,
             "stream_audio": self.config.stream_audio,
             "audio": self.config.audio,
-            "frame_limiter_settings": self.config.frame_limiter_settings,
-            "frame_limiter_executable_path": self.config.frame_limiter_executable_path,
-            "frame_limiter_state": self.limiter_state,
-            "frame_limiter_applied": self.limiter_lease.is_some() && self.limiter_state == "applied",
             "display_request": self.config.display_request.as_ref().map(|request| {
                 let mut value = json!({"configuration": request.configuration,
                     "expected_topology_revision":request.expected_topology_revision});

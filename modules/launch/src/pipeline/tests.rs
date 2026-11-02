@@ -106,6 +106,7 @@ struct Harness {
     generic_lost_start: bool,
     generic_bad_proof: bool,
     drop_prepare_result: bool,
+    prepared_context: Option<Value>,
 }
 impl Harness {
     fn new() -> Self {
@@ -182,6 +183,7 @@ impl Harness {
             generic_lost_start: false,
             generic_bad_proof: false,
             drop_prepare_result: false,
+            prepared_context: None,
         }
     }
     fn session_reply(session: &TestSession) -> Value {
@@ -565,7 +567,11 @@ impl Harness {
                 parent,
                 ..
             } => {
-                let action = payload["action"].as_str().unwrap().to_owned();
+                let action = payload["action"]
+                    .as_str()
+                    .or_else(|| payload["operation"].as_str())
+                    .unwrap()
+                    .to_owned();
                 self.commands
                     .push((service.clone(), payload.clone(), parent));
                 if service == crate::workflow::LUTRIS && self.lutris_transport_unavailable {
@@ -585,6 +591,7 @@ impl Harness {
                     assert!(self.released > 0, "lookup must follow release");
                 }
                 let result = match service.as_str() {
+                    "example.context/1" => self.prepared_context.clone().expect("context fixture"),
                     crate::workflow::CATALOG => {
                         assert_eq!(parent, Some(7));
                         assert!(matches!(
@@ -919,7 +926,6 @@ fn exported_lutris_preflight_rechecks_status_at_launch_admission() {
         Some(json!({"ok":true,"settings_ready":true,"enabled":false,"available":true}));
     let mut launch = launch_export("lutris-export");
     launch["preflight_token"] = preflight["preflight_token"].clone();
-    launch["frame_limiter_settings"] = frame_limiter_snapshot();
     let denied = harness.request(&mut pipeline, "amaterasu.nvhttp", launch);
     assert_eq!(
         denied["launch"]["failure"], "lutris_unavailable",
@@ -996,169 +1002,15 @@ fn lutris_disable_after_session_acquisition_prevents_process_spawn_and_cleans_up
 }
 
 #[test]
-fn launch_export_accepts_only_object_shaped_frame_limiter_compatibility_fields() {
-    let candidate: Operation = serde_json::from_value(json!({
-        "action":"launch_export",
-        "operation_id":"compatibility-objects",
-        "app_id":"app-0000000000000001",
-        "frame_limiter_settings":{"enabled":true,"provider":"auto"},
-        "client_frame_limiter_overrides":{"fps_limit":120},
-    }))
-    .unwrap();
-    candidate.validate().unwrap();
-    let Operation::LaunchExport {
-        frame_limiter_settings,
-        client_frame_limiter_overrides,
-        ..
-    } = candidate
-    else {
-        panic!("expected launch export operation");
-    };
-    assert_eq!(frame_limiter_settings.unwrap()["provider"], "auto");
-    assert_eq!(client_frame_limiter_overrides.unwrap()["fps_limit"], 120);
-
-    let legacy: Operation = serde_json::from_value(launch_export("legacy-omitted")).unwrap();
-    let Operation::LaunchExport {
-        frame_limiter_settings,
-        client_frame_limiter_overrides,
-        preflight_token,
-        display_admission_token,
-        virtual_display_intent,
-        proton_dualsense_compatibility,
-        return_on_admission,
-        ..
-    } = legacy
-    else {
-        panic!("expected launch export operation");
-    };
-    assert_eq!(frame_limiter_settings, None);
-    assert_eq!(client_frame_limiter_overrides, None);
-    assert_eq!(preflight_token, None);
-    assert_eq!(display_admission_token, None);
-    assert_eq!(virtual_display_intent, None);
-    assert!(!proton_dualsense_compatibility);
-    assert!(!return_on_admission);
-
-    let null_compatibility: Operation = serde_json::from_value(json!({
-        "action":"launch_export",
-        "operation_id":"compatibility-null",
-        "app_id":"app-0000000000000001",
-        "frame_limiter_settings":null,
-        "client_frame_limiter_overrides":null,
-    }))
-    .unwrap();
-    let Operation::LaunchExport {
-        frame_limiter_settings,
-        client_frame_limiter_overrides,
-        ..
-    } = null_compatibility
-    else {
-        panic!("expected launch export operation");
-    };
-    assert_eq!(frame_limiter_settings, None);
-    assert_eq!(client_frame_limiter_overrides, None);
-
-    for field in ["frame_limiter_settings", "client_frame_limiter_overrides"] {
-        for invalid in [json!("settings"), json!(1), json!(false), json!([])] {
-            let mut request = launch_export("compatibility-invalid-type");
-            request[field] = invalid.clone();
-            assert!(
-                serde_json::from_value::<Operation>(request).is_err(),
-                "accepted non-object value {invalid} for {field}"
-            );
-        }
-    }
-
-    let mut unknown_field = launch_export("compatibility-unknown-field");
-    unknown_field["unrelated_top_level_field"] = json!(true);
-    assert!(serde_json::from_value::<Operation>(unknown_field).is_err());
-}
-
-fn frame_limiter_snapshot() -> Value {
-    json!({
-        "version":1,
-        "settings":{
-            "frame_limiter_enable":true,
-            "frame_limiter_fps_limit_millihz":120000,
-            "frame_limiter_provider":"auto",
-            "frame_limiter_disable_vsync":false,
-            "frame_limiter_auto_virtual_framegen":"enabled",
-            "rtss_frame_limit_type":"async",
-            "rtss_allow_virtual_display_override":false,
-            "rtss_install_path":"",
-            "mangohud_limiter_method":"late",
-            "mangohud_preset":"custom",
-            "mangohud_always_show_graph":false
-        },
-        "requested_stream_fps_millihz":60000,
-        "client_display_mode_override_millihz":null,
-        "lossless_scaling_limit_millihz":null,
-        "virtual_display_active":null,
-        "physical_framegen_capture":null,
-        "game_frame_generation_mode":null,
-        "rtss_frame_limit_type_explicit_override":null
-    })
-}
-
-#[test]
-fn client_frame_limiter_overrides_require_a_frozen_preflight_row() {
+fn preflight_freezes_catalog_row_for_all_readbacks() {
     let mut harness = Harness::new();
-    let mut pipeline = pipeline();
-    let mut launch = launch_export("client-policy-without-preflight");
-    launch["client_frame_limiter_overrides"] = json!({"frame_limiter_enable":false});
-
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.nvhttp", launch)["code"],
-        "preflight_required"
-    );
-    assert!(harness.commands.is_empty());
-    assert!(harness.sessions.is_empty());
-    assert!(harness.processes.is_empty());
-
-    let mut snapshot_without_preflight = launch_export("snapshot-without-preflight");
-    snapshot_without_preflight["frame_limiter_settings"] = frame_limiter_snapshot();
-    assert_eq!(
-        harness.request(
-            &mut pipeline,
-            "amaterasu.nvhttp",
-            snapshot_without_preflight
-        )["code"],
-        "preflight_required"
-    );
-    assert!(harness.commands.is_empty());
-
-    let preflight = harness.request(
-        &mut pipeline,
-        "amaterasu.nvhttp",
-        json!({"action":"preflight_export","operation_id":"client-policy-without-preflight","app_id":"app-0000000000000001"}),
-    );
-    assert_eq!(preflight["ok"], true, "{preflight}");
-    let mut launch = launch_export("client-policy-without-preflight");
-    launch["preflight_token"] = preflight["preflight_token"].clone();
-    launch["frame_limiter_settings"] = frame_limiter_snapshot();
-    launch["frame_limiter_settings"]["settings"]["frame_limiter_enable"] = json!(false);
-    launch["client_frame_limiter_overrides"] = json!({"frame_limiter_enable":false});
-    let started = harness.request(&mut pipeline, "amaterasu.nvhttp", launch);
-    assert_eq!(started["launch"]["state"], "active", "{started}");
-    assert_eq!(
-        started["launch"]["client_frame_limiter_overrides"],
-        json!({"frame_limiter_enable":false})
-    );
-}
-
-#[test]
-fn preflight_freezes_catalog_row_and_frame_limiter_snapshot_for_all_readbacks() {
-    let mut harness = Harness::new();
-    harness.catalog_config_overrides = Some(json!({"frame_limiter_enable":true}));
+    harness.catalog_config_overrides = Some(json!({"stream_audio":true}));
     let mut pipeline = pipeline();
     let operation_id = "frozen-frame-policy";
     let preflight_request = json!({"action":"preflight_export","operation_id":operation_id,"app_id":"app-0000000000000001"});
     let preflight = harness.request(&mut pipeline, "amaterasu.nvhttp", preflight_request.clone());
     assert_eq!(preflight["catalog_revision"], 1);
-    assert_eq!(
-        preflight["config_overrides"],
-        json!({"frame_limiter_enable":true})
-    );
+    assert_eq!(preflight["config_overrides"], json!({"stream_audio":true}));
     assert_eq!(preflight["app_id"], "app-0000000000000001");
     assert!(preflight["executable_path"].is_string());
     assert!(harness.sessions.is_empty());
@@ -1170,9 +1022,7 @@ fn preflight_freezes_catalog_row_and_frame_limiter_snapshot_for_all_readbacks() 
 
     let mut request = launch_export(operation_id);
     request["preflight_token"] = preflight["preflight_token"].clone();
-    request["frame_limiter_settings"] = frame_limiter_snapshot();
-    request["client_frame_limiter_overrides"] = json!({});
-    harness.catalog_config_overrides = Some(json!({"frame_limiter_enable":false}));
+    harness.catalog_config_overrides = Some(json!({"stream_audio":false}));
     let started = harness.request(&mut pipeline, "amaterasu.nvhttp", request.clone());
     assert_eq!(started["launch"]["state"], "active", "{started}");
     assert_eq!(
@@ -1184,18 +1034,12 @@ fn preflight_freezes_catalog_row_and_frame_limiter_snapshot_for_all_readbacks() 
         preflight["executable_path"]
     );
     assert_eq!(
-        started["launch"]["frame_limiter_settings"],
-        frame_limiter_snapshot()
-    );
-    assert_eq!(
         harness.request(&mut pipeline, "amaterasu.nvhttp", request),
         started
     );
     let mut changed_retry = launch_export(operation_id);
+    changed_retry["proton_dualsense_compatibility"] = json!(true);
     changed_retry["preflight_token"] = preflight["preflight_token"].clone();
-    changed_retry["frame_limiter_settings"] = frame_limiter_snapshot();
-    changed_retry["frame_limiter_settings"]["requested_stream_fps_millihz"] = json!(120000);
-    changed_retry["client_frame_limiter_overrides"] = json!({});
     assert_eq!(
         harness.request(&mut pipeline, "amaterasu.nvhttp", changed_retry)["code"],
         "operation_conflict"
@@ -1206,10 +1050,6 @@ fn preflight_freezes_catalog_row_and_frame_limiter_snapshot_for_all_readbacks() 
         json!({"action":"lookup","operation_id":operation_id}),
     ] {
         let readback = harness.request(&mut pipeline, "amaterasu.nvhttp", query);
-        assert_eq!(
-            readback["launch"]["frame_limiter_settings"],
-            frame_limiter_snapshot()
-        );
         assert_eq!(
             readback["launch"]["config_overrides"],
             preflight["config_overrides"]
@@ -1226,12 +1066,9 @@ fn preflight_freezes_catalog_row_and_frame_limiter_snapshot_for_all_readbacks() 
 }
 
 #[test]
-fn preflight_keeps_target_and_sparse_limiter_policy_together_after_catalog_edit() {
+fn preflight_keeps_target_and_sparse_policy_together_after_catalog_edit() {
     let mut harness = Harness::new();
-    let mut original_policy = json!({"frame_limiter_enable":false});
-    if cfg!(windows) {
-        original_policy["rtss_frame_limit_type"] = json!("back edge sync");
-    }
+    let original_policy = json!({"stream_audio":false});
     harness.catalog_config_overrides = Some(original_policy.clone());
     let mut pipeline = pipeline();
     let operation_id = "frozen-target-and-policy";
@@ -1245,33 +1082,15 @@ fn preflight_keeps_target_and_sparse_limiter_policy_together_after_catalog_edit(
 
     let mut launch = launch_export(operation_id);
     launch["preflight_token"] = preflight["preflight_token"].clone();
-    launch["frame_limiter_settings"] = frame_limiter_snapshot();
-    launch["frame_limiter_settings"]["settings"]["frame_limiter_enable"] = json!(false);
-    let mut client_overrides = json!({"frame_limiter_enable":null});
-    if cfg!(windows) {
-        launch["frame_limiter_settings"]["settings"]["rtss_frame_limit_type"] =
-            json!("back edge sync");
-        launch["frame_limiter_settings"]["rtss_frame_limit_type_explicit_override"] = json!(true);
-        client_overrides["rtss_frame_limit_type"] = Value::Null;
-    }
-    launch["client_frame_limiter_overrides"] = client_overrides.clone();
 
     harness.catalog_playnite_game_id = Some("later-game".into());
-    harness.catalog_config_overrides = Some(json!({"frame_limiter_enable":true}));
+    harness.catalog_config_overrides = Some(json!({"stream_audio":true}));
     let started = harness.request(&mut pipeline, "amaterasu.nvhttp", launch.clone());
     assert_eq!(started["launch"]["state"], "active", "{started}");
     assert_eq!(started["launch"]["config_overrides"], original_policy);
     assert_eq!(
         started["launch"]["executable_path"],
         preflight["executable_path"]
-    );
-    assert_eq!(
-        started["launch"]["frame_limiter_settings"],
-        launch["frame_limiter_settings"]
-    );
-    assert_eq!(
-        started["launch"]["client_frame_limiter_overrides"],
-        client_overrides
     );
     assert!(harness.provider_launches.is_empty());
     assert_eq!(harness.processes.len(), 1);
@@ -1299,98 +1118,6 @@ fn preflight_keeps_target_and_sparse_limiter_policy_together_after_catalog_edit(
     ] {
         assert_eq!(readback, started);
     }
-}
-
-#[test]
-fn rtsp_verifies_only_the_active_preflight_frame_limiter_snapshot() {
-    let mut harness = Harness::new();
-    let mut pipeline = pipeline();
-    let operation_id = "verified-frame-limiter";
-    let app_id = "app-0000000000000001";
-    let preflight = harness.request(
-        &mut pipeline,
-        "amaterasu.nvhttp",
-        json!({"action":"preflight_export","operation_id":operation_id,"app_id":app_id}),
-    );
-    assert_eq!(preflight["ok"], true, "{preflight}");
-    let mut launch = launch_export(operation_id);
-    launch["preflight_token"] = preflight["preflight_token"].clone();
-    launch["frame_limiter_settings"] = frame_limiter_snapshot();
-    let mut verify = json!({
-        "action":"verify_frame_limiter_snapshot",
-        "application_operation_id":operation_id,
-        "app_id":app_id,
-        "catalog_revision":preflight["catalog_revision"],
-        "frame_limiter_settings":launch["frame_limiter_settings"],
-        "frame_limiter_executable_path":preflight["executable_path"],
-    });
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.rtsp", verify.clone())["code"],
-        "frame_limiter_snapshot_denied"
-    );
-
-    let started = harness.request(&mut pipeline, "amaterasu.nvhttp", launch);
-    assert_eq!(started["launch"]["state"], "active", "{started}");
-    assert_eq!(
-        harness.request(&mut pipeline, "other-service", verify.clone())["code"],
-        "frame_limiter_snapshot_denied"
-    );
-    let verified = harness.request(&mut pipeline, "amaterasu.rtsp", verify.clone());
-    assert_eq!(
-        verified,
-        json!({
-            "ok":true,
-            "verified":true,
-            "application_operation_id":operation_id,
-            "app_id":app_id,
-            "catalog_revision":preflight["catalog_revision"],
-            "frame_limiter_settings":started["launch"]["frame_limiter_settings"],
-            "frame_limiter_executable_path":preflight["executable_path"],
-        })
-    );
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.rtsp", verify.clone()),
-        verified
-    );
-
-    for (field, value) in [
-        ("application_operation_id", json!("other-operation")),
-        ("app_id", json!("app-0000000000000002")),
-        ("catalog_revision", json!(2)),
-        ("frame_limiter_executable_path", json!("other-executable")),
-    ] {
-        let mut changed = verify.clone();
-        changed[field] = value;
-        assert_eq!(
-            harness.request(&mut pipeline, "amaterasu.rtsp", changed)["code"],
-            "frame_limiter_snapshot_denied",
-            "{field}"
-        );
-    }
-    verify["frame_limiter_settings"]["settings"]["frame_limiter_enable"] = json!(false);
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.rtsp", verify.clone())["code"],
-        "frame_limiter_snapshot_denied"
-    );
-    verify["frame_limiter_settings"] = started["launch"]["frame_limiter_settings"].clone();
-    assert_eq!(
-        harness
-            .commands
-            .iter()
-            .filter(|(service, _, _)| service == crate::workflow::CATALOG)
-            .count(),
-        1
-    );
-    let stopped = harness.request(
-        &mut pipeline,
-        "amaterasu.nvhttp",
-        json!({"action":"stop","launch_id":started["launch"]["launch_id"]}),
-    );
-    assert_ne!(stopped["launch"]["state"], "active", "{stopped}");
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.rtsp", verify)["code"],
-        "frame_limiter_snapshot_denied"
-    );
 }
 
 #[test]
@@ -1422,7 +1149,6 @@ fn display_export_is_bound_to_frozen_catalog_policy_and_retained_on_retry() {
 
     let mut launch = launch_export("frozen-display-policy");
     launch["preflight_token"] = preflight["preflight_token"].clone();
-    launch["frame_limiter_settings"] = frame_limiter_snapshot();
     launch["application_display_overrides"] = display.clone();
     let mut wrong_token = launch.clone();
     wrong_token["preflight_token"] = json!("wrong-token");
@@ -1495,7 +1221,6 @@ fn per_application_display_settings_are_frozen_and_admission_bound() {
 
     let mut launch = launch_export("app-display-settings");
     launch["preflight_token"] = preflight["preflight_token"].clone();
-    launch["frame_limiter_settings"] = frame_limiter_snapshot();
     launch["application_display_settings"] = settings.clone();
     let mut mismatch = launch.clone();
     mismatch["application_display_settings"]["virtual_screen"] = json!(true);
@@ -1657,7 +1382,6 @@ fn signed_principals_attest_frozen_display_policy_and_reject_changed_or_revoked_
     );
     let mut launch = launch_export("admitted-application");
     launch["preflight_token"] = preflight["preflight_token"].clone();
-    launch["frame_limiter_settings"] = frame_limiter_snapshot();
     launch["application_display_overrides"] = application.clone();
     assert_eq!(
         harness.request(&mut pipeline, "amaterasu.nvhttp", launch.clone())["code"],
@@ -1829,7 +1553,6 @@ fn staged_display_admission_expires_or_stops_before_launch() {
     );
     let mut launch = launch_export("expiring-app");
     launch["preflight_token"] = preflight["preflight_token"].clone();
-    launch["frame_limiter_settings"] = frame_limiter_snapshot();
     launch["display_admission_token"] = admission["display_admission_token"].clone();
     assert_ne!(
         harness.request(&mut pipeline, "amaterasu.nvhttp", launch)["ok"],
@@ -1889,7 +1612,6 @@ fn already_launched_display_admission_keeps_legacy_launch_retry() {
     );
     let mut launch = launch_export("legacy-display-app");
     launch["preflight_token"] = preflight["preflight_token"].clone();
-    launch["frame_limiter_settings"] = frame_limiter_snapshot();
     let started = harness.request(&mut pipeline, "amaterasu.nvhttp", launch.clone());
     assert_eq!(started["launch"]["state"], "active");
     let prepare = json!({
@@ -2052,7 +1774,6 @@ fn preflight_token_is_bound_to_runtime_identity_application_and_operation() {
     );
     let mut launch = launch_export("bound-token");
     launch["preflight_token"] = preflight["preflight_token"].clone();
-    launch["frame_limiter_settings"] = frame_limiter_snapshot();
 
     for (caller, initiator, expected) in [
         ("other-service", "paired-client", "preflight_not_found"),
@@ -2100,124 +1821,6 @@ fn preflight_token_is_bound_to_runtime_identity_application_and_operation() {
         harness.request_as(&mut pipeline, "amaterasu.nvhttp", "paired-client", launch)["launch"]["state"],
         "active"
     );
-}
-
-#[test]
-fn preflight_rejects_invalid_catalog_policy_and_export_rejects_snapshot_mismatch() {
-    let mut harness = Harness::new();
-    let mut pipeline = pipeline();
-    harness.catalog_config_overrides = Some(json!({"rtss_frame_limit_type":17}));
-    let rejected = harness.request(
-        &mut pipeline,
-        "amaterasu.nvhttp",
-        json!({"action":"preflight_export","operation_id":"invalid-catalog","app_id":"app-0000000000000001"}),
-    );
-    assert_eq!(rejected["code"], "invalid_catalog_response");
-    assert!(harness.sessions.is_empty());
-
-    harness.catalog_config_overrides = Some(json!({"frame_limiter_enable":false}));
-    let preflight = harness.request(
-        &mut pipeline,
-        "amaterasu.nvhttp",
-        json!({"action":"preflight_export","operation_id":"validate-snapshot","app_id":"app-0000000000000001"}),
-    );
-    let mut launch = launch_export("validate-snapshot");
-    launch["preflight_token"] = preflight["preflight_token"].clone();
-    launch["frame_limiter_settings"] = frame_limiter_snapshot();
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.nvhttp", launch.clone())["code"],
-        "frame_limiter_policy_mismatch"
-    );
-    launch["frame_limiter_settings"]["settings"]["frame_limiter_enable"] = json!(false);
-    launch["frame_limiter_settings"]["requested_stream_fps_millihz"] = json!("60hz");
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.nvhttp", launch.clone())["code"],
-        "invalid_frame_limiter_snapshot"
-    );
-    launch["frame_limiter_settings"]["requested_stream_fps_millihz"] = json!(60000);
-    launch["client_frame_limiter_overrides"] = json!({"unrecognized":null});
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.nvhttp", launch.clone())["code"],
-        "invalid_client_frame_limiter_overrides"
-    );
-    launch["client_frame_limiter_overrides"] = json!({"frame_limiter_fps_limit":"120"});
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.nvhttp", launch.clone())["code"],
-        "invalid_client_frame_limiter_overrides"
-    );
-    launch["client_frame_limiter_overrides"] = json!({});
-    launch["frame_limiter_settings"]["rtss_frame_limit_type_explicit_override"] = json!("async");
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.nvhttp", launch.clone())["code"],
-        "invalid_frame_limiter_snapshot"
-    );
-    launch["frame_limiter_settings"]["rtss_frame_limit_type_explicit_override"] = Value::Null;
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.nvhttp", launch)["launch"]["state"],
-        "active"
-    );
-}
-
-#[test]
-fn rtss_limit_type_stays_sparse_across_preflight_launch_and_status() {
-    let mut cases = vec![("absent", None, None), ("null", Some(Value::Null), None)];
-    if cfg!(windows) {
-        for value in [
-            "async",
-            "front edge sync",
-            "back edge sync",
-            "nvidia reflex",
-        ] {
-            cases.push((value, Some(json!(value)), Some(value)));
-        }
-    }
-    for (index, (case, configured, expected)) in cases.into_iter().enumerate() {
-        let mut harness = Harness::new();
-        harness.catalog_config_overrides =
-            configured.map(|value| json!({"rtss_frame_limit_type":value}));
-        let mut pipeline = pipeline();
-        let operation_id = format!("rtss-preflight-{index}");
-        let preflight = harness.request(
-            &mut pipeline,
-            "amaterasu.nvhttp",
-            json!({"action":"preflight_export","operation_id":operation_id,"app_id":"app-0000000000000001"}),
-        );
-        assert_eq!(
-            preflight["config_overrides"]
-                .get("rtss_frame_limit_type")
-                .and_then(Value::as_str),
-            expected,
-            "{case}: {preflight}"
-        );
-        let mut launch = launch_export(&operation_id);
-        launch["preflight_token"] = preflight["preflight_token"].clone();
-        launch["frame_limiter_settings"] = frame_limiter_snapshot();
-        launch["frame_limiter_settings"]["settings"]["rtss_frame_limit_type"] =
-            json!(expected.unwrap_or("async"));
-        if expected.is_some() {
-            launch["frame_limiter_settings"]["rtss_frame_limit_type_explicit_override"] =
-                json!(true);
-        }
-        let started = harness.request(&mut pipeline, "amaterasu.nvhttp", launch);
-        assert_eq!(started["launch"]["state"], "active", "{case}: {started}");
-        assert_eq!(
-            started["launch"]["config_overrides"]
-                .get("rtss_frame_limit_type")
-                .and_then(Value::as_str),
-            expected
-        );
-        let status = harness.request(
-            &mut pipeline,
-            "amaterasu.nvhttp",
-            json!({"action":"status","launch_id":started["launch"]["launch_id"]}),
-        );
-        assert_eq!(
-            status["launch"]["config_overrides"]
-                .get("rtss_frame_limit_type")
-                .and_then(Value::as_str),
-            expected
-        );
-    }
 }
 
 #[test]
@@ -2283,7 +1886,6 @@ fn expired_preflight_token_cannot_launch_or_resurrect_after_catalog_change() {
         .preflight_deadline = Some(Instant::now() - Duration::from_secs(1));
     let mut launch = launch_export("expired-token");
     launch["preflight_token"] = preflight["preflight_token"].clone();
-    launch["frame_limiter_settings"] = frame_limiter_snapshot();
     assert_eq!(
         harness.request(&mut pipeline, "amaterasu.nvhttp", launch.clone())["code"],
         "preflight_not_found"
@@ -2315,7 +1917,6 @@ fn launch_export_can_acknowledge_admission_while_owned_startup_remains_stoppable
     );
     let mut launch = launch_export(operation_id);
     launch["preflight_token"] = preflight["preflight_token"].clone();
-    launch["frame_limiter_settings"] = frame_limiter_snapshot();
     launch["proton_dualsense_compatibility"] = json!(true);
     launch["return_on_admission"] = json!(true);
     let admitted = harness.request_as(&mut pipeline, "amaterasu.nvhttp", "management", launch);
@@ -2390,7 +1991,6 @@ fn detached_launch_activation_does_not_complete_the_admission_request_twice() {
     );
     let mut launch = launch_export(operation_id);
     launch["preflight_token"] = preflight["preflight_token"].clone();
-    launch["frame_limiter_settings"] = frame_limiter_snapshot();
     launch["proton_dualsense_compatibility"] = json!(true);
     launch["return_on_admission"] = json!(true);
     let admitted = harness.request_as(&mut pipeline, "amaterasu.nvhttp", "management", launch);
@@ -2417,64 +2017,6 @@ fn detached_launch_activation_does_not_complete_the_admission_request_twice() {
         json!({"action":"status","launch_id":admitted["launch"]["launch_id"]}),
     );
     assert_eq!(status["launch"]["state"], "active", "{status}");
-}
-
-#[test]
-fn frame_limiter_snapshot_rejects_invalid_runtime_context_and_host_policy() {
-    let mut harness = Harness::new();
-    let mut pipeline = pipeline();
-    let preflight = harness.request(
-        &mut pipeline,
-        "amaterasu.nvhttp",
-        json!({"action":"preflight_export","operation_id":"invalid-runtime-context","app_id":"app-0000000000000001"}),
-    );
-    let mut launch = launch_export("invalid-runtime-context");
-    launch["preflight_token"] = preflight["preflight_token"].clone();
-    launch["frame_limiter_settings"] = frame_limiter_snapshot();
-    let mut malformed = launch.clone();
-    malformed["frame_limiter_settings"]["game_frame_generation_mode"] = json!("game_provided");
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.nvhttp", malformed)["code"],
-        "invalid_frame_limiter_snapshot"
-    );
-    let mut malformed = launch.clone();
-    malformed["frame_limiter_settings"]["rtss_frame_limit_type_explicit_override"] = json!(true);
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.nvhttp", malformed)["code"],
-        "frame_limiter_policy_mismatch"
-    );
-    for (field, value) in [
-        ("rtss_install_path", json!("bad\npath")),
-        (
-            "frame_limiter_provider",
-            json!(if cfg!(windows) { "mangohud" } else { "rtss" }),
-        ),
-    ] {
-        let mut malformed = launch.clone();
-        malformed["frame_limiter_settings"]["settings"][field] = value;
-        assert_eq!(
-            harness.request(&mut pipeline, "amaterasu.nvhttp", malformed)["code"],
-            "invalid_frame_limiter_snapshot"
-        );
-    }
-    if !cfg!(windows) {
-        let mut malformed = launch.clone();
-        malformed["frame_limiter_settings"]["settings"]["rtss_install_path"] = json!("/opt/rtss");
-        assert_eq!(
-            harness.request(&mut pipeline, "amaterasu.nvhttp", malformed)["code"],
-            "invalid_frame_limiter_snapshot"
-        );
-    } else {
-        for path in ["C:relative", "\\\\server"] {
-            let mut malformed = launch.clone();
-            malformed["frame_limiter_settings"]["settings"]["rtss_install_path"] = json!(path);
-            assert_eq!(
-                harness.request(&mut pipeline, "amaterasu.nvhttp", malformed)["code"],
-                "invalid_frame_limiter_snapshot"
-            );
-        }
-    }
-    assert!(harness.sessions.is_empty());
 }
 
 #[test]
@@ -2566,7 +2108,6 @@ fn output_path_is_snapshotted_at_preflight_and_forwarded_unchanged_on_replay() {
     );
     let mut request = launch_export("output-snapshot");
     request["preflight_token"] = preflight["preflight_token"].clone();
-    request["frame_limiter_settings"] = frame_limiter_snapshot();
     let launched = harness.request(&mut pipeline, "amaterasu.nvhttp", request.clone());
     assert_eq!(launched["launch"]["state"], "active", "{launched}");
     let application: Vec<_> = harness
@@ -4361,7 +3902,6 @@ fn keybindings_preflight_freezes_whole_lists_without_changing_export_authority()
         assert!(harness.processes.is_empty());
         let mut launch = launch_export(&operation_id);
         launch["preflight_token"] = preflight["preflight_token"].clone();
-        launch["frame_limiter_settings"] = frame_limiter_snapshot();
         let denied = harness.request(&mut pipeline, "other-service", launch.clone());
         assert_eq!(denied["code"], "preflight_not_found");
         assert!(harness.sessions.is_empty());
@@ -4607,10 +4147,8 @@ fn cleanup_readback_list_paginates_by_bytes_and_preserves_owner() {
                 .unwrap();
             let record = pipeline.records.values.get_mut(&id).unwrap();
             record.state = State::Stopping;
-            record.frame_limiter_settings = Some(BTreeMap::from([(
-                "rtss_install_path".into(),
-                json!(format!("/{}", "p".repeat(1_000))),
-            )]));
+            record.application_display_overrides =
+                BTreeMap::from([("output_name".into(), json!("p".repeat(1_000)))]);
             record.config_overrides = Some(
                 serde_json::from_value(
                     json!({"audio_sink":"a".repeat(256),"sw_preset":"p".repeat(256)}),
@@ -4669,6 +4207,7 @@ fn cleanup_readback_list_paginates_by_bytes_and_preserves_owner() {
 }
 
 mod desktop;
+mod prepared_context;
 
 #[test]
 fn retirement_observer_requires_exact_owned_clean_terminal_launch() {
@@ -4867,8 +4406,6 @@ fn retirement_tombstones_completed_preflight_before_delayed_launch() {
     );
     let mut delayed = launch_export(&operation);
     delayed["preflight_token"] = preflight["preflight_token"].clone();
-    delayed["frame_limiter_settings"] = frame_limiter_snapshot();
-    delayed["client_frame_limiter_overrides"] = json!({});
     assert_eq!(
         harness.request(&mut pipeline, "amaterasu.nvhttp", delayed)["code"],
         "operation_retired"
@@ -4879,136 +4416,6 @@ fn retirement_tombstones_completed_preflight_before_delayed_launch() {
     );
     assert!(harness.sessions.is_empty());
     assert!(harness.processes.is_empty());
-}
-
-#[test]
-fn resumed_limiter_attestation_binds_only_validated_cadence_to_one_rtsp_operation() {
-    let mut harness = Harness::new();
-    let mut pipeline = pipeline();
-    let epoch = harness.request(
-        &mut pipeline,
-        "amaterasu.nvhttp",
-        json!({"action":"operation_epoch"}),
-    )["operation_epoch"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let operation = format!(
-        "ale1:{epoch}:nvhttp-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-0000000000000001-application"
-    );
-    let preflight = harness.request(&mut pipeline, "amaterasu.nvhttp", json!({"action":"preflight_export","operation_id":operation,"app_id":"app-0000000000000001"}));
-    let mut start = launch_export(&operation);
-    start["preflight_token"] = preflight["preflight_token"].clone();
-    start["frame_limiter_settings"] = frame_limiter_snapshot();
-    start["client_frame_limiter_overrides"] = json!({});
-    let started = harness.request(&mut pipeline, "amaterasu.nvhttp", start);
-    assert_eq!(started["launch"]["state"], "active", "{started}");
-    let mut snapshot = frame_limiter_snapshot();
-    snapshot["requested_stream_fps_millihz"] = json!(120000);
-    let authorize = json!({"action":"authorize_stream_snapshot","launch_id":1,"application_operation_id":operation,"rtsp_operation_id":"nvhttp-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-0000000000000002-rtsp","frame_limiter_settings":snapshot});
-    assert_eq!(
-        harness.request(&mut pipeline, "mallory", authorize.clone())["code"],
-        "stream_snapshot_denied"
-    );
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.nvhttp", authorize.clone())["ok"],
-        true
-    );
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.nvhttp", authorize.clone())["ok"],
-        true
-    );
-    let mut altered = authorize.clone();
-    altered["frame_limiter_settings"]["settings"]["frame_limiter_enable"] = json!(false);
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.nvhttp", altered)["code"],
-        "stream_snapshot_denied"
-    );
-    let mut verify = json!({"action":"verify_frame_limiter_snapshot","application_operation_id":operation,"rtsp_operation_id":"nvhttp-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-0000000000000002-rtsp","app_id":"app-0000000000000001","catalog_revision":1,"frame_limiter_settings":snapshot,"frame_limiter_executable_path":preflight["executable_path"]});
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.rtsp", verify.clone())["ok"],
-        true
-    );
-    verify["rtsp_operation_id"] = json!("rtsp-other");
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.rtsp", verify)["code"],
-        "frame_limiter_snapshot_denied"
-    );
-    assert_eq!(
-        pipeline.records.values[&1]
-            .frame_limiter_settings
-            .as_ref()
-            .unwrap()["requested_stream_fps_millihz"],
-        60000
-    );
-    for sequence in 3..=25_u64 {
-        let mut next = authorize.clone();
-        next["rtsp_operation_id"] = json!(format!(
-            "nvhttp-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-{sequence:016x}-rtsp"
-        ));
-        assert_eq!(
-            harness.request(&mut pipeline, "amaterasu.nvhttp", next)["ok"],
-            true
-        );
-    }
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.nvhttp", authorize.clone())["code"],
-        "stream_snapshot_denied"
-    );
-    let old_verify = json!({"action":"verify_frame_limiter_snapshot","application_operation_id":operation,"rtsp_operation_id":"nvhttp-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-0000000000000002-rtsp","app_id":"app-0000000000000001","catalog_revision":1,"frame_limiter_settings":snapshot,"frame_limiter_executable_path":preflight["executable_path"]});
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.rtsp", old_verify.clone())["code"],
-        "frame_limiter_snapshot_denied"
-    );
-    let mut old_original = old_verify;
-    old_original["frame_limiter_settings"] = frame_limiter_snapshot();
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.rtsp", old_original)["code"],
-        "frame_limiter_snapshot_denied"
-    );
-    assert_eq!(
-        harness.request(
-            &mut pipeline,
-            "amaterasu.nvhttp",
-            json!({"action":"stop","launch_id":1})
-        )["launch"]["state"],
-        "stopped"
-    );
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.nvhttp", authorize)["code"],
-        "stream_snapshot_denied"
-    );
-}
-
-#[test]
-fn resumed_limiter_lossless_target_only_tracks_fps_when_not_explicit() {
-    let mut harness = Harness::new();
-    let mut pipeline = pipeline();
-    let preflight = harness.request(&mut pipeline, "amaterasu.nvhttp", json!({"action":"preflight_export","operation_id":"nvhttp-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-0000000000000001-application","app_id":"app-0000000000000001"}));
-    let mut original = frame_limiter_snapshot();
-    original["game_frame_generation_mode"] = json!("lossless-scaling");
-    original["lossless_scaling_limit_millihz"] = json!(60000);
-    let mut start =
-        launch_export("nvhttp-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-0000000000000001-application");
-    start["preflight_token"] = preflight["preflight_token"].clone();
-    start["frame_limiter_settings"] = original.clone();
-    start["client_frame_limiter_overrides"] = json!({});
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.nvhttp", start)["launch"]["state"],
-        "active"
-    );
-    let mut resumed = original;
-    resumed["requested_stream_fps_millihz"] = json!(120000);
-    let mut authorize = json!({"action":"authorize_stream_snapshot","launch_id":1,"application_operation_id":"nvhttp-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-0000000000000001-application","rtsp_operation_id":"nvhttp-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-0000000000000002-rtsp","frame_limiter_settings":resumed});
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.nvhttp", authorize.clone())["code"],
-        "stream_snapshot_denied"
-    );
-    authorize["frame_limiter_settings"]["lossless_scaling_limit_millihz"] = json!(120000);
-    assert_eq!(
-        harness.request(&mut pipeline, "amaterasu.nvhttp", authorize)["ok"],
-        true
-    );
 }
 
 #[test]

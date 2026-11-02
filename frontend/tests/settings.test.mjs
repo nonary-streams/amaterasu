@@ -2114,22 +2114,31 @@ test("paired-client DS4 Back inheritance omits the field when saving", async () 
     api, current, id, { ds4_back_as_touchpad_click: null })), saved);
 });
 
-test("paired-client editor rejects unknown fields, mismatched identity and stale readback", async () => {
+test("paired-client editor preserves opaque fields and rejects mismatched identity and stale readback", async () => {
   const current = pairedClients();
   const id = "a".repeat(64);
   assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields(current.clients[0])), []);
   const unsupported = pairedClients();
   unsupported.clients[0].config_overrides.future_policy = true;
-  assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields(unsupported.clients[0])), ["future_policy"]);
+  assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields(unsupported.clients[0])), []);
   const malformed = pairedClients();
   malformed.clients[0].config_overrides.max_bitrate = "fast";
   assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields(malformed.clients[0])), ["max_bitrate"]);
   malformed.clients[0].config_overrides.max_bitrate = 15000;
   malformed.clients[0].config_overrides.frame_limiter_fps_limit = 59.9401;
-  assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields(malformed.clients[0])), ["frame_limiter_fps_limit"]);
-  await assert.rejects(context.Amaterasu.savePairingClientOverrides({ async post() {
-    throw new Error("unexpected write");
-  } }, unsupported, id, { fec_percentage: 30 }), /cannot preserve/);
+  assert.deepEqual(ordinary(context.Amaterasu.unsupportedPairingOverrideFields(malformed.clients[0])), []);
+  let opaqueWrite;
+  await context.Amaterasu.savePairingClientOverrides({ async post(route, body) {
+    if (route === "pairing/update_client_config_overrides") {
+      opaqueWrite = body.config_overrides;
+      return { ok: true, certificate_id: id };
+    }
+    return { ...unsupported, revision: 8, clients: [
+      { ...unsupported.clients[0], config_overrides: opaqueWrite }, unsupported.clients[1],
+    ] };
+  } }, unsupported, id, { fec_percentage: 30 });
+  assert.equal(opaqueWrite.future_policy, true);
+
   const desired = { ...current.clients[0].config_overrides, fec_percentage: 30 };
   const committed = { ...current, revision: 8, clients: [
     { ...current.clients[0], config_overrides: desired }, current.clients[1],
@@ -2188,7 +2197,7 @@ test("paired-client loads discard old list or input status after refresh", async
   assert.equal(await pending, null);
 });
 
-test("paired-client form preserves drafts on conflict and blocks unknown fields after reload", async () => {
+test("paired-client form preserves drafts on conflict and opaque fields after reload", async () => {
   class Element {
     constructor(tagName) {
       this.tagName = tagName;
@@ -2396,8 +2405,8 @@ test("paired-client form preserves drafts on conflict and blocks unknown fields 
   await new Promise(setImmediate);
   assert.match(pairingArea.textContent, /Revision 9/);
   const blocked = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Save");
-  assert.equal(blocked.disabled, true);
-  assert.match(pairingArea.textContent, /cannot preserve \(future_policy\)/);
+  assert.equal(blocked.disabled, false);
+  assert.doesNotMatch(pairingArea.textContent, /cannot preserve/);
   const remainingDraft = find(pairingArea, (node) => node.name === `fec_${"b".repeat(64)}`);
   remainingDraft.value = "42";
   const remove = find(pairingArea, (node) => node.tagName === "button" && node.textContent === "Remove device");

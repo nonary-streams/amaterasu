@@ -8,12 +8,21 @@ pub const SESSION: &str = "amaterasu.session/1";
 pub const APPLICATION: &str = "amaterasu.application/1";
 pub const PLAYNITE: &str = "amaterasu.playnite/1";
 pub const LUTRIS: &str = "amaterasu.lutris/1";
+
+pub(crate) fn preparation_step(record: &Record) -> Step {
+    if record.preparation_context.is_some() && record.prepared_environment.is_none() {
+        Step::ReadPreparationContext
+    } else {
+        Step::CreateSession
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
     Catalog,
     Library,
     LutrisStatus,
     LutrisPreSpawn,
+    ReadPreparationContext,
     CreateSession,
     Acquire,
     Spawn,
@@ -123,6 +132,21 @@ impl Workflow {
                 )
             }
             Step::LutrisStatus | Step::LutrisPreSpawn => (LUTRIS, json!({"action":"status"})),
+            Step::ReadPreparationContext => (
+                record
+                    .prepared_context_service
+                    .as_deref()
+                    .ok_or("preparation_context_not_configured")?,
+                json!(amaterasu_module_sdk::extension_api::PreparedPlansRequest {
+                    operation: "read_prepared_plans".into(),
+                    target: record
+                        .preparation_context
+                        .clone()
+                        .ok_or("preparation_context_missing")?,
+                    owner: record.owner.clone(),
+                    application_operation_id: record.operation_id.clone(),
+                }),
+            ),
             Step::CreateSession => (SESSION, json!({"action":"create","key":record.session_key})),
             Step::Acquire => (
                 SESSION,

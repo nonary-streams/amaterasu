@@ -55,6 +55,7 @@ struct Harness {
     provider_calls: Vec<Value>,
     pending_callbacks: Vec<(u64, Value)>,
     provider: bool,
+    plan_constraints: Value,
 }
 
 impl Harness {
@@ -87,7 +88,7 @@ impl Harness {
                     "consumer_requirements":{"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["example/1"]},
                     "trusted_callers": ["transport", "other-transport"],
                     "operation_grants": {
-                        "transport": ["prepare", "lookup", "snapshot", "describe_resource_control", "verify_resource_control", "validate_resource_control", "verify_control_settlement", "describe_resource_finalize", "verify_resource_finalize", "validate_resource_finalize", "verify_finalize_result"],
+                        "transport": ["prepare", "lookup", "snapshot", "read_prepared_plans", "describe_resource_control", "verify_resource_control", "validate_resource_control", "verify_control_settlement", "describe_resource_finalize", "verify_resource_finalize", "validate_resource_finalize", "verify_finalize_result"],
                         "other-transport": ["prepare", "lookup", "snapshot", "describe_resource_control", "verify_resource_control", "validate_resource_control", "verify_control_settlement", "describe_resource_finalize", "verify_resource_finalize", "validate_resource_finalize", "verify_finalize_result"]
                     }
                 }
@@ -101,7 +102,7 @@ impl Harness {
             configuration["settings"][COORDINATOR]["trusted_callers"] =
                 json!(["transport", "other-transport", "display"]);
             configuration["settings"][COORDINATOR]["operation_grants"]["display"] =
-                json!(["verify_provider_epoch"]);
+                json!(["verify_provider_epoch", "read_provider_context"]);
             let method_ref = |name: &str| json!({"service":"example.display/1","method":name,"interface_major":1,"interface_minor":0,"schema_revision":1});
             configuration["settings"][COORDINATOR]["consumer_requirements"] = json!({"execution_domain":"seat","capture_providers":["capture"],"selector_schemas":["example/1"]});
             configuration["settings"][COORDINATOR]["participants"] = json!([{"provider":"display","plan_method":method_ref("resource_plan"),"callback_method":method_ref("lifecycle_callback"),"status_method":method_ref("lifecycle_status"),"settings_revision":"one","settings":{},"capabilities":[],"cleanup_methods":[]}]);
@@ -139,6 +140,7 @@ impl Harness {
             provider_calls: Vec::new(),
             pending_callbacks: Vec::new(),
             provider,
+            plan_constraints: json!({}),
         };
         harness.start();
         harness
@@ -177,7 +179,7 @@ impl Harness {
                 assert_eq!(caller, COORDINATOR);
                 self.provider_calls.push(payload.clone());
                 if payload["method"] == "resource_plan" {
-                    let plan = json!({"plan_id":"plan","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]});
+                    let plan = json!({"plan_id":"plan","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":self.plan_constraints,"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[]});
                     assert!(matches!(
                         self.broker.borrow_mut().dispatch(
                             "display",
@@ -325,7 +327,10 @@ fn preparation_waits_for_provider_and_verifies_its_exact_durable_callback() {
     let mut harness = Harness::with_provider(true);
     let admitted = harness.call(
         "transport",
-        json!({"operation":"prepare","operation_id":"session-one"}),
+        json!({"operation":"prepare","operation_id":"session-one",
+            "application_ref":{"kind":"application","app_id":"game-1"},
+            "client_context":{"client_ref":"client-1","display_mode":{"width":1920,"height":1080,"refresh_millihz":59940}},
+            "requested_video":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false}}),
     );
     assert_eq!(admitted["status"], "pending");
     for _ in 0..64 {
@@ -338,6 +343,21 @@ fn preparation_waits_for_provider_and_verifies_its_exact_durable_callback() {
     let (request, payload) = harness.pending_callbacks[0].clone();
     let callback: amaterasu_module_sdk::extension_api::ProviderRequest =
         serde_json::from_value(payload["arguments"].clone()).unwrap();
+    let context_request = json!({"operation":"read_provider_context","provider_request":callback});
+    let context = harness.call("display", context_request.clone());
+    assert_eq!(context["status"], "succeeded");
+    assert_eq!(
+        context["context"]["client"]["display_mode"]["refresh_millihz"],
+        59940
+    );
+    assert_eq!(
+        context["context"]["requested_video"]["refresh_millihz"],
+        60000
+    );
+    assert_eq!(
+        harness.call("other-transport", context_request.clone())["code"],
+        "permission_denied"
+    );
     let digest = format!(
         "{:x}",
         Sha256::digest(serde_json::to_vec(&callback).unwrap())
@@ -373,7 +393,85 @@ fn preparation_waits_for_provider_and_verifies_its_exact_durable_callback() {
         }
     }
     assert_eq!(final_receipt["status"], "succeeded");
+    assert_eq!(
+        harness.call("display", context_request)["status"],
+        "rejected"
+    );
     assert_eq!(harness.provider_calls.len(), 2);
     assert_eq!(harness.provider_calls[0]["method"], "resource_plan");
     assert_eq!(harness.provider_calls[1]["method"], "lifecycle_callback");
+}
+
+#[test]
+fn prepared_context_requires_a_prepared_callback_not_only_settled_rights() {
+    for prepared in [true, false] {
+        let mut harness = Harness::with_provider(true);
+        harness.plan_constraints = json!({"consumer_note":"prepared-only"});
+        let admitted = harness.call(
+            "transport",
+            json!({"operation":"prepare","operation_id":"context-session",
+            "application_operation_id":"application-one","application_ref":{"kind":"desktop"}}),
+        );
+        for _ in 0..64 {
+            if !harness.pending_callbacks.is_empty() {
+                break;
+            }
+            harness.tick();
+        }
+        let (request, _) = harness
+            .pending_callbacks
+            .first()
+            .cloned()
+            .expect("provider callback");
+        let response = if prepared {
+            json!({"status":"prepared","candidate":null,"obligations":[]})
+        } else {
+            json!({"status":"cleanup","outcomes":[]})
+        };
+        assert!(matches!(
+            harness.broker.borrow_mut().dispatch(
+                "display",
+                Command::Complete {
+                    request,
+                    payload: response,
+                }
+            ),
+            Response::Ok
+        ));
+        let mut outcome = Value::Null;
+        for _ in 0..64 {
+            outcome = harness.call(
+                "transport",
+                json!({"operation":"lookup","operation_id":"context-session"}),
+            );
+            if outcome["status"] != "pending" {
+                break;
+            }
+        }
+        assert_eq!(
+            outcome["status"],
+            if prepared {
+                "succeeded"
+            } else {
+                "recovery_required"
+            },
+            "prepared={prepared}: {outcome}"
+        );
+        let context = harness.call(
+            "transport",
+            json!({"operation":"read_prepared_plans","target":admitted["target"],
+            "owner":"transport","application_operation_id":"application-one"}),
+        );
+        assert_eq!(
+            context["status"],
+            if prepared { "succeeded" } else { "rejected" },
+            "{context}"
+        );
+        if prepared {
+            assert_eq!(
+                context["plans"][0]["plan"]["constraints"]["consumer_note"],
+                "prepared-only"
+            );
+        }
+    }
 }

@@ -189,10 +189,16 @@ fn required_extension_lifecycle_polls_pending_before_application_launch() {
     let mut controller = Controller::new(Some(config())).unwrap();
     controller.set_session_lifecycle_required(true);
     controller.set_global_display_policy(7, json!({}));
-    let mut broker = Broker::default();
+    let mut broker = Broker {
+        application_executable_path: Some("/games/example".into()),
+        application_input_overrides: Some(json!({"vendor_option":{"quality":"high"}})),
+        ..Default::default()
+    };
     broker.lifecycle_replies.push_back(json!({"status":"pending"}));
     broker.lifecycle_replies.push_back(json!({"status":"succeeded", "target":{"kind":"session","host_epoch":"epoch","session_id":"session","generation":1}}));
-    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let mut client = peer_with_display_mode(1, "1920x1080x59.94").unwrap();
+    client.client_properties = json!({"vendor_option":{"enabled":false,"rate":0}});
+    assert!(controller.launch(10, request(1), client, now).is_none());
     for tick in 0..100 {
         controller.poll(now + Duration::from_millis(tick * 100), &mut |command| broker.send(command));
         if broker.actions().contains(&("amaterasu.launch/1", "launch_export")) { break; }
@@ -203,6 +209,11 @@ fn required_extension_lifecycle_polls_pending_before_application_launch() {
     }).collect();
     assert_eq!(lifecycle.len(), 2);
     assert_eq!(lifecycle[0]["operation"], "prepare");
+    assert_eq!(lifecycle[0]["client_context"]["client_ref"], "client-1");
+    assert_eq!(lifecycle[0]["client_context"]["display_mode"]["refresh_millihz"], 59940);
+    assert_eq!(lifecycle[0]["client_context"]["properties"], json!({"vendor_option":{"enabled":false,"rate":0}}));
+    assert_eq!(lifecycle[0]["application_ref"]["properties"]["vendor_option"], json!({"quality":"high"}));
+    assert_eq!(lifecycle[0]["application_ref"]["executable_path"], "/games/example");
     assert_eq!(lifecycle[1]["operation"], "lookup");
     assert_eq!(lifecycle[0]["operation_id"], lifecycle[1]["operation_id"]);
     let released = broker.commands.iter().filter(|command| matches!(command,

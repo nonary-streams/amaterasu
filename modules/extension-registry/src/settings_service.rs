@@ -2,7 +2,7 @@
 use crate::{
     discovery,
     persistence::Store,
-    policy::Settings,
+    policy::{GrantedScope, Settings},
     settings::{self, Document, Scope},
 };
 use amaterasu_configuration_schema::{Fields, Values};
@@ -60,10 +60,18 @@ struct Pending {
     validation: MethodRef,
     schema_revision: u64,
     migrations: Vec<crate::policy::MigrationPlan>,
-    writable_scopes: BTreeSet<Scope>,
+    writable_scopes: [Vec<GrantedScope>; 2],
     source_caller: String,
     source_initiator: String,
     stage: Stage,
+}
+
+impl Pending {
+    fn can_write(&self, scope: &Scope) -> bool {
+        self.writable_scopes
+            .iter()
+            .all(|grants| grants.iter().any(|grant| grant.matches(scope)))
+    }
 }
 
 enum Stage {
@@ -328,16 +336,13 @@ impl SettingsService {
                 validation: item.descriptor.settings_validate.clone(),
                 schema_revision: item.descriptor.revision,
                 migrations: item.migrations.clone(),
-                writable_scopes: item
-                    .grants
-                    .iter()
-                    .filter(|grant| {
-                        grant.write
-                            && grant.caller == initiator
-                            && item.allows(caller, &grant.scope, true)
-                    })
-                    .map(|grant| grant.scope.clone())
-                    .collect(),
+                writable_scopes: [caller, initiator].map(|identity| {
+                    item.grants
+                        .iter()
+                        .filter(|grant| grant.write && grant.caller == identity)
+                        .map(|grant| grant.scope.clone())
+                        .collect()
+                }),
                 source_caller: caller.to_owned(),
                 source_initiator: initiator.to_owned(),
                 stage,
@@ -406,7 +411,7 @@ impl SettingsService {
                         if document
                             .layers
                             .iter()
-                            .any(|layer| !pending.writable_scopes.contains(&layer.scope))
+                            .any(|layer| !pending.can_write(&layer.scope))
                         {
                             completed.push((
                                 id,
@@ -437,9 +442,7 @@ impl SettingsService {
                             .map(|layer| (layer.scope.clone(), layer.values.clone()))
                             .collect();
                         if replacements.len() != plan.replacements.len()
-                            || replacements
-                                .keys()
-                                .any(|scope| !pending.writable_scopes.contains(scope))
+                            || replacements.keys().any(|scope| !pending.can_write(scope))
                         {
                             completed.push((
                                 id,

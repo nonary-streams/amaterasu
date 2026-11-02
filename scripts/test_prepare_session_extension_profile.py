@@ -17,7 +17,7 @@ class ProfileActionPolicyTest(unittest.TestCase):
         self.root = Path(self.temporary.name)
         (self.root / "data").mkdir()
         principals = [profile.NVHTTP, profile.RTSP, profile.STREAM, profile.INPUT,
-                      profile.MANAGEMENT, profile.CONSOLE]
+                      profile.MANAGEMENT, profile.CONSOLE, profile.LAUNCH]
         self.bootstrap = {"policy": {"principals": {identity: {"call": []} for identity in principals},
                                      "settings": {profile.NVHTTP: {"streaming": {"capture": {}}}},
                                      "api_methods": []}}
@@ -55,6 +55,9 @@ class ProfileActionPolicyTest(unittest.TestCase):
         profile.prepare(bootstrap, self.root, self.descriptor, "digest", copy.deepcopy(self.approvals),
                         self.component, True)
         settings = bootstrap["policy"]["settings"]
+        self.assertEqual(settings[profile.LAUNCH]["prepared_context_service"], profile.LIFECYCLE_SERVICE)
+        self.assertIn("read_prepared_plans", settings[profile.LIFECYCLE]["operation_grants"][profile.LAUNCH])
+        self.assertIn(profile.LIFECYCLE_SERVICE, bootstrap["policy"]["principals"][profile.LAUNCH]["call"])
         self.assertEqual(settings[profile.LIFECYCLE]["input_actions"], [action_id])
         self.assertIn(profile.LIFECYCLE_SERVICE,
                       bootstrap["policy"]["principals"][profile.LIFECYCLE]["call"])

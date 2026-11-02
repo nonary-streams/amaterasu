@@ -172,28 +172,6 @@ impl Pipeline {
                 super::display::accept_apply(record, &payload);
                 job.step = Step::FindDisplay;
             }
-            Step::ApplyLimiter => {
-                super::limiter::accept_apply(record, &payload);
-                job.step = Step::FindLimiter;
-            }
-            Step::FindLimiter => {
-                super::limiter::accept_status(record, &payload);
-                if record.limiter_lease.is_none() {
-                    if super::limiter::status_confirms_no_lease(record, &payload) {
-                        record.limiter_attempted = false;
-                    }
-                    job.limiter_tried = true;
-                }
-            }
-            Step::RestoreLimiter => {
-                if super::limiter::accept_restore(record, &payload) {
-                    record.limiter_attempted = false;
-                    job.limiter_tried = true;
-                } else {
-                    record.cleanup_error = Some("frame_limiter_restore_failed");
-                    job.limiter_tried = true;
-                }
-            }
             Step::FindInput => {
                 if input_missing(&payload) || input_released(record, &payload) {
                     clear_input(record);
@@ -339,16 +317,6 @@ impl Pipeline {
                 job.step = Step::StatusVirtualDisplay;
                 true
             }
-            Step::FindLimiter => {
-                record.cleanup_error = Some("frame_limiter_status_unavailable");
-                job.limiter_tried = true;
-                true
-            }
-            Step::RestoreLimiter => {
-                record.cleanup_error = Some("frame_limiter_restore_failed");
-                job.limiter_tried = true;
-                true
-            }
             Step::ReleaseInput => {
                 record.input_lookup_required = true;
                 job.input_tried = false;
@@ -383,8 +351,6 @@ impl Pipeline {
             && record.uncertain.is_none()
             && !record.input_attempted
             && record.input_lease.is_none()
-            && record.limiter_lease.is_none()
-            && !record.limiter_attempted
             && !record.virtual_display_attempted
             && !record.display_attempted
             && record.display_lease.is_none()

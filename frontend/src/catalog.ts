@@ -493,7 +493,6 @@ namespace Amaterasu {
   }
 
   const refreshRateOptionValues = ["auto", "disabled", "manual", "prefer_highest"] as const;
-  const catalogAutoVirtualFramegenModes = ["enabled", "vrr", "legacy", "disabled"] as const;
   const catalogFrameGenerationProviders = [
     "lossless-scaling",
     "game-provided",
@@ -504,86 +503,10 @@ namespace Amaterasu {
     ...catalogFrameGenerationProviders,
   ] as const satisfies readonly CatalogFrameGenerationMode[];
 
-  export type CatalogFrameLimiterCapabilityName =
-    | "frame_limiter_provider"
-    | "rtss_frame_limit_type";
-
   function catalogSavedUnsupportedEnumValueToken(values: readonly string[]): string {
     let token = "__amaterasu_keep_saved_unsupported_enum_value__";
     while (values.includes(token)) token += "_";
     return token;
-  }
-
-  export function catalogFrameLimiterOverrideOptionValues(
-    name: CatalogFrameLimiterCapabilityName,
-    capabilities: CatalogConfigOverrideCapabilities,
-    current: string | null | undefined,
-  ): string[] {
-    const values = capabilities[name];
-    const options = ["", ...values];
-    if (current != null && !values.includes(current))
-      options.push(catalogSavedUnsupportedEnumValueToken(values));
-    return options;
-  }
-
-  export function catalogFrameLimiterOverrideIsDisabled(
-    name: CatalogFrameLimiterCapabilityName,
-    capabilities: CatalogConfigOverrideCapabilities,
-  ): boolean {
-    return name === "rtss_frame_limit_type" && capabilities.rtss_frame_limit_type.length === 0;
-  }
-
-  function catalogFrameLimiterCapabilitySelect(
-    name: CatalogFrameLimiterCapabilityName,
-    current: string | null | undefined,
-    capabilities: CatalogConfigOverrideCapabilities,
-  ): HTMLElement {
-    const values = capabilities[name];
-    const unsupportedCurrent = current != null && !values.includes(current);
-    const savedValueToken = unsupportedCurrent
-      ? catalogSavedUnsupportedEnumValueToken(values)
-      : undefined;
-    const select = el("select");
-    select.name = name;
-    const inherit = el("option", "", "Inherit");
-    inherit.value = "";
-    select.append(inherit);
-    for (const value of values) {
-      const option = el("option", "", catalogTextLiteral(value));
-      option.value = value;
-      select.append(option);
-    }
-    if (savedValueToken !== undefined) {
-      const saved = el("option", "", catalogTextLiteral(`Keep saved value: ${current} (unsupported on this host)`));
-      saved.value = savedValueToken;
-      select.append(saved);
-    }
-    select.value = savedValueToken ?? current ?? "";
-
-    if (!catalogFrameLimiterOverrideIsDisabled(name, capabilities)) return select;
-
-    select.disabled = true;
-    select.removeAttribute("name");
-    const preservedValue = input(
-      name,
-      savedValueToken ?? "",
-      "hidden",
-    );
-    const controls: HTMLElement[] = [
-      select,
-      preservedValue,
-      el("span", "muted", "Unsupported on this host."),
-    ];
-    if (savedValueToken !== undefined) {
-      const clear = button("Clear override", () => {
-        preservedValue.value = "";
-        select.value = "";
-        clear.disabled = true;
-      }, "quiet");
-      clear.type = "button";
-      controls.push(clear);
-    }
-    return el("div", "catalog-enum-override", ...controls);
   }
 
   function catalogEnumOverrideSelect(
@@ -610,72 +533,39 @@ namespace Amaterasu {
     return select;
   }
 
-  export type CatalogFrameLimiterOverrides = Pick<
+  export type CatalogSessionPolicyOverrides = Pick<
     NonNullable<Entry["config_overrides"]>,
-    | "frame_limiter_enable"
-    | "frame_limiter_fps_limit"
-    | "frame_limiter_provider"
-    | "frame_limiter_disable_vsync"
-    | "frame_limiter_auto_virtual_framegen"
     | "lossless_scaling_framegen"
     | "lossless_scaling_target_fps"
     | "frame_generation_provider"
     | "frame_generation_mode"
-    | "rtss_frame_limit_type"
     | "ds4_back_as_touchpad_click"
   >;
 
-  type CatalogFrameLimiterOverrideControlValues = Record<
-    keyof CatalogFrameLimiterOverrides,
+  type CatalogSessionPolicyOverrideControlValues = Record<
+    keyof CatalogSessionPolicyOverrides,
     string
   >;
 
-  function catalogFrameLimiterOverrideField(
-    label: string,
-    control: HTMLElement,
-    hint: string,
-  ): HTMLElement {
-    if (control instanceof HTMLSelectElement) return field(label, control, hint);
-    const select = control.querySelector("select");
-    if (select) catalogLocalizedAttribute(select, "aria-label", label);
-    return el(
-      "div",
-      "field",
-      el("span", "field-label", label),
-      control,
-      el("small", "muted", hint),
-    );
-  }
-
-  export function catalogFrameLimiterOverrideFormValues(
+  export function catalogSessionPolicyOverrideFormValues(
     overrides: Entry["config_overrides"] | undefined,
-  ): CatalogFrameLimiterOverrideControlValues {
+  ): CatalogSessionPolicyOverrideControlValues {
     const text = (value: boolean | number | string | null | undefined) =>
       value == null ? "" : String(value);
     return {
-      frame_limiter_enable: text(overrides?.frame_limiter_enable),
-      frame_limiter_fps_limit: text(overrides?.frame_limiter_fps_limit),
-      frame_limiter_provider: text(overrides?.frame_limiter_provider),
-      frame_limiter_disable_vsync: text(overrides?.frame_limiter_disable_vsync),
-      frame_limiter_auto_virtual_framegen: text(overrides?.frame_limiter_auto_virtual_framegen),
       lossless_scaling_framegen: text(overrides?.lossless_scaling_framegen),
       lossless_scaling_target_fps: text(overrides?.lossless_scaling_target_fps),
       frame_generation_provider: text(overrides?.frame_generation_provider),
       frame_generation_mode: text(overrides?.frame_generation_mode),
-      rtss_frame_limit_type: text(overrides?.rtss_frame_limit_type),
       ds4_back_as_touchpad_click: text(overrides?.ds4_back_as_touchpad_click),
     };
   }
 
-  function catalogFrameLimiterOverrideFields(
+  function catalogSessionPolicyOverrideFields(
     overrides: Entry["config_overrides"] | undefined,
-    capabilities: CatalogConfigOverrideCapabilities,
+    _capabilities: CatalogConfigOverrideCapabilities,
   ): HTMLElement[] {
-    const values = catalogFrameLimiterOverrideFormValues(overrides);
-    const enable = audioOverrideSelect(
-      "frame_limiter_enable",
-      values.frame_limiter_enable === "" ? undefined : values.frame_limiter_enable === "true",
-    );
+    const values = catalogSessionPolicyOverrideFormValues(overrides);
     const losslessScalingFramegen = audioOverrideSelect(
       "lossless_scaling_framegen",
       values.lossless_scaling_framegen === ""
@@ -701,32 +591,6 @@ namespace Amaterasu {
     losslessScalingTargetFps.max = "1000";
     losslessScalingTargetFps.step = "1";
     losslessScalingTargetFps.placeholder = "Stream FPS";
-    const fpsLimit = input("frame_limiter_fps_limit", values.frame_limiter_fps_limit, "number");
-    fpsLimit.min = "0";
-    fpsLimit.max = "1000";
-    fpsLimit.step = "0.001";
-    fpsLimit.placeholder = "Inherit";
-    const provider = catalogFrameLimiterCapabilitySelect(
-      "frame_limiter_provider",
-      overrides?.frame_limiter_provider,
-      capabilities,
-    );
-    const disableVsync = audioOverrideSelect(
-      "frame_limiter_disable_vsync",
-      values.frame_limiter_disable_vsync === ""
-        ? undefined
-        : values.frame_limiter_disable_vsync === "true",
-    );
-    const autoVirtualFramegen = catalogEnumOverrideSelect(
-      "frame_limiter_auto_virtual_framegen",
-      values.frame_limiter_auto_virtual_framegen,
-      catalogAutoVirtualFramegenModes,
-    );
-    const rtssFrameLimitType = catalogFrameLimiterCapabilitySelect(
-      "rtss_frame_limit_type",
-      overrides?.rtss_frame_limit_type,
-      capabilities,
-    );
     const ds4BackAsTouchpadClick = audioOverrideSelect(
       "ds4_back_as_touchpad_click",
       values.ds4_back_as_touchpad_click === ""
@@ -734,7 +598,6 @@ namespace Amaterasu {
         : values.ds4_back_as_touchpad_click === "true",
     );
     return [
-      field("Frame limiter", enable, "Blank inherits. Runtime application remains pending."),
       field(
         "Lossless Scaling frame generation",
         losslessScalingFramegen,
@@ -754,23 +617,6 @@ namespace Amaterasu {
         "Lossless Scaling target FPS",
         losslessScalingTargetFps,
         "Blank uses the active stream FPS when Lossless Scaling mode is selected; explicit targets must be 1–1000 FPS.",
-      ),
-      field("Frame limiter FPS limit", fpsLimit, "Blank inherits. Use 0–1000 Hz in 0.001 Hz steps."),
-      catalogFrameLimiterOverrideField(
-        "Frame limiter provider",
-        provider,
-        "Choose a provider supported by this host; blank inherits.",
-      ),
-      field("Disable VSync for RTSS", disableVsync, "Blank inherits the next scope."),
-      field(
-        "Auto virtual frame generation mode",
-        autoVirtualFramegen,
-        "Blank inherits. Choose enabled, vrr, legacy, or disabled.",
-      ),
-      catalogFrameLimiterOverrideField(
-        "RTSS frame limit type",
-        rtssFrameLimitType,
-        "Blank inherits. Available RTSS choices depend on host support.",
       ),
       field(
         "DS4 Back as touchpad click",
@@ -830,7 +676,7 @@ namespace Amaterasu {
     };
   }
 
-  function parseCatalogFrameLimiterEnum<T extends string>(
+  function parseCatalogSessionPolicyEnum<T extends string>(
     value: string,
     allowedValues: readonly T[],
     currentValue: string | null | undefined,
@@ -847,29 +693,6 @@ namespace Amaterasu {
     return value as T;
   }
 
-  function parseCatalogFrameLimiterFpsLimit(value: string): number | null {
-    const trimmed = value.trim();
-    if (trimmed === "") return null;
-    if (
-      !/^(?:[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+))(?:[eE][+-]?[0-9]+)?$/.test(trimmed)
-    )
-      throw new Error(
-        "Frame limiter FPS limit must be from 0 to 1000 in 0.001 Hz steps.",
-      );
-    const fpsLimit = Number(trimmed);
-    if (!Number.isFinite(fpsLimit) || fpsLimit < 0 || fpsLimit > 1000)
-      throw new Error(
-        "Frame limiter FPS limit must be from 0 to 1000 in 0.001 Hz steps.",
-      );
-    const millihertz = fpsLimit * 1000;
-    const roundingTolerance = Number.EPSILON * Math.max(Math.abs(millihertz), 1) * 4;
-    if (Math.abs(millihertz - Math.round(millihertz)) > roundingTolerance)
-      throw new Error(
-        "Frame limiter FPS limit must be from 0 to 1000 in 0.001 Hz steps.",
-      );
-    return fpsLimit;
-  }
-
   function parseCatalogLosslessScalingTargetFps(value: string): number | null {
     const trimmed = value.trim();
     if (trimmed === "") return null;
@@ -881,31 +704,14 @@ namespace Amaterasu {
     return targetFps;
   }
 
-  export function parseCatalogFrameLimiterOverrides(
+  export function parseCatalogSessionPolicyOverrides(
     data: FormData,
-    capabilities: CatalogConfigOverrideCapabilities,
+    _capabilities: CatalogConfigOverrideCapabilities,
     currentOverrides?: Entry["config_overrides"],
-  ): CatalogFrameLimiterOverrides {
-    const text = (name: keyof CatalogFrameLimiterOverrides) =>
+  ): CatalogSessionPolicyOverrides {
+    const text = (name: keyof CatalogSessionPolicyOverrides) =>
       String(data.get(name) ?? "");
     return {
-      frame_limiter_enable: Amaterasu.parseInputBooleanOverride(
-        text("frame_limiter_enable"),
-        "Frame limiter",
-      ),
-      frame_limiter_fps_limit: parseCatalogFrameLimiterFpsLimit(
-        text("frame_limiter_fps_limit"),
-      ),
-      frame_limiter_provider: parseCatalogFrameLimiterEnum(
-        text("frame_limiter_provider"),
-        capabilities.frame_limiter_provider,
-        currentOverrides?.frame_limiter_provider,
-        "Frame limiter provider",
-      ),
-      frame_limiter_disable_vsync: Amaterasu.parseInputBooleanOverride(
-        text("frame_limiter_disable_vsync"),
-        "Disable VSync for RTSS",
-      ),
       lossless_scaling_framegen: Amaterasu.parseInputBooleanOverride(
         text("lossless_scaling_framegen"),
         "Lossless Scaling frame generation",
@@ -913,29 +719,17 @@ namespace Amaterasu {
       lossless_scaling_target_fps: parseCatalogLosslessScalingTargetFps(
         text("lossless_scaling_target_fps"),
       ),
-      frame_generation_provider: parseCatalogFrameLimiterEnum(
+      frame_generation_provider: parseCatalogSessionPolicyEnum(
         text("frame_generation_provider"),
         catalogFrameGenerationProviders,
         currentOverrides?.frame_generation_provider,
         "Frame generation provider",
       ),
-      frame_generation_mode: parseCatalogFrameLimiterEnum(
+      frame_generation_mode: parseCatalogSessionPolicyEnum(
         text("frame_generation_mode"),
         catalogFrameGenerationModes,
         currentOverrides?.frame_generation_mode,
         "Frame generation mode",
-      ),
-      frame_limiter_auto_virtual_framegen: parseCatalogFrameLimiterEnum(
-        text("frame_limiter_auto_virtual_framegen"),
-        catalogAutoVirtualFramegenModes,
-        undefined,
-        "Auto virtual frame generation mode",
-      ),
-      rtss_frame_limit_type: parseCatalogFrameLimiterEnum(
-        text("rtss_frame_limit_type"),
-        capabilities.rtss_frame_limit_type,
-        currentOverrides?.rtss_frame_limit_type,
-        "RTSS frame limit type",
       ),
       ds4_back_as_touchpad_click: Amaterasu.parseInputBooleanOverride(
         text("ds4_back_as_touchpad_click"),
@@ -1537,6 +1331,10 @@ namespace Amaterasu {
       }), "primary");
       launch.disabled = typeof api.allowsLaunchAction !== "function" || !api.allowsLaunchAction("start");
       const actions = [launch, edit];
+      const pluginSettings = button("Plugin settings", () =>
+        showSessionExtensionSettings(context, { kind: "application", id: row.id }, `${row.entry.name} plugin settings`));
+      pluginSettings.disabled = !api.allows("configuration.read");
+      actions.push(pluginSettings);
       if (providerLaunch) {
         const configure = button(
           "Streaming settings",
@@ -1718,7 +1516,7 @@ namespace Amaterasu {
           client: catalogTextLiteral(row.entry.name),
         },
       );
-      const frameLimiterFields = catalogFrameLimiterOverrideFields(
+      const sessionPolicyFields = catalogSessionPolicyOverrideFields(
         row.entry.config_overrides,
         capabilities,
       );
@@ -1771,7 +1569,7 @@ namespace Amaterasu {
       const form = el("form", "editor-form",
         catalogEditorSection("Streaming and audio", "Override streaming and audio for this provider-managed application.",
           field("FEC percentage", fec, "Leave blank to inherit the global setting. Supported values are 1–255."),
-          ...frameLimiterFields,
+          ...sessionPolicyFields,
           field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this game streams audio."),
           audioSink.controls, virtualSink.controls,
           field("Capture audio without changing default outputs", captureOnly,
@@ -1806,7 +1604,7 @@ namespace Amaterasu {
             advancedInput.read(),
             softwareEncoder.read(),
             providerConfigOverrides(fec.value, streamAudio.value, audioSink.mode.value, audioSink.id.value, captureOnly.value, backButtonTimeout.value, virtualSink.mode.value, virtualSink.selector.value, controller.value, gamepad.value, keyboard.value, mouse.value, runtimeStatus.recognized_profiles),
-            parseCatalogFrameLimiterOverrides(
+            parseCatalogSessionPolicyOverrides(
               new FormData(form),
               capabilities,
               row.entry.config_overrides,
@@ -1837,7 +1635,7 @@ namespace Amaterasu {
                 mouse?: boolean;
                 dd_refresh_rate_option?: RefreshRateOption | null;
                 display_policy?: Record<string, unknown> | null;
-              } & CatalogFrameLimiterOverrides & CatalogNvencSettingsOverrides & CatalogInputCompatibilityOverrides;
+              } & CatalogSessionPolicyOverrides & CatalogNvencSettingsOverrides & CatalogInputCompatibilityOverrides;
               changed: boolean;
               replayed: boolean;
             }>("catalog/update_provider_overrides", {
@@ -1930,7 +1728,7 @@ namespace Amaterasu {
             row?.entry.config_overrides,
             new FormData(form).keys(),
             entry.config_overrides,
-            parseCatalogFrameLimiterOverrides(
+            parseCatalogSessionPolicyOverrides(
               new FormData(form),
               capabilities,
               row?.entry.config_overrides,
@@ -2152,7 +1950,7 @@ namespace Amaterasu {
     fec.min = "1";
     fec.max = "255";
     fec.step = "1";
-    const frameLimiterFields = catalogFrameLimiterOverrideFields(
+    const sessionPolicyFields = catalogSessionPolicyOverrideFields(
       entry?.config_overrides,
       capabilities,
     );
@@ -2279,7 +2077,7 @@ namespace Amaterasu {
           "Inherit the next setting scope, or set an explicit preference for this application.")),
       catalogEditorDisclosure("Streaming and audio", "Override streaming, frame limiting, and audio for this application.",
         field("FEC percentage", fec, "Leave blank to inherit the global streaming setting; supported values are 1–255."),
-        ...frameLimiterFields,
+        ...sessionPolicyFields,
         field("Audio streaming", streamAudio, "Inherit the host setting, or choose whether this application streams audio."),
         audioSink.controls, virtualSink.controls,
         field("Capture audio without changing default outputs", captureOnly,

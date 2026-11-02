@@ -51,15 +51,12 @@ namespace Amaterasu {
     cwd?: string | null;
     timeout_ms?: number;
   }
-  export type CatalogFrameLimiterProvider = string;
   export type CaptureSelection = "auto" | "ddx" | "wgc" | "wgcc" | "pipewire" | "x11" | "kms";
-  export type CatalogAutoVirtualFramegenMode = "enabled" | "vrr" | "legacy" | "disabled";
   export type CatalogFrameGenerationProvider =
     | "lossless-scaling"
     | "game-provided"
     | "nvidia-smooth-motion";
   export type CatalogFrameGenerationMode = "off" | CatalogFrameGenerationProvider;
-  export type CatalogRtssFrameLimitType = string;
   export interface AdvancedInputOverrides {
     keybindings?: number[] | null;
     high_resolution_scrolling?: boolean | null;
@@ -96,16 +93,10 @@ namespace Amaterasu {
       gamepad?: string;
       keyboard?: boolean;
       mouse?: boolean;
-      frame_limiter_enable?: boolean | null;
-      frame_limiter_fps_limit?: number | null;
-      frame_limiter_provider?: CatalogFrameLimiterProvider | null;
-      frame_limiter_disable_vsync?: boolean | null;
-      frame_limiter_auto_virtual_framegen?: CatalogAutoVirtualFramegenMode | null;
       lossless_scaling_framegen?: boolean | null;
       lossless_scaling_target_fps?: number | null;
       frame_generation_provider?: CatalogFrameGenerationProvider | null;
       frame_generation_mode?: CatalogFrameGenerationMode | null;
-      rtss_frame_limit_type?: CatalogRtssFrameLimitType | null;
       ds4_back_as_touchpad_click?: boolean | null;
       motion_as_ds4?: boolean | null;
       touchpad_as_ds4?: boolean | null;
@@ -145,10 +136,7 @@ namespace Amaterasu {
     id: string;
     entry: Entry;
   }
-  export interface CatalogConfigOverrideCapabilities {
-    frame_limiter_provider: string[];
-    rtss_frame_limit_type: string[];
-  }
+  export type CatalogConfigOverrideCapabilities = Record<string, string[]>;
   export interface CatalogReply {
     revision: number;
     entries: CatalogRow[];
@@ -592,6 +580,6 @@ namespace Amaterasu {
     navigate: (page: PageRoute) => void;
     initialSettingsCategory?: SettingsCategory;
     replaceSettingsCategory?: (category: SettingsCategory) => void;
-    registerDraftGuard?: (isDirty: () => boolean, dispose: () => void) => void;
+    registerDraftGuard?: (isDirty: () => boolean, dispose: () => void) => () => void;
   }
 }

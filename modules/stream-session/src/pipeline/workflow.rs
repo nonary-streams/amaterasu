@@ -13,7 +13,6 @@ pub(super) enum Step {
     ConfirmControlDisconnect,
     MediaReady,
     ConfigureMediaVideoFormat,
-    ApplyLimiter,
     CreateVirtualDisplay,
     StatusVirtualDisplay,
     RemoveVirtualDisplay,
@@ -23,8 +22,6 @@ pub(super) enum Step {
     FindDisplay,
     RestoreDisplay,
     RecoverDisplay,
-    FindLimiter,
-    RestoreLimiter,
     CreateOwnedVirtualDisplay,
     FindOwnedVirtualDisplay,
     RemoveOwnedVirtualDisplay,
@@ -32,6 +29,7 @@ pub(super) enum Step {
     ValidateLifecycleCandidate,
     ObserveLifecycleCapture,
     AckLifecycleCapture,
+    AckLifecycleStream,
     StartLifecycle,
     PauseLifecycle,
     RetireLifecycle,
@@ -76,7 +74,6 @@ pub(super) struct Job {
     pub deadline: u64,
     pub tried: std::collections::BTreeSet<Resource>,
     pub input_tried: bool,
-    pub limiter_tried: bool,
     pub virtual_display_tried: bool,
     pub virtual_display_removing: bool,
     pub display_tried: bool,
@@ -103,7 +100,6 @@ impl Job {
             deadline,
             tried: Default::default(),
             input_tried: false,
-            limiter_tried: false,
             virtual_display_tried: false,
             virtual_display_removing: false,
             display_tried: false,
@@ -211,15 +207,6 @@ impl Job {
                 Step::RemoveOwnedVirtualDisplay
             });
         }
-        if !self.limiter_tried {
-            if record.limiter_attempted && record.limiter_lease.is_none() {
-                return Some(Step::FindLimiter);
-            }
-            if record.limiter_lease.is_some() {
-                return Some(Step::RestoreLimiter);
-            }
-            self.limiter_tried = true;
-        }
         if !self.display_tried {
             if record.display_attempted && !record.display_status_verified {
                 return Some(Step::FindDisplay);
@@ -298,6 +285,7 @@ impl Job {
             ),
             Step::ValidateLifecycleCandidate
             | Step::AckLifecycleCapture
+            | Step::AckLifecycleStream
             | Step::StartLifecycle
             | Step::PauseLifecycle
             | Step::RetireLifecycle
@@ -307,13 +295,11 @@ impl Job {
             | Step::AckLifecycleInput => {
                 let start = record.start.as_ref().expect("lifecycle requires start");
                 let target = start.lifecycle_target.as_ref().expect("lifecycle target");
-                let candidate = start
-                    .lifecycle_candidate
-                    .as_ref()
-                    .expect("lifecycle candidate");
+                let candidate = start.lifecycle_candidate.as_ref();
                 let operation = match self.step {
                     Step::ValidateLifecycleCandidate => "validate_candidate",
                     Step::AckLifecycleCapture => "ack_binding",
+                    Step::AckLifecycleStream => "ack_stream",
                     Step::StartLifecycle => "start_stream",
                     Step::PauseLifecycle => "pause_stream",
                     Step::RetireLifecycle => "retire_stream",
@@ -339,7 +325,7 @@ impl Job {
                 let payload = if self.lifecycle_lookup {
                     json!({"operation":"lookup","operation_id":operation_id})
                 } else {
-                    let mut payload = json!({"operation":operation,"operation_id":operation_id,"target":target,"plan_revision":candidate.plan_revision});
+                    let mut payload = json!({"operation":operation,"operation_id":operation_id,"target":target,"plan_revision":candidate.map(|candidate| candidate.plan_revision)});
                     match self.step {
                         Step::ValidateLifecycleCandidate => payload["candidate"] = json!(candidate),
                         Step::AckLifecycleCapture => {
@@ -347,6 +333,7 @@ impl Job {
                             payload["consumer"] = json!("capture");
                             payload["observed_capture"] = json!(record.lifecycle_observation);
                         }
+                        Step::AckLifecycleStream => payload["consumer"] = json!("capture"),
                         Step::RetireLifecycle => {
                             payload["retirement_receipt"] =
                                 json!(record.lifecycle_retirement_receipt)
@@ -417,18 +404,7 @@ impl Job {
                 "amaterasu.virtual-display/1".into(),
                 super::virtual_display::owned_remove(record),
             ),
-            Step::ApplyLimiter => (
-                "amaterasu.frame-limiter/1".into(),
-                super::limiter::apply(record),
-            ),
-            Step::FindLimiter => (
-                "amaterasu.frame-limiter/1".into(),
-                json!({"action":"status","version":1,"session_id":record.limiter_session()}),
-            ),
-            Step::RestoreLimiter => (
-                "amaterasu.frame-limiter/1".into(),
-                json!({"action":"restore","version":1,"lease":record.limiter_lease}),
-            ),
+
             Step::CreateVirtualDisplay => (
                 "amaterasu.virtual-display/1".into(),
                 super::virtual_display::create(record),

@@ -145,25 +145,6 @@ fn peer_with_stream_overrides(
         .unwrap()
 }
 
-fn peer_with_frame_limiter_overrides(
-    marker: u8,
-    enable: Option<bool>,
-    fps_limit: Option<f64>,
-) -> PeerIdentity {
-    let certificate = vec![marker; 32];
-    PeerIdentity::new("127.0.0.1".parse().unwrap(), certificate.clone())
-        .unwrap()
-        .with_paired_identity(
-            format!("client-{marker}"),
-            fingerprint(&certificate),
-            ClientConfigOverrides {
-                frame_limiter_enable: enable,
-                frame_limiter_fps_limit: fps_limit,
-                ..Default::default()
-            },
-        )
-        .unwrap()
-}
 
 fn peer_with_overrides(
     marker: u8,
@@ -415,14 +396,6 @@ fn paired_physical_mode_freezes_independently_of_stream_cadence_and_retry() {
         first_body.contains("<physicalDisplayRefreshMilliHz>59940</physicalDisplayRefreshMilliHz>")
     );
     assert!(first_body.contains("<clientDisplayModeOverride>1</clientDisplayModeOverride>"));
-    assert_eq!(
-        broker.application_snapshot.as_ref().unwrap()["requested_stream_fps_millihz"],
-        120000
-    );
-    assert_eq!(
-        broker.application_snapshot.as_ref().unwrap()["client_display_mode_override_millihz"],
-        59940
-    );
     assert_eq!(opened_rtsp_payload(&broker)["profile"]["fps"], 120);
     controller.reply_delivered(10, now);
 
@@ -536,10 +509,6 @@ fn malformed_paired_physical_mode_rejects_before_launch_and_absent_inherits_stre
     assert!(body.contains("<physicalDisplayWidth>1280</physicalDisplayWidth>"));
     assert!(body.contains("<physicalDisplayRefreshMilliHz>60000</physicalDisplayRefreshMilliHz>"));
     assert!(body.contains("<clientDisplayModeOverride>0</clientDisplayModeOverride>"));
-    assert!(
-        broker.application_snapshot.as_ref().unwrap()["client_display_mode_override_millihz"]
-            .is_null()
-    );
     assert!(opened_rtsp_payload(&broker)["display_request"].is_null());
 }
 
@@ -586,12 +555,15 @@ fn pairing_lookup_identity_must_match_the_certificate_bytes() {
             fingerprint(&certificate),
             ClientConfigOverrides {
                 fec_percentage: Some(37),
+                retained_options: json!({"vendor_option":{"enabled":false}}).as_object().unwrap().clone(),
                 stream_audio: Some(false),
                 ..Default::default()
             },
         )
         .unwrap();
     assert_eq!(paired.paired_client_id(), Some("moonlight-id"));
+    assert_eq!(paired.client_properties["vendor_option"], json!({"enabled":false}));
+    assert_eq!(paired.client_properties["fec_percentage"], 37);
 }
 
 #[test]
@@ -1379,10 +1351,8 @@ struct Broker {
     application_back_button_timeout: Option<i32>,
     application_input_overrides: Option<Value>,
     application_display_settings: Option<Value>,
-    application_snapshot: Option<Value>,
     application_executable_path: Option<String>,
     application_catalog_revision: u64,
-    rtsp_snapshot: Option<Value>,
     rtsp_display_policy_snapshot: Option<Value>,
     rtsp_encoder: Value,
     rtsp_sw_preset: Value,
@@ -1392,8 +1362,6 @@ struct Broker {
     rtsp_nvenc_settings: Value,
     rtsp_nvenc_spatial_aq: Value,
     rtsp_display_request: Option<Value>,
-    rtsp_executable_path: Option<String>,
-    wrong_rtsp_snapshot: bool,
     wrong_rtsp_display_policy_snapshot: bool,
     reject_rtsp_display_apply: bool,
     missing_rtsp_display_readback: bool,
@@ -1470,10 +1438,8 @@ impl Default for Broker {
             application_back_button_timeout: None,
             application_input_overrides: None,
             application_display_settings: None,
-            application_snapshot: None,
             application_executable_path: None,
             application_catalog_revision: 1,
-            rtsp_snapshot: None,
             rtsp_display_policy_snapshot: None,
             rtsp_encoder: Value::Null,
             rtsp_sw_preset: Value::Null,
@@ -1483,8 +1449,6 @@ impl Default for Broker {
             rtsp_nvenc_settings: Value::Null,
             rtsp_nvenc_spatial_aq: Value::Null,
             rtsp_display_request: None,
-            rtsp_executable_path: None,
-            wrong_rtsp_snapshot: false,
             wrong_rtsp_display_policy_snapshot: false,
             reject_rtsp_display_apply: false,
             missing_rtsp_display_readback: false,
@@ -1718,12 +1682,8 @@ impl Broker {
             self.rtsp_qp = payload["qp"].clone();
             self.rtsp_nvenc_settings = payload["nvenc_settings"].clone();
             self.rtsp_nvenc_spatial_aq = payload["nvenc_spatial_aq"].clone();
-            self.rtsp_snapshot = payload.get("frame_limiter_settings").cloned();
             self.rtsp_display_policy_snapshot = payload.get("display_policy_snapshot").cloned();
             self.rtsp_display_request = payload.get("display_request").cloned();
-            self.rtsp_executable_path = payload["frame_limiter_executable_path"]
-                .as_str()
-                .map(str::to_owned);
         }
         if service == "amaterasu.rtsp/1"
             && self
@@ -1825,7 +1785,6 @@ impl Broker {
                     .unwrap_or_default()
                     .to_owned();
                 self.application_id = payload["app_id"].as_str().unwrap_or_default().to_owned();
-                self.application_snapshot = payload.get("frame_limiter_settings").cloned();
             }
             let operation = self.application_operation.as_str();
             let app = self.application_id.as_str();
@@ -1857,8 +1816,6 @@ impl Broker {
                 "catalog_revision": self.application_catalog_revision,
                 "cleanup_budget_ms":self.application_cleanup_budget,
             });
-            launch["frame_limiter_settings"] =
-                self.application_snapshot.clone().unwrap_or(Value::Null);
             launch["executable_path"] = json!(self.application_executable_path);
             if self.application_fec_percentage.is_some()
                 || self.application_max_bitrate.is_some()
@@ -1933,8 +1890,6 @@ impl Broker {
         } else {
             "ready"
         };
-        let wrong_rtsp_snapshot = self.wrong_rtsp_snapshot;
-        self.wrong_rtsp_snapshot = false;
         let wrong_rtsp_display_policy_snapshot = self.wrong_rtsp_display_policy_snapshot;
         self.wrong_rtsp_display_policy_snapshot = false;
         let missing_rtsp_display_readback = self.missing_rtsp_display_readback;
@@ -1952,12 +1907,6 @@ impl Broker {
             "qp":self.rtsp_qp,
             "nvenc_settings":self.rtsp_nvenc_settings,
             "nvenc_spatial_aq":self.rtsp_nvenc_spatial_aq,
-            "frame_limiter_settings": if wrong_rtsp_snapshot {
-                json!({"wrong":"snapshot"})
-            } else {
-                self.rtsp_snapshot.clone().unwrap_or(Value::Null)
-            },
-            "frame_limiter_executable_path": self.rtsp_executable_path,
             "display_policy_snapshot": if wrong_rtsp_display_policy_snapshot {
                 json!({"forged":true})
             } else {
@@ -3751,693 +3700,22 @@ fn launch_export_uses_the_preparation_snapshot_captured_at_admission() {
     );
 }
 
-#[test]
-fn launch_export_includes_admitted_frame_limiter_settings_and_context() {
-    let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
-    let original = FrameLimiterSettings {
-        frame_limiter_enable: Some(true),
-        frame_limiter_fps_limit: Some(144.0),
-        frame_limiter_provider: Some("none".into()),
-        ..Default::default()
-    };
-    let changed = FrameLimiterSettings {
-        frame_limiter_enable: Some(false),
-        frame_limiter_fps_limit: Some(72.0),
-        frame_limiter_provider: Some("auto".into()),
-        ..Default::default()
-    };
-    controller.set_global_frame_limiter_settings(&original);
-    let mut launch_request = request(1);
-    launch_request.fps = 60;
-    let mut broker = Broker::default();
 
-    assert!(
-        controller
-            .launch(10, launch_request, peer(1), now)
-            .is_none()
-    );
-    controller.set_global_frame_limiter_settings(&changed);
-    let _ = poll_until_reply(&mut controller, &mut broker, now);
 
-    let launch_payload = broker
-        .commands
-        .iter()
-        .find_map(|command| match command {
-            Command::Request {
-                service, payload, ..
-            } if service == "amaterasu.launch/1" && payload["action"] == "launch_export" => {
-                Some(payload)
-            }
-            _ => None,
-        })
-        .expect("launch export request");
-    let expected_settings = json!({
-        "version":1,
-        "settings":serde_json::to_value(original.effective()).unwrap(),
-        "requested_stream_fps_millihz":60000,
-        "client_display_mode_override_millihz":null,
-        "lossless_scaling_limit_millihz":null,
-        "virtual_display_active":null,
-        "physical_framegen_capture":null,
-        "game_frame_generation_mode":null,
-        "rtss_frame_limit_type_explicit_override":null
-    });
 
-    assert_eq!(launch_payload["application_display_overrides"], json!({}));
-    assert_eq!(launch_payload["frame_limiter_settings"], expected_settings);
-    assert_eq!(launch_payload["client_frame_limiter_overrides"], json!({}));
-    let rtsp_open = opened_rtsp_payload(&broker);
-    assert!(rtsp_open["frame_limiter_settings"].is_null());
-    assert!(rtsp_open["frame_limiter_executable_path"].is_null());
-    assert!(rtsp_open.get("application_operation_id").is_none());
-    assert!(rtsp_open.get("app_id").is_none());
-    assert!(rtsp_open.get("catalog_revision").is_none());
-}
 
-#[test]
-fn paired_frame_limiter_values_override_global_settings_and_keep_sparse_presence() {
-    let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
-    let global_settings = FrameLimiterSettings {
-        frame_limiter_enable: Some(true),
-        frame_limiter_fps_limit: Some(120.0),
-        ..Default::default()
-    };
-    controller.set_global_frame_limiter_settings(&global_settings);
-    let mut broker = Broker::default();
 
-    assert!(
-        controller
-            .launch(
-                10,
-                request(1),
-                peer_with_frame_limiter_overrides(1, Some(false), Some(0.0)),
-                now,
-            )
-            .is_none()
-    );
-    let _ = poll_until_reply(&mut controller, &mut broker, now);
 
-    let launch_payload = broker
-        .commands
-        .iter()
-        .find_map(|command| match command {
-            Command::Request {
-                service, payload, ..
-            } if service == "amaterasu.launch/1" && payload["action"] == "launch_export" => {
-                Some(payload)
-            }
-            _ => None,
-        })
-        .expect("launch export request");
-    assert_eq!(
-        launch_payload["frame_limiter_settings"]["settings"]["frame_limiter_enable"],
-        false
-    );
-    assert_eq!(
-        launch_payload["frame_limiter_settings"]["settings"]["frame_limiter_fps_limit_millihz"],
-        0
-    );
-    assert_eq!(
-        launch_payload["client_frame_limiter_overrides"],
-        json!({"frame_limiter_enable":false,"frame_limiter_fps_limit":0.0})
-    );
-}
 
-#[test]
-fn application_frame_limiter_values_decode_sparsely_and_reject_malformed_values() {
-    let payload = json!({
-        "launch": {
-            "config_overrides": {
-                "frame_limiter_enable":false,
-                "frame_limiter_fps_limit":72.0,
-                "frame_limiter_provider":"auto"
-            }
-        }
-    });
-    let decoded = super::workflow::application_config_overrides(&payload).unwrap();
-    assert_eq!(
-        decoded.frame_limiter_settings(),
-        FrameLimiterSettings {
-            frame_limiter_enable: Some(false),
-            frame_limiter_fps_limit: Some(72.0),
-            frame_limiter_provider: Some("auto".into()),
-            ..Default::default()
-        }
-    );
 
-    let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
-    let mut broker = Broker {
-        application_input_overrides: Some(json!({
-            "frame_limiter_fps_limit":72.0,
-            "frame_limiter_provider":"auto"
-        })),
-        ..Broker::default()
-    };
-    assert!(controller.launch(10, request(1), peer(1), now).is_none());
-    let _ = poll_until_reply(&mut controller, &mut broker, now);
-    let record = controller.records.values().next().expect("launch record");
-    assert_eq!(
-        record.application_frame_limiter_settings,
-        FrameLimiterSettings {
-            frame_limiter_fps_limit: Some(72.0),
-            frame_limiter_provider: Some("auto".into()),
-            ..Default::default()
-        }
-    );
-    let launch_payload = broker
-        .commands
-        .iter()
-        .find_map(|command| match command {
-            Command::Request {
-                service, payload, ..
-            } if service == "amaterasu.launch/1" && payload["action"] == "launch_export" => {
-                Some(payload)
-            }
-            _ => None,
-        })
-        .expect("launch export");
-    assert_eq!(launch_payload["client_frame_limiter_overrides"], json!({}));
 
-    #[cfg(windows)]
-    {
-        let windows_payload = json!({
-            "launch": {
-                "config_overrides": {
-                    "frame_limiter_disable_vsync":false,
-                    "frame_limiter_auto_virtual_framegen":"legacy"
-                }
-            }
-        });
-        let decoded = super::workflow::application_config_overrides(&windows_payload).unwrap();
-        assert_eq!(
-            decoded.frame_limiter_settings(),
-            FrameLimiterSettings {
-                frame_limiter_disable_vsync: Some(false),
-                frame_limiter_auto_virtual_framegen: Some("legacy".into()),
-                ..Default::default()
-            }
-        );
-    }
-
-    let malformed_values = [
-        json!({"frame_limiter_enable":"false"}),
-        json!({"frame_limiter_fps_limit":"60"}),
-        json!({"frame_limiter_fps_limit":1000.001}),
-        json!({"frame_limiter_provider":[]}),
-        json!({"frame_limiter_disable_vsync":1}),
-        json!({"frame_limiter_auto_virtual_framegen":"invalid"}),
-        json!({"lossless_scaling_framegen":"true"}),
-        json!({"lossless_scaling_target_fps":0}),
-        json!({"lossless_scaling_target_fps":1001}),
-        json!({"lossless_scaling_target_fps":"60"}),
-        json!({"frame_generation_provider":"unknown"}),
-        json!({"frame_generation_provider":false}),
-        json!({"frame_generation_mode":"disabled"}),
-        json!({"frame_generation_mode":0}),
-        json!({"rtss_frame_limit_type":false}),
-        json!({"ds4_back_as_touchpad_click":"false"}),
-        json!({"unrecognized_override":true}),
-    ];
-    for application_overrides in malformed_values.iter() {
-        let payload = json!({"launch":{"config_overrides":application_overrides}});
-        assert!(super::workflow::application_config_overrides(&payload).is_err());
-    }
-
-    for (offset, application_overrides) in malformed_values.into_iter().enumerate() {
-        let now = Instant::now();
-        let marker = 70 + offset as u8;
-        let mut controller = Controller::new(Some(config())).unwrap();
-        let mut broker = Broker {
-            application_input_overrides: Some(application_overrides),
-            ..Broker::default()
-        };
-
-        assert!(
-            controller
-                .launch(10, request(marker), peer(marker), now)
-                .is_none()
-        );
-        let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
-        assert_eq!(reply.status, 503);
-        assert!(!broker.commands.iter().any(|command| matches!(
-            command,
-            Command::Request { service, payload, .. }
-                if service == "amaterasu.rtsp/1" && payload["action"] == "open"
-        )));
-    }
-}
-
-#[test]
-fn application_lossless_scaling_framegen_projects_into_the_frozen_launch_snapshot() {
-    for (offset, application_overrides, expected_mode, expected_limit) in [
-        (0, None, json!(null), json!(null)),
-        (1, Some(json!({})), json!(null), json!(null)),
-        (
-            2,
-            Some(json!({"lossless_scaling_framegen":null})),
-            json!(null),
-            json!(null),
-        ),
-        (
-            3,
-            Some(json!({"lossless_scaling_framegen":false})),
-            json!("none"),
-            json!(null),
-        ),
-        (
-            4,
-            Some(json!({"lossless_scaling_framegen":true})),
-            json!("lossless-scaling"),
-            json!(60_000),
-        ),
-        (
-            5,
-            Some(
-                json!({"frame_generation_provider":"game-provided","lossless_scaling_framegen":false}),
-            ),
-            json!("game-provided"),
-            json!(null),
-        ),
-        (
-            6,
-            Some(
-                json!({"frame_generation_provider":"nvidia-smooth-motion","lossless_scaling_framegen":false}),
-            ),
-            json!("nvidia-smooth-motion"),
-            json!(null),
-        ),
-        (
-            7,
-            Some(json!({"frame_generation_provider":"lossless-scaling"})),
-            json!(null),
-            json!(null),
-        ),
-        (
-            8,
-            Some(
-                json!({"frame_generation_provider":"lossless-scaling","lossless_scaling_framegen":false}),
-            ),
-            json!("none"),
-            json!(null),
-        ),
-        (
-            9,
-            Some(
-                json!({"frame_generation_mode":"off","frame_generation_provider":"game-provided","lossless_scaling_framegen":true}),
-            ),
-            json!("none"),
-            json!(null),
-        ),
-        (
-            10,
-            Some(
-                json!({"frame_generation_mode":"nvidia-smooth-motion","frame_generation_provider":"game-provided","lossless_scaling_framegen":false}),
-            ),
-            json!("nvidia-smooth-motion"),
-            json!(null),
-        ),
-        (
-            11,
-            Some(
-                json!({"frame_generation_mode":"game-provided","lossless_scaling_framegen":false}),
-            ),
-            json!("game-provided"),
-            json!(null),
-        ),
-        (
-            12,
-            Some(
-                json!({"frame_generation_mode":"lossless-scaling","lossless_scaling_framegen":false,"lossless_scaling_target_fps":144}),
-            ),
-            json!("lossless-scaling"),
-            json!(144_000),
-        ),
-        (
-            13,
-            Some(
-                json!({"frame_generation_mode":"game-provided","lossless_scaling_target_fps":144}),
-            ),
-            json!("game-provided"),
-            json!(null),
-        ),
-    ] {
-        let now = Instant::now();
-        let marker = 80 + offset;
-        let mut controller = Controller::new(Some(config())).unwrap();
-        let mut broker = Broker {
-            application_input_overrides: application_overrides,
-            ..Broker::default()
-        };
-
-        assert!(
-            controller
-                .launch(10, request(marker), peer(marker), now)
-                .is_none()
-        );
-        let _ = poll_until_reply(&mut controller, &mut broker, now);
-
-        let launch_payload = broker
-            .commands
-            .iter()
-            .find_map(|command| match command {
-                Command::Request {
-                    service, payload, ..
-                } if service == "amaterasu.launch/1" && payload["action"] == "launch_export" => {
-                    Some(payload)
-                }
-                _ => None,
-            })
-            .expect("launch export request");
-        assert_eq!(
-            launch_payload["frame_limiter_settings"]["game_frame_generation_mode"], expected_mode,
-            "application override case {offset}"
-        );
-        assert_eq!(
-            launch_payload["frame_limiter_settings"]["lossless_scaling_limit_millihz"],
-            expected_limit,
-            "application override case {offset}"
-        );
-    }
-}
-
-#[test]
-fn lossless_scaling_target_fps_uses_checked_millihertz_conversion() {
-    assert_eq!(
-        super::workflow::lossless_scaling_target_fps_millihz(60),
-        Some(60_000)
-    );
-    assert_eq!(
-        super::workflow::lossless_scaling_target_fps_millihz(1000),
-        Some(1_000_000)
-    );
-    assert_eq!(
-        super::workflow::lossless_scaling_target_fps_millihz(0),
-        None
-    );
-    assert_eq!(
-        super::workflow::lossless_scaling_target_fps_millihz(1001),
-        None
-    );
-    assert_eq!(
-        super::workflow::lossless_scaling_target_fps_millihz(u32::MAX),
-        None
-    );
-}
-
-#[cfg(windows)]
-#[test]
-fn application_rtss_frame_limit_type_decodes_windows_domain_values() {
-    for frame_limit_type in [
-        "async",
-        "front edge sync",
-        "back edge sync",
-        "nvidia reflex",
-    ] {
-        let payload = json!({
-            "launch": {
-                "config_overrides": {
-                    "rtss_frame_limit_type":frame_limit_type
-                }
-            }
-        });
-        let decoded = super::workflow::application_config_overrides(&payload).unwrap();
-        assert_eq!(
-            decoded
-                .frame_limiter_settings()
-                .rtss_frame_limit_type
-                .as_deref(),
-            Some(frame_limit_type)
-        );
-    }
-
-    let invalid_payload = json!({
-        "launch": {
-            "config_overrides": {
-                "rtss_frame_limit_type":"sync"
-            }
-        }
-    });
-    assert!(super::workflow::application_config_overrides(&invalid_payload).is_err());
-    assert_eq!(
-        FrameLimiterSettings {
-            rtss_frame_limit_type: Some("sync".into()),
-            ..Default::default()
-        }
-        .validate(),
-        Err("invalid_rtss_frame_limit_type")
-    );
-}
-
-#[cfg(not(windows))]
-#[test]
-fn application_rtss_frame_limit_type_rejects_windows_domain_values_off_windows() {
-    let payload = json!({
-        "launch": {
-            "config_overrides": {
-                "rtss_frame_limit_type":"async"
-            }
-        }
-    });
-    assert!(super::workflow::application_config_overrides(&payload).is_err());
-    assert_eq!(
-        FrameLimiterSettings {
-            rtss_frame_limit_type: Some("async".into()),
-            ..Default::default()
-        }
-        .validate(),
-        Err("unsupported_frame_limiter_setting")
-    );
-}
-
-#[test]
-fn frame_limiter_fields_resolve_client_then_application_then_global_independently() {
-    let global = FrameLimiterSettings {
-        frame_limiter_enable: Some(true),
-        frame_limiter_fps_limit: Some(60.0),
-        frame_limiter_provider: Some("auto".into()),
-        frame_limiter_disable_vsync: Some(true),
-        frame_limiter_auto_virtual_framegen: Some("enabled".into()),
-        ..Default::default()
-    };
-    let application = FrameLimiterSettings {
-        frame_limiter_enable: Some(true),
-        frame_limiter_fps_limit: Some(90.0),
-        frame_limiter_provider: Some("rtss".into()),
-        frame_limiter_disable_vsync: Some(false),
-        frame_limiter_auto_virtual_framegen: Some("legacy".into()),
-        ..Default::default()
-    };
-    let client = FrameLimiterSettings {
-        frame_limiter_enable: Some(false),
-        frame_limiter_fps_limit: Some(144.0),
-        frame_limiter_provider: Some("none".into()),
-        frame_limiter_disable_vsync: Some(true),
-        frame_limiter_auto_virtual_framegen: Some("vrr".into()),
-        ..Default::default()
-    };
-    let resolved = super::workflow::resolve_frame_limiter_settings(&global, &application, &client);
-    assert_eq!(resolved.frame_limiter_enable, Some(false));
-    assert_eq!(resolved.frame_limiter_fps_limit, Some(144.0));
-    assert_eq!(resolved.frame_limiter_provider.as_deref(), Some("none"));
-    assert_eq!(resolved.frame_limiter_disable_vsync, Some(true));
-    assert_eq!(
-        resolved.frame_limiter_auto_virtual_framegen.as_deref(),
-        Some("vrr")
-    );
-
-    let application_resolved = super::workflow::resolve_frame_limiter_settings(
-        &global,
-        &application,
-        &FrameLimiterSettings::default(),
-    );
-    assert_eq!(application_resolved.frame_limiter_enable, Some(true));
-    assert_eq!(application_resolved.frame_limiter_fps_limit, Some(90.0));
-    assert_eq!(
-        application_resolved.frame_limiter_provider.as_deref(),
-        Some("rtss")
-    );
-    assert_eq!(
-        application_resolved.frame_limiter_disable_vsync,
-        Some(false)
-    );
-    assert_eq!(
-        application_resolved
-            .frame_limiter_auto_virtual_framegen
-            .as_deref(),
-        Some("legacy")
-    );
-
-    let global_resolved = super::workflow::resolve_frame_limiter_settings(
-        &global,
-        &FrameLimiterSettings::default(),
-        &FrameLimiterSettings::default(),
-    );
-    assert_eq!(global_resolved.frame_limiter_enable, Some(true));
-    assert_eq!(global_resolved.frame_limiter_fps_limit, Some(60.0));
-    assert_eq!(
-        global_resolved.frame_limiter_provider.as_deref(),
-        Some("auto")
-    );
-    assert_eq!(global_resolved.frame_limiter_disable_vsync, Some(true));
-    assert_eq!(
-        global_resolved
-            .frame_limiter_auto_virtual_framegen
-            .as_deref(),
-        Some("enabled")
-    );
-
-    let defaults = super::workflow::resolve_frame_limiter_settings(
-        &FrameLimiterSettings::default(),
-        &FrameLimiterSettings::default(),
-        &FrameLimiterSettings::default(),
-    );
-    assert_eq!(defaults.frame_limiter_enable, None);
-    assert_eq!(defaults.frame_limiter_fps_limit, None);
-    assert_eq!(defaults.frame_limiter_provider, None);
-    assert_eq!(defaults.frame_limiter_disable_vsync, None);
-    assert_eq!(defaults.frame_limiter_auto_virtual_framegen, None);
-}
-
-#[cfg(windows)]
-#[test]
-fn rtss_frame_limit_type_resolves_client_then_application_then_global_then_default() {
-    let global = FrameLimiterSettings {
-        rtss_frame_limit_type: Some("async".into()),
-        ..Default::default()
-    };
-    let application = FrameLimiterSettings {
-        rtss_frame_limit_type: Some("front edge sync".into()),
-        ..Default::default()
-    };
-    let client = FrameLimiterSettings {
-        rtss_frame_limit_type: Some("nvidia reflex".into()),
-        ..Default::default()
-    };
-
-    let client_resolved =
-        super::workflow::resolve_frame_limiter_settings(&global, &application, &client);
-    assert_eq!(
-        client_resolved.rtss_frame_limit_type.as_deref(),
-        Some("nvidia reflex")
-    );
-
-    let application_resolved = super::workflow::resolve_frame_limiter_settings(
-        &global,
-        &application,
-        &FrameLimiterSettings::default(),
-    );
-    assert_eq!(
-        application_resolved.rtss_frame_limit_type.as_deref(),
-        Some("front edge sync")
-    );
-
-    let global_resolved = super::workflow::resolve_frame_limiter_settings(
-        &global,
-        &FrameLimiterSettings::default(),
-        &FrameLimiterSettings::default(),
-    );
-    assert_eq!(
-        global_resolved.rtss_frame_limit_type.as_deref(),
-        Some("async")
-    );
-
-    let defaults = super::workflow::resolve_frame_limiter_settings(
-        &FrameLimiterSettings::default(),
-        &FrameLimiterSettings::default(),
-        &FrameLimiterSettings::default(),
-    );
-    assert_eq!(defaults.rtss_frame_limit_type, None);
-    assert_eq!(defaults.effective().rtss_frame_limit_type, "async");
-}
-
-#[cfg(windows)]
-#[test]
-fn application_rtss_frame_limit_type_is_captured_after_launch_export() {
-    let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
-    let global_settings = FrameLimiterSettings {
-        rtss_frame_limit_type: Some("async".into()),
-        ..Default::default()
-    };
-    controller.set_global_frame_limiter_settings(&global_settings);
-    let mut broker = Broker {
-        application_input_overrides: Some(json!({
-            "rtss_frame_limit_type":"back edge sync"
-        })),
-        application_executable_path: Some("C:\\Games\\Example.exe".into()),
-        ..Broker::default()
-    };
-
-    assert!(controller.launch(10, request(1), peer(1), now).is_none());
-    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
-    assert_eq!(reply.status, 200);
-
-    let record = controller.records.values().next().expect("launch record");
-    assert_eq!(
-        record
-            .application_frame_limiter_settings
-            .rtss_frame_limit_type
-            .as_deref(),
-        Some("back edge sync")
-    );
-    let actions = broker.actions();
-    assert!(
-        actions
-            .iter()
-            .position(|(_, action)| *action == "preflight_export")
-            < actions
-                .iter()
-                .position(|(_, action)| *action == "launch_export")
-    );
-    let launch_payload = broker
-        .commands
-        .iter()
-        .find_map(|command| match command {
-            Command::Request {
-                service, payload, ..
-            } if service == "amaterasu.launch/1" && payload["action"] == "launch_export" => {
-                Some(payload)
-            }
-            _ => None,
-        })
-        .unwrap();
-    assert_eq!(launch_payload["preflight_token"], "fixture-preflight-token");
-    assert_eq!(
-        launch_payload["frame_limiter_settings"]["settings"]["rtss_frame_limit_type"],
-        "back edge sync"
-    );
-    assert_eq!(
-        launch_payload["frame_limiter_settings"]["rtss_frame_limit_type_explicit_override"],
-        true
-    );
-    assert_eq!(
-        opened_rtsp_payload(&broker)["frame_limiter_settings"],
-        launch_payload["frame_limiter_settings"]
-    );
-    assert_eq!(
-        opened_rtsp_payload(&broker)["frame_limiter_executable_path"],
-        "C:\\Games\\Example.exe"
-    );
-    let resolved = super::workflow::resolve_frame_limiter_settings(
-        &global_settings,
-        &record.application_frame_limiter_settings,
-        &FrameLimiterSettings::default(),
-    );
-    assert_eq!(
-        resolved.rtss_frame_limit_type.as_deref(),
-        Some("back edge sync")
-    );
-}
 
 #[test]
 fn malformed_preflight_override_fails_before_application_launch() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
     let mut broker = Broker {
-        application_input_overrides: Some(json!({"frame_limiter_enable":"false"})),
+        application_input_overrides: Some(json!({"stream_audio":"false"})),
         ..Broker::default()
     };
     assert!(controller.launch(10, request(1), peer(1), now).is_none());
@@ -4761,7 +4039,7 @@ fn verify_only_freezes_unique_active_monitor_without_mutation_and_retries_exactl
 }
 
 #[test]
-fn display_and_frame_limiter_open_share_frozen_application_identity() {
+fn display_open_preserves_frozen_application_identity() {
     let now = Instant::now();
     let mut streaming = config();
     streaming.capture.capture_provider = CaptureProvider::Wgc;
@@ -4784,7 +4062,6 @@ fn display_and_frame_limiter_open_share_frozen_application_identity() {
     let record = controller.records.values().next().expect("launch record");
     let open = opened_rtsp_payload(&broker);
     assert!(open["display_request"].is_object());
-    assert!(open["frame_limiter_settings"].is_object());
     assert_eq!(
         open["application_operation_id"],
         record.application_operation
@@ -5037,21 +4314,6 @@ fn explicit_null_client_display_field_inherits_application_choice() {
     assert_eq!(snapshot["effective_overrides"]["dd_hdr_option"], "disabled");
 }
 
-#[test]
-fn rtsp_snapshot_readback_mismatch_never_completes_launch() {
-    let now = Instant::now();
-    let mut controller = Controller::new(Some(config())).unwrap();
-    let mut broker = Broker {
-        application_executable_path: Some("C:\\Games\\Example.exe".into()),
-        wrong_rtsp_snapshot: true,
-        ..Broker::default()
-    };
-    assert!(controller.launch(10, request(1), peer(1), now).is_none());
-    let (_, reply) = poll_until_reply(&mut controller, &mut broker, now);
-    assert_ne!(reply.status, 200);
-    assert!(broker.actions().contains(&("amaterasu.rtsp/1", "open")));
-    assert_eq!(controller.current_game(&peer(1)), 0);
-}
 
 #[test]
 fn expired_preflight_settles_without_scheduling_application_cleanup() {
@@ -5185,21 +4447,10 @@ fn lost_rtsp_admission_is_settled_before_owned_lookup_without_reopening() {
         .collect();
     assert_eq!(rtsp_requests.len(), 3);
     assert_eq!(rtsp_requests[0].1, rtsp_requests[1].1);
-    let record = controller.records.values().next().expect("launch record");
-    assert_eq!(
-        rtsp_requests[0].1["application_operation_id"],
-        record.application_operation
-    );
-    assert_eq!(rtsp_requests[0].1["app_id"], super::app_id(1));
-    assert_eq!(
-        rtsp_requests[0].1["catalog_revision"],
-        record.application_catalog_revision.unwrap()
-    );
+    assert!(rtsp_requests[0].1.get("application_operation_id").is_none());
+    assert!(rtsp_requests[0].1.get("app_id").is_none());
+    assert!(rtsp_requests[0].1.get("catalog_revision").is_none());
     assert!(rtsp_requests[0].1.get("display_request").is_none());
-    assert_eq!(
-        rtsp_requests[0].1["frame_limiter_settings"],
-        broker.rtsp_snapshot.clone().expect("frozen RTSP snapshot")
-    );
     assert_eq!(rtsp_requests[0].2, rtsp_requests[1].2);
     assert_eq!(rtsp_requests[2].1["action"], "lookup");
     let cancel = broker

@@ -57,20 +57,13 @@ impl Controller {
                 record.close(Some("dependency_unavailable"));
                 self.schedule_lookup(record, job.caller, now);
             }
-            Phase::VerifyFrameLimiter
-            | Phase::LifecyclePrepare
-            | Phase::LifecycleLookup
-            | Phase::Arm => {
+            Phase::LifecyclePrepare | Phase::LifecycleLookup | Phase::Arm => {
                 if let Some((connection, action_ticket)) = job.network {
                     self.fail_network_action(
                         record,
                         connection,
                         action_ticket,
-                        if job.phase == Phase::VerifyFrameLimiter {
-                            "frame_limiter_verification_unavailable"
-                        } else {
-                            "dependency_unavailable"
-                        },
+                        "dependency_unavailable",
                     );
                 } else {
                     record.close(Some("network_disconnected"));
@@ -99,7 +92,6 @@ impl Controller {
         match job.phase {
             Phase::Prepare => self.prepared(record, job, &payload, now, runtime),
             Phase::Find => self.found(record, job, &payload, now, runtime),
-            Phase::VerifyFrameLimiter => self.verified_frame_limiter(record, job, &payload, now),
             Phase::LifecyclePrepare | Phase::LifecycleLookup => {
                 self.lifecycle_prepared(record, job, &payload, now)
             }
@@ -175,7 +167,17 @@ impl Controller {
             }
             _ => false,
         };
-        let valid_candidate = candidate
+        let returned_mode = serde_json::from_value::<amaterasu_extension_api::CaptureBindingMode>(
+            payload
+                .get("capture_binding_mode")
+                .cloned()
+                .unwrap_or(json!("managed")),
+        )
+        .ok();
+        let valid_candidate = if record.config.lifecycle_capture_mode.is_external() {
+            payload["candidate"].is_null() && payload["required_consumers"] == json!(["capture"])
+        } else {
+            candidate
             .as_ref()
             .zip(record.negotiated_video)
             .zip(record.negotiated_video_stream_format)
@@ -188,8 +190,13 @@ impl Controller {
                     && binding.mode.refresh_millihz == video.fps * 1000
                     && binding.mode.hdr
                         == (format.dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr)
-            });
-        if payload["status"] != "succeeded" || !valid_target || !valid_candidate {
+            })
+        };
+        if payload["status"] != "succeeded"
+            || !valid_target
+            || !valid_candidate
+            || returned_mode != Some(record.config.lifecycle_capture_mode)
+        {
             self.fail_network_action(
                 record,
                 connection,
@@ -210,53 +217,9 @@ impl Controller {
         record.lifecycle_prepare_outstanding = false;
         start["configuration"]["lifecycle_target"] = payload["target"].clone();
         start["configuration"]["lifecycle_candidate"] = payload["candidate"].clone();
+        start["configuration"]["lifecycle_capture_mode"] =
+            json!(record.config.lifecycle_capture_mode);
         self.schedule_actual_arm(record, start, connection, action_ticket, job.deadline);
-    }
-
-    pub(super) fn verified_frame_limiter(
-        &mut self,
-        record: &mut Record,
-        job: Job,
-        payload: &Value,
-        now: u64,
-    ) {
-        let verified = payload["ok"] == true
-            && payload["verified"] == true
-            && payload["application_operation_id"].as_str()
-                == record.config.application_operation_id.as_deref()
-            && payload["app_id"].as_str() == record.config.app_id.as_deref()
-            && payload["catalog_revision"].as_u64() == record.config.catalog_revision
-            && payload.get("frame_limiter_settings")
-                == record.config.frame_limiter_settings.as_ref()
-            && payload["frame_limiter_executable_path"].as_str()
-                == record.config.frame_limiter_executable_path.as_deref()
-            && (record.config.lifecycle_session_target.is_none()
-                || payload["rtsp_operation_id"].as_str()
-                    == Some(record.config.operation_id.as_str()))
-            && record.state == State::Ready
-            && now < record.expires;
-        let Some((connection, action_ticket)) = job.network else {
-            record.close(Some("network_disconnected"));
-            self.schedule_stop(record, job.caller, now);
-            return;
-        };
-        if !verified {
-            self.fail_network_action(
-                record,
-                connection,
-                action_ticket,
-                "frame_limiter_snapshot_denied",
-            );
-            return;
-        }
-        let Some(start) = record
-            .session
-            .and_then(|session| record.authenticated_start_payload(session))
-        else {
-            self.fail_network_action(record, connection, action_ticket, "negotiation_failed");
-            return;
-        };
-        self.schedule_arm(record, start, connection, action_ticket, now);
     }
 
     pub(super) fn prepared(
@@ -302,14 +265,6 @@ impl Controller {
             {
                 return Err("display_lease_unverified");
             }
-            if record.config.frame_limiter_settings.is_some()
-                && (payload.get("frame_limiter_settings")
-                    != record.config.frame_limiter_settings.as_ref()
-                    || payload["frame_limiter_executable_path"].as_str()
-                        != record.config.frame_limiter_executable_path.as_deref())
-            {
-                return Err("frame_limiter_snapshot_unverified");
-            }
             match record.config.history_activity_id.as_deref() {
                 Some(activity_id)
                     if payload["history_activity_id"].as_str() == Some(activity_id)
@@ -322,6 +277,17 @@ impl Controller {
             if payload["lifecycle_session_target"] != json!(record.config.lifecycle_session_target)
             {
                 return Err("lifecycle_identity_unverified");
+            }
+            if serde_json::from_value::<amaterasu_extension_api::CaptureBindingMode>(
+                payload
+                    .get("lifecycle_capture_mode")
+                    .cloned()
+                    .unwrap_or(json!("managed")),
+            )
+            .ok()
+                != Some(record.config.lifecycle_capture_mode)
+            {
+                return Err("lifecycle_mode_unverified");
             }
             if record.config.lifecycle_session_target.is_some() {
                 record.lifecycle_input_required = Some(

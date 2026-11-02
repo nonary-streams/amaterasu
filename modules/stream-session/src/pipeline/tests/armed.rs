@@ -49,6 +49,68 @@ fn arm_lifecycle(host: &mut Harness) -> (u64, Value) {
 }
 
 #[test]
+fn external_lifecycle_keeps_capture_and_input_and_retires_after_native_close() {
+    for input in [false, true] {
+        let mut host = Harness::new();
+        host.pipeline
+            .settings
+            .allowed_principals
+            .push("amaterasu.rtsp".into());
+        host.pipeline.settings.enable_input = input;
+        host.broker.lifecycle_success = true;
+        let mut request = prepare();
+        request["lifecycle_capture_mode"] = json!("external");
+        request["lifecycle_session_target"] =
+            json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1});
+        let id = host.response_from(1, "amaterasu.rtsp", request)["session"]
+            .as_u64()
+            .unwrap();
+        let mut configuration = arm(id);
+        configuration["configuration"]["lifecycle_capture_mode"] = json!("external");
+        configuration["configuration"]["lifecycle_target"] = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1});
+        assert_eq!(
+            host.response_from(2, "amaterasu.rtsp", configuration)["state"],
+            "armed"
+        );
+        host.idle();
+        assert_eq!(host.pipeline.records[&id].state, State::Active);
+        let ticks = host.plane.borrow().ticks;
+        host.idle();
+        assert!(host.plane.borrow().ticks > ticks);
+        let calls = &host.broker.calls;
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.payload["operation"] == "ack_stream")
+        );
+        assert!(!calls.iter().any(|call| matches!(
+            call.payload["operation"].as_str(),
+            Some("validate_candidate" | "ack_binding" | "binding_validate" | "issue_input_binding")
+        )));
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.payload["action"] == "observe_capture")
+        );
+        let stopped =
+            host.response_from(3, "amaterasu.rtsp", json!({"action":"stop","session":id}));
+        assert_eq!(stopped["lifecycle_retired"], true, "{stopped}");
+        let calls = &host.broker.calls;
+        let close = calls
+            .iter()
+            .position(|call| {
+                call.service == "amaterasu.video/1" && call.payload["action"] == "close"
+            })
+            .unwrap();
+        let retire = calls
+            .iter()
+            .position(|call| call.payload["operation"] == "retire_stream")
+            .unwrap();
+        assert!(close < retire);
+    }
+}
+
+#[test]
 fn lifecycle_capture_waits_for_authority_and_retires_after_close() {
     let mut host = Harness::new();
     host.pipeline

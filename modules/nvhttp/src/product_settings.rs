@@ -1,6 +1,5 @@
 //! Caller-scoped NVHTTP product settings persisted by the configuration service.
 use crate::{
-    frame_limiter::FrameLimiterSettings,
     launch::CaptureMode,
     preparation::{
         LegacyPreparationStep, PreparationStep, validate_legacy_preparation, validate_preparation,
@@ -33,7 +32,6 @@ const AUDIO_SINK_CAPTURE_ONLY_SETTINGS_VERSION: u64 = 14;
 const VIRTUAL_SINK_SETTINGS_VERSION: u64 = 15;
 const GLOBAL_PREPARATION_SETTINGS_VERSION: u64 = 16;
 const GLOBAL_RAW_PREPARATION_SETTINGS_VERSION: u64 = 17;
-const FRAME_LIMITER_SETTINGS_VERSION: u64 = 17;
 const ENCRYPTION_MODE_SETTINGS_VERSION: u64 = 17;
 const DISPLAY_POLICY_SETTINGS_VERSION: u64 = 18;
 // The Linux Desktop profile requests video encryption. The default LAN policy
@@ -52,7 +50,8 @@ const NVENC_SETTINGS_VERSION: u64 = 24;
 const STEAM_AUDIO_DRIVER_SETTINGS_VERSION: u64 = 25;
 const FULL_DISPLAY_POLICY_SETTINGS_VERSION: u64 = 26;
 const LEGACY_PERMANENT_MONITOR_COUNT_KEY: &str = "dd_vdd_static_monitor_count";
-const SETTINGS_VERSION: u64 = FULL_DISPLAY_POLICY_SETTINGS_VERSION;
+const RETAINED_OPTIONS_SETTINGS_VERSION: u64 = 27;
+const SETTINGS_VERSION: u64 = RETAINED_OPTIONS_SETTINGS_VERSION;
 const LEGACY_DISPLAY_POLICY_KEYS: [&str; 8] = [
     "dd_mode_remapping",
     "dd_resolution_option",
@@ -133,7 +132,6 @@ pub(crate) enum AdminAction {
         ping_timeout_ms: FieldUpdate<i32>,
         global_preparation: FieldUpdate<Vec<PreparationStep>>,
         legacy_global_preparation: FieldUpdate<Vec<LegacyPreparationStep>>,
-        frame_limiter: FrameLimiterUpdate,
         display_policy: DisplayPolicyUpdate,
         encryption_modes: EncryptionModeUpdate,
         upnp: FieldUpdate<bool>,
@@ -787,7 +785,7 @@ struct UpdatePurpose {
     ping_timeout_ms: Option<i32>,
     global_preparation: Vec<PreparationStep>,
     legacy_global_preparation: Vec<LegacyPreparationStep>,
-    frame_limiter: FrameLimiterSettings,
+    retained_values: serde_json::Map<String, Value>,
     display_policy: Value,
     lan_encryption_mode: u8,
     wan_encryption_mode: u8,
@@ -839,7 +837,7 @@ struct ProductDocument {
     ping_timeout_ms: Option<i32>,
     global_preparation: Vec<PreparationStep>,
     legacy_global_preparation: Vec<LegacyPreparationStep>,
-    frame_limiter: FrameLimiterSettings,
+    retained_values: serde_json::Map<String, Value>,
     display_policy: Value,
     lan_encryption_mode: u8,
     wan_encryption_mode: u8,
@@ -867,27 +865,11 @@ struct ProductStreamingSettings {
     ping_timeout_ms: Option<i32>,
     global_preparation: Vec<PreparationStep>,
     legacy_global_preparation: Vec<LegacyPreparationStep>,
-    frame_limiter: FrameLimiterSettings,
+    retained_values: serde_json::Map<String, Value>,
     display_policy: Value,
     lan_encryption_mode: u8,
     wan_encryption_mode: u8,
     upnp: bool,
-}
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct FrameLimiterUpdate {
-    pub(crate) frame_limiter_enable: FieldUpdate<bool>,
-    pub(crate) frame_limiter_fps_limit: FieldUpdate<f64>,
-    pub(crate) frame_limiter_provider: FieldUpdate<String>,
-    pub(crate) frame_limiter_disable_vsync: FieldUpdate<bool>,
-    pub(crate) frame_limiter_auto_virtual_framegen: FieldUpdate<String>,
-    pub(crate) rtss_frame_limit_type: FieldUpdate<String>,
-    pub(crate) rtss_allow_virtual_display_override: FieldUpdate<bool>,
-    pub(crate) rtss_install_path: FieldUpdate<String>,
-    pub(crate) mangohud_limiter_method: FieldUpdate<String>,
-    pub(crate) mangohud_preset: FieldUpdate<String>,
-    pub(crate) mangohud_always_show_graph: FieldUpdate<bool>,
-    pub(crate) rtss_disable_vsync_ullm: FieldUpdate<bool>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -929,7 +911,7 @@ pub struct ProductSettings {
     configured_ping_timeout_ms: Option<i32>,
     configured_global_preparation: Vec<PreparationStep>,
     configured_legacy_global_preparation: Vec<LegacyPreparationStep>,
-    configured_frame_limiter: FrameLimiterSettings,
+    retained_values: serde_json::Map<String, Value>,
     configured_display_policy: Value,
     lan_encryption_mode: u8,
     wan_encryption_mode: u8,
@@ -1050,7 +1032,7 @@ impl ProductSettings {
             configured_ping_timeout_ms: None,
             configured_global_preparation: Vec::new(),
             configured_legacy_global_preparation: Vec::new(),
-            configured_frame_limiter: FrameLimiterSettings::default(),
+            retained_values: serde_json::Map::new(),
             configured_display_policy: empty_display_policy(),
             lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
             wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
@@ -1108,10 +1090,6 @@ impl ProductSettings {
         &self.configured_legacy_global_preparation
     }
 
-    pub fn configured_frame_limiter(&self) -> &FrameLimiterSettings {
-        &self.configured_frame_limiter
-    }
-
     pub fn lan_encryption_mode(&self) -> u8 {
         self.lan_encryption_mode
     }
@@ -1154,6 +1132,11 @@ impl ProductSettings {
     pub fn video_batch_size_fallback(&self) -> bool {
         self.configured_video_max_batch_size_kb
             .is_some_and(video_batch_size_fallback)
+    }
+
+    #[cfg(test)]
+    fn retained_values(&self) -> &serde_json::Map<String, Value> {
+        &self.retained_values
     }
 
     pub fn configured_max_bitrate(&self) -> Option<i32> {
@@ -1743,7 +1726,6 @@ impl ProductSettings {
                 ping_timeout_ms,
                 global_preparation,
                 legacy_global_preparation,
-                frame_limiter,
                 display_policy,
                 encryption_modes,
                 upnp,
@@ -1983,19 +1965,7 @@ impl ProductSettings {
                         return;
                     }
                 };
-                let frame_limiter = match apply_frame_limiter_update(
-                    frame_limiter,
-                    self.configured_frame_limiter.clone(),
-                ) {
-                    Ok(settings) => settings,
-                    Err(code) => {
-                        self.queue_completion(
-                            request.request,
-                            failure(code, "frame-limiter settings are invalid"),
-                        );
-                        return;
-                    }
-                };
+                let retained_values = self.retained_values.clone();
                 let display_policy = match apply_display_policy_update(
                     display_policy,
                     &self.configured_display_policy,
@@ -2131,7 +2101,7 @@ impl ProductSettings {
                             ping_timeout_ms,
                             global_preparation: global_preparation.clone(),
                             legacy_global_preparation: legacy_global_preparation.clone(),
-                            frame_limiter: frame_limiter.clone(),
+                            retained_values: retained_values.clone(),
                             display_policy: display_policy.clone(),
                             lan_encryption_mode,
                             wan_encryption_mode,
@@ -2164,7 +2134,7 @@ impl ProductSettings {
                         ping_timeout_ms,
                         global_preparation,
                         legacy_global_preparation,
-                        frame_limiter,
+                        retained_values,
                         display_policy,
                         lan_encryption_mode,
                         wan_encryption_mode,
@@ -2300,7 +2270,7 @@ impl ProductSettings {
                     ping_timeout_ms,
                     global_preparation,
                     legacy_global_preparation,
-                    frame_limiter,
+                    retained_values,
                     display_policy,
                     lan_encryption_mode,
                     wan_encryption_mode,
@@ -2334,7 +2304,7 @@ impl ProductSettings {
                             ping_timeout_ms,
                             global_preparation: &global_preparation,
                             legacy_global_preparation: &legacy_global_preparation,
-                            frame_limiter: &frame_limiter,
+                            retained_values: &retained_values,
                             display_policy: &display_policy,
                             lan_encryption_mode,
                             wan_encryption_mode,
@@ -2609,10 +2579,6 @@ impl ProductSettings {
                 "persisted legacy_global_preparation is invalid",
             ));
         }
-        document
-            .frame_limiter
-            .validate()
-            .map_err(|_| invalid_state("persisted frame-limiter settings are invalid"))?;
         if !valid_encryption_mode(document.lan_encryption_mode)
             || !valid_encryption_mode(document.wan_encryption_mode)
         {
@@ -2669,7 +2635,7 @@ impl ProductSettings {
         self.configured_ping_timeout_ms = document.ping_timeout_ms;
         self.configured_global_preparation = document.global_preparation;
         self.configured_legacy_global_preparation = document.legacy_global_preparation;
-        self.configured_frame_limiter = document.frame_limiter;
+        self.retained_values = document.retained_values;
         self.configured_display_policy = document.display_policy;
         self.lan_encryption_mode = document.lan_encryption_mode;
         self.wan_encryption_mode = document.wan_encryption_mode;
@@ -2706,8 +2672,7 @@ impl ProductSettings {
             json!({
                 "configured_global_preparation":self.configured_global_preparation,
                 "configured_legacy_global_preparation":self.configured_legacy_global_preparation,
-                "configured_frame_limiter":self.configured_frame_limiter,
-                "effective_frame_limiter":self.configured_frame_limiter.effective(),
+                "unclaimed_options":self.retained_values,
             }),
             json!({
                 "configured_display_policy":sparse_display_policy(&self.configured_display_policy),
@@ -2847,7 +2812,7 @@ pub fn default_document(settings: &Settings) -> Result<Value, &'static str> {
             ping_timeout_ms: None,
             global_preparation: Vec::new(),
             legacy_global_preparation: Vec::new(),
-            frame_limiter: FrameLimiterSettings::default(),
+            retained_values: serde_json::Map::new(),
             display_policy: empty_display_policy(),
             lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
             wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
@@ -2938,17 +2903,10 @@ fn product_update_payload(
         .as_object_mut()
         .expect("product settings values are an object")
         .extend(nvenc_settings_values(&streaming.nvenc_settings));
-    let frame_limiter_values =
-        serde_json::to_value(streaming.frame_limiter).expect("frame-limiter settings serialize");
-    values
-        .as_object_mut()
-        .expect("product settings values are an object")
-        .extend(
-            frame_limiter_values
-                .as_object()
-                .expect("frame-limiter settings serialize to an object")
-                .clone(),
-        );
+    let owned_values = values.as_object().expect("product settings values").clone();
+    let mut merged = streaming.retained_values;
+    merged.extend(owned_values);
+    values = Value::Object(merged);
     json!({
         "action":"product_update",
         "expected_revision":expected_revision,
@@ -2957,20 +2915,51 @@ fn product_update_payload(
     })
 }
 
-fn frame_limiter_value_names() -> &'static [&'static str; 11] {
-    &[
-        "frame_limiter_enable",
-        "frame_limiter_fps_limit",
-        "frame_limiter_provider",
-        "frame_limiter_disable_vsync",
-        "frame_limiter_auto_virtual_framegen",
-        "rtss_frame_limit_type",
-        "rtss_allow_virtual_display_override",
-        "rtss_install_path",
-        "mangohud_limiter_method",
-        "mangohud_preset",
-        "mangohud_always_show_graph",
-    ]
+/// Fields outside this module's schema are inert data owned by their original
+/// provider. Preserve them across product updates without interpreting them.
+fn retained_product_values(
+    values: &serde_json::Map<String, Value>,
+) -> serde_json::Map<String, Value> {
+    const PRODUCT_KEYS: &[&str] = &[
+        "hostname",
+        "port",
+        "address_family",
+        "bind_address",
+        "output_name",
+        "audio_sink",
+        "virtual_sink",
+        "audio_sink_capture_only",
+        "install_steam_audio_drivers",
+        "nvenc_spatial_aq",
+        "external_ip",
+        "stream_audio",
+        "capture",
+        "video_max_batch_size_kb",
+        "max_bitrate",
+        "qp",
+        "fec_percentage",
+        "minimum_fps_target",
+        "wgc_pacing_smoothing",
+        "sw_preset",
+        "sw_tune",
+        "encoder",
+        "min_threads",
+        "ping_timeout_ms",
+        "global_preparation",
+        "legacy_global_preparation",
+        "lan_encryption_mode",
+        "wan_encryption_mode",
+        "upnp",
+    ];
+    values
+        .iter()
+        .filter(|(key, _)| {
+            !PRODUCT_KEYS.contains(&key.as_str())
+                && !DISPLAY_POLICY_KEYS.contains(&key.as_str())
+                && !NVENC_SETTINGS_KEYS.contains(&key.as_str())
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
 }
 
 fn persisted_encryption_mode(
@@ -3053,7 +3042,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             ping_timeout_ms: None,
             global_preparation: Vec::new(),
             legacy_global_preparation: Vec::new(),
-            frame_limiter: FrameLimiterSettings::default(),
+            retained_values: serde_json::Map::new(),
             display_policy: empty_display_policy(),
             lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
             wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
@@ -3093,11 +3082,16 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             | NVENC_SETTINGS_VERSION
             | STEAM_AUDIO_DRIVER_SETTINGS_VERSION
             | FULL_DISPLAY_POLICY_SETTINGS_VERSION
+            | RETAINED_OPTIONS_SETTINGS_VERSION
     ) || revision == 0
     {
         return Err(invalid_state(
             "product settings version or revision is unsupported",
         ));
+    }
+    if values.len() > 256 || serde_json::to_vec(values).map_or(true, |bytes| bytes.len() > 131_072)
+    {
+        return Err(invalid_state("product settings exceed storage bounds"));
     }
     let mut migrated_values = values.clone();
     if version >= FULL_DISPLAY_POLICY_SETTINGS_VERSION
@@ -3124,20 +3118,20 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         AUDIO_SINK_CAPTURE_ONLY_SETTINGS_VERSION => 15,
         VIRTUAL_SINK_SETTINGS_VERSION => 16,
         GLOBAL_PREPARATION_SETTINGS_VERSION => 17,
-        GLOBAL_RAW_PREPARATION_SETTINGS_VERSION => 32,
-        DISPLAY_POLICY_SETTINGS_VERSION => 40,
-        SOFTWARE_ENCODER_SETTINGS_VERSION => 43,
-        MIN_THREADS_SETTINGS_VERSION => 44,
-        UPNP_SETTINGS_VERSION => 45,
-        QP_SETTINGS_VERSION => 46,
-        FEC_SETTINGS_VERSION => 47,
-        NVENC_SETTINGS_VERSION => 56,
-        STEAM_AUDIO_DRIVER_SETTINGS_VERSION => 57,
-        FULL_DISPLAY_POLICY_SETTINGS_VERSION => 79,
+        GLOBAL_RAW_PREPARATION_SETTINGS_VERSION => 21,
+        DISPLAY_POLICY_SETTINGS_VERSION => 29,
+        SOFTWARE_ENCODER_SETTINGS_VERSION => 32,
+        MIN_THREADS_SETTINGS_VERSION => 33,
+        UPNP_SETTINGS_VERSION => 34,
+        QP_SETTINGS_VERSION => 35,
+        FEC_SETTINGS_VERSION => 36,
+        NVENC_SETTINGS_VERSION => 45,
+        STEAM_AUDIO_DRIVER_SETTINGS_VERSION => 46,
+        FULL_DISPLAY_POLICY_SETTINGS_VERSION | RETAINED_OPTIONS_SETTINGS_VERSION => 68,
         _ => unreachable!(),
     };
-    let matches_expected_value_count = values.len() == expected_value_count
-        || (version == GLOBAL_RAW_PREPARATION_SETTINGS_VERSION && values.len() == 31);
+    let matches_expected_value_count = values.len() >= expected_value_count
+        || (version == GLOBAL_RAW_PREPARATION_SETTINGS_VERSION && values.len() == 20);
     if (version >= SOFTWARE_ENCODER_SETTINGS_VERSION
         && ["sw_preset", "sw_tune", "encoder"]
             .iter()
@@ -3173,10 +3167,6 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             && !values.contains_key("global_preparation"))
         || (version >= GLOBAL_RAW_PREPARATION_SETTINGS_VERSION
             && !values.contains_key("legacy_global_preparation"))
-        || (version >= FRAME_LIMITER_SETTINGS_VERSION
-            && frame_limiter_value_names()
-                .iter()
-                .any(|name| !values.contains_key(*name)))
         || (version >= ENCRYPTION_MODE_SETTINGS_VERSION
             && (!values.contains_key("lan_encryption_mode")
                 || !values.contains_key("wan_encryption_mode")))
@@ -3421,7 +3411,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         FieldUpdate::Value(value) => value,
         FieldUpdate::Omitted
             if version < GLOBAL_RAW_PREPARATION_SETTINGS_VERSION
-                || values.len() == expected_value_count - 1 =>
+                || values.len() >= expected_value_count - 1 =>
         {
             false
         }
@@ -3457,24 +3447,6 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
             "persisted legacy_global_preparation is invalid",
         ));
     }
-    let frame_limiter = if version >= FRAME_LIMITER_SETTINGS_VERSION {
-        let frame_limiter_values = frame_limiter_value_names()
-            .iter()
-            .map(|name| {
-                (
-                    (*name).to_owned(),
-                    values.get(*name).cloned().unwrap_or(Value::Null),
-                )
-            })
-            .collect::<serde_json::Map<_, _>>();
-        serde_json::from_value::<FrameLimiterSettings>(Value::Object(frame_limiter_values))
-            .map_err(|_| invalid_state("persisted frame-limiter settings are invalid"))?
-    } else {
-        FrameLimiterSettings::default()
-    };
-    frame_limiter
-        .validate()
-        .map_err(|_| invalid_state("persisted frame-limiter settings are invalid"))?;
     let display_policy = if version >= DISPLAY_POLICY_SETTINGS_VERSION {
         let mut policy = serde_json::Map::new();
         for key in DISPLAY_POLICY_KEYS {
@@ -3540,7 +3512,7 @@ fn parse_document(payload: &Value) -> Result<ProductDocument, SettingFailure> {
         ping_timeout_ms,
         global_preparation,
         legacy_global_preparation,
-        frame_limiter,
+        retained_values: retained_product_values(values),
         display_policy,
         lan_encryption_mode,
         wan_encryption_mode,
@@ -3573,7 +3545,7 @@ struct UpdateExpectation<'a> {
     ping_timeout_ms: Option<i32>,
     global_preparation: &'a [PreparationStep],
     legacy_global_preparation: &'a [LegacyPreparationStep],
-    frame_limiter: &'a FrameLimiterSettings,
+    retained_values: &'a serde_json::Map<String, Value>,
     display_policy: &'a Value,
     lan_encryption_mode: u8,
     wan_encryption_mode: u8,
@@ -3617,7 +3589,7 @@ fn update_result(
         || document.ping_timeout_ms != expected.ping_timeout_ms
         || document.global_preparation != expected.global_preparation
         || document.legacy_global_preparation != expected.legacy_global_preparation
-        || &document.frame_limiter != expected.frame_limiter
+        || &document.retained_values != expected.retained_values
         || &document.display_policy != expected.display_policy
         || document.lan_encryption_mode != expected.lan_encryption_mode
         || document.wan_encryption_mode != expected.wan_encryption_mode
@@ -3702,66 +3674,6 @@ fn apply_legacy_global_preparation_update(
     validate_legacy_preparation(&preparation)
         .then_some(preparation)
         .ok_or(())
-}
-
-fn apply_frame_limiter_update(
-    update: FrameLimiterUpdate,
-    current: FrameLimiterSettings,
-) -> Result<FrameLimiterSettings, &'static str> {
-    let disable_vsync_update = match (
-        update.frame_limiter_disable_vsync,
-        update.rtss_disable_vsync_ullm,
-    ) {
-        (FieldUpdate::Omitted, alias) => alias,
-        (canonical, FieldUpdate::Omitted) => canonical,
-        (FieldUpdate::Null, FieldUpdate::Null) => FieldUpdate::Null,
-        (FieldUpdate::Value(canonical), FieldUpdate::Value(alias)) if canonical == alias => {
-            FieldUpdate::Value(canonical)
-        }
-        _ => return Err("conflicting_frame_limiter_disable_vsync_alias"),
-    };
-    let settings = FrameLimiterSettings {
-        frame_limiter_enable: apply_field_update(
-            update.frame_limiter_enable,
-            current.frame_limiter_enable,
-        ),
-        frame_limiter_fps_limit: apply_field_update(
-            update.frame_limiter_fps_limit,
-            current.frame_limiter_fps_limit,
-        ),
-        frame_limiter_provider: apply_field_update(
-            update.frame_limiter_provider,
-            current.frame_limiter_provider,
-        ),
-        frame_limiter_disable_vsync: apply_field_update(
-            disable_vsync_update,
-            current.frame_limiter_disable_vsync,
-        ),
-        frame_limiter_auto_virtual_framegen: apply_field_update(
-            update.frame_limiter_auto_virtual_framegen,
-            current.frame_limiter_auto_virtual_framegen,
-        ),
-        rtss_frame_limit_type: apply_field_update(
-            update.rtss_frame_limit_type,
-            current.rtss_frame_limit_type,
-        ),
-        rtss_allow_virtual_display_override: apply_field_update(
-            update.rtss_allow_virtual_display_override,
-            current.rtss_allow_virtual_display_override,
-        ),
-        rtss_install_path: apply_field_update(update.rtss_install_path, current.rtss_install_path),
-        mangohud_limiter_method: apply_field_update(
-            update.mangohud_limiter_method,
-            current.mangohud_limiter_method,
-        ),
-        mangohud_preset: apply_field_update(update.mangohud_preset, current.mangohud_preset),
-        mangohud_always_show_graph: apply_field_update(
-            update.mangohud_always_show_graph,
-            current.mangohud_always_show_graph,
-        ),
-    };
-    settings.validate()?;
-    Ok(settings)
 }
 
 fn normalize_output_name(value: &str) -> Result<Option<String>, ()> {
@@ -3985,7 +3897,7 @@ mod tests {
     fn public_document_helpers_use_canonical_v26_defaults_and_legacy_migration() {
         let mut current = default_document(&Settings::default()).unwrap();
         assert_eq!(current["version"], SETTINGS_VERSION);
-        assert_eq!(current["values"].as_object().unwrap().len(), 79);
+        assert_eq!(current["values"].as_object().unwrap().len(), 68);
         assert_eq!(current["values"]["install_steam_audio_drivers"], true);
         assert_eq!(current["values"]["nvenc_preset"], 1);
         assert_eq!(current["values"]["vaapi_strict_rc_buffer"], false);
@@ -3998,7 +3910,7 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("install_steam_audio_drivers");
-        assert_eq!(v24["values"].as_object().unwrap().len(), 56);
+        assert_eq!(v24["values"].as_object().unwrap().len(), 45);
         assert!(validate_document(&v24).is_ok());
         let migrated_v24 = parse_document(&v24).unwrap();
         assert!(migrated_v24.install_steam_audio_drivers);
@@ -4014,14 +3926,58 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("install_steam_audio_drivers");
-        assert_eq!(legacy["values"].as_object().unwrap().len(), 47);
+        assert_eq!(legacy["values"].as_object().unwrap().len(), 36);
         assert!(validate_document(&legacy).is_ok());
 
         current["values"]["unexpected"] = json!(true);
+        assert!(validate_document(&current).is_ok());
+        assert_eq!(
+            parse_document(&current).unwrap().retained_values["unexpected"],
+            true
+        );
+        current["values"]["hostname"] = json!(false);
         assert_eq!(
             validate_document(&current),
             Err("invalid_product_settings_document")
         );
+    }
+
+    #[test]
+    fn unrelated_product_updates_preserve_opaque_provider_values_exactly() {
+        let mut document = display_v18_document(4);
+        document["values"]["vendor_option"] =
+            json!({"enabled":false,"limit":0,"nested":[null,"saved"]});
+        // Earlier product versions can retain fields without understanding their schema.
+        document["values"]["frame_limiter_enable"] = json!(false);
+        let mut product = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        product.apply_document(parse_document(&document).unwrap());
+        product
+            .enqueue(
+                99,
+                5000,
+                display_update_action(DisplayPolicyUpdate::default(), 4),
+            )
+            .unwrap();
+        product.start_next();
+        let pending = product.pending.take().unwrap();
+        assert_eq!(
+            pending.payload["values"]["vendor_option"],
+            document["values"]["vendor_option"]
+        );
+        assert_eq!(pending.payload["values"]["frame_limiter_enable"], false);
+        let confirmation = json!({"ok":true,"found":true,"version":SETTINGS_VERSION,
+            "revision":5,"values":pending.payload["values"]});
+        product.finish_call(pending.purpose, CallOutcome::Payload(confirmation.clone()));
+        assert_eq!(product.completions.pop_front().unwrap().payload["ok"], true);
+        let mut restarted = ProductSettings::new("Bootstrap".into(), settings::DEFAULT_PORT);
+        restarted.apply_document(parse_document(&confirmation).unwrap());
+        assert_eq!(
+            restarted.settings_payload()["unclaimed_options"]["vendor_option"],
+            document["values"]["vendor_option"]
+        );
+        let mut oversized = confirmation;
+        oversized["values"]["vendor_option"] = json!("x".repeat(131_072));
+        assert!(validate_document(&oversized).is_err());
     }
 
     #[test]
@@ -4068,7 +4024,7 @@ mod tests {
         product.start_next();
         let pending = product.pending.take().expect("Steam driver policy update");
         assert_eq!(pending.payload["version"], SETTINGS_VERSION);
-        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 79);
+        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 68);
         assert_eq!(
             pending.payload["values"]["install_steam_audio_drivers"],
             false
@@ -4131,9 +4087,6 @@ mod tests {
         values
             .entry("legacy_global_preparation")
             .or_insert_with(|| json!([]));
-        for name in frame_limiter_value_names() {
-            values.entry((*name).to_owned()).or_insert(Value::Null);
-        }
         values
             .entry("lan_encryption_mode")
             .or_insert_with(|| json!(DEFAULT_LAN_ENCRYPTION_MODE));
@@ -4207,7 +4160,7 @@ mod tests {
             ping_timeout_ms: FieldUpdate::Omitted,
             global_preparation: FieldUpdate::Omitted,
             legacy_global_preparation: FieldUpdate::Omitted,
-            frame_limiter: FrameLimiterUpdate::default(),
+
             display_policy,
             encryption_modes: EncryptionModeUpdate::default(),
             expected_revision,
@@ -4309,7 +4262,7 @@ mod tests {
         let pending = product.pending.take().unwrap();
         assert_eq!(pending.payload["version"], SETTINGS_VERSION);
         assert_eq!(pending.payload["expected_revision"], 7);
-        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 79);
+        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 68);
         let write = pending.payload["values"].clone();
         let response =
             json!({"ok":true,"found":true,"version":SETTINGS_VERSION,"revision":8,"values":write});
@@ -5045,7 +4998,7 @@ mod tests {
                 ping_timeout_ms: None,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
-                frame_limiter: FrameLimiterSettings::default(),
+                retained_values: serde_json::Map::new(),
                 lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
                 wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
 
@@ -5094,7 +5047,6 @@ mod tests {
                     ping_timeout_ms: FieldUpdate::Omitted,
                     global_preparation: FieldUpdate::Omitted,
                     legacy_global_preparation: FieldUpdate::Omitted,
-                    frame_limiter: FrameLimiterUpdate::default(),
                     encryption_modes: EncryptionModeUpdate::default(),
                     expected_revision: 4,
                     require_listener_apply: false,
@@ -5245,7 +5197,7 @@ mod tests {
                 ping_timeout_ms: reset,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
-                frame_limiter: FrameLimiterSettings::default(),
+                retained_values: serde_json::Map::new(),
                 lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
                 wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
 
@@ -5307,7 +5259,6 @@ mod tests {
                         ping_timeout_ms: FieldUpdate::Omitted,
                         global_preparation: FieldUpdate::Omitted,
                         legacy_global_preparation: FieldUpdate::Omitted,
-                        frame_limiter: FrameLimiterUpdate::default(),
                         encryption_modes: EncryptionModeUpdate::default(),
                         expected_revision: revision,
                         require_listener_apply: false,
@@ -5417,7 +5368,6 @@ mod tests {
                     ping_timeout_ms: FieldUpdate::Omitted,
                     global_preparation: FieldUpdate::Omitted,
                     legacy_global_preparation: FieldUpdate::Omitted,
-                    frame_limiter: FrameLimiterUpdate::default(),
                     encryption_modes: EncryptionModeUpdate::default(),
                     expected_revision: 11,
                     require_listener_apply: false,
@@ -5497,7 +5447,6 @@ mod tests {
                     ping_timeout_ms: FieldUpdate::Omitted,
                     global_preparation: FieldUpdate::Omitted,
                     legacy_global_preparation: FieldUpdate::Omitted,
-                    frame_limiter: FrameLimiterUpdate::default(),
                     encryption_modes: EncryptionModeUpdate::default(),
                     expected_revision: 8,
                     require_listener_apply: false,
@@ -5576,7 +5525,6 @@ mod tests {
                         ping_timeout_ms: FieldUpdate::Omitted,
                         global_preparation: FieldUpdate::Omitted,
                         legacy_global_preparation: FieldUpdate::Omitted,
-                        frame_limiter: FrameLimiterUpdate::default(),
                         encryption_modes: EncryptionModeUpdate::default(),
                         expected_revision: revision,
                         require_listener_apply: false,
@@ -5666,7 +5614,6 @@ mod tests {
                         ping_timeout_ms: FieldUpdate::Omitted,
                         global_preparation: FieldUpdate::Omitted,
                         legacy_global_preparation: FieldUpdate::Omitted,
-                        frame_limiter: FrameLimiterUpdate::default(),
                         encryption_modes: EncryptionModeUpdate::default(),
                         expected_revision: revision,
                         require_listener_apply: false,
@@ -5853,7 +5800,6 @@ mod tests {
     fn rejects_unsupported_or_malformed_persisted_settings() {
         for payload in [
             json!({"ok":true,"found":true,"version":3,"revision":1,"values":{"hostname":"Host","port":47989}}),
-            json!({"ok":true,"found":true,"version":1,"revision":1,"values":{"hostname":"Host","extra":true}}),
             json!({"ok":true,"found":true,"version":2,"revision":1,"values":{"hostname":"Host"}}),
             json!({"ok":true,"found":true,"version":2,"revision":1,"values":{"hostname":"Host","port":1028}}),
             json!({"ok":true,"found":false,"version":null,"revision":1,"values":{}}),
@@ -5876,7 +5822,7 @@ mod tests {
             address_family: None,
             bind_address: None,
         };
-        let default_frame_limiter = FrameLimiterSettings::default();
+        let retained_values = serde_json::Map::new();
         let expected_display_policy = empty_display_policy();
         let expected = UpdateExpectation {
             display_policy: &expected_display_policy,
@@ -5903,7 +5849,7 @@ mod tests {
             ping_timeout_ms: None,
             global_preparation: &[],
             legacy_global_preparation: &[],
-            frame_limiter: &default_frame_limiter,
+            retained_values: &retained_values,
             lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
             wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
 
@@ -6023,10 +5969,7 @@ mod tests {
             std::slice::from_ref(&structured)
         );
         assert!(migrated_document.legacy_global_preparation.is_empty());
-        assert_eq!(
-            migrated_document.frame_limiter,
-            FrameLimiterSettings::default()
-        );
+        assert_eq!(migrated_document.retained_values, serde_json::Map::new());
         assert_eq!(
             migrated_document.lan_encryption_mode,
             DEFAULT_LAN_ENCRYPTION_MODE
@@ -6043,10 +5986,7 @@ mod tests {
             std::slice::from_ref(&structured)
         );
         assert_eq!(product.legacy_global_preparation(), []);
-        assert_eq!(
-            product.settings_payload()["effective_frame_limiter"]["frame_limiter_fps_limit_millihz"],
-            0
-        );
+        assert_eq!(product.settings_payload()["unclaimed_options"], json!({}));
 
         let update = product_update_payload(
             7,
@@ -6078,7 +6018,7 @@ mod tests {
                 ping_timeout_ms: None,
                 global_preparation: product.global_preparation().to_vec(),
                 legacy_global_preparation: product.legacy_global_preparation().to_vec(),
-                frame_limiter: product.configured_frame_limiter().clone(),
+                retained_values: product.retained_values().clone(),
                 lan_encryption_mode: product.lan_encryption_mode(),
                 wan_encryption_mode: product.wan_encryption_mode(),
 
@@ -6086,7 +6026,7 @@ mod tests {
             },
         );
         assert_eq!(update["version"], SETTINGS_VERSION);
-        assert_eq!(update["values"].as_object().unwrap().len(), 79);
+        assert_eq!(update["values"].as_object().unwrap().len(), 68);
         assert_eq!(update["values"]["nvenc_spatial_aq"], false);
         assert_eq!(
             update["values"]["global_preparation"]
@@ -6109,12 +6049,11 @@ mod tests {
             "do":"  echo $(DISPLAY)  ","undo":"restore $HOME","elevated":true
         }))
         .unwrap();
-        let frame_limiter = FrameLimiterSettings {
-            frame_limiter_enable: Some(false),
-            frame_limiter_fps_limit: Some(0.0),
-            frame_limiter_provider: Some("none".into()),
-            ..FrameLimiterSettings::default()
-        };
+        let retained_values = json!({"frame_limiter_enable":false,
+            "frame_limiter_fps_limit":0.0,"frame_limiter_provider":"auto"})
+        .as_object()
+        .unwrap()
+        .clone();
         let payload = product_update_payload(
             9,
             "Host",
@@ -6145,7 +6084,7 @@ mod tests {
                 ping_timeout_ms: None,
                 global_preparation: vec![structured.clone()],
                 legacy_global_preparation: vec![raw.clone()],
-                frame_limiter: frame_limiter.clone(),
+                retained_values: retained_values.clone(),
                 lan_encryption_mode: 2,
                 wan_encryption_mode: 0,
 
@@ -6166,7 +6105,7 @@ mod tests {
             document.legacy_global_preparation.as_slice(),
             std::slice::from_ref(&raw)
         );
-        assert_eq!(document.frame_limiter, frame_limiter);
+        assert_eq!(document.retained_values, retained_values);
         assert_eq!(document.lan_encryption_mode, 2);
         assert_eq!(document.wan_encryption_mode, 0);
         for (name, invalid_mode) in [
@@ -6186,7 +6125,7 @@ mod tests {
         restarted.apply_document(parse_document(&reply).unwrap());
         assert_eq!(restarted.global_preparation(), [structured]);
         assert_eq!(restarted.legacy_global_preparation(), [raw]);
-        assert_eq!(restarted.configured_frame_limiter(), &frame_limiter);
+        assert_eq!(restarted.retained_values(), &retained_values);
         assert_eq!(restarted.lan_encryption_mode(), 2);
         assert_eq!(restarted.wan_encryption_mode(), 0);
         let readback = restarted.settings_payload();
@@ -6195,12 +6134,9 @@ mod tests {
             readback["configured_legacy_global_preparation"][0]["do"],
             "  echo $(DISPLAY)  "
         );
+        assert_eq!(readback["unclaimed_options"]["frame_limiter_enable"], false);
         assert_eq!(
-            readback["configured_frame_limiter"]["frame_limiter_enable"],
-            false
-        );
-        assert_eq!(
-            readback["configured_frame_limiter"]["frame_limiter_fps_limit"],
+            readback["unclaimed_options"]["frame_limiter_fps_limit"],
             0.0
         );
 
@@ -6288,7 +6224,7 @@ mod tests {
                 ping_timeout_ms: None,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
-                frame_limiter: FrameLimiterSettings::default(),
+                retained_values: serde_json::Map::new(),
                 lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
                 wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
 
@@ -6334,7 +6270,7 @@ mod tests {
                 ping_timeout_ms: None,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
-                frame_limiter: FrameLimiterSettings::default(),
+                retained_values: serde_json::Map::new(),
                 lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
                 wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
 
@@ -6381,7 +6317,6 @@ mod tests {
                     ping_timeout_ms: FieldUpdate::Omitted,
                     global_preparation: FieldUpdate::Omitted,
                     legacy_global_preparation: FieldUpdate::Omitted,
-                    frame_limiter: FrameLimiterUpdate::default(),
                     encryption_modes: EncryptionModeUpdate {
                         lan_encryption_mode: FieldUpdate::Value(2),
                         wan_encryption_mode: FieldUpdate::Null,
@@ -6418,48 +6353,6 @@ mod tests {
         assert_eq!(readback["wan_encryption_mode"], 1);
         assert_eq!(readback["nvenc_spatial_aq"], true);
         assert_eq!(readback["revision"], 5);
-    }
-
-    #[test]
-    fn frame_limiter_alias_normalizes_and_rejects_conflicting_values() {
-        let current = FrameLimiterSettings::default();
-        let alias = apply_frame_limiter_update(
-            FrameLimiterUpdate {
-                rtss_disable_vsync_ullm: FieldUpdate::Value(false),
-                ..FrameLimiterUpdate::default()
-            },
-            current.clone(),
-        );
-        #[cfg(windows)]
-        assert_eq!(alias.unwrap().frame_limiter_disable_vsync, Some(false));
-        #[cfg(not(windows))]
-        assert_eq!(alias, Err("unsupported_frame_limiter_setting"));
-
-        let same_values = apply_frame_limiter_update(
-            FrameLimiterUpdate {
-                frame_limiter_disable_vsync: FieldUpdate::Value(true),
-                rtss_disable_vsync_ullm: FieldUpdate::Value(true),
-                ..FrameLimiterUpdate::default()
-            },
-            current.clone(),
-        );
-        #[cfg(windows)]
-        assert_eq!(same_values.unwrap().frame_limiter_disable_vsync, Some(true));
-        #[cfg(not(windows))]
-        assert_eq!(same_values, Err("unsupported_frame_limiter_setting"));
-
-        let conflict = apply_frame_limiter_update(
-            FrameLimiterUpdate {
-                frame_limiter_disable_vsync: FieldUpdate::Value(true),
-                rtss_disable_vsync_ullm: FieldUpdate::Value(false),
-                ..FrameLimiterUpdate::default()
-            },
-            current,
-        );
-        assert_eq!(
-            conflict,
-            Err("conflicting_frame_limiter_disable_vsync_alias")
-        );
     }
 
     #[test]
@@ -6516,32 +6409,7 @@ mod tests {
                 json!({
                     "configured_global_preparation":[],
                     "configured_legacy_global_preparation":[],
-                    "configured_frame_limiter":{
-                        "frame_limiter_enable":null,
-                        "frame_limiter_fps_limit":null,
-                        "frame_limiter_provider":null,
-                        "frame_limiter_disable_vsync":null,
-                        "frame_limiter_auto_virtual_framegen":null,
-                        "rtss_frame_limit_type":null,
-                        "rtss_allow_virtual_display_override":null,
-                        "rtss_install_path":null,
-                        "mangohud_limiter_method":null,
-                        "mangohud_preset":null,
-                        "mangohud_always_show_graph":null,
-                    },
-                    "effective_frame_limiter":{
-                        "frame_limiter_enable":false,
-                        "frame_limiter_fps_limit_millihz":0,
-                        "frame_limiter_provider":"auto",
-                        "frame_limiter_disable_vsync":false,
-                        "frame_limiter_auto_virtual_framegen":"enabled",
-                        "rtss_frame_limit_type":"async",
-                        "rtss_allow_virtual_display_override":false,
-                        "rtss_install_path":"",
-                        "mangohud_limiter_method":"late",
-                        "mangohud_preset":"custom",
-                        "mangohud_always_show_graph":false,
-                    },
+                    "unclaimed_options":{},
                 }),
                 json!({
                     "configured_display_policy":{},
@@ -6696,7 +6564,7 @@ mod tests {
                 ping_timeout_ms: None,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
-                frame_limiter: FrameLimiterSettings::default(),
+                retained_values: serde_json::Map::new(),
                 lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
                 wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
                 expected_revision: 1,
@@ -6773,7 +6641,7 @@ mod tests {
                 ping_timeout_ms: None,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
-                frame_limiter: FrameLimiterSettings::default(),
+                retained_values: serde_json::Map::new(),
                 lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
                 wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
                 expected_revision: 1,
@@ -6963,7 +6831,7 @@ mod tests {
                 ping_timeout_ms: None,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
-                frame_limiter: FrameLimiterSettings::default(),
+                retained_values: serde_json::Map::new(),
                 lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
                 wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
                 expected_revision: 3,
@@ -7086,7 +6954,6 @@ mod tests {
                         ping_timeout_ms: FieldUpdate::Omitted,
                         global_preparation: FieldUpdate::Omitted,
                         legacy_global_preparation: FieldUpdate::Omitted,
-                        frame_limiter: FrameLimiterUpdate::default(),
                         encryption_modes: EncryptionModeUpdate::default(),
                         expected_revision,
                         require_listener_apply: false,
@@ -7233,7 +7100,6 @@ mod tests {
                         ping_timeout_ms: FieldUpdate::Omitted,
                         global_preparation,
                         legacy_global_preparation: FieldUpdate::Omitted,
-                        frame_limiter: FrameLimiterUpdate::default(),
                         encryption_modes: EncryptionModeUpdate::default(),
                         expected_revision: revision,
                         require_listener_apply: false,
@@ -7336,7 +7202,7 @@ mod tests {
                 ping_timeout_ms: None,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
-                frame_limiter: FrameLimiterSettings::default(),
+                retained_values: serde_json::Map::new(),
                 lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
                 wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
 
@@ -7383,7 +7249,7 @@ mod tests {
                 ping_timeout_ms: None,
                 global_preparation: Vec::new(),
                 legacy_global_preparation: Vec::new(),
-                frame_limiter: FrameLimiterSettings::default(),
+                retained_values: serde_json::Map::new(),
                 lan_encryption_mode: DEFAULT_LAN_ENCRYPTION_MODE,
                 wan_encryption_mode: DEFAULT_WAN_ENCRYPTION_MODE,
 
@@ -7485,7 +7351,6 @@ mod tests {
                         ping_timeout_ms: FieldUpdate::Omitted,
                         global_preparation: FieldUpdate::Omitted,
                         legacy_global_preparation: FieldUpdate::Omitted,
-                        frame_limiter: FrameLimiterUpdate::default(),
                         encryption_modes: EncryptionModeUpdate::default(),
                         expected_revision: revision,
                         require_listener_apply: false,
@@ -7569,7 +7434,6 @@ mod tests {
                     ping_timeout_ms: FieldUpdate::Omitted,
                     global_preparation: FieldUpdate::Omitted,
                     legacy_global_preparation: FieldUpdate::Omitted,
-                    frame_limiter: FrameLimiterUpdate::default(),
                     encryption_modes: EncryptionModeUpdate::default(),
                     expected_revision: 4,
                     require_listener_apply: true,
@@ -7624,7 +7488,6 @@ mod tests {
                     ping_timeout_ms: FieldUpdate::Omitted,
                     global_preparation: FieldUpdate::Omitted,
                     legacy_global_preparation: FieldUpdate::Omitted,
-                    frame_limiter: FrameLimiterUpdate::default(),
                     encryption_modes: EncryptionModeUpdate::default(),
                     expected_revision: 4,
                     require_listener_apply: true,
@@ -7682,7 +7545,6 @@ mod tests {
                     ping_timeout_ms: FieldUpdate::Omitted,
                     global_preparation: FieldUpdate::Omitted,
                     legacy_global_preparation: FieldUpdate::Omitted,
-                    frame_limiter: FrameLimiterUpdate::default(),
                     encryption_modes: EncryptionModeUpdate::default(),
                     expected_revision: 4,
                     require_listener_apply: false,
@@ -8047,7 +7909,7 @@ mod tests {
         product.start_next();
         let pending = product.pending.take().expect("NVENC settings update");
         assert_eq!(pending.payload["version"], SETTINGS_VERSION);
-        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 79);
+        assert_eq!(pending.payload["values"].as_object().unwrap().len(), 68);
         assert_eq!(pending.payload["values"]["nvenc_preset"], 7);
         assert_eq!(pending.payload["values"]["nvenc_twopass"], "full_res");
         assert_eq!(pending.payload["values"]["nvenc_split_encode"], "disabled");

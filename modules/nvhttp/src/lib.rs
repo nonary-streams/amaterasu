@@ -4,7 +4,6 @@
 mod audio_driver_install;
 mod encoder_refresh;
 mod encoder_snapshot;
-mod frame_limiter;
 pub mod global_flags;
 mod launch;
 mod network_settings;
@@ -27,8 +26,8 @@ use launch::CaptureMode;
 use network_settings::NetworkSettings;
 use preparation::LegacyPreparationStep;
 use product_settings::{
-    AdminAction, DisplayPolicyUpdate, EncryptionModeUpdate, FieldUpdate, FrameLimiterUpdate,
-    NetworkTarget, NvencSettingsUpdate, ProductSettings, SoftwareEncoderUpdate,
+    AdminAction, DisplayPolicyUpdate, EncryptionModeUpdate, FieldUpdate, NetworkTarget,
+    NvencSettingsUpdate, ProductSettings, SoftwareEncoderUpdate,
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
@@ -194,30 +193,6 @@ enum Operation {
         #[serde(default, deserialize_with = "deserialize_field_update")]
         legacy_global_preparation: FieldUpdate<Vec<LegacyPreparationStep>>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
-        frame_limiter_enable: FieldUpdate<bool>,
-        #[serde(default, deserialize_with = "deserialize_field_update")]
-        frame_limiter_fps_limit: FieldUpdate<f64>,
-        #[serde(default, deserialize_with = "deserialize_field_update")]
-        frame_limiter_provider: FieldUpdate<String>,
-        #[serde(default, deserialize_with = "deserialize_field_update")]
-        frame_limiter_disable_vsync: FieldUpdate<bool>,
-        #[serde(default, deserialize_with = "deserialize_field_update")]
-        frame_limiter_auto_virtual_framegen: FieldUpdate<String>,
-        #[serde(default, deserialize_with = "deserialize_field_update")]
-        rtss_frame_limit_type: FieldUpdate<String>,
-        #[serde(default, deserialize_with = "deserialize_field_update")]
-        rtss_allow_virtual_display_override: FieldUpdate<bool>,
-        #[serde(default, deserialize_with = "deserialize_field_update")]
-        rtss_install_path: FieldUpdate<String>,
-        #[serde(default, deserialize_with = "deserialize_field_update")]
-        mangohud_limiter_method: FieldUpdate<String>,
-        #[serde(default, deserialize_with = "deserialize_field_update")]
-        mangohud_preset: FieldUpdate<String>,
-        #[serde(default, deserialize_with = "deserialize_field_update")]
-        mangohud_always_show_graph: FieldUpdate<bool>,
-        #[serde(default, deserialize_with = "deserialize_field_update")]
-        rtss_disable_vsync_ullm: FieldUpdate<bool>,
-        #[serde(default, deserialize_with = "deserialize_field_update")]
         lan_encryption_mode: FieldUpdate<i64>,
         #[serde(default, deserialize_with = "deserialize_field_update")]
         wan_encryption_mode: FieldUpdate<i64>,
@@ -284,6 +259,7 @@ impl ManagedModule for NvhttpModule {
             )?;
             let mut launches = launch::Controller::new(settings.streaming.clone())?;
             launches.set_session_lifecycle_required(settings.session_lifecycle_required);
+            launches.set_session_lifecycle_capture_mode(settings.session_lifecycle_capture_mode);
             let router = wire::Router::new(
                 wire::RouterConfig {
                     hostname: hostname.clone(),
@@ -381,9 +357,7 @@ impl ManagedModule for NvhttpModule {
             router.set_virtual_sink_settings(self.product_settings.configured_virtual_sink());
             router.set_global_preparation(self.product_settings.global_preparation());
             router.set_legacy_global_preparation(self.product_settings.legacy_global_preparation());
-            router.set_global_frame_limiter_settings(
-                self.product_settings.configured_frame_limiter(),
-            );
+
             if let Some((revision, policy)) = self.product_settings.display_policy_snapshot() {
                 router.set_global_display_policy(revision, policy);
             }
@@ -812,18 +786,7 @@ impl NvhttpModule {
                                 ping_timeout_ms,
                                 global_preparation,
                                 legacy_global_preparation,
-                                frame_limiter_enable,
-                                frame_limiter_fps_limit,
-                                frame_limiter_provider,
-                                frame_limiter_disable_vsync,
-                                frame_limiter_auto_virtual_framegen,
-                                rtss_frame_limit_type,
-                                rtss_allow_virtual_display_override,
-                                rtss_install_path,
-                                mangohud_limiter_method,
-                                mangohud_preset,
-                                mangohud_always_show_graph,
-                                rtss_disable_vsync_ullm,
+
                                 lan_encryption_mode,
                                 wan_encryption_mode,
                                 upnp,
@@ -894,20 +857,6 @@ impl NvhttpModule {
                                     ping_timeout_ms,
                                     global_preparation,
                                     legacy_global_preparation,
-                                    frame_limiter: FrameLimiterUpdate {
-                                        frame_limiter_enable,
-                                        frame_limiter_fps_limit,
-                                        frame_limiter_provider,
-                                        frame_limiter_disable_vsync,
-                                        frame_limiter_auto_virtual_framegen,
-                                        rtss_frame_limit_type,
-                                        rtss_allow_virtual_display_override,
-                                        rtss_install_path,
-                                        mangohud_limiter_method,
-                                        mangohud_preset,
-                                        mangohud_always_show_graph,
-                                        rtss_disable_vsync_ullm,
-                                    },
                                     encryption_modes: EncryptionModeUpdate {
                                         lan_encryption_mode,
                                         wan_encryption_mode,
@@ -1084,6 +1033,19 @@ mod tests {
             port,
             address_family: Some(settings::AddressFamily::Ipv4),
             bind_address: Some("127.0.0.1".into()),
+        }
+    }
+
+    #[test]
+    fn retired_plugin_settings_are_rejected_by_the_product_endpoint() {
+        for field in [
+            "frame_limiter_enable",
+            "mangohud_preset",
+            "rtss_frame_limit_type",
+        ] {
+            let mut payload = json!({"action":"settings_update", "hostname":"Host", "port":47989, "expected_revision":1});
+            payload[field] = json!(false);
+            assert!(serde_json::from_value::<Operation>(payload).is_err());
         }
     }
 
@@ -1293,60 +1255,6 @@ mod tests {
             dd_hdr_request_override,
             FieldUpdate::Value("force_off".into())
         );
-    }
-
-    #[test]
-    fn frame_limiter_settings_update_preserves_nullable_false_zero_and_legacy_alias() {
-        let Operation::SettingsUpdate {
-            frame_limiter_enable: omitted_enable,
-            frame_limiter_fps_limit: omitted_fps_limit,
-            frame_limiter_disable_vsync: omitted_disable_vsync,
-            rtss_disable_vsync_ullm: omitted_alias,
-            ..
-        } = serde_json::from_value(json!({
-            "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2
-        }))
-        .unwrap()
-        else {
-            panic!("settings update expected");
-        };
-        assert_eq!(omitted_enable, FieldUpdate::Omitted);
-        assert_eq!(omitted_fps_limit, FieldUpdate::Omitted);
-        assert_eq!(omitted_disable_vsync, FieldUpdate::Omitted);
-        assert_eq!(omitted_alias, FieldUpdate::Omitted);
-
-        let Operation::SettingsUpdate {
-            frame_limiter_enable: explicit_false,
-            frame_limiter_fps_limit: explicit_zero,
-            rtss_disable_vsync_ullm: legacy_alias,
-            ..
-        } = serde_json::from_value(json!({
-            "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
-            "frame_limiter_enable":false,"frame_limiter_fps_limit":0.0,
-            "rtss_disable_vsync_ullm":false
-        }))
-        .unwrap()
-        else {
-            panic!("settings update expected");
-        };
-        assert_eq!(explicit_false, FieldUpdate::Value(false));
-        assert_eq!(explicit_zero, FieldUpdate::Value(0.0));
-        assert_eq!(legacy_alias, FieldUpdate::Value(false));
-
-        let Operation::SettingsUpdate {
-            frame_limiter_enable: reset,
-            frame_limiter_fps_limit: null_limit,
-            ..
-        } = serde_json::from_value(json!({
-            "action":"settings_update","hostname":"Host","port":48000,"expected_revision":2,
-            "frame_limiter_enable":null,"frame_limiter_fps_limit":null
-        }))
-        .unwrap()
-        else {
-            panic!("settings update expected");
-        };
-        assert_eq!(reset, FieldUpdate::Null);
-        assert_eq!(null_limit, FieldUpdate::Null);
     }
 
     #[test]

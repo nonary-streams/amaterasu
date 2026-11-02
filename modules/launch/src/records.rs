@@ -31,6 +31,12 @@ pub struct Record {
     pub app_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub library_selection: Option<crate::library::Selection>,
+    #[serde(skip)]
+    pub preparation_context: Option<amaterasu_module_sdk::extension_api::LifecycleTarget>,
+    #[serde(skip)]
+    pub prepared_context_service: Option<String>,
+    #[serde(skip)]
+    pub prepared_environment: Option<BTreeMap<String, String>>,
     pub state: State,
     pub session_id: Option<u64>,
     pub process_id: Option<u64>,
@@ -79,12 +85,6 @@ pub struct Record {
     pub application_display_settings: Option<ApplicationDisplaySettings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executable_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub frame_limiter_settings: Option<BTreeMap<String, Value>>,
-    #[serde(skip)]
-    pub stream_limiter_snapshot: Option<StreamLimiterSnapshot>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub client_frame_limiter_overrides: Option<BTreeMap<String, Value>>,
     pub application_display_overrides: BTreeMap<String, Value>,
     #[serde(skip)]
     pub display_admission: Option<DisplayAdmission>,
@@ -131,12 +131,6 @@ pub struct DisplayAdmission {
     pub rtsp_operation_id: String,
     pub request_sha256: String,
     pub snapshot: Value,
-}
-
-pub struct StreamLimiterSnapshot {
-    pub rtsp_operation_id: String,
-    pub sequence: u64,
-    pub settings: BTreeMap<String, Value>,
 }
 
 pub fn random_display_admission_token() -> Result<String, &'static str> {
@@ -274,6 +268,9 @@ impl Records {
                 operation_id,
                 app_id,
                 library_selection: None,
+                preparation_context: None,
+                prepared_context_service: None,
+                prepared_environment: None,
                 state: State::Starting,
                 outstanding_request: None,
                 session_id: None,
@@ -300,9 +297,6 @@ impl Records {
                 config_overrides: None,
                 application_display_settings: None,
                 executable_path: None,
-                frame_limiter_settings: None,
-                stream_limiter_snapshot: None,
-                client_frame_limiter_overrides: None,
                 application_display_overrides: BTreeMap::new(),
                 display_admission: None,
                 virtual_display_intent: None,

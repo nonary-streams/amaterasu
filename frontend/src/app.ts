@@ -82,7 +82,7 @@ namespace Amaterasu {
     private notificationTimer = 0;
     private restorationGeneration = 0;
     private displayedPage: string | null = null;
-    private draftGuard: { isDirty: () => boolean; dispose: () => void } | null = null;
+    private draftGuards = new DraftGuardGroup();
 
     constructor() {
       this.root = document.getElementById("app")!;
@@ -112,7 +112,7 @@ namespace Amaterasu {
         if (this.signedIn) this.renderRequestedPage(event.oldURL);
       });
       window.addEventListener("beforeunload", (event) => {
-        if (this.signedIn && this.draftGuard?.isDirty()) {
+        if (this.signedIn && this.draftGuards.isDirty()) {
           event.preventDefault();
           event.returnValue = "";
         }
@@ -199,12 +199,11 @@ namespace Amaterasu {
     }
 
     private releaseDraftGuard(): void {
-      this.draftGuard?.dispose();
-      this.draftGuard = null;
+      this.draftGuards.dispose();
     }
 
     private mayLeaveDraft(): boolean {
-      return !this.draftGuard?.isDirty() || window.confirm("Discard your unsaved changes?");
+      return !this.draftGuards.isDirty() || window.confirm("Discard your unsaved changes?");
     }
 
     private renderRequestedPage(previousUrl?: string): void {
@@ -586,8 +585,9 @@ namespace Amaterasu {
           this.displayedPage = next;
         },
         registerDraftGuard: (isDirty, dispose) => {
-          if (fresh.isConnected) this.draftGuard = { isDirty, dispose };
-          else dispose();
+          if (fresh.isConnected) return this.draftGuards.register(isDirty, dispose);
+          dispose();
+          return () => {};
         },
       };
       if (page.startsWith("extension/")) {

@@ -3,7 +3,7 @@ use crate::SERVICE;
 use crate::{
     protocol::*,
     records::{
-        CatalogSelection, DisplayAdmission, GlobalPreparation, Records, StreamLimiterSnapshot,
+        CatalogSelection, DisplayAdmission, GlobalPreparation, Records,
         random_display_admission_token,
     },
     responses,
@@ -71,346 +71,7 @@ fn virtual_display_intent_sha256(intent: &VirtualDisplayIntent) -> Option<String
     )
 }
 
-fn valid_frame_limiter_snapshot(snapshot: &BTreeMap<String, Value>) -> bool {
-    let Some(settings) = snapshot.get("settings").and_then(Value::as_object) else {
-        return false;
-    };
-    if snapshot.get("version").and_then(Value::as_u64) != Some(1)
-        || snapshot
-            .get("requested_stream_fps_millihz")
-            .and_then(Value::as_u64)
-            .is_none_or(|rate| rate == 0 || rate > 1_000_000)
-        || snapshot.len() != 9
-        || settings.len() != 11
-    {
-        return false;
-    }
-    for key in [
-        "client_display_mode_override_millihz",
-        "lossless_scaling_limit_millihz",
-    ] {
-        if !snapshot.get(key).is_some_and(|value| {
-            value.is_null() || value.as_u64().is_some_and(|rate| rate <= 1_000_000)
-        }) {
-            return false;
-        }
-    }
-    for key in ["virtual_display_active", "physical_framegen_capture"] {
-        if !snapshot
-            .get(key)
-            .is_some_and(|value| value.is_null() || value.is_boolean())
-        {
-            return false;
-        }
-    }
-    if !snapshot
-        .get("game_frame_generation_mode")
-        .is_some_and(|value| {
-            value.is_null()
-                || value.as_str().is_some_and(|mode| {
-                    matches!(
-                        mode,
-                        "none"
-                            | "lossless-scaling"
-                            | "game-provided"
-                            | "nvidia-smooth-motion"
-                            | "other"
-                    )
-                })
-        })
-        || !snapshot
-            .get("rtss_frame_limit_type_explicit_override")
-            .is_some_and(|value| value.is_null() || value.is_boolean())
-    {
-        return false;
-    }
-    for key in [
-        "frame_limiter_enable",
-        "frame_limiter_disable_vsync",
-        "rtss_allow_virtual_display_override",
-        "mangohud_always_show_graph",
-    ] {
-        if !settings.get(key).is_some_and(Value::is_boolean) {
-            return false;
-        }
-    }
-    if settings
-        .get("frame_limiter_fps_limit_millihz")
-        .and_then(Value::as_u64)
-        .is_none_or(|rate| rate > 1_000_000)
-    {
-        return false;
-    }
-    let string = |key| settings.get(key).and_then(Value::as_str);
-    string("frame_limiter_provider").is_some_and(valid_host_frame_limiter_provider)
-        && string("frame_limiter_auto_virtual_framegen")
-            .is_some_and(|mode| matches!(mode, "enabled" | "vrr" | "legacy" | "disabled"))
-        && string("rtss_frame_limit_type").is_some_and(|mode| {
-            matches!(
-                mode,
-                "async" | "front edge sync" | "back edge sync" | "nvidia reflex"
-            )
-        })
-        && string("rtss_install_path").is_some_and(valid_rtss_install_path)
-        && string("mangohud_limiter_method")
-            .is_some_and(|method| matches!(method, "early" | "late"))
-        && string("mangohud_preset")
-            .is_some_and(|preset| matches!(preset, "custom" | "1" | "2" | "3" | "4"))
-}
-
-fn valid_client_frame_limiter_overrides(overrides: &BTreeMap<String, Value>) -> bool {
-    overrides.iter().all(|(key, value)| {
-        if !matches!(
-            key.as_str(),
-            "frame_limiter_enable"
-                | "frame_limiter_disable_vsync"
-                | "rtss_allow_virtual_display_override"
-                | "mangohud_always_show_graph"
-                | "frame_limiter_fps_limit"
-                | "frame_limiter_provider"
-                | "frame_limiter_auto_virtual_framegen"
-                | "rtss_frame_limit_type"
-                | "rtss_install_path"
-                | "mangohud_limiter_method"
-                | "mangohud_preset"
-        ) {
-            return false;
-        }
-        if value.is_null() {
-            return true;
-        }
-        match key.as_str() {
-            "frame_limiter_enable"
-            | "frame_limiter_disable_vsync"
-            | "rtss_allow_virtual_display_override"
-            | "mangohud_always_show_graph" => value.is_boolean(),
-            "frame_limiter_fps_limit" => value.as_f64().is_some_and(|fps| {
-                fps.is_finite()
-                    && (0.0..=1000.0).contains(&fps)
-                    && ((fps * 1000.0) - (fps * 1000.0).round()).abs() < 0.000_001
-            }),
-            "frame_limiter_provider" => value
-                .as_str()
-                .is_some_and(valid_host_frame_limiter_provider),
-            "frame_limiter_auto_virtual_framegen" => value
-                .as_str()
-                .is_some_and(|mode| matches!(mode, "enabled" | "vrr" | "legacy" | "disabled")),
-            "rtss_frame_limit_type" => {
-                cfg!(windows)
-                    && value.as_str().is_some_and(|mode| {
-                        matches!(
-                            mode,
-                            "async" | "front edge sync" | "back edge sync" | "nvidia reflex"
-                        )
-                    })
-            }
-            "rtss_install_path" => value.as_str().is_some_and(valid_rtss_install_path),
-            "mangohud_limiter_method" => value
-                .as_str()
-                .is_some_and(|method| matches!(method, "early" | "late")),
-            "mangohud_preset" => value
-                .as_str()
-                .is_some_and(|preset| matches!(preset, "custom" | "1" | "2" | "3" | "4")),
-            _ => false,
-        }
-    })
-}
-
-fn valid_host_frame_limiter_provider(provider: &str) -> bool {
-    #[cfg(windows)]
-    {
-        matches!(provider, "auto" | "none" | "rtss" | "nvidia-control-panel")
-    }
-    #[cfg(target_os = "linux")]
-    {
-        matches!(
-            provider,
-            "auto" | "none" | "mangohud" | "proton" | "mangohud-proton"
-        )
-    }
-    #[cfg(target_os = "macos")]
-    {
-        matches!(provider, "auto" | "none")
-    }
-    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-    {
-        let _ = provider;
-        false
-    }
-}
-
-fn valid_rtss_install_path(path: &str) -> bool {
-    if path.len() > 4096 || path.chars().any(char::is_control) {
-        return false;
-    }
-    #[cfg(windows)]
-    {
-        if path.is_empty() {
-            return true;
-        }
-        let bytes = path.as_bytes();
-        let drive_prefix = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
-        let drive_root = drive_prefix && bytes.len() >= 3 && matches!(bytes[2], b'\\' | b'/');
-        let unc_root = path.starts_with("\\\\") || path.starts_with("//");
-        let valid_unc = unc_root
-            && path[2..]
-                .split(['\\', '/'])
-                .filter(|part| !part.is_empty())
-                .count()
-                >= 2;
-        let relative = !matches!(bytes.first().copied(), Some(b'\\' | b'/')) && !drive_prefix;
-        drive_root || valid_unc || relative
-    }
-    #[cfg(not(windows))]
-    {
-        path.is_empty()
-    }
-}
-
-fn snapshot_matches_application_policy(
-    record: &crate::records::Record,
-    snapshot: &BTreeMap<String, Value>,
-    client: Option<&BTreeMap<String, Value>>,
-) -> bool {
-    let Some(settings) = snapshot.get("settings").and_then(Value::as_object) else {
-        return false;
-    };
-    let application = record
-        .config_overrides
-        .as_ref()
-        .map(|overrides| serde_json::to_value(overrides).expect("serializable overrides"))
-        .unwrap_or_else(|| serde_json::json!({}));
-    let explicit_rtss_type = client
-        .and_then(|overrides| overrides.get("rtss_frame_limit_type"))
-        .filter(|value| !value.is_null())
-        .or_else(|| application.get("rtss_frame_limit_type"))
-        .is_some();
-    let provenance = snapshot.get("rtss_frame_limit_type_explicit_override");
-    if explicit_rtss_type && provenance != Some(&Value::Bool(true)) {
-        return false;
-    }
-    if !explicit_rtss_type && provenance == Some(&Value::Bool(true)) {
-        return false;
-    }
-    for (key, effective_key) in [
-        ("frame_limiter_enable", "frame_limiter_enable"),
-        ("frame_limiter_provider", "frame_limiter_provider"),
-        ("frame_limiter_disable_vsync", "frame_limiter_disable_vsync"),
-        (
-            "frame_limiter_auto_virtual_framegen",
-            "frame_limiter_auto_virtual_framegen",
-        ),
-        ("rtss_frame_limit_type", "rtss_frame_limit_type"),
-        (
-            "rtss_allow_virtual_display_override",
-            "rtss_allow_virtual_display_override",
-        ),
-        ("rtss_install_path", "rtss_install_path"),
-        ("mangohud_limiter_method", "mangohud_limiter_method"),
-        ("mangohud_preset", "mangohud_preset"),
-        ("mangohud_always_show_graph", "mangohud_always_show_graph"),
-    ] {
-        let expected = client
-            .and_then(|overrides| overrides.get(key))
-            .filter(|value| !value.is_null())
-            .or_else(|| application.get(key));
-        if let Some(expected) = expected
-            && settings.get(effective_key) != Some(expected)
-        {
-            return false;
-        }
-    }
-    let fps = client
-        .and_then(|overrides| overrides.get("frame_limiter_fps_limit"))
-        .filter(|value| !value.is_null())
-        .or_else(|| application.get("frame_limiter_fps_limit"));
-    if let Some(fps) = fps {
-        let Some(hertz) = fps.as_f64() else {
-            return false;
-        };
-        if !hertz.is_finite()
-            || !(0.0..=1000.0).contains(&hertz)
-            || settings
-                .get("frame_limiter_fps_limit_millihz")
-                .and_then(Value::as_u64)
-                != Some((hertz * 1000.0).round() as u64)
-        {
-            return false;
-        }
-    }
-    true
-}
-
-/// Only the negotiated stream cadence and its derived limiter target may
-/// differ without a fresh authoritative global-settings read.
-fn valid_resumed_stream_snapshot(
-    record: &crate::records::Record,
-    candidate: &BTreeMap<String, Value>,
-) -> bool {
-    let Some(original) = record.frame_limiter_settings.as_ref() else {
-        return false;
-    };
-    if !valid_frame_limiter_snapshot(candidate) {
-        return false;
-    }
-    if original.iter().any(|(key, value)| {
-        !matches!(
-            key.as_str(),
-            "requested_stream_fps_millihz"
-                | "client_display_mode_override_millihz"
-                | "lossless_scaling_limit_millihz"
-        ) && candidate.get(key) != Some(value)
-    }) {
-        return false;
-    }
-    let expected_lossless = if original
-        .get("game_frame_generation_mode")
-        .and_then(Value::as_str)
-        == Some("lossless-scaling")
-        && record
-            .config_overrides
-            .as_ref()
-            .and_then(|overrides| overrides.lossless_scaling_target_fps)
-            .is_none()
-    {
-        candidate.get("requested_stream_fps_millihz")
-    } else {
-        original.get("lossless_scaling_limit_millihz")
-    };
-    candidate.get("lossless_scaling_limit_millihz") == expected_lossless
-}
-
-/// RTSP identities are minted by NVHTTP's monotonically increasing record
-/// counter, under the same random process nonce as the application identity.
-fn stream_sequence(application_operation: &str, rtsp_operation: &str) -> Option<u64> {
-    fn parse<'a>(value: &'a str, purpose: &str) -> Option<(&'a str, u64)> {
-        let mut pieces = value.split('-');
-        if pieces.next()? != "nvhttp" {
-            return None;
-        }
-        let nonce = pieces.next()?;
-        let sequence = pieces.next()?;
-        if nonce.len() != 32
-            || sequence.len() != 16
-            || !nonce
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            || !sequence
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            || pieces.next()? != purpose
-            || pieces.next().is_some()
-        {
-            return None;
-        }
-        Some((nonce, u64::from_str_radix(sequence, 16).ok()?))
-    }
-    let application = application_operation.rsplit(':').next()?;
-    let (application_nonce, application_sequence) = parse(application, "application")?;
-    let (stream_nonce, stream_sequence) = parse(rtsp_operation, "rtsp")?;
-    (application_nonce == stream_nonce && stream_sequence > application_sequence)
-        .then_some(stream_sequence)
-}
+/// Owns admitted launches and consumes only generic preparation contributions.
 pub struct Pipeline {
     records: Records,
     job: Option<Workflow>,
@@ -421,6 +82,7 @@ pub struct Pipeline {
     retirement_observers: BTreeSet<String>,
     provider_routes: BTreeMap<String, ProviderRoute>,
     library_routes: BTreeMap<String, crate::library::Route>,
+    prepared_context_service: Option<String>,
 }
 impl Pipeline {
     pub fn new(environment: BTreeMap<String, String>) -> Result<Self, &'static str> {
@@ -434,6 +96,7 @@ impl Pipeline {
             retirement_observers: BTreeSet::new(),
             provider_routes: BTreeMap::new(),
             library_routes: BTreeMap::new(),
+            prepared_context_service: None,
         })
     }
     pub fn set_retirement_observers(&mut self, observers: BTreeSet<String>) {
@@ -446,6 +109,10 @@ impl Pipeline {
 
     pub fn set_library_routes(&mut self, routes: BTreeMap<String, crate::library::Route>) {
         self.library_routes = routes;
+    }
+
+    pub fn set_prepared_context_service(&mut self, service: Option<String>) {
+        self.prepared_context_service = service;
     }
 
     fn verify_retirement(
@@ -733,9 +400,7 @@ impl Pipeline {
             }
             Ok(
                 operation @ (Operation::PrepareDisplayAdmission { .. }
-                | Operation::VerifyDisplayAdmission { .. }
-                | Operation::VerifyFrameLimiterSnapshot { .. }
-                | Operation::AuthorizeStreamSnapshot { .. }),
+                | Operation::VerifyDisplayAdmission { .. }),
             ) => {
                 self.receive(id, &caller, &initiator, remaining_ms, operation, send)?;
             }
@@ -880,14 +545,16 @@ impl Pipeline {
                 legacy_global_preparation,
                 preflight_token,
                 display_admission_token,
-                frame_limiter_settings,
-                client_frame_limiter_overrides,
+                preparation_context,
                 application_display_overrides,
                 application_display_settings,
                 virtual_display_intent,
                 proton_dualsense_compatibility,
                 return_on_admission,
             } => {
+                if preparation_context.is_some() && self.prepared_context_service.is_none() {
+                    return complete(send, request, error("preparation_context_not_configured"));
+                }
                 if (application_display_overrides.is_some()
                     || application_display_settings.is_some())
                     && preflight_token.is_none()
@@ -916,30 +583,6 @@ impl Pipeline {
                         error("invalid_application_display_overrides"),
                     );
                 }
-                if frame_limiter_settings.is_some() && preflight_token.is_none() {
-                    return complete(send, request, error("preflight_required"));
-                }
-                if client_frame_limiter_overrides.is_some() && preflight_token.is_none() {
-                    return complete(send, request, error("preflight_required"));
-                }
-                if preflight_token.is_some() && frame_limiter_settings.is_none() {
-                    return complete(send, request, error("invalid_frame_limiter_snapshot"));
-                }
-                if let Some(settings) = &frame_limiter_settings
-                    && !valid_frame_limiter_snapshot(settings)
-                {
-                    return complete(send, request, error("invalid_frame_limiter_snapshot"));
-                }
-                if client_frame_limiter_overrides
-                    .as_ref()
-                    .is_some_and(|overrides| !valid_client_frame_limiter_overrides(overrides))
-                {
-                    return complete(
-                        send,
-                        request,
-                        error("invalid_client_frame_limiter_overrides"),
-                    );
-                }
                 match self.records.start(
                     caller,
                     initiator,
@@ -956,11 +599,10 @@ impl Pipeline {
                             self.records.values.remove(&id);
                             return complete(send, request, error("preflight_not_found"));
                         }
-                        self.records
-                            .values
-                            .get_mut(&id)
-                            .expect("launch record")
-                            .launch_started = true;
+                        let record = self.records.values.get_mut(&id).expect("launch record");
+                        record.launch_started = true;
+                        record.preparation_context = preparation_context;
+                        record.prepared_context_service = self.prepared_context_service.clone();
                         self.job = Some(Workflow::launch(id, request, remaining_ms));
                         Ok(())
                     }
@@ -999,38 +641,27 @@ impl Pipeline {
                             (None, None) => {}
                             _ => return complete(send, request, error("display_admission_denied")),
                         }
-                        if let Some(settings) = &frame_limiter_settings
-                            && !snapshot_matches_application_policy(
-                                record,
-                                settings,
-                                client_frame_limiter_overrides.as_ref(),
-                            )
-                        {
-                            return complete(send, request, error("frame_limiter_policy_mismatch"));
-                        }
                         if record.launch_started {
-                            if record.frame_limiter_settings != frame_limiter_settings
-                                || record.client_frame_limiter_overrides
-                                    != client_frame_limiter_overrides
-                                || record.proton_dualsense_compatibility
-                                    != proton_dualsense_compatibility
+                            if record.proton_dualsense_compatibility
+                                != proton_dualsense_compatibility
                                 || record.virtual_display_intent != virtual_display_intent
                                 || record.return_on_admission != return_on_admission
+                                || record.preparation_context != preparation_context
                             {
                                 return complete(send, request, error("operation_conflict"));
                             }
                             return complete(send, request, record.response());
                         }
-                        record.frame_limiter_settings = frame_limiter_settings;
-                        record.client_frame_limiter_overrides = client_frame_limiter_overrides;
                         record.proton_dualsense_compatibility = proton_dualsense_compatibility;
                         record.return_on_admission = return_on_admission;
+                        record.preparation_context = preparation_context;
+                        record.prepared_context_service = self.prepared_context_service.clone();
                         record.launch_started = true;
                         let mut workflow = Workflow::launch(id, request, remaining_ms);
                         workflow.step = if record.lutris_source_id.is_some() {
                             Step::LutrisStatus
                         } else {
-                            Step::CreateSession
+                            crate::workflow::preparation_step(record)
                         };
                         self.job = Some(workflow);
                         Ok(())
@@ -1189,100 +820,7 @@ impl Pipeline {
                 }
                 complete(send, request, response)
             }
-            Operation::VerifyFrameLimiterSnapshot {
-                application_operation_id,
-                rtsp_operation_id,
-                app_id,
-                catalog_revision,
-                frame_limiter_settings,
-                frame_limiter_executable_path,
-            } => {
-                let verified = caller == "amaterasu.rtsp"
-                    && self.records.values.values().any(|record| {
-                        record.owner == "amaterasu.nvhttp"
-                            && record.catalog_selection == CatalogSelection::Exported
-                            && record.preflight_ready
-                            && record.preflight_token.is_some()
-                            && record.launch_started
-                            && record.state == State::Active
-                            && record.operation_id == application_operation_id
-                            && record.app_id == app_id
-                            && record.catalog_revision == Some(catalog_revision)
-                            && match (&rtsp_operation_id, &record.stream_limiter_snapshot) {
-                                (Some(id), Some(active)) => {
-                                    active.rtsp_operation_id == *id
-                                        && active.settings == frame_limiter_settings
-                                }
-                                (_, None) | (None, Some(_)) => {
-                                    record.frame_limiter_settings.as_ref()
-                                        == Some(&frame_limiter_settings)
-                                }
-                            }
-                            && record.executable_path.as_deref()
-                                == Some(frame_limiter_executable_path.as_str())
-                    });
-                if !verified {
-                    return complete(send, request, error("frame_limiter_snapshot_denied"));
-                }
-                let mut response = serde_json::json!({
-                    "ok":true,
-                    "verified":true,
-                    "application_operation_id":application_operation_id,
-                    "app_id":app_id,
-                    "catalog_revision":catalog_revision,
-                    "frame_limiter_settings":frame_limiter_settings,
-                    "frame_limiter_executable_path":frame_limiter_executable_path,
-                });
-                if let Some(rtsp_operation_id) = rtsp_operation_id {
-                    response["rtsp_operation_id"] = serde_json::json!(rtsp_operation_id);
-                }
-                complete(send, request, response)
-            }
-            Operation::AuthorizeStreamSnapshot {
-                launch_id,
-                application_operation_id,
-                rtsp_operation_id,
-                frame_limiter_settings,
-            } => {
-                let Ok(record) = self.records.owned(caller, launch_id) else {
-                    return complete(send, request, error("stream_snapshot_denied"));
-                };
-                let Some(sequence) = stream_sequence(&application_operation_id, &rtsp_operation_id)
-                else {
-                    return complete(send, request, error("stream_snapshot_denied"));
-                };
-                if caller != "amaterasu.nvhttp"
-                    || record.state != State::Active
-                    || record.operation_id != application_operation_id
-                    || !valid_resumed_stream_snapshot(record, &frame_limiter_settings)
-                    || record
-                        .stream_limiter_snapshot
-                        .as_ref()
-                        .is_some_and(|active| {
-                            sequence < active.sequence
-                                || (sequence == active.sequence
-                                    && (active.rtsp_operation_id != rtsp_operation_id
-                                        || active.settings != frame_limiter_settings))
-                        })
-                {
-                    return complete(send, request, error("stream_snapshot_denied"));
-                }
-                let record = self
-                    .records
-                    .values
-                    .get_mut(&launch_id)
-                    .expect("verified owned record");
-                record.stream_limiter_snapshot = Some(StreamLimiterSnapshot {
-                    rtsp_operation_id: rtsp_operation_id.clone(),
-                    sequence,
-                    settings: frame_limiter_settings.clone(),
-                });
-                complete(
-                    send,
-                    request,
-                    serde_json::json!({"ok":true,"application_operation_id":application_operation_id,"rtsp_operation_id":rtsp_operation_id,"frame_limiter_settings":frame_limiter_settings}),
-                )
-            }
+
             Operation::Lookup { operation_id } => {
                 let response = self
                     .records
@@ -1429,9 +967,11 @@ impl Pipeline {
             .values
             .get_mut(&job.launch_id)
             .expect("workflow record");
-        let (service, payload) = job
-            .command(record, &self.environment)
-            .map_err(str::to_owned)?;
+        let environment = record
+            .prepared_environment
+            .as_ref()
+            .unwrap_or(&self.environment);
+        let (service, payload) = job.command(record, environment).map_err(str::to_owned)?;
         let service = service.to_owned();
         // Mark possibly committed mutations before submission. A transport or
         // cancellation error then reconciles by owned lookup, never by respawn.
@@ -1483,7 +1023,7 @@ impl Pipeline {
         if job.cleanup {
             return self.consume_cleanup(job, payload, send);
         }
-        if payload["ok"] != true {
+        if job.step != Step::ReadPreparationContext && payload["ok"] != true {
             if job.step == Step::Library {
                 return self.dependency_failed(job, crate::library::rejection_code(&payload), send);
             }
@@ -1524,6 +1064,35 @@ impl Pipeline {
             .get_mut(&job.launch_id)
             .expect("workflow record");
         match job.step {
+            Step::ReadPreparationContext => {
+                let response = serde_json::from_value::<
+                    amaterasu_module_sdk::extension_api::PreparedPlansResponse,
+                >(payload);
+                let environment = match response {
+                    Ok(response)
+                        if response.status == "succeeded"
+                            && Some(&response.target) == record.preparation_context.as_ref() =>
+                    {
+                        amaterasu_module_sdk::extension_api::launch_environment_contributions(
+                            &response.plans,
+                        )
+                        .and_then(|contributions| {
+                            amaterasu_module_sdk::extension_api::merge_launch_environment(
+                                &self.environment,
+                                &contributions,
+                            )
+                        })
+                    }
+                    _ => Err("invalid prepared context".into()),
+                };
+                match environment {
+                    Ok(environment) => record.prepared_environment = Some(environment),
+                    Err(_) => {
+                        return self.dependency_failed(job, "preparation_context_unverified", send);
+                    }
+                }
+                job.step = Step::CreateSession;
+            }
             Step::Library => {
                 let Some(selection) = record.library_selection.as_ref() else {
                     return self.dependency_failed(job, "invalid_library_response", send);
@@ -1541,7 +1110,7 @@ impl Pipeline {
                 record.target = Some(target);
                 record.generic_provider_service = Some(service);
                 record.resource = Some(resource);
-                job.step = Step::CreateSession;
+                job.step = crate::workflow::preparation_step(record);
             }
             Step::Catalog => {
                 if payload["id"] != record.app_id {
@@ -1684,7 +1253,7 @@ impl Pipeline {
                 job.step = if record.lutris_source_id.is_some() {
                     Step::LutrisStatus
                 } else {
-                    Step::CreateSession
+                    crate::workflow::preparation_step(record)
                 };
             }
             Step::LutrisStatus => {
@@ -1694,7 +1263,7 @@ impl Pipeline {
                 {
                     return self.dependency_failed(job, "lutris_unavailable", send);
                 }
-                job.step = Step::CreateSession;
+                job.step = crate::workflow::preparation_step(record);
             }
             Step::LutrisPreSpawn => {
                 if payload["settings_ready"] != true

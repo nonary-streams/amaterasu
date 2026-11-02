@@ -136,6 +136,24 @@ namespace Amaterasu {
     dispose: () => void;
   }
 
+  export class DraftGuardGroup {
+    private guards = new Set<{ isDirty: () => boolean; dispose: () => void }>();
+
+    register(isDirty: () => boolean, dispose: () => void): () => void {
+      const guard = { isDirty, dispose };
+      this.guards.add(guard);
+      return () => { if (this.guards.delete(guard)) dispose(); };
+    }
+
+    isDirty(): boolean { return [...this.guards].some(guard => guard.isDirty()); }
+
+    dispose(): void {
+      const guards = [...this.guards];
+      this.guards.clear();
+      for (const guard of guards) guard.dispose();
+    }
+  }
+
   // Baselines are held only in memory. A captured baseline represents what was
   // submitted, so edits made while a save is in flight remain unsaved.
   export function trackDrafts(root: HTMLElement, onChange: (dirty: boolean) => void = () => {}): DraftTracker {

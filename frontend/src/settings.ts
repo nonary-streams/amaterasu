@@ -1365,9 +1365,9 @@ namespace Amaterasu {
     "motion_as_ds4", "touchpad_as_ds4", "ds5_inputtino_randomize_mac",
     "proton_dualsense_compatibility",
     "max_bitrate", "minimum_fps_target", "video_max_batch_size_kb",
-    "frame_limiter_fps_limit", "frame_limiter_enable", "frame_limiter_provider",
-    "frame_limiter_disable_vsync", "frame_limiter_auto_virtual_framegen",
-    "rtss_frame_limit_type", "nvenc_spatial_aq", "nvenc_preset", "nvenc_h264_cavlc",
+
+
+    "nvenc_spatial_aq", "nvenc_preset", "nvenc_h264_cavlc",
     "nvenc_twopass", "nvenc_vbv_increase", "nvenc_split_encode", "nvenc_realtime_hags",
     "nvenc_opengl_vulkan_on_dxgi", "nvenc_latency_over_power", "vaapi_strict_rc_buffer",
     "high_resolution_scrolling", "capture",
@@ -1378,7 +1378,7 @@ namespace Amaterasu {
   export function unsupportedPairingOverrideFields(client: PairingClient): string[] {
     const overrides = client.config_overrides ?? {};
     return Object.entries(overrides)
-      .filter(([field, value]) => !forwardablePairingOverrideFields.includes(field) ||
+      .filter(([field, value]) => forwardablePairingOverrideFields.includes(field) &&
         !validStoredPairingOverride(field, value))
       .map(([field]) => field);
   }
@@ -1397,7 +1397,7 @@ namespace Amaterasu {
         "proton_dualsense_compatibility"].includes(field);
     if (value === undefined) return false;
     if (["stream_audio", "audio_sink_capture_only", "controller", "keyboard", "mouse",
-      "native_pen_touch", "ds4_back_as_touchpad_click", "frame_limiter_enable", "frame_limiter_disable_vsync",
+      "native_pen_touch", "ds4_back_as_touchpad_click",
       "motion_as_ds4", "touchpad_as_ds4", "ds5_inputtino_randomize_mac",
       "proton_dualsense_compatibility",
       "nvenc_spatial_aq", "nvenc_h264_cavlc", "nvenc_realtime_hags",
@@ -1419,14 +1419,6 @@ namespace Amaterasu {
       return Number.isSafeInteger(value) && (value as number) >= -2147483648 && (value as number) <= 2147483647;
     if (field === "gamepad")
       return typeof value === "string" && recognizedInputGamepadProfiles.includes(value);
-    if (field === "frame_limiter_provider")
-      return typeof value === "string" && ["auto", "rtss", "nvidia-control-panel", "none",
-        "mangohud", "proton", "mangohud-proton"].includes(value);
-    if (field === "frame_limiter_auto_virtual_framegen")
-      return typeof value === "string" && ["enabled", "vrr", "legacy", "disabled"].includes(value);
-    if (field === "rtss_frame_limit_type")
-      return typeof value === "string" && ["async", "front edge sync", "back edge sync",
-        "nvidia reflex"].includes(value);
     if (field === "nvenc_twopass")
       return value === "disabled" || value === "quarter_res" || value === "full_res";
     if (field === "nvenc_split_encode")
@@ -1444,9 +1436,6 @@ namespace Amaterasu {
         (value as number) <= 0x7fff_ffff;
     if (field === "key_repeat_delay")
       return Number.isSafeInteger(value) && (value as number) >= 0 && (value as number) <= 0x7fff_ffff;
-    if (field === "frame_limiter_fps_limit")
-      return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1000 &&
-        Math.abs(value * 1000 - Math.round(value * 1000)) <= 0.000001;
     if (["minimum_fps_target", "key_repeat_frequency"].includes(field))
       return typeof value === "number" && Number.isFinite(value) && value >= 0 &&
         (field === "key_repeat_frequency" || value <= 1000);
@@ -1482,9 +1471,8 @@ namespace Amaterasu {
   function canonicalPairingOverrides(
     values: Record<string, unknown>,
   ): NonNullable<PairingClient["config_overrides"]> {
-    if (Object.keys(values).some((field) => !forwardablePairingOverrideFields.includes(field)))
-      throw new Error("The paired client has override fields this editor cannot preserve.");
-    return Object.fromEntries(Object.entries(values).filter(([, value]) => value !== null && value !== undefined));
+    return Object.fromEntries(Object.entries(values).filter(([field, value]) => value !== undefined &&
+      (value !== null || !forwardablePairingOverrideFields.includes(field))));
   }
 
   export interface PairingOverrideMerge {
@@ -2994,6 +2982,10 @@ namespace Amaterasu {
                 "Sparse per-client overrides. Use null or empty values to inherit; global-only keys are rejected."),
               audioSettings, inputSettings, advancedSettings,
               el("div", "client-settings-save", save, remove, status)));
+          const pluginSettings = button("Plugin settings", () =>
+            showSessionExtensionSettings(context, { kind: "paired_client", id: client.client_id }, `${client.name} plugin settings`));
+          pluginSettings.disabled = !client.client_id || !context.api.allows("configuration.read");
+          clientCard.append(pluginSettings);
           let baselineControls = pairingControlStates(clientCard);
           return {
             client, card: clientCard,

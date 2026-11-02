@@ -114,14 +114,6 @@ pub struct Broker {
     pub updater_session_stops: Vec<Value>,
     pub tray_activity_updates: Vec<Value>,
     pub tray_vigem_notifications: usize,
-    pub limiter_unavailable: bool,
-    pub limiter_admission_unavailable: bool,
-    pub limiter_restore_failures: usize,
-    pub limiter_lease: Option<String>,
-    pub limiter_session: Option<String>,
-    pub limiter_executable_path: Option<String>,
-    pub limiter_status_executable_override: Option<String>,
-    pub limiter_malformed_status: bool,
     pub display_lease: Option<String>,
     pub display_operation: Option<String>,
     pub display_recovery_required: bool,
@@ -271,12 +263,6 @@ impl Broker {
                     });
                 }
                 if service == "amaterasu.host-metrics/1" && !self.host_metrics_available {
-                    return Ok(Response::Error {
-                        code: "service_unavailable".into(),
-                        message: String::new(),
-                    });
-                }
-                if service == "amaterasu.frame-limiter/1" && self.limiter_admission_unavailable {
                     return Ok(Response::Error {
                         code: "service_unavailable".into(),
                         message: String::new(),
@@ -561,9 +547,6 @@ impl Broker {
         }
         if service == "amaterasu.input/1" {
             return self.input(action, &call.payload);
-        }
-        if service == "amaterasu.frame-limiter/1" {
-            return self.frame_limiter(action, &call.payload);
         }
         if service == "amaterasu.virtual-display/1" {
             if call.payload["reference_id"].is_string() {
@@ -939,63 +922,6 @@ impl Broker {
                     "removed":removed})
             }
             _ => panic!("unexpected virtual display action"),
-        }
-    }
-
-    fn frame_limiter(&mut self, action: &str, payload: &Value) -> Value {
-        match action {
-            "apply" => {
-                if self.limiter_unavailable {
-                    return json!({"ok":true,"version":1,"action":"apply",
-                        "session_id":payload["session_id"],
-                        "state":"runtime_unavailable","applied":false});
-                }
-                let session = payload["session_id"].as_str().unwrap();
-                if self.limiter_session.as_deref() == Some(session) {
-                    return json!({"ok":true,"version":1,"action":"apply",
-                        "session_id":session,"state":"already_applied","applied":true,
-                        "lease":self.limiter_lease});
-                }
-                let lease = format!("limiter-{session}");
-                self.limiter_session = Some(session.into());
-                self.limiter_lease = Some(lease.clone());
-                self.limiter_executable_path =
-                    payload["executable_path"].as_str().map(str::to_owned);
-                json!({"ok":true,"version":1,"action":"apply","session_id":session,
-                    "state":"applied","applied":true,"lease":lease})
-            }
-            "status" => {
-                if self.limiter_malformed_status {
-                    return json!({"ok":true,"version":1,"action":"status","state":"not_found",
-                        "applied":false,"session_id":payload["session_id"]});
-                }
-                let leases = if self.limiter_session.as_deref() == payload["session_id"].as_str() {
-                    vec![
-                        json!({"session_id":self.limiter_session,"lease":self.limiter_lease,
-                        "executable_path":self.limiter_status_executable_override.as_ref()
-                            .or(self.limiter_executable_path.as_ref()),"provider":"rtss",
-                        "state":"applied","applied":true}),
-                    ]
-                } else {
-                    Vec::new()
-                };
-                json!({"ok":true,"version":1,"action":"status","session_id":payload["session_id"],
-                    "state":if leases.is_empty() {"not_found"} else {"applied"},"applied":false,"leases":leases})
-            }
-            "restore" => {
-                if self.limiter_restore_failures > 0 {
-                    self.limiter_restore_failures -= 1;
-                    return json!({"ok":true,"version":1,"action":"restore",
-                        "state":"restore_failed","applied":true});
-                }
-                assert_eq!(payload["lease"], json!(self.limiter_lease));
-                self.limiter_lease = None;
-                self.limiter_session = None;
-                self.limiter_executable_path = None;
-                json!({"ok":true,"version":1,"action":"restore",
-                    "state":"restored","applied":false})
-            }
-            _ => panic!("unexpected frame limiter action"),
         }
     }
 

@@ -347,6 +347,8 @@ pub struct PrepareConfig {
     /// Coordinator-issued logical session selected by the transport adapter.
     #[serde(default)]
     pub lifecycle_session_target: Option<amaterasu_extension_api::LifecycleTarget>,
+    #[serde(default)]
+    pub lifecycle_capture_mode: amaterasu_extension_api::CaptureBindingMode,
     /// Prelaunch History reservation, bound to the signed RTSP operation.
     #[serde(default)]
     pub history_activity_id: Option<String>,
@@ -358,12 +360,6 @@ pub struct PrepareConfig {
     /// Launch-attested display identity/specification for this stream.
     #[serde(default)]
     pub virtual_display_intent: Option<VirtualDisplayIntent>,
-    /// Frozen launch policy; retained with the prepared operation for retries.
-    #[serde(default)]
-    pub frame_limiter_settings: Option<Value>,
-    /// Exact executable selected by the authenticated Catalog launch preflight.
-    #[serde(default)]
-    pub frame_limiter_executable_path: Option<String>,
     #[serde(default)]
     pub video_encryption_policy: Option<VideoEncryptionPolicySnapshot>,
     #[serde(default)]
@@ -402,6 +398,9 @@ pub struct PrepareConfig {
 }
 impl PrepareConfig {
     pub fn validate(&self, allow_remote: bool) -> Result<(), &'static str> {
+        if self.lifecycle_capture_mode.is_external() && self.lifecycle_session_target.is_none() {
+            return Err("invalid_lifecycle_identity");
+        }
         if let Some(target) = &self.lifecycle_session_target {
             match target {
                 amaterasu_extension_api::LifecycleTarget::Session {
@@ -413,7 +412,9 @@ impl PrepareConfig {
                     && *generation > 0 => {}
                 _ => return Err("invalid_lifecycle_identity"),
             }
-            if self.display_request.is_some() || self.virtual_display_intent.is_some() {
+            if self.lifecycle_capture_mode.is_managed()
+                && (self.display_request.is_some() || self.virtual_display_intent.is_some())
+            {
                 return Err("lifecycle_display_policy_conflict");
             }
         }
@@ -432,7 +433,6 @@ impl PrepareConfig {
         {
             return Err("invalid_virtual_display_intent");
         }
-        self.validate_frame_limiter_snapshot()?;
         if self.ping_timeout_ms > i32::MAX as u32 {
             return Err("invalid_ping_timeout");
         }
@@ -451,27 +451,6 @@ impl PrepareConfig {
         self.validate_identity()?;
         self.audio.validate()?;
         self.video.validate()
-    }
-
-    fn validate_frame_limiter_snapshot(&self) -> Result<(), &'static str> {
-        match (
-            &self.frame_limiter_settings,
-            &self.frame_limiter_executable_path,
-        ) {
-            (None, None) => Ok(()),
-            (Some(snapshot), Some(path)) => {
-                if path.trim().is_empty()
-                    || path.len() > 4096
-                    || path.chars().any(char::is_control)
-                    || snapshot.get("version").and_then(Value::as_u64) != Some(1)
-                    || !valid_frame_limiter_settings(snapshot)
-                {
-                    return Err("invalid_frame_limiter_snapshot");
-                }
-                Ok(())
-            }
-            _ => Err("invalid_frame_limiter_snapshot"),
-        }
     }
 
     fn validate_destination(&self, allow_remote: bool) -> Result<(), &'static str> {
@@ -520,119 +499,6 @@ impl PrepareConfig {
         }
         Ok(())
     }
-}
-
-fn valid_frame_limiter_settings(snapshot: &Value) -> bool {
-    let Some(fields) = snapshot.as_object() else {
-        return false;
-    };
-    let Some(settings) = fields.get("settings").and_then(Value::as_object) else {
-        return false;
-    };
-    const SNAPSHOT_FIELDS: [&str; 9] = [
-        "version",
-        "settings",
-        "requested_stream_fps_millihz",
-        "client_display_mode_override_millihz",
-        "lossless_scaling_limit_millihz",
-        "virtual_display_active",
-        "physical_framegen_capture",
-        "game_frame_generation_mode",
-        "rtss_frame_limit_type_explicit_override",
-    ];
-    if fields.len() != SNAPSHOT_FIELDS.len()
-        || fields
-            .keys()
-            .any(|key| !SNAPSHOT_FIELDS.contains(&key.as_str()))
-        || settings.len() != 11
-    {
-        return false;
-    }
-    let rate = |key: &str| {
-        settings
-            .get(key)
-            .and_then(Value::as_u64)
-            .is_some_and(|rate| rate <= 1_000_000)
-    };
-    let text = |key: &str| settings.get(key).and_then(Value::as_str);
-    let boolean = |key: &str| settings.get(key).is_some_and(Value::is_boolean);
-    if !rate("frame_limiter_fps_limit_millihz")
-        || !boolean("frame_limiter_enable")
-        || !boolean("frame_limiter_disable_vsync")
-        || !boolean("rtss_allow_virtual_display_override")
-        || !boolean("mangohud_always_show_graph")
-        || !text("frame_limiter_provider").is_some_and(|value| {
-            matches!(
-                value,
-                "auto"
-                    | "rtss"
-                    | "nvidia-control-panel"
-                    | "mangohud"
-                    | "proton"
-                    | "mangohud-proton"
-                    | "none"
-            )
-        })
-        || !text("frame_limiter_auto_virtual_framegen")
-            .is_some_and(|value| matches!(value, "enabled" | "vrr" | "legacy" | "disabled"))
-        || !text("rtss_frame_limit_type").is_some_and(|value| {
-            matches!(
-                value,
-                "async" | "front edge sync" | "back edge sync" | "nvidia reflex"
-            )
-        })
-        || !text("mangohud_preset")
-            .is_some_and(|value| matches!(value, "custom" | "1" | "2" | "3" | "4"))
-        || !text("mangohud_limiter_method").is_some_and(|value| matches!(value, "early" | "late"))
-        || !text("rtss_install_path")
-            .is_some_and(|value| value.len() <= 4096 && !value.chars().any(char::is_control))
-    {
-        return false;
-    }
-    if !fields
-        .get("requested_stream_fps_millihz")
-        .and_then(Value::as_u64)
-        .is_some_and(|rate| (1..=1_000_000).contains(&rate))
-    {
-        return false;
-    }
-    for key in [
-        "client_display_mode_override_millihz",
-        "lossless_scaling_limit_millihz",
-    ] {
-        if !fields.get(key).is_some_and(|value| {
-            value.is_null() || value.as_u64().is_some_and(|rate| rate <= 1_000_000)
-        }) {
-            return false;
-        }
-    }
-    for key in [
-        "virtual_display_active",
-        "physical_framegen_capture",
-        "rtss_frame_limit_type_explicit_override",
-    ] {
-        if !fields
-            .get(key)
-            .is_some_and(|value| value.is_null() || value.is_boolean())
-        {
-            return false;
-        }
-    }
-    fields
-        .get("game_frame_generation_mode")
-        .is_some_and(|value| {
-            value.is_null()
-                || value.as_str().is_some_and(|mode| {
-                    matches!(
-                        mode,
-                        "none"
-                            | "lossless-scaling"
-                            | "game-provided"
-                            | "nvidia-smooth-motion"
-                            | "other"
-                    )
-                })
-        })
 }
 
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -880,6 +746,11 @@ fn is_default_qp(value: &i32) -> bool {
 #[derive(Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartConfigData {
+    #[serde(
+        default,
+        skip_serializing_if = "amaterasu_extension_api::CaptureBindingMode::is_managed"
+    )]
+    pub lifecycle_capture_mode: amaterasu_extension_api::CaptureBindingMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle_target: Option<amaterasu_extension_api::LifecycleTarget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1019,25 +890,14 @@ impl<'de> Deserialize<'de> for StartConfig {
 }
 
 impl StartConfig {
+    pub fn manages_lifecycle_capture(&self) -> bool {
+        self.lifecycle_target.is_some() && self.lifecycle_capture_mode.is_managed()
+    }
     pub fn matches_prepared_codec(&self, prepared: &PrepareConfig) -> bool {
         prepared
             .video
             .offered_codecs()
             .contains(&self.configuration.codec)
-    }
-
-    pub fn matches_prepared_frame_limiter(&self, prepared: &PrepareConfig) -> bool {
-        prepared
-            .frame_limiter_settings
-            .as_ref()
-            .is_none_or(|snapshot| {
-                self.configuration
-                    .fps
-                    .checked_mul(1_000)
-                    .is_some_and(|fps| {
-                        snapshot["requested_stream_fps_millihz"].as_u64() == Some(u64::from(fps))
-                    })
-            })
     }
 
     pub fn matches_prepared_audio(&self, prepared: &PrepareConfig) -> bool {
@@ -1054,6 +914,11 @@ impl StartConfig {
     }
 
     pub fn validate(&self, stream_audio: bool) -> Result<(), &'static str> {
+        if self.lifecycle_capture_mode.is_external()
+            && (self.lifecycle_target.is_none() || self.lifecycle_candidate.is_some())
+        {
+            return Err("invalid_lifecycle_identity");
+        }
         self.encoder.validate()?;
         if self.encoder_provider.as_deref().is_some_and(|alias| {
             alias.is_empty()

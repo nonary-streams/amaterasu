@@ -42,6 +42,8 @@ fn session(epoch: &str, id: &str) -> SessionRecord {
         application_operation_id: None,
         admission_ids: BTreeSet::new(),
         admission_targets: BTreeMap::new(),
+        capture_binding_mode: Default::default(),
+        prepared_plan_ids: Default::default(),
         admission_phases: BTreeMap::new(),
         resource_generations: Default::default(),
         provider_settings: BTreeMap::new(),

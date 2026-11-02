@@ -46,6 +46,7 @@ mod observation_scheduler;
 mod operations;
 #[allow(dead_code)]
 mod plan_observation;
+mod prepared_plans;
 mod provider_observations;
 mod providers;
 mod recovery;
@@ -401,6 +402,11 @@ struct StreamRecord {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SessionRecord {
+    #[serde(
+        default,
+        skip_serializing_if = "amaterasu_extension_api::CaptureBindingMode::is_managed"
+    )]
+    capture_binding_mode: amaterasu_extension_api::CaptureBindingMode,
     #[serde(default)]
     provider_graph: Option<ProviderGraph>,
     host_epoch: String,
@@ -432,6 +438,10 @@ struct SessionRecord {
     /// Original lifecycle phase; missing legacy entries cannot establish ownership.
     #[serde(default)]
     admission_phases: BTreeMap<String, LifecyclePhase>,
+    /// Only admissions whose authenticated callback reported Prepared may
+    /// supply agreed constraints to a later application launch.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    prepared_plan_ids: BTreeSet<String>,
     #[serde(default)]
     provider_settings: BTreeMap<String, settings_snapshot::FrozenSettings>,
     /// Coordinator-owned generation of each session resource producer.
@@ -584,6 +594,10 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
         || !valid_id(&journal.host_epoch)
         || journal.receipts.len() > MAX_RECEIPTS
         || journal.sessions.len() > MAX_SESSIONS
+        || journal.sessions.values().any(|session| {
+            session.prepared_plan_ids.len() > 128
+                || session.prepared_plan_ids.iter().any(|id| !valid_id(id))
+        })
         || journal.receipts.values().any(|receipt| {
             receipt.work.as_ref().is_some_and(|work| {
                 !work.reprepare_authorized(journal)
@@ -1220,6 +1234,12 @@ impl Coordinator {
         }
         if operation == "verify_provider_epoch" {
             return self.verify_provider(caller, &payload);
+        }
+        if operation == "read_prepared_plans" {
+            return self.read_prepared_plans(caller, payload);
+        }
+        if operation == "read_provider_context" {
+            return self.read_provider_context(caller, payload);
         }
         if operation == "verify_finalize_stage" {
             return self.verify_finalize_stage_operation(caller, &payload);

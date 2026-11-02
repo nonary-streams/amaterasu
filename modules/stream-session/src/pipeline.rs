@@ -7,7 +7,6 @@ mod host_metrics_activity;
 mod input;
 mod journal;
 mod lifecycle;
-mod limiter;
 mod record;
 mod responses;
 mod rpc;
@@ -141,36 +140,7 @@ impl Pipeline {
 
     fn shutdown_with(&mut self, send: &mut Send<'_>) -> bool {
         let mut settled = true;
-        if let Some(job) = self.job.as_mut()
-            && job.step == Step::ApplyLimiter
-            && let Some(mut pending) = job.pending.take()
-            && let Some(record) = self.records.get_mut(&job.session)
-        {
-            if !pending.was_sent() {
-                record.limiter_attempted = false;
-            } else {
-                let mut resolved = false;
-                for turn in 0..8 {
-                    match pending.poll(send, turn) {
-                        rpc::Progress::Result(response) => {
-                            limiter::accept_apply(record, &response);
-                            resolved = pending.release_result(send);
-                            break;
-                        }
-                        rpc::Progress::Waiting => {}
-                        rpc::Progress::Failed | rpc::Progress::Unresolved => break,
-                    }
-                }
-                if !resolved {
-                    let cleanup_settled = pending.shutdown(send);
-                    if !cleanup_settled {
-                        record.uncertain = Some(pending);
-                        record.uncertain_step = Some(Step::ApplyLimiter);
-                    }
-                    settled &= cleanup_settled;
-                }
-            }
-        }
+
         if let Some(job) = self.job.as_mut()
             && job.step == Step::ApplyDisplay
             && let Some(mut pending) = job.pending.take()
@@ -233,7 +203,6 @@ impl Pipeline {
             if let Some(pending) = record.uncertain.as_mut() {
                 settled &= pending.shutdown(send);
             }
-            settled &= limiter::shutdown(record, send);
             let display_request_uncertain = record.uncertain.is_some()
                 && matches!(
                     record.uncertain_step,
@@ -527,7 +496,7 @@ impl Pipeline {
                     && (record
                         .start
                         .as_ref()
-                        .is_some_and(|start| start.lifecycle_target.is_some())
+                        .is_some_and(|start| start.manages_lifecycle_capture())
                         && !record.lifecycle_delivery_permit
                         || record.force_idr
                         || (record.input_lease.is_some()
@@ -565,7 +534,7 @@ impl Pipeline {
             && record
                 .start
                 .as_ref()
-                .is_some_and(|start| start.lifecycle_target.is_some())
+                .is_some_and(|start| start.manages_lifecycle_capture())
             && !record.lifecycle_delivery_permit
             && !(record.lifecycle_control_permit && has_control_work(record))
         {
@@ -615,7 +584,7 @@ impl Pipeline {
             && record
                 .start
                 .as_ref()
-                .is_some_and(|start| start.lifecycle_target.is_some())
+                .is_some_and(|start| start.manages_lifecycle_capture())
         {
             record.lifecycle_control_permit = false;
         }
@@ -709,7 +678,7 @@ impl Pipeline {
                 && record
                     .start
                     .as_ref()
-                    .is_some_and(|start| start.lifecycle_target.is_some())
+                    .is_some_and(|start| start.manages_lifecycle_capture())
             {
                 if !record.lifecycle_delivery_permit {
                     continue;

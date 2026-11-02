@@ -132,6 +132,20 @@ fn every_call_targets_a_provider_the_caller_depends_on() {
                 assert_eq!(caller.id, "amaterasu.management");
                 continue;
             }
+            // These are callback edges. Making them startup dependencies would
+            // create a cycle with the consumer's dependency on the coordinator.
+            if matches!(
+                (caller.id, *service),
+                ("amaterasu.session-lifecycle", "amaterasu.launch/1")
+                    | (
+                        "amaterasu.extension-registry",
+                        "amaterasu.session-lifecycle/1"
+                    )
+                    | ("amaterasu.extension-registry", "nonary.frame-limiter/1")
+                    | ("amaterasu.frame-limiter", "amaterasu.session-lifecycle/1")
+            ) {
+                continue;
+            }
             let provider = providers
                 .get(service)
                 .unwrap_or_else(|| panic!("{} calls absent service {service}", caller.id));
@@ -514,9 +528,30 @@ fn real_broker_delivers_every_delegated_request_and_enforces_each_ancestor() {
     }
 
     fn registered_broker(policy: RuntimeConfig) -> Broker {
+        let approved = policy.api_methods.clone();
         let mut broker = Broker::new(policy).unwrap();
         for component in COMPONENTS {
             for service in component.provides {
+                let methods: Vec<_> = approved
+                    .iter()
+                    .filter(|approval| {
+                        approval.provider == component.id && approval.method.service == *service
+                    })
+                    .collect();
+                if !methods.is_empty() {
+                    for approval in methods {
+                        assert!(matches!(
+                            broker.dispatch(
+                                component.id,
+                                Command::RegisterApi {
+                                    method: approval.method.clone(),
+                                }
+                            ),
+                            Response::Ok
+                        ));
+                    }
+                    continue;
+                }
                 assert!(
                     matches!(
                         broker.dispatch(
@@ -615,6 +650,9 @@ fn nvhttp_chain_grants_match_the_agreed_services_exactly() {
         component(NVHTTP_ID).grants().call,
         expected(&[
             "amaterasu.configuration/1",
+            "amaterasu.session-lifecycle/1",
+            "amaterasu.extension-registry/1",
+            "nonary.frame-limiter/1",
             "amaterasu.input/1",
             "amaterasu.pairing/1",
             "amaterasu.state/1",
@@ -643,6 +681,9 @@ fn nvhttp_chain_grants_match_the_agreed_services_exactly() {
     assert_eq!(
         component(RTSP_ID).grants().call,
         expected(&[
+            "amaterasu.session-lifecycle/1",
+            "amaterasu.extension-registry/1",
+            "nonary.frame-limiter/1",
             "amaterasu.input/1",
             "amaterasu.stream-session/1",
             "amaterasu.session/1",
@@ -664,6 +705,9 @@ fn nvhttp_chain_grants_match_the_agreed_services_exactly() {
     assert_eq!(
         component(STREAM_SESSION_ID).grants().call,
         expected(&[
+            "amaterasu.session-lifecycle/1",
+            "amaterasu.extension-registry/1",
+            "nonary.frame-limiter/1",
             "amaterasu.input/1",
             "amaterasu.session/1",
             "amaterasu.display/1",
@@ -680,7 +724,6 @@ fn nvhttp_chain_grants_match_the_agreed_services_exactly() {
             "amaterasu.encode/1",
             "amaterasu.session-history/1",
             "amaterasu.host-metrics/1",
-            "amaterasu.frame-limiter/1",
         ])
     );
     assert_eq!(
@@ -766,7 +809,14 @@ fn each_effect_option_enables_only_its_own_setting() {
         // State locations follow the temporary root, which differs per call.
         let differing: Vec<_> = baseline
             .keys()
-            .filter(|key| !["amaterasu.state", "amaterasu.session-history"].contains(&key.as_str()))
+            .filter(|key| {
+                ![
+                    "amaterasu.state",
+                    "amaterasu.session-history",
+                    "amaterasu.session-lifecycle",
+                ]
+                .contains(&key.as_str())
+            })
             .filter(|key| settings[*key] != baseline[*key])
             .map(String::as_str)
             .collect();

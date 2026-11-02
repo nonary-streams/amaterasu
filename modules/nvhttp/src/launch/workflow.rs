@@ -9,7 +9,6 @@ use super::{
 use crate::encoder_snapshot::{
     CodecOffer, SOFTWARE_MAX_FPS, SOFTWARE_MAX_HEIGHT, SOFTWARE_MAX_WIDTH,
 };
-use crate::frame_limiter::FrameLimiterSettings;
 use crate::wire::Reply;
 use amaterasu_contracts::virtual_display::{
     VirtualDisplayConfigurationOption, VirtualDisplayHdrOption, VirtualDisplayIntent,
@@ -42,7 +41,6 @@ pub enum Phase {
     VerifyResumeSession,
     VerifyResumeApplication,
     RefreshResumePolicy,
-    AuthorizeResumeSnapshot,
     ReserveHistory,
     ReadProtonPolicy,
     PreflightApplication,
@@ -119,6 +117,7 @@ impl Controller {
             return;
         }
         if phase == Phase::PrepareLifecycle
+            && record.lifecycle_capture_mode.is_managed()
             && (record.virtual_display_intent.is_some() || record.display_request.is_some())
         {
             record.request_cleanup(Some("legacy_display_policy_conflict"), now);
@@ -171,7 +170,6 @@ impl Controller {
                         | Phase::VerifyResumeSession
                         | Phase::VerifyResumeApplication
                         | Phase::RefreshResumePolicy
-                        | Phase::AuthorizeResumeSnapshot
                 ) && !job.call.release_result(send)
                 {
                     let record = self.records.get_mut(&job.record).expect("workflow record");
@@ -216,8 +214,7 @@ impl Controller {
                     | Phase::VerifyPaused
                     | Phase::VerifyResumeSession
                     | Phase::VerifyResumeApplication
-                    | Phase::RefreshResumePolicy
-                    | Phase::AuthorizeResumeSnapshot => {
+                    | Phase::RefreshResumePolicy => {
                         record.fail_cleanup("lifecycle_prepare_unconfirmed");
                         reply_failure(record, replies);
                         self.finish_or_retain(job.record, now, replies);
@@ -260,14 +257,7 @@ impl Controller {
             return;
         }
         if record.resumed && record.lifecycle_session_target.is_some() {
-            if !record.desktop
-                && record.executable_path.is_some()
-                && record.frame_limiter_snapshot.is_some()
-            {
-                record.stage = Stage::AuthorizeResumeSnapshot;
-            } else {
-                advance_resume_display(record, now);
-            }
+            advance_resume_display(record, now);
             return;
         }
         if !record.desktop {
@@ -311,7 +301,6 @@ impl Controller {
         // Desktop has no catalog application or display mutation admission.
         // A synthetic snapshot lacks those attestations and RTSP rejects it.
         record.display_policy_snapshot = None;
-        record.frame_limiter_snapshot = Some(frame_limiter_launch_snapshot(record));
         record.stage = Stage::OpenRtsp;
     }
 
@@ -330,9 +319,12 @@ impl Controller {
                     SESSION_LIFECYCLE_SERVICE,
                     json!({"operation":"prepare",
                         "operation_id":format!("{}-lifecycle", record.application_operation),
-                        "application_ref":{"kind":if record.desktop {"desktop"} else {"application"},"app_id":app_id(record.request.app_id)},
+                        "application_ref":{"kind":if record.desktop {"desktop"} else {"application"},"app_id":app_id(record.request.app_id),
+                            "executable_path":record.executable_path,"properties":record.application_properties},
                         "application_operation_id":record.application_operation,
                         "owner":{"kind":"paired_client","client_ref":record.peer.client_id},
+                        "client_context":record.peer.client_id.as_ref().map(|id| json!({"client_ref":id,"properties":record.peer.client_properties,
+                            "display_mode":record.peer.client_display_mode.map(|mode| json!({"width":mode.width,"height":mode.height,"refresh_millihz":mode.refresh_millihz}))})),
                         "settings_revision":record.global_display_revision.expect("validated revision").to_string(),
                         "requested_video":{"width":record.request.width,"height":record.request.height,
                             "refresh_millihz":record.request.fps * 1000,"hdr":record.request.hdr}}),
@@ -380,11 +372,7 @@ impl Controller {
                 5_000,
             ),
             Phase::RefreshResumePolicy => (INPUT_SERVICE, json!({"action":"settings_get"}), 5_000),
-            Phase::AuthorizeResumeSnapshot => (
-                LAUNCH_SERVICE,
-                json!({"action":"authorize_stream_snapshot", "launch_id":record.application_launch, "application_operation_id":record.application_operation, "rtsp_operation_id":record.rtsp_operation, "frame_limiter_settings":record.frame_limiter_snapshot}),
-                5_000,
-            ),
+
             Phase::ReserveHistory => {
                 record.history_release_required = true;
                 (
@@ -430,14 +418,12 @@ impl Controller {
                         "legacy_global_preparation": record.legacy_global_preparation,
                         "preflight_token": record.application_preflight_token,
                         "display_admission_token": record.display_admission_token,
+                        "preparation_context": record.lifecycle_session_target,
                         "application_display_overrides": record.application_display_overrides,
                         "application_display_settings": record.application_display_settings,
                         "virtual_display_intent": record.virtual_display_intent,
                         "proton_dualsense_compatibility": record
                             .proton_dualsense_compatibility,
-                        "frame_limiter_settings": record.frame_limiter_snapshot,
-                        "client_frame_limiter_overrides":
-                            client_frame_limiter_overrides(record),
                         "return_on_admission": true,
                     }),
                     30_000,
@@ -575,8 +561,6 @@ impl Controller {
                         "nvenc_spatial_aq":record.effective_nvenc_spatial_aq,
                         "adapter_name":resolved_adapter_setting(record, "adapter_name"),
                         "adapter_pnp_id":resolved_adapter_setting(record, "adapter_pnp_id"),
-                        "frame_limiter_settings": record.executable_path.as_ref().and(record.frame_limiter_snapshot.as_ref()),
-                        "frame_limiter_executable_path": record.executable_path,
                         "display_policy_snapshot": record.display_policy_snapshot,
                         "display_request": record.display_request,
                         "application_display_settings": record.application_display_settings,
@@ -628,6 +612,7 @@ impl Controller {
             && let Some(target) = record.lifecycle_session_target.as_ref()
         {
             payload["lifecycle_session_target"] = json!(target);
+            payload["lifecycle_capture_mode"] = json!(record.lifecycle_capture_mode);
             payload["lifecycle_settings_revision"] = json!(
                 record
                     .global_display_revision
@@ -635,6 +620,8 @@ impl Controller {
                     .to_string()
             );
             payload["lifecycle_intent"] = json!(if record.resumed { "resume" } else { "initial" });
+            payload["lifecycle_client_context"] = json!(record.peer.client_id.as_ref().map(|id| json!({"client_ref":id,"properties":record.peer.client_properties,
+                "display_mode":record.peer.client_display_mode.map(|mode| json!({"width":mode.width,"height":mode.height,"refresh_millihz":mode.refresh_millihz}))})));
         }
         if matches!(phase, Phase::OpenRtsp)
             && let Some(policy) = record.video_encryption_policy
@@ -653,8 +640,7 @@ impl Controller {
         if matches!(phase, Phase::OpenRtsp)
             && (record.display_request.is_some()
                 || record.virtual_display_intent.is_some()
-                || record.application_display_settings.is_some()
-                || (record.executable_path.is_some() && record.frame_limiter_snapshot.is_some()))
+                || record.application_display_settings.is_some())
         {
             payload["application_operation_id"] = json!(record.application_operation);
             payload["app_id"] = json!(app_id(record.request.app_id));
@@ -731,7 +717,6 @@ impl Controller {
                     | Phase::VerifyResumeSession
                     | Phase::VerifyResumeApplication
                     | Phase::RefreshResumePolicy
-                    | Phase::AuthorizeResumeSnapshot
             )
         {
             record.stage = Stage::Cleanup;
@@ -766,6 +751,16 @@ impl Controller {
                     record.next_monitor = now + CLEANUP_POLL_INTERVAL;
                 } else if payload["status"] == "succeeded"
                     && let Some(target) = lifecycle_session_target(&payload)
+                    && serde_json::from_value::<
+                        amaterasu_module_sdk::extension_api::CaptureBindingMode,
+                    >(
+                        payload
+                            .get("capture_binding_mode")
+                            .cloned()
+                            .unwrap_or(json!("managed")),
+                    )
+                    .ok()
+                        == Some(record.lifecycle_capture_mode)
                 {
                     record.lifecycle_session_target = Some(target);
                     record.lifecycle_prepare_pending = false;
@@ -849,17 +844,6 @@ impl Controller {
                 }
             }
             Phase::RefreshResumePolicy => unreachable!("handled before borrowing the record"),
-            Phase::AuthorizeResumeSnapshot => {
-                if payload["ok"] == true
-                    && payload["application_operation_id"] == record.application_operation
-                    && payload["rtsp_operation_id"] == record.rtsp_operation
-                    && payload["frame_limiter_settings"] == json!(record.frame_limiter_snapshot)
-                {
-                    advance_resume_display(record, now);
-                } else {
-                    reject_resume(record, replies);
-                }
-            }
             Phase::ReserveHistory => {
                 if record.cleanup_error == Some("broker_settlement_unconfirmed") {
                     record.cleanup_error = None;
@@ -915,10 +899,9 @@ impl Controller {
                         .unwrap_or(record.global_capture_mode);
                     record.application_preflight_token = Some(token);
                     record.application_catalog_revision = Some(catalog_revision);
+                    record.application_properties = payload.get("config_overrides").cloned();
                     record.application_cleanup_budget_ms = Some(cleanup_budget_ms);
                     record.executable_path = executable_path;
-                    record.application_frame_limiter_settings =
-                        application_overrides.frame_limiter_settings();
                     record.application_preflight_overrides = Some(application_overrides);
                     record.application_display_overrides = Some(application_display_overrides(
                         payload.get("config_overrides"),
@@ -942,7 +925,6 @@ impl Controller {
                         return;
                     }
                     record.display_policy_snapshot = Some(display_policy_snapshot(record));
-                    record.frame_limiter_snapshot = Some(frame_limiter_launch_snapshot(record));
                     let frozen_overrides = record
                         .application_preflight_overrides
                         .as_ref()
@@ -1262,7 +1244,6 @@ impl Controller {
                     | Phase::VerifyResumeSession
                     | Phase::VerifyResumeApplication
                     | Phase::RefreshResumePolicy
-                    | Phase::AuthorizeResumeSnapshot
             )
         {
             record.stage = Stage::Cleanup;
@@ -1270,7 +1251,7 @@ impl Controller {
             return;
         }
         match job.phase {
-            Phase::RefreshResumePolicy | Phase::AuthorizeResumeSnapshot => {
+            Phase::RefreshResumePolicy => {
                 self.pending_resume = None;
                 reject_resume(record, replies);
             }
@@ -1386,7 +1367,6 @@ impl Controller {
                     | Phase::VerifyResumeSession
                     | Phase::VerifyResumeApplication
                     | Phase::RefreshResumePolicy
-                    | Phase::AuthorizeResumeSnapshot
             )
         {
             self.finish_or_retain(job.record, now, replies);
@@ -1395,7 +1375,6 @@ impl Controller {
         match job.phase {
             Phase::ReadLaunchEpoch
             | Phase::RefreshResumePolicy
-            | Phase::AuthorizeResumeSnapshot
             | Phase::VerifyPaused
             | Phase::VerifyResumeSession
             | Phase::VerifyResumeApplication
@@ -1609,7 +1588,6 @@ impl Phase {
             Self::VerifyResumeSession => "verify-resume-session",
             Self::VerifyResumeApplication => "verify-resume-application",
             Self::RefreshResumePolicy => "refresh-resume-policy",
-            Self::AuthorizeResumeSnapshot => "authorize-resume-snapshot",
             Self::ReserveHistory => "reserve-history",
             Self::ReadProtonPolicy => "read-proton-policy",
             Self::PreflightApplication => "preflight-launch",
@@ -1684,7 +1662,6 @@ fn needs_work(record: &Record, now: Instant) -> bool {
             | Stage::VerifyResumeSession
             | Stage::VerifyResumeApplication
             | Stage::RefreshResumePolicy
-            | Stage::AuthorizeResumeSnapshot
             | Stage::ReleasePausedHistory
             | Stage::ReleaseRejectedResumeHistory
     ) || (record.stage == Stage::Live
@@ -1776,7 +1753,6 @@ pub(super) fn next_phase(record: &Record) -> Phase {
         Stage::VerifyResumeSession => Phase::VerifyResumeSession,
         Stage::VerifyResumeApplication => Phase::VerifyResumeApplication,
         Stage::RefreshResumePolicy => Phase::RefreshResumePolicy,
-        Stage::AuthorizeResumeSnapshot => Phase::AuthorizeResumeSnapshot,
         Stage::ReleasePausedHistory => Phase::ReleaseHistory,
         Stage::ReleaseRejectedResumeHistory => Phase::ReleaseHistory,
         Stage::Live
@@ -2878,10 +2854,6 @@ fn validate_application_launch_snapshot(
     {
         return Err("application_display_policy_mismatch");
     }
-    record.application_frame_limiter_settings = application_overrides.frame_limiter_settings();
-    if record.frame_limiter_snapshot.as_ref() != payload["launch"].get("frame_limiter_settings") {
-        return Err("application_snapshot_mismatch");
-    }
     if record.executable_path.as_deref() != payload["launch"]["executable_path"].as_str() {
         return Err("application_target_mismatch");
     }
@@ -2904,7 +2876,7 @@ fn advance_after_application_ready(
 }
 
 #[derive(Clone, Default, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub(super) struct ApplicationConfigOverrides {
     fec_percentage: Option<u8>,
     max_bitrate: Option<i32>,
@@ -2951,16 +2923,10 @@ pub(super) struct ApplicationConfigOverrides {
     touchpad_as_ds4: Option<bool>,
     ds5_inputtino_randomize_mac: Option<bool>,
     proton_dualsense_compatibility: Option<bool>,
-    frame_limiter_enable: Option<bool>,
-    frame_limiter_fps_limit: Option<f64>,
-    frame_limiter_provider: Option<String>,
-    frame_limiter_disable_vsync: Option<bool>,
-    frame_limiter_auto_virtual_framegen: Option<String>,
     lossless_scaling_framegen: Option<bool>,
     lossless_scaling_target_fps: Option<u32>,
     frame_generation_provider: Option<String>,
     frame_generation_mode: Option<String>,
-    rtss_frame_limit_type: Option<String>,
     high_resolution_scrolling: Option<bool>,
     always_send_scancodes: Option<bool>,
     key_rightalt_to_key_win: Option<bool>,
@@ -2991,55 +2957,7 @@ fn resolved_virtual_sink(
         .map(str::to_owned)
 }
 
-pub(super) fn lossless_scaling_target_fps_millihz(target_fps: u32) -> Option<u32> {
-    if !(1..=1000).contains(&target_fps) {
-        return None;
-    }
-    target_fps.checked_mul(1_000)
-}
-
-impl ApplicationConfigOverrides {
-    fn game_frame_generation_mode(&self) -> Option<&'static str> {
-        if let Some(mode) = self.frame_generation_mode.as_deref() {
-            return Some(match mode {
-                "off" => "none",
-                "lossless-scaling" => "lossless-scaling",
-                "game-provided" => "game-provided",
-                "nvidia-smooth-motion" => "nvidia-smooth-motion",
-                _ => unreachable!("frame generation mode is validated during preflight"),
-            });
-        }
-
-        if let Some(provider) = self.frame_generation_provider.as_deref() {
-            return match provider {
-                "lossless-scaling" => self
-                    .lossless_scaling_framegen
-                    .map(|enabled| if enabled { "lossless-scaling" } else { "none" }),
-                "game-provided" => Some("game-provided"),
-                "nvidia-smooth-motion" => Some("nvidia-smooth-motion"),
-                _ => unreachable!("frame generation provider is validated during preflight"),
-            };
-        }
-
-        self.lossless_scaling_framegen.map(
-            |enabled| {
-                if enabled { "lossless-scaling" } else { "none" }
-            },
-        )
-    }
-
-    pub(super) fn frame_limiter_settings(&self) -> FrameLimiterSettings {
-        FrameLimiterSettings {
-            frame_limiter_enable: self.frame_limiter_enable,
-            frame_limiter_fps_limit: self.frame_limiter_fps_limit,
-            frame_limiter_provider: self.frame_limiter_provider.clone(),
-            frame_limiter_disable_vsync: self.frame_limiter_disable_vsync,
-            frame_limiter_auto_virtual_framegen: self.frame_limiter_auto_virtual_framegen.clone(),
-            rtss_frame_limit_type: self.rtss_frame_limit_type.clone(),
-            ..FrameLimiterSettings::default()
-        }
-    }
-}
+impl ApplicationConfigOverrides {}
 
 pub(super) fn application_config_overrides(
     payload: &Value,
@@ -3800,10 +3718,6 @@ pub(super) fn parse_application_config_overrides(
         || config_overrides
             .key_repeat_frequency
             .is_some_and(|frequency| !frequency.is_finite() || frequency < 0.0)
-        || config_overrides
-            .frame_limiter_settings()
-            .validate()
-            .is_err()
     {
         return Err("invalid_application_response");
     }
@@ -3879,7 +3793,10 @@ fn rtsp_response<'a>(
                             .map(|revision| revision.to_string())
                     )
                 || payload["lifecycle_intent"]
-                    != json!(if record.resumed { "resume" } else { "initial" })))
+                    != json!(if record.resumed { "resume" } else { "initial" })
+                || serde_json::from_value::<amaterasu_module_sdk::extension_api::CaptureBindingMode>(
+                    payload.get("lifecycle_capture_mode").cloned().unwrap_or(json!("managed"))
+                ).ok() != Some(record.lifecycle_capture_mode)))
         || payload["encoder"] != json!(record.selected_encoder)
         || payload["sw_preset"] != record.effective_software_encoder.effective_preset()
         || payload["sw_tune"] != record.effective_software_encoder.effective_tune()
@@ -3889,15 +3806,6 @@ fn rtsp_response<'a>(
         || payload["nvenc_spatial_aq"] != record.effective_nvenc_spatial_aq
         || payload.get("failure").is_none()
         || payload.get("cleanup_error").is_none()
-        || payload.get("frame_limiter_settings")
-            != Some(
-                record
-                    .executable_path
-                    .as_ref()
-                    .and(record.frame_limiter_snapshot.as_ref())
-                    .unwrap_or(&Value::Null),
-            )
-        || payload["frame_limiter_executable_path"].as_str() != record.executable_path.as_deref()
         || payload.get("display_policy_snapshot")
             != Some(
                 record
@@ -3965,103 +3873,6 @@ fn clean_application_terminal(record: &Record, payload: &Value) -> bool {
     application_response(record, payload).is_ok_and(|(_, state, healthy)| {
         healthy && matches!(state, "stopped" | "cancelled" | "failed")
     }) && payload["cleanup_error"].is_null()
-}
-
-pub(super) fn frame_limiter_launch_snapshot(record: &Record) -> Value {
-    let settings = resolve_frame_limiter_settings(
-        &record.global_frame_limiter_settings,
-        &record.application_frame_limiter_settings,
-        &record.client_frame_limiter_settings,
-    );
-    let requested_stream_fps_millihz = record
-        .request
-        .fps
-        .checked_mul(1_000)
-        .filter(|rate| *rate <= 1_000_000)
-        .expect("admitted stream FPS must fit the frame-limiter service range");
-    let explicit_rtss_override = record
-        .client_frame_limiter_settings
-        .rtss_frame_limit_type
-        .is_some()
-        || record
-            .application_frame_limiter_settings
-            .rtss_frame_limit_type
-            .is_some();
-    let game_frame_generation_mode = record
-        .application_preflight_overrides
-        .as_ref()
-        .map(ApplicationConfigOverrides::game_frame_generation_mode)
-        .unwrap_or(None);
-    let lossless_scaling_limit_millihz = if game_frame_generation_mode == Some("lossless-scaling") {
-        match record
-            .application_preflight_overrides
-            .as_ref()
-            .and_then(|application| application.lossless_scaling_target_fps)
-        {
-            Some(target_fps) => lossless_scaling_target_fps_millihz(target_fps),
-            None => Some(requested_stream_fps_millihz),
-        }
-    } else {
-        None
-    };
-
-    json!({
-        "version":1,
-        "settings":settings.effective(),
-        "requested_stream_fps_millihz":requested_stream_fps_millihz,
-        "client_display_mode_override_millihz":record.peer.client_display_mode.map(|mode| mode.refresh_millihz),
-        "lossless_scaling_limit_millihz":lossless_scaling_limit_millihz,
-        "virtual_display_active":null,
-        "physical_framegen_capture":null,
-        "game_frame_generation_mode":game_frame_generation_mode,
-        "rtss_frame_limit_type_explicit_override":explicit_rtss_override.then_some(true)
-    })
-}
-
-pub(super) fn resolve_frame_limiter_settings(
-    global: &FrameLimiterSettings,
-    application: &FrameLimiterSettings,
-    client: &FrameLimiterSettings,
-) -> FrameLimiterSettings {
-    let mut settings = global.clone();
-    settings.frame_limiter_enable = client
-        .frame_limiter_enable
-        .or(application.frame_limiter_enable)
-        .or(settings.frame_limiter_enable);
-    settings.frame_limiter_fps_limit = client
-        .frame_limiter_fps_limit
-        .or(application.frame_limiter_fps_limit)
-        .or(settings.frame_limiter_fps_limit);
-    settings.frame_limiter_provider = client
-        .frame_limiter_provider
-        .clone()
-        .or(application.frame_limiter_provider.clone())
-        .or(settings.frame_limiter_provider);
-    settings.frame_limiter_disable_vsync = client
-        .frame_limiter_disable_vsync
-        .or(application.frame_limiter_disable_vsync)
-        .or(settings.frame_limiter_disable_vsync);
-    settings.frame_limiter_auto_virtual_framegen = client
-        .frame_limiter_auto_virtual_framegen
-        .clone()
-        .or(application.frame_limiter_auto_virtual_framegen.clone())
-        .or(settings.frame_limiter_auto_virtual_framegen);
-    settings.rtss_frame_limit_type = client
-        .rtss_frame_limit_type
-        .clone()
-        .or(application.rtss_frame_limit_type.clone())
-        .or(settings.rtss_frame_limit_type);
-    settings
-}
-
-fn client_frame_limiter_overrides(record: &Record) -> Value {
-    let mut overrides = serde_json::to_value(&record.client_frame_limiter_settings)
-        .expect("client frame-limiter overrides serialize");
-    overrides
-        .as_object_mut()
-        .expect("client frame-limiter overrides serialize to an object")
-        .retain(|_, value| !value.is_null());
-    overrides
 }
 
 fn take_job(job: &mut Job) -> Job {

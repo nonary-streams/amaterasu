@@ -314,13 +314,16 @@ fn sparse_fec_override_is_typed_defaulted_and_persisted_with_the_entry() {
     }))
     .unwrap();
     assert!(invalid_percentage.validate().is_err());
-    assert!(
-        serde_json::from_value::<Entry>(json!({
-            "name":"Invalid entry",
-            "launch":{"kind":"executable","program":"/games/invalid"},
-            "config_overrides":{"fec_percentage":30,"unknown_key":1}
-        }))
-        .is_err()
+    let opaque: Entry = serde_json::from_value(json!({
+        "name":"Entry with provider options",
+        "launch":{"kind":"executable","program":"/games/valid"},
+        "config_overrides":{"fec_percentage":30,"unknown_key":1}
+    }))
+    .unwrap();
+    opaque.validate().unwrap();
+    assert_eq!(
+        serde_json::to_value(opaque).unwrap()["config_overrides"]["unknown_key"],
+        1
     );
 }
 
@@ -771,125 +774,6 @@ fn preparation_defaults_serialize_as_canonical_metadata() {
 
     let unprepared = serde_json::to_value(entry("Unprepared game")).unwrap();
     assert!(unprepared["launch"].get("preparation").is_none());
-}
-
-#[test]
-fn frame_limiter_overrides_are_sparse_normalized_and_platform_validated() {
-    let missing: Entry = serde_json::from_value(json!({
-        "name":"Inherited limiter settings",
-        "launch":{"kind":"executable","program":"/games/inherited"}
-    }))
-    .unwrap();
-    assert!(missing.config_overrides.is_empty());
-
-    let null_values: Entry = serde_json::from_value(json!({
-        "name":"Null limiter settings",
-        "launch":{"kind":"executable","program":"/games/null"},
-        "config_overrides":{
-            "frame_limiter_enable":null,
-            "frame_limiter_fps_limit":null,
-            "frame_limiter_provider":null,
-            "frame_limiter_disable_vsync":null,
-            "frame_limiter_auto_virtual_framegen":null,
-            "rtss_frame_limit_type":null,
-            "ds4_back_as_touchpad_click":null
-        }
-    }))
-    .unwrap();
-    assert!(null_values.config_overrides.is_empty());
-    assert_eq!(
-        serde_json::to_value(null_values).unwrap()["config_overrides"],
-        json!(null)
-    );
-
-    let mut configured: Entry = serde_json::from_value(json!({
-        "name":"Configured limiter settings",
-        "launch":{"kind":"executable","program":"/games/configured"},
-        "config_overrides":{
-            "frame_limiter_enable":false,
-            "frame_limiter_fps_limit":0.0,
-            "frame_limiter_provider":"auto",
-            "frame_limiter_disable_vsync":false,
-            "frame_limiter_auto_virtual_framegen":true,
-            "ds4_back_as_touchpad_click":false
-        }
-    }))
-    .unwrap();
-    configured.validate().unwrap();
-    assert_eq!(
-        configured
-            .config_overrides
-            .frame_limiter_auto_virtual_framegen
-            .as_deref(),
-        Some("enabled")
-    );
-    let persisted = serde_json::to_value(&configured).unwrap();
-    assert_eq!(
-        persisted["config_overrides"],
-        json!({
-            "frame_limiter_enable":false,
-            "frame_limiter_fps_limit":0.0,
-            "frame_limiter_provider":"auto",
-            "frame_limiter_disable_vsync":false,
-            "frame_limiter_auto_virtual_framegen":"enabled",
-            "ds4_back_as_touchpad_click":false
-        })
-    );
-
-    for fps_limit in [0.0, 1.234, 1000.0] {
-        configured.config_overrides.frame_limiter_fps_limit = Some(fps_limit);
-        configured.validate().unwrap();
-    }
-    for fps_limit in [-0.001, 1.2345, 1000.001, f64::NAN, f64::INFINITY] {
-        configured.config_overrides.frame_limiter_fps_limit = Some(fps_limit);
-        assert!(configured.validate().is_err());
-    }
-
-    let platform_provider = if cfg!(windows) {
-        "nvidia-control-panel"
-    } else if cfg!(target_os = "linux") {
-        "proton"
-    } else {
-        "auto"
-    };
-    configured.config_overrides.frame_limiter_fps_limit = Some(60.0);
-    configured.config_overrides.frame_limiter_provider = Some(platform_provider.into());
-    configured.validate().unwrap();
-    configured.config_overrides.frame_limiter_provider = Some("unsupported".into());
-    assert!(configured.validate().is_err());
-
-    for (legacy, canonical) in [
-        (json!(true), "enabled"),
-        (json!(false), "disabled"),
-        (json!("true"), "enabled"),
-        (json!("false"), "disabled"),
-    ] {
-        let parsed: Entry = serde_json::from_value(json!({
-            "name":"Normalized virtual frame generation",
-            "launch":{"kind":"executable","program":"/games/configured"},
-            "config_overrides":{"frame_limiter_auto_virtual_framegen":legacy}
-        }))
-        .unwrap();
-        assert_eq!(
-            parsed
-                .config_overrides
-                .frame_limiter_auto_virtual_framegen
-                .as_deref(),
-            Some(canonical)
-        );
-    }
-    assert!(
-        serde_json::from_value::<Entry>(json!({
-            "name":"Invalid virtual frame generation",
-            "launch":{"kind":"executable","program":"/games/configured"},
-            "config_overrides":{"frame_limiter_auto_virtual_framegen":"true-ish"}
-        }))
-        .is_err()
-    );
-
-    configured.config_overrides.rtss_frame_limit_type = Some("nvidia reflex".into());
-    configured.config_overrides.frame_limiter_provider = Some(platform_provider.into());
-    assert_eq!(configured.validate().is_ok(), cfg!(windows));
 }
 
 #[test]

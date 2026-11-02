@@ -42,6 +42,43 @@ pub struct ApiRequestOptions<'a> {
 }
 
 impl RuntimeClient {
+    /// Read agreed preparation constraints for this consumer's admitted launch.
+    /// The coordinator checks its explicit read grant and the launch owner and
+    /// operation binding; returned plans do not grant new mutation authority.
+    pub fn request_prepared_plans(
+        &self,
+        options: RequestOptions<'_>,
+        target: crate::extension_api::LifecycleTarget,
+        owner: &str,
+        application_operation_id: &str,
+    ) -> ModuleResult<u64> {
+        self.request_serialized(
+            options,
+            &crate::extension_api::PreparedPlansRequest {
+                operation: "read_prepared_plans".into(),
+                target,
+                owner: owner.into(),
+                application_operation_id: application_operation_id.into(),
+            },
+        )
+    }
+    /// Queue a read of the generic context for a dispatched lifecycle
+    /// operation while its transition remains pending. The caller needs a broker grant, and the
+    /// coordinator still authenticates the exact provider request.
+    pub fn request_provider_context(
+        &self,
+        options: RequestOptions<'_>,
+        provider_request: &crate::extension_api::ProviderRequest,
+    ) -> ModuleResult<u64> {
+        self.request_serialized(
+            options,
+            &crate::extension_api::ProviderContextRequest {
+                operation: "read_provider_context".into(),
+                provider_request: provider_request.clone(),
+            },
+        )
+    }
+
     /// Queue serialized work. Acceptance is not confirmation of its effect.
     pub fn request_serialized<T: Serialize>(
         &self,

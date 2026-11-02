@@ -9,6 +9,9 @@ pub(super) struct ResumeSnapshot {
 
 impl ResumeSnapshot {
     pub(super) fn legacy_display_conflict(&self) -> bool {
+        if self.stream.lifecycle_capture_mode.is_external() {
+            return false;
+        }
         self.stream.virtual_display_intent.is_some()
             || self
                 .stream
@@ -75,8 +78,6 @@ impl ResumeSnapshot {
             controller.configured_virtual_sink.clone(),
             controller.global_preparation.clone(),
             controller.legacy_global_preparation.clone(),
-            controller.global_frame_limiter_settings.clone(),
-            peer.client_frame_limiter_settings.clone(),
             controller.global_ping_timeout_ms,
             controller.global_video_max_batch_size_kb,
             controller.global_max_bitrate_kbps,
@@ -98,6 +99,7 @@ impl ResumeSnapshot {
         stream.requested_capture_output = output;
         stream.encoder_snapshot = controller.encoder_snapshot.clone();
         stream.selected_encoder = config.capture.encoder.clone();
+        stream.lifecycle_capture_mode = retained.lifecycle_capture_mode;
         stream.global_software_encoder = controller.software_encoder.clone();
         stream.global_nvenc_settings = controller.nvenc_settings.clone();
         stream.global_nvenc_spatial_aq = controller.nvenc_spatial_aq;
@@ -105,8 +107,6 @@ impl ResumeSnapshot {
         stream.global_display_policy = controller.global_display_policy.clone();
         stream.global_proton_dualsense_compatibility = Some(global_proton_dualsense_compatibility);
         stream.application_preflight_overrides = retained.application_preflight_overrides.clone();
-        stream.application_frame_limiter_settings =
-            retained.application_frame_limiter_settings.clone();
         stream.application_display_overrides = retained.application_display_overrides.clone();
         stream.application_display_settings = retained.application_display_settings.clone();
         stream.application_catalog_revision = retained.application_catalog_revision;
@@ -129,7 +129,6 @@ impl ResumeSnapshot {
         } else {
             Some(workflow::display_policy_snapshot(&stream))
         };
-        stream.frame_limiter_snapshot = Some(workflow::frame_limiter_launch_snapshot(&stream));
         Ok(Self { stream })
     }
 
@@ -150,13 +149,10 @@ impl ResumeSnapshot {
             global_audio_sink_capture_only,
             global_configured_audio_sink,
             global_configured_virtual_sink,
-            global_frame_limiter_settings,
-            client_frame_limiter_settings,
             global_display_revision,
             global_display_policy,
             display_policy_snapshot,
             virtual_display_intent,
-            frame_limiter_snapshot,
             resolved_virtual_sink,
             capture_sink_without_routing,
             scoped_back_button_timeout,
@@ -257,10 +253,7 @@ mod tests {
         assert_eq!(retained.request.width, 1280);
         assert_eq!(retained.physical_display_mode.width, 1280);
         assert_eq!(retained.physical_display_mode.refresh_millihz, 30_000);
-        assert_eq!(
-            retained.frame_limiter_snapshot.as_ref().unwrap()["requested_stream_fps_millihz"],
-            30_000
-        );
+
         assert_eq!(retained.global_display_revision, Some(8));
         assert_eq!(retained.effective_qp, 22);
         assert_eq!(retained.application_operation, application_operation);

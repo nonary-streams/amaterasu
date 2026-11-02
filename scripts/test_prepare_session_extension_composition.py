@@ -71,7 +71,7 @@ class PrepareCompositionTest(unittest.TestCase):
                                "report": {"artifact_sha256": hashlib.sha256(content).hexdigest()}})
             root, package = directory / "root", directory / "package"
             calls = []
-            identities = [legacy.NVHTTP, legacy.RTSP, legacy.STREAM, legacy.INPUT, legacy.MANAGEMENT, legacy.CONSOLE]
+            identities = [legacy.NVHTTP, legacy.RTSP, legacy.STREAM, legacy.INPUT, legacy.MANAGEMENT, legacy.CONSOLE, legacy.LAUNCH]
             def run(*arguments):
                 calls.append(arguments)
                 if arguments[1] == "init-linux-session":

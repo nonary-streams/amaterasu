@@ -52,14 +52,13 @@ pub enum Operation {
         preflight_token: Option<String>,
         #[serde(default)]
         display_admission_token: Option<String>,
+        /// Session context established by the selected lifecycle coordinator.
+        #[serde(default)]
+        preparation_context: Option<amaterasu_module_sdk::extension_api::LifecycleTarget>,
         #[serde(default)]
         global_preparation: Vec<PreparationStep>,
         #[serde(default)]
         legacy_global_preparation: Vec<LegacyPreparationCommand>,
-        #[serde(default)]
-        frame_limiter_settings: Option<BTreeMap<String, Value>>,
-        #[serde(default)]
-        client_frame_limiter_overrides: Option<BTreeMap<String, Value>>,
         #[serde(default)]
         application_display_overrides: Option<BTreeMap<String, Value>>,
         #[serde(default)]
@@ -96,21 +95,6 @@ pub enum Operation {
         display_policy_snapshot: Value,
         certificate_id: String,
         catalog_revision: u64,
-    },
-    VerifyFrameLimiterSnapshot {
-        application_operation_id: String,
-        #[serde(default)]
-        rtsp_operation_id: Option<String>,
-        app_id: String,
-        catalog_revision: u64,
-        frame_limiter_settings: BTreeMap<String, Value>,
-        frame_limiter_executable_path: String,
-    },
-    AuthorizeStreamSnapshot {
-        launch_id: u64,
-        application_operation_id: String,
-        rtsp_operation_id: String,
-        frame_limiter_settings: BTreeMap<String, Value>,
     },
     Lookup {
         operation_id: String,
@@ -180,30 +164,7 @@ impl Operation {
             {
                 return Err("invalid_request");
             }
-            Self::VerifyFrameLimiterSnapshot {
-                application_operation_id,
-                app_id,
-                rtsp_operation_id,
-                ..
-            } if !valid_operation_id(application_operation_id)
-                || !valid_app_id(app_id)
-                || rtsp_operation_id
-                    .as_ref()
-                    .is_some_and(|id| !valid_operation_id(id)) =>
-            {
-                return Err("invalid_request");
-            }
-            Self::AuthorizeStreamSnapshot {
-                launch_id,
-                application_operation_id,
-                rtsp_operation_id,
-                ..
-            } if *launch_id == 0
-                || !valid_operation_id(application_operation_id)
-                || !valid_operation_id(rtsp_operation_id) =>
-            {
-                return Err("invalid_request");
-            }
+
             Self::PrepareDisplayAdmission {
                 application_operation_id,
                 global_revision: _,
@@ -1460,7 +1421,6 @@ impl Executable {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct ApplicationConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sw_preset: Option<String>,
@@ -1527,20 +1487,6 @@ pub struct ApplicationConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_repeat_frequency: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frame_limiter_enable: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frame_limiter_fps_limit: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frame_limiter_provider: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frame_limiter_disable_vsync: Option<bool>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_auto_virtual_framegen"
-    )]
-    pub frame_limiter_auto_virtual_framegen: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lossless_scaling_framegen: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lossless_scaling_target_fps: Option<u32>,
@@ -1548,8 +1494,6 @@ pub struct ApplicationConfigOverrides {
     pub frame_generation_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_generation_mode: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rtss_frame_limit_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ds4_back_as_touchpad_click: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1560,35 +1504,14 @@ pub struct ApplicationConfigOverrides {
     pub ds5_inputtino_randomize_mac: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proton_dualsense_compatibility: Option<bool>,
-}
-
-fn deserialize_auto_virtual_framegen<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<Value>::deserialize(deserializer)?;
-    match value {
-        None => Ok(None),
-        Some(Value::Bool(enabled)) => Ok(Some(if enabled {
-            "enabled".into()
-        } else {
-            "disabled".into()
-        })),
-        Some(Value::String(value)) if value == "true" => Ok(Some("enabled".into())),
-        Some(Value::String(value)) if value == "false" => Ok(Some("disabled".into())),
-        Some(Value::String(value))
-            if matches!(value.as_str(), "enabled" | "vrr" | "legacy" | "disabled") =>
-        {
-            Ok(Some(value))
-        }
-        _ => Err(serde::de::Error::custom(
-            "frame_limiter_auto_virtual_framegen has an invalid mode",
-        )),
-    }
+    /// Opaque values owned by providers outside this consumer's schema.
+    #[serde(default, flatten)]
+    pub retained_options: serde_json::Map<String, serde_json::Value>,
 }
 
 impl ApplicationConfigOverrides {
     pub fn validate(&self) -> Result<(), &'static str> {
+        amaterasu_module_sdk::retained_options::validate(&self.retained_options)?;
         amaterasu_module_sdk::validate_software_options(
             self.sw_preset.as_deref(),
             self.sw_tune.as_deref(),
@@ -1613,30 +1536,6 @@ impl ApplicationConfigOverrides {
             .minimum_fps_target
             .is_some_and(|target| !target.is_finite() || !(0.0..=1000.0).contains(&target))
             || self.video_max_batch_size_kb.is_some_and(|size| size > 64)
-        {
-            return Err("invalid_catalog_response");
-        }
-        if self
-            .frame_limiter_fps_limit
-            .is_some_and(|limit| !valid_millihertz_value(limit))
-            || self
-                .frame_limiter_provider
-                .as_deref()
-                .is_some_and(|provider| !valid_frame_limiter_provider(provider))
-            || self
-                .frame_limiter_auto_virtual_framegen
-                .as_deref()
-                .is_some_and(|mode| !matches!(mode, "enabled" | "vrr" | "legacy" | "disabled"))
-            || self
-                .rtss_frame_limit_type
-                .as_deref()
-                .is_some_and(|limit_type| {
-                    !cfg!(windows)
-                        || !matches!(
-                            limit_type,
-                            "async" | "front edge sync" | "back edge sync" | "nvidia reflex"
-                        )
-                })
         {
             return Err("invalid_catalog_response");
         }
@@ -1690,7 +1589,8 @@ impl ApplicationConfigOverrides {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.sw_preset.is_none()
+        self.retained_options.is_empty()
+            && self.sw_preset.is_none()
             && self.sw_tune.is_none()
             && self.encoder.is_none()
             && self.fec_percentage.is_none()
@@ -1722,16 +1622,10 @@ impl ApplicationConfigOverrides {
             && self.keybindings.is_none()
             && self.key_repeat_delay.is_none()
             && self.key_repeat_frequency.is_none()
-            && self.frame_limiter_enable.is_none()
-            && self.frame_limiter_fps_limit.is_none()
-            && self.frame_limiter_provider.is_none()
-            && self.frame_limiter_disable_vsync.is_none()
-            && self.frame_limiter_auto_virtual_framegen.is_none()
             && self.lossless_scaling_framegen.is_none()
             && self.lossless_scaling_target_fps.is_none()
             && self.frame_generation_provider.is_none()
             && self.frame_generation_mode.is_none()
-            && self.rtss_frame_limit_type.is_none()
             && self.ds4_back_as_touchpad_click.is_none()
             && self.motion_as_ds4.is_none()
             && self.touchpad_as_ds4.is_none()
@@ -1968,37 +1862,6 @@ fn valid_manual_refresh_rate(value: &str) -> bool {
             .is_some_and(|combined| u32::try_from(combined).is_ok())
 }
 
-fn valid_millihertz_value(value: f64) -> bool {
-    if !value.is_finite() || !(0.0..=1000.0).contains(&value) {
-        return false;
-    }
-    let millihertz = value * 1000.0;
-    let rounding_tolerance = f64::EPSILON * millihertz.abs().max(1.0) * 4.0;
-    (millihertz - millihertz.round()).abs() <= rounding_tolerance
-}
-
-fn valid_frame_limiter_provider(provider: &str) -> bool {
-    #[cfg(windows)]
-    {
-        matches!(provider, "auto" | "rtss" | "nvidia-control-panel" | "none")
-    }
-    #[cfg(target_os = "linux")]
-    {
-        matches!(
-            provider,
-            "auto" | "mangohud" | "proton" | "mangohud-proton" | "none"
-        )
-    }
-    #[cfg(target_os = "macos")]
-    {
-        provider == "auto"
-    }
-    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-    {
-        provider == "auto"
-    }
-}
-
 fn valid_gamepad_profile(profile: &str) -> bool {
     #[cfg(windows)]
     {
@@ -2142,6 +2005,8 @@ pub struct Settings {
     pub retirement_observers: BTreeSet<String>,
     pub provider_routes: BTreeMap<String, ProviderRoute>,
     pub library_routes: BTreeMap<String, crate::library::Route>,
+    /// Trusted startup selection; callers cannot substitute the context provider.
+    pub prepared_context_service: Option<String>,
 }
 impl Settings {
     pub fn resolved_environment(
@@ -2165,6 +2030,17 @@ impl Settings {
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self
+            .prepared_context_service
+            .as_ref()
+            .is_some_and(|service| {
+                service
+                    .strip_suffix("/1")
+                    .is_none_or(|name| !valid_catalog_principal(name))
+            })
+        {
+            return Err("invalid_launch_settings");
+        }
         crate::library::validate_routes(&self.library_routes)?;
         if self.retirement_observers.len() > 32
             || self
@@ -2322,6 +2198,20 @@ fn valid_configured_command(command: &ConfiguredCommand) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plugin_policy_cannot_be_submitted_through_legacy_launch_fields() {
+        for field in ["frame_limiter_settings", "client_frame_limiter_overrides"] {
+            let mut request = serde_json::json!({"action":"launch_export","operation_id":"launch","app_id":"app-0000000000000001"});
+            request[field] = serde_json::json!({});
+            assert!(serde_json::from_value::<Operation>(request).is_err());
+        }
+        for action in ["verify_frame_limiter_snapshot", "authorize_stream_snapshot"] {
+            assert!(
+                serde_json::from_value::<Operation>(serde_json::json!({"action":action})).is_err()
+            );
+        }
+    }
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -2944,189 +2834,6 @@ mod tests {
                 "accepted non-boolean NVENC spatial AQ value {invalid}"
             );
         }
-    }
-
-    #[test]
-    fn frame_limiter_overrides_preserve_sparse_values_and_validate_contract_domains() {
-        let inherited = ApplicationConfigOverrides::default();
-        assert!(inherited.is_empty());
-        let null_values: ApplicationConfigOverrides = serde_json::from_value(json!({
-            "frame_limiter_enable":null,
-            "frame_limiter_fps_limit":null,
-            "frame_limiter_provider":null,
-            "frame_limiter_disable_vsync":null,
-            "frame_limiter_auto_virtual_framegen":null,
-            "lossless_scaling_framegen":null,
-            "lossless_scaling_target_fps":null,
-            "frame_generation_provider":null,
-            "frame_generation_mode":null,
-            "rtss_frame_limit_type":null,
-            "ds4_back_as_touchpad_click":null,
-        }))
-        .unwrap();
-        assert!(null_values.is_empty());
-        assert_eq!(serde_json::to_value(null_values).unwrap(), json!({}));
-
-        let configured: ApplicationConfigOverrides = serde_json::from_value(json!({
-            "frame_limiter_enable":false,
-            "frame_limiter_fps_limit":0,
-            "frame_limiter_provider":"auto",
-            "frame_limiter_disable_vsync":false,
-            "frame_limiter_auto_virtual_framegen":true,
-            "lossless_scaling_framegen":false,
-            "lossless_scaling_target_fps":60,
-            "frame_generation_provider":"game-provided",
-            "frame_generation_mode":"nvidia-smooth-motion",
-            "ds4_back_as_touchpad_click":false,
-        }))
-        .unwrap();
-        configured.validate().unwrap();
-        assert_eq!(configured.frame_limiter_enable, Some(false));
-        assert_eq!(configured.frame_limiter_fps_limit, Some(0.0));
-        assert_eq!(configured.frame_limiter_provider.as_deref(), Some("auto"));
-        assert_eq!(configured.frame_limiter_disable_vsync, Some(false));
-        assert_eq!(
-            configured.frame_limiter_auto_virtual_framegen.as_deref(),
-            Some("enabled")
-        );
-        assert_eq!(configured.lossless_scaling_framegen, Some(false));
-        assert_eq!(configured.lossless_scaling_target_fps, Some(60));
-        assert_eq!(
-            configured.frame_generation_provider.as_deref(),
-            Some("game-provided")
-        );
-        assert_eq!(
-            configured.frame_generation_mode.as_deref(),
-            Some("nvidia-smooth-motion")
-        );
-        assert_eq!(configured.ds4_back_as_touchpad_click, Some(false));
-        assert_eq!(
-            serde_json::to_value(configured).unwrap(),
-            json!({
-                "frame_limiter_enable":false,
-                "frame_limiter_fps_limit":0.0,
-                "frame_limiter_provider":"auto",
-                "frame_limiter_disable_vsync":false,
-                "frame_limiter_auto_virtual_framegen":"enabled",
-                "lossless_scaling_framegen":false,
-                "lossless_scaling_target_fps":60,
-                "frame_generation_provider":"game-provided",
-                "frame_generation_mode":"nvidia-smooth-motion",
-                "ds4_back_as_touchpad_click":false,
-            })
-        );
-
-        let enabled: ApplicationConfigOverrides = serde_json::from_value(json!({
-            "lossless_scaling_framegen":true
-        }))
-        .unwrap();
-        enabled.validate().unwrap();
-        assert_eq!(enabled.lossless_scaling_framegen, Some(true));
-        assert!(!enabled.is_empty());
-        assert_eq!(
-            serde_json::to_value(enabled).unwrap(),
-            json!({"lossless_scaling_framegen":true})
-        );
-
-        for invalid in [json!("true"), json!(0)] {
-            assert!(
-                serde_json::from_value::<ApplicationConfigOverrides>(json!({
-                    "lossless_scaling_framegen":invalid
-                }))
-                .is_err(),
-                "accepted non-boolean Lossless Scaling frame generation value {invalid}"
-            );
-        }
-
-        for (field, invalid) in [
-            ("frame_generation_provider", json!("unknown")),
-            ("frame_generation_provider", json!(false)),
-            ("frame_generation_mode", json!("disabled")),
-            ("frame_generation_mode", json!(0)),
-        ] {
-            let parsed =
-                serde_json::from_value::<ApplicationConfigOverrides>(json!({(field):invalid}));
-            assert!(
-                parsed.is_err() || parsed.unwrap().validate().is_err(),
-                "accepted invalid {field} value {invalid}"
-            );
-        }
-
-        for fps_limit in [0.0, 1.234, 1000.0] {
-            ApplicationConfigOverrides {
-                frame_limiter_fps_limit: Some(fps_limit),
-                ..ApplicationConfigOverrides::default()
-            }
-            .validate()
-            .unwrap();
-        }
-        for target_fps in [0, 1001] {
-            assert!(
-                ApplicationConfigOverrides {
-                    lossless_scaling_target_fps: Some(target_fps),
-                    ..ApplicationConfigOverrides::default()
-                }
-                .validate()
-                .is_err()
-            );
-        }
-        for fps_limit in [-0.001, 1.2345, 1000.001, f64::NAN, f64::INFINITY] {
-            assert_eq!(
-                ApplicationConfigOverrides {
-                    frame_limiter_fps_limit: Some(fps_limit),
-                    ..ApplicationConfigOverrides::default()
-                }
-                .validate(),
-                Err("invalid_catalog_response")
-            );
-        }
-        for mode in ["true", "false", "enabled", "vrr", "legacy", "disabled"] {
-            let parsed: ApplicationConfigOverrides = serde_json::from_value(json!({
-                "frame_limiter_auto_virtual_framegen":mode
-            }))
-            .unwrap();
-            parsed.validate().unwrap();
-        }
-        assert!(
-            serde_json::from_value::<ApplicationConfigOverrides>(json!({
-                "frame_limiter_auto_virtual_framegen":"invalid"
-            }))
-            .is_err()
-        );
-
-        let valid_provider = if cfg!(windows) {
-            "rtss"
-        } else if cfg!(target_os = "linux") {
-            "mangohud-proton"
-        } else {
-            "auto"
-        };
-        ApplicationConfigOverrides {
-            frame_limiter_provider: Some(valid_provider.into()),
-            ..ApplicationConfigOverrides::default()
-        }
-        .validate()
-        .unwrap();
-        assert_eq!(
-            ApplicationConfigOverrides {
-                frame_limiter_provider: Some("unsupported".into()),
-                ..ApplicationConfigOverrides::default()
-            }
-            .validate(),
-            Err("invalid_catalog_response")
-        );
-        assert_eq!(
-            ApplicationConfigOverrides {
-                rtss_frame_limit_type: Some("nvidia reflex".into()),
-                ..ApplicationConfigOverrides::default()
-            }
-            .validate(),
-            if cfg!(windows) {
-                Ok(())
-            } else {
-                Err("invalid_catalog_response")
-            }
-        );
     }
 
     #[test]
@@ -4264,5 +3971,24 @@ mod keybindings_override_tests {
                 .validate()
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod retained_option_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn provider_options_round_trip_without_consumer_policy() {
+        let raw = json!({"vendor_option":{"enabled":false,"rate":0,"optional":null},
+            "frame_limiter_enable":false,"frame_limiter_fps_limit":0});
+        let options: ApplicationConfigOverrides = serde_json::from_value(raw.clone()).unwrap();
+        options.validate().unwrap();
+        assert!(!options.is_empty());
+        assert_eq!(serde_json::to_value(options).unwrap(), raw);
+        let oversized = json!({"vendor_option":"x".repeat(65_536)});
+        let options: ApplicationConfigOverrides = serde_json::from_value(oversized).unwrap();
+        assert!(options.validate().is_err());
     }
 }
