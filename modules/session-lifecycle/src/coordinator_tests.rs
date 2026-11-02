@@ -1,4 +1,6 @@
 use super::*;
+#[path = "coordinator/idle_tests.rs"]
+mod idle;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);

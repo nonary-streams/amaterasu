@@ -2234,35 +2234,34 @@ impl Coordinator {
     }
 
     fn complete_retirement_waiters(&self) -> ModuleResult<()> {
-        let mut next = self.shared.borrow().value.clone();
-        let mut changed = false;
-        let keys: Vec<_> = next
-            .receipts
-            .iter()
-            .filter_map(|(key, r)| {
-                r.wait_target
-                    .as_ref()
-                    .map(|target| (key.clone(), target.clone()))
-            })
-            .collect();
-        for (key, target) in keys {
-            let (_, session, stream, _) = super::operations::target_parts(&target)?;
-            if next
+        let shared = self.shared.borrow();
+        let journal = &shared.value;
+        let mut keys = Vec::new();
+        for (key, receipt) in &journal.receipts {
+            let Some(target) = &receipt.wait_target else {
+                continue;
+            };
+            let (_, session, stream, _) = super::operations::target_parts(target)?;
+            if journal
                 .sessions
                 .get(session)
-                .and_then(|s| s.streams.get(stream?))
-                .is_some_and(|s| s.phase == StreamPhase::Retired)
+                .and_then(|session| session.streams.get(stream?))
+                .is_some_and(|stream| stream.phase == StreamPhase::Retired)
             {
-                let receipt = next.receipts.get_mut(&key).unwrap();
-                receipt.wait_target = None;
-                receipt.response["status"] = json!("succeeded");
-                changed = true;
+                keys.push(key.clone());
             }
         }
-        if changed {
-            save(&self.shared, next)?;
+        if keys.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let mut next = journal.clone();
+        drop(shared);
+        for key in keys {
+            let receipt = next.receipts.get_mut(&key).unwrap();
+            receipt.wait_target = None;
+            receipt.response["status"] = json!("succeeded");
+        }
+        save(&self.shared, next)
     }
 
     fn finish_participant(

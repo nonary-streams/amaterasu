@@ -2217,6 +2217,10 @@ pub(in crate::coordinator) mod tests {
         save(&scheduler.shared, journal.clone()).unwrap();
         let before = serde_json::to_value(&scheduler.shared.borrow().value).unwrap();
         assert!(!scheduler.retire_ended_sessions_if_idle().unwrap());
+        // An unsuccessful closure scan must stay idle until new evidence is
+        // durably published. A later save must still permit retirement.
+        assert!(!scheduler.shared.borrow().retirement_scan_pending);
+        assert!(!scheduler.retire_ended_sessions_if_idle().unwrap());
         assert_eq!(
             serde_json::to_value(&scheduler.shared.borrow().value).unwrap(),
             before

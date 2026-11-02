@@ -562,6 +562,9 @@ impl Journal {
 struct SharedJournal {
     store: LifecycleStore,
     value: Journal,
+    // Closure eligibility depends on durable state. Recheck after a successful
+    // replacement, rather than cloning and validating history on every tick.
+    retirement_scan_pending: bool,
 }
 type Shared = Rc<RefCell<SharedJournal>>;
 
@@ -587,6 +590,7 @@ fn save(shared: &Shared, mut next: Journal) -> ModuleResult<()> {
         .replace(&next)
         .map_err(|_| "journal_write_failed".to_owned())?;
     shared.value = next;
+    shared.retirement_scan_pending = true;
     Ok(())
 }
 fn validate_journal(journal: &Journal) -> io::Result<()> {
@@ -1172,6 +1176,7 @@ impl Coordinator {
             shared: Rc::new(RefCell::new(SharedJournal {
                 store,
                 value: journal,
+                retirement_scan_pending: true,
             })),
             settings: LifecycleSettings::default(),
             configured: false,
@@ -1315,45 +1320,48 @@ impl Coordinator {
             }
             return rejection("operation_id_conflict");
         }
-        let journal = self.shared.borrow().value.clone();
-        if let Some(response) = journal
-            .ended_session_history
-            .end_response(&journal, &key, &payload)
         {
-            return response;
-        }
-        if retention::expired(&journal, &key) {
-            return rejection("receipt_expired");
-        }
-        if operation == "lookup" {
-            if let Some(source) = journal.recovery_sources.get(&key)
-                && let Some(original) = journal.receipts.get(source)
+            let shared = self.shared.borrow();
+            let journal = &shared.value;
+            if let Some(response) = journal
+                .ended_session_history
+                .end_response(journal, &key, &payload)
             {
-                let mut response = original.response.clone();
-                response["operation_id"] = json!(id);
-                response["original_operation_id"] = original.request["operation_id"].clone();
                 return response;
             }
-            return journal
-                .receipts
-                .get(&key)
-                .map(|r| r.response.clone())
-                .unwrap_or_else(|| json!({"status":"not_found"}));
-        }
-        if let Some(receipt) = journal.receipts.get(&key) {
-            return if refresh_receipt::matches(receipt, &payload) {
-                receipt.response.clone()
-            } else {
-                rejection("operation_id_conflict")
-            };
-        }
-        if matches!(operation, "prepare" | "prepare_stream" | "resume_stream")
-            && retention::at_capacity(&journal)
-        {
-            return rejection("retention_capacity_exhausted");
-        }
-        if journal.receipts.len() >= MAX_RECEIPTS {
-            return rejection("capacity_exhausted");
+            if retention::expired(journal, &key) {
+                return rejection("receipt_expired");
+            }
+            if operation == "lookup" {
+                if let Some(source) = journal.recovery_sources.get(&key)
+                    && let Some(original) = journal.receipts.get(source)
+                {
+                    let mut response = original.response.clone();
+                    response["operation_id"] = json!(id);
+                    response["original_operation_id"] = original.request["operation_id"].clone();
+                    return response;
+                }
+                return journal
+                    .receipts
+                    .get(&key)
+                    .map(|r| r.response.clone())
+                    .unwrap_or_else(|| json!({"status":"not_found"}));
+            }
+            if let Some(receipt) = journal.receipts.get(&key) {
+                return if refresh_receipt::matches(receipt, &payload) {
+                    receipt.response.clone()
+                } else {
+                    rejection("operation_id_conflict")
+                };
+            }
+            if matches!(operation, "prepare" | "prepare_stream" | "resume_stream")
+                && retention::at_capacity(journal)
+            {
+                return rejection("retention_capacity_exhausted");
+            }
+            if journal.receipts.len() >= MAX_RECEIPTS {
+                return rejection("capacity_exhausted");
+            }
         }
         let result = if operation == "recover_session" {
             self.recover_session(caller, initiator, payload, key)

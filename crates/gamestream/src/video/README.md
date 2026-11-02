@@ -76,6 +76,12 @@ The original Rust implementation uses the receiver's systematic Cauchy matrix
 over GF(256), polynomial 0x11d. Parity coefficients are the inverse of the XOR of
 row and column coordinates; no third-party source or generated arithmetic tables
 are embedded. A shared 64 KiB multiplication table is generated once at runtime.
+Field inverses are also cached. On x86 with SSSE3, runtime dispatch uses two
+sixteen-entry nibble lookups to multiply sixteen bytes at once; other CPUs keep
+the scalar implementation. Both paths generate the same parity, including audio's
+separate matrix. `cargo run --release -p amaterasu-gamestream --example
+packetization_timing` measures complete packetization for several encoded frame
+sizes without opening sockets.
 The NV stream index/flags and picture bytes are encoded; transport-derived fields
 are filled afterward as expected by the receiver's recovery path.
 
