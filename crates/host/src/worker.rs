@@ -199,6 +199,7 @@ pub fn serve(root: &Path, digest: &str) -> PackageResult<()> {
     send_line("READY")?;
     let mut heartbeat = std::time::Instant::now();
     loop {
+        let observed_work = components.observe_work()?;
         let tick_started = std::time::Instant::now();
         components.tick()?;
         components.health()?;
@@ -206,9 +207,7 @@ pub fn serve(root: &Path, digest: &str) -> PackageResult<()> {
             return finish_lifecycle_action(components, action);
         }
         pulse(&mut heartbeat)?;
-        match input.recv_timeout(crate::timing::remaining_tick_interval(
-            tick_started.elapsed(),
-        )) {
+        match input.recv_timeout(std::time::Duration::ZERO) {
             Ok(Ok(line)) => {
                 let outcome = match serde_json::from_str::<Command>(&line) {
                     Ok(command) => {
@@ -235,7 +234,12 @@ pub fn serve(root: &Path, digest: &str) -> PackageResult<()> {
                 }
             }
             Ok(Err(failure)) => return Err(failure),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                components.wait_for_work(
+                    observed_work,
+                    crate::timing::remaining_tick_interval(tick_started.elapsed()),
+                )?;
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
     }
@@ -269,15 +273,17 @@ pub fn serve_interactive(
     components.health()?;
     send_line("READY")?;
     loop {
+        let observed_work = components.observe_work()?;
         let tick_started = std::time::Instant::now();
         components.tick()?;
         components.health()?;
         if let Some(action) = components.take_host_lifecycle_action()? {
             return finish_lifecycle_action(components, action);
         }
-        std::thread::sleep(crate::timing::remaining_tick_interval(
-            tick_started.elapsed(),
-        ));
+        components.wait_for_work(
+            observed_work,
+            crate::timing::remaining_tick_interval(tick_started.elapsed()),
+        )?;
     }
 }
 

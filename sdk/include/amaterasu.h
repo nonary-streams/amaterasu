@@ -67,6 +67,16 @@ typedef struct {
     void (*destroy)(void *instance);
 } AmaterasuRuntimeApi;
 
+/* Optional amaterasu_runtime_wait_v1() export, using the RuntimeApi instance.
+ * Observe before ticking, then wait against that generation to avoid lost
+ * wakeups. wait accepts at most 1,000,000 microseconds; it may return early.
+ * NotifyWorkReady is a scheduling hint through any existing HostApi endpoint. */
+typedef struct {
+    AmaterasuAbiHeader header;
+    AmaterasuStatus (*observe)(void *instance, uint64_t *generation);
+    AmaterasuStatus (*wait)(void *instance, uint64_t generation, uint64_t timeout_us);
+} AmaterasuRuntimeWaitApi;
+
 /* Product interface tables begin with this prefix. Their size/version describe
  * the product table. Context and table remain live until release(context). */
 typedef struct {
@@ -95,6 +105,7 @@ typedef struct {
 
 const AmaterasuModuleApi *amaterasu_module_v1(void);
 const AmaterasuRuntimeApi *amaterasu_runtime_v1(void);
+const AmaterasuRuntimeWaitApi *amaterasu_runtime_wait_v1(void);
 
 #ifdef __cplusplus
 }

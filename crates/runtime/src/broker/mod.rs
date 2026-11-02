@@ -120,6 +120,10 @@ impl Broker {
         };
 
         match command {
+            Command::NotifyWorkReady {} => Response::error(
+                "runtime_endpoint_required",
+                "readiness hints require the runtime endpoint",
+            ),
             Command::NativeRegister { .. }
             | Command::NativeBind { .. }
             | Command::NativeRegisterTyped { .. }

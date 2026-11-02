@@ -155,3 +155,64 @@ fn ffi_sdk_binding_delivers_table_and_releases_without_holding_broker_lock() {
     }
     unsafe { destroy_runtime(runtime) };
 }
+
+#[test]
+fn sdk_work_and_capture_notifications_wake_the_runtime_without_broker_lock() {
+    use std::time::{Duration, Instant};
+    let configuration = RuntimeConfig {
+        principals: [("consumer".into(), Grants::default())].into(),
+        ..Default::default()
+    };
+    let bytes = serde_json::to_vec(&configuration).unwrap();
+    let mut runtime = std::ptr::null_mut();
+    // SAFETY: configuration bytes and initialized output live through creation.
+    assert_eq!(
+        unsafe { create_runtime(BorrowedBytes::new(&bytes), &mut runtime) },
+        STATUS_OK
+    );
+    {
+        // SAFETY: clients/notifiers/readers stop before runtime destruction below.
+        let transport = unsafe { endpoint(runtime, "consumer") };
+        let client = unsafe { RuntimeClient::from_endpoint(transport) };
+        let notifier = client.work_notifier();
+        let mut generation = 0;
+        assert_eq!(unsafe { observe_work(runtime, &mut generation) }, STATUS_OK);
+        let raw_endpoint = unsafe { &*transport.context.cast::<Endpoint>() };
+        // A worker notification must not wait for ordinary module broker work.
+        let broker = raw_endpoint.broker.lock().unwrap();
+        notifier.notify();
+        drop(broker);
+        let started = Instant::now();
+        assert_eq!(
+            unsafe { wait_work(runtime, generation, 1_000_000) },
+            STATUS_OK
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(unsafe { observe_work(runtime, &mut generation) }, STATUS_OK);
+        let notifications =
+            amaterasu_module_sdk::capture::CaptureNotifications::with_work_notifier(notifier);
+        let sink = unsafe { notifications.native_sink() };
+        unsafe { (sink.frame_ready)(sink.context) };
+        let mut after_frame = 0;
+        assert_eq!(
+            unsafe { observe_work(runtime, &mut after_frame) },
+            STATUS_OK
+        );
+        assert_ne!(after_frame, generation);
+        // Coalesce repeated notices until the consumer acquires the notice.
+        unsafe { (sink.frame_ready)(sink.context) };
+        let mut coalesced = 0;
+        assert_eq!(unsafe { observe_work(runtime, &mut coalesced) }, STATUS_OK);
+        assert_eq!(after_frame, coalesced);
+        assert!(notifications.take().frame_ready);
+        unsafe { (sink.frame_ready)(sink.context) };
+        assert_eq!(unsafe { observe_work(runtime, &mut coalesced) }, STATUS_OK);
+        assert_ne!(after_frame, coalesced);
+        notifications.close();
+    }
+    assert_eq!(
+        unsafe { wait_work(runtime, 0, 1_000_001) },
+        STATUS_INVALID_ARGUMENT
+    );
+    unsafe { destroy_runtime(runtime) };
+}

@@ -12,9 +12,11 @@ struct Endpoint {
     principal: String,
     broker: Arc<Mutex<Broker>>,
     native: Arc<crate::native::NativeServices>,
+    work: Arc<crate::work_signal::WorkSignal>,
 }
 struct Runtime {
     endpoints: BTreeMap<String, Box<Endpoint>>,
+    work: Arc<crate::work_signal::WorkSignal>,
 }
 fn guard(f: impl FnOnce() -> Result<(), Status>) -> Status {
     match catch_unwind(AssertUnwindSafe(f)) {
@@ -39,6 +41,7 @@ unsafe extern "C" fn create_runtime(config: BorrowedBytes, output: *mut *mut c_v
         let broker = Arc::new(Mutex::new(
             Broker::new(config).map_err(|_| STATUS_INVALID_ARGUMENT)?,
         ));
+        let work = Arc::new(crate::work_signal::WorkSignal::default());
         let endpoints = principals
             .into_iter()
             .map(|principal| {
@@ -48,13 +51,14 @@ unsafe extern "C" fn create_runtime(config: BorrowedBytes, output: *mut *mut c_v
                         principal,
                         broker: broker.clone(),
                         native: native.clone(),
+                        work: work.clone(),
                     }),
                 )
             })
             .collect();
         // SAFETY: The caller supplies writable output storage; ownership transfers to destroy.
         unsafe {
-            *output = Box::into_raw(Box::new(Runtime { endpoints })) as *mut c_void;
+            *output = Box::into_raw(Box::new(Runtime { endpoints, work })) as *mut c_void;
         }
         Ok(())
     })
@@ -99,6 +103,10 @@ unsafe extern "C" fn invoke_command(
         let endpoint = unsafe { &*(endpoint as *const Endpoint) };
         // SAFETY: Input bytes remain readable until this synchronous invocation returns.
         let response = match serde_json::from_slice::<Command>(unsafe { input.read()? }) {
+            Ok(Command::NotifyWorkReady {}) => {
+                endpoint.work.notify();
+                Response::Ok
+            }
             Ok(
                 command @ (Command::NativeRegister { .. }
                 | Command::NativeBind { .. }
@@ -139,6 +147,40 @@ static API: RuntimeApi = RuntimeApi {
 #[unsafe(no_mangle)]
 pub extern "C" fn amaterasu_runtime_v1() -> *const RuntimeApi {
     &API
+}
+
+unsafe extern "C" fn observe_work(runtime: *mut c_void, output: *mut u64) -> Status {
+    guard(|| {
+        if runtime.is_null() || output.is_null() {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        // SAFETY: host retains its runtime instance and lends a writable result.
+        unsafe {
+            *output = (&*runtime.cast::<Runtime>()).work.observe();
+        }
+        Ok(())
+    })
+}
+unsafe extern "C" fn wait_work(runtime: *mut c_void, observed: u64, timeout_us: u64) -> Status {
+    guard(|| {
+        if runtime.is_null() || timeout_us > 1_000_000 {
+            return Err(STATUS_INVALID_ARGUMENT);
+        }
+        // SAFETY: the host retains this runtime until the synchronous wait returns.
+        unsafe { &*runtime.cast::<Runtime>() }
+            .work
+            .wait(observed, std::time::Duration::from_micros(timeout_us));
+        Ok(())
+    })
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn amaterasu_runtime_wait_v1() -> *const RuntimeWaitApi {
+    static WAIT: RuntimeWaitApi = RuntimeWaitApi {
+        header: AbiHeader::of::<RuntimeWaitApi>(),
+        observe: observe_work,
+        wait: wait_work,
+    };
+    &WAIT
 }
 
 #[cfg(test)]

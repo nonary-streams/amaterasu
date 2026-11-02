@@ -1,7 +1,8 @@
 //! Library ownership stays here; policy and feature behavior stay in managed libraries.
 use amaterasu_abi::{
     AbiHeader, BorrowedBytes, HostApi, ModuleApi, ModuleEntry, ModuleQuiesceApi,
-    ModuleQuiesceEntry, RuntimeApi, RuntimeEntry, STATUS_OK, Status,
+    ModuleQuiesceEntry, RuntimeApi, RuntimeEntry, RuntimeWaitApi, RuntimeWaitEntry, STATUS_OK,
+    Status,
 };
 use amaterasu_contracts::{
     Command, HOST_LIFECYCLE_CONTROL_PRINCIPAL, HOST_LOG_SERVICE, HostLifecycleAction, HostLogEvent,
@@ -209,6 +210,31 @@ impl LoadedComponents {
             self.tick()?;
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
+    }
+
+    pub fn observe_work(&self) -> PackageResult<u64> {
+        let Some(api) = self.runtime.wait_api else {
+            return Ok(0);
+        };
+        let mut observed = 0;
+        // SAFETY: runtime and output remain live for this serialized call.
+        require_success(
+            unsafe { (api.observe)(self.runtime.instance, &mut observed) },
+            "observe runtime work",
+        )?;
+        Ok(observed)
+    }
+    pub fn wait_for_work(&self, observed: u64, timeout: std::time::Duration) -> PackageResult<()> {
+        let Some(api) = self.runtime.wait_api else {
+            std::thread::sleep(timeout);
+            return Ok(());
+        };
+        let micros = timeout.as_micros().min(1_000_000) as u64;
+        // SAFETY: the selected runtime is retained until the bounded wait returns.
+        require_success(
+            unsafe { (api.wait)(self.runtime.instance, observed, micros) },
+            "wait for runtime work",
+        )
     }
 
     pub fn tick(&mut self) -> PackageResult<()> {
@@ -516,6 +542,7 @@ fn same_path(left: &str, right: &str) -> bool {
 
 struct RuntimeLibrary {
     api: RuntimeApi,
+    wait_api: Option<RuntimeWaitApi>,
     instance: *mut c_void,
     _library: Library,
 }
@@ -532,6 +559,13 @@ impl RuntimeLibrary {
                 .map_err(|error| error.to_string())?;
             read_api_table(entry())?
         };
+        // SAFETY: the named optional contract is checked before its tail is read.
+        let wait_api = unsafe {
+            match library.get::<RuntimeWaitEntry>(b"amaterasu_runtime_wait_v1\0") {
+                Ok(entry) => Some(read_api_table(entry())?),
+                Err(_) => None,
+            }
+        };
         let mut instance = std::ptr::null_mut();
         // SAFETY: configuration lives throughout create; output points to writable storage.
         let status = unsafe { (api.create)(BorrowedBytes::new(configuration), &mut instance) };
@@ -541,6 +575,7 @@ impl RuntimeLibrary {
         }
         Ok(Self {
             api,
+            wait_api,
             instance,
             _library: library,
         })

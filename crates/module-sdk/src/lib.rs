@@ -15,6 +15,8 @@ pub mod requests;
 pub mod retained_options;
 pub mod transport;
 pub mod video;
+mod work;
+pub use work::WorkNotifier;
 pub mod virtual_display;
 pub use native::NativeBinding;
 
@@ -123,6 +125,12 @@ impl RuntimeClient {
             minimum_level,
             log_path: log_path.to_owned(),
         })
+    }
+
+    /// Wake a waiting host after publishing a frame or completing asynchronous
+    /// work. Unsupported older runtimes retain their normal polling behavior.
+    pub fn work_notifier(&self) -> WorkNotifier {
+        WorkNotifier::new(self.endpoint)
     }
 
     /// Creates a bounded nonblocking logger for native workers and its module-

@@ -71,6 +71,7 @@ fn executable_library() -> Library {
 
 fn runtime(trace: &DestructionTrace) -> RuntimeLibrary {
     RuntimeLibrary {
+        wait_api: None,
         api: RuntimeApi {
             header: AbiHeader::of::<RuntimeApi>(),
             create: create_runtime,
