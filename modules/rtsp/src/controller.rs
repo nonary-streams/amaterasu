@@ -752,10 +752,18 @@ fn recovery_session_state(payload: &Value, expected_session: u64) -> Result<bool
         return if payload["cleanup_error"].is_null() {
             Ok(true)
         } else {
+            eprintln!(
+                "rtsp startup recovery blocked state={state} cleanup_error={}",
+                payload["cleanup_error"].as_str().unwrap_or("invalid")
+            );
             Err("startup_reconciliation_cleanup_failed")
         };
     }
     if state == "cleanup_failed" {
+        eprintln!(
+            "rtsp startup recovery blocked state={state} cleanup_error={}",
+            payload["cleanup_error"].as_str().unwrap_or("unknown")
+        );
         return Err("startup_reconciliation_cleanup_failed");
     }
     Ok(false)

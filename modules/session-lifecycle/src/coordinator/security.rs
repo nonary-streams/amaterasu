@@ -123,7 +123,7 @@ impl Coordinator {
         let verification = json!({"host_epoch":epoch,"provider_sequence":request.provider_sequence,
             "operation_id":request.operation_id,"transition_id":request.transition_id,
             "target":request.target,"fingerprint":digest});
-        if self.verify_provider(caller, &verification)["status"] != "succeeded" {
+        if self.verify_provider_request(caller, &verification, false)["status"] != "succeeded" {
             return rejection("permission_denied");
         }
         let shared = self.shared.borrow();
@@ -162,6 +162,17 @@ impl Coordinator {
     }
 
     pub(super) fn verify_provider(&self, caller: &str, payload: &Value) -> Value {
+        self.verify_provider_request(caller, payload, true)
+    }
+
+    // Context reads need the same authenticated request checks as metadata
+    // reads, but do not consume the potentially large recovery metadata.
+    fn verify_provider_request(
+        &self,
+        caller: &str,
+        payload: &Value,
+        include_metadata: bool,
+    ) -> Value {
         let journal = &self.shared.borrow().value;
         for receipt in journal.receipts.values() {
             if receipt.response["status"] != "pending" {
@@ -442,6 +453,9 @@ impl Coordinator {
                     .is_none_or(|id| !journal.authority.admissions.contains_key(id))
             {
                 continue;
+            }
+            if !include_metadata {
+                return json!({"status":"succeeded"});
             }
             let Ok(metadata) = super::provider_observations::metadata(journal, session, caller)
             else {
@@ -1280,6 +1294,38 @@ mod resource_generation_tests {
             coordinator.read_provider_context("foreign", context_request.clone())["status"],
             "rejected"
         );
+        // Large recovery metadata must not deny an otherwise valid read-only
+        // context request. The full metadata API still enforces its bound.
+        let original_journal = coordinator.shared.borrow().value.clone();
+        let mut crowded = original_journal.clone();
+        let session = crowded.sessions.get_mut("session").unwrap();
+        for index in 0..129 {
+            session.obligations.push(
+                serde_json::from_value(json!({
+                    "provider":"owner", "resource_id":format!("resource-{index}"),
+                    "obligation_id":format!("cleanup-{index}"),
+                    "cleanup_method":method, "depends_on":[], "mutation_domain":null,
+                    "payload":{}
+                }))
+                .unwrap(),
+            );
+        }
+        save(&coordinator.shared, crowded).unwrap();
+        assert_eq!(
+            coordinator.verify_provider("owner", &verification)["reason"],
+            "provider_metadata_unavailable"
+        );
+        assert_eq!(
+            coordinator.read_provider_context("owner", context_request.clone())["status"],
+            "succeeded"
+        );
+        let mut altered = context_request.clone();
+        altered["provider_request"]["provider_sequence"] = json!(2);
+        assert_eq!(
+            coordinator.read_provider_context("owner", altered)["reason"],
+            "permission_denied"
+        );
+        save(&coordinator.shared, original_journal).unwrap();
         let mut forged = context_request;
         forged["provider_request"]["requested_video"] =
             json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false});
@@ -1324,6 +1370,58 @@ mod resource_generation_tests {
             coordinator.verify_provider("owner", &stream_verification)["resource_generation"],
             1
         );
+        // Cleanup callbacks must also authorize with crowded history, but
+        // only once all required consumers have retired.
+        let prepared_stream = coordinator.shared.borrow().value.clone();
+        let mut cleanup = prepared_stream.clone();
+        let session = cleanup.sessions.get_mut("session").unwrap();
+        for index in 0..129 {
+            session.obligations.push(
+                serde_json::from_value(json!({
+                    "provider":"owner", "resource_id":format!("resource-{index}"),
+                    "obligation_id":format!("cleanup-{index}"),
+                    "cleanup_method":method, "depends_on":[], "mutation_domain":null,
+                    "payload":{}
+                }))
+                .unwrap(),
+            );
+        }
+        let stream = session.streams.get_mut("stream").unwrap();
+        stream.phase = StreamPhase::Quiescing;
+        stream.required.insert("capture".into());
+        stream.retirements.insert("capture".into());
+        let work = cleanup
+            .receipts
+            .get_mut("work")
+            .unwrap()
+            .work
+            .as_mut()
+            .unwrap();
+        work.phase = LifecyclePhase::StreamRelease;
+        let request = &mut work.states.get_mut("owner").unwrap().request;
+        request.phase = LifecyclePhase::StreamRelease;
+        let cleanup_context =
+            json!({"operation":"read_provider_context", "provider_request":request});
+        save(&coordinator.shared, cleanup.clone()).unwrap();
+        assert_eq!(
+            coordinator.read_provider_context("owner", cleanup_context.clone())["status"],
+            "succeeded"
+        );
+        cleanup
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .streams
+            .get_mut("stream")
+            .unwrap()
+            .retirements
+            .clear();
+        save(&coordinator.shared, cleanup).unwrap();
+        assert_eq!(
+            coordinator.read_provider_context("owner", cleanup_context)["reason"],
+            "permission_denied"
+        );
+        save(&coordinator.shared, prepared_stream).unwrap();
         let mut wrong_stream = coordinator.shared.borrow().value.clone();
         wrong_stream
             .sessions
