@@ -137,6 +137,10 @@ pub struct Broker {
     pub virtual_display_pending_statuses: u8,
     pub virtual_display_removal_statuses: u8,
     pub virtual_display_removing: bool,
+    pub virtual_display_park_on_remove: bool,
+    pub virtual_display_parked: Option<Value>,
+    pub virtual_display_reused_parked: bool,
+    pub virtual_display_invalid_parked_status: bool,
     pub virtual_display_create_failure: Option<String>,
     pub virtual_display_remove_failure: bool,
     pub state_revision: u64,
@@ -865,6 +869,9 @@ impl Broker {
                 if let Some(code) = self.virtual_display_create_failure.as_deref() {
                     return error(code);
                 }
+                if self.virtual_display_parked.take().is_some() {
+                    self.virtual_display_reused_parked = true;
+                }
                 let specification = json!({
                     "identity":payload["identity"],
                     "name":payload["name"],
@@ -892,7 +899,11 @@ impl Broker {
                 let reference = payload["reference_id"].as_str().expect("reference ID");
                 let reference_owned = self.virtual_display_references.contains(reference);
                 if self.virtual_display_removing && self.virtual_display_removal_statuses == 0 {
-                    self.virtual_display_specification = None;
+                    if self.virtual_display_park_on_remove {
+                        self.virtual_display_parked = self.virtual_display_specification.take();
+                    } else {
+                        self.virtual_display_specification = None;
+                    }
                     self.virtual_display_removing = false;
                 }
                 let monitors = self.virtual_display_specification.as_ref().map_or_else(
@@ -913,7 +924,14 @@ impl Broker {
                             "ready":{"device_path":"\\\\.\\DISPLAYVDD"},"error":null})]
                     },
                 );
-                json!({"ok":true,"monitors":monitors,"reference_owned":reference_owned})
+                let parked = self
+                    .virtual_display_parked
+                    .as_ref()
+                    .is_some_and(|specification| specification["identity"] == payload["identity"]);
+                let parked_outputs = self.virtual_display_parked.as_ref().filter(|_| !self.virtual_display_invalid_parked_status).map_or_else(
+                    || json!([]), |specification| json!([{"identity":specification["identity"],"output":"Virtual-2"}]),
+                );
+                json!({"ok":true,"monitors":monitors,"reference_owned":reference_owned,"parked":parked,"parked_outputs":parked_outputs})
             }
             "remove" => {
                 if self.virtual_display_remove_failure {
@@ -923,7 +941,10 @@ impl Broker {
                 let released = self.virtual_display_references.remove(reference);
                 let reference_owned = self.virtual_display_references.contains(reference);
                 let removed = self.virtual_display_references.is_empty();
-                if removed && self.virtual_display_removal_statuses > 0 {
+                if removed
+                    && (self.virtual_display_removal_statuses > 0
+                        || self.virtual_display_park_on_remove)
+                {
                     self.virtual_display_removing = true;
                     return json!({"ok":true,"removed":false,"reference_owned":false,
                         "monitor":{"state":"removing"}});

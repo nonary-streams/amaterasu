@@ -13,6 +13,7 @@ struct FakeBroker {
     effects: Arc<Mutex<Vec<(String, bool)>>>,
     journal: PathBuf,
     reject_removal: Arc<Mutex<bool>>,
+    reject_connection: Arc<Mutex<bool>>,
 }
 impl Broker for FakeBroker {
     fn connected(&self, output: &str) -> Result<bool, String> {
@@ -42,6 +43,9 @@ impl Broker for FakeBroker {
         if !connected && *self.reject_removal.lock().unwrap() {
             return Err("broker unavailable".into());
         }
+        if connected && *self.reject_connection.lock().unwrap() {
+            return Err("connector owned by another uid".into());
+        }
         self.effects
             .lock()
             .unwrap()
@@ -70,17 +74,31 @@ impl ConnectorInventory for FakeConnectors {
 }
 struct FakeCompositor {
     fail: bool,
+    fail_restore: bool,
+    rejected_configuration_layout: Option<serde_json::Value>,
+    snapshot_x: i64,
+    fail_restore_after: Option<usize>,
+    guard_available: bool,
+    parked_observable: bool,
     placements: Vec<(String, Placement)>,
     restored: Vec<bool>,
     mode_journal: Option<PathBuf>,
+    setup_journal: Option<PathBuf>,
 }
 impl FakeCompositor {
     fn new() -> Self {
         Self {
             fail: false,
+            fail_restore: false,
+            rejected_configuration_layout: None,
+            snapshot_x: 0,
+            fail_restore_after: None,
+            guard_available: true,
+            parked_observable: true,
             placements: Vec::new(),
             restored: Vec::new(),
             mode_journal: None,
+            setup_journal: None,
         }
     }
 }
@@ -113,22 +131,62 @@ impl Compositor for FakeCompositor {
         }
     }
     fn snapshot(&mut self, changing: &str) -> Result<Option<super::super::layout::Layout>, String> {
-        super::super::layout::Layout::capture(&serde_json::json!({"outputs":[{"name":"Virtual-1","connected":true,"enabled":true,"currentModeId":"1","modes":[{"id":"1","size":{"width":3840,"height":2160},"refreshRate":60}],"pos":{"x":0,"y":0},"scale":2.5,"rotation":1,"hdr":false,"wcg":true,"priority":1}]}), changing).map(Some)
+        super::super::layout::Layout::capture(&serde_json::json!({"outputs":[{"name":"Virtual-1","connected":true,"enabled":true,"currentModeId":"1","modes":[{"id":"1","size":{"width":3840,"height":2160},"refreshRate":60}],"pos":{"x":self.snapshot_x,"y":0},"scale":2.5,"rotation":1,"hdr":false,"wcg":true,"priority":1}]}), changing).map(Some)
     }
     fn restore(&mut self, layout: Option<&super::super::layout::Layout>) -> Result<(), String> {
         self.restored.push(layout.is_some());
-        Ok(())
+        if self.fail_restore || self.fail_restore_after == Some(self.restored.len()) {
+            Err("restore failed".into())
+        } else {
+            Ok(())
+        }
+    }
+    fn verify_removal_guard(&mut self, _: &str) -> Result<bool, String> {
+        Ok(self.guard_available)
+    }
+    fn verify_parked(&mut self, _: &str) -> Result<(), String> {
+        if self.parked_observable {
+            Ok(())
+        } else {
+            Err("owned output not observable".into())
+        }
     }
     fn configure(
         &mut self,
         output: &str,
         _: &Specification,
-        _: Option<&super::super::layout::Layout>,
+        layout: Option<&super::super::layout::Layout>,
         placement: &Placement,
         _: ScaleSetting,
     ) -> Result<(), String> {
+        if let Some(path) = &self.setup_journal {
+            let document: serde_json::Value =
+                serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            let record = document["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|record| record["output"] == output)
+                .unwrap();
+            assert!(
+                record["setup_layouts"]
+                    .as_array()
+                    .is_some_and(|layouts| !layouts.is_empty()),
+                "current desktop snapshot must be durable before configuration"
+            );
+        }
         self.placements.push((output.into(), placement.clone()));
-        if self.fail {
+        if self.fail
+            || self
+                .rejected_configuration_layout
+                .as_ref()
+                .is_some_and(|rejected| {
+                    layout
+                        .and_then(|value| serde_json::to_value(value).ok())
+                        .as_ref()
+                        == Some(rejected)
+                })
+        {
             Err("compositor failed".into())
         } else {
             Ok(())
@@ -149,6 +207,7 @@ fn fixture() -> (
         effects: Default::default(),
         journal: root.join("connectors.json"),
         reject_removal: Default::default(),
+        reject_connection: Default::default(),
     };
     let controller = Controller {
         journal: Journal::open(&root).unwrap(),
@@ -566,6 +625,37 @@ fn journal_excludes_other_hosts_and_rejects_corrupt_ownership() {
 }
 
 #[test]
+fn ownership_journal_never_persists_more_records_than_restart_can_read() {
+    let (root, mut controller) = fixture();
+    let first = controller
+        .create_with_references(
+            "owner".into(),
+            specification(FIRST),
+            ScaleSetting::Automatic,
+            Some(Default::default()),
+            VirtualDisplayLayout::Exclusive,
+        )
+        .unwrap();
+    for index in 1..8 {
+        let mut record = first.clone();
+        record.specification.identity = format!("00000000-0000-4000-8000-{index:012x}");
+        record.output = format!("Virtual-{}", index + 2);
+        controller.journal.insert(record).unwrap();
+    }
+    let before = fs::read(root.join("connectors.json")).unwrap();
+    let mut overflow = first;
+    overflow.specification.identity = "00000000-0000-4000-8000-000000000009".into();
+    overflow.output = "Virtual-10".into();
+    assert!(controller.journal.insert(overflow).is_err());
+    assert_eq!(fs::read(root.join("connectors.json")).unwrap(), before);
+    drop(controller);
+    let reopened = Journal::open(&root).unwrap();
+    assert_eq!(reopened.records.len(), 8);
+    drop(reopened);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn shutdown_never_admits_a_new_connector_effect() {
     let (root, mut controller) = fixture();
     controller
@@ -715,7 +805,7 @@ fn exclusive_streams_keep_peer_outputs_and_restore_the_pre_stream_desktop() {
     );
     controller.remove(&first.key()).unwrap();
     controller.remove(&second.key()).unwrap();
-    assert_eq!(controller.compositor.restored, [true, true]);
+    assert_eq!(controller.compositor.restored, [true, true, true, true]);
     assert!(controller.journal.records.is_empty());
     drop(controller);
     fs::remove_dir_all(root).unwrap();
@@ -769,8 +859,532 @@ fn extended_streams_restore_the_layout_current_at_removal() {
     assert!(controller.journal.records[0].layout.is_none());
     controller.remove(&record.key()).unwrap();
     // Removal snapshots afresh, so the restore still carries a layout.
-    assert_eq!(controller.compositor.restored, [true]);
+    assert_eq!(controller.compositor.restored, [true, true]);
     drop(controller);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn removal_preserves_connector_and_journal_until_a_survivor_is_available() {
+    let (root, mut controller) = fixture();
+    let record = controller
+        .create_with_references(
+            "stream-session".into(),
+            specification(FIRST),
+            ScaleSetting::Automatic,
+            Some(Default::default()),
+            VirtualDisplayLayout::Extended,
+        )
+        .unwrap();
+    controller.compositor.guard_available = false;
+    assert!(controller.remove(&record.key()).unwrap());
+    assert!(controller.broker.connected(&record.output).unwrap());
+    assert_eq!(controller.journal.records.len(), 1);
+    assert!(controller.journal.records[0].parked);
+    assert!(
+        !controller
+            .broker
+            .effects
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(name, connected)| name == &record.output && !connected)
+    );
+
+    let reused = controller
+        .create_with_references(
+            "new-session".into(),
+            specification(SECOND),
+            ScaleSetting::Automatic,
+            Some(Default::default()),
+            VirtualDisplayLayout::Extended,
+        )
+        .unwrap();
+    assert_eq!(reused.output, record.output);
+    assert!(!controller.journal.records[0].parked);
+    controller.compositor.guard_available = true;
+    controller.remove(&reused.key()).unwrap();
+    assert!(!controller.broker.connected(&reused.output).unwrap());
+    assert!(controller.journal.records.is_empty());
+    drop(controller);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn failed_restore_parks_the_released_display_for_a_new_stream() {
+    let (root, mut controller) = fixture();
+    let old = controller
+        .create_with_references(
+            "owner".into(),
+            specification(FIRST),
+            ScaleSetting::Automatic,
+            Some(Default::default()),
+            VirtualDisplayLayout::Exclusive,
+        )
+        .unwrap();
+    controller.compositor.fail_restore = true;
+    assert!(controller.remove(&old.key()).unwrap());
+    assert_eq!(
+        controller.journal.records[0].park_reason.as_deref(),
+        Some("restore_failed")
+    );
+    assert!(controller.broker.connected(&old.output).unwrap());
+    controller.compositor.fail_restore = false;
+    let next = controller
+        .create_with_references(
+            "owner".into(),
+            specification(SECOND),
+            ScaleSetting::Automatic,
+            Some(Default::default()),
+            VirtualDisplayLayout::Exclusive,
+        )
+        .unwrap();
+    assert_eq!(next.output, old.output);
+    assert!(!controller.remove(&next.key()).unwrap());
+    drop(controller);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn extended_reuse_retains_the_failed_restoration_baseline() {
+    let (root, mut controller) = fixture();
+    let old = controller
+        .create_with_references(
+            "owner".into(),
+            specification(FIRST),
+            ScaleSetting::Automatic,
+            Some(Default::default()),
+            VirtualDisplayLayout::Exclusive,
+        )
+        .unwrap();
+    controller.compositor.fail_restore = true;
+    assert!(controller.remove(&old.key()).unwrap());
+    let baseline = serde_json::to_value(&controller.journal.records[0].layout).unwrap();
+    // The old desktop still cannot be restored. Preparing the new stream
+    // must not reapply that failed baseline as part of configuration.
+    controller.compositor.rejected_configuration_layout = baseline.clone().into();
+    controller.compositor.snapshot_x = 200;
+    controller.compositor.setup_journal = Some(root.join("connectors.json"));
+    let next = controller
+        .create_with_references(
+            "owner".into(),
+            specification(SECOND),
+            ScaleSetting::Automatic,
+            Some(Default::default()),
+            VirtualDisplayLayout::Extended,
+        )
+        .unwrap();
+    assert_eq!(serde_json::to_value(&next.layout).unwrap(), baseline);
+    assert!(next.setup_layouts.is_empty());
+    controller.compositor.fail_restore = false;
+    controller.remove(&next.key()).unwrap();
+    drop(controller);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn failed_reuse_preserves_each_unrestored_setup_across_the_next_stream() {
+    let (root, mut controller) = fixture();
+    let old = controller
+        .create_with_references(
+            "owner".into(),
+            specification(FIRST),
+            ScaleSetting::Automatic,
+            Some(Default::default()),
+            VirtualDisplayLayout::Exclusive,
+        )
+        .unwrap();
+    controller.compositor.fail_restore = true;
+    assert!(controller.remove(&old.key()).unwrap());
+    let baseline = serde_json::to_value(&controller.journal.records[0].layout).unwrap();
+    controller.compositor.snapshot_x = 200;
+    controller.compositor.fail = true;
+    assert!(
+        controller
+            .create_with_references(
+                "owner".into(),
+                specification(SECOND),
+                ScaleSetting::Automatic,
+                Some(Default::default()),
+                VirtualDisplayLayout::Extended,
+            )
+            .is_err()
+    );
+    assert!(controller.journal.records[0].parked);
+    assert_eq!(controller.journal.records[0].setup_layouts.len(), 1);
+    let pending = serde_json::to_value(&controller.journal.records[0].setup_layouts[0]).unwrap();
+    controller.compositor.fail = false;
+    controller.compositor.snapshot_x = 400;
+    let next = controller
+        .create_with_references(
+            "owner".into(),
+            specification(FIRST),
+            ScaleSetting::Automatic,
+            Some(Default::default()),
+            VirtualDisplayLayout::Extended,
+        )
+        .unwrap();
+    assert_eq!(serde_json::to_value(&next.layout).unwrap(), baseline);
+    assert_eq!(next.setup_layouts.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&next.setup_layouts[0]).unwrap(),
+        pending
+    );
+    controller.compositor.fail_restore = false;
+    controller.remove(&next.key()).unwrap();
+    assert!(controller.journal.records.is_empty());
+    drop(controller);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn failed_restore_without_output_proof_keeps_cleanup_unresolved() {
+    let (root, mut controller) = fixture();
+    let record = controller
+        .create_with_references(
+            "owner".into(),
+            specification(FIRST),
+            ScaleSetting::Automatic,
+            Some(Default::default()),
+            VirtualDisplayLayout::Exclusive,
+        )
+        .unwrap();
+    controller.compositor.fail_restore = true;
+    controller.compositor.parked_observable = false;
+    assert!(controller.remove(&record.key()).is_err());
+    assert!(!controller.journal.records[0].parked);
+    assert!(controller.broker.connected(&record.output).unwrap());
+    controller.compositor.fail_restore = false;
+    controller.compositor.parked_observable = true;
+    controller.remove(&record.key()).unwrap();
+    drop(controller);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn failed_post_disconnect_restore_keeps_recoverable_reservation() {
+    let (root, mut controller) = fixture();
+    let record = controller
+        .create_with_references(
+            "owner".into(),
+            specification(FIRST),
+            ScaleSetting::Automatic,
+            Some(Default::default()),
+            VirtualDisplayLayout::Exclusive,
+        )
+        .unwrap();
+    controller.compositor.fail_restore_after = Some(2);
+    assert!(controller.remove(&record.key()).unwrap());
+    assert!(!controller.broker.connected(&record.output).unwrap());
+    assert!(controller.journal.records[0].parked);
+    let next = controller
+        .create_with_references(
+            "owner".into(),
+            specification(SECOND),
+            ScaleSetting::Automatic,
+            Some(Default::default()),
+            VirtualDisplayLayout::Exclusive,
+        )
+        .unwrap();
+    assert_eq!(next.output, record.output);
+    assert!(controller.broker.connected(&next.output).unwrap());
+    controller.remove(&next.key()).unwrap();
+    drop(controller);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn parked_connector_is_recovered_and_reused_after_restart() {
+    let (root, mut controller) = fixture();
+    let old = controller
+        .create_with_references(
+            "owner".into(),
+            specification(FIRST),
+            ScaleSetting::Automatic,
+            Some(Default::default()),
+            VirtualDisplayLayout::Exclusive,
+        )
+        .unwrap();
+    controller.compositor.guard_available = false;
+    assert!(controller.remove(&old.key()).unwrap());
+    let broker = controller.broker.clone();
+    drop(controller);
+    let mut compositor = FakeCompositor::new();
+    compositor.guard_available = false;
+    let mut restarted = Controller {
+        journal: Journal::open(&root).unwrap(),
+        broker,
+        compositor,
+        connectors: FakeConnectors::named(1..=8),
+        layout: VirtualDisplayLayout::Exclusive,
+        stopped: Default::default(),
+    };
+    assert!(restarted.recover().is_none());
+    assert!(restarted.journal.records[0].parked);
+    let next = restarted
+        .create_with_references(
+            "owner".into(),
+            specification(SECOND),
+            ScaleSetting::Automatic,
+            Some(Default::default()),
+            VirtualDisplayLayout::Exclusive,
+        )
+        .unwrap();
+    assert_eq!(next.output, old.output);
+    assert_eq!(restarted.journal.records.len(), 1);
+    restarted.compositor.guard_available = true;
+    restarted.remove(&next.key()).unwrap();
+    drop(restarted);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn vanished_parked_connector_reuses_its_recovery_intent_on_a_new_pool() {
+    let (root, mut controller) = fixture();
+    let old = controller
+        .create_with_references(
+            "owner".into(),
+            specification(FIRST),
+            ScaleSetting::Automatic,
+            Some(Default::default()),
+            VirtualDisplayLayout::Exclusive,
+        )
+        .unwrap();
+    controller.compositor.guard_available = false;
+    assert!(controller.remove(&old.key()).unwrap());
+    let baseline = serde_json::to_value(&controller.journal.records[0].layout).unwrap();
+    controller
+        .broker
+        .outputs
+        .lock()
+        .unwrap()
+        .insert(old.output.clone(), false);
+    controller.connectors = FakeConnectors::named(3..=10);
+    let next = controller
+        .create_with_references(
+            "owner".into(),
+            specification(SECOND),
+            ScaleSetting::Automatic,
+            Some(Default::default()),
+            VirtualDisplayLayout::Extended,
+        )
+        .unwrap();
+    assert_eq!(next.output, "Virtual-3");
+    assert_eq!(serde_json::to_value(&next.layout).unwrap(), baseline);
+    assert_eq!(controller.journal.records.len(), 1);
+    controller.compositor.guard_available = true;
+    controller.remove(&next.key()).unwrap();
+    drop(controller);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn parked_connector_is_not_adopted_without_broker_ownership() {
+    let (root, mut controller) = fixture();
+    let old = controller
+        .create_with_references(
+            "owner".into(),
+            specification(FIRST),
+            ScaleSetting::Automatic,
+            Some(Default::default()),
+            VirtualDisplayLayout::Exclusive,
+        )
+        .unwrap();
+    controller.compositor.guard_available = false;
+    assert!(controller.remove(&old.key()).unwrap());
+    let before = controller.compositor.placements.len();
+    *controller.broker.reject_connection.lock().unwrap() = true;
+    assert!(
+        controller
+            .create_with_references(
+                "owner".into(),
+                specification(SECOND),
+                ScaleSetting::Automatic,
+                Some(std::collections::BTreeSet::from(["next-ref".into()])),
+                VirtualDisplayLayout::Exclusive,
+            )
+            .is_err()
+    );
+    assert_eq!(controller.compositor.placements.len(), before);
+    assert!(
+        controller
+            .journal
+            .records
+            .iter()
+            .any(|record| record.specification.identity == SECOND)
+    );
+    drop(controller);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn parked_status_is_explicit_and_does_not_claim_connector_removal() {
+    use super::super::{Manager, Monitor};
+    let (sender, receiver) = std::sync::mpsc::sync_channel(2);
+    let key = ("owner".to_owned(), FIRST.to_owned());
+    let mut manager = Manager {
+        settings: serde_json::from_value(serde_json::json!({"enabled":true})).unwrap(),
+        monitors: BTreeMap::from([(
+            key.clone(),
+            Monitor {
+                specification: specification(FIRST),
+                state: "removing",
+                output: Some("Virtual-2".into()),
+                error: None,
+                references: Some(Default::default()),
+                layout: VirtualDisplayLayout::Extended,
+                scale: ScaleSetting::Automatic,
+            },
+        )]),
+        parked: Default::default(),
+        ready: true,
+        recovery_error: None,
+        sender: None,
+        receiver: Some(receiver),
+        worker: None,
+        cleanup_pending: std::collections::BTreeSet::from([key.clone()]),
+        observer: None,
+        borrows: Default::default(),
+        reconfigurations: Default::default(),
+        domain_id: "provider_session:test".into(),
+        topology_revision: 1,
+        pending_mutations: 1,
+        stopped: Default::default(),
+    };
+    sender
+        .send(Event::Removed {
+            key,
+            result: Ok(true),
+        })
+        .unwrap();
+    manager.tick();
+    let status = manager.status("owner", Some(FIRST.into()), Some("old-ref".into()));
+    assert_eq!(status["parked"], true);
+    assert_eq!(status["reference_owned"], false);
+    assert_eq!(status["monitors"], serde_json::json!([]));
+    assert_eq!(status["parked_outputs"][0]["identity"], FIRST);
+    let removal = manager.remove("owner", FIRST, Some("old-ref"));
+    assert_eq!(removal["parked"], true);
+    assert_eq!(removal["removed"], false);
+    // A new reference to the same identity supersedes the stale parked
+    // observation while the create worker is still in flight.
+    manager.monitors.insert(
+        ("owner".into(), FIRST.into()),
+        Monitor {
+            specification: specification(FIRST),
+            state: "creating",
+            output: None,
+            error: None,
+            references: Some(std::collections::BTreeSet::from(["new-ref".into()])),
+            layout: VirtualDisplayLayout::Extended,
+            scale: ScaleSetting::Automatic,
+        },
+    );
+    let active = manager.status("owner", Some(FIRST.into()), Some("new-ref".into()));
+    assert_eq!(active["parked"], false);
+    assert_eq!(active["reference_owned"], true);
+    assert_ne!(
+        manager.remove("owner", FIRST, Some("new-ref"))["parked"],
+        true
+    );
+}
+
+#[test]
+fn manager_releases_parks_and_reuses_output_through_public_operations() {
+    use super::super::Manager;
+    let (root, mut controller) = fixture();
+    controller.compositor.guard_available = false;
+    let broker = controller.broker.clone();
+    let (sender, jobs) = std::sync::mpsc::sync_channel(16);
+    let (events, receiver) = std::sync::mpsc::sync_channel(16);
+    let stopped = controller.stopped.clone();
+    let worker_stopped = stopped.clone();
+    let worker = std::thread::spawn(move || {
+        run(
+            controller.journal,
+            controller.broker,
+            controller.compositor,
+            controller.connectors,
+            controller.layout,
+            jobs,
+            events,
+            worker_stopped,
+        )
+    });
+    let mut manager = Manager {
+        settings: serde_json::from_value(serde_json::json!({"enabled":true})).unwrap(),
+        monitors: Default::default(),
+        parked: Default::default(),
+        ready: false,
+        recovery_error: None,
+        sender: Some(sender),
+        receiver: Some(receiver),
+        worker: Some(worker),
+        cleanup_pending: Default::default(),
+        observer: None,
+        borrows: Default::default(),
+        reconfigurations: Default::default(),
+        domain_id: "provider_session:test".into(),
+        topology_revision: 0,
+        pending_mutations: 0,
+        stopped,
+    };
+    let wait = |manager: &mut Manager, ready: &dyn Fn(&Manager) -> bool| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            manager.tick();
+            if ready(manager) {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("display worker did not settle");
+    };
+    wait(&mut manager, &|manager| manager.ready);
+    let create = |identity: &str, reference: &str| crate::model::Operation::Create {
+        hdr_enabled: false,
+        identity: identity.into(),
+        width: 1920,
+        height: 1080,
+        refresh_millihz: 60000,
+        name: "Amaterasu".into(),
+        reference_id: Some(reference.into()),
+        dd_virtual_display_scale: None,
+        virtual_display_layout: None,
+        expected_topology_revision: None,
+        expected_topology_domain_id: None,
+    };
+    assert_eq!(
+        manager.admit("session", create(FIRST, "first-ref")).0["ok"],
+        true
+    );
+    wait(&mut manager, &|manager| manager.pending_mutations == 0);
+    let output = manager.monitors[&("session".into(), FIRST.into())]
+        .output
+        .clone()
+        .unwrap();
+    assert_eq!(
+        manager.remove("session", FIRST, Some("first-ref"))["monitor"]["state"],
+        "removing"
+    );
+    wait(&mut manager, &|manager| manager.pending_mutations == 0);
+    let parked = manager.status("session", Some(FIRST.into()), Some("first-ref".into()));
+    assert_eq!(parked["parked"], true);
+    assert_eq!(parked["reference_owned"], false);
+    assert!(broker.connected(&output).unwrap());
+    assert_eq!(
+        manager.admit("session", create(SECOND, "second-ref")).0["ok"],
+        true
+    );
+    wait(&mut manager, &|manager| manager.pending_mutations == 0);
+    let next = manager.status("session", Some(SECOND.into()), Some("second-ref".into()));
+    assert_eq!(next["monitors"][0]["output"], output);
+    assert_eq!(next["reference_owned"], true);
+    assert_eq!(
+        manager.status("session", None, None)["parked_outputs"],
+        serde_json::json!([])
+    );
+    drop(manager);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -798,6 +1412,7 @@ fn linux_shared_references_persist_and_release_only_the_last_connector_owner() {
     let mut manager = Manager {
         settings: serde_json::from_value(serde_json::json!({"enabled":true})).unwrap(),
         monitors: Default::default(),
+        parked: Default::default(),
         ready: true,
         recovery_error: None,
         sender: Some(sender),

@@ -101,8 +101,21 @@ provider borrow exists; legacy reconfigure continues to require one reference.
 
 `$XDG_STATE_HOME/amaterasu/virtual-display-linux` (default
 `~/.local/state/amaterasu/virtual-display-linux`) is locked against other
-Amaterasu hosts and synced before connect. Startup removes interrupted owned
+Amaterasu hosts and synced before connect. Startup reconciles interrupted owned
 connectors before admitting new ones. Failed cleanup retains ownership intent.
+When the final reference is released, Linux restores the saved layout before
+disconnecting. If restoration fails or there is no distinct active Wayland
+output to guard the disconnect, an independently observed owned output can be
+parked as a provider-owned desktop anchor. Its released reference is no longer
+active; the connector and restoration intent remain journaled and can be reused
+by a later create, including after restart. If restoration fails after a confirmed
+disconnect, a separately observed surviving output permits the disconnected
+connector and restoration intent to be reserved for reuse. Unknown output state
+or an unresolved reference is not treated as a successful park.
+Reuse configures the new stream from the current desktop rather than requiring
+the previously failed restoration to succeed first; the saved recovery layout
+remains journaled. If the driver pool was replaced and the old connector no
+longer exists, its recovery intent transfers to a free connector in the new pool.
 
 KScreen activates only the new connector, selects the requested mode, sets 100%
 scale and SDR, and places it to the right of enabled outputs. Readback must match
@@ -172,6 +185,13 @@ identity. If completion of a newly attached reference is lost, only that new
 reference is released; a previously owned monitor and its other references
 remain intact. Restart resumes either reference ownership or final cleanup from
 the journal.
+
+On Linux, an identity-specific `status` for a parked output reports
+`reference_owned: false`, `parked: true`, and a matching identity and connector
+in `parked_outputs`. An idempotent `remove` reports `removed: false` and
+`parked: true`. Parking proves release of the stream reference, not connector
+disappearance or successful desktop restoration. Parked outputs are excluded
+from the active `monitors` list and may be reassigned by a subsequent create.
 
 Create may include the optional integer `dd_virtual_display_scale`; omission
 defaults to `0` and preserves older callers. Accepted values are `-1`, `0`,

@@ -41,6 +41,24 @@ struct Controller<B: Broker, C: Compositor, I: ConnectorInventory> {
     stopped: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
+    fn park(&mut self, mut record: Record, reason: &str) -> Result<bool, String> {
+        if !record
+            .references
+            .as_ref()
+            .is_some_and(|refs| refs.is_empty())
+            || record
+                .transition
+                .as_ref()
+                .is_some_and(|transition| !transition.completed)
+        {
+            return Err("cannot park an unresolved display owner".into());
+        }
+        record.transition = None;
+        record.parked = true;
+        record.park_reason = Some(reason.into());
+        self.journal.update(record)?;
+        Ok(true)
+    }
     fn reconfigure(
         &mut self,
         key: &(String, String),
@@ -125,7 +143,8 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
             },
         }
     }
-    fn remove(&mut self, key: &(String, String)) -> Result<(), String> {
+    /// Returns true when the connector remains parked as a desktop anchor.
+    fn remove(&mut self, key: &(String, String)) -> Result<bool, String> {
         let Some(mut record) = self
             .journal
             .records
@@ -133,18 +152,60 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
             .find(|record| &record.key() == key)
             .cloned()
         else {
-            return Ok(());
+            return Ok(false);
         };
+        let connected = self.broker.connected(&record.output)?;
         if record.layout.is_none() {
             record.layout = self.compositor.snapshot(&record.output)?;
             self.journal.update(record.clone())?;
         }
-        self.broker.set_connected(&record.output, false)?;
-        self.compositor.restore(record.layout.as_ref())?;
+        if connected {
+            // Status reports connection state, not ownership. Confirm the UID
+            // lease after persisting the snapshot and before changing layout.
+            self.broker.set_connected(&record.output, true)?;
+        }
+        while let Some(layout) = record.setup_layouts.last() {
+            if let Err(error) = self.compositor.restore(Some(layout)) {
+                if connected && self.compositor.verify_parked(&record.output).is_ok() {
+                    return self.park(record, "restore_failed");
+                }
+                return Err(error);
+            }
+            record.setup_layouts.pop();
+            self.journal.update(record.clone())?;
+        }
+        if connected {
+            // Restore and independently observe a surviving desktop before
+            // unplugging the stream output. Keep the journal on uncertainty.
+            let restored = self.compositor.restore(record.layout.as_ref());
+            let (can_remove, park_reason) = match restored {
+                Ok(()) => (
+                    self.compositor.verify_removal_guard(&record.output)?,
+                    "no_survivor",
+                ),
+                Err(_) => {
+                    self.compositor.verify_parked(&record.output)?;
+                    (false, "restore_failed")
+                }
+            };
+            if !can_remove {
+                return self.park(record, park_reason);
+            }
+            self.broker.set_connected(&record.output, false)?;
+        }
+        if let Err(error) = self.compositor.restore(record.layout.as_ref()) {
+            if !self.broker.connected(&record.output)?
+                && self.compositor.verify_removal_guard(&record.output)?
+            {
+                return self.park(record, "restore_failed");
+            }
+            return Err(error);
+        }
         if self.broker.connected(&record.output)? {
             return Err("owned connector remains connected".into());
         }
-        self.journal.remove(key)
+        self.journal.remove(key)?;
+        Ok(false)
     }
     fn recover(&mut self) -> Option<String> {
         let keys: Vec<_> = self.journal.records.iter().map(Record::key).collect();
@@ -178,31 +239,76 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
         }
         // Connector names follow the driver's current type ids, which a module
         // reload advances; never assume the first pool's Virtual-1..8 names.
+        let parked = self
+            .journal
+            .records
+            .iter()
+            .find(|record| record.parked)
+            .cloned();
+        let reused_parked = parked.is_some();
+        if parked
+            .as_ref()
+            .is_some_and(|record| record.setup_layouts.len() >= 4)
+        {
+            return Err("too many unresolved setup layouts".into());
+        }
+        let available = self.connectors.connectors()?;
+        let parked_output_available = parked
+            .as_ref()
+            .is_some_and(|record| available.contains(&record.output));
         let mut selected = None;
-        for output in self.connectors.connectors()? {
-            if !self
-                .journal
-                .records
-                .iter()
-                .any(|record| record.output == output)
-                && !self.broker.connected(&output)?
-            {
-                selected = Some(output);
-                break;
+        if !parked_output_available {
+            for output in available {
+                if !self
+                    .journal
+                    .records
+                    .iter()
+                    .any(|record| record.output == output)
+                    && !self.broker.connected(&output)?
+                {
+                    selected = Some(output);
+                    break;
+                }
             }
         }
         let mut record = Record {
             owner,
             specification,
-            output: selected.ok_or("no free virtual display connector")?,
-            layout: None,
+            output: parked
+                .as_ref()
+                .filter(|_| parked_output_available)
+                .map(|record| record.output.clone())
+                .or(selected)
+                .ok_or("no free virtual display connector")?,
+            layout: parked.as_ref().and_then(|record| record.layout.clone()),
+            setup_layouts: parked
+                .as_ref()
+                .map(|record| record.setup_layouts.clone())
+                .unwrap_or_default(),
             references,
             transition: None,
+            parked: false,
+            park_reason: None,
         };
-        record.layout = self.compositor.snapshot(&record.output)?;
+        if parked.is_none() {
+            record.layout = self.compositor.snapshot(&record.output)?;
+        } else {
+            let current = self
+                .compositor
+                .snapshot(&record.output)?
+                .ok_or("current desktop snapshot unavailable")?;
+            record.setup_layouts.push(current);
+        }
         let placement = self.placement(&record.output, layout);
-        self.journal.insert(record.clone())?;
+        if let Some(previous) = parked {
+            self.journal
+                .replace_parked(&previous.key(), record.clone())?;
+        } else {
+            self.journal.insert(record.clone())?;
+        }
         let result = (|| {
+            // Even an already connected parked output must be checked by the
+            // broker: status alone does not prove that this UID still owns it.
             self.broker.set_connected(&record.output, true)?;
             if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
                 return Err("display manager stopping".into());
@@ -210,7 +316,13 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
             self.compositor.configure(
                 &record.output,
                 &record.specification,
-                record.layout.as_ref(),
+                if reused_parked {
+                    // Preserve the current desktop without reapplying the
+                    // earlier failed restoration during the new setup.
+                    record.setup_layouts.last()
+                } else {
+                    record.layout.as_ref()
+                },
                 &placement,
                 scale,
             )?;
@@ -221,7 +333,12 @@ impl<B: Broker, C: Compositor, I: ConnectorInventory> Controller<B, C, I> {
             // including user changes made during it. An exclusive stream keeps
             // the pre-stream snapshot: removal re-enables the displays it
             // turned off, exactly as they were.
-            if placement == Placement::Extended {
+            // A parked output can carry an unresolved earlier restoration;
+            // retain that baseline across reuse even for an extended stream.
+            if reused_parked {
+                record.setup_layouts.pop();
+                self.journal.update(record.clone())?;
+            } else if placement == Placement::Extended {
                 record.layout = None;
                 self.journal.update(record.clone())?;
             }
@@ -300,15 +417,24 @@ pub(super) fn run<B: Broker, C: Compositor, I: ConnectorInventory>(
                 layout,
             } => {
                 let key = (owner.clone(), specification.identity.clone());
+                let result = controller.create_with_references(
+                    owner,
+                    specification,
+                    scale,
+                    references,
+                    layout,
+                );
+                let parked = controller
+                    .journal
+                    .records
+                    .iter()
+                    .filter(|record| record.parked)
+                    .map(|record| (record.key(), record.output.clone()))
+                    .collect();
                 Event::Created {
                     key,
-                    result: controller.create_with_references(
-                        owner,
-                        specification,
-                        scale,
-                        references,
-                        layout,
-                    ),
+                    result,
+                    parked,
                 }
             }
             Work::References {

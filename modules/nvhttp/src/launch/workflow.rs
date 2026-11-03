@@ -1151,10 +1151,6 @@ impl Controller {
                 Ok((_, _, "closed" | "failed", true))
                     if record.lifecycle_required
                         && !record.stop_on_stream_end
-                        && matches!(
-                            payload["authenticated_disconnect_reason"].as_str(),
-                            Some("peer_disconnected" | "authenticated_peer_idle" | "peer_timeout")
-                        )
                         && payload["lifecycle_retired"] == true =>
                 {
                     record.rtsp_requested = false;
@@ -1175,6 +1171,7 @@ impl Controller {
                     record.rtsp_requested = false;
                     record.rtsp_ticket = None;
                     record.rtsp_url = None;
+                    record.stage = Stage::Cleanup;
                 } else if job.phase == Phase::StopRtsp {
                     record.stage = Stage::VerifyRtspCleanup;
                 } else {
@@ -1184,10 +1181,21 @@ impl Controller {
                 }
             }
             Phase::StopApplication | Phase::VerifyApplicationStopped => {
+                eprintln!(
+                    "amaterasu application cleanup verification response={:?} state={} cleanup={} budget={} expected_budget={:?} stop={} expected_stop={}",
+                    application_response(record, &payload),
+                    payload["launch"]["state"],
+                    payload["launch"]["cleanup_error"],
+                    payload["launch"]["cleanup_budget_ms"],
+                    record.application_cleanup_budget_ms,
+                    payload["launch"]["stop_on_stream_end"],
+                    record.stop_on_stream_end
+                );
                 if clean_application_terminal(record, &payload) {
                     record.lifecycle_retirement_launch = record.application_launch;
                     record.application_requested = false;
                     record.application_launch = None;
+                    record.stage = Stage::Cleanup;
                 } else if job.phase == Phase::StopApplication
                     || application_response(record, &payload)
                         .is_ok_and(|(_, state, healthy)| state == "stopping" && healthy)

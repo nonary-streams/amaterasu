@@ -30,10 +30,11 @@ impl Coordinator {
             || stream.phase != StreamPhase::RecoveryRequired
             || stream.required != BTreeSet::from(["capture".into()])
             || next.receipts.values().any(|receipt| {
-                receipt
-                    .work
-                    .as_ref()
-                    .is_some_and(|work| work.target == target && !rejected_read_only_release(work))
+                receipt.work.as_ref().is_some_and(|work| {
+                    work.target == target
+                        && !rejected_read_only_release(work)
+                        && !waiting_capture_retirement(receipt, work, caller)
+                })
             })
         {
             return Err("stream_not_recoverable".into());
@@ -48,6 +49,28 @@ impl Coordinator {
         // A settled ResourcePlan rejection has no admitted effect. Preserve its
         // rejection receipt while allowing a fresh cleanup attempt; unknown or
         // effectful callbacks remain fenced by the check above.
+        let resumable: Vec<_> = next
+            .receipts
+            .iter()
+            .filter_map(|(key, receipt)| {
+                receipt
+                    .work
+                    .as_ref()
+                    .filter(|work| {
+                        work.target == target && waiting_capture_retirement(receipt, work, caller)
+                    })
+                    .map(|_| key.clone())
+            })
+            .collect();
+        if resumable.len() > 1 {
+            return Err("stream_not_recoverable".into());
+        }
+        let retained_work = resumable.first().map(|key| {
+            let receipt = next.receipts.get_mut(key).expect("selected receipt");
+            receipt.response["status"] = json!("rejected");
+            receipt.response["reason"] = json!("superseded_by_restart_recovery");
+            receipt.work.take().expect("selected release work")
+        });
         for receipt in next.receipts.values_mut() {
             if receipt
                 .work
@@ -58,9 +81,15 @@ impl Coordinator {
                 receipt.response["status"] = json!("rejected");
             }
         }
-        let mut work = self.new_work(LifecyclePhase::StreamRelease, target.clone(), &payload)?;
+        let resumed_existing_work = retained_work.is_some();
+        let mut work = match retained_work {
+            Some(work) => work,
+            None => self.new_work(LifecyclePhase::StreamRelease, target.clone(), &payload)?,
+        };
         work.recovery_authorized_epoch = Some(next.host_epoch.clone());
-        work.use_release_graph(stream.provider_graph.clone());
+        if !resumed_existing_work {
+            work.use_release_graph(stream.provider_graph.clone());
+        }
         work.reason = Some(ReleaseReason::Pause);
         let stream = next
             .sessions
@@ -214,6 +243,27 @@ impl Coordinator {
         save(&self.shared, next)?;
         Ok(response)
     }
+}
+
+fn waiting_capture_retirement(receipt: &Receipt, work: &Work, caller: &str) -> bool {
+    receipt.caller == caller
+        && receipt.initiator == caller
+        && receipt.request["operation"] == "pause_stream"
+        && receipt.request["target"] == json!(work.target)
+        && receipt.response["status"] == "recovery_required"
+        && work.phase == LifecyclePhase::StreamRelease
+        && work.waiting_retirement
+        && !work.compacted_release
+        && work.candidate.is_none()
+        && work.index == 0
+        && work.states.is_empty()
+        && work.composition_progress.is_none()
+        && work.owner_observations.is_empty()
+        && work.reprepare.is_none()
+        && work.failure.is_none()
+        && work.failed_preparation.is_none()
+        && work.action_transfer.is_none()
+        && work.cleanup_blockers.is_empty()
 }
 
 fn rejected_read_only_release(work: &Work) -> bool {
@@ -454,9 +504,68 @@ mod stream_restart_tests {
             coordinator.handle("capture", "capture", stale)["reason"],
             "stream_not_recoverable"
         );
+        let target_value: LifecycleTarget = serde_json::from_value(target.clone()).unwrap();
+        let mut work = coordinator
+            .new_work(LifecyclePhase::StreamRelease, target_value, &json!({}))
+            .unwrap();
+        work.waiting_retirement = true;
+        let transition = work.transition_id.clone();
+        let mut journal = coordinator.shared.borrow().value.clone();
+        journal.receipts.insert(
+            "old-pause".into(),
+            Receipt {
+                caller: "capture".into(),
+                initiator: "capture".into(),
+                request: json!({"operation":"pause_stream","operation_id":"pause","target":target}),
+                response: json!({"status":"recovery_required","reason":"coordinator_restarted"}),
+                work: Some(work),
+                wait_target: None,
+            },
+        );
+        save(&coordinator.shared, journal).unwrap();
+        let mut unsafe_journal = coordinator.shared.borrow().value.clone();
+        unsafe_journal
+            .receipts
+            .get_mut("old-pause")
+            .unwrap()
+            .work
+            .as_mut()
+            .unwrap()
+            .waiting_retirement = false;
+        save(&coordinator.shared, unsafe_journal).unwrap();
+        assert_eq!(
+            coordinator.handle("capture", "capture", request.clone())["reason"],
+            "stream_not_recoverable"
+        );
+        let mut journal = coordinator.shared.borrow().value.clone();
+        journal
+            .receipts
+            .get_mut("old-pause")
+            .unwrap()
+            .work
+            .as_mut()
+            .unwrap()
+            .waiting_retirement = true;
+        save(&coordinator.shared, journal).unwrap();
         assert_eq!(
             coordinator.handle("capture", "capture", request.clone())["status"],
             "pending"
+        );
+        assert_eq!(
+            coordinator.shared.borrow().value.receipts["old-pause"].response["reason"],
+            "superseded_by_restart_recovery"
+        );
+        assert!(
+            coordinator
+                .shared
+                .borrow()
+                .value
+                .receipts
+                .values()
+                .any(|receipt| receipt
+                    .work
+                    .as_ref()
+                    .is_some_and(|work| work.transition_id == transition))
         );
         coordinator
             .advance(&mut |_| panic!("empty release graph must not dispatch a provider"))

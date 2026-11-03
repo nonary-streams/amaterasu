@@ -54,17 +54,31 @@ fn root_generation(journal: &Journal, root: &StoredOutput) -> ModuleResult<u64> 
 /// This is read-only evidence and never authorizes an effect or a new binding.
 #[allow(dead_code)] // Consumed by historical proof endpoints.
 pub(super) fn historical_generation(journal: &Journal, root: &StoredOutput) -> ModuleResult<u64> {
-    if !journal.composition.records().any(|record| record == root) {
-        return Err("resource_root_not_retained".into());
+    let mut matches = journal.composition.records().filter(|record| {
+        if *record == root {
+            return true;
+        }
+        if root.state != OutputState::Retained || record.state != OutputState::Released {
+            return false;
+        }
+        let mut normalized = root.clone();
+        normalized.state = OutputState::Released;
+        &normalized == *record
+    });
+    let stored = matches.next().ok_or("resource_root_not_retained")?;
+    if matches.next().is_some() {
+        return Err("resource_root_ambiguous".into());
     }
-    root_generation(journal, root)
+    root_generation(journal, stored)
 }
 
 /// Verify an exact retained root is still the current session resource. This
 /// is metadata only; action or lifecycle callers must establish separate rights.
 #[allow(dead_code)] // Consumed by action target metadata.
 pub(super) fn current_root_generation(journal: &Journal, root: &StoredOutput) -> ModuleResult<u64> {
-    if root.state != OutputState::Retained {
+    if root.state != OutputState::Retained
+        || !journal.composition.records().any(|record| record == root)
+    {
         return Err("resource_root_not_active".into());
     }
     let LifecycleTarget::Session { host_epoch, .. } = &root.output.origin else {
@@ -325,8 +339,32 @@ pub(super) mod tests {
             .unwrap();
         let released = journal.composition.records().next().unwrap();
         assert_eq!(historical_generation(&journal, released).unwrap(), 7);
+        // A finalized stream stores the previously retained snapshot. Its
+        // immutable provenance remains valid after the root is released.
+        assert_eq!(historical_generation(&journal, &root).unwrap(), 7);
+        let mut forged = root.clone();
+        forged.output.resource.resource_id = "other".into();
+        assert!(historical_generation(&journal, &forged).is_err());
+        assert!(current_root_generation(&journal, &root).is_err());
         assert!(current_root_generation(&journal, released).is_err());
     }
+    #[test]
+    fn released_root_allows_historical_snapshot_but_never_live_authority() {
+        let (mut journal, work, root) = fixture();
+        journal
+            .composition
+            .set_state(
+                &root.output.producer,
+                &root.output.output_id,
+                &root.output.origin,
+                OutputState::Released,
+            )
+            .unwrap();
+        assert_eq!(historical_generation(&journal, &root).unwrap(), 7);
+        assert!(current_root_generation(&journal, &root).is_err());
+        assert!(active_generation(&journal, &work, &root.output).is_err());
+    }
+
     #[test]
     fn released_root_blocks_stream_until_authenticated_replacement() {
         let (mut journal, _, root) = fixture();

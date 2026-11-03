@@ -81,6 +81,89 @@ fn stop_waits_for_final_virtual_display_removal() {
 }
 
 #[test]
+fn parked_display_releases_failed_stream_and_is_reused_by_next_stream() {
+    let mut host = Harness::new();
+    let mut first_intent = intent(
+        "first-reference",
+        VirtualDisplayMode::PerClient,
+        VirtualDisplayLayout::Extended,
+    );
+    first_intent["display_policy"] = display_policy("disabled");
+    let first = host.response(1, prepare_with_intent("first-stream", first_intent));
+    assert_eq!(first["state"], "prepared", "{first}");
+    let first_id = first["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(first_id))["state"], "active");
+    host.broker.virtual_display_park_on_remove = true;
+    let stopped = host.response(3, json!({"action":"stop","session":first_id}));
+    assert_eq!(stopped["state"], "stopped", "{stopped}");
+    assert!(host.broker.virtual_display_parked.is_some());
+    assert!(host.broker.virtual_display_references.is_empty());
+
+    let mut second_intent = intent(
+        "second-reference",
+        VirtualDisplayMode::PerClient,
+        VirtualDisplayLayout::Extended,
+    );
+    second_intent["display_policy"] = display_policy("disabled");
+    let second = host.response(4, prepare_with_intent("second-stream", second_intent));
+    assert_eq!(second["state"], "prepared", "{second}");
+    assert!(host.broker.virtual_display_reused_parked);
+    assert_eq!(
+        host.response(5, start(second["session"].as_u64().unwrap()))["state"],
+        "active"
+    );
+}
+
+#[test]
+fn parked_display_requires_the_exact_provider_reservation() {
+    let mut host = Harness::new();
+    let mut requested = intent(
+        "first-reference",
+        VirtualDisplayMode::PerClient,
+        VirtualDisplayLayout::Extended,
+    );
+    requested["display_policy"] = display_policy("disabled");
+    let first = host.response(1, prepare_with_intent("first-stream", requested));
+    let id = first["session"].as_u64().unwrap();
+    host.broker.virtual_display_park_on_remove = true;
+    host.broker.virtual_display_invalid_parked_status = true;
+    let stopped = host.response(2, json!({"action":"stop","session":id}));
+    assert_eq!(stopped["state"], "cleanup_failed", "{stopped}");
+    assert!(host.broker.virtual_display_parked.is_some());
+}
+
+#[test]
+fn direct_parked_removal_requires_the_matching_identity() {
+    let mut host = Harness::new();
+    let prepared = host.response(
+        1,
+        prepare_with_intent(
+            "parked-removal",
+            intent(
+                "first-reference",
+                VirtualDisplayMode::PerClient,
+                VirtualDisplayLayout::Extended,
+            ),
+        ),
+    );
+    let record = host
+        .pipeline
+        .records
+        .get_mut(&prepared["session"].as_u64().unwrap())
+        .unwrap();
+    let parked =
+        json!({"ok":true,"parked":true,"removed":false,"reference_owned":false,"identity":"wrong"});
+    assert!(!super::super::virtual_display::accept_remove(
+        record, &parked
+    ));
+    assert!(record.virtual_display_reference_owned);
+    let mut exact = parked;
+    exact["identity"] = json!("00000000-0000-0000-0000-000000000001");
+    assert!(super::super::virtual_display::accept_remove(record, &exact));
+    assert_eq!(record.virtual_display_state, "parked");
+}
+
+#[test]
 fn ready_monitor_applies_snapshot_and_restores_before_releasing_reference() {
     let mut host = Harness::new();
     let original_topology = host.broker.display_topology.clone();
@@ -325,7 +408,8 @@ fn disabled_and_verify_only_policies_do_not_acquire_or_restore_a_topology_lease(
             ["snapshot", "status", "apply"]
         );
 
-        let stopped = host.response(2, json!({"action":"stop","session":session}));
+        assert_eq!(host.response(2, start(session))["state"], "active");
+        let stopped = host.response(3, json!({"action":"stop","session":session}));
         assert_eq!(stopped["state"], "stopped", "{stopped}");
         assert!(host.broker.display_lease.is_none());
         assert_eq!(host.broker.display_topology, original_topology);

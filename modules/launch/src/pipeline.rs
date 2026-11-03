@@ -1880,7 +1880,7 @@ impl Pipeline {
             .expect("workflow record");
         record.state = record.cleanup_outcome.state();
         record.cleanup_error = None;
-        record.target = None;
+        record.retire_target();
         record.provider_ticket = None;
         self.reply(job, send)
     }

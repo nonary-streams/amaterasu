@@ -4483,6 +4483,32 @@ fn natural_application_exit_closes_the_stream_and_releases_the_application() {
 }
 
 #[test]
+fn verified_application_stop_returns_to_lifecycle_cleanup() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    launch_ready(&mut controller, &mut broker, now);
+    let record = controller.records.values_mut().next().unwrap();
+    record.state = State::Stopping;
+    record.stage = Stage::VerifyApplicationCleanup;
+    record.lifecycle_required = true;
+    record.lifecycle_session_target = serde_json::from_value(json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1})).ok();
+    record.lifecycle_end_fenced = true;
+    record.rtsp_requested = false;
+    let id = record.id;
+    let launch = record.application_launch.unwrap();
+    broker.application_state = "stopped";
+    let payload = broker.response("amaterasu.launch/1", &json!({"action":"status","launch":launch}));
+    let job = workflow::Job { record:id, phase:workflow::Phase::VerifyApplicationStopped,
+        call:call::Call::new("unused",json!({}),"unused".into(),1000), deadline:now+Duration::from_secs(5)};
+    controller.consume(&job, payload, now, &mut Vec::new());
+    let record = &controller.records[&id];
+    assert_eq!(record.stage, Stage::Cleanup);
+    assert!(!record.application_requested);
+    assert_eq!(workflow::next_phase(record), workflow::Phase::ReportApplicationRetired);
+}
+
+#[test]
 fn long_cleanup_outlives_short_stop_rpc_and_automatically_observes_terminal_undo() {
     for disconnect_cancel in [false, true] {
         let now = Instant::now();
@@ -5349,6 +5375,39 @@ fn steam_lifetime_policy_closes_the_application_on_authenticated_disconnect() {
             assert_eq!(record.stage, Stage::Cleanup);
         } else { assert!(matches!(record.stage, Stage::VerifyPaused | Stage::ReleasePausedHistory)); }
     }
+}
+
+#[test]
+fn retired_stream_failure_preserves_the_application_until_pause_is_verified() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    poll_until_reply(&mut controller, &mut broker, now);
+    controller.reply_delivered(10, now);
+    let record = controller.records.values_mut().next().unwrap();
+    record.lifecycle_required = true;
+    record.lifecycle_session_target = serde_json::from_value(json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1})).ok();
+    let id = record.id;
+    let ticket = record.rtsp_ticket.unwrap();
+    let mut payload = broker.response("amaterasu.rtsp/1", &json!({"action":"status","ticket":ticket}));
+    payload["lifecycle_session_target"] = json!(record.lifecycle_session_target);
+    payload["state"] = json!("failed");
+    payload["failure"] = json!("stream_failed");
+    payload["authenticated_disconnect_reason"] = Value::Null;
+    payload["lifecycle_retired"] = json!(true);
+    payload["lifecycle_intent"] = json!("initial");
+    let job = workflow::Job {record:id, phase:workflow::Phase::MonitorRtsp,
+        call:call::Call::new("unused",json!({}),"unused".into(),1000), deadline:now+Duration::from_secs(5)};
+    controller.consume(&job, payload, now, &mut Vec::new());
+    let record = &controller.records[&id];
+    assert!(matches!(record.stage, Stage::VerifyPaused | Stage::ReleasePausedHistory));
+    assert_eq!(controller.current_game(&peer(1)), 1);
+    let verify = workflow::Job { record:id, phase:workflow::Phase::VerifyPaused,
+        call:call::Call::new("unused",json!({}),"unused".into(),1000), deadline:now+Duration::from_secs(5)};
+    controller.consume(&verify, json!({"status":"ok","host_epoch":"epoch","sessions":[{"session_id":"session","generation":1,"phase":"paused"}]}), now, &mut Vec::new());
+    assert_eq!(controller.records[&id].state, State::Paused);
+    assert_eq!(controller.current_game(&peer(1)), 1);
 }
 
 #[test]

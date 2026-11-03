@@ -64,6 +64,9 @@ pub struct Record {
     pub resource: Option<String>,
     #[serde(skip)]
     pub target: Option<LaunchTarget>,
+    /// The preflight lifetime policy remains stable after the target is retired.
+    #[serde(skip)]
+    pub terminal_stop_on_stream_end: Option<bool>,
     #[serde(skip)]
     pub output: Option<String>,
     /// Launch-time global preparation snapshot retained for idempotency and retries.
@@ -145,7 +148,13 @@ impl Record {
         response
     }
     fn stop_on_stream_end(&self) -> bool {
-        matches!(&self.target, Some(crate::protocol::LaunchTarget::Executable(executable)) if executable.steam_id.is_some())
+        self.terminal_stop_on_stream_end.unwrap_or_else(|| {
+            matches!(&self.target, Some(crate::protocol::LaunchTarget::Executable(executable)) if executable.steam_id.is_some())
+        })
+    }
+    pub fn retire_target(&mut self) {
+        self.terminal_stop_on_stream_end = Some(self.stop_on_stream_end());
+        self.target = None;
     }
     pub fn preflight_response(&self) -> Value {
         json!({"ok":true,"preflight_token":self.preflight_token,"stop_on_stream_end":self.stop_on_stream_end(),"app_id":self.app_id,"catalog_revision":self.catalog_revision,"config_overrides":self.config_overrides.clone().unwrap_or_default(),"application_display_overrides":self.application_display_overrides,"application_display_settings":self.application_display_settings,"executable_path":self.executable_path,"cleanup_budget_ms":self.cleanup_budget_ms})
@@ -293,6 +302,7 @@ impl Records {
                 preparation_operation: format!("{key}.preparation"),
                 resource,
                 target: None,
+                terminal_stop_on_stream_end: None,
                 output: None,
                 global_preparation,
                 legacy_global_preparation,
@@ -411,7 +421,7 @@ impl Records {
         record.state = State::Cancelled;
         record.preflight_ready = false;
         record.display_admission = None;
-        record.target = None;
+        record.retire_target();
         Ok(())
     }
 

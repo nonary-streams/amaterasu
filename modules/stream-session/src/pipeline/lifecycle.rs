@@ -813,6 +813,9 @@ impl Pipeline {
                     }
                     if record.config.display_request.is_some()
                         && (record.display_lease.is_none() || !record.display_status_verified)
+                        && !(super::virtual_display::is_read_only_policy(record)
+                            && record.display_applied
+                            && record.display_state == "applied")
                     {
                         return Err("display_lease_missing");
                     }
