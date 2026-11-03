@@ -338,6 +338,9 @@ pub struct ProviderRequest {
     pub intent: Option<StreamIntent>,
     pub reason: Option<ReleaseReason>,
     pub requested_video: Option<VideoMode>,
+    /// Coordinator-selected capture mode; the client output mode remains `requested_video`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_video_mode: Option<VideoMode>,
     pub consumer_requirements: ConsumerRequirements,
     pub remaining_ms: u64,
     pub plan_revision: Option<u64>,
@@ -347,6 +350,27 @@ pub struct ProviderRequest {
     pub dependency_inputs: Vec<ResourceOutput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub control_results: Vec<ConfirmedControl>,
+}
+
+/// Request one selected provider's immutable settings for an exact session or stream.
+/// Access also requires a signed installed per-caller provider grant.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenProviderSettingsRequest {
+    pub operation: String,
+    pub target: LifecycleTarget,
+    pub provider: String,
+}
+
+/// Effective provider settings captured during lifecycle preparation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrozenProviderSettingsResponse {
+    pub status: String,
+    pub target: LifecycleTarget,
+    pub provider: String,
+    pub revision: String,
+    pub settings: Value,
 }
 
 /// Read-only context for an exact lifecycle operation dispatched to
@@ -659,6 +683,18 @@ pub fn validate_provider_request(request: &ProviderRequest) -> Result<(), String
             > 12 * 1024
     {
         return Err("invalid provider request".into());
+    }
+    if let Some(source) = &request.source_video_mode {
+        let output = request
+            .requested_video
+            .as_ref()
+            .ok_or("source mode requires requested video")?;
+        if source.width != output.width
+            || source.height != output.height
+            || source.refresh_millihz != output.refresh_millihz
+        {
+            return Err("source mode geometry differs from output".into());
+        }
     }
     if request.dependency_inputs.len() > 32
         || request.control_results.len() > 32
@@ -1362,6 +1398,41 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn source_video_range_is_independent_but_geometry_is_bound_to_output() {
+        let mut request: ProviderRequest = serde_json::from_value(json!({
+            "version":2,"provider_sequence":1,"operation":"resource_plan",
+            "transition_id":"transition","operation_id":"operation",
+            "target":{"kind":"session","host_epoch":"epoch","session_id":"session","generation":1},
+            "phase":"session.prepare","settings_revision":"revision","settings":{},
+            "intent":null,"reason":null,
+            "requested_video":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":true},
+            "consumer_requirements":{"execution_domain":"seat","capture_providers":[],"selector_schemas":[]},
+            "remaining_ms":1000,"plan_revision":null,"admission_id":null,"approved_plan":null
+        })).unwrap();
+        assert!(validate_provider_request(&request).is_ok());
+        assert!(
+            serde_json::to_value(&request)
+                .unwrap()
+                .get("source_video_mode")
+                .is_none()
+        );
+        request.source_video_mode = Some(VideoMode {
+            width: 1920,
+            height: 1080,
+            refresh_millihz: 60000,
+            hdr: false,
+        });
+        assert!(validate_provider_request(&request).is_ok());
+        request.source_video_mode.as_mut().unwrap().width = 1280;
+        assert!(validate_provider_request(&request).is_err());
+        request.source_video_mode.as_mut().unwrap().width = 1920;
+        request.source_video_mode.as_mut().unwrap().refresh_millihz = 59940;
+        assert!(validate_provider_request(&request).is_err());
+        request.requested_video = None;
+        assert!(validate_provider_request(&request).is_err());
+    }
+
+    #[test]
     fn authorized_launch_environment_contributions_merge_without_conflicts() {
         let base = std::collections::BTreeMap::from([
             ("PATH".into(), "/bin".into()),
@@ -1787,6 +1858,7 @@ mod tests {
             intent: None,
             reason: None,
             requested_video: None,
+            source_video_mode: None,
             consumer_requirements: ConsumerRequirements {
                 execution_domain: "desktop".into(),
                 capture_providers: vec!["capture".into()],

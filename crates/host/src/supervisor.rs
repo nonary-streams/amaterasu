@@ -29,12 +29,13 @@ pub(crate) fn select_active(root: &Path) -> PackageResult<String> {
 
     let selection_path = root.join("selection.json");
     let mut selection: ActivationState = read_json(&selection_path)?;
-    recover_interrupted_trial(&selection_path, &mut selection)?;
-
-    if !bootstrap.development && selection.pending.is_some() {
+    if !bootstrap.development && (selection.pending.is_some() || selection.trial.is_some()) {
         return Err(
             "production package activation must be completed by authenticated provisioning".into(),
         );
+    }
+    if bootstrap.development {
+        recover_interrupted_trial(&selection_path, &mut selection)?;
     }
 
     if bootstrap.development
@@ -324,6 +325,70 @@ impl ProbeMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use amaterasu_contracts::RuntimeConfig;
+    use amaterasu_package::random_identifier;
+    use std::collections::BTreeMap;
+    use std::fs;
+
+    fn recovery_fixture(development: bool, selection: &ActivationState) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-supervisor-trial-recovery-{}",
+            random_identifier().unwrap()
+        ));
+        fs::create_dir(&root).unwrap();
+        write_json_atomically(
+            &root.join("bootstrap.json"),
+            &BootstrapConfig {
+                development,
+                allow_unsigned: false,
+                trusted_keys: BTreeMap::new(),
+                policy: RuntimeConfig::default(),
+            },
+        )
+        .unwrap();
+        write_json_atomically(&root.join("selection.json"), selection).unwrap();
+        root
+    }
+
+    #[test]
+    fn production_rejects_interrupted_transitions_without_erasing_evidence() {
+        for (pending, trial) in [(true, false), (false, true), (true, true)] {
+            let selection = ActivationState {
+                active: Some("a".repeat(64)),
+                pending: pending.then(|| "b".repeat(64)),
+                trial: trial.then(|| "b".repeat(64)),
+                ..ActivationState::default()
+            };
+            let root = recovery_fixture(false, &selection);
+            let path = root.join("selection.json");
+            let before = fs::read(&path).unwrap();
+            let error = select_active(&root).unwrap_err();
+            assert!(error.contains("authenticated provisioning"), "{error}");
+            assert_eq!(fs::read(&path).unwrap(), before);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn development_recovers_an_interrupted_trial() {
+        let root = recovery_fixture(
+            true,
+            &ActivationState {
+                pending: Some("b".repeat(64)),
+                trial: Some("b".repeat(64)),
+                ..ActivationState::default()
+            },
+        );
+        assert!(
+            select_active(&root)
+                .unwrap_err()
+                .contains("no active or pending")
+        );
+        let recovered: ActivationState = read_json(&root.join("selection.json")).unwrap();
+        assert!(recovered.pending.is_none());
+        assert!(recovered.trial.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn legitimate_progress_extends_the_inactivity_deadline() {

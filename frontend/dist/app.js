@@ -1816,6 +1816,8 @@ var Amaterasu;
                 forbidden: "This account cannot perform that action.",
                 rate_limited: "Too many sign-in attempts. Wait a minute before trying again.",
                 revision_conflict: "This data changed elsewhere. Refresh before saving again.",
+                activation_unavailable: "Plugin activation is not enabled on this host. Update the host and complete its activation setup.",
+                activation_in_progress: "A plugin activation is already in progress.",
                 not_registered: "No settings schema has been registered for this console.",
             };
             return new ApiError(messages[code] ??
@@ -10198,6 +10200,158 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
+    function parseRtxHdrStatus(value) {
+        if (!value || typeof value !== "object" || Array.isArray(value))
+            throw new Error("RTX HDR status is invalid.");
+        const status = value;
+        const phases = ["idle", "downloading", "verifying", "installing", "ready", "failed", "cancelled", "activating", "waiting_stream"];
+        if (status.ok !== true || typeof status.phase !== "string" || !phases.includes(status.phase) ||
+            !Number.isSafeInteger(status.transferred_bytes) || status.transferred_bytes < 0 ||
+            (status.total_bytes !== null && (!Number.isSafeInteger(status.total_bytes) || status.total_bytes < 0)) ||
+            (status.error !== null && typeof status.error !== "string") ||
+            typeof status.restart_required !== "boolean" || typeof status.supported !== "boolean" || typeof status.runtime_ready !== "boolean" ||
+            typeof status.package_ready !== "boolean" ||
+            (status.provider_active !== null && typeof status.provider_active !== "boolean"))
+            throw new Error("RTX HDR status is invalid.");
+        return status;
+    }
+    Amaterasu.parseRtxHdrStatus = parseRtxHdrStatus;
+    async function rtxHdrSettingsAvailable(context) {
+        let after = null;
+        let revision = null;
+        const seen = new Set();
+        let count = 0;
+        do {
+            const page = await context.api.post("session-extensions/list", { after, limit: 32, revision });
+            if (!Array.isArray(page.items) || (page.next !== null && typeof page.next !== "string") ||
+                !Number.isSafeInteger(page.revision) || page.revision < 0 || (revision !== null && page.revision !== revision))
+                throw new Error("Invalid plugin settings discovery response.");
+            revision = page.revision;
+            count += page.items.length;
+            if (count > 1024)
+                throw new Error("Too many plugin settings providers.");
+            if (page.items.some((descriptor) => descriptor.provider === "amaterasu.rtx-hdr" &&
+                Array.isArray(descriptor.options) && descriptor.options.some((option) => Array.isArray(option.allowed_scopes) && option.allowed_scopes.includes("host"))))
+                return true;
+            after = page.next;
+            if (after && seen.has(after))
+                throw new Error("Plugin settings cursor repeated.");
+            if (after)
+                seen.add(after);
+        } while (after);
+        return false;
+    }
+    function renderRtxHdrIntegration(context, area) {
+        let generation = 0;
+        let timer;
+        let settingsAvailable;
+        let awaitingRestart = false;
+        const statusArea = Amaterasu.el("div", "integration-status");
+        const actions = Amaterasu.el("div", "actions");
+        const statusMessage = Amaterasu.el("div");
+        const card = Amaterasu.el("section", "panel integration-card", Amaterasu.el("h2", "", "RTX HDR"), Amaterasu.el("p", "muted", "Convert supported SDR streams to HDR using NVIDIA RTX. The runtime is downloaded only when installed."), statusArea, actions, statusMessage);
+        area.replaceChildren(card);
+        function schedule() {
+            if (timer !== undefined)
+                window.clearTimeout(timer);
+            timer = window.setTimeout(() => { if (card.isConnected)
+                void refresh(); }, 1500);
+        }
+        async function refresh() {
+            const request = ++generation;
+            try {
+                if (awaitingRestart)
+                    settingsAvailable = undefined;
+                const [reply, descriptorAvailable] = await Promise.all([
+                    context.api.post("rtx-hdr/status", {}),
+                    settingsAvailable ??= rtxHdrSettingsAvailable(context).catch(() => false),
+                ]);
+                const status = parseRtxHdrStatus(reply);
+                if (descriptorAvailable || status.phase === "failed")
+                    awaitingRestart = false;
+                if (!card.isConnected || request !== generation)
+                    return;
+                const activating = status.phase === "activating";
+                const waiting = status.phase === "waiting_stream";
+                const busy = ["downloading", "verifying", "installing"].includes(status.phase);
+                const label = !status.supported ? "Unsupported" : (status.provider_active || descriptorAvailable) ? "Available" :
+                    status.phase === "failed" ? "Preparation failed" : status.phase === "cancelled" ? "Preparation cancelled" :
+                        status.phase === "downloading" ? "Downloading" : status.phase === "verifying" ? "Verifying" :
+                            status.phase === "installing" ? "Preparing plugin" : waiting ? "Waiting for stream to end" : activating ? "Activating" : status.package_ready ? "Plugin package staged" :
+                                status.runtime_ready ? "Runtime installed" : "Not installed";
+                const detail = !status.supported ? "RTX HDR runtime installation is unavailable on this platform." :
+                    (status.provider_active || descriptorAvailable) ? "The RTX HDR provider is loaded. Configure it to enable conversion." : waiting ?
+                        "The current stream continues unchanged. Activation waits for the stream and game session to end. Cancel activation to resume a paused game." : activating ?
+                        "The host is checking the plugin and restarting the service before the next stream." : status.package_ready ?
+                        "The runtime and verified plugin package are staged. Activation waits for the current stream and game session to end." :
+                        status.runtime_ready ? "The runtime is installed. The plugin package has not been staged." :
+                            "Prepare the NVIDIA runtime and plugin package to make RTX HDR available.";
+                const progress = status.phase === "downloading" ? (status.total_bytes && status.total_bytes > 0 ?
+                    `Downloaded ${Math.min(100, Math.floor(status.transferred_bytes * 100 / status.total_bytes))}%.` :
+                    `Downloaded ${status.transferred_bytes} bytes.`) : "";
+                statusArea.replaceChildren(Amaterasu.badge(label, status.phase === "failed" ? "bad" : ""), Amaterasu.el("p", "muted", detail), ...(progress ? [Amaterasu.el("p", "muted", progress)] : []), ...(status.error ? [Amaterasu.el("p", "muted", Amaterasu.literalText(status.error === "runtime_verification_failed"
+                        ? "The installed runtime failed verification and cannot be used. Repair requires an administrator."
+                        : status.error === "activation_failed" ? "The host could not activate the plugin. The previous package was retained; check the host logs and try again."
+                            : status.error === "runtime_install_failed" ? "The runtime could not be installed. Try again."
+                                : status.error === "rtx_hdr_package_unavailable" ? "The verified RTX HDR package could not be prepared. Check the approved repositories and connection, then try again." : status.error))] : []), ...(status.restart_required ? [Amaterasu.el("p", "muted", "Restart required to apply the selected configuration.")] : []));
+                const canWrite = context.api.allows("configuration.write");
+                const action = Amaterasu.button(waiting ? "Cancel activation" : busy ? "Cancel installation" : "Prepare RTX HDR", () => {
+                    void Amaterasu.runAction(action, statusMessage, async () => {
+                        await context.api.post((busy || waiting) ? "rtx-hdr/cancel" : "rtx-hdr/install", {});
+                        if (waiting)
+                            awaitingRestart = false;
+                        await refresh();
+                    });
+                });
+                action.disabled = !status.supported || !canWrite || activating || status.phase === "verifying" || (!busy && !waiting && (status.package_ready || status.error === "runtime_verification_failed"));
+                actions.replaceChildren(action);
+                if (status.package_ready && !status.provider_active && !descriptorAvailable) {
+                    const activate = Amaterasu.button("Activate RTX HDR", () => {
+                        void Amaterasu.runAction(activate, statusMessage, async () => {
+                            awaitingRestart = true;
+                            try {
+                                await context.api.post("rtx-hdr/activate", {});
+                            }
+                            catch (error) {
+                                if (error instanceof Amaterasu.ApiError)
+                                    awaitingRestart = false;
+                                throw error;
+                            }
+                            finally {
+                                await refresh();
+                            }
+                        });
+                    });
+                    activate.disabled = !canWrite || busy || activating || waiting || awaitingRestart;
+                    actions.append(activate);
+                }
+                if (status.provider_active || descriptorAvailable) {
+                    const settings = Amaterasu.button("Configure", () => Amaterasu.showSessionExtensionSettings(context, { kind: "host" }, "RTX HDR settings", "amaterasu.rtx-hdr"));
+                    settings.disabled = !context.api.allows("configuration.read");
+                    actions.append(settings);
+                }
+                if (busy || waiting || activating || awaitingRestart)
+                    schedule();
+            }
+            catch (error) {
+                if (card.isConnected && request === generation) {
+                    actions.replaceChildren();
+                    statusArea.replaceChildren(Amaterasu.errorPanel(error, () => { void refresh(); }));
+                    if (awaitingRestart)
+                        schedule();
+                }
+            }
+        }
+        statusArea.replaceChildren(Amaterasu.el("p", "muted", "Loading RTX HDR status…"));
+        if (context.api.allows("configuration.read"))
+            void refresh();
+        else
+            statusArea.replaceChildren(Amaterasu.el("p", "muted", "This account cannot read RTX HDR status."));
+    }
+    Amaterasu.renderRtxHdrIntegration = renderRtxHdrIntegration;
+})(Amaterasu || (Amaterasu = {}));
+var Amaterasu;
+(function (Amaterasu) {
     function providerRecord(value) {
         if (!value || typeof value !== "object" || Array.isArray(value))
             throw new Error("Provider status is invalid.");
@@ -10277,9 +10431,11 @@ var Amaterasu;
             { name: "playnite", label: "Playnite", description: "Sync a Playnite library and provider-managed applications.", scope: "configuration.read" },
         ];
         let generation = 0;
-        context.content.append(Amaterasu.sectionHeading("Integrations", "Connect and manage application providers on this host.", Amaterasu.button("Refresh", load)), area);
+        const rtxHdrArea = Amaterasu.el("div");
+        context.content.append(Amaterasu.sectionHeading("Integrations", "Connect and manage integrations on this host.", Amaterasu.button("Refresh", load)), rtxHdrArea, area);
         async function load() {
             const request = ++generation;
+            Amaterasu.renderRtxHdrIntegration(context, rtxHdrArea);
             const cards = providers.map((provider) => {
                 const status = Amaterasu.el("div", "integration-status", Amaterasu.el("p", "muted", "Loading provider status…"));
                 const settings = Amaterasu.button("Configure", () => context.navigate("settings/integrations"));
@@ -16288,7 +16444,7 @@ var Amaterasu;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
-    function showSessionExtensionSettings(context, scope, title) {
+    function showSessionExtensionSettings(context, scope, title, provider) {
         if (!context.content.isConnected)
             return;
         const area = Amaterasu.el("div");
@@ -16310,10 +16466,10 @@ var Amaterasu;
         dialog.addEventListener("cancel", (event) => { event.preventDefault(); close(); });
         document.body.append(dialog);
         dialog.showModal();
-        renderSessionExtensionSettings(context, area, scope);
+        renderSessionExtensionSettings(context, area, scope, provider);
     }
     Amaterasu.showSessionExtensionSettings = showSessionExtensionSettings;
-    function renderSessionExtensionSettings(context, area, scope = { kind: "host" }) {
+    function renderSessionExtensionSettings(context, area, scope = { kind: "host" }, provider) {
         let generation = 0;
         async function load() {
             const current = ++generation;
@@ -16338,7 +16494,7 @@ var Amaterasu;
                     if (descriptors.length > 1024)
                         throw new Error("Too many extensions.");
                 } while (after);
-                const scopedDescriptors = descriptors.filter((descriptor) => Array.isArray(descriptor.options) && descriptor.options.some((option) => Array.isArray(option.allowed_scopes) && option.allowed_scopes.includes(scope.kind)));
+                const scopedDescriptors = descriptors.filter((descriptor) => (!provider || descriptor.provider === provider) && Array.isArray(descriptor.options) && descriptor.options.some((option) => Array.isArray(option.allowed_scopes) && option.allowed_scopes.includes(scope.kind)));
                 const settings = await Promise.all(scopedDescriptors.map((descriptor) => context.api.post("session-extensions/settings_get", { provider: descriptor.provider, scope })));
                 if (current !== generation || !context.content.isConnected || !area.isConnected)
                     return;
@@ -16405,7 +16561,7 @@ var Amaterasu;
                     panels.push(Amaterasu.panel(Amaterasu.literalText(descriptor.display_name || "Plugin settings"), form));
                 });
                 for (const descriptor of descriptors) {
-                    if (scope.kind !== "host")
+                    if (scope.kind !== "host" || (provider && descriptor.provider !== provider))
                         continue;
                     if (!Array.isArray(descriptor.actions))
                         throw new Error("Invalid extension actions response.");

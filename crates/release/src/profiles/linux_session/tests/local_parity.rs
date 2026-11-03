@@ -128,8 +128,20 @@ fn every_call_targets_a_provider_the_caller_depends_on() {
         let closure = dependency_closure(caller.id);
         for service in caller.calls {
             // This service is supplied by the host, not by a loadable component.
-            if *service == "amaterasu.host-logs/1" {
-                assert_eq!(caller.id, "amaterasu.management");
+            if matches!(
+                *service,
+                "amaterasu.host-logs/1"
+                    | "amaterasu.host-package-activation/1"
+                    | "amaterasu.host-package-barrier/1"
+            ) {
+                if *service == "amaterasu.host-package-barrier/1" {
+                    assert!(matches!(
+                        caller.id,
+                        "amaterasu.stream-session" | "amaterasu.nvhttp"
+                    ));
+                } else {
+                    assert_eq!(caller.id, "amaterasu.management");
+                }
                 continue;
             }
             // These are callback edges. Making them startup dependencies would
@@ -286,7 +298,12 @@ fn policy_grants_each_component_exactly_what_its_manifest_requests() {
             continue;
         }
         let granted = &policy.principals[component.id];
-        let requested = component.grants();
+        let mut requested = component.grants();
+        if component.id == "amaterasu.management" {
+            requested
+                .call
+                .remove(amaterasu_contracts::HOST_PACKAGE_ACTIVATION_SERVICE);
+        }
         assert_eq!(granted.call, requested.call, "{}", component.id);
         assert_eq!(granted.provide, requested.provide, "{}", component.id);
         assert_eq!(granted.native_use, requested.native_use, "{}", component.id);
@@ -649,6 +666,7 @@ fn nvhttp_chain_grants_match_the_agreed_services_exactly() {
     assert_eq!(
         component(NVHTTP_ID).grants().call,
         expected(&[
+            "amaterasu.host-package-barrier/1",
             "amaterasu.configuration/1",
             "amaterasu.session-lifecycle/1",
             "amaterasu.extension-registry/1",
@@ -705,6 +723,7 @@ fn nvhttp_chain_grants_match_the_agreed_services_exactly() {
     assert_eq!(
         component(STREAM_SESSION_ID).grants().call,
         expected(&[
+            "amaterasu.host-package-barrier/1",
             "amaterasu.session-lifecycle/1",
             "amaterasu.extension-registry/1",
             "nonary.frame-limiter/1",
@@ -769,8 +788,14 @@ fn effect_bearing_settings_default_to_disabled() {
     // Compute-only components are on so a client can read the codec snapshot.
     assert_eq!(settings["amaterasu.encode"]["enabled"], true);
     assert_eq!(settings["amaterasu.audio-encode"]["enabled"], true);
-    // The management listener is configured when the root is initialised.
-    assert!(!settings.contains_key("amaterasu.management"));
+    // The private runtime parent is data-only; the listener is configured at initialization.
+    assert!(settings["amaterasu.management"]["rtx_hdr_runtime_parent"].is_string());
+    assert!(settings["amaterasu.management"].get("enabled").is_none());
+    assert!(
+        !policy.principals["amaterasu.management"]
+            .call
+            .contains(amaterasu_contracts::HOST_PACKAGE_ACTIVATION_SERVICE)
+    );
     assert!(!settings.contains_key("amaterasu.upnp"));
     assert!(!settings.contains_key("amaterasu.updater"));
 }
@@ -814,6 +839,7 @@ fn each_effect_option_enables_only_its_own_setting() {
                     "amaterasu.state",
                     "amaterasu.session-history",
                     "amaterasu.session-lifecycle",
+                    "amaterasu.management",
                 ]
                 .contains(&key.as_str())
             })

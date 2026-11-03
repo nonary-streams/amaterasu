@@ -62,6 +62,25 @@ impl RuntimeClient {
             },
         )
     }
+    /// Request the frozen settings of an explicitly granted provider for an
+    /// exact ready session or stream. The broker and lifecycle coordinator
+    /// authenticate the consumer and its installed provider-specific grant.
+    pub fn request_frozen_provider_settings(
+        &self,
+        options: RequestOptions<'_>,
+        target: crate::extension_api::LifecycleTarget,
+        provider: &str,
+    ) -> ModuleResult<u64> {
+        self.request_serialized(
+            options,
+            &crate::extension_api::FrozenProviderSettingsRequest {
+                operation: "read_frozen_provider_settings".into(),
+                target,
+                provider: provider.into(),
+            },
+        )
+    }
+
     /// Queue a read of the generic context for a dispatched lifecycle
     /// operation while its transition remains pending. The caller needs a broker grant, and the
     /// coordinator still authenticates the exact provider request.

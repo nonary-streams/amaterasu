@@ -49,6 +49,153 @@ fn arm_lifecycle(host: &mut Harness) -> (u64, Value) {
 }
 
 #[test]
+fn processing_plan_uses_frozen_settings_and_rejects_source_mismatch() {
+    for (enabled, source_hdr, output_hdr, bad_revision, omit_ranges, expected_open) in [
+        (false, false, false, false, false, true),
+        (false, false, true, false, false, false),
+        (true, false, true, false, false, true),
+        (true, true, true, false, false, false),
+        (true, false, false, false, false, false),
+        (true, false, true, true, false, false),
+        (true, false, true, false, true, false),
+    ] {
+        let mut host = Harness::new();
+        host.pipeline
+            .settings
+            .allowed_principals
+            .push("amaterasu.rtsp".into());
+        host.pipeline.settings.processing_plan = Some(crate::model::ProcessingPlanProvider {
+            provider: "example.gpu".into(),
+            control_service: "example.processing-control/1".into(),
+            processor_service: "example.gpu/1".into(),
+            omit_disabled: false,
+        });
+        host.broker.lifecycle_success = true;
+        host.broker.processing_plan_enabled = enabled;
+        host.broker.processing_plan_source_hdr = source_hdr;
+        host.broker.processing_plan_bad_revision = bad_revision;
+        host.broker.processing_plan_omit_ranges = omit_ranges;
+        let mut request = prepare();
+        request["video"]["codecs"] = json!(["h264", "hevc"]);
+        request["lifecycle_session_target"] =
+            json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1});
+        let id = host.response_from(1, "amaterasu.rtsp", request)["session"]
+            .as_u64()
+            .unwrap();
+        let mut launch = arm(id);
+        launch["configuration"]["capture_provider"] = json!("pipewire");
+        launch["configuration"]["lifecycle_target"] = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1});
+        launch["configuration"]["lifecycle_candidate"] = json!({"capture_provider":"amaterasu.capture-pipewire/1","selector_schema":"amaterasu.kwin-wl-output/1","selector":{"output":"kwin:Virtual-12"},"resource":{"provider":"provider","resource_id":"r","incarnation":"i","revision":1,"execution_domain":"seat","mutation_domain":null},"mode":{"width":1280,"height":720,"refresh_millihz":60000,"hdr":false},"plan_revision":1,"geometry_revision":1,"generation":1});
+        launch["configuration"]["configuration"]["video_stream_format"] = json!({"codec":"hevc","bit_depth":10,"dynamic_range":if output_hdr {"hdr"} else {"sdr"}});
+        assert_eq!(
+            host.response_from(2, "amaterasu.rtsp", launch)["state"],
+            "armed"
+        );
+        host.idle();
+        assert!(host.broker.commands.iter().any(|command| matches!(command,
+            Command::CallApi { service, method, interface_major: 1, interface_minor: 0, .. }
+                if service == "example.processing-control/1" && method == "processing_intent"
+        )));
+        let open =
+            host.broker.calls.iter().find(|call| {
+                call.service == "amaterasu.video/1" && call.payload["action"] == "open"
+            });
+        assert_eq!(
+            open.is_some(),
+            expected_open,
+            "enabled={enabled} source={source_hdr} output={output_hdr} bad_revision={bad_revision} omit_ranges={omit_ranges}"
+        );
+        if let Some(open) = open {
+            assert_eq!(
+                open.payload["configuration"]["gpu_processing"],
+                json!({
+                    "service":"example.gpu/1","enabled":enabled,"settings":{"test_control":42},
+                    "source_hdr_required":false
+                })
+            );
+        }
+    }
+}
+
+#[test]
+fn external_capture_receives_source_requirement_from_frozen_processing_plan() {
+    for (enabled, hdr_output, omit_disabled, selected) in [
+        (false, false, false, true),
+        (false, false, true, false),
+        (false, true, true, true),
+        (true, true, true, true),
+    ] {
+        let mut host = Harness::new();
+        host.pipeline
+            .settings
+            .allowed_principals
+            .push("amaterasu.rtsp".into());
+        host.pipeline.settings.processing_plan = Some(crate::model::ProcessingPlanProvider {
+            provider: "example.gpu".into(),
+            control_service: "example.processing-control/1".into(),
+            processor_service: "example.gpu/1".into(),
+            omit_disabled,
+        });
+        host.broker.lifecycle_success = true;
+        host.broker.processing_plan_enabled = enabled;
+        let mut request = prepare();
+        request["video"]["codecs"] = json!(["h264", "hevc"]);
+        request["lifecycle_capture_mode"] = json!("external");
+        request["lifecycle_session_target"] =
+            json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1});
+        let id = host.response_from(1, "amaterasu.rtsp", request)["session"]
+            .as_u64()
+            .unwrap();
+        let mut launch = arm(id);
+        launch["configuration"]["lifecycle_capture_mode"] = json!("external");
+        launch["configuration"]["lifecycle_target"] = json!({"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1});
+        launch["configuration"]["configuration"]["video_stream_format"] = json!({"codec":"hevc","bit_depth":10,"dynamic_range":if hdr_output {"hdr"} else {"sdr"}});
+        assert_eq!(
+            host.response_from(2, "amaterasu.rtsp", launch)["state"],
+            "armed"
+        );
+        host.idle();
+        let open = host
+            .broker
+            .calls
+            .iter()
+            .find(|call| call.service == "amaterasu.video/1" && call.payload["action"] == "open")
+            .expect("video opened");
+        let selection = open.payload["configuration"].get("gpu_processing");
+        assert_eq!(selection.is_some(), selected);
+        if let Some(selection) = selection {
+            assert_eq!(selection["enabled"], enabled);
+            // With conversion disabled, the source must match the output.
+            assert_eq!(
+                selection["source_hdr_required"],
+                if enabled { false } else { hdr_output }
+            );
+        }
+    }
+}
+
+#[test]
+fn selected_processing_rejects_legacy_stream_without_frozen_authority() {
+    let mut host = Harness::new();
+    host.pipeline.settings.processing_plan = Some(crate::model::ProcessingPlanProvider {
+        provider: "example.gpu".into(),
+        control_service: "example.processing-control/1".into(),
+        processor_service: "example.gpu/1".into(),
+        omit_disabled: false,
+    });
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    let response = host.response(2, start(id));
+    assert_eq!(response["code"], "processing_lifecycle_required");
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == "amaterasu.video/1")
+    );
+}
+
+#[test]
 fn external_lifecycle_keeps_capture_and_input_and_retires_after_native_close() {
     for input in [false, true] {
         let mut host = Harness::new();

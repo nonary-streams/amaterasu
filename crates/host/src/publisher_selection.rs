@@ -1,5 +1,5 @@
 //! Bind a staged native digest to the publisher approved at selection time.
-//! Production authorization of repository native code is intentionally absent.
+//! Production selections additionally require a healthy, pinned signed set.
 use amaterasu_package::{
     ActivationState, BootstrapConfig, PackageResult, VerificationPolicy, VerifiedPackage,
     package_directory, read_json, repository::RepositoryStore, unix_timestamp,
@@ -49,13 +49,26 @@ pub fn with_verified_selected<T>(
         {
             return Err("repository native set lacks explicit activation authorization".into());
         }
-        if !bootstrap.development {
-            return Err("production repository native activation is not authorized".into());
+        if !bootstrap.development
+            && (purpose != SelectionPurpose::Worker
+                || selection.active.as_deref() != Some(digest)
+                || selection.pending.is_some()
+                || selection.trial.is_some()
+                || !selection.healthy_sets.contains(digest))
+        {
+            return Err("production repository set is not a healthy active selection".into());
         }
         let store = RepositoryStore::new(root.join("repositories"))?;
         return store.with_active_approval(&source.repository_id, |approved| {
             if approved.fingerprint != source.key_fingerprint {
                 return Err("selected native publisher fingerprint changed".into());
+            }
+            if !bootstrap.development
+                && bootstrap.trusted_keys.get(&approved.fingerprint) != Some(&approved.public_key)
+            {
+                return Err(
+                    "selected native publisher is not trusted by the production host".into(),
+                );
             }
             let floor = selection
                 .repository_floors
@@ -82,7 +95,8 @@ pub fn with_verified_selected<T>(
                 return Err("selected repository native set lacks accepted provenance".into());
             }
             if purpose == SelectionPurpose::Worker
-                && (selection.pending.as_deref() == Some(digest)
+                && (!bootstrap.development
+                    || selection.pending.as_deref() == Some(digest)
                     || selection.trial.as_deref() == Some(digest))
                 && (package.manifest.sequence != floor.sequence || package.digest != floor.digest)
             {
@@ -214,6 +228,20 @@ mod tests {
         let mut production = bootstrap.clone();
         production.development = false;
         assert!(verify_selected(&root, &digest, &production, &mut |_, _| Ok(())).is_err());
+        let approved = store.approved("synthetic").unwrap();
+        production
+            .trusted_keys
+            .insert(approved.fingerprint.clone(), approved.public_key.clone());
+        selection.pending = None;
+        selection.active = Some(digest.clone());
+        write_json_atomically(&root.join("selection.json"), &selection).unwrap();
+        assert!(verify_selected(&root, &digest, &production, &mut |_, _| Ok(())).is_err());
+        selection.healthy_sets.insert(digest.clone());
+        write_json_atomically(&root.join("selection.json"), &selection).unwrap();
+        assert!(verify_selected(&root, &digest, &production, &mut |_, _| Ok(())).is_ok());
+        selection.active = None;
+        selection.pending = Some(digest.clone());
+        write_json_atomically(&root.join("selection.json"), &selection).unwrap();
         selection
             .repository_floors
             .values_mut()

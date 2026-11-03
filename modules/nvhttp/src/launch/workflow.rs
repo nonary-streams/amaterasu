@@ -3550,6 +3550,7 @@ fn virtual_display_mode_policy(
             .map(str::to_owned),
         hdr_option: Some(hdr_option),
         effective_client_hdr_request: Some(record.request.hdr),
+        source_hdr_required: None,
     };
     policy
         .validate()

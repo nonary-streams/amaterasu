@@ -41,6 +41,7 @@ test("integration cards isolate unavailable providers and respect read scopes", 
     vm.runInContext(ts.transpile(readFileSync(source, "utf8"), { target: ts.ScriptTarget.ES2022 }), dom);
     vm.runInContext("Object.assign(globalThis, Amaterasu); globalThis.literalText = value => value; Amaterasu.literalText = value => value;", dom);
   }
+  dom.renderRtxHdrIntegration = dom.Amaterasu.renderRtxHdrIntegration = () => {};
   const content = new Element("main");
   const calls = [];
   const navigation = [];

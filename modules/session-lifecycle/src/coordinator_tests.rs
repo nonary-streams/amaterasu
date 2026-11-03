@@ -487,6 +487,7 @@ fn frozen_action_lineage_survives_restart_and_rejects_tampering() {
         .into(),
     };
     let session = SessionRecord {
+        processing_decision: None,
         resource_generations: BTreeMap::new(),
         provider_graph: Some(graph),
         host_epoch: epoch.clone(),

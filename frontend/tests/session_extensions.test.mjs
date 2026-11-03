@@ -7,7 +7,7 @@ import ts from "typescript";
 const plain = value => JSON.parse(JSON.stringify(value));
 const settle = async () => { for (let i = 0; i < 20; i++) await Promise.resolve(); };
 
-function fixture(scope, write = true, values = { enabled: false }) {
+function fixture(scope, write = true, values = { enabled: false }, provider) {
   class Element {
     children = [];
     listeners = {};
@@ -64,7 +64,7 @@ function fixture(scope, write = true, values = { enabled: false }) {
       return { ok: true, revision: 8 };
     },
   } };
-  runtime.Amaterasu.renderSessionExtensionSettings(context, area, scope);
+  runtime.Amaterasu.renderSessionExtensionSettings(context, area, scope, provider);
   return { area, calls, nodes, editors, pending, errors };
 }
 
@@ -123,4 +123,15 @@ test("editing an inherited application value automatically makes it an override"
   env.nodes.find(node => node.tag === "form").listeners.submit({ preventDefault() {} });
   await Promise.all(env.pending);
   assert.equal(env.calls.find(([route]) => route.endsWith("/settings_update"))[1].values.enabled, true);
+});
+
+
+test("provider filter shows only the selected plugin settings", async () => {
+  const matching = fixture({ kind: "host" }, true, {}, "example.pacing");
+  await settle();
+  assert.equal(matching.editors.length, 2);
+  const other = fixture({ kind: "host" }, true, {}, "amaterasu.rtx-hdr");
+  await settle();
+  assert.equal(other.editors.length, 0);
+  assert.equal(other.calls.some(([route]) => route.endsWith("/settings_get")), false);
 });

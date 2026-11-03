@@ -546,6 +546,7 @@ mod tests {
             dependencies: BTreeMap::from([("owner".into(), vec![])]),
         };
         let session = SessionRecord {
+            processing_decision: None,
             resource_generations: BTreeMap::new(),
             provider_graph: Some(graph.clone()),
             host_epoch: epoch.clone(),

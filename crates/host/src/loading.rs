@@ -116,6 +116,7 @@ fn inject_running_package_digest(
 pub struct LoadedComponents {
     // Fields drop in declaration order: modules must stop before their runtime disappears.
     modules: Vec<FeatureLibrary>,
+    quiesced: bool,
     product_logger: Option<ProductLogger>,
     host_log_service: Option<HostLogService>,
     host_logs_enabled: bool,
@@ -233,6 +234,7 @@ impl LoadedComponents {
         // before their native providers, including progress and endpoint failures.
         let mut loaded = Self {
             modules: Vec::new(),
+            quiesced: false,
             product_logger,
             host_log_service: None,
             host_logs_enabled,
@@ -250,7 +252,10 @@ impl LoadedComponents {
         Ok(loaded)
     }
 
-    fn quiesce(&mut self, budget: std::time::Duration) -> PackageResult<()> {
+    pub(crate) fn quiesce(&mut self, budget: std::time::Duration) -> PackageResult<()> {
+        if self.quiesced {
+            return Ok(());
+        }
         let deadline = std::time::Instant::now() + budget;
         loop {
             let mut ready = true;
@@ -258,6 +263,7 @@ impl LoadedComponents {
                 ready &= module.quiesce()?;
             }
             if ready {
+                self.quiesced = true;
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
@@ -474,6 +480,22 @@ impl LoadedComponents {
 
     pub fn console_endpoint(&mut self) -> PackageResult<HostApi> {
         self.runtime.endpoint("amaterasu.console")
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn take_host_package_activation(
+        &self,
+    ) -> PackageResult<Option<amaterasu_contracts::HostPackageActivation>> {
+        let input = serde_json::to_vec(&Command::HostPackageActivationDrain {})
+            .map_err(|error| error.to_string())?;
+        // SAFETY: the private host endpoint belongs to this live runtime.
+        let output = unsafe { self.lifecycle_endpoint.call(&input) }
+            .map_err(|status| format!("host activation endpoint returned status {status}"))?;
+        match serde_json::from_slice(&output).map_err(|error| error.to_string())? {
+            Response::HostPackageActivation { request } => Ok(request.map(|value| *value)),
+            Response::Error { code, message } => Err(format!("{code}: {message}")),
+            response => Err(format!("unexpected host activation response: {response:?}")),
+        }
     }
 
     pub fn take_host_lifecycle_action(&self) -> PackageResult<Option<HostLifecycleAction>> {

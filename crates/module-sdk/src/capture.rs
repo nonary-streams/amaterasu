@@ -2,6 +2,7 @@
 //! runs on a capture thread. Each channel represents one capture session.
 mod connection;
 mod negotiation;
+mod provenance;
 mod publisher;
 mod subscription;
 
@@ -12,6 +13,7 @@ pub use negotiation::{
     NegotiationError, Ownership, ProviderOffer, Schema, select_delivery,
     select_delivery_with_compatibility,
 };
+pub use provenance::color_provenance;
 pub use publisher::{CaptureFrames, CapturePublisher, PublishError, capture_channel};
 pub use subscription::{CaptureNotice, CaptureNotifications, CaptureSubscription};
 

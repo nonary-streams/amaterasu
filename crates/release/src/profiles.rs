@@ -29,6 +29,8 @@ pub enum PackageProfile {
     DesktopStreamSmoke,
     /// Product Linux session host; effects stay disabled until selected.
     LinuxSession,
+    /// Explicit optional NVIDIA RTX HDR session composition.
+    LinuxSessionRtxHdr,
     /// Explicit session extension composition; requires operator policy.
     LinuxSessionExtensions,
 }
@@ -1615,6 +1617,7 @@ impl PackageProfile {
                 RTSP_DESKTOP_SMOKE,
             ],
             Self::LinuxSession => linux_session::COMPONENTS,
+            Self::LinuxSessionRtxHdr => linux_session::RTX_HDR_COMPONENTS,
             Self::LinuxSessionExtensions => linux_session::EXTENSION_COMPONENTS,
             Self::Platform => &[
                 RUNTIME,

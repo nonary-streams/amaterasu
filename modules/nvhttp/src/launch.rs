@@ -677,6 +677,7 @@ struct PendingResume {
 }
 
 pub struct Controller {
+    package_activation_pending: bool,
     logger: Option<LogEmitter>,
     config: Option<StreamingConfig>,
     session_lifecycle_required: bool,
@@ -723,6 +724,7 @@ impl Controller {
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).map_err(|_| "random_unavailable")?;
         Ok(Self {
+            package_activation_pending: false,
             logger: None,
             config,
             session_lifecycle_required: false,
@@ -1030,6 +1032,9 @@ impl Controller {
         peer: PeerIdentity,
         now: Instant,
     ) -> Option<Reply> {
+        if self.package_activation_pending {
+            return Some(private_error(503, "plugin activation is pending"));
+        }
         let Some(config) = &self.config else {
             return Some(private_error(503, "streaming is disabled"));
         };
@@ -1263,6 +1268,9 @@ impl Controller {
         peer: &PeerIdentity,
         now: Instant,
     ) -> Option<Reply> {
+        if self.package_activation_pending {
+            return Some(private_error(503, "plugin activation is pending"));
+        }
         let Some(config) = &self.config else {
             return Some(private_error(503, "streaming is disabled"));
         };
@@ -1568,6 +1576,13 @@ impl Controller {
             }
         }
         self.job.is_none() && self.records.values().all(|record| record.state.terminal())
+    }
+
+    pub fn package_activation_barrier(&mut self, pending: bool) -> bool {
+        self.package_activation_pending = pending;
+        self.job.is_none()
+            && self.pending_resume.is_none()
+            && self.records.values().all(|record| record.state.terminal())
     }
 
     pub fn shutdown(&mut self, send: &mut Send<'_>) {

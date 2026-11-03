@@ -549,11 +549,14 @@ dependencies = [
  "amaterasu-input-policy",
  "amaterasu-module-sdk",
  "amaterasu-package",
+ "amaterasu-rtx-runtime",
  "ed25519-dalek",
  "httparse",
+ "libc",
  "rustls",
  "serde",
  "serde_json",
+ "ureq",
  "url",
 ]
 
@@ -763,13 +766,30 @@ dependencies = [
 name = "amaterasu-rtx-hdr"
 version = "0.1.0"
 dependencies = [
+ "amaterasu-configuration-schema",
  "amaterasu-media",
  "amaterasu-module-sdk",
+ "amaterasu-rtx-runtime",
  "cc",
  "libc",
  "pkg-config",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "amaterasu-rtx-runtime"
+version = "0.1.0"
+dependencies = [
+ "amaterasu-abi",
+ "amaterasu-module-sdk",
+ "amaterasu-network-sockets",
+ "flate2",
+ "getrandom 0.3.4",
+ "libc",
+ "sha2",
+ "ureq",
+ "zip",
 ]
 
 [[package]]

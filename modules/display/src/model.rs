@@ -65,6 +65,9 @@ pub struct ModePolicy {
     pub hdr_option: Option<DisplayHdrOption>,
     #[serde(default)]
     pub effective_client_hdr_request: Option<bool>,
+    /// Required source display range, independent of the client stream range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_hdr_required: Option<bool>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -257,7 +260,9 @@ impl Configuration {
         if let Some(refresh_rate) = resolved.refresh_rate {
             display.refresh = refresh_rate;
         }
-        if let Some(option) = policy.hdr_option {
+        if let Some(required) = policy.source_hdr_required {
+            display.hdr_enabled = Some(required);
+        } else if let Some(option) = policy.hdr_option {
             display.hdr_enabled = match option {
                 DisplayHdrOption::Auto => Some(
                     resolve_hdr_configuration(

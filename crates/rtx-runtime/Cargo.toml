@@ -1,0 +1,21 @@
+[package]
+name = "amaterasu-rtx-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sha2.workspace = true
+flate2 = { version = "1", features = ["rust_backend"] }
+libc = "0.2"
+getrandom.workspace = true
+ureq = { version = "=3.4.2", default-features = false, features = ["rustls", "platform-verifier"] }
+zip = { version = "2.4.2", default-features = false, features = ["deflate-flate2", "flate2"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+amaterasu-module-sdk = { workspace = true, features = ["network-http"] }
+amaterasu-network-sockets.workspace = true
+amaterasu-abi.workspace = true

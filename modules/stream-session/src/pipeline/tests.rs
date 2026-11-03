@@ -10,6 +10,37 @@ use super::*;
 use harness::*;
 
 #[test]
+fn plugin_replacement_waits_for_active_stream_and_fences_new_streams() {
+    let mut host = Harness::new();
+    let id = host.response(1, prepare())["session"].as_u64().unwrap();
+    assert_eq!(host.response(2, start(id))["state"], "active");
+    host.pipeline.package_barrier_pending = true;
+    assert!(!host.pipeline.package_replacement_ready());
+    let mut next = prepare();
+    next["operation_id"] = json!("next-stream");
+    assert_eq!(
+        host.response(3, next.clone())["code"],
+        "package_activation_pending"
+    );
+    assert_eq!(
+        host.response(4, json!({"action":"status","session":id}))["state"],
+        "active"
+    );
+    assert_eq!(
+        host.response(5, json!({"action":"stop","session":id}))["state"],
+        "stopped"
+    );
+    host.idle();
+    assert!(host.pipeline.package_replacement_ready());
+    assert_eq!(
+        host.response(6, next.clone())["code"],
+        "package_activation_pending"
+    );
+    host.pipeline.package_barrier_pending = false;
+    assert_eq!(host.response(7, next)["state"], "prepared");
+}
+
+#[test]
 fn legacy_plugin_payloads_are_rejected_before_any_stream_effect() {
     for field in ["frame_limiter_settings", "frame_limiter_executable_path"] {
         let mut request = prepare();

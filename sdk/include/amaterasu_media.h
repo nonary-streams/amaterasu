@@ -612,10 +612,32 @@ typedef struct {
     AmaterasuStatus (*hdr_metadata)(void *, uint64_t, AmaterasuHdrMetadata *);
 } AmaterasuGpuProcessorApiV1_1;
 #define AMATERASU_GPU_PROCESSOR_API_V1_1_SIZE ((uint32_t)sizeof(AmaterasuGpuProcessorApiV1_1))
+/* v1.2 borrows at most 16384 bytes of UTF-8 JSON synchronously. Configure once
+ * before metadata or frames; the provider copies anything retained. Cancel
+ * retires the configured stream. An unsupported provider may reject it. */
+#define AMATERASU_GPU_PROCESSOR_MAX_CONFIGURATION_BYTES 16384u
+#define AMATERASU_GPU_PROCESSOR_CONFIGURATION_INTERFACE_MINOR 2u
+typedef struct {
+    AmaterasuGpuProcessorApiV1_1 base;
+    AmaterasuStatus (*configure_stream)(void *, uint64_t, const uint8_t *, size_t);
+} AmaterasuGpuProcessorApiV1_2;
+#define AMATERASU_GPU_PROCESSOR_API_V1_2_SIZE ((uint32_t)sizeof(AmaterasuGpuProcessorApiV1_2))
 typedef struct {
     AmaterasuCaptureApiV1_8 base;
     AmaterasuStatus (*hdr_metadata)(void *, uint64_t, AmaterasuHdrMetadata *);
 } AmaterasuCaptureApiV1_9;
+/* v1.10: color_provenance writes flags only on OK for a caller-owned stream.
+ * AUTHORITATIVE means each delivered frame color derives from that same source
+ * presentation, never an assumed default. PENDING means not yet established;
+ * UNSUPPORTED or zero flags means no claim. Unknown frame colors remain unknown.
+ * The provider must revoke or stop delivery if it can no longer honor the claim. */
+#define AMATERASU_CAPTURE_COLOR_PER_PRESENTATION_AUTHORITATIVE 1u
+#define AMATERASU_CAPTURE_COLOR_PROVENANCE_INTERFACE_MINOR 10u
+typedef struct {
+    AmaterasuCaptureApiV1_9 base;
+    AmaterasuStatus (*color_provenance)(void *, uint64_t, uint32_t *);
+} AmaterasuCaptureApiV1_10;
+#define AMATERASU_CAPTURE_API_V1_10_SIZE ((uint32_t)sizeof(AmaterasuCaptureApiV1_10))
 typedef struct {
     AmaterasuVideoApiV1_1 base;
     AmaterasuStatus (*hdr_metadata)(void *, uint64_t, AmaterasuHdrMetadata *);

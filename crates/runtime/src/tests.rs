@@ -2102,3 +2102,221 @@ fn legacy_native_contract_approval_requires_valid_names_and_provider_grant() {
         assert!(Broker::new(config.clone()).is_err());
     }
 }
+
+#[test]
+fn package_activation_requires_host_capability_management_grant_and_bounded_queue() {
+    let mut config = RuntimeConfig {
+        host_lifecycle_control: true,
+        host_package_activation_control: true,
+        ..Default::default()
+    };
+    config
+        .principals
+        .insert(HOST_LIFECYCLE_CONTROL_PRINCIPAL.into(), Grants::default());
+    let grant = Grants {
+        call: names(&[HOST_PACKAGE_ACTIVATION_SERVICE]),
+        ..Default::default()
+    };
+    config
+        .principals
+        .insert("amaterasu.management".into(), grant.clone());
+    config.principals.insert("other".into(), grant);
+    config.principals.insert(
+        "example.stream-provider".into(),
+        Grants {
+            call: names(&[HOST_PACKAGE_BARRIER_SERVICE]),
+            ..Default::default()
+        },
+    );
+    config.principals.insert(
+        "example.session-provider".into(),
+        Grants {
+            call: names(&[HOST_PACKAGE_BARRIER_SERVICE]),
+            ..Default::default()
+        },
+    );
+    let mut broker = Broker::new(config.clone()).unwrap();
+    let request = HostPackageActivation {
+        repository_id: "approved-repository".into(),
+        catalog_digest: "1".repeat(64),
+        manifest_digest: "2".repeat(64),
+        expected_active: "3".repeat(64),
+        expected_revision: "4".repeat(64),
+    };
+    let command = || Command::HostPackageActivate {
+        request: request.clone(),
+    };
+    assert!(broker.dispatch("other", command()).is_error());
+    assert!(
+        broker
+            .dispatch("amaterasu.management", command())
+            .is_error()
+    );
+    assert!(
+        broker
+            .dispatch("other", Command::HostPackageBarrierRegister {})
+            .is_error()
+    );
+    assert!(
+        !broker
+            .dispatch(
+                "example.stream-provider",
+                Command::HostPackageBarrierRegister {}
+            )
+            .is_error()
+    );
+    assert!(
+        broker
+            .dispatch("amaterasu.management", command())
+            .is_error()
+    );
+    assert!(
+        !broker
+            .dispatch(
+                "example.session-provider",
+                Command::HostPackageBarrierRegister {}
+            )
+            .is_error()
+    );
+    assert!(
+        broker
+            .dispatch(
+                "amaterasu.management",
+                Command::HostPackageActivationDrain {}
+            )
+            .is_error()
+    );
+    assert!(
+        !broker
+            .dispatch("amaterasu.management", command())
+            .is_error()
+    );
+    assert!(matches!(
+        broker.dispatch(
+            HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            Command::HostPackageActivationDrain {}
+        ),
+        Response::HostPackageActivation { request: None }
+    ));
+    assert!(matches!(
+        broker.dispatch(
+            "example.stream-provider",
+            Command::HostPackageBarrierPending {}
+        ),
+        Response::HostPackageActivationState {
+            pending: true,
+            started: false
+        }
+    ));
+    assert!(
+        broker
+            .dispatch("other", Command::HostPackageBarrierReady { ready: true })
+            .is_error()
+    );
+    assert!(
+        !broker
+            .dispatch(
+                "example.stream-provider",
+                Command::HostPackageBarrierReady { ready: true }
+            )
+            .is_error()
+    );
+    assert!(matches!(
+        broker.dispatch(
+            HOST_LIFECYCLE_CONTROL_PRINCIPAL,
+            Command::HostPackageActivationDrain {}
+        ),
+        Response::HostPackageActivation { request: None }
+    ));
+    assert!(
+        !broker
+            .dispatch(
+                "example.session-provider",
+                Command::HostPackageBarrierReady { ready: true }
+            )
+            .is_error()
+    );
+    assert!(
+        broker
+            .dispatch("amaterasu.management", command())
+            .is_error()
+    );
+    assert!(
+        matches!(broker.dispatch(HOST_LIFECYCLE_CONTROL_PRINCIPAL, Command::HostPackageActivationDrain {}), Response::HostPackageActivation { request: Some(value) } if *value == request)
+    );
+    assert!(matches!(
+        broker.dispatch(
+            "example.stream-provider",
+            Command::HostPackageBarrierPending {}
+        ),
+        Response::HostPackageActivationState {
+            pending: true,
+            started: true
+        }
+    ));
+    assert!(
+        broker
+            .dispatch(
+                "amaterasu.management",
+                Command::HostPackageActivationCancel {}
+            )
+            .is_error()
+    );
+    let mut invalid = request.clone();
+    invalid.manifest_digest = "bad".into();
+    assert!(
+        broker
+            .dispatch(
+                "amaterasu.management",
+                Command::HostPackageActivate { request: invalid }
+            )
+            .is_error()
+    );
+    let mut cancellable = Broker::new(config.clone()).unwrap();
+    assert!(
+        !cancellable
+            .dispatch(
+                "example.stream-provider",
+                Command::HostPackageBarrierRegister {}
+            )
+            .is_error()
+    );
+    assert!(
+        !cancellable
+            .dispatch(
+                "example.session-provider",
+                Command::HostPackageBarrierRegister {}
+            )
+            .is_error()
+    );
+    assert!(
+        !cancellable
+            .dispatch("amaterasu.management", command())
+            .is_error()
+    );
+    assert!(
+        !cancellable
+            .dispatch(
+                "amaterasu.management",
+                Command::HostPackageActivationCancel {}
+            )
+            .is_error()
+    );
+    assert!(matches!(
+        cancellable.dispatch(
+            "example.stream-provider",
+            Command::HostPackageBarrierPending {}
+        ),
+        Response::HostPackageActivationState {
+            pending: false,
+            started: false
+        }
+    ));
+    config.host_package_activation_control = false;
+    let mut disabled = Broker::new(config).unwrap();
+    assert!(
+        disabled
+            .dispatch("amaterasu.management", command())
+            .is_error()
+    );
+}

@@ -9,6 +9,8 @@ _Static_assert(offsetof(AmaterasuCaptureApiV1_7, resolve_swap) == 104, "swap dec
 _Static_assert(offsetof(AmaterasuCaptureApiV1_8, base) == 0, "capture v1.8 prefix");
 _Static_assert(offsetof(AmaterasuCaptureApiV1_8, enumerate_resources) == sizeof(AmaterasuCaptureApiV1_7), "capture v1.7 prefix preserved");
 _Static_assert(AMATERASU_CAPTURE_API_V1_8_SIZE == sizeof(AmaterasuCaptureApiV1_8), "capture resource table size");
+_Static_assert(offsetof(AmaterasuCaptureApiV1_10, color_provenance) == sizeof(AmaterasuCaptureApiV1_9), "capture v1.9 prefix preserved");
+_Static_assert(AMATERASU_CAPTURE_API_V1_10_SIZE == sizeof(AmaterasuCaptureApiV1_10), "capture provenance table size");
 _Static_assert(offsetof(AmaterasuFrameResourceProcessorApi, base) == 0, "resource consumer prefix");
 _Static_assert(offsetof(AmaterasuFrameResourceProcessorApi, enumerate_outputs) == sizeof(AmaterasuFrameResourceConsumerApi), "resource processor extension");
 _Static_assert(sizeof(AmaterasuFrameDescriptor) == 40, "resource descriptor layout");
@@ -70,6 +72,8 @@ _Static_assert(offsetof(AmaterasuDmaBufFrameLease, release) == 128, "GPU lease r
 _Static_assert(sizeof(AmaterasuDmaBufLeaseSink) == 16, "GPU lease sink");
 _Static_assert(sizeof(AmaterasuGpuProcessorApi) == 48, "GPU processor layout");
 _Static_assert(sizeof(AmaterasuGpuProcessorApiV1_1) == 56, "GPU processor v1.1 layout");
+_Static_assert(sizeof(AmaterasuGpuProcessorApiV1_2) == 64, "GPU processor v1.2 layout");
+_Static_assert(offsetof(AmaterasuGpuProcessorApiV1_2, configure_stream) == sizeof(AmaterasuGpuProcessorApiV1_1), "GPU processor v1.1 prefix preserved");
 _Static_assert(offsetof(AmaterasuGpuProcessorApiV1_1, hdr_metadata) == sizeof(AmaterasuGpuProcessorApi), "GPU processor v1.0 prefix preserved");
 _Static_assert(offsetof(AmaterasuGpuProcessorApi, cancel_dmabuf_leases) == 40, "GPU processor cancel offset");
 _Static_assert(AMATERASU_CAPTURE_API_V1_6_SIZE == 88, "capture v1.6 layout");

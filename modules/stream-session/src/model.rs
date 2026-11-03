@@ -10,6 +10,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub providers: crate::providers::ProviderServices,
+    pub processing_plan: Option<ProcessingPlanProvider>,
     pub enabled: bool,
     pub allow_remote: bool,
     pub allowed_principals: Vec<String>,
@@ -22,6 +23,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             providers: Default::default(),
+            processing_plan: None,
             enabled: false,
             allow_remote: false,
             allowed_principals: Vec::new(),
@@ -35,6 +37,9 @@ impl Default for Settings {
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
         self.providers.validate()?;
+        if let Some(plan) = &self.processing_plan {
+            plan.validate()?;
+        }
         if self.allowed_principals.len() > 16
             || self
                 .allowed_principals
@@ -45,6 +50,33 @@ impl Settings {
             || !(1000..=30000).contains(&self.input_lease_ttl_ms)
         {
             return Err("invalid_settings");
+        }
+        Ok(())
+    }
+}
+
+/// Processing identities are selected by signed startup composition.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessingPlanProvider {
+    pub provider: String,
+    pub control_service: String,
+    pub processor_service: String,
+    /// Signed composition must also set video's gpu_processor_opt_in when true.
+    #[serde(default)]
+    pub omit_disabled: bool,
+}
+
+impl ProcessingPlanProvider {
+    fn validate(&self) -> Result<(), &'static str> {
+        if !amaterasu_contracts::valid_name(&self.provider)
+            || self.provider.contains('/')
+            || !amaterasu_contracts::valid_name(&self.control_service)
+            || !amaterasu_contracts::valid_name(&self.processor_service)
+            || !self.control_service.ends_with("/1")
+            || !self.processor_service.ends_with("/1")
+        {
+            return Err("invalid_processing_plan_provider");
         }
         Ok(())
     }
@@ -198,6 +230,8 @@ struct DisplayModePolicy {
     hdr_option: Option<String>,
     #[serde(rename = "effective_client_hdr_request")]
     _effective_client_hdr_request: Option<bool>,
+    #[serde(rename = "source_hdr_required")]
+    _source_hdr_required: Option<bool>,
 }
 
 #[derive(Deserialize)]

@@ -83,6 +83,7 @@ pub(crate) fn registrations() -> Vec<Command> {
                     ],
                     &[
                         ("resource_generation", Kind::Integer),
+                        ("source_video_mode", Kind::Object),
                         ("dependency_inputs", Kind::Array),
                         ("control_results", Kind::Array),
                     ],
@@ -754,6 +755,45 @@ mod tests {
             extension_api::validate_provider_response(&disabled, &response).unwrap();
             assert!(result["plan"]["resources"].as_array().unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn lifecycle_methods_accept_a_distinct_source_video_mode() {
+        for command in registrations() {
+            let Command::RegisterApi { method } = command else {
+                panic!("expected lifecycle method registration");
+            };
+            if method.method == "lifecycle_status" {
+                assert!(!method.request.optional.contains_key("source_video_mode"));
+                continue;
+            }
+            assert_eq!(
+                method.request.optional.get("source_video_mode"),
+                Some(&Kind::Object)
+            );
+        }
+
+        let mut request = request("none");
+        request.requested_video.as_mut().unwrap().hdr = true;
+        let mut source = request.requested_video.clone().unwrap();
+        source.hdr = false;
+        request.source_video_mode = Some(source.clone());
+        assert!(extension_api::validate_provider_request(&request).is_ok());
+        let payload = json!({"method":"resource_plan","interface_major":1,"interface_minor":0,"arguments":request});
+        let mut bridge = Bridge::new(Selection {
+            principal: "coordinator".into(),
+            service: "lifecycle/1".into(),
+        });
+        assert!(bridge.accept(1, "coordinator", payload, 5000).is_none());
+        assert_eq!(bridge.pending[0].request.source_video_mode, Some(source));
+        assert!(
+            bridge.pending[0]
+                .request
+                .requested_video
+                .as_ref()
+                .unwrap()
+                .hdr
+        );
     }
 
     #[test]

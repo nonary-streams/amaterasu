@@ -713,6 +713,18 @@ impl Coordinator {
             add_policy_method(&policy.owner_provider, &policy.method)?;
             add_policy_method(&policy.owner_provider, &policy.status_method)?;
         }
+        if let Some(policy) = &self.settings.processing_policy {
+            add_policy_method(
+                &policy.provider,
+                &amaterasu_extension_api::MethodRef {
+                    service: policy.service.clone(),
+                    method: "processing_intent".into(),
+                    interface_major: 1,
+                    interface_minor: 0,
+                    schema_revision: 1,
+                },
+            )?;
+        }
         if self.approval_cursor >= methods.len() {
             return Ok(());
         }
@@ -1085,12 +1097,150 @@ impl Coordinator {
         Ok(())
     }
 
+    fn ensure_processing_policy(
+        &mut self,
+        key: &str,
+        work: &mut Work,
+        send: &mut dyn FnMut(Command) -> ModuleResult<Response>,
+    ) -> ModuleResult<bool> {
+        let Some(policy) = self.settings.processing_policy.clone() else {
+            return Ok(true);
+        };
+        if !matches!(
+            work.phase,
+            LifecyclePhase::SessionPrepare | LifecyclePhase::StreamPrepare
+        ) {
+            return Ok(true);
+        }
+        if !work
+            .provider_graph
+            .as_ref()
+            .is_some_and(|graph| graph.order.contains(&policy.provider))
+        {
+            return Err("processing_provider_not_selected".into());
+        }
+        // Never dispatch the policy query until the broker identifies the
+        // exact installed provider and approved method selected at startup.
+        if !self
+            .selections
+            .get(&policy.provider)
+            .is_some_and(|selection| {
+                selection.approvals.iter().any(|approval| {
+                    approval.method.service == policy.service
+                        && approval.method.method == "processing_intent"
+                        && approval.method.interface_major == 1
+                        && approval.method.interface_minor == 0
+                        && approval.broker_approval["provider"] == policy.provider
+                })
+            })
+        {
+            return Ok(false);
+        }
+        let snapshot = {
+            let shared = self.shared.borrow();
+            frozen_settings(&shared.value, &work.target)?
+                .get(&policy.provider)
+                .cloned()
+                .ok_or("processing_settings_missing")?
+        };
+        if let Some(decision) = &work.processing_decision {
+            if decision.target != work.target
+                || decision.revision != snapshot.revision
+                || decision.processor_service != policy.processor_service
+            {
+                return Err("processing_policy_changed".into());
+            }
+            return Ok(true);
+        }
+        if !self.processing_jobs.contains_key(key) {
+            self.processing_jobs.insert(
+                key.to_owned(),
+                super::processing_preflight::ProcessingPreflightJob::new(
+                    policy.service,
+                    policy.processor_service,
+                    work.target.clone(),
+                    snapshot.revision,
+                    snapshot.settings,
+                    work.video.clone(),
+                )?,
+            );
+        }
+        let decision = self
+            .processing_jobs
+            .get_mut(key)
+            .expect("job inserted")
+            .advance(send)?;
+        let Some(decision) = decision else {
+            return Ok(false);
+        };
+        self.processing_jobs.remove(key);
+        if decision.source_video_mode.is_some()
+            && self
+                .settings
+                .processing_policy
+                .as_ref()
+                .is_none_or(|policy| {
+                    policy
+                        .source_mode_providers
+                        .iter()
+                        .any(|id| !work.providers.contains(id))
+                })
+        {
+            return Err("source_video_mode_provider_missing".into());
+        }
+        let mut next = self.shared.borrow().value.clone();
+        let (_, session_id, stream_id, _) = super::operations::target_parts(&work.target)?;
+        let session = next.sessions.get_mut(session_id).ok_or("unknown_session")?;
+        if stream_id.is_some() {
+            let previous = session
+                .processing_decision
+                .as_ref()
+                .ok_or("session_processing_policy_missing")?;
+            if previous.enabled != decision.enabled
+                || previous.source_video_mode.as_ref().map(|mode| mode.hdr)
+                    != decision.source_video_mode.as_ref().map(|mode| mode.hdr)
+                || previous.processor_service != decision.processor_service
+            {
+                return Err("processing_source_range_changed".into());
+            }
+        } else {
+            session.processing_decision = Some(decision.clone());
+        }
+        work.processing_decision = Some(decision);
+        next.receipts.get_mut(key).ok_or("unknown_transition")?.work = Some(work.clone());
+        save(&self.shared, next)?;
+        Ok(true)
+    }
+
     pub(super) fn advance_work(
         &mut self,
         send: &mut dyn FnMut(Command) -> ModuleResult<Response>,
     ) -> ModuleResult<()> {
         self.advance_validations(send)?;
         self.complete_retirement_waiters()?;
+        // A cancellation or failed transition can retire work while its
+        // read-only preflight still owns a broker record. Keep driving that
+        // job until the broker confirms release.
+        let orphaned: Vec<String> = {
+            let shared = self.shared.borrow();
+            self.processing_jobs
+                .keys()
+                .filter(|key| {
+                    !shared.value.receipts.get(*key).is_some_and(|receipt| {
+                        receipt.response["status"] == "pending" && receipt.work.is_some()
+                    })
+                })
+                .cloned()
+                .collect()
+        };
+        for key in orphaned.into_iter().take(4) {
+            let Some(job) = self.processing_jobs.get_mut(&key) else {
+                continue;
+            };
+            if job.cancel() || matches!(job.advance(send), Ok(Some(_)) | Err(_)) {
+                self.processing_jobs.remove(&key);
+            }
+        }
         if self.selections.len() != self.settings.participants.len() {
             return Ok(());
         }
@@ -1248,7 +1398,8 @@ impl Coordinator {
                 self.fail_work(&key, "resource_reprepare_authority_changed")?;
                 continue;
             }
-            let provider = &work.providers[work.index];
+            let current_provider = work.providers[work.index].clone();
+            let provider = &current_provider;
             if matches!(
                 work.phase,
                 LifecyclePhase::StreamRelease | LifecyclePhase::SessionRelease
@@ -1305,6 +1456,17 @@ impl Coordinator {
                         self.settings_jobs.remove(&job_key);
                     }
                     self.fail_work(&key, "settings_snapshot_unavailable")?;
+                    continue;
+                }
+            }
+            match self.ensure_processing_policy(&key, &mut work, send) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(reason) => {
+                    // The job may still own an accepted broker request. The
+                    // orphan retirement pass cancels/releases it after the
+                    // transition is marked failed.
+                    self.fail_work(&key, &reason)?;
                     continue;
                 }
             }
@@ -1580,6 +1742,13 @@ impl Coordinator {
                     intent: work.intent.clone(),
                     reason: work.reason.clone(),
                     requested_video: work.video.clone(),
+                    source_video_mode: self
+                        .settings
+                        .processing_policy
+                        .as_ref()
+                        .filter(|policy| policy.source_mode_providers.contains(provider))
+                        .and(work.processing_decision.as_ref())
+                        .and_then(|decision| decision.source_video_mode.clone()),
                     consumer_requirements: self.settings.consumer_requirements.clone(),
                     remaining_ms: 30_000,
                     plan_revision: None,
@@ -2446,7 +2615,12 @@ impl Coordinator {
                         .get_mut(stream_id.ok_or("stream_target_required")?)
                         .ok_or("unknown_stream")?;
                     if candidate.generation != stream.generation
-                        || work.video.as_ref() != Some(&candidate.mode)
+                        || work
+                            .processing_decision
+                            .as_ref()
+                            .and_then(|decision| decision.source_video_mode.as_ref())
+                            .or(work.video.as_ref())
+                            != Some(&candidate.mode)
                     {
                         return Err("capture_candidate_mismatch".into());
                     }
@@ -2699,6 +2873,7 @@ impl Coordinator {
                     composition_progress: None,
                     compacted_release: false,
                     owner_observations: Default::default(),
+                    processing_decision: None,
                     reprepare: None,
                     phase,
                     target: work.target.clone(),
@@ -2889,6 +3064,7 @@ mod admission_target_tests {
 
     fn session(id: &str) -> SessionRecord {
         SessionRecord {
+            processing_decision: None,
             provider_graph: None,
             host_epoch: "epoch".into(),
             id: id.into(),
@@ -3096,6 +3272,7 @@ mod dependency_cleanup_tests {
             composition_progress: None,
             compacted_release: false,
             owner_observations: Default::default(),
+            processing_decision: None,
             reprepare: None,
             phase: LifecyclePhase::SessionRelease,
             target: LifecycleTarget::Session {

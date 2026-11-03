@@ -92,6 +92,9 @@ pub struct Pipeline {
     recovery_ids: BTreeSet<u64>,
     recovery_ready: bool,
     recovery_blocked: bool,
+    package_barrier_registered: bool,
+    package_barrier_pending: bool,
+    package_barrier_next_poll: u64,
 }
 
 impl Pipeline {
@@ -115,6 +118,9 @@ impl Pipeline {
             recovery_ids: BTreeSet::new(),
             recovery_ready: false,
             recovery_blocked: false,
+            package_barrier_registered: false,
+            package_barrier_pending: false,
+            package_barrier_next_poll: 0,
         })
     }
 
@@ -236,16 +242,57 @@ impl Pipeline {
         settled
     }
 
+    pub fn enable_package_barrier(&mut self) {
+        self.package_barrier_registered = true;
+    }
+
+    fn package_replacement_ready(&self) -> bool {
+        self.journal.loaded
+            && !self.journal.failed
+            && self.recovery_ready
+            && !self.recovery_blocked
+            && self.journal.document.entries.is_empty()
+            && self.recovery_queue.is_empty()
+            && self.job.is_none()
+            && !self.history_activities.has_active_reservations()
+            && self.records.values().all(|record| {
+                record.state.terminal()
+                    && !record.history.has_work()
+                    && record.uncertain.is_none()
+                    && record.plane.is_none()
+                    && !record.audio_recovery_needed
+            })
+    }
+
     pub fn tick(&mut self, runtime: &RuntimeClient) -> ModuleResult<()> {
         let now = self.started.elapsed().as_millis().min(u64::MAX as u128) as u64;
-        self.tick_with(
+        let poll_barrier = self.package_barrier_registered && now >= self.package_barrier_next_poll;
+        if poll_barrier {
+            match runtime.send(Command::HostPackageBarrierPending {})? {
+                Response::HostPackageActivationState { pending, .. } => {
+                    self.package_barrier_pending = pending
+                }
+                _ => return Err("package activation barrier status unavailable".into()),
+            }
+            self.package_barrier_next_poll = now.saturating_add(100);
+        }
+        let result = self.tick_with(
             now,
             &mut |command| runtime.send_ephemeral(command),
             &mut |handles, providers| {
                 Plane::new(runtime, handles, providers)
                     .map(|plane| Box::new(plane) as Box<dyn Drive>)
             },
-        )
+        );
+        if poll_barrier {
+            let ready =
+                result.is_ok() && self.package_barrier_pending && self.package_replacement_ready();
+            match runtime.send(Command::HostPackageBarrierReady { ready })? {
+                Response::Ok => {}
+                _ => return Err("package activation barrier update failed".into()),
+            }
+        }
+        result
     }
 
     fn tick_with(

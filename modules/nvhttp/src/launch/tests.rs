@@ -5408,6 +5408,11 @@ fn retired_stream_failure_preserves_the_application_until_pause_is_verified() {
     controller.consume(&verify, json!({"status":"ok","host_epoch":"epoch","sessions":[{"session_id":"session","generation":1,"phase":"paused"}]}), now, &mut Vec::new());
     assert_eq!(controller.records[&id].state, State::Paused);
     assert_eq!(controller.current_game(&peer(1)), 1);
+    assert!(!controller.package_activation_barrier(true));
+    assert_eq!(controller.current_game(&peer(1)), 1);
+    assert_eq!(controller.records[&id].state, State::Paused);
+    assert!(controller.resume(11, request(1), &peer(1), now).is_some());
+    controller.package_activation_barrier(false);
 }
 
 #[test]

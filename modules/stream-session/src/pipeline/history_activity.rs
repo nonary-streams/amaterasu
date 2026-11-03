@@ -34,6 +34,17 @@ pub(super) struct HistoryActivities {
 }
 
 impl HistoryActivities {
+    pub(super) fn contains(&self, activity_id: &str) -> bool {
+        self.entries.contains_key(activity_id)
+    }
+
+    /// A reservation or an uncertain cleanup may still own a launch/session.
+    pub(super) fn has_active_reservations(&self) -> bool {
+        self.entries
+            .values()
+            .any(|entry| !matches!(entry.phase, Phase::Ended | Phase::Unavailable))
+    }
+
     pub(super) fn reserve(
         &mut self,
         request: u64,

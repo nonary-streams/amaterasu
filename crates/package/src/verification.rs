@@ -226,6 +226,7 @@ fn resolve_runtime_grants(
         host_context: Default::default(),
         // Package policy cannot create the reserved host lifecycle endpoint.
         host_lifecycle_control: false,
+        host_package_activation_control: false,
     };
 
     for component in components.iter().filter(|component| !component.runtime) {

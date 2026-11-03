@@ -22,10 +22,18 @@ impl ManagedModule for StreamSession {
         let settings: Settings =
             serde_json::from_value(payload).map_err(|_| "invalid stream session settings")?;
         settings.validate()?;
-        let pipeline = Pipeline::new(settings)?;
+        let mut pipeline = Pipeline::new(settings)?;
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;
+        // A host may select this provider as its non-disruptive activation
+        // barrier. Older hosts and profiles continue without the capability.
+        if matches!(
+            runtime.send(Command::HostPackageBarrierRegister {}),
+            Ok(Response::Ok)
+        ) {
+            pipeline.enable_package_barrier();
+        }
         Ok(Self { runtime, pipeline })
     }
     fn tick(&mut self) -> ModuleResult<()> {

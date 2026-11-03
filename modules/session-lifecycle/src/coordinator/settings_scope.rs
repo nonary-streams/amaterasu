@@ -167,6 +167,7 @@ mod tests {
         coordinator.shared.borrow_mut().value.sessions.insert(
             "session".into(),
             SessionRecord {
+                processing_decision: None,
                 provider_graph: None,
                 host_epoch: epoch.clone(),
                 id: "session".into(),

@@ -62,6 +62,10 @@ impl Pipeline {
             } => {
                 if input.owner != "amaterasu.nvhttp" || !self.settings.enabled {
                     rpc::complete(send, input.request, error("permission_denied"));
+                } else if self.package_barrier_pending
+                    && !self.history_activities.contains(&activity_id)
+                {
+                    rpc::complete(send, input.request, error("package_activation_pending"));
                 } else if !valid_name(&activity_id) || activity_id != rtsp_operation_id {
                     rpc::complete(send, input.request, error("invalid_history_activity"));
                 } else {
@@ -159,6 +163,11 @@ impl Pipeline {
             rpc::complete(send, request, reply);
             return;
         }
+        // Existing operations may finish or retry while no new stream is admitted.
+        if self.package_barrier_pending {
+            rpc::complete(send, request, error("package_activation_pending"));
+            return;
+        }
         if let (Some(activity_id), Some(rtsp_operation_id)) =
             (&config.history_activity_id, &config.rtsp_operation_id)
         {
@@ -198,6 +207,7 @@ impl Pipeline {
             .map(|_| self.settings.enable_input);
         let mut record = Record::new(id, owner, config, self.settings.input_lease_ttl_ms);
         record.providers = self.settings.providers.clone();
+        record.processing_plan_provider = self.settings.processing_plan.clone();
         record.lifecycle_input_required = lifecycle_input_required;
         self.records.insert(id, record);
         self.job = Some(Job::new(
@@ -236,6 +246,14 @@ impl Pipeline {
             rpc::complete(send, request, error("session_not_found"));
             return;
         };
+        if record.processing_plan_provider.is_some()
+            && (configuration.lifecycle_target.is_none()
+                || (configuration.lifecycle_capture_mode.is_managed()
+                    && configuration.lifecycle_candidate.is_none()))
+        {
+            rpc::complete(send, request, error("processing_lifecycle_required"));
+            return;
+        }
         match (
             &record.config.lifecycle_session_target,
             &configuration.lifecycle_target,

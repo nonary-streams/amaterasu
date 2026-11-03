@@ -21,6 +21,26 @@ pub struct CaptureApiV1_9 {
         unsafe extern "C" fn(*mut c_void, u64, CaptureResourceFrameSink) -> Status,
     pub hdr_metadata: unsafe extern "C" fn(*mut c_void, u64, *mut HdrMetadata) -> Status,
 }
+/// A capture provider guarantees that each delivered frame's color value is
+/// derived from that presentation, rather than a default or inferred value.
+/// Unknown color remains unknown and must be rejected when a known range is
+/// required. This is a native provider contract, not a native-code sandbox.
+pub const CAPTURE_COLOR_PER_PRESENTATION_AUTHORITATIVE: u32 = 1;
+pub const CAPTURE_COLOR_PROVENANCE_INTERFACE_MINOR: u32 = 10;
+
+/// Additive capture v1.10 tail. `color_provenance` authenticates the binding's
+/// stream owner and writes flags only on STATUS_OK. Before the source has
+/// established the property it returns MEDIA_PENDING; unavailable provenance
+/// returns MEDIA_UNSUPPORTED or zero flags. The guarantee applies to every
+/// delivered frame from this stream, including after source changes; a provider
+/// must stop delivery or revoke the guarantee before it can no longer honor it.
+/// Consumers still validate each frame's recognized color against their need.
+#[repr(C)]
+pub struct CaptureApiV1_10 {
+    pub base: CaptureApiV1_9,
+    pub color_provenance: unsafe extern "C" fn(*mut c_void, u64, *mut u32) -> Status,
+}
+
 /// Additive video v1.2 prefix; metadata belongs to the caller-owned stream.
 #[repr(C)]
 pub struct VideoApiV1_2 {
@@ -46,6 +66,10 @@ mod tests {
         assert_eq!(
             offset_of!(CaptureApiV1_9, hdr_metadata),
             size_of::<CaptureApiV1_8>()
+        );
+        assert_eq!(
+            offset_of!(CaptureApiV1_10, color_provenance),
+            size_of::<CaptureApiV1_9>()
         );
         assert_eq!(
             offset_of!(VideoApiV1_2, hdr_metadata),

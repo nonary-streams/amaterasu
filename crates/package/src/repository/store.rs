@@ -74,6 +74,18 @@ impl RepositoryStore {
         repository_id: &str,
         manifest_sha256: &str,
     ) -> PackageResult<PathBuf> {
+        let path = self.existing_native_candidate_cache_path(repository_id, manifest_sha256)?;
+        create_private_directory(&self.directory)?;
+        create_private_directory(path.parent().ok_or("invalid native candidate cache path")?)?;
+        Ok(path)
+    }
+
+    /// Derive an existing digest-addressed cache path without changing filesystem state.
+    pub fn existing_native_candidate_cache_path(
+        &self,
+        repository_id: &str,
+        manifest_sha256: &str,
+    ) -> PackageResult<PathBuf> {
         if !super::valid_segment(repository_id)
             || manifest_sha256.len() != 64
             || manifest_sha256 != manifest_sha256.to_ascii_lowercase()
@@ -83,10 +95,11 @@ impl RepositoryStore {
         {
             return Err("invalid native candidate cache digest".into());
         }
-        create_private_directory(&self.directory)?;
-        let repository_cache = self.directory.join("native-candidates").join(repository_id);
-        create_private_directory(&repository_cache)?;
-        Ok(repository_cache.join(manifest_sha256))
+        Ok(self
+            .directory
+            .join("native-candidates")
+            .join(repository_id)
+            .join(manifest_sha256))
     }
 
     pub fn approve(&self, approval: ApprovedRepository) -> PackageResult<()> {

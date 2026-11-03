@@ -720,6 +720,10 @@ impl Router {
         self.launches.quiesce(Instant::now())
     }
 
+    pub fn package_activation_barrier(&mut self, pending: bool) -> bool {
+        self.launches.package_activation_barrier(pending)
+    }
+
     pub fn shutdown(&mut self, runtime: &RuntimeClient) {
         self.launches
             .shutdown(&mut |command| runtime.send_ephemeral(command));

@@ -8,6 +8,9 @@ mod peer_policy;
 mod product_settings;
 mod route_payload;
 mod routes;
+#[cfg(target_os = "linux")]
+mod rtx_hdr_candidate;
+mod rtx_hdr_install;
 mod server;
 mod tls;
 mod tray_events;
@@ -45,12 +48,14 @@ struct Settings {
     allowed_origins: Vec<String>,
     web: Option<assets::WebSettings>,
     extensions: Option<extensions::Settings>,
+    rtx_hdr_runtime_parent: Option<std::path::PathBuf>,
 }
 
 struct ManagementModule {
     runtime: RuntimeClient,
     server: Option<Server>,
     repositories: Option<RepositoryStore>,
+    rtx_hdr_installer: Option<rtx_hdr_install::Installer>,
     operational_health: Option<OperationalHealth>,
     product_settings: product_settings::ProductSettings,
     tray_events: tray_events::TrayEventConsumer,
@@ -98,8 +103,33 @@ impl ManagedModule for ManagementModule {
             .extensions
             .map(extensions::Extensions::new)
             .transpose()?;
+        let network = if settings.enabled {
+            Some(Network::from_settings(&runtime, &payload)?)
+        } else {
+            None
+        };
+        let rtx_hdr_installer = match (&settings.rtx_hdr_runtime_parent, &network) {
+            (Some(parent), Some(network)) => {
+                let mut installer =
+                    rtx_hdr_install::Installer::new(parent.clone(), network.clone())?;
+                let repository_directory = settings
+                    .web
+                    .as_ref()
+                    .and_then(|web| web.repository_directory().ok());
+                let package_root = match runtime.send(Command::GetPackageRoot {}) {
+                    Ok(Response::Result { payload }) => payload
+                        .get("package_root")
+                        .and_then(serde_json::Value::as_str)
+                        .map(std::path::PathBuf::from),
+                    _ => None,
+                };
+                installer.configure_package(repository_directory, package_root);
+                Some(installer)
+            }
+            _ => None,
+        };
         let server = if settings.enabled {
-            let network = Network::from_settings(&runtime, &payload)?;
+            let network = network.ok_or("management network unavailable")?;
             let mut server = Server::bind_with_network(
                 network,
                 settings
@@ -130,6 +160,7 @@ impl ManagedModule for ManagementModule {
             runtime,
             server,
             repositories,
+            rtx_hdr_installer,
             operational_health: None,
             product_settings: product_settings::ProductSettings::default(),
             tray_events: tray_events::TrayEventConsumer::default(),
@@ -137,6 +168,9 @@ impl ManagedModule for ManagementModule {
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
+        if let Some(installer) = &mut self.rtx_hdr_installer {
+            installer.advance();
+        }
         self.product_settings
             .tick(Instant::now(), &mut |command| self.runtime.send(command))?;
         self.advance_operational_health()?;
@@ -186,6 +220,83 @@ impl ManagedModule for ManagementModule {
                         payload,
                         &mut |command| self.runtime.send(command),
                     );
+                }
+                if payload == json!({"action":"rtx_hdr_activate"}) {
+                    if caller != "amaterasu.management" {
+                        return complete(
+                            &self.runtime,
+                            id,
+                            json!({"ok":false,"code":"permission_denied"}),
+                        );
+                    }
+                    #[cfg(target_os = "linux")]
+                    let result = if let Some(installer) = &mut self.rtx_hdr_installer {
+                        match installer.activation_request() {
+                            Ok(request) => {
+                                match self.runtime.send(Command::HostPackageActivate { request }) {
+                                    Ok(Response::Ok) => {
+                                        installer.mark_activation_requested();
+                                        json!({"ok":true})
+                                    }
+                                    _ => json!({"ok":false,"code":"activation_unavailable"}),
+                                }
+                            }
+                            Err(code) => json!({"ok":false,"code":code}),
+                        }
+                    } else {
+                        json!({"ok":false,"code":"activation_unavailable"})
+                    };
+                    #[cfg(not(target_os = "linux"))]
+                    let result = json!({"ok":false,"code":"activation_unavailable"});
+                    return complete(&self.runtime, id, result);
+                }
+                if let Some(action @ ("rtx_hdr_status" | "rtx_hdr_install" | "rtx_hdr_cancel")) =
+                    payload.get("action").and_then(serde_json::Value::as_str)
+                {
+                    let result = if caller != "amaterasu.management"
+                        || payload != json!({"action": action})
+                    {
+                        json!({"ok":false,"code":"permission_denied"})
+                    } else if let Some(installer) = &mut self.rtx_hdr_installer {
+                        #[cfg(target_os = "linux")]
+                        let cancel_waiting =
+                            action == "rtx_hdr_cancel" && installer.waiting_for_stream();
+                        #[cfg(not(target_os = "linux"))]
+                        let cancel_waiting = false;
+                        let mut result = if cancel_waiting {
+                            match self.runtime.send(Command::HostPackageActivationCancel {}) {
+                                Ok(Response::Ok) => {
+                                    installer.cancel_pending_activation();
+                                    installer.request("rtx_hdr_status")
+                                }
+                                _ => json!({"ok":false,"code":"activation_in_progress"}),
+                            }
+                        } else {
+                            installer.request(action)
+                        };
+                        #[cfg(target_os = "linux")]
+                        if action == "rtx_hdr_status" {
+                            if let Ok(Response::HostPackageActivationState { pending, started }) =
+                                self.runtime.send(Command::HostPackageActivationStatus {})
+                            {
+                                installer.update_activation_state(pending, started);
+                                result = installer.request("rtx_hdr_status");
+                            }
+                            let running =
+                                match self.runtime.send(Command::GetRunningPackageDigest {}) {
+                                    Ok(Response::Result { payload }) => payload
+                                        .get("digest")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::to_owned),
+                                    _ => None,
+                                };
+                            installer.reconcile_activation(&mut result, running.as_deref());
+                        }
+                        result
+                    } else {
+                        json!({"ok":false,"code":"rtx_hdr_install_unavailable"})
+                    };
+                    return complete(&self.runtime, id, result);
                 }
                 let payload = if payload.get("action").and_then(serde_json::Value::as_str)
                     == Some("repository_list")

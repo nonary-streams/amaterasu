@@ -266,6 +266,17 @@ fn factory_checks_version_and_uses_authenticated_principal() {
         assert_eq!(invoke(&factory, principal, &query, &mut result), STATUS_OK);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         (*result).release.unwrap()((*result).context);
+        query.min_minor = GPU_PROCESSOR_CONFIGURATION_INTERFACE_MINOR;
+        query.min_size = GPU_PROCESSOR_API_V1_2_SIZE;
+        assert_eq!(invoke(&factory, principal, &query, &mut result), STATUS_OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        (*result).release.unwrap()((*result).context);
+        query.min_minor += 1;
+        assert_eq!(
+            invoke(&factory, principal, &query, &mut result),
+            MEDIA_UNSUPPORTED
+        );
+        assert!(result.is_null());
     }
 }
 
@@ -316,4 +327,156 @@ fn consumer_panic_is_contained_and_output_reference_is_retired() {
     unsafe {
         api.base.release.unwrap()(api.base.context);
     }
+}
+
+type ObservedConfigurations = Rc<std::cell::RefCell<Vec<(u64, Vec<u8>)>>>;
+
+struct ConfiguredEffect {
+    observed: ObservedConfigurations,
+    state: Rc<State>,
+}
+impl GpuFrameProcessor for ConfiguredEffect {
+    fn configure_stream(&mut self, stream: u64, json: &[u8]) -> Result<(), Status> {
+        self.observed.borrow_mut().push((stream, json.to_vec()));
+        Ok(())
+    }
+    fn process(&mut self, _: u64, input: GpuFrame<'_>) -> Result<GpuOutputFrame, Status> {
+        Ok(output(&self.state, *input.frame()))
+    }
+    fn cancel(&mut self, _: u64) {}
+    fn shutdown(&mut self) {}
+}
+
+#[test]
+fn stream_configuration_is_bounded_versioned_and_provider_owned() {
+    assert_eq!(
+        std::mem::offset_of!(GpuProcessorApiV1_2, configure_stream),
+        size_of::<GpuProcessorApiV1_1>()
+    );
+    let observed = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let raw = into_gpu_binding(ConfiguredEffect {
+        observed: observed.clone(),
+        state: Rc::new(State::default()),
+    });
+    let api = unsafe { &*raw };
+    assert_eq!(
+        unsafe { configure_gpu_stream(api, 41, br#"{"gain":42}"#) },
+        Ok(())
+    );
+    assert_eq!(
+        observed.borrow().as_slice(),
+        &[(41, br#"{"gain":42}"#.to_vec())]
+    );
+    assert_eq!(
+        unsafe { configure_gpu_stream(api, 42, b"not json") },
+        Err(STATUS_INVALID_ARGUMENT)
+    );
+    assert_eq!(
+        unsafe {
+            configure_gpu_stream(
+                api,
+                42,
+                &vec![b' '; GPU_PROCESSOR_MAX_CONFIGURATION_BYTES + 1],
+            )
+        },
+        Err(STATUS_INVALID_ARGUMENT)
+    );
+    let tail = unsafe { &*raw.cast::<GpuProcessorApiV1_2>() };
+    assert_eq!(
+        unsafe { (tail.configure_stream)(api.base.context, 42, std::ptr::null(), 1) },
+        STATUS_INVALID_ARGUMENT
+    );
+    assert_eq!(observed.borrow().len(), 1);
+    assert_eq!(unchanged_consumer(api), DMABUF_COLOR_SRGB);
+    unsafe { api.base.release.unwrap()(api.base.context) };
+
+    // An unchanged provider still works for frames and rejects the new option.
+    let old = into_gpu_binding(AlternateEffect {
+        state: Rc::new(State::default()),
+    });
+    let api = unsafe { &*old };
+    assert_eq!(
+        unsafe { configure_gpu_stream(api, 41, b"{}") },
+        Err(MEDIA_UNSUPPORTED)
+    );
+    assert_eq!(unchanged_consumer(api), DMABUF_COLOR_SRGB);
+    unsafe { api.base.release.unwrap()(api.base.context) };
+
+    // An actual v1.0-size table must never be accessed as a v1.2 table.
+    let api = GpuProcessorApi {
+        base: NativeInterface {
+            header: AbiHeader {
+                major: GPU_PROCESSOR_INTERFACE_MAJOR,
+                minor: 0,
+                size: GPU_PROCESSOR_API_V1_0_SIZE,
+            },
+            context: std::ptr::null_mut(),
+            release: None,
+        },
+        process: unreachable_process,
+        cancel_dmabuf_leases: unreachable_cancel,
+    };
+    assert_eq!(
+        unsafe { configure_gpu_stream(&api, 41, b"{}") },
+        Err(MEDIA_UNSUPPORTED)
+    );
+}
+
+unsafe extern "C" fn unreachable_process(
+    _: *mut c_void,
+    _: u64,
+    _: *const DmaBufFrameLease,
+    _: u32,
+    _: DmaBufLeaseSink,
+) -> Status {
+    panic!("unexpected process")
+}
+unsafe extern "C" fn unreachable_cancel(_: *mut c_void, _: u64) {
+    panic!("unexpected cancel")
+}
+
+struct RejectingConfiguration {
+    reserved: Rc<Cell<bool>>,
+    cancellations: Rc<Cell<u32>>,
+}
+impl GpuFrameProcessor for RejectingConfiguration {
+    fn configure_stream(&mut self, _: u64, _: &[u8]) -> Result<(), Status> {
+        self.reserved.set(true);
+        Err(MEDIA_BACKEND_ERROR)
+    }
+    fn process(&mut self, _: u64, _: GpuFrame<'_>) -> Result<GpuOutputFrame, Status> {
+        Err(MEDIA_BACKEND_ERROR)
+    }
+    fn cancel(&mut self, stream: u64) {
+        assert_eq!(stream, 27);
+        assert!(self.reserved.replace(false));
+        self.cancellations.set(self.cancellations.get() + 1);
+    }
+    fn shutdown(&mut self) {
+        assert!(!self.reserved.get());
+    }
+}
+
+#[test]
+fn rejected_configuration_retires_partial_provider_state_once() {
+    let reserved = Rc::new(Cell::new(false));
+    let cancellations = Rc::new(Cell::new(0));
+    let raw = into_gpu_binding(RejectingConfiguration {
+        reserved: reserved.clone(),
+        cancellations: cancellations.clone(),
+    });
+    let api = unsafe { &*raw };
+    assert_eq!(
+        unsafe { configure_gpu_stream(api, 27, b"invalid") },
+        Err(STATUS_INVALID_ARGUMENT)
+    );
+    assert_eq!(cancellations.get(), 0);
+    assert_eq!(
+        unsafe { configure_gpu_stream(api, 27, b"{}") },
+        Err(MEDIA_BACKEND_ERROR)
+    );
+    assert!(!reserved.get());
+    assert_eq!(cancellations.get(), 1);
+    unsafe { api.base.release.unwrap()(api.base.context) };
+    assert_eq!(cancellations.get(), 1);
 }

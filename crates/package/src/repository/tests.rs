@@ -960,3 +960,172 @@ fn bounded_transport_refreshes_catalog_and_downloads_verified_web_bundle() {
         .is_err()
     );
 }
+
+#[test]
+fn production_candidate_verification_is_read_only_and_checks_live_authority() {
+    let fixture = Fixture::new();
+    let (active_source, active_candidate) =
+        fixture.native_set_variant("active-package", 3, "1.0", b"old trusted library");
+    let (source, candidate) = fixture.native_set();
+    let (raw, signature) = fixture.signed_catalog(vec![candidate.clone()], 7);
+    let store = RepositoryStore::new(fixture.root.join("production-approvals")).unwrap();
+    store.approve(fixture.approved.clone()).unwrap();
+    store
+        .accept_catalog(
+            &fixture.approved.id,
+            &raw,
+            &signature,
+            &current_target(),
+            100,
+        )
+        .unwrap();
+    let catalog = store
+        .catalog(&fixture.approved.id, &current_target(), 100)
+        .unwrap();
+    let cache = cache_candidate(&store, &fixture.approved.id, &candidate, &source);
+    let active_path = package_directory(&fixture.root, &active_candidate.manifest_sha256).unwrap();
+    fs::create_dir_all(&active_path).unwrap();
+    for entry in fs::read_dir(active_source).unwrap() {
+        let entry = entry.unwrap();
+        fs::copy(entry.path(), active_path.join(entry.file_name())).unwrap();
+    }
+    let mut bootstrap = fixture.bootstrap.clone();
+    bootstrap.development = false;
+    bootstrap.allow_unsigned = false;
+    bootstrap.trusted_keys.insert(
+        fixture.approved.fingerprint.clone(),
+        fixture.approved.public_key.clone(),
+    );
+    write_json_atomically(&fixture.root.join("bootstrap.json"), &bootstrap).unwrap();
+    let state = ActivationState {
+        active: Some(active_candidate.manifest_sha256.clone()),
+        highest_sequence: 3,
+        ..Default::default()
+    };
+    write_json_atomically(&fixture.root.join("selection.json"), &state).unwrap();
+    let revision = read_native_selection(&fixture.root).unwrap().revision;
+    let selection_before = fs::read(fixture.root.join("selection.json")).unwrap();
+    let _root_lock = RootLock::acquire(&fixture.root).unwrap();
+    let verify = |expected_revision: &str| {
+        with_verified_production_candidate(
+            &fixture.root,
+            &bootstrap,
+            &store,
+            &fixture.approved.id,
+            catalog.digest(),
+            &candidate.manifest_sha256,
+            &active_candidate.manifest_sha256,
+            expected_revision,
+            100,
+            |path, package, listed| {
+                assert_eq!(path, cache);
+                assert_eq!(package.digest, candidate.manifest_sha256);
+                assert_eq!(listed.implementation, candidate.implementation);
+                Ok(package.manifest.sequence)
+            },
+        )
+    };
+    assert_eq!(verify(&revision).unwrap(), 4);
+    assert!(verify(&"0".repeat(64)).unwrap_err().is_conflict());
+    assert_eq!(
+        fs::read(fixture.root.join("selection.json")).unwrap(),
+        selection_before
+    );
+    // A trial must bind the candidate and frozen host policy to the same
+    // live selection and independently approved publisher and changes.
+    let current_bytes = fs::read(fixture.root.join("bootstrap.json")).unwrap();
+    let mut proposed = bootstrap.clone();
+    proposed.policy.settings.insert(
+        "amaterasu.capture".into(),
+        serde_json::json!({"enabled": true}),
+    );
+    let proposed_bytes = serde_json::to_vec(&proposed).unwrap();
+    let context = crate::policy_approval::PolicyCandidateContext {
+        selection_revision: &revision,
+        publisher_fingerprint: &fixture.approved.fingerprint,
+        manifest_sha256: &candidate.manifest_sha256,
+    };
+    let approval =
+        crate::policy_approval::propose_policy_approval(&current_bytes, &proposed_bytes, &context)
+            .unwrap();
+    let allowlist = crate::policy_approval::PolicyAllowlist {
+        publisher_fingerprint: fixture.approved.fingerprint.clone(),
+        changes: approval.changes.clone(),
+    };
+    let trial = |allowlist: &crate::policy_approval::PolicyAllowlist, bytes: &[u8]| {
+        with_verified_production_trial(
+            &fixture.root,
+            &bootstrap,
+            &store,
+            &fixture.approved.id,
+            catalog.digest(),
+            &candidate.manifest_sha256,
+            &active_candidate.manifest_sha256,
+            &revision,
+            100,
+            ProductionTrialPolicy {
+                current_bytes: &current_bytes,
+                candidate_bytes: bytes,
+                allowlist,
+                approval: &approval,
+            },
+            |_path, package, trial_bootstrap| {
+                assert_eq!(
+                    package.runtime_config.settings.get("amaterasu.capture"),
+                    trial_bootstrap.policy.settings.get("amaterasu.capture")
+                );
+                Ok(package.manifest.sequence)
+            },
+        )
+    };
+    assert_eq!(trial(&allowlist, &proposed_bytes).unwrap(), 4);
+    let staged_digest = stage_verified_production_trial(
+        &fixture.root,
+        &bootstrap,
+        &store,
+        &fixture.approved.id,
+        catalog.digest(),
+        &candidate.manifest_sha256,
+        &active_candidate.manifest_sha256,
+        &revision,
+        100,
+        ProductionTrialPolicy {
+            current_bytes: &current_bytes,
+            candidate_bytes: &proposed_bytes,
+            allowlist: &allowlist,
+            approval: &approval,
+        },
+        |path, package, _policy| {
+            assert_ne!(path, cache);
+            assert_eq!(
+                fs::read(path.join("capture.bin")).unwrap(),
+                b"synthetic library bytes, never loaded"
+            );
+            Ok(package.digest.clone())
+        },
+    )
+    .unwrap();
+    assert_eq!(staged_digest, candidate.manifest_sha256);
+    assert_eq!(
+        fs::read(fixture.root.join("selection.json")).unwrap(),
+        selection_before
+    );
+    let mut denied = allowlist.clone();
+    denied.changes.clear();
+    assert!(trial(&denied, &proposed_bytes).is_err());
+    let mut changed = proposed.clone();
+    changed.policy.settings.insert(
+        "amaterasu.capture".into(),
+        serde_json::json!({"enabled": false}),
+    );
+    assert!(trial(&allowlist, &serde_json::to_vec(&changed).unwrap()).is_err());
+    fs::write(cache.join("capture.bin"), b"modified").unwrap();
+    assert!(verify(&revision).is_err());
+    fs::copy(source.join("capture.bin"), cache.join("capture.bin")).unwrap();
+    store.revoke(&fixture.approved.id).unwrap();
+    assert!(verify(&revision).is_err());
+    assert_eq!(
+        fs::read(fixture.root.join("selection.json")).unwrap(),
+        selection_before
+    );
+}

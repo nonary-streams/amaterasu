@@ -2,6 +2,9 @@
 //! LinuxSession package. Generation never installs or starts the unit.
 
 use crate::profiles::PackageProfile;
+#[cfg(test)]
+use amaterasu_package::linux_user_unit::systemd_quote;
+use amaterasu_package::linux_user_unit::{render_service_unit, valid_digest};
 use amaterasu_package::{
     ActivationState, BootstrapConfig, PackageResult, VerificationPolicy, create_private_directory,
     current_target, package_directory, random_identifier, read_bounded, sha256, sha256_reader,
@@ -199,6 +202,31 @@ pub fn preflight(
         return Err("active package is not the selected signed LinuxSession package".into());
     }
     validate_linux_session_composition(&verified.manifest.components)?;
+    let rtx_selected = verified
+        .manifest
+        .components
+        .iter()
+        .any(|component| component.id == "amaterasu.rtx-hdr");
+    let authority_request = verified.privileged_requests.iter().any(|request| {
+        request.component == "amaterasu.capture-vkms"
+            && request.operation == amaterasu_package::PrivilegedOperation::VkmsFrameExportV1
+    });
+    if let Some(helper) = validate_rtx_capture_configuration(
+        &verified.runtime_config.settings,
+        rtx_selected,
+        authority_request,
+    )? {
+        let helper = existing_path(&helper, "RTX HDR frame helper", false)?;
+        validate_executable(&helper)?;
+    }
+    if rtx_selected {
+        println!(
+            "[ok] RTX HDR requires immutable VKMS snapshots and an explicitly selected helper"
+        );
+        println!(
+            "[info] capture/helper build features, leased driver ioctl, and GPU processing require runtime validation"
+        );
+    }
     let expected_unit = render_service_unit(
         &host_executable,
         &runtime_root,
@@ -330,6 +358,76 @@ fn setting_enabled(
         .and_then(|value| value.get("enabled"))
         .and_then(serde_json::Value::as_bool)
         == Some(true)
+}
+
+/// Check only signed profile configuration. Actual capture and helper features
+/// are checked by the provider and wire handshake; driver support requires a
+/// real frame export and cannot be established from package filenames.
+fn validate_rtx_capture_configuration(
+    settings: &std::collections::BTreeMap<String, serde_json::Value>,
+    rtx_selected: bool,
+    authority_request: bool,
+) -> PackageResult<Option<PathBuf>> {
+    if !rtx_selected {
+        return Ok(None);
+    }
+    let video = settings
+        .get(crate::profiles::linux_session::VIDEO_COMPONENT_ID)
+        .and_then(serde_json::Value::as_object)
+        .ok_or("RTX HDR requires the Linux session video settings")?;
+    if video
+        .get("gpu_processor_service")
+        .and_then(serde_json::Value::as_str)
+        != Some("amaterasu.rtx-hdr/1")
+        || video
+            .get("gpu_processor_opt_in")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+    {
+        return Err("RTX HDR signed profile must select the opt-in GPU processor".into());
+    }
+    let capture = settings
+        .get("amaterasu.capture-vkms")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("RTX HDR requires VKMS capture settings")?;
+    if capture.get("enabled").and_then(serde_json::Value::as_bool) != Some(true)
+        || capture
+            .get("gpu_snapshot")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || capture
+            .get("require_lease")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || !capture
+            .get("capture_principals")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|principals| {
+                principals.iter().any(|principal| {
+                    principal == crate::profiles::linux_session::VIDEO_COMPONENT_ID
+                })
+            })
+    {
+        return Err(
+            "RTX HDR requires enabled VKMS capture, GPU snapshots and immutable driver leases"
+                .into(),
+        );
+    }
+    let authority = capture
+        .get("authority_channel")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let helper = capture
+        .get("frame_helper")
+        .and_then(serde_json::Value::as_str);
+    match (authority, helper) {
+        (true, None) if authority_request => Ok(None),
+        (false, Some(path)) if !path.is_empty() => Ok(Some(PathBuf::from(path))),
+        (true, None) => {
+            Err("RTX HDR authority capture requires a signed VKMS helper request".into())
+        }
+        _ => Err("RTX HDR requires exactly one configured VKMS helper or authority channel".into()),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -797,15 +895,22 @@ fn validate_linux_session_composition(
         .iter()
         .map(|component| component.id.as_str())
         .collect::<BTreeSet<_>>();
-    let expected = PackageProfile::LinuxSession
-        .components()
-        .iter()
-        .map(|component| component.id)
-        .collect::<BTreeSet<_>>();
-    if actual != expected {
-        return Err("signed package does not match the LinuxSession component composition".into());
+    let supported_profiles = [
+        PackageProfile::LinuxSession,
+        PackageProfile::LinuxSessionRtxHdr,
+    ];
+    if supported_profiles.into_iter().any(|profile| {
+        let expected = profile
+            .components()
+            .iter()
+            .map(|component| component.id)
+            .collect::<BTreeSet<_>>();
+        actual == expected && components.len() == expected.len()
+    }) {
+        Ok(())
+    } else {
+        Err("signed package does not match a supported LinuxSession composition".into())
     }
-    Ok(())
 }
 
 fn existing_path(path: &Path, description: &str, directory: bool) -> PackageResult<PathBuf> {
@@ -893,23 +998,6 @@ fn write_artifact_directory(output: &Path, files: &[(&str, String)]) -> PackageR
     result
 }
 
-fn render_service_unit(
-    executable: &Path,
-    root: &Path,
-    digest: &str,
-    host_executable_digest: &str,
-) -> PackageResult<String> {
-    if !valid_digest(digest) || !valid_digest(host_executable_digest) {
-        return Err("service unit digests must be SHA-256 values".into());
-    }
-    let executable = systemd_quote(executable)?;
-    let root = systemd_quote(root)?;
-    Ok(format!(
-        "[Unit]\nDescription=Amaterasu LinuxSession ({})\n# HostExecutableSha256={host_executable_digest}\nAfter=graphical-session.target\nPartOf=graphical-session.target\nStartLimitIntervalSec=0\n\n[Service]\nType=simple\nExecStart={executable} service-user {root} {digest}\nRestart=on-failure\nRestartSec=5s\nKillSignal=SIGTERM\nKillMode=mixed\nTimeoutStopSec=20s\n\n[Install]\nWantedBy=graphical-session.target\n",
-        &digest[..12],
-    ))
-}
-
 /// Hashes the executable bytes without running the selected host program. This
 /// keeps preparation usable for cross-built artifacts and pins the bytes into
 /// the generated, reviewable unit for later preflight comparisons.
@@ -929,26 +1017,6 @@ fn host_executable_sha256(path: &Path) -> PackageResult<String> {
         return Err("host executable changed while hashing".into());
     }
     Ok(digest)
-}
-
-fn systemd_quote(path: &Path) -> PackageResult<String> {
-    let value = path
-        .to_str()
-        .ok_or("systemd unit paths must be valid UTF-8")?;
-    if value.chars().any(char::is_control) {
-        return Err("systemd unit paths cannot contain control characters".into());
-    }
-    let mut quoted = String::from("\"");
-    for character in value.chars() {
-        match character {
-            '\\' => quoted.push_str("\\\\"),
-            '"' => quoted.push_str("\\\""),
-            '%' => quoted.push_str("%%"),
-            value => quoted.push(value),
-        }
-    }
-    quoted.push('"');
-    Ok(quoted)
 }
 
 fn install_script() -> &'static str {
@@ -1064,6 +1132,11 @@ if ! "$release_cli" preflight-linux-user-service "$1" "$2" "$bundle_dir"; then
     echo "active signed package or desktop prerequisites changed during enable; new unit changes rolled back" >&2
     exit 1
 fi
+# Authorize the fixed optional plugin policy for the verified installed
+# publisher; the NVIDIA runtime and RTX HDR plugin are not installed here.
+if ! runtime_root=$(CDPATH= cd -- "$1" && pwd -P) || ! "$release_cli" provision-default-package-activation "$runtime_root" >/dev/null; then
+    echo "Warning: RTX HDR activation setup was not completed; the base service is installed." >&2
+fi
 echo "Enabled $unit_name for this user; it will start with graphical-session.target."
 echo "To start it now, run: systemctl --user start $unit_name"
 "#
@@ -1177,10 +1250,6 @@ For a package with owned virtual displays, preparation also emits `org.amaterasu
 The generated service scripts affect only the current user service directory selected by `XDG_CONFIG_HOME` (or `$HOME/.config`). They refuse root execution and symlinked service paths, and verify that systemd resolves this exact unit file before enabling or uninstalling it. No service was installed or started when this bundle was generated.
 "#
     )
-}
-
-fn valid_digest(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -1355,6 +1424,10 @@ exit 0
             &fake_release,
             r#"#!/bin/sh
 printf '%s\n' "$*" >> "$RELEASE_LOG"
+if [ "$1" = provision-default-package-activation ]; then
+    [ ! -f "$PROVISION_FAIL_FILE" ]
+    exit $?
+fi
 count=0
 [ ! -f "$PREFLIGHT_COUNT_FILE" ] || count=$(cat "$PREFLIGHT_COUNT_FILE")
 count=$((count + 1))
@@ -1378,6 +1451,8 @@ fail_at=0
         let release_log = root.join("release.log");
         let preflight_count = root.join("preflight-count");
         let preflight_fail_at = root.join("preflight-fail-at");
+        let provision_fail = root.join("provision-fail");
+        fs::create_dir_all(root.join("runtime")).unwrap();
         let query_status = root.join("query-status");
         let duplicate_status = root.join("duplicate-status");
         let active_state = root.join("active-state");
@@ -1409,6 +1484,7 @@ fail_at=0
                 .env("RELEASE_LOG", &release_log)
                 .env("PREFLIGHT_COUNT_FILE", &preflight_count)
                 .env("PREFLIGHT_FAIL_AT_FILE", &preflight_fail_at)
+                .env("PROVISION_FAIL_FILE", &provision_fail)
                 .env("QUERY_STATUS_FILE", &query_status)
                 .env("DUPLICATE_STATUS_FILE", &duplicate_status)
                 .env("ACTIVE_STATE_FILE", &active_state)
@@ -1475,6 +1551,14 @@ fail_at=0
 
         assert!(run_script("install-user-service.sh", &expected_fragment, false).success());
         assert!(run_script("install-user-service.sh", &expected_fragment, false).success());
+        assert!(
+            fs::read_to_string(&release_log)
+                .unwrap()
+                .contains("provision-default-package-activation")
+        );
+        fs::write(&provision_fail, "fail").unwrap();
+        assert!(run_script("install-user-service.sh", &expected_fragment, false).success());
+        fs::remove_file(&provision_fail).unwrap();
         assert_eq!(fs::read(&installed).unwrap(), unit.as_bytes());
         assert!(wanted_link.is_symlink());
         assert!(!fs::read_to_string(&log).unwrap().contains("start "));
@@ -1726,6 +1810,48 @@ esac
     }
 
     #[test]
+    fn rtx_preflight_rejects_unqualified_capture_and_missing_authority() {
+        use serde_json::json;
+        let mut settings = std::collections::BTreeMap::from([
+            (
+                crate::profiles::linux_session::VIDEO_COMPONENT_ID.to_owned(),
+                json!({
+                    "gpu_processor_service":"amaterasu.rtx-hdr/1", "gpu_processor_opt_in":true
+                }),
+            ),
+            (
+                "amaterasu.capture-vkms".to_owned(),
+                json!({
+                    "enabled":true, "gpu_snapshot":true, "require_lease":true,
+                    "capture_principals":[crate::profiles::linux_session::VIDEO_COMPONENT_ID],
+                    "authority_channel":true
+                }),
+            ),
+        ]);
+        assert!(validate_rtx_capture_configuration(&settings, false, false).is_ok());
+        assert!(validate_rtx_capture_configuration(&settings, true, false).is_err());
+        assert_eq!(
+            validate_rtx_capture_configuration(&settings, true, true).unwrap(),
+            None
+        );
+        settings.get_mut("amaterasu.capture-vkms").unwrap()["gpu_snapshot"] = json!(false);
+        assert!(validate_rtx_capture_configuration(&settings, true, true).is_err());
+        settings.get_mut("amaterasu.capture-vkms").unwrap()["gpu_snapshot"] = json!(true);
+        settings.get_mut("amaterasu.capture-vkms").unwrap()["require_lease"] = json!(false);
+        assert!(validate_rtx_capture_configuration(&settings, true, true).is_err());
+        settings.get_mut("amaterasu.capture-vkms").unwrap()["require_lease"] = json!(true);
+        settings.get_mut("amaterasu.capture-vkms").unwrap()["authority_channel"] = json!(false);
+        settings.get_mut("amaterasu.capture-vkms").unwrap()["frame_helper"] =
+            json!("/usr/libexec/amaterasu-vkms-frame-helper");
+        assert_eq!(
+            validate_rtx_capture_configuration(&settings, true, false).unwrap(),
+            Some(PathBuf::from("/usr/libexec/amaterasu-vkms-frame-helper"))
+        );
+        settings.get_mut("amaterasu.capture-vkms").unwrap()["authority_channel"] = json!(true);
+        assert!(validate_rtx_capture_configuration(&settings, true, true).is_err());
+    }
+
+    #[test]
     fn loader_checks_follow_actual_linux_session_capture_settings() {
         let root = std::env::temp_dir().join(format!(
             "amaterasu-linux-session-preflight-settings-{}-{}",
@@ -1789,23 +1915,30 @@ esac
 
     #[test]
     fn package_composition_must_match_exact_linux_session_component_set() {
-        let manifests = PackageProfile::LinuxSession
-            .components()
-            .iter()
-            .map(|component| ComponentManifest {
-                id: component.id.into(),
-                version: "0.1.0".into(),
-                file: format!("{}.so", component.library),
-                sha256: "0".repeat(64),
-                size: 1,
-                abi_major: 1,
-                runtime: component.id == "amaterasu.runtime",
-                requires: Default::default(),
-                requested: Grants::default(),
-            })
-            .collect::<Vec<_>>();
-        assert!(validate_linux_session_composition(&manifests).is_ok());
-        assert!(validate_linux_session_composition(&manifests[..manifests.len() - 1]).is_err());
+        for profile in [
+            PackageProfile::LinuxSession,
+            PackageProfile::LinuxSessionRtxHdr,
+        ] {
+            let mut manifests = profile
+                .components()
+                .iter()
+                .map(|component| ComponentManifest {
+                    id: component.id.into(),
+                    version: "0.1.0".into(),
+                    file: format!("{}.so", component.library),
+                    sha256: "0".repeat(64),
+                    size: 1,
+                    abi_major: 1,
+                    runtime: component.id == "amaterasu.runtime",
+                    requires: Default::default(),
+                    requested: Grants::default(),
+                })
+                .collect::<Vec<_>>();
+            assert!(validate_linux_session_composition(&manifests).is_ok());
+            assert!(validate_linux_session_composition(&manifests[..manifests.len() - 1]).is_err());
+            manifests.push(manifests[0].clone());
+            assert!(validate_linux_session_composition(&manifests).is_err());
+        }
     }
 
     #[test]

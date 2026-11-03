@@ -4,3 +4,6 @@
 [submodule "modules/capture-vkms"]
 	path = modules/capture-vkms
 	url = https://github.com/nonary-streams/amaterasu-capture-vkms.git
+[submodule "modules/rtx-hdr"]
+	path = modules/rtx-hdr
+	url = https://github.com/nonary-streams/amaterasu-rtx-hdr.git

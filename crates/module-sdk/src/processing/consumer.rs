@@ -1,10 +1,57 @@
 //! Synchronous GPU processor consumer, shared by built-in and external plugins.
 use crate::abi::{STATUS_INVALID_ARGUMENT, STATUS_OK, Status};
-use amaterasu_media::{DmaBufFrameLease, DmaBufLeaseSink, GpuProcessorApi, MEDIA_BUSY};
+use amaterasu_media::{
+    DmaBufFrameLease, DmaBufLeaseSink, GPU_PROCESSOR_API_V1_2_SIZE,
+    GPU_PROCESSOR_CONFIGURATION_INTERFACE_MINOR, GPU_PROCESSOR_INTERFACE_MAJOR,
+    GPU_PROCESSOR_MAX_CONFIGURATION_BYTES, GpuProcessorApi, GpuProcessorApiV1_2, MEDIA_BUSY,
+    MEDIA_UNSUPPORTED,
+};
 use std::{
     ffi::c_void,
     panic::{AssertUnwindSafe, catch_unwind},
 };
+
+/// Configure an advertised v1.2 processor before metadata queries and frames.
+/// The provider consumes the bounded JSON synchronously, without retaining it.
+/// If the provider rejects the call, this adapter cancels the stream before
+/// returning, retiring any resources it may have reserved. The caller must not
+/// retry or cancel that stream again. Invalid input or an unsupported interface
+/// is rejected before dispatch and does not require cancellation.
+///
+/// # Safety
+/// `api` must be the prefix of a live GPU processor binding, and an advertised
+/// v1.2 table must occupy its complete declared size for this call.
+pub unsafe fn configure_gpu_stream(
+    api: &GpuProcessorApi,
+    stream: u64,
+    json: &[u8],
+) -> Result<(), Status> {
+    if json.is_empty()
+        || json.len() > GPU_PROCESSOR_MAX_CONFIGURATION_BYTES
+        || serde_json::from_slice::<serde_json::Value>(json).is_err()
+    {
+        return Err(STATUS_INVALID_ARGUMENT);
+    }
+    let header = api.base.header;
+    if header.major != GPU_PROCESSOR_INTERFACE_MAJOR
+        || header.minor < GPU_PROCESSOR_CONFIGURATION_INTERFACE_MINOR
+        || header.size < GPU_PROCESSOR_API_V1_2_SIZE
+    {
+        return Err(MEDIA_UNSUPPORTED);
+    }
+    // SAFETY: caller promises the advertised complete table and live binding.
+    let table = unsafe { &*std::ptr::from_ref(api).cast::<GpuProcessorApiV1_2>() };
+    let status =
+        unsafe { (table.configure_stream)(api.base.context, stream, json.as_ptr(), json.len()) };
+    if status == STATUS_OK {
+        Ok(())
+    } else {
+        // SAFETY: a rejected configuration may have reserved provider state;
+        // the live binding's cancellation callback synchronously retires it.
+        unsafe { (api.cancel_dmabuf_leases)(api.base.context, stream) };
+        Err(status)
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProcessingOutcome {

@@ -82,9 +82,11 @@ namespace Amaterasu {
       { name: "playnite", label: "Playnite", description: "Sync a Playnite library and provider-managed applications.", scope: "configuration.read" },
     ];
     let generation = 0;
-    context.content.append(sectionHeading("Integrations", "Connect and manage application providers on this host.", button("Refresh", load)), area);
+    const rtxHdrArea = el("div");
+    context.content.append(sectionHeading("Integrations", "Connect and manage integrations on this host.", button("Refresh", load)), rtxHdrArea, area);
     async function load(): Promise<void> {
       const request = ++generation;
+      renderRtxHdrIntegration(context, rtxHdrArea);
       const cards = providers.map((provider) => {
         const status = el("div", "integration-status", el("p", "muted", "Loading provider status…"));
         const settings = button("Configure", () => context.navigate("settings/integrations"));

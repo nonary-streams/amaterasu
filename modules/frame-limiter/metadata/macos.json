@@ -162,7 +162,8 @@
         "optional": {
           "control_results": "array",
           "dependency_inputs": "array",
-          "resource_generation": "integer"
+          "resource_generation": "integer",
+          "source_video_mode": "object"
         },
         "required": {
           "admission_id": "any",
@@ -211,7 +212,8 @@
         "optional": {
           "control_results": "array",
           "dependency_inputs": "array",
-          "resource_generation": "integer"
+          "resource_generation": "integer",
+          "source_video_mode": "object"
         },
         "required": {
           "admission_id": "any",

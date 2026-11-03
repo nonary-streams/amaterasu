@@ -23,7 +23,7 @@ namespace Amaterasu {
     effective: Record<string, { value: unknown; source: unknown }>;
   }
 
-  export function showSessionExtensionSettings(context: PageContext, scope: SessionExtensionScope, title: string): void {
+  export function showSessionExtensionSettings(context: PageContext, scope: SessionExtensionScope, title: string, provider?: string): void {
     if (!context.content.isConnected) return;
     const area = el("div");
     const dialog = el("dialog", "extension-settings-dialog");
@@ -41,10 +41,10 @@ namespace Amaterasu {
     dialog.addEventListener("cancel", (event) => { event.preventDefault(); close(); });
     document.body.append(dialog);
     dialog.showModal();
-    renderSessionExtensionSettings(context, area, scope);
+    renderSessionExtensionSettings(context, area, scope, provider);
   }
 
-  export function renderSessionExtensionSettings(context: PageContext, area: HTMLElement, scope: SessionExtensionScope = { kind: "host" }): void {
+  export function renderSessionExtensionSettings(context: PageContext, area: HTMLElement, scope: SessionExtensionScope = { kind: "host" }, provider?: string): void {
     let generation = 0;
     async function load(): Promise<void> {
       const current = ++generation;
@@ -64,7 +64,7 @@ namespace Amaterasu {
           if (after) seen.add(after);
           if (descriptors.length > 1024) throw new Error("Too many extensions.");
         } while (after);
-        const scopedDescriptors = descriptors.filter((descriptor) => Array.isArray(descriptor.options) && descriptor.options.some((option) => Array.isArray(option.allowed_scopes) && option.allowed_scopes.includes(scope.kind)));
+        const scopedDescriptors = descriptors.filter((descriptor) => (!provider || descriptor.provider === provider) && Array.isArray(descriptor.options) && descriptor.options.some((option) => Array.isArray(option.allowed_scopes) && option.allowed_scopes.includes(scope.kind)));
         const settings = await Promise.all(scopedDescriptors.map((descriptor) => context.api.post<SessionExtensionSettings>("session-extensions/settings_get", { provider: descriptor.provider, scope })));
         if (current !== generation || !context.content.isConnected || !area.isConnected) return;
         const panels: HTMLElement[] = [];
@@ -125,7 +125,7 @@ namespace Amaterasu {
           panels.push(panel(literalText(descriptor.display_name || "Plugin settings"), form));
         });
         for (const descriptor of descriptors) {
-          if (scope.kind !== "host") continue;
+          if (scope.kind !== "host" || (provider && descriptor.provider !== provider)) continue;
           if (!Array.isArray(descriptor.actions)) throw new Error("Invalid extension actions response.");
           const actions = descriptor.actions.filter((action) => Array.isArray(action.allowed_targets) && action.allowed_targets.includes("host") && ["read_only", "host_mutation"].includes(action.execution));
           if (actions.length) panels.push(panel(`${descriptor.provider} actions`, ...actions.map((action) => renderExtensionAction(context, action))));

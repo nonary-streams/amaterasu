@@ -2631,6 +2631,34 @@ fn disabled_hdr_policy_leaves_hdr_untouched() {
 }
 
 #[test]
+fn required_sdr_source_overrides_hdr_client_and_disabled_display_option() {
+    for option in ["auto", "disabled"] {
+        let mut state = State::default();
+        let mut pipeline = Pipeline::new(
+            FakePlatform {
+                hdr_supported: true,
+                hdr_state: true,
+                ..Default::default()
+            },
+            true,
+        );
+        let mut request = hdr_apply(option, Some(true));
+        request["mode_policy"]["source_hdr_required"] = json!(false);
+        let applied = state.run(&mut pipeline, "owner", request);
+        assert_eq!(applied["applied"], true, "{applied}");
+        assert_eq!(pipeline.platform.prepared_hdr, Some(Some(false)));
+        assert!(!pipeline.platform.hdr_state);
+        let restored = state.run(
+            &mut pipeline,
+            "owner",
+            json!({"action":"restore","lease":applied["lease"]}),
+        );
+        assert_eq!(restored["restored"], true);
+        assert!(pipeline.platform.hdr_state);
+    }
+}
+
+#[test]
 fn unsupported_hdr_and_missing_client_request_cannot_claim_success() {
     let mut state = State::default();
     let mut pipeline = Pipeline::new(FakePlatform::default(), true);

@@ -214,6 +214,7 @@ where
 }
 
 struct NvhttpModule {
+    package_barrier_registered: bool,
     runtime: RuntimeClient,
     log_queue: amaterasu_module_sdk::LogQueue,
     startup_settings: Settings,
@@ -306,7 +307,12 @@ impl ManagedModule for NvhttpModule {
             "nvhttp",
             "control and pairing module initialized",
         );
+        let package_barrier_registered = matches!(
+            runtime.send(Command::HostPackageBarrierRegister {}),
+            Ok(Response::Ok)
+        );
         Ok(Self {
+            package_barrier_registered,
             runtime,
             log_queue,
             startup_settings: settings,
@@ -344,6 +350,22 @@ impl ManagedModule for NvhttpModule {
 
     fn tick(&mut self) -> ModuleResult<()> {
         self.log_queue.flush(&self.runtime);
+        if self.package_barrier_registered && !self.quiescing {
+            let pending = match self.runtime.send(Command::HostPackageBarrierPending {})? {
+                Response::HostPackageActivationState { pending, .. } => pending,
+                _ => return Err("package activation barrier status unavailable".into()),
+            };
+            let ready = self
+                .router
+                .as_mut()
+                .is_none_or(|router| router.package_activation_barrier(pending));
+            match self.runtime.send(Command::HostPackageBarrierReady {
+                ready: pending && ready,
+            })? {
+                Response::Ok => {}
+                _ => return Err("package activation barrier update failed".into()),
+            }
+        }
         if self.quiescing {
             if let Some(router) = &mut self.router {
                 router.poll_with_trust(&self.runtime, |_, _| true);

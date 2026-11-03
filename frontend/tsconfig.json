@@ -22,6 +22,7 @@
     "src/management-policy.ts",
     "src/csrf-policy.ts",
     "src/settings.ts",
+    "src/rtx_hdr.ts",
     "src/integrations.ts",
     "src/updates.ts",
     "src/locale.ts",

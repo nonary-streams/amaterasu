@@ -419,7 +419,7 @@ pub fn user_service(root: &Path, expected_digest: &str) -> PackageResult<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn validate_user_service_root(root: &Path) -> PackageResult<std::path::PathBuf> {
+pub(crate) fn validate_user_service_root(root: &Path) -> PackageResult<std::path::PathBuf> {
     use std::path::Component;
 
     if !root.is_absolute()
@@ -454,7 +454,7 @@ fn validate_user_service_root(root: &Path) -> PackageResult<std::path::PathBuf> 
 
 #[cfg(target_os = "linux")]
 fn valid_package_digest(digest: &str) -> bool {
-    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+    amaterasu_package::linux_user_unit::valid_digest(digest)
 }
 
 #[cfg(target_os = "linux")]
@@ -466,8 +466,47 @@ fn validate_active_package_pin(expected: &str, active: &str) -> PackageResult<()
 }
 
 #[cfg(target_os = "linux")]
+enum LinuxUserAction {
+    Lifecycle(HostLifecycleAction),
+    Activate(amaterasu_contracts::HostPackageActivation),
+}
+
+#[cfg(target_os = "linux")]
 fn run_linux_user_service(root: &Path, expected_digest: &str) -> PackageResult<()> {
     let _lock = RootLock::acquire(root)?;
+    let mut trial_pending =
+        match crate::package_activation::startup_transition(root, expected_digest)? {
+            crate::package_activation::StartupTransition::None => false,
+            crate::package_activation::StartupTransition::Trial => true,
+            crate::package_activation::StartupTransition::Recovered => {
+                if let Ok(state) = validate_user_state_root(&root.join("data/state")) {
+                    let _ =
+                        crate::package_activation::write_status(&state, expected_digest, "failed");
+                }
+                return Err(
+                    "interrupted package transition recovered; service restart required".into(),
+                );
+            }
+        };
+    let result = run_linux_user_service_inner(root, expected_digest, &mut trial_pending);
+    if result.is_err() && trial_pending {
+        let recovered = crate::package_activation::recover(root, expected_digest);
+        if let Ok(state) = validate_user_state_root(&root.join("data/state")) {
+            let _ = crate::package_activation::write_status(&state, expected_digest, "failed");
+        }
+        if let Err(error) = recovered {
+            return Err(format!("trial failed and recovery is required: {error}"));
+        }
+    }
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn run_linux_user_service_inner(
+    root: &Path,
+    expected_digest: &str,
+    trial_pending: &mut bool,
+) -> PackageResult<()> {
     let digest = crate::supervisor::select_active(root)?;
     validate_active_package_pin(expected_digest, &digest)?;
     let bootstrap: BootstrapConfig = read_json(&root.join("bootstrap.json"))?;
@@ -491,15 +530,55 @@ fn run_linux_user_service(root: &Path, expected_digest: &str) -> PackageResult<(
             let starttime = crate::linux_input::process_starttime(pid)?;
             input.refresh(root, &digest, pid, starttime)?;
             publish_service_readiness(root, &digest)?;
+            if *trial_pending {
+                crate::package_activation::finalize(root, &digest)?;
+                *trial_pending = false;
+                if let Err(error) =
+                    crate::package_activation::write_status(&state_root, &digest, "committed")
+                {
+                    eprintln!("package activation receipt unavailable: {error}");
+                }
+            }
 
+            // Give management time to deliver its accepted response before
+            // stopping its listener for the trial and service restart.
+            let mut pending_activation: Option<(
+                amaterasu_contracts::HostPackageActivation,
+                Instant,
+            )> = None;
             while !USER_SERVICE_STOP_REQUESTED.load(Ordering::Relaxed) {
                 let tick_started = Instant::now();
                 components.tick()?;
                 components.health()?;
+                if pending_activation
+                    .as_ref()
+                    .is_some_and(|(_, deadline)| Instant::now() >= *deadline)
+                {
+                    let (request, _) = pending_activation.take().expect("checked pending request");
+                    input.revoke();
+                    if let Err(error) = components.quiesce(Duration::from_secs(20)) {
+                        let _ = crate::package_activation::write_status(
+                            &state_root,
+                            &request.manifest_digest,
+                            "failed",
+                        );
+                        return Err(format!(
+                            "cannot retire the running package for activation: {error}"
+                        ));
+                    }
+                    drop(components);
+                    return Ok(Some(LinuxUserAction::Activate(request)));
+                }
+                if pending_activation.is_none()
+                    && let Some(request) = components.take_host_package_activation()?
+                {
+                    pending_activation =
+                        Some((request, Instant::now() + Duration::from_millis(250)));
+                }
                 if let Some(action) = components.take_host_lifecycle_action()? {
                     input.revoke();
                     drop(components);
-                    return Ok(Some(action));
+                    return Ok(Some(LinuxUserAction::Lifecycle(action)));
                 }
                 input.refresh(root, &digest, pid, starttime)?;
                 std::thread::sleep(crate::timing::remaining_tick_interval(
@@ -513,13 +592,44 @@ fn run_linux_user_service(root: &Path, expected_digest: &str) -> PackageResult<(
         input.revoke();
         remove_service_readiness(root);
         match outcome {
-            Ok(Some(HostLifecycleAction::Restart)) => {
+            Ok(Some(LinuxUserAction::Activate(request))) => {
+                if let Err(error) = crate::package_activation::write_status(
+                    &state_root,
+                    &request.manifest_digest,
+                    "activating",
+                ) {
+                    eprintln!("package activation receipt unavailable: {error}");
+                    continue;
+                }
+                match crate::package_activation::activate(root, &digest, &state_root, &request) {
+                    Ok(()) => {
+                        break Err(
+                            "package activation committed; restart with the updated service pin"
+                                .into(),
+                        );
+                    }
+                    Err(error) => {
+                        let _ = crate::package_activation::write_status(
+                            &state_root,
+                            &request.manifest_digest,
+                            "failed",
+                        );
+                        eprintln!("package activation failed: {error}");
+                        if std::fs::symlink_metadata(root.join("package-activation-journal.json"))
+                            .is_ok()
+                        {
+                            break Err("package activation recovery is required".into());
+                        }
+                    }
+                }
+            }
+            Ok(Some(LinuxUserAction::Lifecycle(HostLifecycleAction::Restart))) => {
                 let Some(delay) = restarts.next_delay() else {
                     break Err("user service restart budget exhausted".into());
                 };
                 std::thread::sleep(delay);
             }
-            Ok(Some(HostLifecycleAction::Quit) | None) => break Ok(()),
+            Ok(Some(LinuxUserAction::Lifecycle(HostLifecycleAction::Quit)) | None) => break Ok(()),
             Err(error) => break Err(error),
         }
     };
@@ -556,6 +666,8 @@ fn load_linux_user_components(
             )?;
             let mut package = package;
             logging.inject(&mut package.runtime_config)?;
+            // Only this verified Linux user-service supervisor handles package requests.
+            package.runtime_config.host_package_activation_control = true;
             crate::loading::LoadedComponents::load(
                 root,
                 &package_path,
@@ -569,7 +681,7 @@ fn load_linux_user_components(
 }
 
 #[cfg(target_os = "linux")]
-fn validate_user_state_root(path: &Path) -> PackageResult<std::path::PathBuf> {
+pub(crate) fn validate_user_state_root(path: &Path) -> PackageResult<std::path::PathBuf> {
     use std::os::unix::fs::MetadataExt;
 
     if !path.is_absolute() {

@@ -93,6 +93,10 @@ pub(super) struct Record {
     pub restart_lifecycle_operation: Option<String>,
     pub restart_lifecycle_target: Option<amaterasu_extension_api::LifecycleTarget>,
     pub lifecycle_candidate_validated: bool,
+    pub processing_plan_provider: Option<crate::model::ProcessingPlanProvider>,
+    pub processing_frozen: Option<(String, Value)>,
+    pub processing_plan_complete: bool,
+    pub gpu_processing: Option<Value>,
     pub lifecycle_fenced: bool,
     pub lifecycle_retired: bool,
     pub lifecycle_delivery_permit: bool,
@@ -229,6 +233,10 @@ impl Record {
             restart_lifecycle_target: None,
             restart_lifecycle_operation: None,
             lifecycle_candidate_validated: false,
+            processing_plan_provider: None,
+            processing_frozen: None,
+            processing_plan_complete: false,
+            gpu_processing: None,
             lifecycle_fenced: false,
             lifecycle_retired: false,
             lifecycle_delivery_permit: false,
@@ -508,6 +516,9 @@ impl Record {
                 let start = self.start.as_ref().expect("validated start workflow");
                 let mut payload = json!({"action":"open", "encoder":start.encoder,
                     "configuration":start.configuration,"packet_boundaries":true});
+                if let Some(processing) = &self.gpu_processing {
+                    payload["configuration"]["gpu_processing"] = processing.clone();
+                }
                 if let Some(alias) = &start.encoder_provider {
                     payload["encoder_provider"] = json!(alias);
                 }

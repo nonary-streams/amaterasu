@@ -73,6 +73,262 @@ pub fn read_native_selection(root: &Path) -> PackageResult<NativeSelectionSnapsh
     Ok(snapshot(&selection, revision))
 }
 
+/// Verify a production candidate while holding its repository approval lock.
+///
+/// The caller must already hold the host root lock and authorize the request.
+/// The closure executes with current approval locked, and must enforce its own
+/// product policy for the candidate. This function does not stage or select it.
+/// Repository locks use nonblocking acquisition; contention returns an error.
+/// Cached bytes can change, so a caller that copies them must verify the copy.
+#[allow(clippy::too_many_arguments)]
+pub fn with_verified_production_candidate<T>(
+    root: &Path,
+    bootstrap: &BootstrapConfig,
+    store: &RepositoryStore,
+    repository_id: &str,
+    catalog_digest: &str,
+    manifest_digest: &str,
+    expected_active: &str,
+    expected_revision: &str,
+    now: u64,
+    operation: impl FnOnce(&Path, &crate::VerifiedPackage, &Candidate) -> PackageResult<T>,
+) -> Result<T, NativeSelectionError> {
+    let result = (|| {
+        if bootstrap.development || bootstrap.allow_unsigned || bootstrap.trusted_keys.is_empty() {
+            return Err("production verification requires a signed production bootstrap".into());
+        }
+        validate_revision(expected_revision)?;
+        if !canonical_digest(expected_active) || !canonical_digest(manifest_digest) {
+            return Err("invalid native package digest".into());
+        }
+        let current: BootstrapConfig = read_json(&root.join("bootstrap.json"))?;
+        if serde_json::to_vec(&current).map_err(|error| error.to_string())?
+            != serde_json::to_vec(bootstrap).map_err(|error| error.to_string())?
+        {
+            return Err("host bootstrap changed; reload before native package operation".into());
+        }
+        let (selection, revision) = read_selection_with_revision(root)?;
+        if revision != expected_revision || selection.active.as_deref() != Some(expected_active) {
+            return Err(SELECTION_REVISION_CONFLICT.into());
+        }
+        if selection.pending.is_some() || selection.trial.is_some() {
+            return Err("native activation already in progress".into());
+        }
+        let active = verify_package(
+            &package_directory(root, expected_active)?,
+            bootstrap,
+            VerificationPolicy {
+                minimum_sequence: selection.highest_sequence,
+                allow_historical: false,
+                now,
+            },
+        )?;
+        if !active.signed
+            || active.digest != expected_active
+            || active.manifest.host_context_schema != 1
+        {
+            return Err("active production selection lost authenticated identity".into());
+        }
+        let source = store.existing_native_candidate_cache_path(repository_id, manifest_digest)?;
+        let metadata = std::fs::symlink_metadata(&source)
+            .map_err(|error| format!("cached native candidate is unavailable: {error}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err("cached native candidate is not a private package directory".into());
+        }
+        store.with_current_catalog(
+            repository_id,
+            catalog_digest,
+            &current_target(),
+            now,
+            |approved, catalog| {
+                let mut candidates = catalog.candidates().iter().filter(|candidate| {
+                    candidate.kind == CandidateKind::NativeSet
+                        && candidate.manifest_sha256 == manifest_digest
+                });
+                let candidate = candidates
+                    .next()
+                    .ok_or("native candidate is absent from the current catalog")?;
+                if candidates.next().is_some() {
+                    return Err("native candidate digest has ambiguous catalog entries".into());
+                }
+                if bootstrap.trusted_keys.get(&approved.fingerprint) != Some(&approved.public_key) {
+                    return Err(
+                        "approved repository signer is not trusted by the production bootstrap"
+                            .into(),
+                    );
+                }
+                verify_candidate(approved, catalog, candidate, &source, bootstrap, now)?;
+                let package = verify_package(
+                    &source,
+                    bootstrap,
+                    VerificationPolicy {
+                        minimum_sequence: selection.highest_sequence,
+                        allow_historical: false,
+                        now,
+                    },
+                )?;
+                if !package.signed
+                    || package.digest != manifest_digest
+                    || package.manifest.host_context_schema != 1
+                    || package.signer_fingerprint.as_deref() != Some(approved.fingerprint.as_str())
+                {
+                    return Err("production candidate signature, ABI or digest changed".into());
+                }
+                if package.manifest.sequence == selection.highest_sequence
+                    && package.digest != expected_active
+                {
+                    return Err("production native release sequence was equivocated".into());
+                }
+                if let Some(floor) = selection.repository_floors.get(&approved.fingerprint)
+                    && (package.manifest.sequence < floor.sequence
+                        || (package.manifest.sequence == floor.sequence
+                            && package.digest != floor.digest))
+                {
+                    return Err("production candidate violates publisher release floor".into());
+                }
+                operation(&source, &package, candidate)
+            },
+        )
+    })();
+    result.map_err(selection_operation_error)
+}
+
+/// Policy and package inputs for a production trial. The caller must load the
+/// allowlist and approval from independently protected host authority; neither
+/// the repository nor the requesting component may supply that authority.
+pub struct ProductionTrialPolicy<'a> {
+    pub current_bytes: &'a [u8],
+    pub candidate_bytes: &'a [u8],
+    pub allowlist: &'a crate::policy_approval::PolicyAllowlist,
+    pub approval: &'a crate::policy_approval::PolicyApproval,
+}
+
+/// Verify the signed candidate and the exact authorized policy together while
+/// the repository approval lock is held. This does not stage or activate it.
+/// The host must hold its root lock, and must reverify any copied artifacts.
+#[allow(clippy::too_many_arguments)]
+pub fn with_verified_production_trial<T>(
+    root: &Path,
+    bootstrap: &BootstrapConfig,
+    store: &RepositoryStore,
+    repository_id: &str,
+    catalog_digest: &str,
+    manifest_digest: &str,
+    expected_active: &str,
+    expected_revision: &str,
+    now: u64,
+    policy: ProductionTrialPolicy<'_>,
+    operation: impl FnOnce(&Path, &crate::VerifiedPackage, &BootstrapConfig) -> PackageResult<T>,
+) -> Result<T, NativeSelectionError> {
+    if read_bounded(&root.join("bootstrap.json"), 1024 * 1024)
+        .map_err(NativeSelectionError::Failed)?
+        != policy.current_bytes
+    {
+        return Err(NativeSelectionError::Conflict);
+    }
+    with_verified_production_candidate(
+        root,
+        bootstrap,
+        store,
+        repository_id,
+        catalog_digest,
+        manifest_digest,
+        expected_active,
+        expected_revision,
+        now,
+        |path, verified, _candidate| {
+            let publisher = verified
+                .signer_fingerprint
+                .as_deref()
+                .ok_or("candidate signer is unavailable")?;
+            let context = crate::policy_approval::PolicyCandidateContext {
+                selection_revision: expected_revision,
+                publisher_fingerprint: publisher,
+                manifest_sha256: manifest_digest,
+            };
+            let trial_bootstrap = crate::policy_approval::verify_policy_candidate(
+                policy.allowlist,
+                policy.approval,
+                &context,
+                policy.current_bytes,
+                policy.candidate_bytes,
+            )?;
+            let trial = verify_package(
+                path,
+                &trial_bootstrap,
+                VerificationPolicy {
+                    minimum_sequence: verified.manifest.sequence,
+                    allow_historical: false,
+                    now,
+                },
+            )?;
+            if !trial.signed
+                || trial.digest != verified.digest
+                || trial.signer_fingerprint != verified.signer_fingerprint
+                || trial.manifest.host_context_schema != 1
+            {
+                return Err("candidate changed while preparing authorized trial".into());
+            }
+            operation(path, &trial, &trial_bootstrap)
+        },
+    )
+}
+
+/// Copy an authorized production trial into the host-owned set store and
+/// reverify the copy before the host attempts to load it. This does not change
+/// the active selection or release floor. The caller holds the host root lock.
+#[allow(clippy::too_many_arguments)]
+pub fn stage_verified_production_trial<T>(
+    root: &Path,
+    bootstrap: &BootstrapConfig,
+    store: &RepositoryStore,
+    repository_id: &str,
+    catalog_digest: &str,
+    manifest_digest: &str,
+    expected_active: &str,
+    expected_revision: &str,
+    now: u64,
+    policy: ProductionTrialPolicy<'_>,
+    operation: impl FnOnce(&Path, &crate::VerifiedPackage, &BootstrapConfig) -> PackageResult<T>,
+) -> Result<T, NativeSelectionError> {
+    with_verified_production_trial(
+        root,
+        bootstrap,
+        store,
+        repository_id,
+        catalog_digest,
+        manifest_digest,
+        expected_active,
+        expected_revision,
+        now,
+        policy,
+        |source, verified, trial_bootstrap| {
+            let verification = VerificationPolicy {
+                minimum_sequence: verified.manifest.sequence,
+                allow_historical: false,
+                now,
+            };
+            crate::staging::install_immutable_set(
+                source,
+                root,
+                trial_bootstrap,
+                verification,
+                verified,
+            )?;
+            let staged_path = package_directory(root, &verified.digest)?;
+            let staged = verify_package(&staged_path, trial_bootstrap, verification)?;
+            if !staged.signed
+                || staged.digest != verified.digest
+                || staged.signer_fingerprint != verified.signer_fingerprint
+                || staged.manifest.host_context_schema != 1
+            {
+                return Err("staged trial does not match authorized candidate".into());
+            }
+            operation(&staged_path, &staged, trial_bootstrap)
+        },
+    )
+}
+
 /// Verifies and stages the exact candidate named by a current approved catalog,
 /// using only the digest-derived cache entry owned by `RepositoryStore`.
 /// Approval lock order is repository store first, then activation root.

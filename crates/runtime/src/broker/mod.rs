@@ -7,10 +7,11 @@ mod requests;
 
 use amaterasu_contracts::{
     Command, DIAGNOSTICS_COMPONENT, Grants, HOST_LIFECYCLE_CONTROL_PRINCIPAL,
-    HOST_LIFECYCLE_SERVICE, HOST_LOG_SERVICE, HOST_STATE_CONTEXT_SERVICE, HostLifecycleAction,
-    HostLogEvent, Response, RuntimeConfig,
+    HOST_LIFECYCLE_SERVICE, HOST_LOG_SERVICE, HOST_PACKAGE_ACTIVATION_SERVICE,
+    HOST_PACKAGE_BARRIER_SERVICE, HOST_STATE_CONTEXT_SERVICE, HostLifecycleAction, HostLogEvent,
+    HostPackageActivation, Response, RuntimeConfig,
 };
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
 
 use api::{ApiInvocation, ApiQuery, ApiRegistry};
@@ -24,6 +25,9 @@ pub struct Broker {
     events: EventBus,
     hooks: HookRegistry,
     host_lifecycle: VecDeque<HostLifecycleAction>,
+    host_package_activation: Option<HostPackageActivation>,
+    host_package_barriers: BTreeMap<String, bool>,
+    host_package_activation_started: bool,
     log_events: VecDeque<HostLogEvent>,
     dropped_log_records: u64,
     logging_revision: u64,
@@ -64,6 +68,9 @@ impl Broker {
             requests,
             events: EventBus::default(),
             host_lifecycle: VecDeque::with_capacity(HOST_LIFECYCLE_QUEUE_CAPACITY),
+            host_package_activation: None,
+            host_package_barriers: BTreeMap::new(),
+            host_package_activation_started: false,
             log_events: VecDeque::with_capacity(LOG_EVENT_QUEUE_CAPACITY),
             dropped_log_records: 0,
             logging_revision: 0,
@@ -85,6 +92,28 @@ impl Broker {
             }
             return Response::HostLifecycle {
                 action: self.host_lifecycle.pop_front(),
+            };
+        }
+
+        if matches!(command, Command::HostPackageActivationDrain {}) {
+            if caller != HOST_LIFECYCLE_CONTROL_PRINCIPAL
+                || !self.configuration.host_package_activation_control
+            {
+                return errors::permission_denied();
+            }
+            let request = if !self.host_package_barriers.is_empty()
+                && self.host_package_barriers.values().all(|ready| *ready)
+            {
+                let request = self.host_package_activation.take();
+                if request.is_some() {
+                    self.host_package_activation_started = true;
+                }
+                request
+            } else {
+                None
+            };
+            return Response::HostPackageActivation {
+                request: request.map(Box::new),
             };
         }
 
@@ -141,6 +170,126 @@ impl Broker {
                 }
                 self.host_lifecycle.push_back(action);
                 Response::Ok
+            }
+            Command::HostPackageActivate { request } => {
+                let valid_digest = |value: &str| {
+                    value.len() == 64
+                        && value
+                            .bytes()
+                            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                };
+                if !self.configuration.host_package_activation_control
+                    || caller != "amaterasu.management"
+                    || !grants.call.contains(HOST_PACKAGE_ACTIVATION_SERVICE)
+                {
+                    return errors::permission_denied();
+                }
+                if request.repository_id.is_empty()
+                    || request.repository_id.len() > 128
+                    || !request
+                        .repository_id
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
+                    || ![
+                        &request.catalog_digest,
+                        &request.manifest_digest,
+                        &request.expected_active,
+                        &request.expected_revision,
+                    ]
+                    .iter()
+                    .all(|v| valid_digest(v))
+                {
+                    return Response::error(
+                        "invalid_request",
+                        "invalid package activation identity",
+                    );
+                }
+                if self.host_package_barriers.is_empty()
+                    || self
+                        .configuration
+                        .principals
+                        .iter()
+                        .any(|(principal, grants)| {
+                            grants.call.contains(HOST_PACKAGE_BARRIER_SERVICE)
+                                && !self.host_package_barriers.contains_key(principal)
+                        })
+                {
+                    return Response::error(
+                        "activation_barrier_unavailable",
+                        "the stream retirement barrier is unavailable",
+                    );
+                }
+                if self.host_package_activation.is_some() || self.host_package_activation_started {
+                    return Response::error(
+                        "activation_in_progress",
+                        "a package request is already pending",
+                    );
+                }
+                self.host_package_barriers
+                    .values_mut()
+                    .for_each(|ready| *ready = false);
+                self.host_package_activation = Some(request);
+                Response::Ok
+            }
+            Command::HostPackageActivationStatus {} | Command::HostPackageActivationCancel {} => {
+                if !self.configuration.host_package_activation_control
+                    || caller != "amaterasu.management"
+                    || !grants.call.contains(HOST_PACKAGE_ACTIVATION_SERVICE)
+                {
+                    return errors::permission_denied();
+                }
+                if matches!(command, Command::HostPackageActivationCancel {}) {
+                    if self.host_package_activation_started {
+                        return Response::error(
+                            "activation_in_progress",
+                            "activation has already started",
+                        );
+                    }
+                    self.host_package_activation = None;
+                    self.host_package_barriers
+                        .values_mut()
+                        .for_each(|ready| *ready = false);
+                    return Response::Ok;
+                }
+                Response::HostPackageActivationState {
+                    pending: self.host_package_activation.is_some(),
+                    started: self.host_package_activation_started,
+                }
+            }
+            Command::HostPackageBarrierRegister {} => {
+                if !self.configuration.host_package_activation_control
+                    || !grants.call.contains(HOST_PACKAGE_BARRIER_SERVICE)
+                {
+                    return errors::permission_denied();
+                }
+                self.host_package_barriers
+                    .entry(caller.into())
+                    .or_insert(false);
+                Response::Ok
+            }
+            Command::HostPackageBarrierPending {} | Command::HostPackageBarrierReady { .. } => {
+                if !self.configuration.host_package_activation_control
+                    || !self.host_package_barriers.contains_key(caller)
+                    || !grants.call.contains(HOST_PACKAGE_BARRIER_SERVICE)
+                {
+                    return errors::permission_denied();
+                }
+                if let Command::HostPackageBarrierReady { ready } = command {
+                    self.host_package_barriers.insert(
+                        caller.into(),
+                        ready && self.host_package_activation.is_some(),
+                    );
+                    Response::Ok
+                } else {
+                    Response::HostPackageActivationState {
+                        pending: self.host_package_activation.is_some()
+                            || self.host_package_activation_started,
+                        started: self.host_package_activation_started,
+                    }
+                }
+            }
+            Command::HostPackageActivationDrain {} => {
+                unreachable!("drain handled before module dispatch")
             }
             Command::HostLifecycleDrain {} => unreachable!("drain handled before module dispatch"),
             Command::DrainLogEvents {} => unreachable!("log drain handled before module dispatch"),
@@ -207,14 +356,25 @@ impl Broker {
                 }
             }
             Command::Register { service } => {
-                if service == HOST_LOG_SERVICE || self.api.owns_service(&service) {
+                if matches!(
+                    service.as_str(),
+                    HOST_LOG_SERVICE
+                        | HOST_PACKAGE_ACTIVATION_SERVICE
+                        | HOST_PACKAGE_BARRIER_SERVICE
+                ) || self.api.owns_service(&service)
+                {
                     errors::permission_denied()
                 } else {
                     self.requests.register_service(caller, grants, service)
                 }
             }
             Command::RegisterApi { method } => {
-                if method.service == HOST_LOG_SERVICE {
+                if matches!(
+                    method.service.as_str(),
+                    HOST_LOG_SERVICE
+                        | HOST_PACKAGE_ACTIVATION_SERVICE
+                        | HOST_PACKAGE_BARRIER_SERVICE
+                ) {
                     return errors::permission_denied();
                 }
                 let registered = self.api.register(caller, grants, method.clone());

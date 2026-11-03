@@ -123,3 +123,19 @@ pub struct GpuProcessorApiV1_1 {
 
 pub const GPU_PROCESSOR_METADATA_INTERFACE_MINOR: u32 = 1;
 pub const GPU_PROCESSOR_API_V1_1_SIZE: u32 = size_of::<GpuProcessorApiV1_1>() as u32;
+
+/// Maximum size of the UTF-8 JSON configuration borrowed by `configure_stream`.
+pub const GPU_PROCESSOR_MAX_CONFIGURATION_BYTES: usize = 16 * 1024;
+pub const GPU_PROCESSOR_CONFIGURATION_INTERFACE_MINOR: u32 = 2;
+
+/// Additive stream configuration. The consumer invokes this synchronously once
+/// before metadata or frame processing. The provider must copy any needed bytes;
+/// the pointer is borrowed for the call and the stream must be retired by cancel.
+/// A selected provider may reject unsupported or invalid configuration.
+#[repr(C)]
+pub struct GpuProcessorApiV1_2 {
+    pub base: GpuProcessorApiV1_1,
+    pub configure_stream: unsafe extern "C" fn(*mut c_void, u64, *const u8, usize) -> Status,
+}
+
+pub const GPU_PROCESSOR_API_V1_2_SIZE: u32 = size_of::<GpuProcessorApiV1_2>() as u32;

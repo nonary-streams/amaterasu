@@ -42,11 +42,13 @@ mod finalize_result;
 mod finalize_result_verify;
 #[allow(dead_code)] // Finalization selection remains gated until composition sequencing is wired.
 mod finalize_selection;
+mod frozen_settings_read;
 mod observation_scheduler;
 mod operations;
 #[allow(dead_code)]
 mod plan_observation;
 mod prepared_plans;
+mod processing_preflight;
 mod provider_observations;
 mod providers;
 mod recovery;
@@ -130,6 +132,8 @@ struct Work {
     intent: Option<StreamIntent>,
     reason: Option<ReleaseReason>,
     video: Option<VideoMode>,
+    #[serde(default)]
+    processing_decision: Option<processing_preflight::ProcessingDecision>,
     transition_id: String,
     providers: Vec<String>,
     #[serde(default)]
@@ -447,6 +451,8 @@ struct SessionRecord {
     /// Coordinator-owned generation of each session resource producer.
     #[serde(default)]
     resource_generations: BTreeMap<String, u64>,
+    #[serde(default)]
+    processing_decision: Option<processing_preflight::ProcessingDecision>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1111,6 +1117,7 @@ pub struct Coordinator {
     ephemeral: BTreeMap<String, (Receipt, Instant)>,
     work_cursor: usize,
     settings_jobs: BTreeMap<String, settings_snapshot::SettingsSnapshotJob>,
+    processing_jobs: BTreeMap<String, processing_preflight::ProcessingPreflightJob>,
 }
 
 impl Coordinator {
@@ -1193,6 +1200,7 @@ impl Coordinator {
             ephemeral: BTreeMap::new(),
             work_cursor: 0,
             settings_jobs: BTreeMap::new(),
+            processing_jobs: BTreeMap::new(),
         })
     }
 
@@ -1242,6 +1250,9 @@ impl Coordinator {
         }
         if operation == "read_prepared_plans" {
             return self.read_prepared_plans(caller, payload);
+        }
+        if operation == "read_frozen_provider_settings" {
+            return self.read_frozen_provider_settings(caller, payload);
         }
         if operation == "read_provider_context" {
             return self.read_provider_context(caller, payload);

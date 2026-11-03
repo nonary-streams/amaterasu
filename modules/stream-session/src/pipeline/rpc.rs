@@ -46,6 +46,26 @@ impl Pending {
         }
     }
 
+    pub fn processing_api(
+        service: &str,
+        payload: Value,
+        operation: String,
+        parent: Option<u64>,
+    ) -> Self {
+        let mut pending = Self::new(service, payload.clone(), operation.clone(), parent);
+        pending.command = Command::CallApi {
+            service: service.into(),
+            method: "processing_intent".into(),
+            interface_major: 1,
+            interface_minor: 0,
+            payload,
+            timeout_ms: 5000,
+            operation_id: operation,
+            parent,
+        };
+        pending
+    }
+
     /// Broker operation IDs make replay of this command safe after a lost
     /// admission. The caller must use this only for an idempotent provider action.
     pub fn retry_uncertain_admission(mut self) -> Self {

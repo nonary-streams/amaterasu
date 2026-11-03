@@ -1279,6 +1279,8 @@ struct DisplayModePolicy {
     configuration_option: Option<String>,
     #[serde(rename = "effective_client_hdr_request")]
     _effective_client_hdr_request: Option<bool>,
+    #[serde(rename = "source_hdr_required")]
+    _source_hdr_required: Option<bool>,
 }
 
 #[derive(Deserialize)]

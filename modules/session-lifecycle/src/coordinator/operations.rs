@@ -182,6 +182,7 @@ impl Coordinator {
             composition_progress: None,
             compacted_release: false,
             owner_observations: Default::default(),
+            processing_decision: None,
             reprepare: None,
             phase,
             target,
@@ -272,6 +273,7 @@ impl Coordinator {
             next.sessions.insert(
                 id.clone(),
                 SessionRecord {
+                    processing_decision: None,
                     provider_graph: current.provider_graph.clone(),
                     capture_binding_mode: self.settings.capture_binding_mode,
                     host_epoch: next.host_epoch.clone(),

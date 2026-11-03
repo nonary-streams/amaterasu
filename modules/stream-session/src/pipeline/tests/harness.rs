@@ -35,6 +35,10 @@ pub enum Fault {
 pub struct Broker {
     pub lifecycle_success: bool,
     pub lifecycle_reject_operation: Option<String>,
+    pub processing_plan_enabled: bool,
+    pub processing_plan_source_hdr: bool,
+    pub processing_plan_bad_revision: bool,
+    pub processing_plan_omit_ranges: bool,
     pub lifecycle_omit_consumer_confirmation: bool,
     pub lifecycle_observation_override: Option<Value>,
     pub lifecycle_input_target: Option<Value>,
@@ -255,6 +259,23 @@ impl Broker {
                 self.replies.insert(request, payload);
                 Ok(Response::Ok)
             }
+            Command::CallApi {
+                service,
+                method,
+                interface_major,
+                interface_minor,
+                payload,
+                timeout_ms,
+                operation_id,
+                parent,
+            } => self.send(Command::Request {
+                service,
+                payload: json!({"method":method,"interface_major":interface_major,
+                        "interface_minor":interface_minor,"arguments":payload}),
+                timeout_ms,
+                operation_id,
+                parent,
+            }),
             Command::Request {
                 service,
                 payload,
@@ -398,6 +419,11 @@ impl Broker {
                 return json!({"status":"rejected"});
             }
             let operation = call.payload["operation"].as_str().unwrap();
+            if operation == "read_frozen_provider_settings" {
+                return json!({"status":"succeeded","target":call.payload["target"],
+                    "provider":call.payload["provider"],"revision":"r1",
+                    "settings":{"test_control":42}});
+            }
             let id = call.payload["operation_id"].as_str().unwrap();
             if self.lifecycle_reject_operation.as_deref() == Some(operation) {
                 return json!({"status":"rejected"});
@@ -419,6 +445,18 @@ impl Broker {
                 return json!({"status":"pending"});
             }
             return result;
+        }
+        if call.service == "example.processing-control/1" {
+            assert_eq!(call.payload["method"], "processing_intent");
+            assert_eq!(call.payload["interface_major"], 1);
+            assert_eq!(call.payload["interface_minor"], 0);
+            return json!({"status":"succeeded", "target":call.payload["arguments"]["target"],
+                "revision":if self.processing_plan_bad_revision {"wrong"} else {"r1"},
+                "enabled":self.processing_plan_enabled,
+                "source_hdr_required":if self.processing_plan_enabled && !self.processing_plan_omit_ranges {Some(self.processing_plan_source_hdr)} else {None},
+                "output_hdr_required":if self.processing_plan_enabled && !self.processing_plan_omit_ranges {Some(true)} else {None},
+                "processor_settings":call.payload["arguments"]["settings"],
+                "processor_service":"example.gpu/1"});
         }
         let action = call.payload["action"].as_str().unwrap();
         let service = call.service.as_str();

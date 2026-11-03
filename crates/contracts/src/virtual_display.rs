@@ -84,6 +84,9 @@ pub struct VirtualDisplayModePolicy {
     pub hdr_option: Option<VirtualDisplayHdrOption>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_client_hdr_request: Option<bool>,
+    /// Required display source range, independent of the encoded stream range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_hdr_required: Option<bool>,
 }
 
 impl VirtualDisplayModePolicy {
@@ -504,6 +507,7 @@ mod tests {
             manual_refresh_rate: Some("59.94".into()),
             hdr_option: Some(VirtualDisplayHdrOption::Auto),
             effective_client_hdr_request: Some(true),
+            source_hdr_required: None,
         });
         assert_eq!(request.validate(), Ok(()));
 
@@ -515,6 +519,16 @@ mod tests {
             "ensure_primary"
         );
         assert_eq!(encoded["display_policy"]["hdr_option"], "auto");
+
+        let mut sdr_source = encoded.clone();
+        sdr_source["display_policy"]["source_hdr_required"] = json!(false);
+        let decoded: VirtualDisplayIntent = serde_json::from_value(sdr_source.clone()).unwrap();
+        assert_eq!(
+            decoded.display_policy.unwrap().source_hdr_required,
+            Some(false)
+        );
+        sdr_source["display_policy"]["source_hdr_required"] = json!("false");
+        assert!(serde_json::from_value::<VirtualDisplayIntent>(sdr_source).is_err());
 
         let mut unknown = encoded.clone();
         unknown["display_policy"]["unsupported"] = serde_json::json!(true);
@@ -552,6 +566,7 @@ mod tests {
             manual_refresh_rate: Some("59.94".into()),
             hdr_option: Some(VirtualDisplayHdrOption::Auto),
             effective_client_hdr_request: None,
+            source_hdr_required: None,
         });
         assert_eq!(request.validate(), Err("invalid_virtual_display_policy"));
 

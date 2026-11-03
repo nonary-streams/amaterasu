@@ -1435,6 +1435,10 @@ namespace Amaterasu {
           "Too many sign-in attempts. Wait a minute before trying again.",
         revision_conflict:
           "This data changed elsewhere. Refresh before saving again.",
+        activation_unavailable:
+          "Plugin activation is not enabled on this host. Update the host and complete its activation setup.",
+        activation_in_progress:
+          "A plugin activation is already in progress.",
         not_registered:
           "No settings schema has been registered for this console.",
       };

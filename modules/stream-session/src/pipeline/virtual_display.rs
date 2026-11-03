@@ -26,7 +26,11 @@ pub(super) fn create(record: &Record) -> Value {
         hdr_enabled: intent
             .display_policy
             .as_ref()
-            .and_then(|policy| policy.effective_client_hdr_request)
+            .and_then(|policy| {
+                policy
+                    .source_hdr_required
+                    .or(policy.effective_client_hdr_request)
+            })
             .unwrap_or(false),
         dd_virtual_display_scale: Some(intent.dd_virtual_display_scale),
         virtual_display_layout: None,

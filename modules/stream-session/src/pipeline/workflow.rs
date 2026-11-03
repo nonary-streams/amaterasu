@@ -27,6 +27,8 @@ pub(super) enum Step {
     RemoveOwnedVirtualDisplay,
     AcquireOutput,
     ValidateLifecycleCandidate,
+    ReadFrozenProcessingSettings,
+    PlanGpuProcessing,
     ObserveLifecycleCapture,
     AckLifecycleCapture,
     AckLifecycleStream,
@@ -302,6 +304,22 @@ impl Job {
                     "retirement_receipt":record.lifecycle_retirement_receipt})
                 };
                 ("amaterasu.session-lifecycle/1".into(), payload)
+            }
+            Step::ReadFrozenProcessingSettings => (
+                "amaterasu.session-lifecycle/1".into(),
+                json!({"operation":"read_frozen_provider_settings",
+                    "target":record.start.as_ref().expect("start").lifecycle_target,
+                    "provider":record.processing_plan_provider.as_ref().expect("provider").provider}),
+            ),
+            Step::PlanGpuProcessing => {
+                let plan = record.processing_plan_provider.as_ref().expect("provider");
+                let (revision, settings) =
+                    record.processing_frozen.as_ref().expect("frozen settings");
+                (
+                    plan.control_service.clone(),
+                    json!({"target":record.start.as_ref().expect("start").lifecycle_target,
+                    "revision":revision, "settings":settings}),
+                )
             }
             Step::ObserveLifecycleCapture | Step::ObserveActiveBinding => (
                 record.service(Resource::Video),

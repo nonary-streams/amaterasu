@@ -419,6 +419,66 @@ fn fake_runner_applies_requested_mode_and_verifies_readback_without_enable_chang
 }
 
 #[test]
+fn hdr_source_apply_and_restore_are_readback_verified() {
+    let mut raw = configuration();
+    raw["outputs"][0]["hdr"] = json!(true);
+    let baseline = typed_snapshot_for(&raw);
+    let request: Configuration = serde_json::from_value(json!({
+        "displays": [{
+            "id":"DP-1", "width":1920, "height":1080,
+            "refresh":{"numerator":60,"denominator":1}, "x":0,"y":0,
+            "hdr_enabled":false
+        }]
+    }))
+    .unwrap();
+    let mut runner = FakeKScreenRunner {
+        current: Some(raw),
+        ..Default::default()
+    };
+    apply_kscreen_snapshot_with(&mut runner, &request, &baseline, &mut || Ok(())).unwrap();
+    assert_eq!(runner.current.as_ref().unwrap()["outputs"][0]["hdr"], false);
+    assert!(runner.commands.iter().any(|command| matches!(command,
+    KScreenCommand::Configure(actions) if actions.contains(&KScreenAction::Hdr {
+        output: "DP-1".into(), enabled: false
+    }))));
+    restore_kscreen_snapshot_with(&mut runner, &baseline, &mut || Ok(())).unwrap();
+    assert!(baseline.matches_restoration(&typed_snapshot_for(runner.current.as_ref().unwrap())));
+    assert!(runner.commands.iter().any(|command| matches!(command,
+    KScreenCommand::Configure(actions) if actions.contains(&KScreenAction::Hdr {
+        output: "DP-1".into(), enabled: true
+    }))));
+}
+
+#[test]
+fn hdr_source_change_rejects_unreadable_baseline_before_mutation() {
+    let mut raw = configuration();
+    raw["outputs"][0].as_object_mut().unwrap().remove("hdr");
+    let baseline = typed_snapshot_for(&raw);
+    let request: Configuration = serde_json::from_value(json!({
+        "displays": [{
+            "id":"DP-1", "width":1920, "height":1080,
+            "refresh":{"numerator":60,"denominator":1}, "x":0,"y":0,
+            "hdr_enabled":false
+        }]
+    }))
+    .unwrap();
+    let mut runner = FakeKScreenRunner {
+        current: Some(raw),
+        ..Default::default()
+    };
+    let error =
+        apply_kscreen_snapshot_with(&mut runner, &request, &baseline, &mut || Ok(())).unwrap_err();
+    assert_eq!(error.code, "unsupported_topology");
+    assert!(!error.may_have_changed);
+    assert!(
+        !runner
+            .commands
+            .iter()
+            .any(|command| matches!(command, KScreenCommand::Configure(_)))
+    );
+}
+
+#[test]
 fn restore_is_readback_verified_idempotent_and_never_toggles_last_active_output() {
     let baseline_raw = reference_kde_configuration();
     let baseline = typed_snapshot_for(&baseline_raw);

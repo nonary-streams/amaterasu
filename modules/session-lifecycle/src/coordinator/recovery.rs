@@ -330,6 +330,7 @@ mod tests {
             composition_progress: None,
             compacted_release: false,
             owner_observations: Default::default(),
+            processing_decision: None,
             reprepare: None,
             phase: LifecyclePhase::StreamPrepare,
             target: old_target.clone(),
@@ -350,6 +351,7 @@ mod tests {
             recovery_authorized_epoch: None,
         };
         let session = SessionRecord {
+            processing_decision: None,
             provider_graph: None,
             host_epoch: "old".into(),
             id: "session".into(),

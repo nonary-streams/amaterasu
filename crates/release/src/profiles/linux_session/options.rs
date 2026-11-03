@@ -6,6 +6,7 @@
 //! touches a device or changes a firewall.
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 
 /// Moonlight's conventional base port, used when no LAN option is supplied.
 pub const DEFAULT_BASE_PORT: u16 = 47_989;
@@ -37,6 +38,7 @@ pub enum OptionError {
     InvalidManagementPort(String),
     InvalidCatalogOwner(String),
     InvalidFrameHelper(String),
+    InvalidRtxHdrRuntime(String),
     InvalidCaptureAuthorityHelper(String),
     InvalidCaptureAuthorityCard(String),
     CaptureAuthorityRequirements,
@@ -79,6 +81,10 @@ impl fmt::Display for OptionError {
             ),
             Self::VirtualScreenCaptureRequirements => formatter.write_str(
                 "--enable-virtual-screen-capture requires --enable-capture, --enable-virtual-display, a --capture-authority-helper or already configured --frame-helper, and the default capture output"
+            ),
+            Self::InvalidRtxHdrRuntime(value) => write!(
+                formatter,
+                "--rtx-hdr-runtime expects an absolute normal directory path, got {value:?}"
             ),
             Self::InvalidFrameHelper(value) => write!(
                 formatter,
@@ -316,6 +322,8 @@ pub struct LinuxSessionOptions {
     /// Absolute path of the root-owned `amaterasu-vkms-frame-helper` that the
     /// operator granted `cap_sys_admin+p`. Enables direct scanout capture.
     pub frame_helper: Option<String>,
+    /// Trusted directory containing the optional NVIDIA VFX runtime.
+    pub rtx_hdr_runtime_directory: Option<PathBuf>,
     /// Source artifact for the signed package's narrowly scoped capture authority.
     /// Packaging and approval are separate from installing any OS authority.
     pub capture_authority_helper: Option<String>,
@@ -339,6 +347,7 @@ impl Default for LinuxSessionOptions {
             enable_input: false,
             enable_display_mutation: false,
             frame_helper: None,
+            rtx_hdr_runtime_directory: None,
             capture_authority_helper: None,
             capture_authority_card: 0,
         }
@@ -402,6 +411,12 @@ impl LinuxSessionOptions {
                 "--enable-audio" => {
                     seen.once("--enable-audio")?;
                     options.enable_audio = true;
+                }
+                "--rtx-hdr-runtime" => {
+                    seen.once("--rtx-hdr-runtime")?;
+                    let value = required_value(&mut arguments, "--rtx-hdr-runtime")?;
+                    options.rtx_hdr_runtime_directory =
+                        Some(parse_rtx_hdr_runtime(Path::new(&value))?);
                 }
                 "--frame-helper" => {
                     seen.once("--frame-helper")?;
@@ -482,6 +497,9 @@ impl LinuxSessionOptions {
         {
             return Err(OptionError::VirtualScreenCaptureRequirements);
         }
+        if let Some(directory) = &self.rtx_hdr_runtime_directory {
+            parse_rtx_hdr_runtime(directory)?;
+        }
         if let Some(helper) = &self.frame_helper {
             parse_frame_helper(helper)?;
         }
@@ -513,6 +531,21 @@ fn required_value<'a>(
         .next()
         .cloned()
         .ok_or(OptionError::MissingValue(option))
+}
+
+fn parse_rtx_hdr_runtime(path: &Path) -> Result<PathBuf, OptionError> {
+    let value = path
+        .to_str()
+        .ok_or_else(|| OptionError::InvalidRtxHdrRuntime(path.to_string_lossy().into_owned()))?;
+    let normal = value.starts_with('/')
+        && value.len() > 1
+        && value[1..].split('/').all(|part| {
+            !part.is_empty() && part != "." && part != ".." && !part.chars().any(char::is_control)
+        });
+    if !normal || !path.is_absolute() {
+        return Err(OptionError::InvalidRtxHdrRuntime(value.into()));
+    }
+    Ok(path.to_path_buf())
 }
 
 fn parse_capture_authority_helper(value: &str) -> Result<String, OptionError> {
@@ -566,4 +599,52 @@ fn label(value: String, option: &'static str, maximum: usize) -> Result<String, 
         return Err(OptionError::InvalidLabel(option));
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod rtx_hdr_tests {
+    use super::*;
+
+    #[test]
+    fn runtime_is_explicit_and_validated_for_cli_and_programmatic_use() {
+        assert_eq!(
+            LinuxSessionOptions::default().rtx_hdr_runtime_directory,
+            None
+        );
+        let parse = |values: &[&str]| {
+            LinuxSessionOptions::from_arguments(
+                &values.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+            )
+        };
+        let selected = parse(&["--rtx-hdr-runtime", "/opt/amaterasu/truehdr"]).unwrap();
+        assert_eq!(
+            selected.rtx_hdr_runtime_directory.as_deref(),
+            Some(Path::new("/opt/amaterasu/truehdr"))
+        );
+        for value in [
+            "",
+            "/",
+            "relative/path",
+            "/opt/../runtime",
+            "/opt/./runtime",
+            "/opt//runtime",
+            "/opt/runtime/",
+            "/opt/\nruntime",
+        ] {
+            assert!(
+                parse(&["--rtx-hdr-runtime", value]).is_err(),
+                "accepted {value:?}"
+            );
+            let options = LinuxSessionOptions {
+                rtx_hdr_runtime_directory: Some(PathBuf::from(value)),
+                ..Default::default()
+            };
+            assert!(
+                options.validate().is_err(),
+                "accepted programmatic {value:?}"
+            );
+        }
+        assert!(parse(&["--rtx-hdr-runtime"]).is_err());
+        assert!(parse(&["--rtx-hdr-runtime", "/one", "--rtx-hdr-runtime", "/two"]).is_err());
+    }
 }

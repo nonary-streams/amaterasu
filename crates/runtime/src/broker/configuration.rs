@@ -8,6 +8,9 @@ const MAX_GRANTS_PER_KIND: usize = 256;
 const MAX_HOOK_PARTICIPANTS: usize = 32;
 
 pub(super) fn validate(configuration: &RuntimeConfig) -> Result<(), String> {
+    if configuration.host_package_activation_control && !configuration.host_lifecycle_control {
+        return Err("package activation requires the host control endpoint".into());
+    }
     if configuration.principals.len() > MAX_PRINCIPALS {
         return Err("too many principals".into());
     }

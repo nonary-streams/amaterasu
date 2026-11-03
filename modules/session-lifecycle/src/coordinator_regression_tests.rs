@@ -31,6 +31,8 @@ struct Harness {
     request_sequence: u64,
     provider_calls: Vec<Value>,
     provider: bool,
+    processing: bool,
+    stream_processing_enabled: bool,
     provider_invalid: bool,
     simulate_stage_refresh: bool,
     stage_refresh_request: Option<u64>,
@@ -59,6 +61,14 @@ impl Harness {
     }
 
     fn with_registry(provider: bool, registry_settings: Option<(u64, Value)>) -> Self {
+        Self::with_processing(provider, registry_settings, false)
+    }
+
+    fn with_processing(
+        provider: bool,
+        registry_settings: Option<(u64, Value)>,
+        processing: bool,
+    ) -> Self {
         let root = std::env::temp_dir().join(format!(
             "amaterasu-lifecycle-broker-{}-{}",
             std::process::id(),
@@ -154,6 +164,22 @@ impl Harness {
             for name in ["resource_plan", "lifecycle_callback", "lifecycle_status"] {
                 methods.push(json!({"service":"example.settings/2","method":name,"interface_major":2,"interface_minor":0,"request":{"required":{},"optional":{},"allow_extra":true},"response":{"required":{},"optional":{},"allow_extra":true},"privilege":"user"}));
             }
+            if processing {
+                configuration["settings"][COORDINATOR]["participants"][0]["capabilities"] =
+                    json!(["source_video_mode/1"]);
+                configuration["settings"][COORDINATOR]["participants"][1]["settings"] =
+                    json!({"enabled":true});
+                configuration["principals"][COORDINATOR]["call"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!("example.processing/1"));
+                configuration["principals"]["settings"]["provide"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!("example.processing/1"));
+                configuration["settings"][COORDINATOR]["processing_policy"] = json!({"provider":"settings","service":"example.processing/1","processor_service":"example.processor/1","source_mode_providers":["display"]});
+                methods.push(json!({"service":"example.processing/1","method":"processing_intent","interface_major":1,"interface_minor":0,"request":{"required":{},"optional":{},"allow_extra":true},"response":{"required":{},"optional":{},"allow_extra":true},"privilege":"user"}));
+            }
             configuration["api_methods"]=json!(methods.iter().map(|method|json!({"provider":if method["service"] == "example.display/2" {"display"} else {"settings"},"callers":[COORDINATOR],"method":method})).collect::<Vec<_>>());
         }
         if registry_settings.is_some() {
@@ -217,6 +243,8 @@ impl Harness {
             request_sequence: 0,
             provider_calls: Vec::new(),
             provider,
+            processing,
+            stream_processing_enabled: true,
             provider_invalid: false,
             simulate_stage_refresh: false,
             stage_refresh_request: None,
@@ -326,7 +354,7 @@ impl Harness {
                     let finalize = args["operation"] == "resource_finalize_plan";
                     let resource = json!({"provider":"display","resource_id":"output","incarnation":if stream {json!("native")} else {Value::Null},"expected_revision":if stream {self.staged_output.as_ref().map(|output|output["resource"]["revision"].clone()).unwrap_or(json!(1))} else {Value::Null},"execution_domain":"seat","mutation_domains":["topology"],"access":if finalize || release {"exclusive"} else {"read"}});
                     let constraint = if finalize {
-                        json!({"capture_provider":"capture","selector_schema":"example/1","resource_provider":"display","resource_id":"output","incarnation":"native","execution_domain":"seat","mode":args["requested_video"],"plan_revision":1,"geometry_revision":1})
+                        json!({"capture_provider":"capture","selector_schema":"example/1","resource_provider":"display","resource_id":"output","incarnation":"native","execution_domain":"seat","mode":args.get("source_video_mode").unwrap_or(&args["requested_video"]),"plan_revision":1,"geometry_revision":1})
                     } else {
                         Value::Null
                     };
@@ -539,7 +567,14 @@ impl Harness {
             self.dependent_calls.push(payload.clone());
             self.events.push(("settings".into(), payload.clone()));
             let args = &payload["arguments"];
-            let response = if payload["method"] == "resource_plan" {
+            let response = if payload["method"] == "processing_intent" {
+                assert!(self.processing);
+                let enabled = args["target"]["kind"] != "stream" || self.stream_processing_enabled;
+                json!({"status":"succeeded","target":args["target"],"revision":args["revision"],"enabled":enabled,
+                    "source_hdr_required":if enabled { Some(false) } else { None },
+                    "output_hdr_required":if enabled { Some(true) } else { None },
+                    "processor_settings":args["settings"],"processor_service":"example.processor/1"})
+            } else if payload["method"] == "resource_plan" {
                 let mut plan = json!({"plan_id":"dependent-plan","revision":1,"resources":[],"mutation_domains":[],"required_capabilities":[],"constraints":{},"obligations":[],"affected_consumers":[],"consumer_change":"live","candidate_constraint":null,"allowed_degradation":[],"control_proposals":[]});
                 if args["phase"] == "stream.prepare" || args["phase"] == "stream.release" {
                     let input = &args["dependency_inputs"][0];
@@ -1251,4 +1286,145 @@ fn composed_restore_and_close(last_cycle: usize) {
 #[test]
 fn composed_single_cycle_closes_session() {
     composed_restore_and_close(0);
+}
+
+#[test]
+fn processing_preflight_sets_source_range_before_session_and_stream_effects() {
+    let mut harness = Harness::with_processing(true, None, true);
+    harness.simulate_stage_refresh = true;
+    harness.verify_finalize = true;
+    let requested = json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":true});
+    let started = harness.call("transport", json!({"operation":"prepare","operation_id":"processing-session", "application_ref":{"kind":"application","app_id":"app"},"requested_video":requested}));
+    assert_eq!(started["status"], "pending", "{started}");
+    let mut prepared = Value::Null;
+    for _ in 0..180 {
+        prepared = harness.call(
+            "transport",
+            json!({"operation":"lookup","operation_id":"processing-session"}),
+        );
+        if prepared["status"] != "pending" {
+            break;
+        }
+    }
+    assert_eq!(prepared["status"], "succeeded", "{prepared}");
+    let session = prepared["target"].clone();
+    let source_plan = harness
+        .provider_calls
+        .iter()
+        .find(|call| {
+            call["method"] == "resource_plan" && call["arguments"]["phase"] == "session.prepare"
+        })
+        .expect("display plan");
+    assert_eq!(source_plan["arguments"]["requested_video"]["hdr"], true);
+    assert_eq!(source_plan["arguments"]["source_video_mode"]["hdr"], false);
+    let unrelated_plan = harness
+        .dependent_calls
+        .iter()
+        .find(|call| {
+            call["method"] == "resource_plan" && call["arguments"]["phase"] == "session.prepare"
+        })
+        .expect("dependent plan");
+    assert_eq!(unrelated_plan["arguments"]["requested_video"]["hdr"], true);
+    assert!(
+        unrelated_plan["arguments"]
+            .get("source_video_mode")
+            .is_none()
+    );
+    assert_eq!(harness.call("transport",json!({"operation":"bind_application","operation_id":"processing-bind","target":session,"launch_id":42,"application_operation_id":"launch-42"}))["status"],"succeeded");
+    let started = harness.call("transport", json!({"operation":"prepare_stream","operation_id":"processing-stream","target":session,"intent":"initial","requested_video":requested}));
+    assert_eq!(started["status"], "pending", "{started}");
+    let mut stream = Value::Null;
+    for _ in 0..400 {
+        stream = harness.call(
+            "transport",
+            json!({"operation":"lookup","operation_id":"processing-stream"}),
+        );
+        if stream["status"] != "pending" {
+            break;
+        }
+    }
+    assert_eq!(stream["status"], "succeeded", "{stream}");
+    assert_eq!(stream["candidate"]["mode"]["hdr"], false);
+    let finalize = harness
+        .provider_calls
+        .iter()
+        .find(|call| {
+            call["method"] == "resource_plan"
+                && call["arguments"]["operation"] == "resource_finalize_plan"
+        })
+        .expect("finalize plan");
+    assert_eq!(finalize["arguments"]["requested_video"]["hdr"], true);
+    assert_eq!(finalize["arguments"]["source_video_mode"]["hdr"], false);
+}
+
+#[test]
+fn processing_preflight_rejects_incompatible_output_before_provider_effects() {
+    let mut harness = Harness::with_processing(true, None, true);
+    let started = harness.call("transport", json!({"operation":"prepare","operation_id":"incompatible-session","application_ref":{"kind":"desktop"},"requested_video":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false}}));
+    assert_eq!(started["status"], "pending", "{started}");
+    let mut result = Value::Null;
+    for _ in 0..160 {
+        result = harness.call(
+            "transport",
+            json!({"operation":"lookup","operation_id":"incompatible-session"}),
+        );
+        if result["status"] != "pending" {
+            break;
+        }
+    }
+    assert_eq!(result["status"], "failed", "{result}");
+    assert_eq!(
+        result["reason"], "processing_output_range_mismatch",
+        "{result}"
+    );
+    assert!(
+        harness.provider_calls.is_empty(),
+        "display effects occurred: {:?}",
+        harness.provider_calls
+    );
+}
+
+#[test]
+fn processing_preflight_rejects_stream_policy_incompatible_with_session_source() {
+    let mut harness = Harness::with_processing(true, None, true);
+    let requested = json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":true});
+    harness.call("transport", json!({"operation":"prepare","operation_id":"policy-session","application_ref":{"kind":"application","app_id":"app"},"requested_video":requested}));
+    let mut prepared = Value::Null;
+    for _ in 0..180 {
+        prepared = harness.call(
+            "transport",
+            json!({"operation":"lookup","operation_id":"policy-session"}),
+        );
+        if prepared["status"] != "pending" {
+            break;
+        }
+    }
+    assert_eq!(prepared["status"], "succeeded", "{prepared}");
+    let session = prepared["target"].clone();
+    assert_eq!(harness.call("transport",json!({"operation":"bind_application","operation_id":"policy-bind","target":session,"launch_id":42,"application_operation_id":"launch-42"}))["status"],"succeeded");
+    let calls_before = harness.provider_calls.len();
+    harness.stream_processing_enabled = false;
+    harness.call("transport", json!({"operation":"prepare_stream","operation_id":"policy-stream","target":session,"intent":"initial","requested_video":requested}));
+    let mut result = Value::Null;
+    for _ in 0..160 {
+        result = harness.call(
+            "transport",
+            json!({"operation":"lookup","operation_id":"policy-stream"}),
+        );
+        if result["status"] != "pending" {
+            break;
+        }
+    }
+    assert_eq!(result["status"], "failed", "{result}");
+    assert_eq!(
+        result["reason"], "processing_source_range_changed",
+        "{result}"
+    );
+    assert!(
+        !harness.provider_calls[calls_before..]
+            .iter()
+            .any(|call| call["arguments"]["phase"] == "stream.prepare"),
+        "stream effect occurred: {:?}",
+        &harness.provider_calls[calls_before..]
+    );
 }

@@ -300,6 +300,10 @@ impl Coordinator {
             intent: work.intent.clone(),
             reason: work.reason.clone(),
             requested_video: work.video.clone(),
+            source_video_mode: work
+                .processing_decision
+                .as_ref()
+                .and_then(|decision| decision.source_video_mode.clone()),
             consumer_requirements: self.settings.consumer_requirements.clone(),
             remaining_ms: 30_000,
             plan_revision: None,
@@ -507,7 +511,12 @@ impl Coordinator {
         if constraint
             .geometry_revision
             .is_none_or(|revision| revision == 0)
-            || constraint.mode.as_ref() != work.video.as_ref()
+            || constraint.mode.as_ref()
+                != work
+                    .processing_decision
+                    .as_ref()
+                    .and_then(|decision| decision.source_video_mode.as_ref())
+                    .or(work.video.as_ref())
         {
             return Err("finalize_geometry_or_mode_unpinned".into());
         }
@@ -708,7 +717,12 @@ impl Coordinator {
             .filter(|revision| *revision > 0)
             .ok_or("finalize_geometry_unpinned")?;
         let (_, _, _, generation) = super::operations::target_parts(&work.target)?;
-        let requested_mode = work.video.clone().ok_or("finalize_mode_missing")?;
+        let requested_mode = work
+            .processing_decision
+            .as_ref()
+            .and_then(|decision| decision.source_video_mode.clone())
+            .or(work.video.clone())
+            .ok_or("finalize_mode_missing")?;
         let catalog = amaterasu_extension_api::schemas::SchemaCatalog::compile(
             selection
                 .schema_documents

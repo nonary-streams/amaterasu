@@ -1,4 +1,6 @@
 #[cfg(target_os = "linux")]
+mod activation_transaction;
+#[cfg(target_os = "linux")]
 mod capture_authority;
 #[cfg(windows)]
 mod input_companion;
@@ -11,6 +13,8 @@ mod linux_input;
 mod loading;
 mod logging_config;
 mod native_recovery;
+#[cfg(target_os = "linux")]
+mod package_activation;
 mod privilege;
 mod protocol;
 mod publisher_selection;
@@ -81,6 +85,20 @@ fn run() -> PackageResult<()> {
                 Path::new(state_root),
                 Some(Path::new(seed)),
             )?;
+        }
+        #[cfg(target_os = "linux")]
+        [command, root, repository, catalog, digest, active, revision]
+            if command == "probe-package-activation" =>
+        {
+            let request = amaterasu_contracts::HostPackageActivation {
+                repository_id: repository.clone(),
+                catalog_digest: catalog.clone(),
+                manifest_digest: digest.clone(),
+                expected_active: active.clone(),
+                expected_revision: revision.clone(),
+            };
+            package_activation::probe(Path::new(root), &request)?;
+            println!("Candidate passed a disposable trial; active package was not changed.");
         }
         [command, root] if command == "probe" => {
             supervisor::probe(Path::new(root), None)?;

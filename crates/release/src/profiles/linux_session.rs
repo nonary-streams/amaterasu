@@ -143,6 +143,38 @@ const LINUX_SESSION_VIDEO: ComponentDefinition = ComponentDefinition {
     ..VIDEO
 };
 
+/// The optional processor is a separately packaged native provider. Its service
+/// is bound only in the explicitly selected RTX HDR composition.
+pub const RTX_HDR_COMPONENT: ComponentDefinition = ComponentDefinition {
+    id: "amaterasu.rtx-hdr",
+    library: "amaterasu_rtx_hdr",
+    provides: &["amaterasu.rtx-hdr/1", "nonary.rtx-hdr/1"],
+    calls: &["amaterasu.session-lifecycle/1"],
+    publishes: &[],
+    dependencies: &[RUNTIME_ID],
+    native_provides: &["amaterasu.rtx-hdr/1"],
+    native_uses: &[],
+};
+
+const RTX_HDR_VIDEO: ComponentDefinition = ComponentDefinition {
+    native_uses: &[
+        "amaterasu.capture-kms/1",
+        "amaterasu.capture-pipewire/1",
+        "amaterasu.capture-vkms/1",
+        "amaterasu.encode/1",
+        "amaterasu.rtx-hdr/1",
+    ],
+    dependencies: &[
+        RUNTIME_ID,
+        "amaterasu.capture-kms",
+        "amaterasu.capture-pipewire",
+        "amaterasu.capture-vkms",
+        "amaterasu.encode",
+        "amaterasu.rtx-hdr",
+    ],
+    ..LINUX_SESSION_VIDEO
+};
+
 // The grant chain. A parented request carries the intersection of every
 // ancestor's call grants, so PipeWire call authority must transit NVHTTP,
 // RTSP, and the stream session. Native-use authority stays on the Linux video
@@ -171,6 +203,7 @@ const LINUX_SESSION_LIBRARY: ComponentDefinition = ComponentDefinition {
 
 const LINUX_SESSION_NVHTTP: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "amaterasu.host-package-barrier/1",
         "amaterasu.session-lifecycle/1",
         "amaterasu.extension-registry/1",
         "nonary.frame-limiter/1",
@@ -243,6 +276,7 @@ const LINUX_SESSION_RTSP: ComponentDefinition = ComponentDefinition {
 
 const LINUX_SESSION_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "amaterasu.host-package-barrier/1",
         "amaterasu.session-lifecycle/1",
         "amaterasu.extension-registry/1",
         "nonary.frame-limiter/1",
@@ -285,6 +319,7 @@ const LINUX_SESSION_STREAM_SESSION: ComponentDefinition = ComponentDefinition {
 
 const LINUX_SESSION_MANAGEMENT: ComponentDefinition = ComponentDefinition {
     calls: &[
+        "amaterasu.host-package-activation/1",
         "amaterasu.extension-registry/1",
         "nonary.frame-limiter/1",
         "amaterasu.library/1",
@@ -392,6 +427,81 @@ pub const COMPONENTS: &[ComponentDefinition] = &[
     LINUX_SESSION_RTSP,
 ];
 
+const fn append_name<const N: usize>(
+    values: &'static [&'static str],
+    extra: &'static str,
+) -> [&'static str; N] {
+    assert!(values.len() + 1 == N);
+    let mut result = [""; N];
+    let mut index = 0;
+    while index < values.len() {
+        result[index] = values[index];
+        index += 1;
+    }
+    result[index] = extra;
+    result
+}
+
+macro_rules! with_rtx_control {
+    ($name:ident, $base:ident) => {
+        const $name: ComponentDefinition = ComponentDefinition {
+            calls: &append_name::<{ $base.calls.len() + 1 }>($base.calls, "nonary.rtx-hdr/1"),
+            dependencies: &append_name::<{ $base.dependencies.len() + 1 }>(
+                $base.dependencies,
+                "amaterasu.rtx-hdr",
+            ),
+            ..$base
+        };
+    };
+}
+
+with_rtx_control!(RTX_HDR_COORDINATOR, SESSION_LIFECYCLE);
+with_rtx_control!(RTX_HDR_REGISTRY, EXTENSION_REGISTRY);
+with_rtx_control!(RTX_HDR_MANAGEMENT, LINUX_SESSION_MANAGEMENT);
+with_rtx_control!(RTX_HDR_NVHTTP, LINUX_SESSION_NVHTTP);
+with_rtx_control!(RTX_HDR_RTSP, LINUX_SESSION_RTSP);
+with_rtx_control!(RTX_HDR_STREAM_SESSION, LINUX_SESSION_STREAM_SESSION);
+
+/// Publisher-signed complete set for the optional RTX HDR composition.
+/// The standard Linux session package remains independent of this provider.
+pub const RTX_HDR_COMPONENTS: &[ComponentDefinition] = &[
+    RUNTIME,
+    NETWORK,
+    STATE,
+    SESSION,
+    CONFIGURATION,
+    RTX_HDR_COORDINATOR,
+    RTX_HDR_REGISTRY,
+    SESSION_HISTORY,
+    HOST_METRICS,
+    STEAM,
+    LUTRIS,
+    CATALOG,
+    LINUX_SESSION_LIBRARY,
+    APPLICATION,
+    AUTHENTICATION,
+    RTX_HDR_MANAGEMENT,
+    LINUX_SESSION_PAIRING,
+    RTX_HDR_NVHTTP,
+    DISPLAY,
+    LINUX_SESSION_LAUNCH,
+    INPUT,
+    VIRTUAL_DISPLAY,
+    CAPTURE_KMS,
+    CAPTURE_PIPEWIRE,
+    CAPTURE_VKMS,
+    AUDIO,
+    AUDIO_ENCODE,
+    ENCODE,
+    RTX_HDR_COMPONENT,
+    RTX_HDR_VIDEO,
+    MEDIA_TRANSPORT,
+    CONTROL_TRANSPORT,
+    LINUX_FRAME_LIMITER,
+    RTX_HDR_STREAM_SESSION,
+    RTX_HDR_RTSP,
+];
+
 const EXTENSION_ACTIONS: ComponentDefinition = ComponentDefinition {
     id: "amaterasu.extension-actions",
     library: "amaterasu_extension_actions",
@@ -448,8 +558,16 @@ pub fn linux_session_policy(
     options: &LinuxSessionOptions,
 ) -> PackageResult<RuntimeConfig> {
     options.validate().map_err(|error| error.to_string())?;
+    if options.rtx_hdr_runtime_directory.is_some() && options.external_extension_composition {
+        return Err("RTX HDR and external extension composition cannot be combined".into());
+    }
     let mut policy = RuntimeConfig::default();
-    for component in COMPONENTS {
+    let components = if options.rtx_hdr_runtime_directory.is_some() {
+        RTX_HDR_COMPONENTS
+    } else {
+        COMPONENTS
+    };
+    for component in components {
         if options.external_extension_composition
             && [SESSION_LIFECYCLE.id, EXTENSION_REGISTRY.id].contains(&component.id)
         {
@@ -460,6 +578,13 @@ pub fn linux_session_policy(
                 .principals
                 .insert(component.id.into(), component.grants());
         }
+    }
+    // The manifest requests the capability, but installed policy grants it
+    // only after explicit host provisioning.
+    if let Some(management) = policy.principals.get_mut("amaterasu.management") {
+        management
+            .call
+            .remove(amaterasu_contracts::HOST_PACKAGE_ACTIVATION_SERVICE);
     }
     // The standalone VKMS provider still pins an SDK released before typed
     // registration. This explicit principal/service attestation lets it use
@@ -491,7 +616,160 @@ pub fn linux_session_policy(
             &directories.lifecycle,
         )?;
     }
+    if let Some(runtime_directory) = &options.rtx_hdr_runtime_directory {
+        enable_rtx_hdr(&mut policy, runtime_directory)?;
+    }
     Ok(policy)
+}
+
+/// Prepare an explicit RTX HDR policy for a complete signed Linux session set.
+/// The caller must obtain `runtime_directory` from trusted host configuration;
+/// browser requests do not select paths. Conflicts leave the input unchanged.
+pub fn enable_rtx_hdr(policy: &mut RuntimeConfig, runtime_directory: &Path) -> PackageResult<()> {
+    use std::path::Component;
+    if !runtime_directory.is_absolute()
+        || runtime_directory
+            .components()
+            .any(|component| !matches!(component, Component::RootDir | Component::Normal(_)))
+    {
+        return Err("RTX HDR runtime directory must be an absolute normal path".into());
+    }
+    let mut candidate = policy.clone();
+    let capture = candidate
+        .settings
+        .get_mut("amaterasu.capture-vkms")
+        .and_then(Value::as_object_mut)
+        .ok_or("RTX HDR requires configured VKMS capture")?;
+    let authority = capture.get("authority_channel").and_then(Value::as_bool) == Some(true);
+    let helper = capture
+        .get("frame_helper")
+        .and_then(Value::as_str)
+        .is_some_and(|path| !path.is_empty() && Path::new(path).is_absolute());
+    if !authority && !helper {
+        return Err("RTX HDR requires an approved VKMS frame helper or capture authority".into());
+    }
+    // Capture validates that the module was built with driver-read-leases when
+    // require_lease is set. Matching helper protocol and hardware are checked
+    // when the provider establishes capture; the frame path fails closed.
+    capture.insert("gpu_snapshot".into(), json!(true));
+    capture.insert("require_lease".into(), json!(true));
+    let video_settings = candidate
+        .settings
+        .get_mut(VIDEO_COMPONENT_ID)
+        .and_then(Value::as_object_mut)
+        .ok_or("Linux session video settings missing")?;
+    if video_settings
+        .get("cpu_processor_service")
+        .is_some_and(|value| !value.is_null())
+        || video_settings
+            .get("gpu_processor_service")
+            .is_some_and(|value| value.as_str() != Some("amaterasu.rtx-hdr/1"))
+    {
+        return Err("video already selects another processor".into());
+    }
+    video_settings.insert("gpu_processor_service".into(), json!("amaterasu.rtx-hdr/1"));
+    video_settings.insert("gpu_processor_opt_in".into(), json!(true));
+    let video_grants = candidate
+        .principals
+        .get_mut(VIDEO_COMPONENT_ID)
+        .ok_or("Linux session video principal missing")?;
+    video_grants.native_use.insert("amaterasu.rtx-hdr/1".into());
+    let desired_grants = RTX_HDR_COMPONENT.grants();
+    if let Some(existing) = candidate.principals.get(RTX_HDR_COMPONENT.id) {
+        if serde_json::to_value(existing).map_err(|error| error.to_string())?
+            != serde_json::to_value(&desired_grants).map_err(|error| error.to_string())?
+        {
+            return Err("RTX HDR principal conflicts with the approved composition".into());
+        }
+    } else {
+        candidate
+            .principals
+            .insert(RTX_HDR_COMPONENT.id.into(), desired_grants);
+    }
+    if let Some(settings) = candidate.settings.get_mut(RTX_HDR_COMPONENT.id) {
+        if settings.get("runtime_directory") != Some(&json!(runtime_directory)) {
+            return Err("RTX HDR runtime directory conflicts with existing settings".into());
+        }
+        settings
+            .as_object_mut()
+            .ok_or("RTX HDR settings must be an object")?
+            .insert("require_verified_runtime".into(), json!(true));
+    } else {
+        candidate.settings.insert(
+            RTX_HDR_COMPONENT.id.into(),
+            json!({"runtime_directory": runtime_directory, "require_verified_runtime": true}),
+        );
+    }
+    for principal in [
+        "amaterasu.session-lifecycle",
+        "amaterasu.extension-registry",
+        "amaterasu.management",
+        "amaterasu.nvhttp",
+        "amaterasu.rtsp",
+        "amaterasu.stream-session",
+        CONSOLE_ID,
+    ] {
+        let grants = candidate
+            .principals
+            .get_mut(principal)
+            .ok_or("RTX HDR requires the complete Linux session principal set")?;
+        grants.call.insert("nonary.rtx-hdr/1".into());
+    }
+    let stream = candidate
+        .settings
+        .get_mut("amaterasu.stream-session")
+        .and_then(Value::as_object_mut)
+        .ok_or("stream session settings missing")?;
+    let plan = json!({"provider":"amaterasu.rtx-hdr", "control_service":"nonary.rtx-hdr/1", "processor_service":"amaterasu.rtx-hdr/1", "omit_disabled":true});
+    if stream
+        .get("processing_plan")
+        .is_some_and(|existing| !existing.is_null() && *existing != plan)
+    {
+        return Err("stream session already selects another processor".into());
+    }
+    stream.insert("processing_plan".into(), plan);
+    let lifecycle = candidate
+        .settings
+        .get_mut("amaterasu.session-lifecycle")
+        .and_then(Value::as_object_mut)
+        .ok_or("session lifecycle settings missing")?;
+    let plan = json!({"provider":"amaterasu.rtx-hdr", "service":"nonary.rtx-hdr/1", "processor_service":"amaterasu.rtx-hdr/1", "source_mode_providers":[]});
+    if lifecycle
+        .get("processing_policy")
+        .is_some_and(|existing| !existing.is_null() && *existing != plan)
+    {
+        return Err("session lifecycle already selects another processor".into());
+    }
+    lifecycle.insert("processing_policy".into(), plan);
+    let operations = lifecycle
+        .get_mut("operation_grants")
+        .and_then(Value::as_object_mut)
+        .and_then(|grants| grants.get_mut("amaterasu.stream-session"))
+        .and_then(Value::as_array_mut)
+        .ok_or("stream lifecycle operation grants missing")?;
+    if !operations.contains(&json!("read_frozen_provider_settings")) {
+        operations.push(json!("read_frozen_provider_settings"));
+    }
+    let readers = lifecycle
+        .entry("provider_settings_readers")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or("invalid provider settings readers")?;
+    let readers = readers
+        .entry("amaterasu.stream-session")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+        .ok_or("invalid stream settings readers")?;
+    if !readers.contains(&json!("amaterasu.rtx-hdr")) {
+        readers.push(json!("amaterasu.rtx-hdr"));
+    }
+    super::default_extensions::add_extension(
+        &mut candidate,
+        include_str!("../../../../modules/rtx-hdr/metadata/linux.json"),
+        Some("amaterasu.stream-session"),
+    )?;
+    *policy = candidate;
+    Ok(())
 }
 
 /// Persistent state locations, each private to the host user (mode 0700).
@@ -499,6 +777,7 @@ struct PrivateStateDirectories {
     state: std::path::PathBuf,
     session_history_database: std::path::PathBuf,
     lifecycle: std::path::PathBuf,
+    rtx_hdr_runtime_parent: std::path::PathBuf,
 }
 
 impl PrivateStateDirectories {
@@ -508,10 +787,12 @@ impl PrivateStateDirectories {
         let state = canonical_private_directory(&data.join("state"))?;
         let history = canonical_private_directory(&state.join("session-history"))?;
         let lifecycle = canonical_private_directory(&state.join("session-lifecycle"))?;
+        let rtx_hdr_runtime_parent = canonical_private_directory(&state.join("rtx-hdr"))?;
         Ok(Self {
             state,
             session_history_database: history.join("history.db"),
             lifecycle,
+            rtx_hdr_runtime_parent,
         })
     }
 }
@@ -540,6 +821,12 @@ fn settings(
         json!({"database_path": directories.session_history_database.to_string_lossy()}),
     );
     insert("amaterasu.authentication", authentication_settings());
+    insert(
+        "amaterasu.management",
+        json!({
+            "rtx_hdr_runtime_parent": directories.rtx_hdr_runtime_parent,
+        }),
+    );
     insert(
         "amaterasu.pairing",
         json!({
@@ -598,7 +885,7 @@ fn settings(
     // The portal owns the explicit user-consent prompt. Capture remains
     // disabled until selected in the portal; video processing is separately
     // enabled through the profile option.
-    let video_settings = if options.enable_virtual_screen_capture {
+    let mut video_settings = if options.enable_virtual_screen_capture {
         json!({
             "enabled": options.enable_capture,
             "capture_providers": ["kms", "pipewire"],
@@ -609,6 +896,14 @@ fn settings(
     } else {
         json!({"enabled": options.enable_capture, "capture_providers": ["kms", "pipewire", "vkms"]})
     };
+    if let Some(runtime_directory) = &options.rtx_hdr_runtime_directory {
+        video_settings["gpu_processor_service"] = json!("amaterasu.rtx-hdr/1");
+        video_settings["gpu_processor_opt_in"] = json!(true);
+        insert(
+            "amaterasu.rtx-hdr",
+            json!({"runtime_directory": runtime_directory}),
+        );
+    }
     insert(VIDEO_COMPONENT_ID, video_settings);
     let mut capture_settings = portal_capture_settings();
     if options.enable_virtual_display {

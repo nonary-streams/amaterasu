@@ -79,6 +79,7 @@ fn linux_launch_environment_is_an_explicit_desktop_allowlist() {
         state: "/tmp/amaterasu-state".into(),
         session_history_database: "/tmp/amaterasu-state/history.db".into(),
         lifecycle: "/tmp/amaterasu-state/session-lifecycle".into(),
+        rtx_hdr_runtime_parent: "/tmp/amaterasu-state/rtx-hdr".into(),
     };
     let configured = settings(&options, &directories);
     let names = configured["amaterasu.launch"]["inherit_environment"]
@@ -909,4 +910,172 @@ fn session_extensions_profile_adds_actions_to_default_extension_services() {
             .iter()
             .any(|candidate| candidate.id == component.id)
     }));
+}
+
+#[test]
+fn rtx_hdr_composition_is_explicit_and_authorizes_the_processor() {
+    let root = TemporaryRoot::new("rtx-hdr-composition");
+    let default = linux_session_policy(root.path(), &LinuxSessionOptions::default()).unwrap();
+    assert!(!default.principals.contains_key("amaterasu.rtx-hdr"));
+    assert!(!default.settings.contains_key("amaterasu.rtx-hdr"));
+    assert!(
+        !default.principals[VIDEO_COMPONENT_ID]
+            .native_use
+            .contains("amaterasu.rtx-hdr/1")
+    );
+    assert!(
+        COMPONENTS
+            .iter()
+            .all(|component| component.id != "amaterasu.rtx-hdr")
+    );
+
+    let runtime = root.path().join("runtime");
+    let enabled = linux_session_policy(
+        root.path(),
+        &LinuxSessionOptions {
+            rtx_hdr_runtime_directory: Some(runtime.clone()),
+            frame_helper: Some("/opt/amaterasu/amaterasu-vkms-frame-helper".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let provider = RTX_HDR_COMPONENTS
+        .iter()
+        .find(|component| component.id == "amaterasu.rtx-hdr")
+        .unwrap();
+    let video = RTX_HDR_COMPONENTS
+        .iter()
+        .find(|component| component.id == VIDEO_COMPONENT_ID)
+        .unwrap();
+    assert!(provider.native_provides.contains(&"amaterasu.rtx-hdr/1"));
+    assert!(video.native_uses.contains(&"amaterasu.rtx-hdr/1"));
+    assert!(video.dependencies.contains(&provider.id));
+    assert!(
+        enabled.principals[VIDEO_COMPONENT_ID]
+            .native_use
+            .contains("amaterasu.rtx-hdr/1")
+    );
+    assert!(
+        enabled.principals[provider.id]
+            .native_provide
+            .contains("amaterasu.rtx-hdr/1")
+    );
+    assert_eq!(
+        enabled.settings[VIDEO_COMPONENT_ID]["gpu_processor_service"],
+        "amaterasu.rtx-hdr/1"
+    );
+    assert_eq!(
+        enabled.settings[provider.id]["runtime_directory"],
+        json!(runtime)
+    );
+    assert!(
+        enabled.settings[VIDEO_COMPONENT_ID]
+            .get("require_frame_lease")
+            .is_none()
+    );
+    assert_eq!(
+        enabled.settings[VIDEO_COMPONENT_ID]["gpu_processor_opt_in"],
+        true
+    );
+    assert_eq!(
+        enabled.settings["amaterasu.capture-vkms"]["gpu_snapshot"],
+        true
+    );
+    assert_eq!(
+        enabled.settings["amaterasu.capture-vkms"]["require_lease"],
+        true
+    );
+    assert_eq!(
+        enabled.settings["amaterasu.stream-session"]["processing_plan"]["provider"],
+        "amaterasu.rtx-hdr"
+    );
+    assert_eq!(
+        enabled.settings["amaterasu.stream-session"]["processing_plan"]["omit_disabled"],
+        true
+    );
+    assert_eq!(
+        enabled.settings["amaterasu.session-lifecycle"]["processing_policy"]["processor_service"],
+        "amaterasu.rtx-hdr/1"
+    );
+    assert!(enabled.settings["amaterasu.session-lifecycle"]["provider_settings_readers"]["amaterasu.stream-session"].as_array().unwrap().contains(&json!("amaterasu.rtx-hdr")));
+    assert!(
+        enabled.settings["amaterasu.session-lifecycle"]["participants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|participant| participant["provider"] == "amaterasu.rtx-hdr")
+    );
+    assert!(
+        enabled.settings["amaterasu.extension-registry"]["descriptors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|descriptor| descriptor["descriptor"]["provider"] == "amaterasu.rtx-hdr")
+    );
+    for approval in enabled
+        .api_methods
+        .iter()
+        .filter(|approval| approval.provider == "amaterasu.rtx-hdr")
+    {
+        for caller in &approval.callers {
+            assert!(
+                enabled.principals[caller]
+                    .call
+                    .contains(&approval.method.service),
+                "bootstrap lacks control grant for {caller}"
+            );
+            if caller != CONSOLE_ID {
+                let component = RTX_HDR_COMPONENTS
+                    .iter()
+                    .find(|component| component.id == caller)
+                    .expect("approved caller must be packaged");
+                assert!(
+                    component.calls.contains(&approval.method.service.as_str()),
+                    "signed component lacks control grant for {caller}"
+                );
+            }
+        }
+    }
+    assert!(
+        enabled
+            .api_methods
+            .iter()
+            .any(|approval| approval.provider == "amaterasu.rtx-hdr"
+                && approval.method.method == "processing_intent")
+    );
+    assert_eq!(RTX_HDR_COMPONENTS.len(), COMPONENTS.len() + 1);
+    for component in COMPONENTS {
+        assert!(
+            RTX_HDR_COMPONENTS
+                .iter()
+                .any(|entry| entry.id == component.id)
+        );
+    }
+    assert_eq!(
+        default.settings["amaterasu.management"]["rtx_hdr_runtime_parent"],
+        json!(root.path().join("data/state/rtx-hdr"))
+    );
+}
+
+#[test]
+fn rtx_hdr_policy_conflicts_leave_existing_policy_unchanged() {
+    let root = TemporaryRoot::new("rtx-hdr-conflict");
+    let mut policy = linux_session_policy(root.path(), &LinuxSessionOptions::default()).unwrap();
+    policy.settings.get_mut("amaterasu.capture-vkms").unwrap()["frame_helper"] =
+        json!("/opt/amaterasu/amaterasu-vkms-frame-helper");
+    policy.settings.get_mut(VIDEO_COMPONENT_ID).unwrap()["cpu_processor_service"] =
+        json!("example.other/1");
+    let before = serde_json::to_value(&policy).unwrap();
+    assert!(enable_rtx_hdr(&mut policy, &root.path().join("runtime")).is_err());
+    assert_eq!(serde_json::to_value(&policy).unwrap(), before);
+}
+
+#[test]
+fn rtx_hdr_policy_rejects_missing_capture_helper_without_mutation() {
+    let root = TemporaryRoot::new("rtx-hdr-missing-helper");
+    let mut policy = linux_session_policy(root.path(), &LinuxSessionOptions::default()).unwrap();
+    let before = serde_json::to_value(&policy).unwrap();
+    let error = enable_rtx_hdr(&mut policy, &root.path().join("runtime")).unwrap_err();
+    assert!(error.contains("frame helper"));
+    assert_eq!(serde_json::to_value(&policy).unwrap(), before);
 }

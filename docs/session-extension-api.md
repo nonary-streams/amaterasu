@@ -106,6 +106,16 @@ The launch module selects its coordinator through the trusted
 `prepared_context_service` setting and freezes the merged environment before
 creating its application session. It does not inspect provider-specific policy.
 
+Selected consumers can use the SDK's `request_frozen_provider_settings` to
+read the settings snapshot for one provider at an exact ready session or
+ready/active stream target. Installed lifecycle policy must grant both the
+operation and the exact caller/provider pair via `provider_settings_readers`;
+the provider must also be present in that target's frozen participant graph.
+The response includes the target, provider and revision so consumers can
+validate the result and pass opaque settings to the owning provider. A session
+and a stream have independently frozen snapshots; consumers must not assume
+they match. These reads grant no resource mutation authority.
+
 Built-in launch, RTSP and stream-session messages do not accept legacy
 frame-limiter policy payloads or invoke the limiter's apply/status/restore RPCs.
 The standard package no longer grants those calls to streaming consumers. A
@@ -188,6 +198,26 @@ persists the complete batch atomically. This records the trusted provider's
 native readback. It does not independently prove operating-system state.
 Producer identity remains stable across consumer borrows; individual native
 borrow tokens remain separate lease evidence.
+
+## Processing and capture range
+
+A selected GPU processor may require a capture range different from the client's
+encoded output. The lifecycle coordinator obtains a read-only processing intent
+from the selected provider using that provider's frozen settings and validates
+the requested output before provider effects. `ProviderRequest.requested_video`
+continues to describe the client output. When capture requires a different HDR
+state, `source_video_mode` describes the source; width, height, and refresh must
+match the output. It is omitted when the modes are the same.
+
+The trusted composition identifies the processor and the source-mode-aware
+participants. Only those explicitly selected participants receive the source
+mode; capture owners in a managed composition must advertise
+`source_video_mode/1`. A candidate must match the admitted source mode. Stream
+preparation must preserve the session's processing enablement, processor, and
+source range; changing them requires a new session. Providers must validate the
+coordinator caller and admitted request as usual. A source mode is a requirement,
+not proof of the captured pixels. With external capture, the selected processor
+must independently reject frames whose format or color tagging is incompatible.
 
 ## Composition protocol v2
 

@@ -9,6 +9,12 @@ use std::collections::{BTreeMap, BTreeSet};
 /// it may request that the trusted host restart or stop the selected runtime.
 pub const HOST_LIFECYCLE_SERVICE: &str = "amaterasu.host-lifecycle/1";
 
+/// Explicit host grant to request a signed package trial.
+pub const HOST_PACKAGE_ACTIVATION_SERVICE: &str = "amaterasu.host-package-activation/1";
+
+/// Trusted provider contract for a non-disruptive package replacement barrier.
+pub const HOST_PACKAGE_BARRIER_SERVICE: &str = "amaterasu.host-package-barrier/1";
+
 /// Effective call grant allowing a module to read the host-selected state root.
 /// It does not grant access to package metadata or host lifecycle commands.
 pub const HOST_STATE_CONTEXT_SERVICE: &str = "amaterasu.host-state-context/1";
@@ -27,6 +33,17 @@ pub const HOST_LOG_SERVICE: &str = "amaterasu.host-logs/1";
 pub enum HostLifecycleAction {
     Restart,
     Quit,
+}
+
+/// Identifies a candidate already fetched into the trusted repository cache.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostPackageActivation {
+    pub repository_id: String,
+    pub catalog_digest: String,
+    pub manifest_digest: String,
+    pub expected_active: String,
+    pub expected_revision: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -95,6 +112,9 @@ pub struct RuntimeConfig {
     /// the host sets it after verification when creating its private control endpoint.
     #[serde(default)]
     pub host_lifecycle_control: bool,
+    /// Host-injected capability; signed package policy cannot enable it.
+    #[serde(default)]
+    pub host_package_activation_control: bool,
 }
 
 /// A wire contract can describe arbitrary namespaced methods. `Any` and
@@ -207,6 +227,21 @@ pub enum Command {
     HostLifecycle {
         action: HostLifecycleAction,
     },
+    /// Request a host-verified package trial; only approved management may call.
+    HostPackageActivate {
+        request: HostPackageActivation,
+    },
+    /// Observe or cancel a pending activation before the host starts it.
+    HostPackageActivationStatus {},
+    HostPackageActivationCancel {},
+    /// The trusted barrier provider blocks new work and reports safe retirement.
+    HostPackageBarrierRegister {},
+    HostPackageBarrierPending {},
+    HostPackageBarrierReady {
+        ready: bool,
+    },
+    /// Reserved for the host control endpoint.
+    HostPackageActivationDrain {},
     /// Emits one bounded product log record through the trusted host transport.
     Log {
         level: u8,
@@ -401,6 +436,15 @@ pub enum Response {
     /// Returned only to the reserved host control endpoint.
     HostLifecycle {
         action: Option<HostLifecycleAction>,
+    },
+    /// Returned only to the reserved host control endpoint.
+    HostPackageActivation {
+        request: Option<Box<HostPackageActivation>>,
+    },
+    /// Bounded activation and barrier status for authorized participants.
+    HostPackageActivationState {
+        pending: bool,
+        started: bool,
     },
     /// Returned only to the reserved host control endpoint.
     LogEvents {

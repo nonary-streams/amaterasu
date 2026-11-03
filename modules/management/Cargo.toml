@@ -11,12 +11,17 @@ crate-type = ["cdylib", "rlib"]
 amaterasu-contracts.workspace = true
 amaterasu-input-policy.workspace = true
 amaterasu-package.workspace = true
-amaterasu-module-sdk.workspace = true
+amaterasu-module-sdk = { workspace = true, features = ["network-http"] }
 serde.workspace = true
 serde_json.workspace = true
 httparse.workspace = true
+ureq = { version = "=3.4.2", default-features = false, features = ["rustls", "platform-verifier"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 url = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+amaterasu-rtx-runtime = { path = "../../crates/rtx-runtime" }
+libc = "0.2"
 
 [dev-dependencies]
 ed25519-dalek.workspace = true

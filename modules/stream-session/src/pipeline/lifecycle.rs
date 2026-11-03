@@ -100,6 +100,8 @@ impl Pipeline {
                     if matches!(
                         job.step,
                         Step::ValidateLifecycleCandidate
+                            | Step::ReadFrozenProcessingSettings
+                            | Step::PlanGpuProcessing
                             | Step::ObserveLifecycleCapture
                             | Step::AckLifecycleCapture
                             | Step::AckLifecycleStream
@@ -293,6 +295,12 @@ impl Pipeline {
             job.step = Step::ValidateLifecycleCandidate;
         }
         if job.step == Step::AcquireOutput
+            && record.processing_plan_provider.is_some()
+            && !record.processing_plan_complete
+        {
+            job.step = Step::ReadFrozenProcessingSettings;
+        }
+        if job.step == Step::AcquireOutput
             && super::virtual_display::requested(record)
             && record.virtual_display_output.is_none()
         {
@@ -372,7 +380,11 @@ impl Pipeline {
             .journal_operation_id
             .clone()
             .unwrap_or_else(|| format!("ss-{:x}-{}", record.id, self.sequence));
-        let pending = rpc::Pending::new(&service, payload, operation_id, parent);
+        let pending = if job.step == Step::PlanGpuProcessing {
+            rpc::Pending::processing_api(&service, payload, operation_id, parent)
+        } else {
+            rpc::Pending::new(&service, payload, operation_id, parent)
+        };
         job.pending = Some(if job.step == Step::RecoverAudio {
             pending.retry_uncertain_admission()
         } else {
@@ -461,6 +473,85 @@ impl Pipeline {
             }
             return true;
         }
+        if job.step == Step::ReadFrozenProcessingSettings {
+            let start = record.start.as_ref().expect("processing requires start");
+            let plan = record
+                .processing_plan_provider
+                .as_ref()
+                .expect("processing provider");
+            let valid = payload["status"] == "succeeded"
+                && payload["target"] == json!(start.lifecycle_target)
+                && payload["provider"] == plan.provider
+                && payload["revision"]
+                    .as_str()
+                    .is_some_and(|revision| !revision.is_empty() && revision.len() <= 128)
+                && payload["settings"].is_object()
+                && serde_json::to_vec(&payload["settings"])
+                    .is_ok_and(|bytes| bytes.len() <= 16_384);
+            if !valid {
+                job.fail(record, "processing_settings_unavailable", now);
+                return true;
+            }
+            record.processing_frozen = Some((
+                payload["revision"].as_str().unwrap().to_owned(),
+                payload["settings"].clone(),
+            ));
+            job.step = Step::PlanGpuProcessing;
+            return true;
+        }
+        if job.step == Step::PlanGpuProcessing {
+            let start = record.start.as_ref().expect("processing requires start");
+            let plan = record
+                .processing_plan_provider
+                .as_ref()
+                .expect("processing provider");
+            let (revision, frozen) = record.processing_frozen.as_ref().expect("frozen settings");
+            let enabled = payload["enabled"].as_bool();
+            let source = payload["source_hdr_required"].as_bool();
+            let output = payload["output_hdr_required"].as_bool();
+            let actual_source = start
+                .lifecycle_candidate
+                .as_ref()
+                .map(|candidate| candidate.mode.hdr);
+            let actual_output = start.configuration.video_stream_format.dynamic_range
+                == amaterasu_module_sdk::DynamicRange::Hdr;
+            let valid = payload["status"] == "succeeded"
+                && payload["target"] == json!(start.lifecycle_target)
+                && payload["revision"] == *revision
+                && payload["processor_service"] == plan.processor_service
+                && payload["processor_settings"] == *frozen
+                && enabled.is_some()
+                && (payload["source_hdr_required"].is_null() || source.is_some())
+                && (payload["output_hdr_required"].is_null() || output.is_some())
+                // A selected transform must declare both sides of its range contract.
+                && (enabled != Some(true) || (source.is_some() && output.is_some()))
+                // Managed candidates are authenticated before this point. External
+                // capture proves its source range at the video frame boundary.
+                && source.is_none_or(|required| actual_source.is_none_or(|actual| actual == required))
+                && output.is_none_or(|required| actual_output == required)
+                // Bypassing the processor cannot change the source dynamic range.
+                && (enabled != Some(false) || actual_source.is_none_or(|actual| actual == actual_output));
+            if !valid {
+                job.fail(record, "processing_plan_rejected", now);
+                return true;
+            }
+            let required_source = if enabled == Some(false) {
+                actual_output
+            } else {
+                source.unwrap()
+            };
+            // An SDR stream with processing disabled may use the existing
+            // video path only when trusted composition selects opt-in behavior.
+            // HDR output retains frame provenance checks even on bypass.
+            if enabled != Some(false) || actual_output || !plan.omit_disabled {
+                record.gpu_processing = Some(json!({"service":plan.processor_service,
+                    "enabled":enabled.unwrap(), "settings":frozen,
+                    "source_hdr_required":required_source}));
+            }
+            record.processing_plan_complete = true;
+            job.step = Step::AcquireOutput;
+            return true;
+        }
         if matches!(
             job.step,
             Step::ValidateLifecycleCandidate
@@ -496,7 +587,11 @@ impl Pipeline {
             match job.step {
                 Step::ValidateLifecycleCandidate => {
                     record.lifecycle_candidate_validated = true;
-                    job.step = Step::AcquireOutput;
+                    job.step = if record.processing_plan_provider.is_some() {
+                        Step::ReadFrozenProcessingSettings
+                    } else {
+                        Step::AcquireOutput
+                    };
                 }
                 Step::AckLifecycleCapture => {
                     job.step = if record.config.stream_audio {

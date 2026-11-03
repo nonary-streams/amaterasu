@@ -369,6 +369,40 @@ fn resolved_display_mode_policy_reaches_the_existing_topology_transaction() {
 }
 
 #[test]
+fn virtual_display_source_range_is_independent_of_client_hdr() {
+    for (source, client, expected) in [
+        (Some(false), true, false),
+        (Some(true), false, true),
+        (None, true, true),
+        (None, false, false),
+    ] {
+        let mut host = Harness::new();
+        let mut display = intent(
+            "source-range",
+            VirtualDisplayMode::PerClient,
+            VirtualDisplayLayout::Extended,
+        );
+        let mut policy = display_policy("disabled");
+        policy["effective_client_hdr_request"] = json!(client);
+        if let Some(source) = source {
+            policy["source_hdr_required"] = json!(source);
+        }
+        display["display_policy"] = policy;
+        let prepared = host.response(1, prepare_with_intent("source-range", display));
+        assert_eq!(prepared["state"], "prepared", "{prepared}");
+        let create = host
+            .broker
+            .calls
+            .iter()
+            .find(|call| {
+                call.service == "amaterasu.virtual-display/1" && call.payload["action"] == "create"
+            })
+            .expect("virtual display was created");
+        assert_eq!(create.payload["hdr_enabled"], expected);
+    }
+}
+
+#[test]
 fn disabled_and_verify_only_policies_do_not_acquire_or_restore_a_topology_lease() {
     for option in ["disabled", "verify_only"] {
         let mut host = Harness::new();

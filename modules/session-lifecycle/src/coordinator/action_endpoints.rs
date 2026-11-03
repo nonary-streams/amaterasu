@@ -644,6 +644,7 @@ impl Coordinator {
                     composition_progress: None,
                     compacted_release: false,
                     owner_observations: Default::default(),
+                    processing_decision: None,
                     reprepare: None,
                     phase: amaterasu_extension_api::LifecyclePhase::StreamRelease,
                     target,
@@ -2255,6 +2256,7 @@ mod tests {
         state.sessions.insert(
             "session".into(),
             SessionRecord {
+                processing_decision: None,
                 provider_graph: None,
                 host_epoch: epoch.clone(),
                 id: "session".into(),
@@ -2410,6 +2412,7 @@ mod tests {
         state.sessions.insert(
             "session".into(),
             SessionRecord {
+                processing_decision: None,
                 provider_graph: None,
                 host_epoch: epoch.clone(),
                 id: "session".into(),
@@ -2752,6 +2755,7 @@ mod tests {
         state.sessions.insert(
             "session".into(),
             SessionRecord {
+                processing_decision: None,
                 provider_graph: None,
                 host_epoch: epoch.clone(),
                 id: "session".into(),

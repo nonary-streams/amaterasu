@@ -48,6 +48,10 @@ pub struct LifecycleSettings {
     /// absolute path. Requires the host-state-context call grant.
     pub journal_in_runtime_state: bool,
     pub operation_grants: BTreeMap<String, BTreeSet<String>>,
+    /// Installed per-caller grants for reading only the named provider snapshots.
+    pub provider_settings_readers: BTreeMap<String, BTreeSet<String>>,
+    /// Optional installed selection for generic processing source policy.
+    pub processing_policy: Option<ProcessingPolicy>,
     pub participants: Vec<ParticipantSettings>,
     /// Installed owner-mediated control grants; absent means no control is allowed.
     pub control_policies: Vec<ControlPolicy>,
@@ -73,6 +77,8 @@ impl Default for LifecycleSettings {
             journal_path: String::new(),
             journal_in_runtime_state: false,
             operation_grants: BTreeMap::new(),
+            provider_settings_readers: BTreeMap::new(),
+            processing_policy: None,
             participants: Vec::new(),
             control_policies: Vec::new(),
             finalize_policies: Vec::new(),
@@ -92,6 +98,16 @@ impl Default for LifecycleSettings {
 pub struct SchemaDocument {
     pub reference: SchemaRef,
     pub document: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessingPolicy {
+    pub provider: String,
+    pub service: String,
+    pub processor_service: String,
+    /// Participants explicitly advertising the generic source mode contract.
+    pub source_mode_providers: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -358,6 +374,28 @@ impl LifecycleSettings {
     }
 
     pub(crate) fn validate(&self) -> ModuleResult<()> {
+        if self.processing_policy.as_ref().is_some_and(|policy| {
+            !valid_identifier(&policy.provider)
+                || !valid_identifier(&policy.service)
+                || !valid_identifier(&policy.processor_service)
+                || !self
+                    .participants
+                    .iter()
+                    .any(|p| p.provider == policy.provider)
+                || (policy.source_mode_providers.is_empty()
+                    && self.capture_binding_mode.is_managed())
+                || policy.source_mode_providers.iter().any(|id| {
+                    !self.participants.iter().any(|p| {
+                        &p.provider == id && p.capabilities.contains("source_video_mode/1")
+                    })
+                })
+                || self
+                    .finalize_policies
+                    .iter()
+                    .any(|p| !policy.source_mode_providers.contains(&p.owner_provider))
+        }) {
+            return Err("invalid lifecycle processing policy".into());
+        }
         if self.journal_path.is_empty() != self.journal_in_runtime_state {
             return Err("select exactly one lifecycle journal location".into());
         }
@@ -508,6 +546,18 @@ impl LifecycleSettings {
                     return Err("invalid lifecycle participant method".into());
                 }
             }
+        }
+        if self.provider_settings_readers.len() > 128
+            || self
+                .provider_settings_readers
+                .iter()
+                .any(|(caller, allowed)| {
+                    !self.trusted_callers.contains(caller)
+                        || allowed.len() > 32
+                        || allowed.iter().any(|provider| !providers.contains(provider))
+                })
+        {
+            return Err("invalid lifecycle provider settings readers".into());
         }
         self.resolved_participants()?;
         self.validate_contract_profile()?;
@@ -820,6 +870,55 @@ mod tests {
         assert!(settings.validate().is_ok());
         assert!(root.join("session-lifecycle").is_dir());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn processing_selection_requires_source_provider_for_managed_capture() {
+        let method = json!({"service":"provider/1","method":"plan","interface_major":1,"interface_minor":0,"schema_revision":1});
+        let participant = json!({"provider":"provider", "plan_method":method,
+            "callback_method":method,"status_method":method,"capabilities":[],"cleanup_methods":[],
+            "settings_revision":"initial","settings":{}});
+        let mut settings: LifecycleSettings = serde_json::from_value(json!({
+            "journal_in_runtime_state":true,
+            "capture_binding_mode":"external",
+            "consumer_requirements":{"execution_domain":"desktop", "capture_providers":[], "selector_schemas":[]},
+            "participants":[participant],
+            "processing_policy":{"provider":"provider","service":"provider/1",
+                "processor_service":"processor/1", "source_mode_providers":[]}
+        })).unwrap();
+        assert!(settings.validate().is_ok());
+        settings.capture_binding_mode = amaterasu_extension_api::CaptureBindingMode::Managed;
+        settings.consumer_requirements.capture_providers = vec!["capture".into()];
+        settings.consumer_requirements.selector_schemas = vec!["selector/1".into()];
+        assert!(settings.validate().is_err());
+        settings
+            .processing_policy
+            .as_mut()
+            .unwrap()
+            .source_mode_providers
+            .insert("provider".into());
+        assert!(settings.validate().is_err());
+        settings.participants[0]
+            .capabilities
+            .insert("source_video_mode/1".into());
+        assert!(settings.validate().is_ok());
+    }
+
+    #[test]
+    fn provider_settings_readers_require_trusted_caller_and_selected_provider() {
+        let mut settings: LifecycleSettings = serde_json::from_value(json!({
+            "journal_in_runtime_state":true,
+            "capture_binding_mode":"external",
+            "consumer_requirements":{"execution_domain":"desktop", "capture_providers":[], "selector_schemas":[]}
+        })).unwrap();
+        settings
+            .provider_settings_readers
+            .insert("consumer".into(), ["missing".into()].into());
+        assert!(settings.validate().is_err());
+        settings.trusted_callers.insert("consumer".into());
+        assert!(settings.validate().is_err());
+        settings.provider_settings_readers.clear();
+        assert!(settings.validate().is_ok());
     }
 
     #[test]

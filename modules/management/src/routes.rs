@@ -119,6 +119,21 @@ pub fn resolve(path: &str) -> Option<Route> {
             "repository_list",
             Some("configuration.read"),
         ),
+        ("rtx-hdr", action @ ("status" | "install" | "cancel" | "activate")) => (
+            "amaterasu.management/1",
+            match action {
+                "status" => "rtx_hdr_status",
+                "install" => "rtx_hdr_install",
+                "cancel" => "rtx_hdr_cancel",
+                "activate" => "rtx_hdr_activate",
+                _ => unreachable!(),
+            },
+            Some(if action == "status" {
+                "configuration.read"
+            } else {
+                "configuration.write"
+            }),
+        ),
         ("package-selection", "status") => (
             "amaterasu.management/1",
             "package_selection_status",
@@ -414,7 +429,8 @@ pub fn resolve(path: &str) -> Option<Route> {
         service,
         action,
         scope,
-        requires_empty_body: domain == "media"
+        requires_empty_body: domain == "rtx-hdr"
+            || domain == "media"
             || (domain == "steam" && action == "force_sync")
             || (domain == "host-metrics" && action == "stats_read")
             || domain == "live-streams"
@@ -603,6 +619,31 @@ mod tests {
             .is_err()
         );
         assert!(resolve("/v1/capture/open").is_none());
+    }
+
+    #[test]
+    fn rtx_hdr_routes_require_scoped_empty_requests() {
+        for (name, action, scope) in [
+            ("status", "rtx_hdr_status", "configuration.read"),
+            ("install", "rtx_hdr_install", "configuration.write"),
+            ("cancel", "rtx_hdr_cancel", "configuration.write"),
+            ("activate", "rtx_hdr_activate", "configuration.write"),
+        ] {
+            let route = resolve(&format!("/v1/rtx-hdr/{name}")).unwrap();
+            assert_eq!(route.service, "amaterasu.management/1");
+            assert_eq!(route.action, action);
+            assert_eq!(route.scope, Some(scope));
+            assert!(route.requires_empty_body);
+            assert_eq!(payload(route, br#"{}"#).unwrap()["action"], action);
+            for body in [
+                br#"{"action":"install"}"#.as_slice(),
+                br#"{"path":"/tmp/runtime"}"#,
+                br#"{"url":"https://example.com/runtime"}"#,
+                br#"{"admin":true}"#,
+            ] {
+                assert!(payload(route, body).is_err());
+            }
+        }
     }
 
     #[test]

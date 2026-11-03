@@ -231,10 +231,23 @@ fn initialize_profile(root: &Path, profile: DevelopmentProfile<'_>) -> PackageRe
     };
     let web_directory = root.join("web");
     create_private_directory(&web_directory)?;
-    bootstrap.policy.settings.insert("amaterasu.management".into(), serde_json::json!({
+    let rtx_hdr_runtime_parent = bootstrap
+        .policy
+        .settings
+        .get("amaterasu.management")
+        .and_then(|settings| settings.get("rtx_hdr_runtime_parent"))
+        .cloned();
+    let mut management_settings = serde_json::json!({
         "enabled": false,
         "web": {"directory": web_directory.canonicalize().map_err(|error| error.to_string())?, "trusted_keys": bootstrap.trusted_keys}
-    }));
+    });
+    if let Some(parent) = rtx_hdr_runtime_parent {
+        management_settings["rtx_hdr_runtime_parent"] = parent;
+    }
+    bootstrap
+        .policy
+        .settings
+        .insert("amaterasu.management".into(), management_settings);
     if let DevelopmentProfile::LinuxSession(options) = &profile {
         let management = bootstrap
             .policy
@@ -385,7 +398,9 @@ pub fn build_package_with_library_selection(
     let signing_key = SigningKey::from_bytes(&decode_hex::<32>(&secret)?);
     let authority = if matches!(
         profile,
-        PackageProfile::LinuxSession | PackageProfile::LinuxSessionExtensions
+        PackageProfile::LinuxSession
+            | PackageProfile::LinuxSessionRtxHdr
+            | PackageProfile::LinuxSessionExtensions
     ) && root
         .join(crate::capture_authority_package::SPEC_FILE)
         .try_exists()
@@ -1589,6 +1604,37 @@ mod provision_tests {
     }
 
     #[test]
+    fn installer_seed_excludes_optional_rtx_hdr_artifacts() {
+        let root = fixture("installer-excludes-rtx-hdr");
+        let artifacts = root.join("artifacts");
+        write_artifacts(&artifacts);
+
+        // Build outputs and the vendor runtime may share the artifacts root.
+        // Their presence must not add RTX HDR to the default installer.
+        let plugin = library_filename("amaterasu_rtx_hdr");
+        fs::write(artifacts.join(&plugin), b"optional RTX HDR plugin").unwrap();
+        let vendor_directory = artifacts.join("nvvfx/libs");
+        fs::create_dir_all(&vendor_directory).unwrap();
+        fs::write(
+            vendor_directory.join("libnvVFXTrueHDR.so"),
+            b"vendor runtime",
+        )
+        .unwrap();
+
+        let seed = prepare_seed(&root, &artifacts, &SigningKey::from_bytes(&[42; 32]));
+        let manifest: ReleaseManifest = read_json(&seed.join("package/manifest.json")).unwrap();
+        assert!(
+            manifest.components.iter().all(|component| {
+                component.id != "amaterasu.rtx-hdr" && component.file != plugin
+            }),
+            "the default installer must not select the optional provider"
+        );
+        assert!(!seed.join("package").join(&plugin).exists());
+        assert!(!seed.join("package/nvvfx").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn supplied_tls_survives_reinstall_and_rotation_rolls_back_with_policy() {
         let root = fixture("tls-provision-rotation");
         let artifacts = root.join("artifacts");
@@ -2585,7 +2631,9 @@ fn build_signed_package_with_runtime_probe_and_authority(
     if authority.is_some()
         && !matches!(
             profile,
-            PackageProfile::LinuxSession | PackageProfile::LinuxSessionExtensions
+            PackageProfile::LinuxSession
+                | PackageProfile::LinuxSessionRtxHdr
+                | PackageProfile::LinuxSessionExtensions
         )
     {
         return Err("capture authority is only supported by the Linux session package".into());
@@ -2595,7 +2643,9 @@ fn build_signed_package_with_runtime_probe_and_authority(
     }
     let linux_x264_encoder = matches!(
         profile,
-        PackageProfile::LinuxSession | PackageProfile::LinuxSessionExtensions
+        PackageProfile::LinuxSession
+            | PackageProfile::LinuxSessionRtxHdr
+            | PackageProfile::LinuxSessionExtensions
     )
     .then(|| preflight_linux_x264(artifacts, runtime_available))
     .transpose()?;

@@ -1263,14 +1263,19 @@ fn apply_actions(
                 rotation,
             });
         }
-        if display
-            .hdr_enabled
-            .is_some_and(|hdr| output.get("hdr").and_then(Value::as_bool) != Some(hdr))
-        {
-            actions.push(KScreenAction::Hdr {
-                output: output_name(output)?.to_owned(),
-                enabled: display.hdr_enabled.expect("checked HDR request"),
-            });
+        if let Some(requested_hdr) = display.hdr_enabled {
+            let current_hdr = output.get("hdr").and_then(Value::as_bool).ok_or_else(|| {
+                DisplayError::new(
+                    "unsupported_topology",
+                    "KScreen HDR state must be readable before it can be changed",
+                )
+            })?;
+            if current_hdr != requested_hdr {
+                actions.push(KScreenAction::Hdr {
+                    output: output_name(output)?.to_owned(),
+                    enabled: requested_hdr,
+                });
+            }
         }
     }
     Ok(actions)
