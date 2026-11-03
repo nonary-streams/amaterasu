@@ -20,6 +20,7 @@ struct NoticeState {
 struct Signals {
     state: Mutex<NoticeState>,
     ready: Condvar,
+    work: Option<crate::WorkNotifier>,
 }
 
 /// Lightweight, thread-safe notification reader. Waiting does not acquire a
@@ -42,6 +43,17 @@ impl CaptureNotifications {
     pub fn new() -> Self {
         Self {
             signals: Arc::new(Signals::default()),
+        }
+    }
+
+    /// Wake the host when a new capture notice becomes available. The owning
+    /// module must unsubscribe and drop these readers before its runtime stops.
+    pub fn with_work_notifier(work: crate::WorkNotifier) -> Self {
+        Self {
+            signals: Arc::new(Signals {
+                work: Some(work),
+                ..Signals::default()
+            }),
         }
     }
 
@@ -310,8 +322,13 @@ unsafe extern "C" fn frame_ready(context: *mut c_void) {
         if let Ok(mut state) = signals.state.lock()
             && !state.closed
         {
+            let changed = !state.frame_ready;
             state.frame_ready = true;
             signals.ready.notify_one();
+            drop(state);
+            if changed && let Some(work) = &signals.work {
+                work.notify();
+            }
         }
     }));
 }
@@ -338,6 +355,10 @@ unsafe extern "C" fn stopped(context: *mut c_void, reason: BorrowedBytes) {
             state.frame_ready = false;
             state.swap_request = None;
             signals.ready.notify_all();
+            drop(state);
+            if let Some(work) = &signals.work {
+                work.notify();
+            }
         }
     }));
 }
@@ -378,6 +399,10 @@ unsafe extern "C" fn request_swap(
         }
         state.swap_request = Some(parsed);
         signals.ready.notify_one();
+        drop(state);
+        if let Some(work) = &signals.work {
+            work.notify();
+        }
         STATUS_OK
     }))
     .unwrap_or(STATUS_INTERNAL_ERROR)

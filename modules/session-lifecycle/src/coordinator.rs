@@ -46,6 +46,7 @@ mod observation_scheduler;
 mod operations;
 #[allow(dead_code)]
 mod plan_observation;
+mod prepared_plans;
 mod provider_observations;
 mod providers;
 mod recovery;
@@ -401,6 +402,11 @@ struct StreamRecord {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SessionRecord {
+    #[serde(
+        default,
+        skip_serializing_if = "amaterasu_extension_api::CaptureBindingMode::is_managed"
+    )]
+    capture_binding_mode: amaterasu_extension_api::CaptureBindingMode,
     #[serde(default)]
     provider_graph: Option<ProviderGraph>,
     host_epoch: String,
@@ -432,6 +438,10 @@ struct SessionRecord {
     /// Original lifecycle phase; missing legacy entries cannot establish ownership.
     #[serde(default)]
     admission_phases: BTreeMap<String, LifecyclePhase>,
+    /// Only admissions whose authenticated callback reported Prepared may
+    /// supply agreed constraints to a later application launch.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    prepared_plan_ids: BTreeSet<String>,
     #[serde(default)]
     provider_settings: BTreeMap<String, settings_snapshot::FrozenSettings>,
     /// Coordinator-owned generation of each session resource producer.
@@ -552,6 +562,9 @@ impl Journal {
 struct SharedJournal {
     store: LifecycleStore,
     value: Journal,
+    // Closure eligibility depends on durable state. Recheck after a successful
+    // replacement, rather than cloning and validating history on every tick.
+    retirement_scan_pending: bool,
 }
 type Shared = Rc<RefCell<SharedJournal>>;
 
@@ -577,6 +590,7 @@ fn save(shared: &Shared, mut next: Journal) -> ModuleResult<()> {
         .replace(&next)
         .map_err(|_| "journal_write_failed".to_owned())?;
     shared.value = next;
+    shared.retirement_scan_pending = true;
     Ok(())
 }
 fn validate_journal(journal: &Journal) -> io::Result<()> {
@@ -584,6 +598,10 @@ fn validate_journal(journal: &Journal) -> io::Result<()> {
         || !valid_id(&journal.host_epoch)
         || journal.receipts.len() > MAX_RECEIPTS
         || journal.sessions.len() > MAX_SESSIONS
+        || journal.sessions.values().any(|session| {
+            session.prepared_plan_ids.len() > 128
+                || session.prepared_plan_ids.iter().any(|id| !valid_id(id))
+        })
         || journal.receipts.values().any(|receipt| {
             receipt.work.as_ref().is_some_and(|work| {
                 !work.reprepare_authorized(journal)
@@ -1158,6 +1176,7 @@ impl Coordinator {
             shared: Rc::new(RefCell::new(SharedJournal {
                 store,
                 value: journal,
+                retirement_scan_pending: true,
             })),
             settings: LifecycleSettings::default(),
             configured: false,
@@ -1220,6 +1239,12 @@ impl Coordinator {
         }
         if operation == "verify_provider_epoch" {
             return self.verify_provider(caller, &payload);
+        }
+        if operation == "read_prepared_plans" {
+            return self.read_prepared_plans(caller, payload);
+        }
+        if operation == "read_provider_context" {
+            return self.read_provider_context(caller, payload);
         }
         if operation == "verify_finalize_stage" {
             return self.verify_finalize_stage_operation(caller, &payload);
@@ -1295,48 +1320,53 @@ impl Coordinator {
             }
             return rejection("operation_id_conflict");
         }
-        let journal = self.shared.borrow().value.clone();
-        if let Some(response) = journal
-            .ended_session_history
-            .end_response(&journal, &key, &payload)
         {
-            return response;
-        }
-        if retention::expired(&journal, &key) {
-            return rejection("receipt_expired");
-        }
-        if operation == "lookup" {
-            if let Some(source) = journal.recovery_sources.get(&key)
-                && let Some(original) = journal.receipts.get(source)
+            let shared = self.shared.borrow();
+            let journal = &shared.value;
+            if let Some(response) = journal
+                .ended_session_history
+                .end_response(journal, &key, &payload)
             {
-                let mut response = original.response.clone();
-                response["operation_id"] = json!(id);
-                response["original_operation_id"] = original.request["operation_id"].clone();
                 return response;
             }
-            return journal
-                .receipts
-                .get(&key)
-                .map(|r| r.response.clone())
-                .unwrap_or_else(|| json!({"status":"not_found"}));
-        }
-        if let Some(receipt) = journal.receipts.get(&key) {
-            return if refresh_receipt::matches(receipt, &payload) {
-                receipt.response.clone()
-            } else {
-                rejection("operation_id_conflict")
-            };
-        }
-        if matches!(operation, "prepare" | "prepare_stream" | "resume_stream")
-            && retention::at_capacity(&journal)
-        {
-            return rejection("retention_capacity_exhausted");
-        }
-        if journal.receipts.len() >= MAX_RECEIPTS {
-            return rejection("capacity_exhausted");
+            if retention::expired(journal, &key) {
+                return rejection("receipt_expired");
+            }
+            if operation == "lookup" {
+                if let Some(source) = journal.recovery_sources.get(&key)
+                    && let Some(original) = journal.receipts.get(source)
+                {
+                    let mut response = original.response.clone();
+                    response["operation_id"] = json!(id);
+                    response["original_operation_id"] = original.request["operation_id"].clone();
+                    return response;
+                }
+                return journal
+                    .receipts
+                    .get(&key)
+                    .map(|r| r.response.clone())
+                    .unwrap_or_else(|| json!({"status":"not_found"}));
+            }
+            if let Some(receipt) = journal.receipts.get(&key) {
+                return if refresh_receipt::matches(receipt, &payload) {
+                    receipt.response.clone()
+                } else {
+                    rejection("operation_id_conflict")
+                };
+            }
+            if matches!(operation, "prepare" | "prepare_stream" | "resume_stream")
+                && retention::at_capacity(journal)
+            {
+                return rejection("retention_capacity_exhausted");
+            }
+            if journal.receipts.len() >= MAX_RECEIPTS {
+                return rejection("capacity_exhausted");
+            }
         }
         let result = if operation == "recover_session" {
             self.recover_session(caller, initiator, payload, key)
+        } else if operation == "retire_stream" && payload["restart_recovery"] == true {
+            self.retire_restarted_stream(caller, initiator, payload, key)
         } else if operation == "refresh_provider_observations" {
             self.refresh_provider_observations(caller, initiator, payload, key)
         } else {

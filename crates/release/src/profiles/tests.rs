@@ -434,7 +434,10 @@ fn nvhttp_upnp_management_poll_has_a_scoped_call_grant_without_a_load_cycle() {
     ));
     let policy = development_policy(&directory).unwrap();
     std::fs::remove_dir_all(directory).unwrap();
-    assert_eq!(policy.principals[NVHTTP.id].call, NVHTTP.grants().call);
+    assert_eq!(
+        policy.principals[NVHTTP.id].call,
+        platform_extensions::TRANSPORT.grants().call
+    );
     let management_calls = &policy.principals[MANAGEMENT.id].call;
     assert!(
         MANAGEMENT
@@ -1065,7 +1068,6 @@ fn stream_probe_replaces_platform_sources_without_widening_native_interfaces() {
                 .filter(|service| {
                     ![
                         "amaterasu.session-history/1",
-                        "amaterasu.frame-limiter/1",
                         "amaterasu.host-metrics/1",
                         "amaterasu.updater/1",
                         "amaterasu.system-tray/1",
@@ -1089,7 +1091,7 @@ fn stream_probe_replaces_platform_sources_without_widening_native_interfaces() {
 }
 
 #[test]
-fn stream_profiles_register_frame_limiter_with_only_stream_session_call_grant() {
+fn stream_profiles_do_not_grant_the_legacy_limiter_service_to_consumers() {
     let service = "amaterasu.frame-limiter/1";
     assert_eq!(FRAME_LIMITER.library, "amaterasu_frame_limiter");
     assert_eq!(FRAME_LIMITER.provides, &[service]);
@@ -1108,7 +1110,7 @@ fn stream_profiles_register_frame_limiter_with_only_stream_session_call_grant() 
             .find(|component| component.id == STREAM_SESSION.id)
             .unwrap();
         assert!(session.dependencies.contains(&FRAME_LIMITER.id));
-        assert!(session.calls.contains(&service));
+        assert!(!session.calls.contains(&service));
         for component in components
             .iter()
             .filter(|component| component.id != STREAM_SESSION.id)
@@ -1134,9 +1136,9 @@ fn stream_profiles_register_frame_limiter_with_only_stream_session_call_grant() 
     for policy in [development, installer] {
         assert_eq!(
             policy.principals[FRAME_LIMITER.id].provide,
-            names(&[service])
+            names(&[service, "nonary.frame-limiter/1"])
         );
-        assert!(policy.principals[STREAM_SESSION.id].call.contains(service));
+        assert!(!policy.principals[STREAM_SESSION.id].call.contains(service));
         for (principal, grants) in &policy.principals {
             if principal != STREAM_SESSION.id && principal != "amaterasu.console" {
                 assert!(
@@ -1326,6 +1328,7 @@ fn generated_policies_grant_launch_only_the_expected_provider_calls() {
     std::fs::remove_dir_all(root).unwrap();
     let installer = installer_policy("__WEB__", BTreeMap::new());
     let expected_calls = names(&[
+        "amaterasu.session-lifecycle/1",
         "amaterasu.catalog/1",
         "amaterasu.state/1",
         "amaterasu.session/1",

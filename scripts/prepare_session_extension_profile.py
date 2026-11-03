@@ -27,10 +27,12 @@ INPUT = "amaterasu.input"
 NVHTTP = "amaterasu.nvhttp"
 RTSP = "amaterasu.rtsp"
 STREAM = "amaterasu.stream-session"
+LAUNCH = "amaterasu.launch"
 CONSOLE = "amaterasu.console"
 
 # These are operation grants, not a native-code sandbox or user role grants.
 OPERATIONS = {
+    LAUNCH: ["read_prepared_plans"],
     NVHTTP: ["prepare", "bind_application", "application_retired", "end_session", "lookup", "snapshot", "recover_session"],
     RTSP: ["prepare_stream", "resume_stream", "lookup", "snapshot"],
     STREAM: ["validate_candidate", "ack_binding", "start_stream", "pause_stream", "retire_stream", "binding_validate", "capture_invalidated", "resource_invalidated", "issue_input_binding", "lookup"],
@@ -51,6 +53,20 @@ def run(*arguments: object) -> str:
 def method_ref(name: str) -> dict:
     return {"service": PROVIDER_SERVICE, "method": name, "interface_major": 1,
             "interface_minor": 0, "schema_revision": 1}
+
+
+def settings_grants(callers: list[str]) -> list[dict]:
+    """Only trusted coordinators and editors receive class-wide scope grants."""
+    grants = []
+    for caller in callers:
+        if caller == REGISTRY:
+            continue
+        kinds = ["host"]
+        if caller in (LIFECYCLE, MANAGEMENT, CONSOLE):
+            kinds += ["all_applications", "all_paired_clients", "all_sessions"]
+        grants.extend({"caller": caller, "scope": {"kind": kind}, "read": True,
+                       "write": caller in (MANAGEMENT, CONSOLE)} for kind in kinds)
+    return grants
 
 
 def validate_provider(descriptor: dict, approvals: list[dict], component: dict,
@@ -95,6 +111,7 @@ def prepare(bootstrap: dict, root: Path, descriptor: dict, descriptor_digest: st
         for identity in parent_chain
     }
     calls.update({
+        LAUNCH: [LIFECYCLE_SERVICE],
         LIFECYCLE: ["amaterasu.launch/1", "amaterasu.input/1", LIFECYCLE_SERVICE, REGISTRY_SERVICE, PROVIDER_SERVICE,
                     STATE, "amaterasu.display/1", "amaterasu.virtual-display/1"],
         REGISTRY: [LIFECYCLE_SERVICE, STATE, PROVIDER_SERVICE],
@@ -123,8 +140,7 @@ def prepare(bootstrap: dict, root: Path, descriptor: dict, descriptor_digest: st
     if len(identities) != len(set(identities)):
         raise ValueError("provider API approval conflicts with existing policy")
     policy["api_methods"] = installed + approvals
-    grants = [{"caller": identity, "scope": {"kind": "host"}, "read": True,
-               "write": identity in (MANAGEMENT, CONSOLE)} for identity in validation_callers if identity != REGISTRY]
+    grants = settings_grants(validation_callers)
     settings[REGISTRY] = {"descriptors": [{"descriptor": descriptor,
         "descriptor_sha256": descriptor_digest,
         "approved_methods": [item["method"] for item in approvals], "grants": grants, "migrations": []}]}
@@ -153,6 +169,7 @@ def prepare(bootstrap: dict, root: Path, descriptor: dict, descriptor_digest: st
                      for identity in (MANAGEMENT, INPUT, STREAM)] if enable_display_actions else []
     settings[ACTIONS] = {"input_service": INPUT, "grants": action_grants}
     settings.setdefault("amaterasu.launch", {})["retirement_observers"] = [LIFECYCLE]
+    settings[LAUNCH]["prepared_context_service"] = LIFECYCLE_SERVICE
     settings[NVHTTP]["session_lifecycle_required"] = True
     # The implemented binding adapter supports PipeWire/KWin SDR only.
     settings[NVHTTP]["streaming"]["capture"]["capture_provider"] = "pipewire"
@@ -185,7 +202,7 @@ def main() -> None:
         parser.error("session-extension capture currently requires PipeWire; KMS output and virtual-screen capture selection are unsupported")
     validate_provider(descriptor, approvals, component, args.enable_display_actions)
     descriptor_digest = run(args.publisher, "extension-descriptor-digest", examples / "settings-descriptor.json")
-    run(args.publisher, "init-linux-session", args.root, *options)
+    run(args.publisher, "init-linux-session", args.root, "--external-extension-composition", *options)
     bootstrap_path = args.root / "bootstrap.json"
     bootstrap = json.loads(bootstrap_path.read_text())
     calls = prepare(bootstrap, args.root.resolve(), descriptor, descriptor_digest, approvals, component, args.enable_display_actions)

@@ -50,6 +50,68 @@ Effect callbacks additionally carry their admitted plan and admission ID. Status
 queries refer to the original operation and sequence; querying status must not
 replay an effect.
 
+An approved participant can request `read_provider_context` through the SDK
+while the transition containing its exact planning or lifecycle callback remains
+pending. The coordinator
+verifies the broker caller and the complete durable provider request before
+returning the application reference, requested video mode, and any client facts
+supplied by the trusted owner for that particular transition. A participant
+also needs an explicit broker call grant and lifecycle operation grant. Unknown
+facts remain absent. NVHTTP supplies the paired client reference, explicit
+display-mode override and opaque client properties for initial preparation and
+each stream or resume. Application properties and executable metadata come
+from the admitted preflight. The coordinator reads only the current
+transition's values. Client references and properties are descriptive context,
+never authority; registry reads still require independently granted access to
+the selected scope.
+
+The selected coordinator freezes effective provider settings separately for
+initial preparation and each new or resumed stream. It derives the application,
+paired client, and session selectors from the admitted transition and resolves
+them through the registry with host < application < paired client < session
+precedence. Providers receive this frozen snapshot; they do not parse another
+plugin's settings or ask transport modules to apply overrides.
+
+Registry installation grants accept exact scopes and explicit class-wide
+permissions: `all_applications`, `all_paired_clients`, and `all_sessions`. These
+are trusted configuration permissions, not valid request selectors or stored
+layer identities. Both the broker caller and initiator must hold the applicable
+permission; class-wide reads never imply writes. The default composition gives
+the coordinator read access and the management/console editors read and write
+access to the selected extensions. Ordinary dynamic reads still require the
+existing live-target authorization. Generic plugin editors in the application
+and paired-device views save only their selected scope and preserve parent
+settings when an override is removed.
+
+Descriptors may provide a `display_name`, and enum options may provide
+`choice_labels` keyed by their wire values. These are bounded plain-text display
+strings; the generic editor still saves the original option IDs and enum values.
+Providers own the wording and option order. Host-level edits are saved directly;
+editing an inherited application or device value selects an explicit override.
+
+The SDK defines a generic `LaunchEnvironmentContribution` and bounded merge
+helper. Contributions can set/remove values or extend delimited values while
+preserving inherited entries. Conflicting edits are rejected. A participant
+declares the `amaterasu.launch-environment` capability and a digest-pinned
+`launch_environment` requirement in its plan's constraints. The coordinator's
+ordinary capability admission applies; a descriptor alone grants no rights.
+
+An approved launch consumer uses `request_prepared_plans` to read the agreed
+constraints after session preparation succeeds. The coordinator requires an
+explicit `read_prepared_plans` operation grant, the exact session target, and
+the frozen application operation and owner. Reads are available before the
+application is bound, and stop when the session ends or requires recovery.
+The consumer does not receive new resource-mutation authority from these data.
+The launch module selects its coordinator through the trusted
+`prepared_context_service` setting and freezes the merged environment before
+creating its application session. It does not inspect provider-specific policy.
+
+Built-in launch, RTSP and stream-session messages do not accept legacy
+frame-limiter policy payloads or invoke the limiter's apply/status/restore RPCs.
+The standard package no longer grants those calls to streaming consumers. A
+plugin's compatibility service is available only to callers explicitly granted
+that service by a separate composition.
+
 Plans identify owned resources, mutation domains, expected revisions, affected
 consumers, cleanup obligations, and an optional capture constraint. The provider
 rechecks native state immediately before effects. The coordinator holds admission
@@ -351,3 +413,25 @@ two keyboard removals, fresh resource generations and resume through generation
 three, session end, and an exact retry after a lost completion reply without
 native replay or injected input. These runs do not establish live hardware or
 full host-restart behavior.
+
+## Consumer-owned and provider-owned settings
+
+The host routes lifecycle requests and checks grants. A participant reads the
+authorized transition through the SDK and owns its option definitions,
+validation, policy and effects. A consumer must not reconstruct a participant's
+settings or select its backend.
+
+Older product, application and device records can contain values whose provider
+has moved to the extension registry. Readers retain those values as bounded
+opaque data. Consumer edits preserve them without interpreting their meaning;
+new plugin settings are edited through the registry descriptor. Importing an
+older value into a plugin scope is a provider-owned migration, not an implicit
+consumer fallback. Retained data does not confer permission to read a record
+or apply an effect.
+
+The coordinator can select `journal_in_runtime_state: true` instead of an
+absolute `journal_path`. This requires the existing
+`amaterasu.host-state-context/1` grant and places its journal in the worker's
+private `session-lifecycle` directory. Selecting both locations, omitting both,
+or failing to obtain the granted runtime context prevents startup; the module
+does not fall back to a process-wide or temporary path.

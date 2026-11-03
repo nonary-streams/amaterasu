@@ -807,6 +807,27 @@ dialog::backdrop {
   background: #050911ba;
   backdrop-filter: blur(3px);
 }
+.extension-settings-dialog {
+  max-width: 760px;
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
+}
+
+.session-extension-option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0 0 18px;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+.session-extension-option legend { padding: 0 0 6px; font-weight: 600; }
+.session-extension-option > select,
+.session-extension-option > input:not([type="checkbox"]) { width: min(100%, 420px); }
+.session-extension-option > small { line-height: 1.45; max-width: 680px; }
+.session-extension-inherit { display: flex; align-items: center; gap: 6px; font-size: 13px; }
 dialog p {
   font-size: 12px;
   margin: 15px 0 24px;

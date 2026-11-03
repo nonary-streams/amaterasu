@@ -2,6 +2,7 @@ use super::{PlaneResult, *};
 
 pub(super) struct VideoPacket {
     metadata: EncodedPacket,
+    processing_started_host_us: u64,
     bytes: Vec<u8>,
 }
 
@@ -17,8 +18,17 @@ impl VideoPacket {
         metadata.data = std::ptr::null();
         Ok(Self {
             metadata,
+            processing_started_host_us: 0,
             bytes: bytes.to_vec(),
         })
+    }
+
+    /// # Safety
+    /// The provider keeps the timed header and initialized bytes live during copy.
+    pub(super) unsafe fn copy_timed(packet: &TimedEncodedPacket) -> PlaneResult<Self> {
+        let mut output = unsafe { Self::copy(&packet.base) }?;
+        output.processing_started_host_us = packet.processing_started_host_us;
+        Ok(output)
     }
 }
 
@@ -57,6 +67,7 @@ impl VideoAssembly {
             if packet.metadata.flags == FLAG_END_OF_STREAM
                 || packet.metadata.sequence != current.metadata.sequence
                 || packet.metadata.timestamp_us != current.metadata.timestamp_us
+                || packet.processing_started_host_us != current.processing_started_host_us
             {
                 return Err("video_access_unit_incomplete");
             }
@@ -82,6 +93,12 @@ impl VideoAssembly {
             len: packet.bytes.len(),
             ..packet.metadata
         })
+    }
+
+    pub(super) fn processing_started_host_us(&self) -> u64 {
+        self.packet
+            .as_ref()
+            .map_or(0, |packet| packet.processing_started_host_us)
     }
 
     pub(super) fn clear(&mut self) {

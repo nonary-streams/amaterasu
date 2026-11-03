@@ -448,6 +448,8 @@ impl EndedSessionCertificate {
             application_operation_id: self.application_operation_id.clone(),
             admission_ids: BTreeSet::new(),
             admission_targets: BTreeMap::new(),
+            capture_binding_mode: Default::default(),
+            prepared_plan_ids: Default::default(),
             admission_phases: BTreeMap::new(),
             provider_settings: BTreeMap::new(),
             resource_generations: BTreeMap::new(),

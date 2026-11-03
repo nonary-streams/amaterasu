@@ -31,6 +31,7 @@ pub trait LifecycleHandler: Sized {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct LifecycleSettings {
+    pub capture_binding_mode: amaterasu_extension_api::CaptureBindingMode,
     pub trusted_callers: BTreeSet<String>,
     /// Broker identities granted delegation by installed operator policy.
     pub session_delegates: BTreeSet<String>,
@@ -43,6 +44,9 @@ pub struct LifecycleSettings {
     /// Optional registry service used to freeze provider settings at session start.
     pub settings_registry_service: Option<String>,
     pub journal_path: String,
+    /// Selects the trusted worker's private state root instead of an installed
+    /// absolute path. Requires the host-state-context call grant.
+    pub journal_in_runtime_state: bool,
     pub operation_grants: BTreeMap<String, BTreeSet<String>>,
     pub participants: Vec<ParticipantSettings>,
     /// Installed owner-mediated control grants; absent means no control is allowed.
@@ -58,6 +62,7 @@ pub struct LifecycleSettings {
 impl Default for LifecycleSettings {
     fn default() -> Self {
         Self {
+            capture_binding_mode: Default::default(),
             trusted_callers: BTreeSet::new(),
             session_delegates: BTreeSet::new(),
             input_actions: BTreeSet::new(),
@@ -66,6 +71,7 @@ impl Default for LifecycleSettings {
             settings_registry_caller: String::new(),
             settings_registry_service: None,
             journal_path: String::new(),
+            journal_in_runtime_state: false,
             operation_grants: BTreeMap::new(),
             participants: Vec::new(),
             control_policies: Vec::new(),
@@ -352,8 +358,8 @@ impl LifecycleSettings {
     }
 
     pub(crate) fn validate(&self) -> ModuleResult<()> {
-        if self.journal_path.is_empty() {
-            return Err("lifecycle journal path is required".into());
+        if self.journal_path.is_empty() != self.journal_in_runtime_state {
+            return Err("select exactly one lifecycle journal location".into());
         }
         let requirements = &self.consumer_requirements;
         if requirements.execution_domain.is_empty()
@@ -365,7 +371,7 @@ impl LifecycleSettings {
             ]
             .into_iter()
             .any(|values| {
-                values.is_empty()
+                (values.is_empty() != self.capture_binding_mode.is_external())
                     || values.len() > 32
                     || values.iter().any(|value| {
                         value.is_empty()
@@ -377,6 +383,16 @@ impl LifecycleSettings {
             })
         {
             return Err("invalid lifecycle consumer requirements".into());
+        }
+        if self.capture_binding_mode.is_external()
+            && (!self.control_policies.is_empty()
+                || !self.finalize_policies.is_empty()
+                || self
+                    .participants
+                    .iter()
+                    .any(|participant| participant.contract_version != 1))
+        {
+            return Err("external capture cannot select capture composition".into());
         }
         if self.trusted_callers.len() > 256
             || self
@@ -514,9 +530,10 @@ impl<H: LifecycleHandler> ManagedModule for LifecycleAdapter<H> {
         let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
             return Err("lifecycle settings unavailable".into());
         };
-        let settings: LifecycleSettings =
+        let mut settings: LifecycleSettings =
             serde_json::from_value(payload).map_err(|_| "invalid lifecycle settings".to_owned())?;
         settings.validate()?;
+        resolve_journal_location(&mut settings, || runtime.runtime_state_root())?;
         let handler = H::from_settings(&settings)?;
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
@@ -585,6 +602,28 @@ impl<H: LifecycleHandler> ManagedModule for LifecycleAdapter<H> {
             )),
         }
     }
+}
+
+fn resolve_journal_location(
+    settings: &mut LifecycleSettings,
+    state_root: impl FnOnce() -> ModuleResult<std::path::PathBuf>,
+) -> ModuleResult<()> {
+    if !settings.journal_in_runtime_state {
+        return Ok(());
+    }
+    let root = state_root()?;
+    if !root.is_absolute() {
+        return Err("runtime state root must be absolute".into());
+    }
+    let directory = root.join("session-lifecycle");
+    amaterasu_storage::create_private_directory(&directory)?;
+    settings.journal_path = directory
+        .join("journal.json")
+        .to_str()
+        .ok_or("lifecycle journal path is not UTF-8")?
+        .to_owned();
+    settings.journal_in_runtime_state = false;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -745,6 +784,42 @@ mod tests {
             assert_eq!(run(&mut late).is_ok(), code != "permission_denied");
             assert_eq!(late.completions.len(), 1);
         }
+    }
+
+    #[test]
+    fn runtime_journal_selection_is_explicit_and_has_no_fallback() {
+        let mut settings: LifecycleSettings = serde_json::from_value(json!({
+            "journal_in_runtime_state":true,
+            "capture_binding_mode":"external",
+            "consumer_requirements":{"execution_domain":"desktop", "capture_providers":[], "selector_schemas":[]}
+        })).unwrap();
+        assert!(settings.validate().is_ok());
+        let mut ambiguous = settings.clone();
+        ambiguous.journal_path = "/operator/journal".into();
+        assert!(ambiguous.validate().is_err());
+        assert!(
+            resolve_journal_location(&mut settings, || Err("permission_denied".into())).is_err()
+        );
+        assert!(settings.journal_path.is_empty());
+        assert!(settings.journal_in_runtime_state);
+        assert!(resolve_journal_location(&mut settings, || Ok("relative".into())).is_err());
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-runtime-journal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        resolve_journal_location(&mut settings, || Ok(root.clone())).unwrap();
+        assert_eq!(
+            std::path::Path::new(&settings.journal_path),
+            root.join("session-lifecycle/journal.json")
+        );
+        assert!(!settings.journal_in_runtime_state);
+        assert!(settings.validate().is_ok());
+        assert!(root.join("session-lifecycle").is_dir());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -31,6 +31,7 @@ pub struct Settings {
     pub hostname: String,
     pub streaming: Option<StreamingConfig>,
     pub session_lifecycle_required: bool,
+    pub session_lifecycle_capture_mode: amaterasu_module_sdk::extension_api::CaptureBindingMode,
 }
 
 impl Default for Settings {
@@ -47,12 +48,16 @@ impl Default for Settings {
             hostname: default_hostname(),
             streaming: None,
             session_lifecycle_required: false,
+            session_lifecycle_capture_mode: Default::default(),
         }
     }
 }
 
 impl Settings {
     pub fn validate(&self) -> Result<(), &'static str> {
+        if self.session_lifecycle_capture_mode.is_external() && !self.session_lifecycle_required {
+            return Err("external_lifecycle_requires_coordinator");
+        }
         if !amaterasu_module_sdk::network::valid_provider(&self.network_provider) {
             return Err("invalid_network_provider");
         }

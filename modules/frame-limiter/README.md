@@ -1,32 +1,40 @@
 # Frame limiter service and policy
 
-This crate defines typed global frame-limiter settings, inventory-scoped
-override resolution, provider policy, and the managed
-`amaterasu.frame-limiter/1` service.
+This crate owns frame-limiter settings, backend policy and effects. The default
+Linux and Windows product compositions use the plugin's lifecycle callbacks
+and the generic extension settings registry. Launch, RTSP and stream-session do not send
+limiter-specific settings or call its apply/status/restore methods.
+
+The `amaterasu.frame-limiter/1` service remains available inside the plugin for
+legacy external callers. It is not granted to built-in streaming consumers.
 
 The version 1 `apply` request carries the immutable effective settings for one
 launch plus optional stream, Lossless Scaling, explicit client display-mode,
 virtual-display, and frame-generation context. Missing or null context is
-unknown; the launch adapter must not infer a client display override from
+unknown; callers must not infer a client display override from
 stream dimensions. Rate values are exact unsigned millihertz, and zero means
-the known follow-stream/no-rate value. The launch adapter resolves the six
-application/client overridable fields with client-over-application-over-global
-precedence. Other settings remain global. The legacy
+the known follow-stream/no-rate value. The selected registry resolves the
+plugin's declared application/client fields before each prepared transition.
+Other settings remain global. The legacy
 `rtss_disable_vsync_ullm` input folds into `frame_limiter_disable_vsync`, and
 callers persist only the canonical field. An empty RTSS install path selects
 auto-detection.
 
 ## Runtime behavior
 
-64-bit Windows reads RTSS profile values through `RTSSHooks64.dll` and updates
-an existing executable profile through its `.cfg` file. Before changing any
-bytes, the provider opens that regular file without following a final-component
-reparse point, denies delete/rename opens, and takes a nonblocking exclusive
+64-bit Windows reads RTSS profile values through `RTSSHooks64.dll`. The
+lifecycle backend controls the `Profiles/Global` profile, including
+desktop streams; the compatibility service can still target an executable
+profile through its `.cfg` file. Before changing any bytes, the provider opens
+that regular file without following a final-component reparse point, denies
+write/delete sharing, and takes a nonblocking exclusive
 Win32 byte-range lock over the full file range. It reads and compares the three
 `[Framerate]` values while holding the lock, replaces only their numeric text,
 flushes and verifies the file, then asks RTSS to reload the profile and checks
 the values through the hooks API. An expected-value mismatch or lock failure
-does not mutate the profile. Apply and restore use the same transaction, with
+does not mutate the profile. A preexisting write-capable handle also makes the
+transaction unavailable before mutation; it does not rely solely on byte-lock
+enforcement. Apply and restore use the same transaction, with
 the lease journal durable before apply and restore conditional on the exact
 applied values.
 
@@ -45,27 +53,54 @@ The in-place file update is not crash-atomic; failed writes attempt to restore
 the original bytes while the lock is held, and an unverified result leaves the
 durable pending lease for recovery. Profiles with missing, duplicate, or
 malformed frame-rate keys are refused. 32-bit Windows and non-Windows RTSS
-requests remain unavailable. `auto` has no unimplemented fallback.
+requests remain unavailable. Auto tries the NVIDIA driver limiter only after
+RTSS has confirmed that it owns no unresolved effect.
 
-The RTSS limiter-disabled flag is global, so the module only reads it. If RTSS
-has disabled the limiter globally, apply reports unavailable without changing
-the flag or other applications' profiles. RTSS cannot apply the separate
-`frame_limiter_disable_vsync` setting, so requests that enable it are declined
-before any provider mutation. The read-only probe requires an existing regular
-executable profile to inspect values; a missing profile makes a requested apply
-unavailable with `rtss_profile_missing_safe_create_unsupported`. The module
-does not create or delete profiles. An explicit relative RTSS install path is
-accepted by settings validation but currently returns unavailable; leave the
-field empty for auto-detection or supply an absolute path to the running
-installation.
+The global lifecycle lease records RTSS's limiter-disabled bit before applying
+its profile. It enables the limiter only after the pending journal is durable,
+preserves every unrelated flag, and restores the original bit after conditional
+profile restoration. Known partial profile/flag transactions return to their
+saved baseline during recovery; unrelated profile edits retain the lease for
+recovery. Compatibility requests for an executable do not enable a globally
+disabled limiter. The separate `frame_limiter_disable_vsync` option uses a
+plugin-owned NVIDIA driver lease. If that required change fails without an
+effect, the plugin restores its RTSS lease; an uncertain driver save retains
+ownership for recovery. A missing Global profile is initialized with
+unlimited default values only after its creation intent is durable. The provider
+pins the Profiles directory, rejects reparse points, and creates the file
+exclusively; a racing file is preserved. After cleanup the initialized default
+profile remains. Failed initialization deletes only the newly created file
+through its still-exclusive handle. Missing executable profiles on the legacy
+service remain unavailable. A configured RTSS path may be absolute or relative
+to a Windows Program Files directory. An empty path uses the running
+installation, or the conventional installed directory during preparation.
+An explicit path must match an already-running installation in the plugin's
+Windows login session; it cannot redirect the Hooks API to a different copy.
+
+Preparation can start a stopped RTSS installation. Status reads only inspect
+an existing instance. Before loading or starting code, the plugin pins a
+non-reparse installation beneath a system-resolved Program Files root, rejects
+user-writable installation/code ACLs, verifies the executable and Hooks DLL
+with Authenticode, and requires their signing certificates to match. Open code
+handles prevent write/delete replacement, and the loaded DLL's file identity
+must match the verified file. These checks use cached trust information without
+network retrieval.
+
+The plugin creates RTSS hidden and suspended, assigns it to a private
+kill-on-close process job, then resumes it and waits for readiness. The owned
+instance stays warm across stream transitions and pauses. Session cleanup
+retires it only after all RTSS leases are gone, including when the final stream
+cleanup arrives after session cleanup. An existing instance is never included
+in that job. Failed startup and worker termination retire only the owned
+process tree.
 
 A lease belongs to the broker caller and `session_id`. An exact request retry
 returns the same lease while RTSS still matches, and the retry check runs
 before policy can return `not_needed` or `runtime_unavailable`. Changed
 settings or target for that owner and session return `lease_conflict`, including
-after restore while its tombstone is retained. Conflicts are scoped to one RTSS
-installation and executable profile, so independent profiles may have active
-leases at the same time. A stale lease continues to reserve its profile until
+after restore while its tombstone is retained. Conflicts are scoped to one RTSS installation and profile. The lifecycle
+backend serializes the shared global target; compatibility callers can own
+independent executable profiles. A stale lease continues to reserve its profile until
 it is restored or resolved. `status` lists only that caller's leases and may
 filter by session. When no owned lease exists, `status` probes the RTSS process
 and required API and reports provider availability separately from lease state.
@@ -95,7 +130,43 @@ than automatically deleting or overwriting the profile. A readback mismatch is
 rolled back only when the current profile and global limiter flag still match
 the attempted change.
 
+Windows native effects execute in a separate process launched by the plugin
+from its already selected DLL. The plugin uses the system `rundll32.exe` and a
+private pipe; the host does not interpret the worker protocol or package an
+additional helper. The child belongs to a kill-on-close job and all parent I/O
+threads are retired before unloading the module. This is a fault-isolation
+boundary for trusted native code, not a permission sandbox.
+
+Lifecycle and compatibility requests remain asynchronous in the host process.
+The parent limits the queue to 32 requests and retains 256 completed receipts.
+Worker startup has a five-second deadline. RTSS preparation has a four-second
+watchdog; other in-flight native stages have a one-second watchdog. All remain
+bounded by the caller's overall deadline. On a stall the parent first
+terminates the owned process tree and confirms that no descendant remains.
+Auto and explicit RTSS selection may retry through NVIDIA
+only when both durable journals prove there is no outstanding native effect.
+Unrecognized state, an outstanding lease, an expired request or a stalled
+NVIDIA call returns recovery-required rather than attempting another backend.
+
 ## Policy behavior
+
+On 64-bit Windows the NVIDIA backend uses the system NVAPI DRS interface. It
+records the selected profile's name, setting values and override provenance
+before saving changes. Explicit NVIDIA selection bypasses RTSS. Auto may fall
+back after a confirmed RTSS failure; pending native ownership prevents fallback.
+When RTSS is active, the plugin also disables an available NVIDIA driver cap so
+the two limiters do not compete. Requested VSync control can operate without a
+frame cap. Smooth Motion requests enable its driver flag and API mask only on
+driver 571.86 or newer. Driver limits round to whole FPS and clamp to 1–1023.
+
+The separate `nvcp-leases.json` journal is locked, bounded, and written before
+driver saves. Cleanup compares only the settings that lease owns; explicit
+values are restored, and formerly inherited settings have the temporary
+override removed. Uncertain or interrupted saves are reconciled against the
+recorded before/after states. An unrelated value keeps the lease unresolved.
+NVAPI does not expose an atomic compare-and-save operation across independent
+applications; a writer racing between the snapshot check and driver save
+remains a runtime qualification limit.
 
 The Windows RTSS policy changes the configured sync type only for an active
 frame-generation policy with Auto or RTSS selected. Smooth Motion uses Front
@@ -120,10 +191,104 @@ generated output. An explicit configured frame-limiter rate keeps precedence
 and is written exactly; all other rate sources also keep their exact
 millihertz ratio. The policy plan continues to report the resolved LS output
 target, while the RTSS lease records the derived game-input cap. Native RTSS
-apply and restore remain unavailable until the provider can perform safe
-conditional profile writes.
+apply and restore use the conditional profile transaction described above;
+live RTSS behavior still needs Windows qualification.
 
 ## Remaining integration and platform gates
+
+The plugin contains an extension-registry settings descriptor and a typed
+settings validator for the independently approved `nonary.frame-limiter/1`
+service. Set
+`extension_registry_principal` to the operator-selected registry identity and
+approve that method before registering it. The default Linux session profile
+selects this extension with limiting disabled and exposes the plugin-owned
+options through the generic extension settings editor. The Windows product
+selects the same contracts with its Windows descriptor; its lifecycle journal uses
+the worker state root through an explicit context grant. The legacy product
+and application/device editors no longer define or validate limiter fields. Their storage readers
+retain options they do not own as bounded opaque data, and unrelated edits
+preserve those values, including false, zero and null. The plugin still needs
+an explicit import of older saved limiter settings into its registry scopes;
+retention alone does not activate those settings. The
+descriptor for a target platform can be generated with
+`cargo run -p amaterasu-frame-limiter --example print_settings_descriptor -- linux`
+(or `windows` / `macos`).
+
+An explicitly configured `lifecycle_coordinator` (`principal` and `service`)
+also registers generic v1 lifecycle methods. The participant asynchronously reads
+the exact authorized context before responding. Linux callbacks declare a
+plugin-owned mutation domain, validate the admitted plan, and return bounded
+receipts while the worker installs hooks and applies or removes a policy.
+Status queries recover the recorded outcome without replaying effects. Exact
+cleanup generations prevent a delayed stream release from removing a resumed
+stream's policy. An uncertain worker effect retires the worker and fences further
+effects until recovery settles; it is never reported as successful preparation
+or cleanup merely because the worker was stopped.
+The default Linux profile uses external capture ownership: lifecycle callbacks
+run before application launch and stream start, but capture and input stay with
+their selected existing providers. No capture candidate is supplied by the
+limiter. RTSP and stream-session reject a change of ownership mode mid-session.
+Explicit display-composition packaging uses `--external-extension-composition`
+to supply its own reviewed lifecycle graph; that graph currently excludes this
+default participant rather than mixing unsupported v1/v2 participants.
+
+The Linux plugin also contains a bundled Proton helper, bounded discovery,
+temporary policy store, and subprocess bridge. Fixture tests exercise the
+installer and launch-time environment edits. A native integration test loads the
+independently built module through its ABI and drives the real broker and
+lifecycle coordinator through session preparation and cleanup in a disposable
+Proton installation. The plugin's policy projection uses a configured limit first, then a Lossless Scaling
+output target (or its requested stream rate), then an explicit client mode, then
+the requested stream rate; absent client context
+is not treated as proof that no override exists. The installer serializes its
+own writes and checks the existing file
+before atomic replacement; an unrelated writer that ignores the lock can still
+race the final comparison. No live Proton installation has been modified or
+qualified by these tests. The worker normally uses `XDG_RUNTIME_DIR` and the
+current user's Steam roots. Trusted plugin startup settings may instead supply
+`proton_runtime_directory` and `proton_steam_roots`; paths must be absolute and
+the worker still checks ownership before writing.
+
+When Steam's pressure-vessel runtime hides that directory, the Proton hook
+reads its policy from the live plugin worker over a bounded Unix abstract
+socket. Both ends check the peer's user ID; the socket is specific to that
+runtime root and disappears with the worker. The worker checks its owned state
+before answering and returns only the selected application's policy.
+Inside the container, the hook supplies private Vulkan manifests pointing to
+the installed host MangoHUD libraries and architecture-specific preload links.
+Those files are removed when Proton exits. Existing overlay configuration and
+other Vulkan layers are retained. Installer upgrades replace only an exact
+recognized previous helper; externally changed helpers remain untouched.
+
+The Linux plugin keeps `lifecycle.json` beside its temporary `active.json`
+policy. Its private journal records a stable random owner ID, receipt identities,
+target generations, and the exact before/after policy intent before submitting
+an effect. A process lock permits one module owner; directory-relative file
+operations reject symlinks and shared writable state, compare file identity
+before replacement, and sync the new journal and containing directory.
+The journal is bounded to 4 MiB, 32 pending receipts and 256 completed receipts.
+
+On a worker exit or module restart, a replacement worker first removes only an
+inactive policy with that journal's owner ID and a matching before/after policy
+snapshot. Other owners, changed policies and unrecognized legacy files remain
+untouched and keep recovery blocked. Readiness means the previous policy is
+absent; it never reactivates saved settings. The plugin then retires the saved
+generations, confirms cleanup receipts, and reports old preparations as requiring
+recovery. Queued effects from the old worker are retired instead of replayed.
+New streams can prepare after this reconciliation, while delayed cleanup retains
+its original target identity. The native broker test restarts the loaded plugin
+between preparation and cleanup for each Linux backend.
+
+Run the native integration check after building the module:
+
+```sh
+cargo build -p amaterasu-frame-limiter
+AMATERASU_FRAME_LIMITER_LIBRARY="$PWD/target/debug/libamaterasu_frame_limiter.so" \
+  cargo test -p amaterasu-session-lifecycle --test frame_limiter -- --ignored
+```
+
+The test creates its own subprocess and private directories. It does not alter
+the installed Proton tools or the current user's settings.
 
 The lifecycle contract is implemented behind the fake-provider test seam.
 Live RTSS process/API detection, profile locking, reload, and game behavior were
@@ -131,8 +296,45 @@ not exercised because RTSS is not installed and running in the build
 environment. RTSS hooks may also be blocked by a game's anti-cheat. The
 community `SyncLimiter` numeric mapping and read behavior still require
 verification against supported RTSS versions.
-NVIDIA Control Panel, VSync control, MangoHUD, and Proton runtime providers
-remain unimplemented; unsupported provider choices return `runtime_unavailable`.
+The Windows branch is cross-checked for `x86_64-pc-windows-gnu`, including its
+test targets. Its unit tests also run in a private Wine prefix, including the
+native create-new, write-sharing and conditional file-update checks. This does
+not qualify RTSS Hooks or game behavior on Windows. The file transaction denies
+competing write handles in addition to the byte-range lock; it does not depend
+on Wine enforcing the Windows byte-lock behavior.
+RTSS process warm-up, owned-tree retirement, read-only probes and watchdog
+fallback are covered by process and provider fixtures. Those fixtures also
+verify that an independently launched process survives owned-tree cleanup.
+Path confinement, mutable-code rejection and unsigned-code rejection run in
+the private Wine prefix; a real signed RTSS installation still needs Windows
+qualification. The actual DLL entrypoint is exercised in a private
+Wine process with disposable journals, including paths with spaces and commas.
+The NVIDIA backend and VSync control are implemented and tested through a DRS
+ABI fixture; live driver persistence and game behavior still need Windows
+qualification. The reference's special repair of preexisting Smooth Motion
+Off overrides is not yet implemented. The new Linux
+lifecycle backend supports Proton launch hooks, including MangoHUD limiting or
+overlay settings. Native launches receive the same plugin-owned limits through
+the generic `amaterasu.launch-environment` constraint. The launch consumer merges
+inherited configuration and rejects conflicts before spawning. The plugin's
+descriptor advertises that capability; startup composition must grant it explicitly.
+Configured frame-generation mode and Lossless Scaling context are resolved inside
+the plugin from application/client properties. Automatic virtual-display/GPU
+discovery and scoped RTSS-type provenance remain unfinished. MangoHUD executable
+discovery stays inside the plugin; Auto and combined mode use Proton without
+the overlay when it is absent. Explicit MangoHUD selection reports unavailable.
+Trusted startup can set bounded absolute `mangohud_search_paths` instead of PATH.
+Safe upgrades from older installer compositions and ownership-free legacy
+runtime policy files remain incomplete.
+Application and paired-client overrides are edited through the generic plugin
+settings dialogs and frozen by the registry for each prepared transition.
+The legacy `/1` lease service still reports Linux providers as
+unavailable; Linux lifecycle effects use the separately approved plugin service.
+
+Migration of unfinished legacy stream-owned effects remains a release gate.
+Stream-session reads old inactive journal markers without writing them again;
+an old journal declaring a pending effect is preserved and blocks new sessions.
+It cannot be treated as clean just because the old direct RPC path was removed.
 
 Focused policy, lifecycle, and disposable profile-file transaction tests are in
 `src/tests.rs`, `src/lease.rs`, and `src/rtss_profile.rs`; strict service wire

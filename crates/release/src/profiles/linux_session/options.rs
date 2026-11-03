@@ -291,6 +291,8 @@ impl CatalogOwner {
 /// Everything an operator can change when initialising a Linux session root.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LinuxSessionOptions {
+    /// Reserve extension composition for the caller's reviewed provider graph.
+    pub external_extension_composition: bool,
     pub network: NetworkOption,
     pub catalog_owner: CatalogOwner,
     /// Enables the loopback management listener on this port.
@@ -324,6 +326,7 @@ pub struct LinuxSessionOptions {
 impl Default for LinuxSessionOptions {
     fn default() -> Self {
         Self {
+            external_extension_composition: false,
             network: NetworkOption::default(),
             catalog_owner: CatalogOwner::default(),
             management_port: None,
@@ -352,6 +355,10 @@ impl LinuxSessionOptions {
         let mut arguments = arguments.iter();
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
+                "--external-extension-composition" => {
+                    seen.once("--external-extension-composition")?;
+                    options.external_extension_composition = true;
+                }
                 "--lan" => {
                     seen.once("--lan")?;
                     lan = Some(required_value(&mut arguments, "--lan")?);

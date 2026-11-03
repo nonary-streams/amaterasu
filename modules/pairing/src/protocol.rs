@@ -4,7 +4,6 @@ use std::collections::BTreeSet;
 
 pub const MAX_DOCUMENT_BYTES: usize = 12_000;
 pub const MAX_CLIENTS: usize = 8;
-const MAX_FRAME_LIMITER_FPS: f64 = 1_000.0;
 
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -278,7 +277,6 @@ impl ClientPermissions {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ClientConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sw_preset: Option<String>,
@@ -317,18 +315,6 @@ pub struct ClientConfigOverrides {
     pub dd_configuration_option: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dd_hdr_request_override: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frame_limiter_fps_limit: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frame_limiter_enable: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frame_limiter_provider: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frame_limiter_disable_vsync: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frame_limiter_auto_virtual_framegen: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rtss_frame_limit_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_audio: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -395,10 +381,14 @@ pub struct ClientConfigOverrides {
     pub key_repeat_delay: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_repeat_frequency: Option<f64>,
+    /// Opaque values owned by providers outside this consumer's schema.
+    #[serde(default, flatten)]
+    pub retained_options: serde_json::Map<String, serde_json::Value>,
 }
 
 impl ClientConfigOverrides {
     pub fn validate(&self) -> Result<(), &'static str> {
+        amaterasu_module_sdk::retained_options::validate(&self.retained_options)?;
         amaterasu_module_sdk::validate_software_options(
             self.sw_preset.as_deref(),
             self.sw_tune.as_deref(),
@@ -439,24 +429,6 @@ impl ClientConfigOverrides {
             .minimum_fps_target
             .is_some_and(|target| !target.is_finite() || !(0.0..=1000.0).contains(&target))
             || self.video_max_batch_size_kb.is_some_and(|size| size > 64)
-            || self
-                .frame_limiter_fps_limit
-                .is_some_and(|fps| !valid_frame_limiter_fps_limit(fps))
-            || self
-                .frame_limiter_provider
-                .as_deref()
-                .is_some_and(|provider| !valid_frame_limiter_provider(provider))
-            || self
-                .frame_limiter_auto_virtual_framegen
-                .as_deref()
-                .is_some_and(|mode| !matches!(mode, "enabled" | "vrr" | "legacy" | "disabled"))
-            || self.rtss_frame_limit_type.as_deref().is_some_and(|mode| {
-                !matches!(
-                    mode,
-                    "async" | "front edge sync" | "back edge sync" | "nvidia reflex"
-                )
-            })
-            || self.has_unsupported_frame_limiter_fields()
         {
             return Err("invalid_config_overrides");
         }
@@ -540,7 +512,8 @@ impl ClientConfigOverrides {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.sw_preset.is_none()
+        self.retained_options.is_empty()
+            && self.sw_preset.is_none()
             && self.sw_tune.is_none()
             && self.encoder.is_none()
             && self.min_threads.is_none()
@@ -558,12 +531,6 @@ impl ClientConfigOverrides {
             && self.dd_hdr_option.is_none()
             && self.dd_configuration_option.is_none()
             && self.dd_hdr_request_override.is_none()
-            && self.frame_limiter_fps_limit.is_none()
-            && self.frame_limiter_enable.is_none()
-            && self.frame_limiter_provider.is_none()
-            && self.frame_limiter_disable_vsync.is_none()
-            && self.frame_limiter_auto_virtual_framegen.is_none()
-            && self.rtss_frame_limit_type.is_none()
             && self.stream_audio.is_none()
             && self.audio_sink.is_none()
             && self.virtual_sink.is_none()
@@ -595,31 +562,6 @@ impl ClientConfigOverrides {
             && self.keybindings.is_none()
             && self.key_repeat_delay.is_none()
             && self.key_repeat_frequency.is_none()
-    }
-
-    fn has_unsupported_frame_limiter_fields(&self) -> bool {
-        #[cfg(windows)]
-        {
-            false
-        }
-        #[cfg(target_os = "linux")]
-        {
-            self.frame_limiter_disable_vsync.is_some()
-                || self.frame_limiter_auto_virtual_framegen.is_some()
-                || self.rtss_frame_limit_type.is_some()
-        }
-        #[cfg(target_os = "macos")]
-        {
-            self.frame_limiter_disable_vsync.is_some()
-                || self.frame_limiter_auto_virtual_framegen.is_some()
-                || self.rtss_frame_limit_type.is_some()
-        }
-        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-        {
-            self.frame_limiter_disable_vsync.is_some()
-                || self.frame_limiter_auto_virtual_framegen.is_some()
-                || self.rtss_frame_limit_type.is_some()
-        }
     }
 }
 
@@ -824,37 +766,6 @@ fn valid_manual_refresh_rate(value: &str) -> bool {
     let reduced_denominator = denominator / left;
     reduced_denominator <= u32::MAX as u128
         && (u128::from(integer) * reduced_denominator + fraction / left) <= u32::MAX as u128
-}
-
-fn valid_frame_limiter_fps_limit(fps: f64) -> bool {
-    if !fps.is_finite() || !(0.0..=MAX_FRAME_LIMITER_FPS).contains(&fps) {
-        return false;
-    }
-
-    let millihz = fps * 1_000.0;
-    (millihz - millihz.round()).abs() <= 0.000_001
-}
-
-fn valid_frame_limiter_provider(provider: &str) -> bool {
-    #[cfg(windows)]
-    {
-        matches!(provider, "auto" | "rtss" | "nvidia-control-panel" | "none")
-    }
-    #[cfg(target_os = "linux")]
-    {
-        matches!(
-            provider,
-            "auto" | "mangohud" | "proton" | "mangohud-proton" | "none"
-        )
-    }
-    #[cfg(target_os = "macos")]
-    {
-        provider == "auto"
-    }
-    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-    {
-        provider == "auto"
-    }
 }
 
 fn valid_gamepad_profile(profile: &str) -> bool {
@@ -1255,231 +1166,6 @@ mod tests {
             if let Ok(overrides) = serde_json::from_value::<ClientConfigOverrides>(invalid) {
                 assert!(overrides.validate().is_err());
             }
-        }
-    }
-
-    #[test]
-    fn client_frame_limiter_overrides_preserve_sparse_values_and_update_validation() {
-        let inherited = ClientConfigOverrides::default();
-        assert!(inherited.is_empty());
-        assert_eq!(inherited.frame_limiter_fps_limit, None);
-        assert_eq!(inherited.frame_limiter_enable, None);
-        assert_eq!(inherited.frame_limiter_provider, None);
-        assert_eq!(serde_json::to_value(&inherited).unwrap(), json!({}));
-
-        let null_values: ClientConfigOverrides = serde_json::from_value(json!({
-            "frame_limiter_fps_limit":null,
-            "frame_limiter_enable":null,
-            "frame_limiter_provider":null,
-            "frame_limiter_disable_vsync":null,
-            "frame_limiter_auto_virtual_framegen":null,
-            "rtss_frame_limit_type":null,
-        }))
-        .unwrap();
-        assert!(null_values.is_empty());
-        assert_eq!(serde_json::to_value(null_values).unwrap(), json!({}));
-
-        for one_override in [
-            json!({"frame_limiter_fps_limit":0.0}),
-            json!({"frame_limiter_enable":false}),
-            json!({"frame_limiter_provider":"auto"}),
-            json!({"frame_limiter_disable_vsync":false}),
-            json!({"frame_limiter_auto_virtual_framegen":"enabled"}),
-            json!({"rtss_frame_limit_type":"async"}),
-        ] {
-            let override_value: ClientConfigOverrides =
-                serde_json::from_value(one_override.clone()).unwrap();
-            assert!(!override_value.is_empty());
-            assert_eq!(serde_json::to_value(override_value).unwrap(), one_override);
-        }
-
-        let override_json = json!({
-            "frame_limiter_fps_limit":0.0,
-            "frame_limiter_enable":false,
-            "frame_limiter_provider":"auto"
-        });
-        #[cfg(windows)]
-        let override_json = {
-            let mut override_json = override_json;
-            override_json["frame_limiter_disable_vsync"] = json!(false);
-            override_json["frame_limiter_auto_virtual_framegen"] = json!("enabled");
-            override_json["rtss_frame_limit_type"] = json!("async");
-            override_json
-        };
-
-        let selected: ClientConfigOverrides =
-            serde_json::from_value(override_json.clone()).unwrap();
-        selected.validate().unwrap();
-        assert!(!selected.is_empty());
-        assert_eq!(selected.frame_limiter_fps_limit, Some(0.0));
-        assert_eq!(selected.frame_limiter_enable, Some(false));
-        assert_eq!(selected.frame_limiter_provider.as_deref(), Some("auto"));
-        assert_eq!(serde_json::to_value(&selected).unwrap(), override_json);
-
-        let operation: Operation = serde_json::from_value(json!({
-            "action":"update_client_config_overrides",
-            "certificate_id":"ab".repeat(32),
-            "config_overrides":serde_json::to_value(&selected).unwrap(),
-            "expected_revision":7
-        }))
-        .unwrap();
-        operation.validate().unwrap();
-    }
-
-    #[test]
-    fn legacy_client_records_load_without_frame_limiter_fields() {
-        let legacy_record = json!({
-            "certificate_id":"ab".repeat(32),
-            "client_id":"legacy-client",
-            "name":"Legacy client",
-            "certificate_pem":"legacy certificate",
-            "paired_at":12,
-            "config_overrides":{"fec_percentage":73,"controller":false}
-        });
-        let legacy: Client = serde_json::from_value(legacy_record.clone()).unwrap();
-        assert_eq!(legacy.config_overrides.fec_percentage, Some(73));
-        assert_eq!(legacy.config_overrides.frame_limiter_fps_limit, None);
-        assert_eq!(legacy.config_overrides.frame_limiter_provider, None);
-        assert_eq!(serde_json::to_value(&legacy).unwrap(), legacy_record);
-
-        let mut no_overrides = legacy_record;
-        assert!(
-            no_overrides
-                .as_object_mut()
-                .unwrap()
-                .remove("config_overrides")
-                .is_some()
-        );
-        let legacy: Client = serde_json::from_value(no_overrides.clone()).unwrap();
-        assert!(legacy.config_overrides.is_empty());
-        assert_eq!(serde_json::to_value(legacy).unwrap(), no_overrides);
-    }
-
-    #[test]
-    fn client_frame_limiter_fps_is_decimal_hz_with_exact_millihertz_precision() {
-        for fps in [0.0, 59.94, 143.997, MAX_FRAME_LIMITER_FPS] {
-            let overrides: ClientConfigOverrides = serde_json::from_value(json!({
-                "frame_limiter_fps_limit":fps
-            }))
-            .unwrap();
-            overrides.validate().unwrap();
-            assert_eq!(
-                serde_json::to_value(&overrides).unwrap()["frame_limiter_fps_limit"],
-                fps
-            );
-        }
-
-        let boundary = ClientConfigOverrides {
-            frame_limiter_fps_limit: Some(MAX_FRAME_LIMITER_FPS),
-            ..ClientConfigOverrides::default()
-        };
-        boundary.validate().unwrap();
-
-        let above_boundary = ClientConfigOverrides {
-            frame_limiter_fps_limit: Some(MAX_FRAME_LIMITER_FPS + 0.001),
-            ..ClientConfigOverrides::default()
-        };
-        assert_eq!(above_boundary.validate(), Err("invalid_config_overrides"));
-        for fps in [-0.001, 1000.001, 59.9999] {
-            let overrides: ClientConfigOverrides = serde_json::from_value(json!({
-                "frame_limiter_fps_limit":fps
-            }))
-            .unwrap();
-            assert_eq!(overrides.validate(), Err("invalid_config_overrides"));
-        }
-
-        assert!(
-            serde_json::from_value::<ClientConfigOverrides>(json!({
-                "frame_limiter_fps_limit":"60"
-            }))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn client_frame_limiter_provider_enums_and_platform_fields_are_validated() {
-        #[cfg(windows)]
-        let (providers, invalid_provider): (&[&str], &str) = (
-            &["auto", "rtss", "nvidia-control-panel", "none"],
-            "mangohud",
-        );
-        #[cfg(target_os = "linux")]
-        let (providers, invalid_provider): (&[&str], &str) = (
-            &["auto", "mangohud", "proton", "mangohud-proton", "none"],
-            "rtss",
-        );
-        #[cfg(target_os = "macos")]
-        let (providers, invalid_provider): (&[&str], &str) = (&["auto"], "rtss");
-        #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-        let (providers, invalid_provider): (&[&str], &str) = (&["auto"], "rtss");
-
-        for provider in providers {
-            let overrides = ClientConfigOverrides {
-                frame_limiter_provider: Some((*provider).into()),
-                ..ClientConfigOverrides::default()
-            };
-            overrides.validate().unwrap();
-        }
-        for provider in [invalid_provider, "invalid-provider"] {
-            let overrides = ClientConfigOverrides {
-                frame_limiter_provider: Some(provider.into()),
-                ..ClientConfigOverrides::default()
-            };
-            assert_eq!(overrides.validate(), Err("invalid_config_overrides"));
-        }
-
-        #[cfg(windows)]
-        {
-            for mode in ["enabled", "vrr", "legacy", "disabled"] {
-                ClientConfigOverrides {
-                    frame_limiter_auto_virtual_framegen: Some(mode.into()),
-                    ..ClientConfigOverrides::default()
-                }
-                .validate()
-                .unwrap();
-            }
-            for mode in [
-                "async",
-                "front edge sync",
-                "back edge sync",
-                "nvidia reflex",
-            ] {
-                ClientConfigOverrides {
-                    rtss_frame_limit_type: Some(mode.into()),
-                    ..ClientConfigOverrides::default()
-                }
-                .validate()
-                .unwrap();
-            }
-            assert!(
-                ClientConfigOverrides {
-                    frame_limiter_auto_virtual_framegen: Some("invalid".into()),
-                    ..ClientConfigOverrides::default()
-                }
-                .validate()
-                .is_err()
-            );
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            assert!(
-                ClientConfigOverrides {
-                    frame_limiter_disable_vsync: Some(false),
-                    ..ClientConfigOverrides::default()
-                }
-                .validate()
-                .is_err()
-            );
-        }
-
-        for invalid in [
-            json!({"frame_limiter_enable":"false"}),
-            json!({"frame_limiter_provider":false}),
-            json!({"rtss_frame_limit_type":true}),
-            json!({"frame_limiter_enable":0}),
-        ] {
-            assert!(serde_json::from_value::<ClientConfigOverrides>(invalid).is_err());
         }
     }
 
@@ -1892,5 +1578,24 @@ mod keybindings_override_tests {
             );
         }
         assert!(serde_json::from_value::<ClientConfigOverrides>(Value::Null).is_err());
+    }
+}
+
+#[cfg(test)]
+mod retained_option_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn provider_options_round_trip_without_consumer_policy() {
+        let raw = json!({"vendor_option":{"enabled":false,"rate":0,"optional":null},
+            "frame_limiter_enable":false,"frame_limiter_fps_limit":0});
+        let options: ClientConfigOverrides = serde_json::from_value(raw.clone()).unwrap();
+        options.validate().unwrap();
+        assert!(!options.is_empty());
+        assert_eq!(serde_json::to_value(options).unwrap(), raw);
+        let oversized = json!({"vendor_option":"x".repeat(65_536)});
+        let options: ClientConfigOverrides = serde_json::from_value(oversized).unwrap();
+        assert!(options.validate().is_err());
     }
 }

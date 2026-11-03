@@ -6,6 +6,14 @@
 //! resources when completion or cleanup is uncertain. Responses, cancellation,
 //! recovery, and capability discovery still require a shared provider adapter;
 //! this request type alone does not establish full substitutability.
+//!
+//! A Linux provider may transfer a released final reference into a durable
+//! provider-owned recovery reservation, which may remain connected as a desktop
+//! anchor. Identity-specific status then reports
+//! `parked: true`, `reference_owned: false` and the matching identity and
+//! connector in `parked_outputs`; an idempotent remove reports `parked: true`
+//! and `removed: false`. This proves reference release, not physical removal
+//! or successful restoration. Consumers must preserve that distinction.
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub const SERVICE: &str = "amaterasu.virtual-display/1";

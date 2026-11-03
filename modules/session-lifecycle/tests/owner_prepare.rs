@@ -161,7 +161,7 @@ fn owner_configuration() -> Value {
     let method = |name| json!({"service":"nonary.virtual-screen/2","method":name,"interface_major":2,"interface_minor":0,"schema_revision":1});
     let mut configuration = json!({"principals":{
         COORDINATOR:{"provide":[LIFECYCLE],"call":["nonary.virtual-screen/2",LIFECYCLE,"amaterasu.state/1","amaterasu.virtual-display/1"]},
-        SCREEN:{"provide":["nonary.virtual-screen/2"],"call":[LIFECYCLE,"amaterasu.state/1","amaterasu.virtual-display/1"]},
+        SCREEN:{"provide":["nonary.virtual-screen/2"],"call":[LIFECYCLE,"amaterasu.state/1","amaterasu.virtual-display/1","amaterasu.host-state-context/1"]},
         "transport":{"call":[LIFECYCLE]}, "capture":{"call":[LIFECYCLE]},
         "amaterasu.extension-registry":{"call":["nonary.virtual-screen/2"]},
         "amaterasu.extension-actions":{"call":["nonary.virtual-screen/2"]},
@@ -222,6 +222,9 @@ struct Fixture {
     domain_revision: u64,
     borrow_sequence: u32,
     mode: (u64, u64, u64),
+    park_final: bool,
+    parked_identity: Option<String>,
+    reused_parked: bool,
 }
 impl Fixture {
     fn new() -> Self {
@@ -235,6 +238,7 @@ impl Fixture {
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut configuration = owner_configuration();
         configuration["settings"][COORDINATOR]["journal_path"] = json!(root.join("journal.json"));
+        configuration["host_context"] = json!({"schema":1,"state_root":root});
         let config = serde_json::from_value(configuration).unwrap();
         let broker = Rc::new(RefCell::new(Broker::new(config).unwrap()));
         for (caller, service) in [
@@ -274,6 +278,9 @@ impl Fixture {
             domain_revision: 1,
             borrow_sequence: 0,
             mode: (1920, 1080, 60000),
+            park_final: false,
+            parked_identity: None,
+            reused_parked: false,
         }
     }
     fn tick(&mut self) {
@@ -312,6 +319,44 @@ impl Fixture {
     fn state(&mut self, caller: &str, p: &Value) -> Value {
         let store = self.stores.entry(caller.to_owned()).or_default();
         match p["action"].as_str().unwrap() {
+            "snapshot" => {
+                let cursor = p.get("cursor").filter(|value| !value.is_null());
+                if cursor.is_some_and(|cursor| cursor["revision"] != store.revision) {
+                    return json!({"ok":false,"error":{"code":"revision_conflict"},"revision":store.revision});
+                }
+                let after = cursor.and_then(|cursor| cursor["after"].as_str());
+                let limit = p["limit"].as_u64().unwrap_or(128) as usize;
+                let mut remaining = store
+                    .values
+                    .iter()
+                    .filter(|(key, _)| after.is_none_or(|after| key.as_str() > after))
+                    .peekable();
+                let mut values = BTreeMap::new();
+                let mut result =
+                    json!({"ok":true,"revision":store.revision,"values":values,"next_cursor":null});
+                while let Some((key, value)) = remaining.next() {
+                    values.insert(key.clone(), value.clone());
+                    let next = remaining
+                        .peek()
+                        .map(|_| json!({"revision":store.revision,"after":key}));
+                    let candidate = json!({"ok":true,"revision":store.revision,"values":values,"next_cursor":next});
+                    if serde_json::to_vec(&candidate).unwrap().len() > 16_384 {
+                        assert!(values.len() > 1);
+                        break;
+                    }
+                    result = candidate;
+                    if values.len() == limit {
+                        break;
+                    }
+                }
+                result
+            }
+            "delete" => {
+                assert_eq!(p["expected_revision"], store.revision);
+                let deleted = store.values.remove(p["key"].as_str().unwrap()).is_some();
+                store.revision += 1;
+                json!({"ok":true,"revision":store.revision,"deleted":deleted})
+            }
             "get" => {
                 let value = store.values.get(p["key"].as_str().unwrap());
                 json!({"ok":true,"revision":store.revision,"found":value.is_some(),"value":value})
@@ -372,9 +417,18 @@ impl Fixture {
                     || json!([]),
                     |call| json!([{"reference_owned":reference_owned.unwrap_or(false),"specification":{"identity":call["identity"],"width":self.mode.0,"height":self.mode.1,"refresh_millihz":self.mode.2,"name":"Amaterasu","hdr_enabled":false},"state":"ready","output":"Virtual-1","error":null,"virtual_display_layout":"extended","dd_virtual_display_scale":0,"capture_output":"kwin:Virtual-1","ready":{"device_path":"Virtual-1","active":true}}]),
                 );
-                json!({"ok":true,"enabled":true,"native_supported":true,"driver":"libvirtualdisplay","ownership_authority":"unix_uid_broker","recovery_ready":true,"reference_owned":reference_owned,"monitors":monitors,"mutation_domain":domain(self.domain_revision,self.borrows.len()),"mode_only_preservation":"kscreen-strict-v1","settings":{"virtual_display_layout":"extended","dd_virtual_display_scale":0}})
+                let parked = identity.is_some_and(|id| self.parked_identity.as_deref() == Some(id));
+                let parked_outputs = self
+                    .parked_identity
+                    .as_ref()
+                    .map(|id| json!([{"identity":id,"output":"Virtual-1"}]))
+                    .unwrap_or(json!([]));
+                json!({"ok":true,"enabled":true,"native_supported":true,"driver":"libvirtualdisplay","ownership_authority":"unix_uid_broker","recovery_ready":true,"reference_owned":reference_owned,"monitors":monitors,"parked":parked,"parked_outputs":parked_outputs,"mutation_domain":domain(self.domain_revision,self.borrows.len()),"mode_only_preservation":"kscreen-strict-v1","settings":{"virtual_display_layout":"extended","dd_virtual_display_scale":0}})
             }
             "create" => {
+                if self.parked_identity.take().is_some() {
+                    self.reused_parked = true;
+                }
                 assert!(
                     self.collections
                         .iter()
@@ -429,6 +483,11 @@ impl Fixture {
                     .references
                     .values()
                     .any(|id| id == p["identity"].as_str().unwrap());
+                if !present && self.park_final {
+                    self.parked_identity = p["identity"].as_str().map(str::to_owned);
+                    self.domain_revision += 1;
+                    return json!({"ok":true,"removed":false,"monitor":{"specification":{"identity":p["identity"]},"state":"removing"},"reference_owned":false});
+                }
                 json!({"ok":true,"removed":!present,"identity":p["identity"],"reference_released":true,"reference_owned":false})
             }
             action => panic!("unexpected virtual action {action}: {p}"),
@@ -609,7 +668,24 @@ fn real_owner_finalizes_stream_and_validates_capture_binding() {
 #[test]
 #[ignore = "requires a cleanup-capable owner and lifecycle with stream/session release support"]
 fn real_owner_releases_stream_then_session_after_capture_retirement() {
+    run_owner_release_and_relaunch(false, true);
+}
+
+#[test]
+#[ignore = "requires matching virtual-screen and lifecycle plugins and approved configuration"]
+fn real_owner_parks_final_display_and_prepares_a_new_stream() {
+    run_owner_release_and_relaunch(true, true);
+}
+
+#[test]
+#[ignore = "requires matching virtual-screen and lifecycle plugins and approved configuration"]
+fn failed_capture_start_parks_display_and_allows_another_stream() {
+    run_owner_release_and_relaunch(true, false);
+}
+
+fn run_owner_release_and_relaunch(park_final: bool, capture_started: bool) {
     let mut f = Fixture::new();
+    f.park_final = park_final;
     let video = json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false});
     let pending = f.call(json!({"operation":"prepare","operation_id":"owner-session","requested_video":video,"application_ref":{"kind":"desktop"}}));
     assert_eq!(pending["status"], "pending", "{pending}");
@@ -636,36 +712,38 @@ fn real_owner_releases_stream_then_session_after_capture_retirement() {
         "finalize not dispatched"
     );
     drop(trace);
-    let observed = json!({"version":1,"protocol":"wayland-wl-output","compositor_id":"b".repeat(64),"registry_global":4,"output_name":"Virtual-1","width":1920,"height":1080,"refresh_millihz":60000});
-    let ack = f.call_as("capture", json!({"operation":"ack_binding","operation_id":"capture-ack","target":target,"consumer":"capture","plan_revision":candidate["plan_revision"],"candidate":candidate,"observed_capture":observed}));
-    assert_eq!(ack["status"], "pending", "{ack}");
-    let mut outcome = Value::Null;
-    for _ in 0..500 {
-        outcome = f.call_as(
-            "capture",
-            json!({"operation":"lookup","operation_id":"capture-ack"}),
-        );
-        if outcome["status"] != "pending" {
-            break;
+    if capture_started {
+        let observed = json!({"version":1,"protocol":"wayland-wl-output","compositor_id":"b".repeat(64),"registry_global":4,"output_name":"Virtual-1","width":1920,"height":1080,"refresh_millihz":60000});
+        let ack = f.call_as("capture", json!({"operation":"ack_binding","operation_id":"capture-ack","target":target,"consumer":"capture","plan_revision":candidate["plan_revision"],"candidate":candidate,"observed_capture":observed}));
+        assert_eq!(ack["status"], "pending", "{ack}");
+        let mut outcome = Value::Null;
+        for _ in 0..500 {
+            outcome = f.call_as(
+                "capture",
+                json!({"operation":"lookup","operation_id":"capture-ack"}),
+            );
+            if outcome["status"] != "pending" {
+                break;
+            }
         }
+        assert_eq!(
+            outcome["status"],
+            "succeeded",
+            "{outcome}; trace={:?}",
+            f.trace.borrow()
+        );
+        assert!(
+            f.trace
+                .borrow()
+                .iter()
+                .any(|event| event["principal"] == COORDINATOR
+                    && event["command"]["method"] == "binding_validate"),
+            "binding validator not dispatched"
+        );
+        let started =
+            f.call(json!({"operation":"start_stream","operation_id":"start","target":target}));
+        assert_eq!(started["status"], "succeeded", "{started}");
     }
-    assert_eq!(
-        outcome["status"],
-        "succeeded",
-        "{outcome}; trace={:?}",
-        f.trace.borrow()
-    );
-    assert!(
-        f.trace
-            .borrow()
-            .iter()
-            .any(|event| event["principal"] == COORDINATOR
-                && event["command"]["method"] == "binding_validate"),
-        "binding validator not dispatched"
-    );
-    let started =
-        f.call(json!({"operation":"start_stream","operation_id":"start","target":target}));
-    assert_eq!(started["status"], "succeeded", "{started}");
     let end =
         f.call(json!({"operation":"end_session","operation_id":"end","target":session["target"]}));
     assert_eq!(end["status"], "pending", "{end}");
@@ -706,4 +784,44 @@ fn real_owner_releases_stream_then_session_after_capture_retirement() {
         .position(|event| release(&event, "session.release"))
         .expect("session release");
     assert!(stream_release < session_release, "{trace:?}");
+    drop(trace);
+    if park_final {
+        assert!(f.parked_identity.is_some(), "final output was not parked");
+        let pending = f.call(json!({"operation":"prepare","operation_id":"next-session","requested_video":video,"application_ref":{"kind":"desktop"}}));
+        assert_eq!(pending["status"], "pending", "{pending}");
+        let session = f.settled("next-session");
+        assert_eq!(
+            session["status"], "succeeded",
+            "{session}; native={:?}",
+            f.native_calls
+        );
+        let pending = f.call(json!({"operation":"prepare_stream","operation_id":"next-stream","target":session["target"],"intent":"initial","requested_video":video,"consumer_requirements":["capture"]}));
+        assert_eq!(pending["status"], "pending", "{pending}");
+        let stream = f.settled("next-stream");
+        assert_eq!(
+            stream["status"], "succeeded",
+            "{stream}; native={:?}",
+            f.native_calls
+        );
+        assert!(f.reused_parked, "new session did not reuse parked output");
+        let target = stream["target"].clone();
+        let candidate = stream["candidate"].clone();
+        let observed = json!({"version":1,"protocol":"wayland-wl-output","compositor_id":"b".repeat(64),"registry_global":4,"output_name":"Virtual-1","width":1920,"height":1080,"refresh_millihz":60000});
+        let ack = f.call_as("capture", json!({"operation":"ack_binding","operation_id":"next-capture-ack","target":target,"consumer":"capture","plan_revision":candidate["plan_revision"],"candidate":candidate,"observed_capture":observed}));
+        assert_eq!(ack["status"], "pending", "{ack}");
+        let mut outcome = Value::Null;
+        for _ in 0..500 {
+            outcome = f.call_as(
+                "capture",
+                json!({"operation":"lookup","operation_id":"next-capture-ack"}),
+            );
+            if outcome["status"] != "pending" {
+                break;
+            }
+        }
+        assert_eq!(outcome["status"], "succeeded", "{outcome}");
+        let started =
+            f.call(json!({"operation":"start_stream","operation_id":"next-start","target":target}));
+        assert_eq!(started["status"], "succeeded", "{started}");
+    }
 }

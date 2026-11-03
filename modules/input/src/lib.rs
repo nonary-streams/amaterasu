@@ -223,6 +223,9 @@ impl ManagedModule for InputModule {
         })
     }
     fn tick(&mut self) -> ModuleResult<()> {
+        let _priority = amaterasu_module_sdk::threading::ScopedThreadPriority::best_effort(
+            amaterasu_module_sdk::threading::ThreadPriority::Critical,
+        );
         self.controller.expire(Instant::now());
         let runtime = &self.runtime;
         self.product_settings

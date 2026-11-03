@@ -27,6 +27,12 @@ pub(crate) struct ProfileValues {
     pub sync_limiter: i32,
 }
 
+pub(crate) const DEFAULT_PROFILE: ProfileValues = ProfileValues {
+    frame_limit: 0,
+    frame_limit_denominator: 1,
+    sync_limiter: 0,
+};
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct ProviderSnapshot {
     pub profile: ProfileValues,
@@ -54,17 +60,27 @@ pub(crate) struct LeaseRecord {
     pub before: ProviderSnapshot,
     pub applied: ProviderSnapshot,
     #[serde(default)]
+    pub manage_limiter_enable: bool,
+    /// A default profile created by this intent remains after cleanup, as an
+    /// initialized RTSS configuration; cleanup removes its temporary cap.
+    #[serde(default)]
+    pub initialized_profile: bool,
+    #[serde(default)]
     pub phase: LeasePhase,
 }
 
-struct LeaseApplyRequest<'a> {
-    owner: &'a str,
-    session_id: &'a str,
-    executable_path: &'a str,
-    rtss_install_path: &'a str,
-    profile: &'a str,
-    request_fingerprint: &'a str,
-    desired_profile: ProfileValues,
+pub(crate) struct LeaseApplyRequest<'a> {
+    pub owner: &'a str,
+    pub session_id: &'a str,
+    pub executable_path: &'a str,
+    pub rtss_install_path: &'a str,
+    pub profile: &'a str,
+    pub request_fingerprint: &'a str,
+    pub desired_profile: ProfileValues,
+    /// Global lifecycle policies may enable RTSS while holding the lease.
+    /// Compatibility requests for an executable do not change this global bit.
+    pub enable_limiter: bool,
+    pub initialize_profile: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,12 +104,17 @@ pub(crate) enum ProviderError {
         observed: ProfileValues,
     },
     VerifyFailed(&'static str),
+    /// Create-new lost a race before changing any bytes.
+    #[cfg(any(windows, test))]
+    CreationConflict(&'static str),
 }
 
 impl ProviderError {
     pub(crate) fn diagnostic(&self) -> &'static str {
         match self {
             Self::Unavailable(code) | Self::VerifyFailed(code) => code,
+            #[cfg(any(windows, test))]
+            Self::CreationConflict(code) => code,
             #[cfg(any(windows, test))]
             Self::ReadFailed(code) => code,
             #[cfg(any(windows, test))]
@@ -106,9 +127,31 @@ impl ProviderError {
 /// so the lease manager can preserve unrelated global RTSS flags.
 pub(crate) trait FrameLimitProvider {
     fn select_installation(&mut self, path: &str) -> Result<String, ProviderError>;
+    /// Effectful preparation is separate from read-only provider probes.
+    fn prepare_installation(&mut self, path: &str) -> Result<String, ProviderError> {
+        self.select_installation(path)
+    }
+    #[cfg(any(windows, test))]
+    fn retire_idle(&mut self) -> Result<(), ProviderError> {
+        Ok(())
+    }
     fn profile_exists(&mut self, profile: &str) -> Result<bool, ProviderError>;
     fn read_profile(&mut self, profile: &str) -> Result<ProfileValues, ProviderError>;
     fn ensure_safe_writes_supported(&mut self) -> Result<(), ProviderError>;
+    fn missing_profile_baseline(&mut self, _profile: &str) -> Result<ProfileValues, ProviderError> {
+        Err(ProviderError::Unavailable(
+            "rtss_profile_missing_safe_create_unsupported",
+        ))
+    }
+    fn create_profile_verified(
+        &mut self,
+        _profile: &str,
+        _values: ProfileValues,
+    ) -> Result<(), ProviderError> {
+        Err(ProviderError::Unavailable(
+            "rtss_profile_missing_safe_create_unsupported",
+        ))
+    }
     /// Writes only when the current values match `expected`. `ProfileMismatch`
     /// includes the exact values observed under the provider's write guard.
     fn write_profile_verified(
@@ -118,12 +161,35 @@ pub(crate) trait FrameLimitProvider {
         values: ProfileValues,
     ) -> Result<(), ProviderError>;
     fn limiter_disabled(&mut self) -> Result<bool, ProviderError>;
+    fn ensure_limiter_flag_writes_supported(&mut self) -> Result<(), ProviderError> {
+        Err(ProviderError::Unavailable(
+            "rtss_limiter_flag_write_unsupported",
+        ))
+    }
+    fn set_limiter_disabled_verified(
+        &mut self,
+        expected: bool,
+        desired: bool,
+    ) -> Result<(), ProviderError> {
+        if self.limiter_disabled()? != expected {
+            return Err(ProviderError::VerifyFailed("rtss_limiter_flag_changed"));
+        }
+        if expected == desired {
+            Ok(())
+        } else {
+            Err(ProviderError::Unavailable(
+                "rtss_limiter_flag_write_unsupported",
+            ))
+        }
+    }
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Journal {
     format_version: u32,
+    #[serde(default = "initial_revision")]
+    revision: u64,
     leases: Vec<LeaseRecord>,
     #[serde(default)]
     completed: Vec<CompletedLease>,
@@ -133,6 +199,7 @@ impl Default for Journal {
     fn default() -> Self {
         Self {
             format_version: JOURNAL_FORMAT,
+            revision: initial_revision(),
             leases: Vec::new(),
             completed: Vec::new(),
         }
@@ -151,6 +218,11 @@ pub(crate) struct LeaseManager<P> {
     leases: BTreeMap<String, LeaseRecord>,
     completed: BTreeMap<String, CompletedLease>,
     journal_path: Option<PathBuf>,
+    revision: u64,
+}
+
+fn initial_revision() -> u64 {
+    1
 }
 
 impl<P: FrameLimitProvider> LeaseManager<P> {
@@ -161,6 +233,7 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
             leases: BTreeMap::new(),
             completed: BTreeMap::new(),
             journal_path: None,
+            revision: initial_revision(),
         }
     }
 
@@ -181,10 +254,11 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
             leases,
             completed,
             journal_path: Some(path),
+            revision: journal.revision,
         })
     }
 
-    fn apply(&mut self, request: LeaseApplyRequest<'_>) -> ApplyOutcome {
+    pub(crate) fn apply(&mut self, request: LeaseApplyRequest<'_>) -> ApplyOutcome {
         let LeaseApplyRequest {
             owner,
             session_id,
@@ -193,6 +267,8 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
             profile,
             request_fingerprint,
             desired_profile,
+            enable_limiter,
+            initialize_profile,
         } = request;
         if let Some(existing) = self
             .leases
@@ -204,6 +280,7 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
                 && existing.profile == profile
                 && existing.request_fingerprint == request_fingerprint
                 && existing.applied.profile == desired_profile
+                && existing.manage_limiter_enable == enable_limiter
                 && existing.applied.profile_exists
             {
                 return match self.confirmed_active_state(&existing) {
@@ -215,7 +292,7 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
             return ApplyOutcome::Conflict("session_already_has_a_different_lease");
         }
 
-        let normalized_install_path = match self.provider.select_installation(rtss_install_path) {
+        let normalized_install_path = match self.provider.prepare_installation(rtss_install_path) {
             Ok(path) => path,
             Err(error) => return ApplyOutcome::Unavailable(error.diagnostic()),
         };
@@ -233,10 +310,15 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
             Ok(exists) => exists,
             Err(error) => return ApplyOutcome::Unavailable(error.diagnostic()),
         };
-        if !before_exists {
-            return ApplyOutcome::Unavailable("rtss_profile_missing_safe_create_unsupported");
-        }
-        let before_profile = match self.provider.read_profile(profile) {
+        let before_profile = match if before_exists {
+            self.provider.read_profile(profile)
+        } else if initialize_profile {
+            self.provider.missing_profile_baseline(profile)
+        } else {
+            Err(ProviderError::Unavailable(
+                "rtss_profile_missing_safe_create_unsupported",
+            ))
+        } {
             Ok(values) => values,
             Err(error) => return ApplyOutcome::Unavailable(error.diagnostic()),
         };
@@ -249,8 +331,12 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
             profile_exists: before_exists,
             limiter_disabled: before_disabled,
         };
-        if before_disabled {
+        if before_disabled && !enable_limiter {
             return ApplyOutcome::Unavailable("rtss_limiter_disabled_globally");
+        }
+        if before_disabled && let Err(error) = self.provider.ensure_limiter_flag_writes_supported()
+        {
+            return ApplyOutcome::Unavailable(error.diagnostic());
         }
         if let Err(error) = self.provider.ensure_safe_writes_supported() {
             return ApplyOutcome::Unavailable(error.diagnostic());
@@ -258,7 +344,11 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
         let applied = ProviderSnapshot {
             profile: desired_profile,
             profile_exists: true,
-            limiter_disabled: before_disabled,
+            limiter_disabled: if enable_limiter {
+                false
+            } else {
+                before_disabled
+            },
         };
 
         let mut record = LeaseRecord {
@@ -271,12 +361,28 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
             profile: profile.to_owned(),
             before,
             applied,
+            manage_limiter_enable: enable_limiter,
+            initialized_profile: !before_exists && initialize_profile,
             phase: LeasePhase::Pending,
         };
         self.leases.insert(record.lease_id.clone(), record.clone());
         if let Err(code) = self.persist() {
             self.leases.remove(&record.lease_id);
             return ApplyOutcome::Unavailable(code);
+        }
+
+        if record.initialized_profile
+            && let Err(error) = self
+                .provider
+                .create_profile_verified(profile, before_profile)
+        {
+            return match error {
+                #[cfg(any(windows, test))]
+                ProviderError::CreationConflict(code) => {
+                    self.discard_unmutated_pending_apply(record, code)
+                }
+                error => self.rollback_pending_apply(record, error.diagnostic()),
+            };
         }
 
         if let Err(error) =
@@ -290,6 +396,14 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
                 }
                 error => self.rollback_pending_apply(record, error.diagnostic()),
             };
+        }
+
+        if before.limiter_disabled != applied.limiter_disabled
+            && let Err(error) = self
+                .provider
+                .set_limiter_disabled_verified(before.limiter_disabled, applied.limiter_disabled)
+        {
+            return self.rollback_pending_apply(record, error.diagnostic());
         }
 
         match self.current_state(&record) {
@@ -413,6 +527,14 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
         self.provider.select_installation("").map(|_| ())
     }
 
+    #[cfg(any(windows, test))]
+    pub(crate) fn retire_provider_if_idle(&mut self) -> Result<(), ProviderError> {
+        if self.leases.is_empty() {
+            self.provider.retire_idle()?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn restore(
         &mut self,
         owner: &str,
@@ -452,6 +574,9 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
             return RestoreOutcome::NotFound;
         }
 
+        let previous_leases = self.leases.clone();
+        let previous_completed = self.completed.clone();
+
         let mut restored = Vec::new();
         for id in targets {
             let Some(lease) = self.leases.get(&id).cloned() else {
@@ -480,6 +605,10 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
             }
         }
         if let Err(code) = self.persist() {
+            // Native restoration may already have succeeded. Retain its exact
+            // ownership evidence until the durable journal also confirms it.
+            self.leases = previous_leases;
+            self.completed = previous_completed;
             return RestoreOutcome::Failed {
                 lease_id: restored.first().cloned().unwrap_or_default(),
                 code,
@@ -488,32 +617,28 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
         RestoreOutcome::Restored(restored)
     }
 
-    #[cfg(test)]
+    #[cfg(any(windows, test))]
     pub(crate) fn records(&self) -> Vec<LeaseRecord> {
         self.leases.values().cloned().collect()
     }
 
+    #[cfg(any(windows, test))]
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
     /// Reconciles the durable journal with RTSS before accepting new requests.
     /// Pending intents at their applied state become active. Intents still at
-    /// their before-state are finalized; any third state stays stale and is
-    /// never overwritten during recovery.
+    /// their before-state are finalized. A known partial profile/enable-flag
+    /// transaction returns to its before-state; unrelated state stays stale.
     pub(crate) fn recover(&mut self) -> Result<(), &'static str> {
         let leases: Vec<LeaseRecord> = self.leases.values().cloned().collect();
         let mut changed = false;
         for lease in leases {
             let current = self
                 .provider
-                .select_installation(&lease.rtss_install_path)
-                .and_then(|_| self.provider.read_profile(&lease.profile))
-                .and_then(|profile| {
-                    let exists = self.provider.profile_exists(&lease.profile)?;
-                    let disabled = self.provider.limiter_disabled()?;
-                    Ok(ProviderSnapshot {
-                        profile,
-                        profile_exists: exists,
-                        limiter_disabled: disabled,
-                    })
-                });
+                .prepare_installation(&lease.rtss_install_path)
+                .and_then(|_| self.read_provider_snapshot(&lease.profile));
             let Ok(current) = current else {
                 continue;
             };
@@ -532,11 +657,34 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
                 .snapshot_matches_applied(&lease, current)
                 .unwrap_or(false)
                 && lease.phase == LeasePhase::Pending
+                && (lease.manage_limiter_enable
+                    || lease.before.limiter_disabled == lease.applied.limiter_disabled)
                 && self.provider.ensure_safe_writes_supported().is_ok()
+                && (lease.before.limiter_disabled == lease.applied.limiter_disabled
+                    || self.provider.ensure_limiter_flag_writes_supported().is_ok())
             {
                 let mut active = lease;
                 active.phase = LeasePhase::Active;
                 self.leases.insert(active.lease_id.clone(), active);
+                changed = true;
+            } else if lease.phase == LeasePhase::Pending
+                && lease.manage_limiter_enable
+                && lease.before.limiter_disabled != lease.applied.limiter_disabled
+                && (self.snapshot_matches_before_profile(&lease, current)
+                    || self
+                        .snapshot_matches_applied_profile(&lease, current)
+                        .unwrap_or(false))
+                && self.restore_one(&lease).is_ok()
+            {
+                self.leases.remove(&lease.lease_id);
+                self.completed.insert(
+                    lease.lease_id.clone(),
+                    CompletedLease {
+                        lease_id: lease.lease_id,
+                        owner: lease.owner,
+                        session_id: lease.session_id,
+                    },
+                );
                 changed = true;
             }
         }
@@ -554,40 +702,43 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
     }
 
     fn confirmed_active_state(&mut self, lease: &LeaseRecord) -> Result<bool, ProviderError> {
-        if lease.phase == LeasePhase::Pending {
+        if lease.phase == LeasePhase::Pending
+            || (!lease.manage_limiter_enable
+                && lease.before.limiter_disabled != lease.applied.limiter_disabled)
+        {
             return Ok(false);
         }
         // A lease imported from an older journal may still match its applied
         // values even though this provider can no longer restore them safely.
         // Do not advertise that record as an active, retryable effect.
         self.provider.ensure_safe_writes_supported()?;
+        if lease.before.limiter_disabled != lease.applied.limiter_disabled {
+            self.provider.ensure_limiter_flag_writes_supported()?;
+        }
         self.current_state(lease)
     }
 
     fn restore_one(&mut self, lease: &LeaseRecord) -> Result<(), RestoreFailure> {
+        if !lease.manage_limiter_enable
+            && lease.before.limiter_disabled != lease.applied.limiter_disabled
+        {
+            return Err(RestoreFailure::Stale);
+        }
         self.provider
-            .select_installation(&lease.rtss_install_path)
+            .prepare_installation(&lease.rtss_install_path)
             .map_err(|error| RestoreFailure::Provider(error.diagnostic()))?;
         self.provider
             .ensure_safe_writes_supported()
             .map_err(|error| RestoreFailure::Provider(error.diagnostic()))?;
-        let current = self
-            .provider
-            .read_profile(&lease.profile)
+        if lease.before.limiter_disabled != lease.applied.limiter_disabled {
+            self.provider
+                .ensure_limiter_flag_writes_supported()
+                .map_err(|error| RestoreFailure::Provider(error.diagnostic()))?;
+        }
+        let current_profile = self
+            .read_provider_snapshot(&lease.profile)
             .map_err(|error| RestoreFailure::Provider(error.diagnostic()))?;
-        let profile_exists = self
-            .provider
-            .profile_exists(&lease.profile)
-            .map_err(|error| RestoreFailure::Provider(error.diagnostic()))?;
-        let disabled = self
-            .provider
-            .limiter_disabled()
-            .map_err(|error| RestoreFailure::Provider(error.diagnostic()))?;
-        let current_profile = ProviderSnapshot {
-            profile: current,
-            profile_exists,
-            limiter_disabled: disabled,
-        };
+        let disabled = current_profile.limiter_disabled;
         let profile_at_applied = self
             .snapshot_matches_applied_profile(lease, current_profile)
             .map_err(|error| RestoreFailure::Provider(error.diagnostic()))?;
@@ -602,7 +753,7 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
         }
 
         if profile_at_applied {
-            if !lease.before.profile_exists {
+            if !lease.before.profile_exists && !lease.initialized_profile {
                 return Err(RestoreFailure::Stale);
             }
             match self.provider.write_profile_verified(
@@ -622,10 +773,15 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
                 }
                 Err(error) => return Err(RestoreFailure::Provider(error.diagnostic())),
             }
-        } else if lease.before.profile_exists {
+        } else if current_profile.profile_exists {
             // Hooks can lag a direct file edit. Even when its snapshot already
             // equals the before state, confirm that state under the file guard.
             self.confirm_profile_at_before(lease)?;
+        }
+        if !flag_at_before {
+            self.provider
+                .set_limiter_disabled_verified(disabled, lease.before.limiter_disabled)
+                .map_err(|error| RestoreFailure::Provider(error.diagnostic()))?;
         }
         if !self
             .exactly_at_before(lease)
@@ -670,6 +826,7 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
             current.profile_exists && current.profile == lease.before.profile
         } else {
             !current.profile_exists
+                || (lease.initialized_profile && current.profile == lease.before.profile)
         }
     }
 
@@ -690,7 +847,8 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
         if !current.profile_exists || current.profile != lease.applied.profile {
             return Ok(false);
         }
-        Ok(lease.before.profile_exists && lease.applied.profile_exists)
+        Ok((lease.before.profile_exists || lease.initialized_profile)
+            && lease.applied.profile_exists)
     }
 
     fn rollback_unleased(&mut self, lease: &LeaseRecord) -> Result<(), ProviderError> {
@@ -700,33 +858,23 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
         if self.snapshot_matches_before(lease, current) {
             return Ok(());
         }
-        if !self.snapshot_matches_applied(lease, current)? {
-            return Err(ProviderError::VerifyFailed(
-                "provider_state_changed_before_rollback",
-            ));
-        }
-
-        if !lease.before.profile_exists {
-            return Err(ProviderError::VerifyFailed(
-                "provider_state_changed_before_rollback",
-            ));
-        }
-        self.provider.write_profile_verified(
-            &lease.profile,
-            lease.applied.profile,
-            lease.before.profile,
-        )?;
-        let after = self.read_provider_snapshot(&lease.profile)?;
-        if !self.snapshot_matches_before(lease, after) {
-            return Err(ProviderError::VerifyFailed("rollback_verification_failed"));
-        }
-        Ok(())
+        self.restore_one(lease).map_err(|error| match error {
+            RestoreFailure::Stale => {
+                ProviderError::VerifyFailed("provider_state_changed_before_rollback")
+            }
+            RestoreFailure::Provider(code) => ProviderError::VerifyFailed(code),
+        })
     }
 
     fn read_provider_snapshot(&mut self, profile: &str) -> Result<ProviderSnapshot, ProviderError> {
+        let exists = self.provider.profile_exists(profile)?;
         Ok(ProviderSnapshot {
-            profile: self.provider.read_profile(profile)?,
-            profile_exists: self.provider.profile_exists(profile)?,
+            profile: if exists {
+                self.provider.read_profile(profile)?
+            } else {
+                DEFAULT_PROFILE
+            },
+            profile_exists: exists,
             limiter_disabled: self.provider.limiter_disabled()?,
         })
     }
@@ -799,15 +947,21 @@ impl<P: FrameLimitProvider> LeaseManager<P> {
         ApplyOutcome::Unavailable(code)
     }
 
-    fn persist(&self) -> Result<(), &'static str> {
-        let Some(path) = &self.journal_path else {
-            return Ok(());
-        };
-        save_journal(
-            path,
-            self.leases.values().cloned().collect(),
-            self.completed.values().cloned().collect(),
-        )
+    fn persist(&mut self) -> Result<(), &'static str> {
+        let next = self
+            .revision
+            .checked_add(1)
+            .ok_or("lease_revision_exhausted")?;
+        if let Some(path) = &self.journal_path {
+            save_journal(
+                path,
+                next,
+                self.leases.values().cloned().collect(),
+                self.completed.values().cloned().collect(),
+            )?;
+        }
+        self.revision = next;
+        Ok(())
     }
 }
 
@@ -983,6 +1137,8 @@ fn handle_apply<P: FrameLimitProvider>(
         }
     };
     match manager.apply(LeaseApplyRequest {
+        enable_limiter: false,
+        initialize_profile: false,
         owner: caller,
         session_id: &request.session_id,
         executable_path: &request.executable_path,
@@ -1223,7 +1379,7 @@ fn current_platform() -> Platform {
     }
 }
 
-fn profile_name(executable_path: &str) -> Option<String> {
+pub(crate) fn profile_name(executable_path: &str) -> Option<String> {
     let name = executable_path.rsplit(['\\', '/']).next()?;
     if name.is_empty()
         || !name.ends_with(".exe")
@@ -1241,7 +1397,7 @@ fn exact_rtss_ratio(millihz: u32) -> (i32, i32) {
     ((millihz / divisor) as i32, (1000 / divisor) as i32)
 }
 
-fn desired_rtss_profile(
+pub(crate) fn desired_rtss_profile(
     source: FrameLimitSource,
     effective_limit_millihz: u32,
     sync_limiter: RtssFrameLimitType,
@@ -1363,7 +1519,7 @@ fn load_journal(path: &Path) -> Result<Journal, &'static str> {
         return Err("lease_journal_too_large");
     }
     let journal: Journal = serde_json::from_slice(&bytes).map_err(|_| "lease_journal_corrupt")?;
-    if journal.format_version != JOURNAL_FORMAT {
+    if journal.format_version != JOURNAL_FORMAT || journal.revision == 0 {
         return Err("lease_journal_version_unsupported");
     }
     let mut identifiers = BTreeMap::new();
@@ -1372,6 +1528,10 @@ fn load_journal(path: &Path) -> Result<Journal, &'static str> {
             || lease.owner.is_empty()
             || lease.session_id.is_empty()
             || lease.profile.is_empty()
+            || (lease.initialized_profile
+                && (lease.before.profile_exists
+                    || !lease.applied.profile_exists
+                    || lease.before.profile != DEFAULT_PROFILE))
             || identifiers.insert(lease.lease_id.as_str(), ()).is_some()
         {
             return Err("lease_journal_corrupt");
@@ -1380,8 +1540,14 @@ fn load_journal(path: &Path) -> Result<Journal, &'static str> {
     Ok(journal)
 }
 
+#[cfg(windows)]
+pub(crate) fn journal_has_effects(path: &Path) -> Result<bool, &'static str> {
+    Ok(!load_journal(path)?.leases.is_empty())
+}
+
 fn save_journal(
     path: &Path,
+    revision: u64,
     leases: Vec<LeaseRecord>,
     completed: Vec<CompletedLease>,
 ) -> Result<(), &'static str> {
@@ -1398,6 +1564,7 @@ fn save_journal(
     }
     let journal = Journal {
         format_version: JOURNAL_FORMAT,
+        revision,
         leases,
         completed: completed
             .into_iter()
@@ -1447,6 +1614,323 @@ mod tests {
         frame_limit_denominator: 1_000,
         sync_limiter: 2,
     };
+
+    fn global_provider() -> FakeProvider {
+        let mut provider = FakeProvider::new();
+        let global = crate::rtss::GLOBAL_PROFILE.to_owned();
+        provider.profiles.insert(global.clone(), START);
+        provider.profile_files.insert(global.clone(), START);
+        provider.existent_profiles.insert(global, true);
+        provider.limiter_disabled = true;
+        provider
+    }
+
+    fn apply_global(manager: &mut LeaseManager<FakeProvider>) -> ApplyOutcome {
+        manager.apply(LeaseApplyRequest {
+            enable_limiter: true,
+            initialize_profile: true,
+            owner: "global-owner",
+            session_id: "global-session",
+            executable_path: crate::rtss::GLOBAL_PROFILE,
+            rtss_install_path: r"C:\RTSS",
+            profile: crate::rtss::GLOBAL_PROFILE,
+            request_fingerprint: "global-request",
+            desired_profile: TARGET,
+        })
+    }
+
+    fn missing_global_provider() -> FakeProvider {
+        let mut provider = global_provider();
+        provider.profiles.remove(crate::rtss::GLOBAL_PROFILE);
+        provider.profile_files.remove(crate::rtss::GLOBAL_PROFILE);
+        provider
+            .existent_profiles
+            .insert(crate::rtss::GLOBAL_PROFILE.into(), false);
+        provider
+    }
+
+    #[test]
+    fn creation_is_journaled_and_cleanup_retains_the_initialized_default_profile() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-profile-create-{}-{}",
+            std::process::id(),
+            NEXT_LEASE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let journal = root.join("leases.json");
+        let mut provider = missing_global_provider();
+        provider.journal_path = Some(journal.clone());
+        let mut manager = LeaseManager::open(provider, journal.clone()).unwrap();
+        let ApplyOutcome::Applied(lease) = apply_global(&mut manager) else {
+            panic!("create failed");
+        };
+        assert!(lease.initialized_profile);
+        assert!(!lease.before.profile_exists);
+        assert_eq!(lease.before.profile, DEFAULT_PROFILE);
+        assert!(manager.provider.durable_creation_intent_seen);
+        assert_eq!(manager.provider.created_profiles, 1);
+        let provider = manager.provider.clone();
+        drop(manager);
+        let mut restarted = LeaseManager::open(provider, journal).unwrap();
+        restarted.recover().unwrap();
+        assert_eq!(
+            restarted.restore("global-owner", Some("global-session"), None),
+            RestoreOutcome::Restored(vec![lease.lease_id])
+        );
+        assert_eq!(
+            restarted.provider.profiles[crate::rtss::GLOBAL_PROFILE],
+            DEFAULT_PROFILE
+        );
+        assert!(restarted.provider.existent_profiles[crate::rtss::GLOBAL_PROFILE]);
+        assert!(restarted.provider.limiter_disabled);
+        drop(restarted);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_profile_initialization_proof_is_rejected_on_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-profile-proof-{}-{}",
+            std::process::id(),
+            NEXT_LEASE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let journal = root.join("leases.json");
+        let mut manager = LeaseManager::open(missing_global_provider(), journal.clone()).unwrap();
+        let ApplyOutcome::Applied(mut lease) = apply_global(&mut manager) else {
+            panic!("create failed");
+        };
+        lease.before.profile = TARGET;
+        save_journal(&journal, manager.revision(), vec![lease], vec![]).unwrap();
+        assert!(matches!(
+            LeaseManager::open(manager.provider.clone(), journal),
+            Err("lease_journal_corrupt")
+        ));
+        drop(manager);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn create_races_and_external_edits_never_overwrite_the_other_writer() {
+        let foreign = ProfileValues {
+            frame_limit: 77,
+            ..DEFAULT_PROFILE
+        };
+        let mut provider = missing_global_provider();
+        provider.race_before_create = Some(foreign);
+        let mut manager = LeaseManager::in_memory(provider);
+        assert_eq!(
+            apply_global(&mut manager),
+            ApplyOutcome::Unavailable("rtss_profile_already_exists")
+        );
+        assert_eq!(
+            manager.provider.profiles[crate::rtss::GLOBAL_PROFILE],
+            foreign
+        );
+        assert!(manager.provider.limiter_disabled);
+        assert!(manager.leases.is_empty());
+        assert_eq!(manager.provider.created_profiles, 0);
+        let mut manager = LeaseManager::in_memory(missing_global_provider());
+        let ApplyOutcome::Applied(lease) = apply_global(&mut manager) else {
+            panic!("create failed");
+        };
+        manager
+            .provider
+            .profiles
+            .insert(crate::rtss::GLOBAL_PROFILE.into(), foreign);
+        manager
+            .provider
+            .profile_files
+            .insert(crate::rtss::GLOBAL_PROFILE.into(), foreign);
+        assert_eq!(
+            manager.restore("global-owner", Some("global-session"), None),
+            RestoreOutcome::Stale(lease.lease_id)
+        );
+        assert_eq!(
+            manager.provider.profiles[crate::rtss::GLOBAL_PROFILE],
+            foreign
+        );
+        assert!(!manager.provider.limiter_disabled);
+    }
+
+    #[test]
+    fn abandoned_creation_recovers_a_default_profile_without_claiming_an_active_cap() {
+        let mut manager = LeaseManager::in_memory(missing_global_provider());
+        let ApplyOutcome::Applied(lease) = apply_global(&mut manager) else {
+            panic!("create failed");
+        };
+        manager.leases.get_mut(&lease.lease_id).unwrap().phase = LeasePhase::Pending;
+        manager
+            .provider
+            .profiles
+            .insert(crate::rtss::GLOBAL_PROFILE.into(), DEFAULT_PROFILE);
+        manager
+            .provider
+            .profile_files
+            .insert(crate::rtss::GLOBAL_PROFILE.into(), DEFAULT_PROFILE);
+        manager.provider.limiter_disabled = true;
+        manager.recover().unwrap();
+        assert!(manager.leases.is_empty());
+        assert_eq!(
+            manager.provider.profiles[crate::rtss::GLOBAL_PROFILE],
+            DEFAULT_PROFILE
+        );
+        assert!(manager.provider.limiter_disabled);
+    }
+
+    #[test]
+    fn global_enable_is_write_ahead_and_restores_the_original_flag_after_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-global-flag-{}-{}",
+            std::process::id(),
+            NEXT_LEASE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let journal = root.join("leases.json");
+        let mut provider = global_provider();
+        provider.journal_path = Some(journal.clone());
+        let mut first = LeaseManager::open(provider, journal.clone()).unwrap();
+        let ApplyOutcome::Applied(lease) = apply_global(&mut first) else {
+            panic!("global apply failed");
+        };
+        assert!(lease.before.limiter_disabled);
+        assert!(!lease.applied.limiter_disabled);
+        assert!(lease.manage_limiter_enable);
+        assert!(first.provider.durable_flag_intent_seen);
+        assert!(!first.provider.limiter_disabled);
+        let provider = first.provider.clone();
+        drop(first);
+        let mut restarted = LeaseManager::open(provider, journal).unwrap();
+        restarted.recover().unwrap();
+        assert_eq!(
+            restarted.restore("global-owner", Some("global-session"), None),
+            RestoreOutcome::Restored(vec![lease.lease_id])
+        );
+        assert_eq!(
+            restarted.provider.profiles[crate::rtss::GLOBAL_PROFILE],
+            START
+        );
+        assert!(restarted.provider.limiter_disabled);
+        assert_eq!(
+            restarted.provider.flag_writes,
+            [(true, false), (false, true)]
+        );
+        drop(restarted);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn flag_write_failure_restores_the_profile_without_losing_ownership_on_retry() {
+        let mut provider = global_provider();
+        provider.fail_flag_writes = true;
+        let mut manager = LeaseManager::in_memory(provider);
+        assert_eq!(
+            apply_global(&mut manager),
+            ApplyOutcome::Unavailable("fake_flag_write_failure")
+        );
+        assert!(manager.leases.is_empty());
+        assert_eq!(
+            manager.provider.profiles[crate::rtss::GLOBAL_PROFILE],
+            START
+        );
+        assert!(manager.provider.limiter_disabled);
+        manager.provider.fail_flag_writes = false;
+        let ApplyOutcome::Applied(lease) = apply_global(&mut manager) else {
+            panic!("retry failed");
+        };
+        manager.provider.fail_flag_writes = true;
+        assert!(matches!(
+            manager.restore("global-owner", Some("global-session"), None),
+            RestoreOutcome::Failed {
+                code: "fake_flag_write_failure",
+                ..
+            }
+        ));
+        assert!(manager.leases.contains_key(&lease.lease_id));
+        assert!(!manager.provider.limiter_disabled);
+        assert_eq!(
+            manager.provider.profiles[crate::rtss::GLOBAL_PROFILE],
+            START
+        );
+        manager.provider.fail_flag_writes = false;
+        assert_eq!(
+            manager.restore("global-owner", Some("global-session"), None),
+            RestoreOutcome::Restored(vec![lease.lease_id])
+        );
+        assert!(manager.provider.limiter_disabled);
+    }
+
+    #[test]
+    fn an_old_journal_cannot_claim_ownership_of_an_unattributed_global_flag() {
+        let mut manager = LeaseManager::in_memory(global_provider());
+        let ApplyOutcome::Applied(lease) = apply_global(&mut manager) else {
+            panic!("apply failed");
+        };
+        let stored = manager.leases.get_mut(&lease.lease_id).unwrap();
+        stored.manage_limiter_enable = false;
+        stored.phase = LeasePhase::Pending;
+        let writes = manager.provider.flag_writes.clone();
+        manager.recover().unwrap();
+        assert_eq!(manager.status("global-owner", None)[0].state, "stale_lease");
+        assert_eq!(
+            manager.restore("global-owner", Some("global-session"), None),
+            RestoreOutcome::Stale(lease.lease_id)
+        );
+        assert_eq!(manager.provider.flag_writes, writes);
+        assert!(!manager.provider.limiter_disabled);
+    }
+
+    #[test]
+    fn pending_mixed_profile_and_flag_states_recover_but_foreign_profiles_remain_untouched() {
+        for profile_at_before in [false, true] {
+            let mut manager = LeaseManager::in_memory(global_provider());
+            let ApplyOutcome::Applied(lease) = apply_global(&mut manager) else {
+                panic!("apply failed");
+            };
+            manager.leases.get_mut(&lease.lease_id).unwrap().phase = LeasePhase::Pending;
+            if profile_at_before {
+                manager
+                    .provider
+                    .profiles
+                    .insert(crate::rtss::GLOBAL_PROFILE.into(), START);
+                manager
+                    .provider
+                    .profile_files
+                    .insert(crate::rtss::GLOBAL_PROFILE.into(), START);
+            } else {
+                manager.provider.limiter_disabled = true;
+            }
+            manager.recover().unwrap();
+            assert!(manager.leases.is_empty());
+            assert!(manager.provider.limiter_disabled);
+            assert_eq!(
+                manager.provider.profiles[crate::rtss::GLOBAL_PROFILE],
+                START
+            );
+        }
+        let mut manager = LeaseManager::in_memory(global_provider());
+        let ApplyOutcome::Applied(lease) = apply_global(&mut manager) else {
+            panic!("apply failed");
+        };
+        let foreign = ProfileValues {
+            frame_limit: 77,
+            ..START
+        };
+        manager
+            .provider
+            .profiles
+            .insert(crate::rtss::GLOBAL_PROFILE.into(), foreign);
+        manager
+            .provider
+            .profile_files
+            .insert(crate::rtss::GLOBAL_PROFILE.into(), foreign);
+        assert_eq!(
+            manager.restore("global-owner", Some("global-session"), None),
+            RestoreOutcome::Stale(lease.lease_id)
+        );
+        assert!(!manager.provider.limiter_disabled);
+        assert_eq!(
+            manager.provider.profiles[crate::rtss::GLOBAL_PROFILE],
+            foreign
+        );
+    }
 
     #[test]
     fn lossless_scaling_rtss_limit_uses_rounded_half_rate() {
@@ -1521,6 +2005,14 @@ mod tests {
         profile_files: BTreeMap<String, ProfileValues>,
         journal_path: Option<PathBuf>,
         durable_pending_seen_before_write: bool,
+        durable_flag_intent_seen: bool,
+        fail_flag_writes: bool,
+        flag_writes: Vec<(bool, bool)>,
+        race_before_create: Option<ProfileValues>,
+        durable_creation_intent_seen: bool,
+        created_profiles: usize,
+        installation_preparations: usize,
+        idle_retirements: usize,
     }
 
     impl FakeProvider {
@@ -1537,11 +2029,29 @@ mod tests {
                 profile_files: [("game.exe".into(), START), ("other.exe".into(), START)].into(),
                 journal_path: None,
                 durable_pending_seen_before_write: false,
+                durable_flag_intent_seen: false,
+                fail_flag_writes: false,
+                flag_writes: vec![],
+                race_before_create: None,
+                durable_creation_intent_seen: false,
+                created_profiles: 0,
+                installation_preparations: 0,
+                idle_retirements: 0,
             }
         }
     }
 
     impl FrameLimitProvider for FakeProvider {
+        fn prepare_installation(&mut self, path: &str) -> Result<String, ProviderError> {
+            self.installation_preparations += 1;
+            self.select_installation(path)
+        }
+
+        fn retire_idle(&mut self) -> Result<(), ProviderError> {
+            self.idle_retirements += 1;
+            Ok(())
+        }
+
         fn select_installation(&mut self, path: &str) -> Result<String, ProviderError> {
             if self.available {
                 Ok(path.to_owned())
@@ -1571,6 +2081,50 @@ mod tests {
             } else {
                 Err(ProviderError::Unavailable("fake_safe_write_unsupported"))
             }
+        }
+
+        fn missing_profile_baseline(
+            &mut self,
+            profile: &str,
+        ) -> Result<ProfileValues, ProviderError> {
+            if profile != crate::rtss::GLOBAL_PROFILE {
+                return Err(ProviderError::Unavailable(
+                    "rtss_profile_missing_safe_create_unsupported",
+                ));
+            }
+            Ok(DEFAULT_PROFILE)
+        }
+
+        fn create_profile_verified(
+            &mut self,
+            profile: &str,
+            values: ProfileValues,
+        ) -> Result<(), ProviderError> {
+            if let Some(foreign) = self.race_before_create.take() {
+                self.profiles.insert(profile.into(), foreign);
+                self.profile_files.insert(profile.into(), foreign);
+                self.existent_profiles.insert(profile.into(), true);
+            }
+            if self.profile_exists(profile)? {
+                return Err(ProviderError::CreationConflict(
+                    "rtss_profile_already_exists",
+                ));
+            }
+            if let Some(path) = &self.journal_path {
+                let journal = load_journal(path).unwrap();
+                self.durable_creation_intent_seen = journal.leases.iter().any(|lease| {
+                    lease.phase == LeasePhase::Pending
+                        && lease.profile == profile
+                        && lease.initialized_profile
+                        && !lease.before.profile_exists
+                });
+                assert!(self.durable_creation_intent_seen);
+            }
+            self.created_profiles += 1;
+            self.profiles.insert(profile.into(), values);
+            self.profile_files.insert(profile.into(), values);
+            self.existent_profiles.insert(profile.into(), true);
+            Ok(())
         }
 
         fn write_profile_verified(
@@ -1607,13 +2161,22 @@ mod tests {
                 let journal = load_journal(path).expect(
                     "the write-ahead lease intent must be durable before provider mutation",
                 );
-                self.durable_pending_seen_before_write = journal.leases.iter().any(|lease| {
+                let applying = journal.leases.iter().any(|lease| {
                     lease.phase == LeasePhase::Pending
                         && lease.profile == profile
-                        && lease.before.profile == START
+                        && lease.before.profile == expected
                         && lease.applied.profile == values
                 });
-                assert!(self.durable_pending_seen_before_write);
+                let restoring = journal.leases.iter().any(|lease| {
+                    lease.profile == profile
+                        && lease.before.profile == values
+                        && (expected == lease.applied.profile || expected == lease.before.profile)
+                });
+                self.durable_pending_seen_before_write |= applying;
+                assert!(
+                    applying || restoring,
+                    "write must match the durable apply or restore intent"
+                );
             }
             let written = if self.mismatch_writeback {
                 ProfileValues {
@@ -1632,10 +2195,39 @@ mod tests {
         fn limiter_disabled(&mut self) -> Result<bool, ProviderError> {
             Ok(self.limiter_disabled)
         }
+
+        fn ensure_limiter_flag_writes_supported(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+
+        fn set_limiter_disabled_verified(
+            &mut self,
+            expected: bool,
+            desired: bool,
+        ) -> Result<(), ProviderError> {
+            if self.limiter_disabled != expected {
+                return Err(ProviderError::VerifyFailed("fake_limiter_flag_changed"));
+            }
+            if self.fail_flag_writes {
+                return Err(ProviderError::Unavailable("fake_flag_write_failure"));
+            }
+            if let Some(path) = &self.journal_path {
+                let journal: Journal = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+                self.durable_flag_intent_seen = journal
+                    .leases
+                    .iter()
+                    .any(|lease| lease.before.limiter_disabled != lease.applied.limiter_disabled);
+            }
+            self.limiter_disabled = desired;
+            self.flag_writes.push((expected, desired));
+            Ok(())
+        }
     }
 
     fn apply(manager: &mut LeaseManager<FakeProvider>, owner: &str, session: &str) -> ApplyOutcome {
         manager.apply(LeaseApplyRequest {
+            enable_limiter: false,
+            initialize_profile: false,
             owner,
             session_id: session,
             executable_path: r"C:\Games\game.exe",
@@ -1646,6 +2238,79 @@ mod tests {
         })
     }
 
+    #[test]
+    fn status_and_retries_do_not_start_a_provider_and_live_leases_prevent_retirement() {
+        let mut manager = LeaseManager::in_memory(FakeProvider::new());
+        manager.probe_provider().unwrap();
+        assert!(manager.status("caller", None).is_empty());
+        assert_eq!(manager.provider.installation_preparations, 0);
+
+        assert!(matches!(
+            apply(&mut manager, "caller", "session"),
+            ApplyOutcome::Applied(_)
+        ));
+        assert_eq!(manager.provider.installation_preparations, 1);
+        assert_eq!(manager.status("caller", None)[0].state, "applied");
+        assert!(matches!(
+            apply(&mut manager, "caller", "session"),
+            ApplyOutcome::AlreadyApplied(_)
+        ));
+        assert_eq!(manager.provider.installation_preparations, 1);
+        manager.retire_provider_if_idle().unwrap();
+        assert_eq!(manager.provider.idle_retirements, 0);
+
+        // An unresolved effect must retain its provider, including after failed cleanup.
+        manager.provider.fail_writes = true;
+        assert!(matches!(
+            manager.restore("caller", Some("session"), None),
+            RestoreOutcome::Failed { .. }
+        ));
+        manager.retire_provider_if_idle().unwrap();
+        assert_eq!(manager.provider.idle_retirements, 0);
+        manager.provider.fail_writes = false;
+        assert!(matches!(
+            manager.restore("caller", Some("session"), None),
+            RestoreOutcome::Restored(_)
+        ));
+        manager.retire_provider_if_idle().unwrap();
+        assert_eq!(manager.provider.idle_retirements, 1);
+    }
+
+    #[test]
+    fn recovery_only_prepares_installations_with_owned_effects() {
+        let root = std::env::temp_dir().join(format!(
+            "limiter-preparation-{}-{}",
+            std::process::id(),
+            NEXT_LEASE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let journal = root.join("leases.json");
+        let mut manager = LeaseManager::open(FakeProvider::new(), journal.clone()).unwrap();
+        assert_eq!(manager.provider.installation_preparations, 0);
+        assert!(matches!(
+            apply(&mut manager, "caller", "session"),
+            ApplyOutcome::Applied(_)
+        ));
+        let mut provider = manager.provider.clone();
+        provider.installation_preparations = 0;
+        drop(manager);
+        let mut restarted = LeaseManager::open(provider, journal.clone()).unwrap();
+        restarted.recover().unwrap();
+        assert_eq!(restarted.provider.installation_preparations, 1);
+        assert!(matches!(
+            restarted.restore("caller", Some("session"), None),
+            RestoreOutcome::Restored(_)
+        ));
+        assert_eq!(restarted.provider.installation_preparations, 2);
+        let mut provider = restarted.provider.clone();
+        provider.installation_preparations = 0;
+        drop(restarted);
+        let mut restarted = LeaseManager::open(provider, journal).unwrap();
+        restarted.recover().unwrap();
+        assert_eq!(restarted.provider.installation_preparations, 0);
+        drop(restarted);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn apply_for_profile(
         manager: &mut LeaseManager<FakeProvider>,
         owner: &str,
@@ -1653,6 +2318,8 @@ mod tests {
         profile: &str,
     ) -> ApplyOutcome {
         manager.apply(LeaseApplyRequest {
+            enable_limiter: false,
+            initialize_profile: false,
             owner,
             session_id: session,
             executable_path: if profile == "game.exe" {
@@ -1768,6 +2435,45 @@ mod tests {
     }
 
     #[test]
+    fn failed_restore_journal_keeps_ownership_until_retry_confirms_persistence() {
+        let root = std::env::temp_dir().join(format!(
+            "amaterasu-restore-journal-{}-{}",
+            std::process::id(),
+            NEXT_LEASE_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let journal = root.join("leases.json");
+        let backup = root.join("leases.before.json");
+        let mut manager = LeaseManager::open(FakeProvider::new(), journal.clone()).unwrap();
+        let ApplyOutcome::Applied(lease) = apply(&mut manager, "caller.a", "session") else {
+            panic!("apply must succeed");
+        };
+        let revision = manager.revision();
+        fs::rename(&journal, &backup).unwrap();
+        fs::create_dir(&journal).unwrap();
+        assert!(matches!(
+            manager.restore("caller.a", None, Some(&lease.lease_id)),
+            RestoreOutcome::Failed {
+                code: "lease_journal_invalid_path",
+                ..
+            }
+        ));
+        assert_eq!(manager.revision(), revision);
+        assert!(manager.leases.contains_key(&lease.lease_id));
+        assert!(manager.completed.is_empty());
+        assert_eq!(manager.provider.profiles["game.exe"], START);
+        fs::remove_dir(&journal).unwrap();
+        fs::rename(&backup, &journal).unwrap();
+        assert_eq!(
+            manager.restore("caller.a", None, Some(&lease.lease_id)),
+            RestoreOutcome::Restored(vec![lease.lease_id.clone()])
+        );
+        assert!(!manager.leases.contains_key(&lease.lease_id));
+        assert_eq!(manager.revision(), revision + 1);
+        drop(manager);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn restart_reloads_owned_lease_and_restores_exact_before_state() {
         let provider = FakeProvider::new();
         let temp_directory = std::env::temp_dir().join(format!(
@@ -1835,7 +2541,7 @@ mod tests {
         // journal could promote the durable intent to Active.
         let mut pending_lease = active_lease.clone();
         pending_lease.phase = LeasePhase::Pending;
-        save_journal(&journal_path, vec![pending_lease], Vec::new()).unwrap();
+        save_journal(&journal_path, 1, vec![pending_lease], Vec::new()).unwrap();
         let provider = first.provider.clone();
         drop(first);
 
@@ -1868,7 +2574,7 @@ mod tests {
         // creation. Recovery must never delete or overwrite that whole profile.
         lease.before.profile_exists = false;
         lease.phase = LeasePhase::Pending;
-        save_journal(&journal_path, vec![lease.clone()], Vec::new()).unwrap();
+        save_journal(&journal_path, 1, vec![lease.clone()], Vec::new()).unwrap();
         let provider = first.provider.clone();
         drop(first);
 
@@ -1902,7 +2608,7 @@ mod tests {
             panic!("the initial fake provider supports writes");
         };
         lease.phase = LeasePhase::Pending;
-        save_journal(&journal_path, vec![lease.clone()], Vec::new()).unwrap();
+        save_journal(&journal_path, 1, vec![lease.clone()], Vec::new()).unwrap();
         let mut provider = first.provider.clone();
         provider.mutation_supported = false;
         drop(first);
@@ -2019,6 +2725,8 @@ mod tests {
         };
         assert_eq!(
             manager.apply(LeaseApplyRequest {
+                enable_limiter: false,
+                initialize_profile: false,
                 owner: "caller.a",
                 session_id: "session-1",
                 executable_path: r"C:\Games\game.exe",
@@ -2278,7 +2986,7 @@ mod tests {
                 session_id: format!("session-{index:03}"),
             })
             .collect();
-        save_journal(&journal_path, Vec::new(), completed).unwrap();
+        save_journal(&journal_path, 1, Vec::new(), completed).unwrap();
         let journal = load_journal(&journal_path).unwrap();
         assert_eq!(journal.completed.len(), COMPLETED_LEASE_LIMIT);
         assert!(

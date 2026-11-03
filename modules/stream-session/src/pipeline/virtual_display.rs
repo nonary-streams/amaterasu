@@ -75,7 +75,55 @@ pub(super) fn accept_status(record: &mut Record, response: &Value) -> ReferenceS
         record.virtual_display_state = "invalid_intent".into();
         return ReferenceStatus::Failed;
     };
-    if response["reference_owned"] != true {
+    let Some(reference_owned) = response["reference_owned"].as_bool() else {
+        record.virtual_display_state = "invalid_status".into();
+        return ReferenceStatus::Failed;
+    };
+    if !reference_owned {
+        if response["parked"] == true {
+            let parked = response["parked_outputs"].as_array().and_then(|outputs| {
+                let mut matches = outputs
+                    .iter()
+                    .filter(|output| output["identity"] == intent.identity);
+                let output = matches.next()?;
+                (matches.next().is_none()
+                    && output["output"]
+                        .as_str()
+                        .is_some_and(|name| !name.is_empty())
+                    && response["monitors"].as_array().is_some_and(Vec::is_empty))
+                .then_some(output)
+            });
+            if parked.is_none() {
+                record.virtual_display_state = "invalid_parked_status".into();
+                return ReferenceStatus::Failed;
+            }
+            record.virtual_display_reference_owned = false;
+            record.virtual_display_status_verified = true;
+            record.virtual_display_attempted = false;
+            record.virtual_display_remove_attempted = false;
+            record.virtual_display_device_path = None;
+            record.virtual_display_state = "parked".into();
+            return ReferenceStatus::Missing;
+        }
+        if record.virtual_display_remove_attempted
+            && let Some(monitor) = response["monitors"].as_array().and_then(|monitors| {
+                monitors.iter().find(|monitor| {
+                    monitor["specification"]["identity"] == intent.identity
+                        && matches!(
+                            monitor["state"].as_str(),
+                            Some("removing" | "cleanup_failed")
+                        )
+                })
+            })
+        {
+            record.virtual_display_reference_owned = false;
+            record.virtual_display_state = monitor["state"].as_str().unwrap().into();
+            return if monitor["state"] == "removing" {
+                ReferenceStatus::Pending
+            } else {
+                ReferenceStatus::Failed
+            };
+        }
         record.virtual_display_reference_owned = false;
         record.virtual_display_status_verified = true;
         record.virtual_display_attempted = false;
@@ -136,6 +184,35 @@ pub(super) fn accept_status(record: &mut Record, response: &Value) -> ReferenceS
 }
 
 pub(super) fn accept_remove(record: &mut Record, response: &Value) -> bool {
+    if response["parked"] == true {
+        let identity_matches = record
+            .config
+            .virtual_display_intent
+            .as_ref()
+            .is_some_and(|intent| response["identity"] == intent.identity);
+        if response["ok"] != true
+            || response["removed"] != false
+            || response["reference_owned"] != false
+            || !identity_matches
+        {
+            record.virtual_display_state = "invalid_parked_status".into();
+            return false;
+        }
+        record.virtual_display_reference_owned = false;
+        record.virtual_display_status_verified = true;
+        record.virtual_display_attempted = false;
+        record.virtual_display_remove_attempted = false;
+        record.virtual_display_device_path = None;
+        record.virtual_display_state = "parked".into();
+        return true;
+    }
+    if response["ok"] == true && response["monitor"]["state"] == "removing" {
+        record.virtual_display_reference_owned = false;
+        record.virtual_display_status_verified = false;
+        record.virtual_display_remove_attempted = true;
+        record.virtual_display_state = "removing".into();
+        return false;
+    }
     if response["ok"] == true
         && (response["reference_owned"] == false
             || response["reference_released"] == true

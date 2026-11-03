@@ -1,6 +1,7 @@
 //! Library ownership stays here; policy and feature behavior stay in managed libraries.
 use amaterasu_abi::{
-    AbiHeader, BorrowedBytes, HostApi, ModuleApi, ModuleEntry, RuntimeApi, RuntimeEntry, STATUS_OK,
+    AbiHeader, BorrowedBytes, HostApi, ModuleApi, ModuleEntry, ModuleQuiesceApi,
+    ModuleQuiesceEntry, RuntimeApi, RuntimeEntry, RuntimeWaitApi, RuntimeWaitEntry, STATUS_OK,
     Status,
 };
 use amaterasu_contracts::{
@@ -21,6 +22,60 @@ mod teardown_tests;
 
 const HOST_CONFIGURATION_COMPONENT: &str = "amaterasu.host-configuration";
 const STEAM_COMPONENT: &str = "amaterasu.steam";
+
+/// Losses remain pending until the product logger accepts a summary. Acceptance
+/// is queue admission, not proof that the disk sink ultimately wrote it.
+#[derive(Default)]
+struct LogLoss {
+    broker: u64,
+    host: u64,
+}
+
+impl LogLoss {
+    fn record_broker(&mut self, count: u64) {
+        self.broker = self.broker.saturating_add(count);
+    }
+
+    fn record_host(&mut self) {
+        self.host = self.host.saturating_add(1);
+    }
+
+    fn report(&mut self, emit: impl FnOnce(&str) -> Result<(), LoggerError>) {
+        if self.broker == 0 && self.host == 0 {
+            return;
+        }
+        let message = format!(
+            "log records dropped before logger admission: broker={} host={}",
+            self.broker, self.host
+        );
+        if emit(&message).is_ok() {
+            *self = Self::default();
+        }
+    }
+}
+
+#[cfg(test)]
+mod log_loss_tests {
+    use super::{LogLoss, LoggerError};
+
+    #[test]
+    fn dropped_log_summary_is_retried_after_logger_backpressure() {
+        let mut loss = LogLoss::default();
+        loss.record_broker(3);
+        loss.record_host();
+        loss.report(|message| {
+            assert!(message.contains("broker=3 host=1"));
+            Err(LoggerError::QueueFull)
+        });
+        loss.record_broker(2);
+        loss.record_host();
+        loss.report(|message| {
+            assert!(message.contains("broker=5 host=2"));
+            Ok(())
+        });
+        loss.report(|_| panic!("accepted losses must not be reported twice"));
+    }
+}
 
 pub(crate) fn path_to_unicode_string(path: &Path) -> Result<String, String> {
     path.to_str()
@@ -65,12 +120,16 @@ pub struct LoadedComponents {
     host_log_service: Option<HostLogService>,
     host_logs_enabled: bool,
     pending_log_policy: Option<HostLogEvent>,
+    log_loss: LogLoss,
     lifecycle_endpoint: HostApi,
     runtime: RuntimeLibrary,
 }
 
 impl Drop for LoadedComponents {
     fn drop(&mut self) {
+        if let Err(error) = self.quiesce(std::time::Duration::from_secs(20)) {
+            eprintln!("cooperative module shutdown incomplete: {error}");
+        }
         while let Some(module) = self.modules.pop() {
             drop(module);
         }
@@ -178,6 +237,7 @@ impl LoadedComponents {
             host_log_service: None,
             host_logs_enabled,
             pending_log_policy: None,
+            log_loss: LogLoss::default(),
             lifecycle_endpoint,
             runtime,
         };
@@ -188,6 +248,49 @@ impl LoadedComponents {
             progress(index + 2)?;
         }
         Ok(loaded)
+    }
+
+    fn quiesce(&mut self, budget: std::time::Duration) -> PackageResult<()> {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            let mut ready = true;
+            for module in self.modules.iter_mut().rev() {
+                ready &= module.quiesce()?;
+            }
+            if ready {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err("module drain deadline elapsed".into());
+            }
+            self.tick()?;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    pub fn observe_work(&self) -> PackageResult<u64> {
+        let Some(api) = self.runtime.wait_api else {
+            return Ok(0);
+        };
+        let mut observed = 0;
+        // SAFETY: runtime and output remain live for this serialized call.
+        require_success(
+            unsafe { (api.observe)(self.runtime.instance, &mut observed) },
+            "observe runtime work",
+        )?;
+        Ok(observed)
+    }
+    pub fn wait_for_work(&self, observed: u64, timeout: std::time::Duration) -> PackageResult<()> {
+        let Some(api) = self.runtime.wait_api else {
+            std::thread::sleep(timeout);
+            return Ok(());
+        };
+        let micros = timeout.as_micros().min(1_000_000) as u64;
+        // SAFETY: the selected runtime is retained until the bounded wait returns.
+        require_success(
+            unsafe { (api.wait)(self.runtime.instance, observed, micros) },
+            "wait for runtime work",
+        )
     }
 
     pub fn tick(&mut self) -> PackageResult<()> {
@@ -211,12 +314,17 @@ impl LoadedComponents {
         let Ok(output) = (unsafe { self.lifecycle_endpoint.call(&input) }) else {
             return;
         };
-        let Ok(Response::LogEvents { events, .. }) = serde_json::from_slice(&output) else {
+        let Ok(Response::LogEvents {
+            events,
+            dropped_records,
+        }) = serde_json::from_slice(&output)
+        else {
             return;
         };
         let Some(logger) = &self.product_logger else {
             return;
         };
+        self.log_loss.record_broker(dropped_records);
         let mut pending_policy = self.pending_log_policy.take();
         if let Some(HostLogEvent::Policy {
             revision,
@@ -248,8 +356,8 @@ impl LoadedComponents {
                     target,
                     message,
                 } => {
-                    if !policy_queue_blocked {
-                        let _ = logger.emit(level, &target, &message);
+                    if policy_queue_blocked || logger.emit(level, &target, &message).is_err() {
+                        self.log_loss.record_host();
                     }
                 }
                 HostLogEvent::Policy {
@@ -287,6 +395,10 @@ impl LoadedComponents {
                     }
                 }
             }
+        }
+        if !policy_queue_blocked {
+            self.log_loss
+                .report(|message| logger.emit(3, "amaterasu.host::logging", message));
         }
         self.pending_log_policy = pending_policy;
     }
@@ -495,6 +607,7 @@ fn same_path(left: &str, right: &str) -> bool {
 
 struct RuntimeLibrary {
     api: RuntimeApi,
+    wait_api: Option<RuntimeWaitApi>,
     instance: *mut c_void,
     _library: Library,
 }
@@ -511,6 +624,13 @@ impl RuntimeLibrary {
                 .map_err(|error| error.to_string())?;
             read_api_table(entry())?
         };
+        // SAFETY: the named optional contract is checked before its tail is read.
+        let wait_api = unsafe {
+            match library.get::<RuntimeWaitEntry>(b"amaterasu_runtime_wait_v1\0") {
+                Ok(entry) => Some(read_api_table(entry())?),
+                Err(_) => None,
+            }
+        };
         let mut instance = std::ptr::null_mut();
         // SAFETY: configuration lives throughout create; output points to writable storage.
         let status = unsafe { (api.create)(BorrowedBytes::new(configuration), &mut instance) };
@@ -520,6 +640,7 @@ impl RuntimeLibrary {
         }
         Ok(Self {
             api,
+            wait_api,
             instance,
             _library: library,
         })
@@ -555,6 +676,7 @@ impl Drop for RuntimeLibrary {
 struct FeatureLibrary {
     id: String,
     api: ModuleApi,
+    quiesce_api: Option<ModuleQuiesceApi>,
     instance: *mut c_void,
     _library: Library,
 }
@@ -569,6 +691,14 @@ impl FeatureLibrary {
                 .map_err(|error| error.to_string())?;
             read_api_table(entry())?
         };
+        // SAFETY: An optional, named contract is read only after the signed
+        // library's header validates its version and complete table size.
+        let quiesce_api = unsafe {
+            match library.get::<ModuleQuiesceEntry>(b"amaterasu_module_quiesce_v1\0") {
+                Ok(entry) => Some(read_api_table(entry())?),
+                Err(_) => None,
+            }
+        };
         let mut instance = std::ptr::null_mut();
         // SAFETY: the module borrows the table during creation and copies it if needed later.
         let status = unsafe { (api.create)(endpoint, &mut instance) };
@@ -579,9 +709,26 @@ impl FeatureLibrary {
         Ok(Self {
             id: id.to_owned(),
             api,
+            quiesce_api,
             instance,
             _library: library,
         })
+    }
+
+    fn quiesce(&mut self) -> PackageResult<bool> {
+        let Some(api) = self.quiesce_api else {
+            return Ok(true);
+        };
+        let mut ready = 0;
+        // SAFETY: This table belongs to the same loaded library and live instance;
+        // lifecycle calls are serialized and the output byte lives for this call.
+        let status = unsafe { (api.poll)(self.instance, &mut ready) };
+        require_success(status, &format!("quiesce {}", self.id))?;
+        match ready {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(format!("invalid quiesce readiness from {}", self.id)),
+        }
     }
 
     fn tick(&mut self) -> PackageResult<()> {

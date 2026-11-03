@@ -6,18 +6,20 @@ mod native;
 mod stream;
 
 use amaterasu_module_sdk::{
-    Command, ManagedModule, ModuleResult, Response, RuntimeClient, network::Network,
+    Command, LogLevel, ManagedModule, ModuleResult, Response, RuntimeClient, network::Network,
 };
 use controller::{ControlReply, Controller};
 use model::{Operation, Settings};
 use serde_json::json;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const SERVICE: &str = "amaterasu.media-transport/1";
 
 struct MediaTransportModule {
     runtime: RuntimeClient,
     controller: native::Shared,
+    latency_window_started: Instant,
     _factory: Box<native::Factory>,
 }
 
@@ -27,10 +29,42 @@ impl ManagedModule for MediaTransportModule {
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
-        self.controller
-            .lock()
-            .map_err(|_| "transport state unavailable")?
-            .tick();
+        let _priority = amaterasu_module_sdk::threading::ScopedThreadPriority::best_effort(
+            amaterasu_module_sdk::threading::ThreadPriority::High,
+        );
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.latency_window_started);
+        let due = elapsed >= Duration::from_secs(10);
+        let summaries = {
+            let mut controller = self
+                .controller
+                .lock()
+                .map_err(|_| "transport state unavailable")?;
+            controller.tick();
+            if due {
+                controller.take_processing_latencies()
+            } else {
+                Vec::new()
+            }
+        };
+        if due {
+            self.latency_window_started = now;
+            for (stream, sample) in summaries {
+                let message = format!(
+                    "stream={stream} window_ms={} samples={} known_samples={} unknown_samples={} total_tenths_ms={} max_tenths_ms={} zero_known={} scope=capture_start_to_media_admission_not_delivery",
+                    elapsed.as_millis(),
+                    sample.samples,
+                    sample.samples.saturating_sub(sample.unknown_samples),
+                    sample.unknown_samples,
+                    sample.total_tenths_ms,
+                    sample.max_tenths_ms,
+                    sample.zero_samples
+                );
+                let _ = self
+                    .runtime
+                    .log(LogLevel::Info, "media.processing_latency", &message);
+            }
+        }
         match self.runtime.send(Command::Poll {})? {
             Response::Pending => Ok(()),
             Response::Request {
@@ -113,6 +147,7 @@ impl MediaTransportModule {
         Ok(Self {
             runtime,
             controller,
+            latency_window_started: Instant::now(),
             _factory: factory,
         })
     }

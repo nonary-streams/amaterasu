@@ -18,6 +18,8 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 const LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
+// The worker may spend up to 20 seconds quiescing components before teardown.
+const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
 const SERVICE_READY_FILE: &str = "service-ready.json";
 const OPERATIONAL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -853,7 +855,7 @@ impl Worker {
         &mut self,
         action: HostLifecycleAction,
     ) -> PackageResult<HostLifecycleAction> {
-        let deadline = Instant::now() + LIVENESS_TIMEOUT;
+        let deadline = Instant::now() + Duration::from_secs(25);
         loop {
             if let Some(status) = self.child.try_wait().map_err(|error| error.to_string())? {
                 return crate::protocol::acknowledge_host_action(action, status.success());
@@ -932,7 +934,7 @@ impl Worker {
     fn shutdown(&mut self) -> PackageResult<()> {
         // EOF asks modules to destroy in reverse load order before runtime teardown.
         self.input.take();
-        let deadline = Instant::now() + LIVENESS_TIMEOUT;
+        let deadline = Instant::now() + WORKER_SHUTDOWN_TIMEOUT;
         loop {
             if let Some(status) = self.child.try_wait().map_err(|error| error.to_string())? {
                 return if status.success() {

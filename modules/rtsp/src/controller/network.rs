@@ -126,16 +126,7 @@ impl Controller {
                     self.records.insert(ticket, record);
                     return;
                 };
-                if record.config.frame_limiter_settings.is_some() {
-                    self.schedule_frame_limiter_verification(
-                        &record,
-                        connection,
-                        action_ticket,
-                        now,
-                    );
-                } else {
-                    self.schedule_arm(&mut record, payload, connection, action_ticket, now);
-                }
+                self.schedule_arm(&mut record, payload, connection, action_ticket, now);
             }
             Ok(NegotiationStep::Action {
                 ticket: action_ticket,
@@ -170,40 +161,6 @@ impl Controller {
         self.records.insert(ticket, record);
     }
 
-    pub(super) fn schedule_frame_limiter_verification(
-        &mut self,
-        record: &Record,
-        connection: u64,
-        action_ticket: u64,
-        now: u64,
-    ) {
-        let mut verification = json!({
-            "action":"verify_frame_limiter_snapshot",
-            "application_operation_id":record.config.application_operation_id,
-            "app_id":record.config.app_id,
-            "catalog_revision":record.config.catalog_revision,
-            "frame_limiter_settings":record.config.frame_limiter_settings,
-            "frame_limiter_executable_path":record.config.frame_limiter_executable_path,
-        });
-        if record.config.lifecycle_session_target.is_some() {
-            verification["rtsp_operation_id"] = json!(record.config.operation_id);
-        }
-        let call = Call::for_service(
-            "amaterasu.launch/1",
-            verification,
-            self.operation_id(record, "verify-frame-limiter"),
-            None,
-        );
-        self.job = Some(Job {
-            ticket: record.id,
-            phase: Phase::VerifyFrameLimiter,
-            call,
-            caller: None,
-            network: Some((connection, action_ticket)),
-            deadline: now.saturating_add(PREPARE_BUDGET_MS),
-        });
-    }
-
     pub(super) fn schedule_arm(
         &mut self,
         record: &mut Record,
@@ -235,11 +192,12 @@ impl Controller {
             record.lifecycle_prepare_outstanding = true;
             let request = json!({"operation":"prepare_stream", "operation_id":operation,
                 "target":target, "intent":record.config.lifecycle_intent,
+                "client_context":record.config.lifecycle_client_context,
                 "settings_revision":record.config.lifecycle_settings_revision,
                 "requested_video":{"width":video.width,"height":video.height,
                     "refresh_millihz":video.fps * 1000,
                     "hdr":format.dynamic_range == amaterasu_module_sdk::DynamicRange::Hdr},
-                "consumer_requirements":if input_required { vec!["capture", "input"] } else { vec!["capture"] }});
+                "consumer_requirements":if input_required && record.config.lifecycle_capture_mode.is_managed() { vec!["capture", "input"] } else { vec!["capture"] }});
             let call = Call::for_service(
                 "amaterasu.session-lifecycle/1",
                 request,

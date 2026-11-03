@@ -235,13 +235,6 @@ impl Router {
         self.launches.set_legacy_global_preparation(preparation);
     }
 
-    pub fn set_global_frame_limiter_settings(
-        &mut self,
-        settings: &crate::frame_limiter::FrameLimiterSettings,
-    ) {
-        self.launches.set_global_frame_limiter_settings(settings);
-    }
-
     pub fn set_global_display_policy(&mut self, revision: u64, policy: serde_json::Value) {
         self.launches.set_global_display_policy(revision, policy);
     }
@@ -723,6 +716,10 @@ impl Router {
         self.launches.revoke_untrusted(Instant::now(), trusted)
     }
 
+    pub fn quiesce(&mut self) -> bool {
+        self.launches.quiesce(Instant::now())
+    }
+
     pub fn shutdown(&mut self, runtime: &RuntimeClient) {
         self.launches
             .shutdown(&mut |command| runtime.send_ephemeral(command));
@@ -806,8 +803,8 @@ fn response_code(response: &ModuleResult<Response>) -> &str {
     }
 }
 
-#[derive(Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Default, Deserialize, serde::Serialize)]
+#[serde(default)]
 pub(super) struct ClientConfigOverrides {
     pub(super) sw_preset: Option<String>,
     pub(super) sw_tune: Option<String>,
@@ -862,12 +859,8 @@ pub(super) struct ClientConfigOverrides {
     pub(super) keybindings: Option<amaterasu_input_policy::KeyBindings>,
     pub(super) key_repeat_delay: Option<u32>,
     pub(super) key_repeat_frequency: Option<f64>,
-    pub(super) frame_limiter_enable: Option<bool>,
-    pub(super) frame_limiter_fps_limit: Option<f64>,
-    pub(super) frame_limiter_provider: Option<String>,
-    pub(super) frame_limiter_disable_vsync: Option<bool>,
-    pub(super) frame_limiter_auto_virtual_framegen: Option<String>,
-    pub(super) rtss_frame_limit_type: Option<String>,
+    #[serde(default, flatten)]
+    pub(super) retained_options: serde_json::Map<String, Value>,
 }
 
 impl ClientConfigOverrides {

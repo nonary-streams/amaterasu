@@ -144,12 +144,22 @@ impl Coordinator {
         json!({"status":"ok","host_epoch":journal.host_epoch,"sessions":sessions})
     }
 
-    fn new_work(
+    pub(super) fn new_work(
         &self,
         phase: LifecyclePhase,
         target: LifecycleTarget,
         payload: &Value,
     ) -> ModuleResult<Work> {
+        if let Some(value) = payload
+            .get("client_context")
+            .filter(|value| !value.is_null())
+        {
+            let context: amaterasu_extension_api::ClientContext =
+                serde_json::from_value(value.clone()).map_err(|_| "invalid_client_context")?;
+            if !context.validate() {
+                return Err("invalid_client_context".into());
+            }
+        }
         let order = self.settings.resolved_participants()?;
         let dependencies = self
             .settings
@@ -263,6 +273,7 @@ impl Coordinator {
                 id.clone(),
                 SessionRecord {
                     provider_graph: current.provider_graph.clone(),
+                    capture_binding_mode: self.settings.capture_binding_mode,
                     host_epoch: next.host_epoch.clone(),
                     id,
                     generation: 1,
@@ -290,6 +301,7 @@ impl Coordinator {
                     application_operation_id,
                     admission_ids: BTreeSet::new(),
                     admission_targets: BTreeMap::new(),
+                    prepared_plan_ids: Default::default(),
                     admission_phases: BTreeMap::new(),
                     resource_generations: Default::default(),
                     provider_settings: BTreeMap::new(),
@@ -377,6 +389,12 @@ impl Coordinator {
                     {
                         return Err("invalid_consumers".into());
                     }
+                    if session.capture_binding_mode != self.settings.capture_binding_mode
+                        || (session.capture_binding_mode.is_external()
+                            && required != BTreeSet::from(["capture".into()]))
+                    {
+                        return Err("consumer_policy_changed".into());
+                    }
                     if !required.contains("capture") {
                         return Err("capture_consumer_required".into());
                     }
@@ -453,6 +471,27 @@ impl Coordinator {
                     {
                         return Err("candidate_mismatch".into());
                     }
+                }
+                "ack_stream" => {
+                    if !session.capture_binding_mode.is_external()
+                        || !self.settings.consumers.capture.contains(caller)
+                        || payload.get("consumer").and_then(Value::as_str) != Some("capture")
+                    {
+                        return Err("permission_denied".into());
+                    }
+                    let stream = next
+                        .sessions
+                        .get_mut(&session_id)
+                        .unwrap()
+                        .streams
+                        .get_mut(stream_id.as_deref().ok_or("stream_target_required")?)
+                        .unwrap();
+                    if stream.phase != StreamPhase::Ready
+                        || stream.required != BTreeSet::from(["capture".into()])
+                    {
+                        return Err("invalid_stream_state".into());
+                    }
+                    stream.acknowledgements.insert("capture".into());
                 }
                 "ack_binding" => {
                     return self

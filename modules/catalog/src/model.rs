@@ -164,7 +164,6 @@ impl ArtworkReference {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct ConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sw_preset: Option<String>,
@@ -265,20 +264,6 @@ pub struct ConfigOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefer_10bit_sdr: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frame_limiter_enable: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frame_limiter_fps_limit: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frame_limiter_provider: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub frame_limiter_disable_vsync: Option<bool>,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_auto_virtual_framegen"
-    )]
-    pub frame_limiter_auto_virtual_framegen: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lossless_scaling_framegen: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lossless_scaling_target_fps: Option<u32>,
@@ -286,8 +271,6 @@ pub struct ConfigOverrides {
     pub frame_generation_provider: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame_generation_mode: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rtss_frame_limit_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ds4_back_as_touchpad_click: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -300,35 +283,14 @@ pub struct ConfigOverrides {
     pub ds5_inputtino_randomize_mac: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proton_dualsense_compatibility: Option<bool>,
-}
-
-fn deserialize_auto_virtual_framegen<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    match value {
-        None => Ok(None),
-        Some(serde_json::Value::Bool(enabled)) => Ok(Some(if enabled {
-            "enabled".into()
-        } else {
-            "disabled".into()
-        })),
-        Some(serde_json::Value::String(value)) if value == "true" => Ok(Some("enabled".into())),
-        Some(serde_json::Value::String(value)) if value == "false" => Ok(Some("disabled".into())),
-        Some(serde_json::Value::String(value))
-            if matches!(value.as_str(), "enabled" | "vrr" | "legacy" | "disabled") =>
-        {
-            Ok(Some(value))
-        }
-        _ => Err(serde::de::Error::custom(
-            "frame_limiter_auto_virtual_framegen must be enabled, vrr, legacy, or disabled",
-        )),
-    }
+    /// Opaque values owned by providers outside this consumer's schema.
+    #[serde(default, flatten)]
+    pub retained_options: serde_json::Map<String, serde_json::Value>,
 }
 
 impl ConfigOverrides {
     pub fn validate(&self) -> Result<(), &'static str> {
+        amaterasu_module_sdk::retained_options::validate(&self.retained_options)?;
         amaterasu_module_sdk::validate_software_options(
             self.sw_preset.as_deref(),
             self.sw_tune.as_deref(),
@@ -399,32 +361,14 @@ impl ConfigOverrides {
         {
             return Err("dd_hdr_request_override must be auto, force_on, or force_off");
         }
-        if self
-            .frame_limiter_fps_limit
-            .is_some_and(|limit| !valid_millihertz_value(limit))
-        {
-            return Err("frame_limiter_fps_limit must be 0..=1000 with at most 3 decimals");
-        }
+
         if self
             .lossless_scaling_target_fps
             .is_some_and(|fps| !(1..=1000).contains(&fps))
         {
             return Err("lossless_scaling_target_fps must be between 1 and 1000");
         }
-        if self
-            .frame_limiter_provider
-            .as_deref()
-            .is_some_and(|provider| !valid_frame_limiter_provider(provider))
-        {
-            return Err("frame_limiter_provider is not available on this platform");
-        }
-        if self
-            .frame_limiter_auto_virtual_framegen
-            .as_deref()
-            .is_some_and(|mode| !matches!(mode, "enabled" | "vrr" | "legacy" | "disabled"))
-        {
-            return Err("frame_limiter_auto_virtual_framegen has an invalid mode");
-        }
+
         if self
             .frame_generation_provider
             .as_deref()
@@ -436,19 +380,7 @@ impl ConfigOverrides {
         {
             return Err("frame generation provider or mode is invalid");
         }
-        if self
-            .rtss_frame_limit_type
-            .as_deref()
-            .is_some_and(|limit_type| {
-                !cfg!(windows)
-                    || !matches!(
-                        limit_type,
-                        "async" | "front edge sync" | "back edge sync" | "nvidia reflex"
-                    )
-            })
-        {
-            return Err("rtss_frame_limit_type is a Windows RTSS setting");
-        }
+
         if self.video_max_batch_size_kb.is_some_and(|size| size > 64) {
             return Err("video_max_batch_size_kb must be between 0 and 64");
         }
@@ -500,7 +432,8 @@ impl ConfigOverrides {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.sw_preset.is_none()
+        self.retained_options.is_empty()
+            && self.sw_preset.is_none()
             && self.sw_tune.is_none()
             && self.encoder.is_none()
             && self.min_threads.is_none()
@@ -546,16 +479,10 @@ impl ConfigOverrides {
             && self.nvenc_latency_over_power.is_none()
             && self.vaapi_strict_rc_buffer.is_none()
             && self.prefer_10bit_sdr.is_none()
-            && self.frame_limiter_enable.is_none()
-            && self.frame_limiter_fps_limit.is_none()
-            && self.frame_limiter_provider.is_none()
-            && self.frame_limiter_disable_vsync.is_none()
-            && self.frame_limiter_auto_virtual_framegen.is_none()
             && self.lossless_scaling_framegen.is_none()
             && self.lossless_scaling_target_fps.is_none()
             && self.frame_generation_provider.is_none()
             && self.frame_generation_mode.is_none()
-            && self.rtss_frame_limit_type.is_none()
             && self.ds4_back_as_touchpad_click.is_none()
             && self.native_pen_touch.is_none()
             && self.motion_as_ds4.is_none()
@@ -891,37 +818,6 @@ fn valid_manual_refresh_rate(value: &str) -> bool {
             .checked_mul(denominator)
             .and_then(|scaled| scaled.checked_add(numerator))
             .is_some_and(|combined| u32::try_from(combined).is_ok())
-}
-
-fn valid_millihertz_value(value: f64) -> bool {
-    if !value.is_finite() || !(0.0..=1000.0).contains(&value) {
-        return false;
-    }
-    let millihertz = value * 1000.0;
-    let rounding_tolerance = f64::EPSILON * millihertz.abs().max(1.0) * 4.0;
-    (millihertz - millihertz.round()).abs() <= rounding_tolerance
-}
-
-fn valid_frame_limiter_provider(provider: &str) -> bool {
-    #[cfg(windows)]
-    {
-        matches!(provider, "auto" | "rtss" | "nvidia-control-panel" | "none")
-    }
-    #[cfg(target_os = "linux")]
-    {
-        matches!(
-            provider,
-            "auto" | "mangohud" | "proton" | "mangohud-proton" | "none"
-        )
-    }
-    #[cfg(target_os = "macos")]
-    {
-        provider == "auto"
-    }
-    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-    {
-        provider == "auto"
-    }
 }
 
 fn valid_gamepad_profile(profile: &str) -> bool {
@@ -2944,5 +2840,24 @@ mod keybindings_override_tests {
             );
         }
         assert!(serde_json::from_value::<ConfigOverrides>(Value::Null).is_err());
+    }
+}
+
+#[cfg(test)]
+mod retained_option_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn provider_options_round_trip_without_consumer_policy() {
+        let raw = json!({"vendor_option":{"enabled":false,"rate":0,"optional":null},
+            "frame_limiter_enable":false,"frame_limiter_fps_limit":0});
+        let options: ConfigOverrides = serde_json::from_value(raw.clone()).unwrap();
+        options.validate().unwrap();
+        assert!(!options.is_empty());
+        assert_eq!(serde_json::to_value(options).unwrap(), raw);
+        let oversized = json!({"vendor_option":"x".repeat(65_536)});
+        let options: ConfigOverrides = serde_json::from_value(oversized).unwrap();
+        assert!(options.validate().is_err());
     }
 }

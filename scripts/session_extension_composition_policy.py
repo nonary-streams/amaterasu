@@ -91,9 +91,7 @@ def provider_entries(selected: list[dict], enable_action: bool = False) -> dict:
                 approval["callers"] = [legacy.REGISTRY, legacy.ACTIONS, legacy.MANAGEMENT, legacy.INPUT, legacy.STREAM]
             else:
                 approval["callers"] = [legacy.LIFECYCLE]
-        grants = [{"caller": caller, "scope": {"kind": "host"}, "read": True,
-                   "write": caller in (legacy.MANAGEMENT, legacy.CONSOLE)}
-                  for caller in validation_callers if caller != legacy.REGISTRY]
+        grants = legacy.settings_grants(validation_callers)
         # Registry validates only the descriptor's settings and advertised
         # action methods. Lifecycle and owner-control methods stay pinned in
         # broker approvals, and need not consume the bounded registry payload.
@@ -165,6 +163,7 @@ def build_bootstrap(base: dict, selected: list[dict], entries: dict, lifecycle_s
     calls = {identity: [legacy.LIFECYCLE_SERVICE, legacy.REGISTRY_SERVICE, legacy.ACTIONS_SERVICE,
                         legacy.STATE, *services] for identity in parent_chain}
     calls.update({
+        legacy.LAUNCH: [legacy.LIFECYCLE_SERVICE],
         legacy.LIFECYCLE: ["amaterasu.launch/1", "amaterasu.input/1", legacy.LIFECYCLE_SERVICE,
                            legacy.REGISTRY_SERVICE, legacy.STATE, "amaterasu.display/1",
                            "amaterasu.virtual-display/1", *services],
@@ -212,6 +211,7 @@ def build_bootstrap(base: dict, selected: list[dict], entries: dict, lifecycle_s
     settings[legacy.LIFECYCLE] = lifecycle
     settings[legacy.ACTIONS] = {"input_service": legacy.INPUT, "grants": copy.deepcopy(entries["action_grants"])}
     launch = settings.setdefault("amaterasu.launch", {})
+    launch["prepared_context_service"] = legacy.LIFECYCLE_SERVICE
     observers = launch.setdefault("retirement_observers", [])
     if not isinstance(observers, list) or any(not isinstance(item, str) for item in observers):
         raise ValueError("invalid existing retirement observers")

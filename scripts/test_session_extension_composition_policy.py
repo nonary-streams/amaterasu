@@ -118,7 +118,7 @@ class CompositionPolicyTest(unittest.TestCase):
             self.owner["approvals"].append(approval)
         entries = policy.provider_entries(self.selected, True)
         identities = [legacy.NVHTTP, legacy.RTSP, legacy.STREAM, legacy.INPUT,
-                      legacy.MANAGEMENT, legacy.CONSOLE]
+                      legacy.MANAGEMENT, legacy.CONSOLE, legacy.LAUNCH]
         base = {"policy": {"principals": {identity: {"call": []} for identity in identities},
                            "settings": {legacy.NVHTTP: {"streaming": {"capture": {}}}},
                            "api_methods": []}}
@@ -159,7 +159,7 @@ class CompositionPolicyTest(unittest.TestCase):
 
     def test_bootstrap_assembly_preserves_existing_base_and_refuses_old_extension(self):
         identities = [legacy.NVHTTP, legacy.RTSP, legacy.STREAM, legacy.INPUT,
-                      legacy.MANAGEMENT, legacy.CONSOLE]
+                      legacy.MANAGEMENT, legacy.CONSOLE, legacy.LAUNCH]
         base = {"policy": {"principals": {identity: {"call": []} for identity in identities},
                            "settings": {legacy.NVHTTP: {"streaming": {"capture": {}}},
                                         "amaterasu.launch": {"retirement_observers": ["other.observer"]}},
@@ -192,6 +192,8 @@ class CompositionPolicyTest(unittest.TestCase):
         self.assertTrue(settings[legacy.NVHTTP]["session_lifecycle_required"])
         self.assertEqual(settings[legacy.NVHTTP]["streaming"]["capture"]["capture_provider"], "pipewire")
         self.assertEqual(settings["amaterasu.launch"]["retirement_observers"], ["other.observer", legacy.LIFECYCLE])
+        self.assertEqual(settings[legacy.LAUNCH]["prepared_context_service"], legacy.LIFECYCLE_SERVICE)
+        self.assertIn(legacy.LIFECYCLE_SERVICE, calls[legacy.LAUNCH])
         self.assertIn(check.OWNER + "/2", calls[legacy.LIFECYCLE])
         self.assertIn(check.DISPLAY + "/2", calls[legacy.REGISTRY])
         principals = assembled["policy"]["principals"]
@@ -205,7 +207,7 @@ class CompositionPolicyTest(unittest.TestCase):
 
     def test_bootstrap_refuses_duplicate_approvals_and_graph_override(self):
         identities = [legacy.NVHTTP, legacy.RTSP, legacy.STREAM, legacy.INPUT,
-                      legacy.MANAGEMENT, legacy.CONSOLE]
+                      legacy.MANAGEMENT, legacy.CONSOLE, legacy.LAUNCH]
         base = {"policy": {"principals": {identity: {"call": []} for identity in identities},
                            "settings": {legacy.NVHTTP: {"streaming": {"capture": {}}}},
                            "api_methods": []}}

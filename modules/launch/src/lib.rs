@@ -31,6 +31,7 @@ impl ManagedModule for LaunchModule {
         pipeline.set_retirement_observers(settings.retirement_observers);
         pipeline.set_provider_routes(settings.provider_routes);
         pipeline.set_library_routes(settings.library_routes);
+        pipeline.set_prepared_context_service(settings.prepared_context_service);
         runtime.require_success(Command::Register {
             service: SERVICE.into(),
         })?;

@@ -22,10 +22,9 @@ mod tests {
 use crate::encoder_snapshot::{
     CodecAdvertisement, CodecOffer, EncoderSnapshot, StreamMode, unknown_encoders_offer,
 };
-use crate::frame_limiter::FrameLimiterSettings;
 use crate::preparation::{LegacyPreparationStep, PreparationStep};
 use crate::wire::{ClientConfigOverrides, Reply, xml};
-use amaterasu_module_sdk::{Command, ModuleResult, Response};
+use amaterasu_module_sdk::{Command, LogEmitter, LogLevel, ModuleResult, Response};
 use record::{Record, Stage, State};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -141,6 +140,7 @@ pub struct PeerIdentity {
     remote: IpAddr,
     certificate: Vec<u8>,
     client_id: Option<String>,
+    client_properties: Value,
     certificate_id: Option<String>,
     client_fec_percentage: Option<u8>,
     client_max_bitrate: Option<i32>,
@@ -169,7 +169,6 @@ pub struct PeerIdentity {
     client_keybindings: Option<amaterasu_input_policy::KeyBindings>,
     client_key_repeat_delay: Option<u32>,
     client_key_repeat_frequency: Option<f64>,
-    client_frame_limiter_settings: FrameLimiterSettings,
     client_display_overrides: Value,
     client_display_mode: Option<PhysicalDisplayMode>,
     client_software_encoder: SoftwareEncoderOptions,
@@ -193,6 +192,7 @@ impl PeerIdentity {
             remote,
             certificate,
             client_id: None,
+            client_properties: json!({}),
             certificate_id: None,
             client_fec_percentage: None,
             client_max_bitrate: None,
@@ -221,7 +221,6 @@ impl PeerIdentity {
             client_keybindings: None,
             client_key_repeat_delay: None,
             client_key_repeat_frequency: None,
-            client_frame_limiter_settings: FrameLimiterSettings::default(),
             client_display_overrides: json!({}),
             client_display_mode: None,
             client_software_encoder: SoftwareEncoderOptions::default(),
@@ -236,6 +235,10 @@ impl PeerIdentity {
         certificate_id: String,
         config_overrides: ClientConfigOverrides,
     ) -> Result<Self, &'static str> {
+        amaterasu_module_sdk::retained_options::validate(&config_overrides.retained_options)
+            .map_err(|_| "invalid_paired_identity")?;
+        let client_properties =
+            serde_json::to_value(&config_overrides).map_err(|_| "invalid_paired_identity")?;
         let client_display_overrides = config_overrides.display_overrides();
         let client_nvenc_settings = NvencSettingsOverrides {
             nvenc_preset: config_overrides.nvenc_preset,
@@ -293,23 +296,8 @@ impl PeerIdentity {
             keybindings,
             key_repeat_delay,
             key_repeat_frequency,
-            frame_limiter_enable,
-            frame_limiter_fps_limit,
-            frame_limiter_provider,
-            frame_limiter_disable_vsync,
-            frame_limiter_auto_virtual_framegen,
-            rtss_frame_limit_type,
             ..
         } = config_overrides;
-        let client_frame_limiter_settings = FrameLimiterSettings {
-            frame_limiter_enable,
-            frame_limiter_fps_limit,
-            frame_limiter_provider,
-            frame_limiter_disable_vsync,
-            frame_limiter_auto_virtual_framegen,
-            rtss_frame_limit_type,
-            ..FrameLimiterSettings::default()
-        };
         if !valid_client_id(&client_id)
             || !valid_fingerprint(&certificate_id)
             || !fingerprint(&self.certificate).eq_ignore_ascii_case(&certificate_id)
@@ -329,7 +317,6 @@ impl PeerIdentity {
             || key_repeat_delay.is_some_and(|delay| delay > i32::MAX as u32)
             || key_repeat_frequency
                 .is_some_and(|frequency| !frequency.is_finite() || frequency < 0.0)
-            || client_frame_limiter_settings.validate().is_err()
             || workflow::parse_application_config_overrides(Some(&client_display_overrides))
                 .is_err()
         {
@@ -364,7 +351,7 @@ impl PeerIdentity {
         self.client_keybindings = keybindings;
         self.client_key_repeat_delay = key_repeat_delay;
         self.client_key_repeat_frequency = key_repeat_frequency;
-        self.client_frame_limiter_settings = client_frame_limiter_settings;
+        self.client_properties = client_properties;
         self.client_display_overrides = client_display_overrides;
         self.client_display_mode = client_display_mode;
         self.client_software_encoder = client_software_encoder;
@@ -690,8 +677,10 @@ struct PendingResume {
 }
 
 pub struct Controller {
+    logger: Option<LogEmitter>,
     config: Option<StreamingConfig>,
     session_lifecycle_required: bool,
+    session_lifecycle_capture_mode: amaterasu_module_sdk::extension_api::CaptureBindingMode,
     /// Latest encoder enumeration; `None` until the first one completes.
     encoder_snapshot: Option<EncoderSnapshot>,
     configured_output_name: Option<String>,
@@ -699,7 +688,6 @@ pub struct Controller {
     configured_virtual_sink: Option<String>,
     global_preparation: Vec<PreparationStep>,
     legacy_global_preparation: Vec<LegacyPreparationStep>,
-    global_frame_limiter_settings: FrameLimiterSettings,
     global_display_revision: Option<u64>,
     global_display_policy: Value,
     global_audio_sink_capture_only: bool,
@@ -735,15 +723,16 @@ impl Controller {
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).map_err(|_| "random_unavailable")?;
         Ok(Self {
+            logger: None,
             config,
             session_lifecycle_required: false,
+            session_lifecycle_capture_mode: Default::default(),
             encoder_snapshot: None,
             configured_output_name: None,
             configured_audio_sink: None,
             configured_virtual_sink: None,
             global_preparation: Vec::new(),
             legacy_global_preparation: Vec::new(),
-            global_frame_limiter_settings: FrameLimiterSettings::default(),
             global_display_revision: None,
             global_display_policy: json!({}),
             global_audio_sink_capture_only: false,
@@ -776,8 +765,27 @@ impl Controller {
         self.config.is_some()
     }
 
+    pub fn set_logger(&mut self, logger: LogEmitter) {
+        self.logger = Some(logger);
+    }
+
+    fn log_phase(&self, level: LogLevel, phase: workflow::Phase, event: &str) {
+        if let Some(logger) = &self.logger {
+            // The phase and event are internal enums and fixed strings; request
+            // contents and client identities are deliberately excluded.
+            let _ = logger.emit(level, "launch", &format!("phase={phase:?} event={event}"));
+        }
+    }
+
     pub fn set_session_lifecycle_required(&mut self, required: bool) {
         self.session_lifecycle_required = required;
+    }
+
+    pub fn set_session_lifecycle_capture_mode(
+        &mut self,
+        mode: amaterasu_module_sdk::extension_api::CaptureBindingMode,
+    ) {
+        self.session_lifecycle_capture_mode = mode;
     }
 
     pub fn set_encoder_snapshot(&mut self, snapshot: EncoderSnapshot) {
@@ -839,10 +847,6 @@ impl Controller {
 
     pub fn set_legacy_global_preparation(&mut self, preparation: &[LegacyPreparationStep]) {
         self.legacy_global_preparation = preparation.to_vec();
-    }
-
-    pub fn set_global_frame_limiter_settings(&mut self, settings: &FrameLimiterSettings) {
-        self.global_frame_limiter_settings = settings.clone();
     }
 
     pub fn set_global_display_policy(&mut self, revision: u64, policy: Value) {
@@ -1064,8 +1068,6 @@ impl Controller {
         let global_audio_sink_capture_only = self.global_audio_sink_capture_only;
         let global_preparation = self.global_preparation.clone();
         let legacy_global_preparation = self.legacy_global_preparation.clone();
-        let global_frame_limiter_settings = self.global_frame_limiter_settings.clone();
-        let client_frame_limiter_settings = peer.client_frame_limiter_settings.clone();
         let global_ping_timeout_ms = self.global_ping_timeout_ms;
         let global_video_max_batch_size_kb = self.global_video_max_batch_size_kb;
         let global_max_bitrate_kbps = self.global_max_bitrate_kbps;
@@ -1149,8 +1151,6 @@ impl Controller {
             self.configured_virtual_sink.clone(),
             global_preparation,
             legacy_global_preparation,
-            global_frame_limiter_settings,
-            client_frame_limiter_settings,
             global_ping_timeout_ms,
             global_video_max_batch_size_kb,
             global_max_bitrate_kbps,
@@ -1169,6 +1169,7 @@ impl Controller {
         );
         record.requested_capture_output = requested_capture_output;
         record.lifecycle_required = self.session_lifecycle_required;
+        record.lifecycle_capture_mode = self.session_lifecycle_capture_mode;
         record.desktop = desktop;
         record.video_codec_offer = video_codec_offer;
         record.encoder_snapshot = self.encoder_snapshot.clone();
@@ -1555,6 +1556,18 @@ impl Controller {
             job.call.cancel();
         }
         close
+    }
+
+    pub fn quiesce(&mut self, now: Instant) -> bool {
+        self.pending_resume = None;
+        for record in self.records.values_mut() {
+            if !record.state.terminal()
+                && !matches!(record.state, State::Stopping | State::CleanupFailed)
+            {
+                record.request_cleanup(Some("host_stopping"), now);
+            }
+        }
+        self.job.is_none() && self.records.values().all(|record| record.state.terminal())
     }
 
     pub fn shutdown(&mut self, send: &mut Send<'_>) {

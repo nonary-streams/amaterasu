@@ -104,7 +104,75 @@ fn normalized_observation(value: &Value) -> ModuleResult<Value> {
 }
 
 impl Coordinator {
+    pub(super) fn read_provider_context(&self, caller: &str, payload: Value) -> Value {
+        let Ok(query) =
+            serde_json::from_value::<amaterasu_extension_api::ProviderContextRequest>(payload)
+        else {
+            return rejection("invalid_request");
+        };
+        if query.operation != "read_provider_context" {
+            return rejection("invalid_request");
+        }
+        let request = query.provider_request;
+        let Ok((epoch, session_id, _, _)) = super::operations::target_parts(&request.target) else {
+            return rejection("invalid_target");
+        };
+        let Ok(digest) = fingerprint(&request) else {
+            return rejection("invalid_request");
+        };
+        let verification = json!({"host_epoch":epoch,"provider_sequence":request.provider_sequence,
+            "operation_id":request.operation_id,"transition_id":request.transition_id,
+            "target":request.target,"fingerprint":digest});
+        if self.verify_provider_request(caller, &verification, false)["status"] != "succeeded" {
+            return rejection("permission_denied");
+        }
+        let shared = self.shared.borrow();
+        let Some(session) = shared.value.sessions.get(session_id) else {
+            return rejection("unknown_session");
+        };
+        let mut receipts = shared.value.receipts.values().filter(|receipt| {
+            receipt.work.as_ref().is_some_and(|work| {
+                work.target == request.target && work.transition_id == request.transition_id
+            })
+        });
+        let Some(receipt) = receipts.next() else {
+            return rejection("context_unavailable");
+        };
+        if receipts.next().is_some() {
+            return rejection("context_ambiguous");
+        }
+        let client = match receipt.request.get("client_context") {
+            None | Some(Value::Null) => None,
+            Some(value) => match serde_json::from_value::<amaterasu_extension_api::ClientContext>(
+                value.clone(),
+            ) {
+                Ok(client) if client.validate() => Some(client),
+                _ => return rejection("invalid_client_context"),
+            },
+        };
+        json!(amaterasu_extension_api::ProviderContextResponse {
+            status: "succeeded".into(),
+            context: amaterasu_extension_api::ProviderContext {
+                target: request.target,
+                application: session.application_ref.clone(),
+                requested_video: request.requested_video,
+                client,
+            },
+        })
+    }
+
     pub(super) fn verify_provider(&self, caller: &str, payload: &Value) -> Value {
+        self.verify_provider_request(caller, payload, true)
+    }
+
+    // Context reads need the same authenticated request checks as metadata
+    // reads, but do not consume the potentially large recovery metadata.
+    fn verify_provider_request(
+        &self,
+        caller: &str,
+        payload: &Value,
+        include_metadata: bool,
+    ) -> Value {
         let journal = &self.shared.borrow().value;
         for receipt in journal.receipts.values() {
             if receipt.response["status"] != "pending" {
@@ -385,6 +453,9 @@ impl Coordinator {
                     .is_none_or(|id| !journal.authority.admissions.contains_key(id))
             {
                 continue;
+            }
+            if !include_metadata {
+                return json!({"status":"succeeded"});
             }
             let Ok(metadata) = super::provider_observations::metadata(journal, session, caller)
             else {
@@ -1197,13 +1268,71 @@ mod resource_generation_tests {
         journal
             .sessions
             .insert("session".into(), serde_json::from_value(session).unwrap());
-        journal.receipts.insert("work".into(), serde_json::from_value(json!({"caller":"transport","initiator":"user","request":{},"response":{"status":"pending"},"work":work})).unwrap());
+        journal.receipts.insert("work".into(), serde_json::from_value(json!({"caller":"transport","initiator":"user","request":{"client_context":{"client_ref":"client-1","display_mode":{"width":1920,"height":1080,"refresh_millihz":59940},"properties":{"vendor_option":{"enabled":false,"rate":0}}}},"response":{"status":"pending"},"work":work})).unwrap());
         save(&coordinator.shared, journal).unwrap();
         let typed: amaterasu_extension_api::ProviderRequest =
             serde_json::from_value(request).unwrap();
         let verification = json!({"host_epoch":epoch,"provider_sequence":1,"operation_id":"owner-plan","transition_id":"transition","target":target,"fingerprint":fingerprint(&typed).unwrap(),"resource_generation":99});
         let response = coordinator.verify_provider("owner", &verification);
         assert_eq!(response["status"], "succeeded");
+        let context_request =
+            json!({"operation":"read_provider_context", "provider_request":typed});
+        let context = coordinator.read_provider_context("owner", context_request.clone());
+        assert_eq!(context["status"], "succeeded");
+        assert_eq!(context["context"]["target"], target);
+        assert_eq!(context["context"]["application"], json!({}));
+        assert_eq!(context["context"]["client"]["client_ref"], "client-1");
+        assert_eq!(
+            context["context"]["client"]["properties"],
+            json!({"vendor_option":{"enabled":false,"rate":0}})
+        );
+        assert_eq!(
+            context["context"]["client"]["display_mode"]["refresh_millihz"],
+            59940
+        );
+        assert_eq!(
+            coordinator.read_provider_context("foreign", context_request.clone())["status"],
+            "rejected"
+        );
+        // Large recovery metadata must not deny an otherwise valid read-only
+        // context request. The full metadata API still enforces its bound.
+        let original_journal = coordinator.shared.borrow().value.clone();
+        let mut crowded = original_journal.clone();
+        let session = crowded.sessions.get_mut("session").unwrap();
+        for index in 0..129 {
+            session.obligations.push(
+                serde_json::from_value(json!({
+                    "provider":"owner", "resource_id":format!("resource-{index}"),
+                    "obligation_id":format!("cleanup-{index}"),
+                    "cleanup_method":method, "depends_on":[], "mutation_domain":null,
+                    "payload":{}
+                }))
+                .unwrap(),
+            );
+        }
+        save(&coordinator.shared, crowded).unwrap();
+        assert_eq!(
+            coordinator.verify_provider("owner", &verification)["reason"],
+            "provider_metadata_unavailable"
+        );
+        assert_eq!(
+            coordinator.read_provider_context("owner", context_request.clone())["status"],
+            "succeeded"
+        );
+        let mut altered = context_request.clone();
+        altered["provider_request"]["provider_sequence"] = json!(2);
+        assert_eq!(
+            coordinator.read_provider_context("owner", altered)["reason"],
+            "permission_denied"
+        );
+        save(&coordinator.shared, original_journal).unwrap();
+        let mut forged = context_request;
+        forged["provider_request"]["requested_video"] =
+            json!({"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false});
+        assert_eq!(
+            coordinator.read_provider_context("owner", forged)["status"],
+            "rejected"
+        );
         assert_eq!(response["resource_generation"], 1);
         assert_eq!(
             coordinator.verify_provider("foreign", &verification)["status"],
@@ -1226,11 +1355,73 @@ mod resource_generation_tests {
         stream_request.phase = LifecyclePhase::StreamPrepare;
         stream_request.target = stream_target.clone();
         let stream_verification = json!({"host_epoch":epoch,"provider_sequence":1,"operation_id":"owner-plan","transition_id":"transition","target":stream_target,"fingerprint":fingerprint(stream_request).unwrap()});
+        let stream_context_request =
+            json!({"operation":"read_provider_context", "provider_request":stream_request});
+        stream_journal.receipts.get_mut("work").unwrap().request["client_context"] = json!({
+            "client_ref":"resumed-client", "display_mode":null
+        });
         save(&coordinator.shared, stream_journal).unwrap();
+        assert_eq!(
+            coordinator.read_provider_context("owner", stream_context_request)["context"]["client"]
+                ["client_ref"],
+            "resumed-client"
+        );
         assert_eq!(
             coordinator.verify_provider("owner", &stream_verification)["resource_generation"],
             1
         );
+        // Cleanup callbacks must also authorize with crowded history, but
+        // only once all required consumers have retired.
+        let prepared_stream = coordinator.shared.borrow().value.clone();
+        let mut cleanup = prepared_stream.clone();
+        let session = cleanup.sessions.get_mut("session").unwrap();
+        for index in 0..129 {
+            session.obligations.push(
+                serde_json::from_value(json!({
+                    "provider":"owner", "resource_id":format!("resource-{index}"),
+                    "obligation_id":format!("cleanup-{index}"),
+                    "cleanup_method":method, "depends_on":[], "mutation_domain":null,
+                    "payload":{}
+                }))
+                .unwrap(),
+            );
+        }
+        let stream = session.streams.get_mut("stream").unwrap();
+        stream.phase = StreamPhase::Quiescing;
+        stream.required.insert("capture".into());
+        stream.retirements.insert("capture".into());
+        let work = cleanup
+            .receipts
+            .get_mut("work")
+            .unwrap()
+            .work
+            .as_mut()
+            .unwrap();
+        work.phase = LifecyclePhase::StreamRelease;
+        let request = &mut work.states.get_mut("owner").unwrap().request;
+        request.phase = LifecyclePhase::StreamRelease;
+        let cleanup_context =
+            json!({"operation":"read_provider_context", "provider_request":request});
+        save(&coordinator.shared, cleanup.clone()).unwrap();
+        assert_eq!(
+            coordinator.read_provider_context("owner", cleanup_context.clone())["status"],
+            "succeeded"
+        );
+        cleanup
+            .sessions
+            .get_mut("session")
+            .unwrap()
+            .streams
+            .get_mut("stream")
+            .unwrap()
+            .retirements
+            .clear();
+        save(&coordinator.shared, cleanup).unwrap();
+        assert_eq!(
+            coordinator.read_provider_context("owner", cleanup_context)["reason"],
+            "permission_denied"
+        );
+        save(&coordinator.shared, prepared_stream).unwrap();
         let mut wrong_stream = coordinator.shared.borrow().value.clone();
         wrong_stream
             .sessions

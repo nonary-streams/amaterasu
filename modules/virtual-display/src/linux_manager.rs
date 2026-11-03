@@ -28,10 +28,20 @@ pub(super) struct Record {
     pub output: String,
     #[serde(default)]
     layout: Option<layout::Layout>,
+    /// Desktop snapshots protecting hotplug attempts made while a previous
+    /// restoration remains outstanding, newest last.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    setup_layouts: Vec<layout::Layout>,
     #[serde(default)]
     references: Option<BTreeSet<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     transition: Option<Transition>,
+    /// A released connector reserved by the provider for recovery and reuse.
+    /// It may remain connected as a desktop anchor or already be disconnected.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    parked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    park_reason: Option<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,12 +62,25 @@ impl Record {
         (self.owner.clone(), self.specification.identity.clone())
     }
     fn valid(&self) -> bool {
-        self.references.as_ref().is_none_or(|references| {
-            references.len() <= 64
-                && references
-                    .iter()
-                    .all(|reference| valid_reference_id(reference))
-        }) && self.layout.as_ref().is_none_or(layout::Layout::valid)
+        (if self.parked {
+            matches!(
+                self.park_reason.as_deref(),
+                Some("restore_failed" | "no_survivor")
+            )
+        } else {
+            self.park_reason.is_none()
+        }) && (!self.parked
+            || (self.references.as_ref().is_some_and(BTreeSet::is_empty)
+                && self.transition.is_none()))
+            && self.references.as_ref().is_none_or(|references| {
+                references.len() <= 64
+                    && references
+                        .iter()
+                        .all(|reference| valid_reference_id(reference))
+            })
+            && self.layout.as_ref().is_none_or(layout::Layout::valid)
+            && self.setup_layouts.len() <= 4
+            && self.setup_layouts.iter().all(layout::Layout::valid)
             && !self.owner.is_empty()
             && self.owner.len() <= 128
             && !self.owner.chars().any(char::is_control)
@@ -185,16 +208,18 @@ enum Event {
     Created {
         key: (String, String),
         result: Result<Record, String>,
+        parked: BTreeMap<(String, String), String>,
     },
     Removed {
         key: (String, String),
-        result: Result<(), String>,
+        result: Result<bool, String>,
     },
 }
 
 pub struct Manager {
     settings: Settings,
     monitors: BTreeMap<(String, String), Monitor>,
+    parked: BTreeMap<(String, String), String>,
     ready: bool,
     recovery_error: Option<String>,
     sender: Option<SyncSender<Work>>,
@@ -223,6 +248,7 @@ impl Manager {
         let mut manager = Self {
             settings,
             monitors: BTreeMap::new(),
+            parked: BTreeMap::new(),
             ready: false,
             recovery_error: None,
             sender: None,
@@ -312,6 +338,10 @@ impl Manager {
                     self.ready = error.is_none();
                     self.recovery_error = error;
                     for record in records {
+                        if record.parked {
+                            self.parked.insert(record.key(), record.output);
+                            continue;
+                        }
                         self.monitors.insert(
                             record.key(),
                             Monitor {
@@ -326,8 +356,13 @@ impl Manager {
                         );
                     }
                 }
-                Event::Created { key, result } => {
+                Event::Created {
+                    key,
+                    result,
+                    parked,
+                } => {
                     self.pending_mutations = self.pending_mutations.saturating_sub(1);
+                    self.parked = parked;
                     if let Some(monitor) = self.monitors.get_mut(&key) {
                         match result {
                             Ok(record) => {
@@ -348,8 +383,15 @@ impl Manager {
                     self.pending_mutations = self.pending_mutations.saturating_sub(1);
                     self.cleanup_pending.remove(&key);
                     match result {
-                        Ok(()) => {
-                            self.monitors.remove(&key);
+                        Ok(parked) => {
+                            let monitor = self.monitors.remove(&key);
+                            if parked
+                                && let Some(output) = monitor.and_then(|monitor| monitor.output)
+                            {
+                                self.parked.insert(key.clone(), output);
+                            } else {
+                                self.parked.remove(&key);
+                            }
                             self.reconfigurations.remove(&key);
                             if self.monitors.is_empty() && self.recovery_error.is_some() {
                                 self.ready = true;
@@ -694,6 +736,9 @@ impl Manager {
             return failure("invalid_request");
         }
         let key = (caller.to_owned(), identity.to_owned());
+        if !self.monitors.contains_key(&key) && self.parked.contains_key(&key) {
+            return json!({"ok":true,"removed":false,"parked":true,"identity":identity,"reference_owned":false});
+        }
         if !self.ready && self.recovery_error.is_none() {
             return failure("startup_reconciliation_pending");
         }
@@ -1432,7 +1477,17 @@ impl Manager {
                         .is_some_and(|references| references.contains(reference))
                 })
             });
-        json!({"reference_owned":reference_id.map(|_|reference_owned),"ok":true,"enabled":self.settings.enabled,"native_supported":true,"driver":"libvirtualdisplay","mode_only_preservation":"kscreen-strict-v1",
+        let parked = identity.as_ref().is_some_and(|identity| {
+            let key = (caller.to_owned(), identity.clone());
+            !self.monitors.contains_key(&key) && self.parked.contains_key(&key)
+        });
+        let parked_outputs: Vec<_> = self
+            .parked
+            .iter()
+            .filter(|((owner, _), _)| owner == caller)
+            .map(|((_, identity), output)| json!({"identity":identity,"output":output}))
+            .collect();
+        json!({"reference_owned":reference_id.map(|_|reference_owned),"parked":parked,"parked_outputs":parked_outputs,"ok":true,"enabled":self.settings.enabled,"native_supported":true,"driver":"libvirtualdisplay","mode_only_preservation":"kscreen-strict-v1",
             "ownership_authority":"unix_uid_broker","mutation_domain":self.domain(),"settings":{"virtual_display_layout":self.settings.virtual_display_layout,"dd_virtual_display_scale":Self::scale_value(self.settings.dd_virtual_display_scale),"dd_activate_virtual_display":self.settings.dd_activate_virtual_display,"dd_use_sunshine_virtual_display_driver":self.settings.dd_use_sunshine_virtual_display_driver},"recovery_ready":self.ready && self.reconfigurations.values().all(|change| change.state == "succeeded"),"recovery_error":self.recovery_error,"monitors":monitors,
             "activation_requested":self.settings.dd_activate_virtual_display,
             "configured_permanent_monitor_count":self.settings.dd_virtual_display_permanent_count,"permanent_monitor_runtime_supported":false})

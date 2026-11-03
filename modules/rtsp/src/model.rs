@@ -610,18 +610,19 @@ pub struct Open {
     #[serde(default)]
     pub lifecycle_session_target: Option<amaterasu_extension_api::LifecycleTarget>,
     #[serde(default)]
+    pub lifecycle_capture_mode: amaterasu_extension_api::CaptureBindingMode,
+    #[serde(default)]
     pub lifecycle_settings_revision: Option<String>,
     #[serde(default)]
     pub lifecycle_intent: Option<String>,
+    /// Facts supplied by the trusted session owner for this stream only.
+    #[serde(default)]
+    pub lifecycle_client_context: Option<amaterasu_extension_api::ClientContext>,
     /// NVHTTP's nonce-bound RTSP operation, reused as the History session ID.
     #[serde(default)]
     pub history_activity_id: Option<String>,
     pub peer_ip: IpAddr,
-    #[serde(default)]
-    pub frame_limiter_settings: Option<serde_json::Value>,
-    #[serde(default)]
-    pub frame_limiter_executable_path: Option<String>,
-    /// Frozen Launch identity for verifying a limiter before stream activation.
+    /// Frozen Launch identity for display admission.
     #[serde(default)]
     pub app_id: Option<String>,
     #[serde(default)]
@@ -752,42 +753,17 @@ impl Open {
     }
 
     pub fn validate(&self, allow_remote: bool) -> Result<[u8; 16], &'static str> {
-        if self.frame_limiter_settings.is_some() != self.frame_limiter_executable_path.is_some() {
-            return Err("invalid_frame_limiter_snapshot");
+        match (&self.app_id, self.catalog_revision) {
+            (Some(app_id), Some(_)) if valid_name(app_id) => {}
+            (None, None) => {}
+            _ => return Err("invalid_application_identity"),
         }
-        match (
-            &self.frame_limiter_settings,
-            &self.app_id,
-            self.catalog_revision,
-        ) {
-            (Some(_), Some(app_id), Some(_))
-                if valid_name(app_id)
-                    && self
-                        .application_operation_id
-                        .as_deref()
-                        .is_some_and(valid_name) => {}
-            (None, Some(app_id), Some(revision))
-                if self.display_admission_required()
-                    && valid_name(app_id)
-                    && self
-                        .display_policy_snapshot
-                        .as_ref()
-                        .is_some_and(|snapshot| {
-                            snapshot["catalog_revision"].as_u64() == Some(revision)
-                        }) => {}
-            (None, None, None) => {}
-            _ => return Err("frame_limiter_unattested"),
-        }
-        if self.frame_limiter_settings.is_some()
-            && self.display_admission_required()
-            && self
-                .display_policy_snapshot
-                .as_ref()
-                .is_some_and(|snapshot| {
-                    snapshot["catalog_revision"].as_u64() != self.catalog_revision
-                })
+        if self
+            .application_operation_id
+            .as_deref()
+            .is_some_and(|id| !valid_name(id))
         {
-            return Err("frame_limiter_unattested");
+            return Err("invalid_application_identity");
         }
         if self
             .virtual_display_intent
@@ -833,7 +809,6 @@ impl Open {
                 return Err("display_request_unattested");
             }
         } else if self.display_admission_token.is_some()
-            || (self.frame_limiter_settings.is_none() && self.application_operation_id.is_some())
             || self
                 .display_policy_snapshot
                 .as_ref()
@@ -848,20 +823,6 @@ impl Open {
         {
             return Err("invalid_display_policy_snapshot");
         }
-        if let Some(snapshot) = &self.frame_limiter_settings
-            && !valid_frame_limiter_snapshot(snapshot, self.profile.fps)
-        {
-            return Err("invalid_frame_limiter_snapshot");
-        }
-        if self
-            .frame_limiter_executable_path
-            .as_deref()
-            .is_some_and(|path| {
-                path.trim().is_empty() || path.len() > 4096 || path.chars().any(char::is_control)
-            })
-        {
-            return Err("invalid_executable_path");
-        }
         if self.ping_timeout_ms > i32::MAX as u32 {
             return Err("invalid_ping_timeout");
         }
@@ -869,6 +830,17 @@ impl Open {
             return Err("continuous_audio_requires_stream_audio");
         }
         self.validate_operation_id()?;
+        if self.lifecycle_capture_mode.is_external() && self.lifecycle_session_target.is_none() {
+            return Err("invalid_lifecycle_identity");
+        }
+        if self
+            .lifecycle_client_context
+            .as_ref()
+            .is_some_and(|context| !context.validate())
+            || (self.lifecycle_client_context.is_some() && self.lifecycle_session_target.is_none())
+        {
+            return Err("invalid_lifecycle_client_context");
+        }
         match (
             &self.lifecycle_session_target,
             &self.lifecycle_settings_revision,
@@ -888,8 +860,9 @@ impl Open {
                 && *generation > 0
                 && valid_lifecycle_id(revision)
                 && matches!(intent.as_str(), "initial" | "resume")
-                && self.display_request.is_none()
-                && self.virtual_display_intent.is_none() => {}
+                && (self.lifecycle_capture_mode.is_external()
+                    || (self.display_request.is_none()
+                        && self.virtual_display_intent.is_none())) => {}
             _ => return Err("invalid_lifecycle_identity"),
         }
         self.validate_destination(allow_remote)?;
@@ -987,7 +960,6 @@ impl Open {
             || !video_matches
             || !audio_matches
             || !profile.matches_transport(announce)
-            || (self.frame_limiter_settings.is_some() && video.fps != profile.fps)
         {
             return None;
         }
@@ -1163,12 +1135,6 @@ impl Open {
                 "wan_mode": policy.wan_mode,
             });
         }
-        if let Some(snapshot) = &self.frame_limiter_settings {
-            payload["frame_limiter_settings"] = snapshot.clone();
-        }
-        if let Some(path) = &self.frame_limiter_executable_path {
-            payload["frame_limiter_executable_path"] = serde_json::json!(path);
-        }
         if let Some(request) = &self.display_request {
             payload["display_request"] = request.clone();
         }
@@ -1181,6 +1147,7 @@ impl Open {
         }
         if let Some(session) = &self.lifecycle_session_target {
             payload["lifecycle_session_target"] = serde_json::json!(session);
+            payload["lifecycle_capture_mode"] = serde_json::json!(self.lifecycle_capture_mode);
         }
         payload
     }
@@ -1603,102 +1570,6 @@ fn valid_display_policy_snapshot(snapshot: &serde_json::Value) -> bool {
     resolved.extend(application.clone());
     resolved.extend(client.clone());
     &resolved == effective
-}
-
-fn valid_frame_limiter_snapshot(snapshot: &serde_json::Value, stream_fps: u32) -> bool {
-    let Some(fields) = snapshot.as_object() else {
-        return false;
-    };
-    let Some(settings) = snapshot["settings"].as_object() else {
-        return false;
-    };
-    let Some(requested_fps) = stream_fps.checked_mul(1_000) else {
-        return false;
-    };
-    if fields.len() != 9
-        || settings.len() != 11
-        || snapshot["version"] != 1
-        || snapshot["requested_stream_fps_millihz"] != requested_fps
-        || !matches!(settings["frame_limiter_enable"], serde_json::Value::Bool(_))
-        || settings["frame_limiter_fps_limit_millihz"]
-            .as_u64()
-            .is_none_or(|fps| fps > 1_000_000)
-        || !matches!(
-            settings["frame_limiter_disable_vsync"],
-            serde_json::Value::Bool(_)
-        )
-        || !matches!(
-            settings["rtss_allow_virtual_display_override"],
-            serde_json::Value::Bool(_)
-        )
-        || !matches!(
-            settings["mangohud_always_show_graph"],
-            serde_json::Value::Bool(_)
-        )
-        || !matches!(
-            settings["frame_limiter_provider"].as_str(),
-            Some(
-                "auto"
-                    | "rtss"
-                    | "nvidia-control-panel"
-                    | "mangohud"
-                    | "proton"
-                    | "mangohud-proton"
-                    | "none"
-            )
-        )
-        || !matches!(
-            settings["frame_limiter_auto_virtual_framegen"].as_str(),
-            Some("enabled" | "vrr" | "legacy" | "disabled")
-        )
-        || !matches!(
-            settings["rtss_frame_limit_type"].as_str(),
-            Some("async" | "front edge sync" | "back edge sync" | "nvidia reflex")
-        )
-        || !matches!(
-            settings["mangohud_preset"].as_str(),
-            Some("custom" | "1" | "2" | "3" | "4")
-        )
-        || !matches!(
-            settings["mangohud_limiter_method"].as_str(),
-            Some("early" | "late")
-        )
-        || settings["rtss_install_path"]
-            .as_str()
-            .is_none_or(|path| path.len() > 4096 || path.chars().any(char::is_control))
-    {
-        return false;
-    }
-    for rate in [
-        "client_display_mode_override_millihz",
-        "lossless_scaling_limit_millihz",
-    ] {
-        if !fields.contains_key(rate)
-            || (!snapshot[rate].is_null()
-                && snapshot[rate].as_u64().is_none_or(|rate| rate > 1_000_000))
-        {
-            return false;
-        }
-    }
-    for flag in [
-        "virtual_display_active",
-        "physical_framegen_capture",
-        "rtss_frame_limit_type_explicit_override",
-    ] {
-        if !fields.contains_key(flag) || (!snapshot[flag].is_null() && !snapshot[flag].is_boolean())
-        {
-            return false;
-        }
-    }
-    fields.contains_key("game_frame_generation_mode")
-        && matches!(
-            snapshot["game_frame_generation_mode"].as_str(),
-            None | Some(
-                "none" | "lossless-scaling" | "game-provided" | "nvidia-smooth-motion" | "other"
-            )
-        )
-        && (snapshot["game_frame_generation_mode"].is_null()
-            || snapshot["game_frame_generation_mode"].is_string())
 }
 
 fn default_stream_audio() -> bool {
@@ -2204,121 +2075,6 @@ mod tests {
 
         let legacy = open().prepare("legacy", None);
         assert!(legacy.get("video_encryption_policy").is_none());
-    }
-
-    #[test]
-    fn frozen_frame_limiter_snapshot_reaches_stream_preparation() {
-        let mut value = open_json();
-        value["application_operation_id"] = json!("launch-one");
-        value["app_id"] = json!("app-0000000000000001");
-        value["catalog_revision"] = json!(1);
-        value["frame_limiter_settings"] = json!({
-            "version":1,
-            "settings":{
-                "frame_limiter_enable":true,
-                "frame_limiter_fps_limit_millihz":60000,
-                "frame_limiter_provider":"auto",
-                "frame_limiter_disable_vsync":false,
-                "frame_limiter_auto_virtual_framegen":"enabled",
-                "rtss_frame_limit_type":"back edge sync",
-                "rtss_allow_virtual_display_override":false,
-                "rtss_install_path":"",
-                "mangohud_limiter_method":"late",
-                "mangohud_preset":"custom",
-                "mangohud_always_show_graph":false
-            },
-            "requested_stream_fps_millihz":60000,
-            "client_display_mode_override_millihz":null,
-            "lossless_scaling_limit_millihz":null,
-            "virtual_display_active":null,
-            "physical_framegen_capture":null,
-            "game_frame_generation_mode":null,
-            "rtss_frame_limit_type_explicit_override":true
-        });
-        value["frame_limiter_executable_path"] = json!("C:\\Games\\Example.exe");
-        let request: Open = serde_json::from_value(value.clone()).unwrap();
-        assert!(request.validate(false).is_ok());
-        let prepare = request.prepare("frozen", None);
-        assert_eq!(
-            prepare["frame_limiter_settings"],
-            value["frame_limiter_settings"]
-        );
-        assert_eq!(
-            prepare["frame_limiter_executable_path"],
-            value["frame_limiter_executable_path"]
-        );
-
-        let mut combined = value.clone();
-        combined["display_request"] = json!({
-            "expected_topology_revision":"aa".repeat(16),
-            "configuration":{"displays":[
-                {"id":"one","width":1920,"height":1080,
-                 "refresh":{"numerator":60,"denominator":1},"x":0,"y":0}
-            ]},
-            "mode_policy":{"display_id":"one","remapping":{},"context":{
-                "resolution_is_automatic":true,"refresh_rate_is_automatic":true,
-                "client_display_mode_override":false,"optimize_game_settings":false
-            }}
-        });
-        combined["display_admission_token"] = json!("ab".repeat(32));
-        combined["display_policy_snapshot"] = json!({
-            "global_revision":1,"global_overrides":{},"catalog_revision":1,
-            "certificate_id":"cd".repeat(32),"application_overrides":{},
-            "client_overrides":{},"effective_overrides":{}
-        });
-        let consistent: Open = serde_json::from_value(combined.clone()).unwrap();
-        consistent.validate(false).unwrap();
-        combined["display_policy_snapshot"]["catalog_revision"] = json!(2);
-        let inconsistent: Open = serde_json::from_value(combined).unwrap();
-        assert_eq!(
-            inconsistent.validate(false),
-            Err("frame_limiter_unattested")
-        );
-
-        let mut unbound = value.clone();
-        unbound.as_object_mut().unwrap().remove("app_id");
-        let unbound: Open = serde_json::from_value(unbound).unwrap();
-        assert_eq!(unbound.validate(false), Err("frame_limiter_unattested"));
-
-        value["frame_limiter_settings"]["requested_stream_fps_millihz"] = json!(120000);
-        let mismatched: Open = serde_json::from_value(value).unwrap();
-        assert_eq!(
-            mismatched.validate(false),
-            Err("invalid_frame_limiter_snapshot")
-        );
-        let mut missing_path = open_json();
-        missing_path["frame_limiter_settings"] = prepare["frame_limiter_settings"].clone();
-        let missing_path: Open = serde_json::from_value(missing_path).unwrap();
-        assert_eq!(
-            missing_path.validate(false),
-            Err("invalid_frame_limiter_snapshot")
-        );
-
-        for path in ["  ", "C:\\Games\\Bad\nName.exe"] {
-            let mut invalid = open_json();
-            invalid["application_operation_id"] = json!("launch-one");
-            invalid["app_id"] = json!("app-0000000000000001");
-            invalid["catalog_revision"] = json!(1);
-            invalid["frame_limiter_settings"] = prepare["frame_limiter_settings"].clone();
-            invalid["frame_limiter_executable_path"] = json!(path);
-            let invalid: Open = serde_json::from_value(invalid).unwrap();
-            assert_eq!(invalid.validate(false), Err("invalid_executable_path"));
-        }
-        for install_path in ["C:\\RTSS\\Bad\nName", &"x".repeat(4097)] {
-            let mut invalid = open_json();
-            invalid["application_operation_id"] = json!("launch-one");
-            invalid["app_id"] = json!("app-0000000000000001");
-            invalid["catalog_revision"] = json!(1);
-            invalid["frame_limiter_settings"] = prepare["frame_limiter_settings"].clone();
-            invalid["frame_limiter_settings"]["settings"]["rtss_install_path"] =
-                json!(install_path);
-            invalid["frame_limiter_executable_path"] = json!("C:\\Games\\Example.exe");
-            let invalid: Open = serde_json::from_value(invalid).unwrap();
-            assert_eq!(
-                invalid.validate(false),
-                Err("invalid_frame_limiter_snapshot")
-            );
-        }
     }
 
     #[test]
@@ -2908,6 +2664,12 @@ mod tests {
     #[test]
     fn unknown_fields_are_rejected_at_every_configuration_boundary() {
         assert!(serde_json::from_value::<Settings>(json!({"listen_backlog": 8})).is_err());
+
+        for field in ["frame_limiter_settings", "frame_limiter_executable_path"] {
+            let mut operation = open_operation_json();
+            operation[field] = json!({});
+            assert!(serde_json::from_value::<Operation>(operation).is_err());
+        }
 
         let mut operation = open_operation_json();
         operation["administrator"] = json!(true);

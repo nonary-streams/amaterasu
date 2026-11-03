@@ -17,6 +17,10 @@ pub(super) const KEY: &str = "stream-session/lifecycle/v1";
 const FORMAT_VERSION: u32 = 1;
 const MAX_ENTRIES: usize = 2;
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 pub(super) type Send<'a> = dyn FnMut(amaterasu_module_sdk::Command) -> ModuleResult<Response> + 'a;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -40,9 +44,19 @@ pub(super) struct Entry {
     pub display_attempted: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_operation_id: Option<String>,
-    pub limiter_attempted: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub limiter_executable_path: Option<String>,
+    // Read-only v1 migration markers. An old effect is never silently retired.
+    #[serde(
+        default,
+        rename = "limiter_attempted",
+        skip_serializing_if = "is_false"
+    )]
+    pub legacy_effect_pending: bool,
+    #[serde(
+        default,
+        rename = "limiter_executable_path",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub legacy_effect_target: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -155,11 +169,8 @@ impl Entry {
                 .flatten(),
             display_attempted: record.display_attempted,
             display_operation_id: record.display_attempted.then(|| record.display_operation()),
-            limiter_attempted: record.limiter_attempted,
-            limiter_executable_path: record
-                .limiter_attempted
-                .then(|| record.config.frame_limiter_executable_path.clone())
-                .flatten(),
+            legacy_effect_pending: false,
+            legacy_effect_target: None,
         }
     }
 
@@ -178,10 +189,8 @@ impl Entry {
                     && operation.len() <= 128
                     && operation.bytes().all(|byte| byte.is_ascii_graphic())
             })
-            && (self.limiter_attempted == self.limiter_executable_path.is_some())
-            && self.limiter_executable_path.as_ref().is_none_or(|path| {
-                !path.trim().is_empty() && path.len() <= 4096 && !path.chars().any(char::is_control)
-            })
+            && !self.legacy_effect_pending
+            && self.legacy_effect_target.is_none()
             && self.attempted_resources.len() <= 6
             && self.attempted_resources.iter().all(|resource| {
                 matches!(
@@ -200,11 +209,6 @@ impl Entry {
         if !self.validate() {
             return Err("invalid_lifecycle_journal_entry");
         }
-        // Old process handles and epochs cannot authorize lifecycle cleanup.
-        // Preserve this entry and block admission until the authority can reconcile it.
-        if self.lifecycle_recovery.is_some() {
-            return Err("lifecycle_reconciliation_required");
-        }
         let config: PrepareConfig = serde_json::from_value(json!({
             "peer_ip":"127.0.0.1",
             "key_hex":"00000000000000000000000000000000",
@@ -214,6 +218,25 @@ impl Entry {
         }))
         .map_err(|_| "invalid_lifecycle_journal_entry")?;
         let mut record = Record::new(self.record_id, self.owner.clone(), config, 30_000);
+        if let Some(recovery) = &self.lifecycle_recovery {
+            if recovery.version != 1
+                || recovery.plan_revision.is_some()
+                || recovery.stream_target.is_none()
+            {
+                return Err("lifecycle_reconciliation_required");
+            }
+            record.restart_lifecycle_target = recovery.stream_target.clone();
+            let mut nonce = [0u8; 16];
+            getrandom::fill(&mut nonce).map_err(|_| "entropy_unavailable")?;
+            record.restart_lifecycle_operation = Some(format!(
+                "ss-{:016x}-restart-retire-{:032x}",
+                self.record_id,
+                u128::from_le_bytes(nonce)
+            ));
+            // This is a retired-process cleanup marker, not a live binding fence.
+            // The coordinator verifies the old epoch and exact consumer scope.
+            record.lifecycle_fenced = true;
+        }
         record.providers = self.providers.clone();
         record.attempted = self
             .attempted_resources
@@ -229,8 +252,6 @@ impl Entry {
             .map(VirtualDisplayRecovery::recovery_intent);
         record.display_operation_id = self.display_operation_id.clone();
         record.display_attempted = self.display_attempted;
-        record.limiter_attempted = self.limiter_attempted;
-        record.config.frame_limiter_executable_path = self.limiter_executable_path.clone();
         record.state = super::record::State::Stopping;
         record.outcome = super::record::State::Failed;
         record.error = Some("host_restart_recovery");
@@ -509,12 +530,24 @@ mod tests {
         entry.attempted_resources.insert("unknown-provider".into());
         assert!(!entry.validate());
         let mut entry = Entry::from_record(&record());
-        entry.limiter_attempted = true;
+        entry.legacy_effect_pending = true;
         assert!(!entry.validate());
-        entry.limiter_executable_path = Some("bad\npath".into());
+        entry.legacy_effect_target = Some("bad\npath".into());
         assert!(!entry.validate());
-        entry.limiter_executable_path = Some("x".repeat(4097));
+        entry.legacy_effect_target = Some("x".repeat(4097));
         assert!(!entry.validate());
+    }
+
+    #[test]
+    fn inactive_legacy_effect_markers_are_readable_but_never_written_again() {
+        let mut old = serde_json::to_value(Entry::from_record(&record())).unwrap();
+        old["limiter_attempted"] = json!(false);
+        old["limiter_executable_path"] = Value::Null;
+        let entry: Entry = serde_json::from_value(old).unwrap();
+        assert!(entry.validate());
+        let current = serde_json::to_value(entry).unwrap();
+        assert!(current.get("limiter_attempted").is_none());
+        assert!(current.get("limiter_executable_path").is_none());
     }
 
     #[test]

@@ -28,6 +28,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from test_component_updates import CARGO, ComponentHarness, run
 from test_control_transport import encrypt_control, wait_connected
 from test_host_service import Console
+from test_linux_session_profile import isolated_environment
 from test_management_api import Api, ORIGIN, PASSWORD, available_moonlight_port_pair
 from test_native_media import inverse, parity_row
 from test_nvhttp import FIXTURES, get, pair, successful, tls_context, wait_for
@@ -118,6 +119,10 @@ def configure(harness, custom_capture=False, direct=False, generic_cpu=False):
             bootstrap["policy"]["principals"]["amaterasu.media-probe"]["call"].append(CUSTOM_CAPTURE)
     settings["amaterasu.encode"] = {"enabled": True}
     settings["amaterasu.audio-encode"] = {"enabled": True}
+    # The probe package grants only the legacy limiter service. The development
+    # bootstrap also configures its optional registry/lifecycle bridge, whose
+    # nonary service is deliberately absent from this fixture's manifest.
+    settings["amaterasu.frame-limiter"] = {}
     if direct:
         settings["amaterasu.nvhttp"]["enabled"] = False
         settings["amaterasu.rtsp"]["enabled"] = False
@@ -252,6 +257,9 @@ def reassemble_video(datagrams, key):
         payload = b"".join(parts[index][32:] for index in range(count))
         # Bytes 1 and 2 carry the measured host processing latency.
         assert payload[0] == 1 and payload[6:8] == bytes(2), payload[:8].hex()
+        # Synthetic CPU capture supplies no independent processing clock.
+        # Do not derive it from the presentation timestamp used by RTP.
+        assert payload[1:3] == bytes(2), (frame, payload[:8].hex())
         final_size = int.from_bytes(payload[4:6], "little")
         assert 0 < final_size <= 1008
         actual_size = (count - 1) * 1008 + final_size
@@ -368,7 +376,7 @@ def main():
         directory = Path(temporary)
         harness = ComponentHarness(directory)
         configure(harness, custom_capture, generic_cpu=arguments.generic_cpu)
-        console = Console(harness)
+        console = Console(harness, environment=isolated_environment(directory))
         try:
             wait_ready(console)
             https, context = initialize(console, arguments.encoder)

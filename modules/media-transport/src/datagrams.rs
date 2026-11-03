@@ -517,6 +517,9 @@ impl Delivery {
     }
 
     pub fn fail(&mut self, code: &'static str) {
+        if self.failure.is_none() {
+            eprintln!("amaterasu media transport failed code={code}");
+        }
         self.failure = Some(code);
         self.discarded_datagrams = self
             .discarded_datagrams

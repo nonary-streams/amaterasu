@@ -70,6 +70,7 @@ struct Completed {
     kind: AsyncKind,
     queue_wait_us: u64,
     operation_us: u64,
+    native_stages: Option<NativeStageTimings>,
 }
 
 struct Request {
@@ -82,6 +83,46 @@ struct Request {
 struct Pending {
     kind: AsyncKind,
     response: Receiver<Completed>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[repr(C)]
+pub struct NativeStageTimings {
+    pub import_convert_us: u64,
+    pub interop_copy_us: u64,
+    pub map_input_us: u64,
+    pub submit_picture_us: u64,
+    pub lock_output_us: u64,
+    pub stream_ordered: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct NativeStageTotals {
+    pub samples: u64,
+    pub import_convert_us: u64,
+    pub interop_copy_us: u64,
+    pub map_input_us: u64,
+    pub submit_picture_us: u64,
+    pub lock_output_us: u64,
+    pub stream_ordered_samples: u64,
+}
+
+impl NativeStageTotals {
+    fn record(&mut self, sample: NativeStageTimings) {
+        self.samples = self.samples.saturating_add(1);
+        self.import_convert_us = self
+            .import_convert_us
+            .saturating_add(sample.import_convert_us);
+        self.interop_copy_us = self.interop_copy_us.saturating_add(sample.interop_copy_us);
+        self.map_input_us = self.map_input_us.saturating_add(sample.map_input_us);
+        self.submit_picture_us = self
+            .submit_picture_us
+            .saturating_add(sample.submit_picture_us);
+        self.lock_output_us = self.lock_output_us.saturating_add(sample.lock_output_us);
+        self.stream_ordered_samples = self
+            .stream_ordered_samples
+            .saturating_add(u64::from(sample.stream_ordered != 0));
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
@@ -101,6 +142,7 @@ pub struct Metrics {
     pub drain_max_us: u64,
     pub busy_submissions: u64,
     pub pending_operations: u64,
+    pub native_stage_totals: Option<NativeStageTotals>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,6 +164,9 @@ pub(crate) trait WorkerBackend {
     fn submit(&mut self, data: Vec<u8>, timestamp: i64, force: bool) -> Result<(), &'static str>;
     fn receive(&mut self) -> Result<Option<Packet>, &'static str>;
     fn drain(&mut self) -> Result<(), &'static str>;
+    fn native_stage_timings(&self) -> Option<NativeStageTimings> {
+        None
+    }
     /// Reported once, on the worker thread, right after the backend opens.
     fn input_support(&self) -> InputSupport {
         InputSupport::default()
@@ -143,6 +188,9 @@ pub(crate) trait WorkerBackend {
 }
 
 impl WorkerBackend for platform::Encoder {
+    fn native_stage_timings(&self) -> Option<NativeStageTimings> {
+        platform::Encoder::native_stage_timings(self)
+    }
     fn uses_background_encode(&self) -> bool {
         platform::Encoder::uses_background_encode(self)
     }
@@ -206,15 +254,26 @@ impl Worker {
         identity: EncoderIdentity,
         config: Configuration,
         emitter: amaterasu_module_sdk::LogEmitter,
+        notifier: amaterasu_module_sdk::WorkNotifier,
     ) -> Result<Self, &'static str> {
-        Self::start(move || {
-            platform::Encoder::open_with_log_emitter(&identity, &config, Some(emitter))
-                .map(|encoder| Box::new(encoder) as Box<dyn WorkerBackend>)
-        })
+        Self::start_with_notifier(
+            move || {
+                platform::Encoder::open_with_log_emitter(&identity, &config, Some(emitter))
+                    .map(|encoder| Box::new(encoder) as Box<dyn WorkerBackend>)
+            },
+            Some(notifier),
+        )
     }
 
     fn start(
         open_backend: impl FnOnce() -> Result<Box<dyn WorkerBackend>, &'static str> + Send + 'static,
+    ) -> Result<Self, &'static str> {
+        Self::start_with_notifier(open_backend, None)
+    }
+
+    fn start_with_notifier(
+        open_backend: impl FnOnce() -> Result<Box<dyn WorkerBackend>, &'static str> + Send + 'static,
+        notifier: Option<amaterasu_module_sdk::WorkNotifier>,
     ) -> Result<Self, &'static str> {
         let (sender, receiver) = mpsc::sync_channel::<Request>(ASYNC_QUEUE_CAPACITY);
         let (ready, initialized) = mpsc::sync_channel(1);
@@ -223,6 +282,9 @@ impl Worker {
         let thread = thread::Builder::new()
             .name("amaterasu-h264".into())
             .spawn(move || {
+                amaterasu_module_sdk::threading::configure_worker_priority(
+                    amaterasu_module_sdk::threading::ThreadPriority::High,
+                );
                 let mut encoder = match open_backend() {
                     Ok(encoder) => encoder,
                     Err(error) => {
@@ -245,6 +307,10 @@ impl Worker {
                 let mut failed = false;
                 while let Ok(request) = receiver.recv() {
                     let started_at = Instant::now();
+                    let is_dmabuf = matches!(
+                        &request.operation,
+                        Operation::SubmitGpu(GpuInput::DmaBuf(_), ..)
+                    );
                     let queue_wait_us =
                         duration_micros(started_at.saturating_duration_since(request.queued_at));
                     let result = if failed {
@@ -263,20 +329,35 @@ impl Worker {
                             Operation::Drain => encoder.drain().map(|()| Reply::Done),
                         }
                     };
+                    let work_ready = result.is_err()
+                        || matches!(&result, Ok(Reply::Packet(Some(_))))
+                        || matches!(request.kind, AsyncKind::Submit | AsyncKind::Drain);
                     if result.is_err() {
                         failed = true;
                     }
                     let operation_us = duration_micros(started_at.elapsed());
-                    if request
+                    let native_stages = if result.is_ok() && is_dmabuf {
+                        encoder.native_stage_timings()
+                    } else {
+                        None
+                    };
+                    let delivered = request
                         .reply
                         .send(Completed {
                             result,
                             kind: request.kind,
                             queue_wait_us,
                             operation_us,
+                            native_stages,
                         })
-                        .is_err()
+                        .is_ok();
+                    if delivered
+                        && work_ready
+                        && let Some(notifier) = &notifier
                     {
+                        notifier.notify();
+                    }
+                    if !delivered {
                         // An abandoned asynchronous reply is expected during close.
                         if worker_cancel.is_cancelled() {
                             continue;
@@ -444,6 +525,12 @@ impl Worker {
     }
 
     fn record_completion(&mut self, completed: &Completed) {
+        if let Some(sample) = completed.native_stages {
+            self.metrics
+                .native_stage_totals
+                .get_or_insert_with(Default::default)
+                .record(sample);
+        }
         self.metrics.queue_wait_us_total = self
             .metrics
             .queue_wait_us_total
@@ -479,6 +566,12 @@ impl Worker {
     pub fn metrics(&mut self) -> Result<Metrics, &'static str> {
         self.poll_background()?;
         Ok(self.metrics)
+    }
+
+    /// Read only completions already observed by normal media operations.
+    /// Logging must not consume a worker error or change operation ordering.
+    pub fn observed_metrics(&self) -> Metrics {
+        self.metrics
     }
 
     pub fn submit(
@@ -634,6 +727,28 @@ pub fn enumerate() -> Result<Vec<EncoderDescription>, &'static str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_stage_totals_preserve_independent_measurements_and_saturate() {
+        let mut totals = super::NativeStageTotals::default();
+        totals.record(super::NativeStageTimings {
+            import_convert_us: 100,
+            interop_copy_us: 200,
+            map_input_us: 3,
+            submit_picture_us: 4,
+            lock_output_us: u64::MAX,
+            stream_ordered: 1,
+        });
+        totals.record(super::NativeStageTimings {
+            import_convert_us: 50,
+            lock_output_us: 1,
+            ..Default::default()
+        });
+        assert_eq!(totals.samples, 2);
+        assert_eq!(totals.import_convert_us, 150);
+        assert_eq!(totals.interop_copy_us, 200);
+        assert_eq!(totals.lock_output_us, u64::MAX);
+        assert_eq!(totals.stream_ordered_samples, 1);
+    }
     use super::*;
     use std::sync::{Condvar, Mutex};
 
@@ -656,6 +771,146 @@ mod tests {
                 keyframe: call == 0,
             }))
         }
+    }
+
+    #[test]
+    fn readiness_wakes_for_packets_and_submits_but_not_empty_receive_polls() {
+        use amaterasu_module_sdk::{RuntimeClient, abi::*};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        unsafe extern "C" fn notify(
+            context: *mut std::ffi::c_void,
+            input: BorrowedBytes,
+            reply: ReplySink,
+        ) -> Status {
+            // SAFETY: fixture and input are retained through this worker callback.
+            let count = unsafe { &*context.cast::<AtomicUsize>() };
+            let command: amaterasu_module_sdk::Command =
+                serde_json::from_slice(unsafe { input.read().unwrap() }).unwrap();
+            assert!(matches!(
+                command,
+                amaterasu_module_sdk::Command::NotifyWorkReady {}
+            ));
+            count.fetch_add(1, Ordering::SeqCst);
+            // SAFETY: the SDK lends this sink until synchronous invoke returns.
+            unsafe { reply.send(br#"{"kind":"ok"}"#) };
+            STATUS_OK
+        }
+        struct Backend {
+            calls: Arc<AtomicUsize>,
+        }
+        impl WorkerBackend for Backend {
+            fn uses_background_encode(&self) -> bool {
+                true
+            }
+            fn submit(&mut self, _: Vec<u8>, _: i64, _: bool) -> Result<(), &'static str> {
+                Ok(())
+            }
+            fn drain(&mut self) -> Result<(), &'static str> {
+                Ok(())
+            }
+            fn receive(&mut self) -> Result<Option<Packet>, &'static str> {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok((call == 1).then(|| Packet {
+                    bytes: vec![1],
+                    timestamp_100ns: 0,
+                    keyframe: true,
+                }))
+            }
+        }
+        let notifications = AtomicUsize::new(0);
+        let endpoint = HostApi {
+            header: AbiHeader::of::<HostApi>(),
+            context: (&notifications as *const AtomicUsize).cast_mut().cast(),
+            invoke: notify,
+        };
+        // SAFETY: notifications and endpoint live until worker is joined below.
+        let runtime = unsafe { RuntimeClient::from_endpoint(endpoint) };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend_calls = calls.clone();
+        let mut worker = Worker::start_with_notifier(
+            move || {
+                Ok(Box::new(Backend {
+                    calls: backend_calls,
+                }))
+            },
+            Some(runtime.work_notifier()),
+        )
+        .unwrap();
+        assert!(matches!(worker.receive().unwrap(), ReceiveResult::Pending));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            worker.poll_background().unwrap();
+            if worker.receive_result.is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert_eq!(
+            notifications.load(Ordering::SeqCst),
+            0,
+            "empty receive created a polling wake loop"
+        );
+        assert!(matches!(
+            worker.receive().unwrap(),
+            ReceiveResult::Ready(None)
+        ));
+        while notifications.load(Ordering::SeqCst) < 1 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        loop {
+            match worker.receive().unwrap() {
+                ReceiveResult::Ready(Some(packet)) => {
+                    assert_eq!(packet.bytes, [1]);
+                    break;
+                }
+                _ => {
+                    assert!(Instant::now() < deadline);
+                    thread::yield_now();
+                }
+            }
+        }
+        assert_eq!(
+            worker.submit(vec![0], 1, false).unwrap(),
+            SubmitResult::Accepted
+        );
+        while notifications.load(Ordering::SeqCst) < 2 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        drop(worker);
+        assert_eq!(notifications.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn diagnostic_snapshot_does_not_consume_pending_worker_results() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend_calls = calls.clone();
+        let mut worker = Worker::start(move || Ok(Box::new(PacketBackend(backend_calls)))).unwrap();
+        assert!(matches!(worker.receive().unwrap(), ReceiveResult::Pending));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while calls.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert_eq!(worker.observed_metrics().completed_operations, 0);
+        assert_eq!(worker.pending.len(), 1);
+        assert!(worker.receive_result.is_none());
+        loop {
+            match worker.receive().unwrap() {
+                ReceiveResult::Ready(Some(packet)) => {
+                    assert_eq!(packet.bytes, [0]);
+                    break;
+                }
+                ReceiveResult::Pending => {}
+                _ => panic!("pending packet was lost"),
+            }
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert_eq!(worker.observed_metrics().receive_operations, 1);
     }
 
     #[test]

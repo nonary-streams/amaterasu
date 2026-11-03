@@ -2584,22 +2584,7 @@ fn list_and_search_replies_advertise_override_capabilities_without_changing_expo
     );
     assert_eq!(created["ok"], true, "{created}");
 
-    let expected_capabilities = if cfg!(windows) {
-        json!({
-            "frame_limiter_provider":["auto","rtss","nvidia-control-panel","none"],
-            "rtss_frame_limit_type":["async","front edge sync","back edge sync","nvidia reflex"]
-        })
-    } else if cfg!(target_os = "linux") {
-        json!({
-            "frame_limiter_provider":["auto","mangohud","proton","mangohud-proton","none"],
-            "rtss_frame_limit_type":[]
-        })
-    } else {
-        json!({
-            "frame_limiter_provider":["auto"],
-            "rtss_frame_limit_type":[]
-        })
-    };
+    let expected_capabilities = json!({});
 
     let list = backend.run(&mut ordinary_pipeline, json!({"action":"list"}));
     assert_eq!(list["config_override_capabilities"], expected_capabilities);
@@ -2992,7 +2977,7 @@ fn exported_launch_resolution_returns_sparse_revisioned_preflight_rows() {
 }
 
 #[test]
-fn exported_launch_resolution_rejects_malformed_stored_frame_limiter() {
+fn exported_launch_resolution_retains_opaque_provider_options() {
     let mut pipeline = Pipeline::new_with_steam_id_export_principals(
         BTreeSet::from(["launch".into()]),
         BTreeMap::from([("nvhttp".into(), "management".into())]),
@@ -3020,8 +3005,11 @@ fn exported_launch_resolution_rejects_malformed_stored_frame_limiter() {
         "nvhttp",
         "management",
     );
-    assert_eq!(result["ok"], false);
-    assert_eq!(result["error"]["code"], "invalid_state_response");
+    assert_eq!(result["ok"], true);
+    assert_eq!(
+        result["entry"]["config_overrides"]["frame_limiter_enable"],
+        "false"
+    );
 }
 
 #[test]

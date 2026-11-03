@@ -22,7 +22,7 @@ namespace Amaterasu {
     value(): unknown;
   }
 
-  export function extensionFieldEditor(definition: ExtensionFieldDefinition, value: unknown): ExtensionFieldEditor {
+  export function extensionFieldEditor(definition: ExtensionFieldDefinition, value: unknown, choiceLabels: Record<string, string> = {}): ExtensionFieldEditor {
     switch (definition.type) {
       case "nullable": {
         if (!definition.inner) throw new Error("Invalid nullable setting.");
@@ -70,7 +70,8 @@ namespace Amaterasu {
       case "enum": {
         const control = el("select");
         for (const option of definition.options ?? []) {
-          const element = el("option", "", option);
+          const label = choiceLabels[option] ?? option;
+          const element = el("option", "", typeof Amaterasu.literalText === "function" ? Amaterasu.literalText(label) : label);
           element.value = option;
           control.append(element);
         }

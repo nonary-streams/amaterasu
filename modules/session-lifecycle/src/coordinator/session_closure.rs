@@ -335,8 +335,12 @@ impl Coordinator {
         {
             return Ok(false);
         }
-        let mut draft = self.shared.borrow().value.clone();
-        let targets: Vec<_> = draft
+        let shared = self.shared.borrow();
+        if !shared.retirement_scan_pending {
+            return Ok(false);
+        }
+        let targets: Vec<_> = shared
+            .value
             .sessions
             .values()
             .filter(|session| session.phase == SessionPhase::Ended)
@@ -346,6 +350,13 @@ impl Coordinator {
                 generation: session.generation,
             })
             .collect();
+        if targets.is_empty() {
+            drop(shared);
+            self.shared.borrow_mut().retirement_scan_pending = false;
+            return Ok(false);
+        }
+        let mut draft = shared.value.clone();
+        drop(shared);
         for target in targets {
             let Ok(certificate) =
                 session_closed_history::EndedSessionCertificate::from_verified(&draft, &target)
@@ -361,6 +372,7 @@ impl Coordinator {
             save(&self.shared, draft)?;
             return Ok(true);
         }
+        self.shared.borrow_mut().retirement_scan_pending = false;
         Ok(false)
     }
 

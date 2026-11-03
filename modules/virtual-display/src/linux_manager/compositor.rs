@@ -51,6 +51,10 @@ pub(super) trait Compositor: Send {
     fn restore(&mut self, _layout: Option<&Layout>) -> Result<(), String> {
         Ok(())
     }
+    /// Returns false only when the owned output is still observable but no
+    /// distinct active output can guard its removal.
+    fn verify_removal_guard(&mut self, output: &str) -> Result<bool, String>;
+    fn verify_parked(&mut self, output: &str) -> Result<(), String>;
     fn configure(
         &mut self,
         output: &str,
@@ -131,6 +135,59 @@ impl Compositor for KScreen {
         }
         Ok(())
     }
+    fn verify_removal_guard(&mut self, output: &str) -> Result<bool, String> {
+        let configuration = query()?;
+        let outputs = configuration["outputs"]
+            .as_array()
+            .ok_or("missing KScreen outputs")?;
+        let mut observer =
+            super::observer::Observer::open().ok_or("cannot observe surviving Wayland output")?;
+        let guarded = outputs.iter().any(|candidate| {
+            candidate["connected"] == true
+                && candidate["enabled"] == true
+                && candidate["name"].as_str().is_some_and(|name| {
+                    name != output
+                        && observer.read(name).is_some_and(|seen| {
+                            seen.width > 0 && seen.height > 0 && seen.refresh > 0
+                        })
+                })
+        });
+        if guarded {
+            return Ok(true);
+        }
+        let owned_active = outputs.iter().any(|candidate| {
+            candidate["name"] == output
+                && candidate["connected"] == true
+                && candidate["enabled"] == true
+        });
+        if owned_active
+            && observer
+                .read(output)
+                .is_some_and(|seen| seen.width > 0 && seen.height > 0 && seen.refresh > 0)
+        {
+            Ok(false)
+        } else {
+            Err("neither a surviving output nor the owned output can be observed".into())
+        }
+    }
+    fn verify_parked(&mut self, output: &str) -> Result<(), String> {
+        let configuration = query()?;
+        let active = configuration["outputs"].as_array().is_some_and(|outputs| {
+            outputs.iter().any(|candidate| {
+                candidate["name"] == output
+                    && candidate["connected"] == true
+                    && candidate["enabled"] == true
+            })
+        });
+        let observed = super::observer::Observer::open()
+            .and_then(|mut observer| observer.read(output))
+            .is_some_and(|seen| seen.width > 0 && seen.height > 0 && seen.refresh > 0);
+        if active && observed {
+            Ok(())
+        } else {
+            Err("owned output is not observable for parking".into())
+        }
+    }
     fn configure(
         &mut self,
         output: &str,
@@ -175,11 +232,11 @@ impl Compositor for KScreen {
             Some(layout) => layout.arguments(&configuration)?,
             None => Vec::new(),
         };
-        arguments.extend(target.arguments(
-            output,
-            right,
-            layout.map_or(1, Layout::next_priority) as usize,
-        ));
+        let priority = match layout {
+            Some(layout) => layout.next_priority() as usize,
+            None => live_next_priority(&configuration, output)?,
+        };
+        arguments.extend(target.arguments(output, right, priority));
         run(&arguments)?;
         let confirmed = query()?;
         if layout.is_some_and(|layout| !layout.matches(&confirmed)) {
@@ -446,6 +503,22 @@ fn mode(configuration: &Value, output: &str, spec: &Specification) -> Option<Str
         .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
         .map(str::to_owned)
 }
+fn live_next_priority(configuration: &Value, owned: &str) -> Result<usize, String> {
+    let outputs = configuration["outputs"]
+        .as_array()
+        .ok_or("missing current outputs")?;
+    if outputs.len() > 64 {
+        return Err("too many outputs".into());
+    }
+    Ok(outputs
+        .iter()
+        .filter(|output| {
+            output["name"] != owned && output["connected"] == true && output["enabled"] == true
+        })
+        .count()
+        + 1)
+}
+
 fn right_edge(configuration: &Value, owned: &str) -> Result<i64, String> {
     right_edge_of(configuration, |name| name != owned)
 }
@@ -608,6 +681,9 @@ mod tests {
             {"name":"Virtual-2","connected":true,"enabled":true,"pos":{"x":0},"size":{"width":1920,"height":1080},"scale":1,"rotation":1}]});
         assert_eq!(right_edge(&configuration, "Virtual-2").unwrap(), 1536);
         assert_eq!(configuration["outputs"][0]["pos"]["x"], 0);
+        assert_eq!(live_next_priority(&configuration, "Virtual-2").unwrap(), 2);
+        let no_survivor = json!({"outputs":[{"name":"Virtual-2","connected":true,"enabled":true}]});
+        assert_eq!(live_next_priority(&no_survivor, "Virtual-2").unwrap(), 1);
     }
     #[test]
     fn exclusive_turns_off_only_other_enabled_displays_amaterasu_does_not_own() {

@@ -1,4 +1,4 @@
-//! Bounded host-scope provider settings snapshot, read before session effects.
+//! Bounded provider settings snapshots, read before session and stream effects.
 use crate::adapter::ParticipantSettings;
 use amaterasu_module_sdk::{Command, ModuleResult, Response};
 use serde::{Deserialize, Serialize};
@@ -8,6 +8,71 @@ use std::collections::{BTreeMap, BTreeSet};
 const MAX_PROVIDERS: usize = 32;
 const MAX_SETTINGS_BYTES: usize = 8192;
 const MAX_REGISTRY_RESPONSE_BYTES: usize = 12_000;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct SnapshotScopes {
+    application: Option<String>,
+    paired_client: Option<String>,
+    session: Option<String>,
+}
+
+impl SnapshotScopes {
+    /// Select from the admitted transition, never from provider-supplied data.
+    pub(super) fn from_work(journal: &super::Journal, work: &super::Work) -> ModuleResult<Self> {
+        let (_, session_id, _, _) = super::operations::target_parts(&work.target)?;
+        let session = journal.sessions.get(session_id).ok_or("unknown_session")?;
+        super::operations::checked_target(
+            journal,
+            &work.target,
+            &session.owner.caller,
+            &session.owner.initiator,
+        )?;
+        let application = (session.application_ref["kind"] == "application")
+            .then(|| {
+                session.application_ref["app_id"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .flatten();
+        let mut receipts = journal.receipts.values().filter(|receipt| {
+            receipt.work.as_ref().is_some_and(|pending| {
+                pending.target == work.target && pending.transition_id == work.transition_id
+            })
+        });
+        let client = receipts
+            .next()
+            .and_then(|receipt| receipt.request.get("client_context"));
+        if receipts.next().is_some() {
+            return Err("ambiguous_settings_context".into());
+        }
+        let paired_client = match client {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                let client: amaterasu_extension_api::ClientContext =
+                    serde_json::from_value(value.clone()).map_err(|_| "invalid_client_context")?;
+                if !client.validate() {
+                    return Err("invalid_client_context".into());
+                }
+                client.client_ref
+            }
+        };
+        Ok(Self {
+            application,
+            paired_client,
+            session: Some(session_id.into()),
+        })
+    }
+
+    fn valid(&self) -> bool {
+        [&self.application, &self.paired_client, &self.session]
+            .into_iter()
+            .all(|id| {
+                id.as_deref().is_none_or(|id| {
+                    !id.is_empty() && id.len() <= 256 && !id.chars().any(char::is_control)
+                })
+            })
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -41,11 +106,19 @@ pub struct SettingsSnapshotJob {
     index: usize,
     snapshots: BTreeMap<String, FrozenSettings>,
     stage: Stage,
+    scopes: SnapshotScopes,
 }
 
 impl SettingsSnapshotJob {
-    pub fn new(service: Option<&str>, participants: &[ParticipantSettings]) -> ModuleResult<Self> {
-        if participants.len() > MAX_PROVIDERS || service.is_some_and(str::is_empty) {
+    pub(super) fn new(
+        service: Option<&str>,
+        participants: &[ParticipantSettings],
+        scopes: SnapshotScopes,
+    ) -> ModuleResult<Self> {
+        if participants.len() > MAX_PROVIDERS
+            || service.is_some_and(str::is_empty)
+            || !scopes.valid()
+        {
             return Err("invalid settings snapshot configuration".into());
         }
         let mut seen = BTreeSet::new();
@@ -84,6 +157,7 @@ impl SettingsSnapshotJob {
             index,
             snapshots,
             stage: Stage::Submit,
+            scopes,
         })
     }
 
@@ -119,7 +193,7 @@ impl SettingsSnapshotJob {
                     .map_err(|_| "settings snapshot entropy unavailable")?;
                 let command = Command::Request {
                     service: self.service.clone().ok_or("registry service unavailable")?,
-                    payload: json!({"operation":"settings_get", "provider":self.participants[self.index].provider, "scope":{"kind":"host"}, "application":null, "paired_client":null, "session":null}),
+                    payload: json!({"operation":"settings_get", "provider":self.participants[self.index].provider, "scope":{"kind":"host"}, "application":self.scopes.application, "paired_client":self.scopes.paired_client, "session":self.scopes.session}),
                     timeout_ms: 5000,
                     operation_id,
                     parent: None,
@@ -241,11 +315,106 @@ mod tests {
             payload: json!({"ok":true,"status":"ok","revision":revision,"values":{},"effective":{"x":{"value":value,"source":{"kind":"host"}}}}),
         }
     }
+
+    #[test]
+    fn admitted_context_selects_scopes_and_request_waits_for_result_release() {
+        let root = std::env::temp_dir().join(format!(
+            "limiter-scopes-{}-{}",
+            std::process::id(),
+            amaterasu_storage::random_identifier().unwrap()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut coordinator = super::super::Coordinator::open(&root.join("journal.json")).unwrap();
+        let admitted = coordinator.handle(
+            "transport",
+            "client",
+            json!({
+                "operation":"prepare","operation_id":"prepare",
+                "application_ref":{"kind":"application","app_id":"game"},
+                "client_context":{"client_ref":"paired-client","display_mode":null}
+            }),
+        );
+        assert_eq!(admitted["status"], "pending");
+        let journal = coordinator.shared.borrow();
+        let work = journal
+            .value
+            .receipts
+            .values()
+            .find_map(|receipt| receipt.work.as_ref())
+            .unwrap();
+        let scopes = SnapshotScopes::from_work(&journal.value, work).unwrap();
+        assert_eq!(scopes.application.as_deref(), Some("game"));
+        assert_eq!(scopes.paired_client.as_deref(), Some("paired-client"));
+        assert_eq!(scopes.session.as_deref(), admitted["session_id"].as_str());
+        let mut invalid = work.clone();
+        invalid.target = serde_json::from_value(json!({"kind":"session","host_epoch":"foreign","session_id":admitted["session_id"],"generation":1})).unwrap();
+        assert!(SnapshotScopes::from_work(&journal.value, &invalid).is_err());
+        let mut resumed = journal.value.clone();
+        let mut receipt = resumed
+            .receipts
+            .values()
+            .find(|receipt| receipt.work.is_some())
+            .unwrap()
+            .clone();
+        let session_id = admitted["session_id"].as_str().unwrap();
+        resumed.sessions.get_mut(session_id).unwrap().streams.insert("stream".into(), serde_json::from_value(json!({
+            "generation":2,"phase":"preparing","candidate":null,"required":[],"acknowledgements":[],"retirements":[]
+        })).unwrap());
+        receipt.request["client_context"]["client_ref"] = json!("resumed-client");
+        let work = receipt.work.as_mut().unwrap();
+        work.transition_id = "resume".into();
+        work.target =
+            serde_json::from_value(json!({"kind":"stream","host_epoch":admitted["host_epoch"],
+            "session_id":session_id,"stream_id":"stream","generation":2}))
+            .unwrap();
+        let stream_work = work.clone();
+        resumed.receipts.insert("resumed".into(), receipt);
+        let stream_scopes = SnapshotScopes::from_work(&resumed, &stream_work).unwrap();
+        assert_eq!(
+            stream_scopes.paired_client.as_deref(),
+            Some("resumed-client")
+        );
+        assert_eq!(stream_scopes.application, scopes.application);
+        assert_eq!(stream_scopes.session, scopes.session);
+        assert_eq!(scopes.paired_client.as_deref(), Some("paired-client"));
+        drop(journal);
+        let mut job =
+            SettingsSnapshotJob::new(Some("registry/1"), &[participant("limiter")], scopes)
+                .unwrap();
+        let mut commands = Vec::new();
+        let mut replies = VecDeque::from([
+            Response::Accepted { id: 1 },
+            registry_result(json!(false), 9),
+            Response::Ok,
+        ]);
+        let mut send = |command| {
+            commands.push(command);
+            Ok(replies.pop_front().unwrap())
+        };
+        assert!(job.advance(&mut send).unwrap().is_none());
+        assert!(job.advance(&mut send).unwrap().is_none());
+        let result = job.advance(&mut send).unwrap().unwrap();
+        assert_eq!(result["limiter"].settings, json!({"x":false}));
+        assert!(
+            matches!(&commands[0], Command::Request{payload,parent:None,..}
+            if payload["application"] == "game" && payload["paired_client"] == "paired-client"
+                && payload["session"] == admitted["session_id"])
+        );
+        assert!(matches!(commands[2], Command::ReleaseResult { request: 1 }));
+        drop(coordinator);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn two_providers_are_frozen_only_after_every_result_is_released() {
         let mut job = SettingsSnapshotJob::new(
             Some("amaterasu.extension-registry/1"),
             &[participant("a"), participant("b")],
+            SnapshotScopes::default(),
         )
         .unwrap();
         let mut replies = VecDeque::from([
@@ -285,8 +454,12 @@ mod tests {
             },
             Response::error("deadline_exceeded", "expired"),
         ] {
-            let mut job =
-                SettingsSnapshotJob::new(Some("registry/1"), &[participant("a")]).unwrap();
+            let mut job = SettingsSnapshotJob::new(
+                Some("registry/1"),
+                &[participant("a")],
+                SnapshotScopes::default(),
+            )
+            .unwrap();
             let mut replies = VecDeque::from([Response::Accepted { id: 1 }, result, Response::Ok]);
             let mut send = |_: Command| Ok(replies.pop_front().unwrap());
             assert!(job.advance(&mut send).unwrap().is_none());
@@ -297,7 +470,12 @@ mod tests {
     }
     #[test]
     fn failed_release_fences_and_disabled_registry_uses_installed_baseline() {
-        let mut job = SettingsSnapshotJob::new(Some("registry/1"), &[participant("a")]).unwrap();
+        let mut job = SettingsSnapshotJob::new(
+            Some("registry/1"),
+            &[participant("a")],
+            SnapshotScopes::default(),
+        )
+        .unwrap();
         let mut replies = VecDeque::from([
             Response::Accepted { id: 1 },
             registry_result(json!(3), 1),
@@ -308,13 +486,21 @@ mod tests {
         assert!(job.advance(&mut send).unwrap().is_none());
         assert!(job.advance(&mut send).is_err());
         assert!(job.advance(&mut send).is_err());
-        let mut baseline = SettingsSnapshotJob::new(None, &[participant("a")]).unwrap();
+        let mut baseline =
+            SettingsSnapshotJob::new(None, &[participant("a")], SnapshotScopes::default()).unwrap();
         let result = baseline
             .advance(&mut |_| panic!("baseline should not call broker"))
             .unwrap()
             .unwrap();
         assert_eq!(result["a"].revision, "installed");
         assert_eq!(result["a"].settings, json!({"x":1}));
-        assert!(SettingsSnapshotJob::new(None, &[participant("a"), participant("a")]).is_err());
+        assert!(
+            SettingsSnapshotJob::new(
+                None,
+                &[participant("a"), participant("a")],
+                SnapshotScopes::default()
+            )
+            .is_err()
+        );
     }
 }

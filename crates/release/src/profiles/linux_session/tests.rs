@@ -2,11 +2,83 @@ use super::*;
 use crate::profiles::PackageProfile;
 
 #[test]
+fn default_extension_metadata_builds_a_disabled_generic_lifecycle() {
+    let root = local_parity::TemporaryRoot::new("default-extensions");
+    let policy = linux_session_policy(root.path(), &LinuxSessionOptions::default()).unwrap();
+    let settings = &policy.settings["amaterasu.session-lifecycle"];
+    assert_eq!(settings["capture_binding_mode"], "external");
+    assert_eq!(settings["participants"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        settings["participants"][0]["settings"]["frame_limiter_enable"],
+        false
+    );
+    assert_eq!(
+        settings["participants"][0]["plan_method"]["service"],
+        "nonary.frame-limiter/1"
+    );
+    let registry = &policy.settings["amaterasu.extension-registry"];
+    assert_eq!(
+        registry["descriptors"][0]["descriptor"]["provider"],
+        settings["participants"][0]["provider"]
+    );
+    assert!(
+        registry["descriptors"][0]["descriptor"]["options"]
+            .as_array()
+            .unwrap()
+            .len()
+            > 5
+    );
+    let grants = registry["descriptors"][0]["grants"].as_array().unwrap();
+    for kind in [
+        "host",
+        "all_applications",
+        "all_paired_clients",
+        "all_sessions",
+    ] {
+        assert!(
+            grants
+                .iter()
+                .any(|grant| grant["caller"] == "amaterasu.session-lifecycle"
+                    && grant["scope"]["kind"] == kind
+                    && grant["read"] == true
+                    && grant["write"] == false)
+        );
+        assert!(
+            grants
+                .iter()
+                .any(|grant| grant["caller"] == "amaterasu.management"
+                    && grant["scope"]["kind"] == kind
+                    && grant["read"] == true
+                    && grant["write"] == true)
+        );
+    }
+    let replacement = linux_session_policy(
+        root.path(),
+        &LinuxSessionOptions {
+            external_extension_composition: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        !replacement
+            .settings
+            .contains_key("amaterasu.session-lifecycle")
+    );
+    assert!(
+        !replacement
+            .principals
+            .contains_key("amaterasu.extension-registry")
+    );
+}
+
+#[test]
 fn linux_launch_environment_is_an_explicit_desktop_allowlist() {
     let options = LinuxSessionOptions::default();
     let directories = PrivateStateDirectories {
         state: "/tmp/amaterasu-state".into(),
         session_history_database: "/tmp/amaterasu-state/history.db".into(),
+        lifecycle: "/tmp/amaterasu-state/session-lifecycle".into(),
     };
     let configured = settings(&options, &directories);
     let names = configured["amaterasu.launch"]["inherit_environment"]
@@ -804,7 +876,7 @@ fn package_authority_profile_uses_only_the_inherited_channel() {
 }
 
 #[test]
-fn session_extensions_profile_is_explicit_and_keeps_default_profile_unchanged() {
+fn session_extensions_profile_adds_actions_to_default_extension_services() {
     let extra = [
         (
             "amaterasu.session-lifecycle",
@@ -820,7 +892,10 @@ fn session_extensions_profile_is_explicit_and_keeps_default_profile_unchanged() 
         ),
     ];
     for (id, service) in extra {
-        assert!(!COMPONENTS.iter().any(|component| component.id == id));
+        assert_eq!(
+            COMPONENTS.iter().any(|component| component.id == id),
+            id != "amaterasu.extension-actions"
+        );
         let component = EXTENSION_COMPONENTS
             .iter()
             .find(|component| component.id == id)
@@ -828,7 +903,7 @@ fn session_extensions_profile_is_explicit_and_keeps_default_profile_unchanged() 
         assert!(component.provides.contains(&service));
         assert!(component.dependencies.contains(&RUNTIME_ID));
     }
-    assert_eq!(EXTENSION_COMPONENTS.len(), COMPONENTS.len() + extra.len());
+    assert_eq!(EXTENSION_COMPONENTS.len(), COMPONENTS.len() + 1);
     assert!(COMPONENTS.iter().all(|component| {
         EXTENSION_COMPONENTS
             .iter()

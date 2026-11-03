@@ -53,6 +53,7 @@ const PA_SAMPLE_FLOAT32LE: c_int = 5;
 const AUDIO_RATE: u32 = 48_000;
 const FRAMES_PER_PACKET: u32 = 480;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+const ROUTE_RESTORE_TIMEOUT: Duration = Duration::from_millis(750);
 const DEFAULT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_QUERY_FAILURE_LIMIT: u8 = 3;
@@ -781,6 +782,10 @@ impl PulseClient {
     }
 
     fn set_default_sink(&mut self, name: &str) -> AudioResult<()> {
+        self.set_default_sink_with_timeout(name, CONTROL_TIMEOUT)
+    }
+
+    fn set_default_sink_with_timeout(&mut self, name: &str, timeout: Duration) -> AudioResult<()> {
         let name = CString::new(name).map_err(|_| "invalid_endpoint")?;
         let mut result = Box::new(BooleanResult::default());
         // SAFETY: the endpoint CString remains live through operation creation;
@@ -793,7 +798,7 @@ impl PulseClient {
                 (&mut *result as *mut BooleanResult).cast(),
             )
         };
-        let result = self.wait_operation(operation, result)?;
+        let result = self.wait_operation_with_timeout(operation, result, timeout)?;
         if result.completed && result.succeeded {
             Ok(())
         } else {
@@ -1778,6 +1783,15 @@ impl RouteRegistry {
             .as_ref()
             .is_some_and(|active| active.references == 0)
     }
+
+    fn abandon_idle_restore(&mut self) {
+        if self.restore_pending() {
+            // Keep the durable intent until a new assignment replaces it.
+            // Failed cleanup is diagnostic state, not an admission lock.
+            eprintln!("Amaterasu audio route restore remains pending; allowing a new stream");
+            self.active = None;
+        }
+    }
 }
 
 fn record_pending_route(registry: &mut RouteRegistry, endpoint: &str, original: Option<String>) {
@@ -1851,18 +1865,16 @@ fn acquire_route(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     retry_route_restore(client, &mut registry);
+    registry.abandon_idle_restore();
 
     if registry.active.is_none() {
         let _ = reconcile_persisted_route(client);
         if read_cleanup_state()?.route.is_some() {
-            return Err("audio_route_restore_pending");
+            eprintln!("Amaterasu audio route recovery remains pending; allowing a new stream");
         }
     }
 
     if let Some(active) = &mut registry.active {
-        if active.references == 0 {
-            return Err("audio_route_restore_failed");
-        }
         if active.endpoint != endpoint {
             return Err("audio_route_conflict");
         }
@@ -1875,7 +1887,18 @@ fn acquire_route(
         })));
     }
 
-    let original = current_default.map(str::to_owned);
+    // Recovery above can change the default. Do not use the caller's snapshot
+    // as the original for this stream or reject its successful restoration.
+    let observed_default = client.default_sink()?;
+    let pending_route = read_cleanup_state()?.route;
+    let original = replacement_route_original(pending_route.as_ref(), observed_default.as_deref());
+    let plan = route_plan(
+        endpoint,
+        observed_default.as_deref(),
+        capture_only,
+        explicit_route,
+        virtual_route,
+    );
     let needs_assignment = plan == RoutePlan::Assign;
     if needs_assignment && original.is_none() {
         // PulseAudio has no API to restore an unset default sink. Keep capture
@@ -1884,7 +1907,7 @@ fn acquire_route(
     }
     if needs_assignment {
         let original_sink = original.as_deref().ok_or("audio_route_failed")?;
-        if client.default_sink()?.as_deref() != Some(original_sink) {
+        if client.default_sink()? != observed_default {
             return Err("audio_route_changed");
         }
         // Durable intent precedes the global route mutation. If the callback
@@ -1908,7 +1931,7 @@ fn acquire_route(
         }
         if !wait_for_route_readback(
             endpoint,
-            original
+            observed_default
                 .as_deref()
                 .expect("assignment requires a previous route"),
             Duration::from_millis(250),
@@ -1951,7 +1974,7 @@ impl Drop for RouteLease {
         }
         active.references -= 1;
         if active.references == 0
-            && let Ok(mut client) = PulseClient::connect()
+            && let Ok(mut client) = PulseClient::connect_with_timeout(ROUTE_RESTORE_TIMEOUT)
         {
             retry_route_restore(&mut client, &mut registry);
         }
@@ -1990,7 +2013,9 @@ fn retry_route_restore(client: &mut PulseClient, registry: &mut RouteRegistry) {
 }
 
 fn reconcile_route_intent(client: &mut PulseClient, intent: &RouteIntent) -> bool {
-    let Ok(Some(current_default)) = client.default_sink() else {
+    let deadline = Instant::now() + ROUTE_RESTORE_TIMEOUT;
+    let remaining = || deadline.saturating_duration_since(Instant::now());
+    let Ok(Some(current_default)) = client.default_sink_with_timeout(remaining()) else {
         return false;
     };
     match route_restore_action(intent, Some(&current_default)) {
@@ -2000,7 +2025,7 @@ fn reconcile_route_intent(client: &mut PulseClient, intent: &RouteIntent) -> boo
             // Re-read immediately before the write. PulseAudio has no compare-
             // and-set route API, so this prevents overwriting any user change
             // already visible to us at restoration time.
-            let Ok(Some(current_default)) = client.default_sink() else {
+            let Ok(Some(current_default)) = client.default_sink_with_timeout(remaining()) else {
                 return false;
             };
             match route_restore_action(intent, Some(&current_default)) {
@@ -2010,8 +2035,11 @@ fn reconcile_route_intent(client: &mut PulseClient, intent: &RouteIntent) -> boo
                     if mark_route_restoration_submitted(&intent.target_sink).is_err() {
                         return false;
                     }
-                    if client.set_default_sink(&intent.original_sink).is_err() {
-                        if client.quiesce_prior_commands().is_ok() {
+                    if let Err(code) =
+                        client.set_default_sink_with_timeout(&intent.original_sink, remaining())
+                    {
+                        eprintln!("Amaterasu audio route restore was not acknowledged: {code}");
+                        if client.server_info_with_timeout(remaining()).is_ok() {
                             let _ = mark_route_restoration_quiesced(&intent.target_sink);
                         }
                         return false;
@@ -2022,11 +2050,14 @@ fn reconcile_route_intent(client: &mut PulseClient, intent: &RouteIntent) -> boo
                     if wait_for_route_readback(
                         &intent.original_sink,
                         &intent.target_sink,
-                        Duration::from_millis(250),
+                        remaining().min(Duration::from_millis(250)),
                         |timeout| client.default_sink_with_timeout(timeout),
                     ) {
                         clear_route_intent(&intent.target_sink).is_ok()
                     } else {
+                        eprintln!(
+                            "Amaterasu audio route restore acknowledged; waiting for readback"
+                        );
                         false
                     }
                 }
@@ -2043,6 +2074,23 @@ fn reconcile_persisted_route(client: &mut PulseClient) -> bool {
         return true;
     };
     reconcile_route_intent(client, &intent)
+}
+
+fn replacement_route_original(
+    pending: Option<&RouteIntent>,
+    current_default: Option<&str>,
+) -> Option<String> {
+    // Carry the real original forward when failed restoration left the old
+    // virtual sink selected. The next stream must not restore to that sink.
+    match pending {
+        Some(intent)
+            if intent.assignment_confirmed
+                && current_default == Some(intent.target_sink.as_str()) =>
+        {
+            Some(intent.original_sink.clone())
+        }
+        _ => current_default.map(str::to_owned),
+    }
 }
 
 fn resolve_virtual<'a>(sinks: &'a [Sink], selector: &str) -> Option<&'a Sink> {
@@ -2097,7 +2145,7 @@ pub fn route_restore_pending() -> bool {
     if !registry.restore_pending() && !persisted_route_pending {
         return false;
     }
-    if let Ok(mut client) = PulseClient::connect() {
+    if let Ok(mut client) = PulseClient::connect_with_timeout(ROUTE_RESTORE_TIMEOUT) {
         if registry.restore_pending() {
             retry_route_restore(&mut client, &mut registry);
         } else {
@@ -3176,6 +3224,132 @@ mod tests {
         };
         assert!(!registry.restore_pending());
         assert_eq!(registry.active.as_ref().unwrap().references, 1);
+    }
+
+    #[test]
+    fn failed_restore_does_not_reserve_the_next_stream_route() {
+        let mut registry = RouteRegistry::default();
+        record_pending_route(&mut registry, "old-stream", Some("headset".into()));
+        registry.abandon_idle_restore();
+        assert!(registry.active.is_none());
+
+        record_pending_route(&mut registry, "live-stream", Some("headset".into()));
+        registry.active.as_mut().unwrap().references = 1;
+        registry.abandon_idle_restore();
+        assert_eq!(registry.active.as_ref().unwrap().endpoint, "live-stream");
+    }
+
+    #[test]
+    fn replacement_stream_restores_headset_instead_of_obsolete_virtual_sink() {
+        let pending = RouteIntent {
+            target_sink: "old-stream".into(),
+            original_sink: "headset".into(),
+            assignment_confirmed: true,
+            restoration_submitted: true,
+            ..RouteIntent::default()
+        };
+        assert_eq!(
+            replacement_route_original(Some(&pending), Some("old-stream")).as_deref(),
+            Some("headset")
+        );
+        assert_eq!(
+            replacement_route_original(Some(&pending), Some("new-user-choice")).as_deref(),
+            Some("new-user-choice")
+        );
+        assert_eq!(replacement_route_original(Some(&pending), None), None);
+    }
+
+    #[test]
+    #[ignore = "requires the user Pulse server; temporarily routes audio to private sinks and restores the original default"]
+    fn pending_restore_recovers_and_two_successive_streams_capture_and_clean_up() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut client = PulseClient::connect().expect("user Pulse server is available");
+        let original = client.default_sink().unwrap().expect("default sink exists");
+        let state_root = std::env::temp_dir().join(format!(
+            "amaterasu-audio-recovery-probe-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&state_root).unwrap();
+        std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        struct CleanupProbe {
+            state_root: std::path::PathBuf,
+            original: String,
+        }
+        impl Drop for CleanupProbe {
+            fn drop(&mut self) {
+                shutdown();
+                if let Ok(mut client) = PulseClient::connect() {
+                    let _ = client.set_default_sink(&self.original);
+                }
+                let _ = std::fs::remove_dir_all(&self.state_root);
+            }
+        }
+        let _cleanup = CleanupProbe {
+            state_root: state_root.clone(),
+            original: original.clone(),
+        };
+        let journal = CleanupJournal::open(&state_root).unwrap();
+        journal
+            .write(&CleanupState {
+                route: Some(RouteIntent {
+                    target_sink: "amaterasu-obsolete-recovery-probe".into(),
+                    original_sink: original.clone(),
+                    assignment_confirmed: true,
+                    restoration_submitted: true,
+                    ..RouteIntent::default()
+                }),
+                ..CleanupState::default()
+            })
+            .unwrap();
+        startup(&state_root).unwrap();
+        assert!(!route_restore_pending(), "uncertain restore is reconciled");
+        // An unacknowledged assignment remains unresolved by design. Its
+        // cleanup must still allow a subsequent stream to acquire a route.
+        journal
+            .write(&CleanupState {
+                route: Some(RouteIntent {
+                    target_sink: "amaterasu-obsolete-recovery-probe".into(),
+                    original_sink: original.clone(),
+                    ..RouteIntent::default()
+                }),
+                ..CleanupState::default()
+            })
+            .unwrap();
+        assert!(route_restore_pending());
+        record_pending_route(
+            &mut route_registry().lock().unwrap(),
+            "amaterasu-obsolete-recovery-probe",
+            Some(original.clone()),
+        );
+        for _ in 0..2 {
+            let mut capture = Capture::open("", None, None, None, false, false).unwrap();
+            let endpoint = capture.endpoint().to_owned();
+            assert_ne!(endpoint, original);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                if let Some(packet) = capture.read().unwrap() {
+                    assert_eq!(packet.frames, FRAMES_PER_PACKET);
+                    break;
+                }
+                assert!(Instant::now() < deadline, "capture produced no PCM");
+                thread::sleep(Duration::from_millis(2));
+            }
+            drop(capture);
+            assert!(!route_restore_pending());
+            assert_eq!(
+                client.default_sink().unwrap().as_deref(),
+                Some(original.as_str())
+            );
+            assert!(
+                !client
+                    .sinks()
+                    .unwrap()
+                    .iter()
+                    .any(|sink| sink.endpoint.id == endpoint)
+            );
+            assert!(journal.read().unwrap().sinks.is_empty());
+        }
     }
 
     #[test]

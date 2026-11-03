@@ -3,3 +3,8 @@
 *.dSYM/
 __pycache__/
 *.pyc
+
+# Local investigation reports, recovery bundles, and build fixtures.
+/audit-results/
+/audits/
+/task-output/

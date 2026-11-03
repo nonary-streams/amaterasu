@@ -408,6 +408,8 @@ mod tests {
                 application_operation_id: None,
                 admission_ids: Default::default(),
                 admission_targets: Default::default(),
+                capture_binding_mode: Default::default(),
+                prepared_plan_ids: Default::default(),
                 admission_phases: Default::default(),
                 resource_generations: Default::default(),
                 provider_settings: Default::default(),

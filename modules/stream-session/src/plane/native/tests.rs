@@ -24,15 +24,22 @@ struct Provider {
     pcm_failed: bool,
     alternate_audio: bool,
     submitted_pcm: bool,
+    timed_video_calls: usize,
+    timed_media_calls: usize,
+    timed_media_busy: bool,
+    timing_received: u64,
+    presentation_received: u64,
 }
 
 struct Host {
     services: crate::providers::ProviderServices,
     provider: Box<Provider>,
     video: VideoApi,
+    timed_video: Option<Box<VideoApiV1_3>>,
     capture: AudioCaptureApi,
     encoder: AudioEncoderApi,
     media: MediaTransportApi,
+    timed_media: Option<Box<MediaTransportApiV1_1>>,
     control: ControlTransportApi,
     released: Vec<u64>,
     bindings: Vec<String>,
@@ -51,6 +58,8 @@ impl Host {
                 base: prefix::<VideoApi>(context),
                 receive: video,
             },
+            timed_video: None,
+            timed_media: None,
             capture: AudioCaptureApi {
                 base: prefix::<AudioCaptureApi>(context),
                 read_audio: pcm,
@@ -144,13 +153,27 @@ fn bind_service(host: &mut Host, service: String) -> Response {
         }
     } else {
         let (binding, address) = if service == host.services.video {
-            (1, &host.video.base as *const _ as usize)
+            (
+                1,
+                host.timed_video
+                    .as_ref()
+                    .map_or(&host.video.base as *const _ as usize, |table| {
+                        &table.base.base as *const _ as usize
+                    }),
+            )
         } else if service == host.services.audio_capture {
             (2, &host.capture.base as *const _ as usize)
         } else if service == host.services.audio_encoder {
             (3, &host.encoder.base as *const _ as usize)
         } else if service == host.services.media_transport {
-            (4, &host.media.base as *const _ as usize)
+            (
+                4,
+                host.timed_media
+                    .as_ref()
+                    .map_or(&host.media.base as *const _ as usize, |table| {
+                        &table.base.base as *const _ as usize
+                    }),
+            )
         } else if service == host.services.control_transport {
             (5, &host.control.base as *const _ as usize)
         } else {
@@ -184,6 +207,54 @@ unsafe extern "C" fn video(context: *mut c_void, stream: u64, sink: PacketSink) 
     } else {
         status
     }
+}
+
+unsafe extern "C" fn timed_video(context: *mut c_void, _: u64, sink: TimedPacketSink) -> Status {
+    // SAFETY: provider and packet are borrowed during this synchronous call.
+    let provider = unsafe { &mut *context.cast::<Provider>() };
+    provider.timed_video_calls += 1;
+    let bytes = [0, 0, 1, 0x65, 9];
+    let packet = TimedEncodedPacket {
+        base: EncodedPacket {
+            codec: CODEC_H264,
+            flags: FLAG_END_OF_ACCESS_UNIT,
+            data: bytes.as_ptr(),
+            len: bytes.len(),
+            timestamp_us: 7000,
+            sequence: 11,
+        },
+        processing_started_host_us: 6500,
+    };
+    unsafe { sink.send(&packet) }
+}
+
+unsafe extern "C" fn timed_submit_video(
+    context: *mut c_void,
+    _: u64,
+    packet: *const TimedEncodedPacket,
+) -> Status {
+    // SAFETY: the test provider and timed header outlive this call.
+    let provider = unsafe { &mut *context.cast::<Provider>() };
+    let packet = unsafe { &*packet };
+    provider.timed_media_calls += 1;
+    provider.timing_received = packet.processing_started_host_us;
+    provider.presentation_received = packet.base.timestamp_us;
+    if provider.timed_media_busy {
+        MEDIA_BUSY
+    } else {
+        STATUS_OK
+    }
+}
+
+unsafe extern "C" fn geometry_unavailable(
+    _: *mut c_void,
+    _: u64,
+    _: *mut CaptureGeometry,
+) -> Status {
+    MEDIA_UNSUPPORTED
+}
+unsafe extern "C" fn hdr_unavailable(_: *mut c_void, _: u64, _: *mut HdrMetadata) -> Status {
+    MEDIA_UNSUPPORTED
 }
 
 unsafe extern "C" fn pcm(context: *mut c_void, _: u64, sink: AudioSink) -> Status {
@@ -316,6 +387,73 @@ fn disabled_audio_handles() -> Handles {
 }
 
 #[test]
+fn replacement_tables_negotiate_timing_only_when_both_providers_support_it() {
+    for (video_timed, media_timed) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut host = Host::new();
+        host.provider.timed_media_busy = true;
+        let context = (&mut *host.provider as *mut Provider).cast();
+        if video_timed {
+            let mut base = prefix::<VideoApiV1_3>(context);
+            base.header.minor = 3;
+            host.timed_video = Some(Box::new(VideoApiV1_3 {
+                base: VideoApiV1_2 {
+                    base,
+                    receive: video,
+                    geometry: geometry_unavailable,
+                    hdr_metadata: hdr_unavailable,
+                },
+                receive_timed: timed_video,
+            }));
+        }
+        if media_timed {
+            let mut base = prefix::<MediaTransportApiV1_1>(context);
+            base.header.minor = 1;
+            host.timed_media = Some(Box::new(MediaTransportApiV1_1 {
+                base: MediaTransportApi {
+                    base,
+                    submit_video,
+                    submit_audio,
+                    drain,
+                },
+                submit_video_timed: timed_submit_video,
+            }));
+        }
+        let mut backend = NativeBackend::new(
+            &host.runtime(),
+            disabled_audio_handles(),
+            &crate::providers::ProviderServices::default(),
+        )
+        .unwrap();
+        let mut assembly = VideoAssembly::new(CODEC_H264);
+        assembly.push(backend.video().unwrap().unwrap()).unwrap();
+        let header = assembly.header().unwrap();
+        assert_eq!(header.timestamp_us, 7000);
+        let start = assembly.processing_started_host_us();
+        assert_eq!(start, if video_timed && media_timed { 6500 } else { 0 });
+        assert!(!backend.submit_video(&header, start).unwrap());
+        assert_eq!(
+            assembly.processing_started_host_us(),
+            start,
+            "BUSY retains timing"
+        );
+        if video_timed && media_timed {
+            assert_eq!(host.provider.timed_video_calls, 1);
+            assert_eq!(host.provider.timed_media_calls, 1);
+            assert_eq!(host.provider.timing_received, 6500);
+            assert_eq!(host.provider.presentation_received, 7000);
+            host.provider.timed_media_busy = false;
+            assert!(backend.submit_video(&header, start).unwrap());
+            assert_eq!(host.provider.timed_media_calls, 2);
+            assert_eq!(host.provider.timing_received, 6500);
+            assert_eq!(host.provider.presentation_received, 7000);
+        } else {
+            assert_eq!(host.provider.timed_video_calls, 0);
+            assert_eq!(host.provider.timed_media_calls, 0);
+        }
+    }
+}
+
+#[test]
 fn actual_native_tables_copy_borrowed_bytes_and_release_all_bindings() {
     let mut host = Host::new();
     let mut backend = NativeBackend::new(
@@ -330,7 +468,7 @@ fn actual_native_tables_copy_borrowed_bytes_and_release_all_bindings() {
     let header = assembly.header().unwrap();
     // SAFETY: assembly owns the copied bytes despite provider overwriting its source.
     assert_eq!(unsafe { header.bytes().unwrap() }, [0, 0, 1, 0x65, 9]);
-    assert!(!backend.submit_video(&header).unwrap());
+    assert!(!backend.submit_video(&header, 0).unwrap());
     assert_eq!(host.typed_contracts.len(), 5);
     drop(backend);
     assert_eq!(host.released, [1, 2, 3, 4, 5]);

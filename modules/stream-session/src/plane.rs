@@ -154,7 +154,11 @@ trait Backend {
     fn video(&mut self) -> PlaneResult<Option<VideoPacket>>;
     fn pcm(&mut self) -> PlaneResult<Option<PcmPacket>>;
     fn audio(&mut self) -> PlaneResult<Option<AudioPacket>>;
-    fn submit_video(&mut self, packet: &EncodedPacket) -> PlaneResult<bool>;
+    fn submit_video(
+        &mut self,
+        packet: &EncodedPacket,
+        processing_started_host_us: u64,
+    ) -> PlaneResult<bool>;
     fn submit_pcm(&mut self, frame: &AudioFrame) -> PlaneResult<bool>;
     fn submit_audio(&mut self, packet: &EncodedAudioPacket) -> PlaneResult<bool>;
     fn drain_encoder(&mut self) -> PlaneResult<bool>;
@@ -342,7 +346,10 @@ impl<B: Backend> Pump<B> {
             }
             if self.video.ready() {
                 let header = self.video.header().expect("ready assembly");
-                if !self.backend.submit_video(&header)? {
+                if !self
+                    .backend
+                    .submit_video(&header, self.video.processing_started_host_us())?
+                {
                     return Ok(());
                 }
                 self.record_video_admission(&header, progress);
@@ -361,7 +368,10 @@ impl<B: Backend> Pump<B> {
         // for a subsequent frame or introducing an artificial frame of latency.
         if self.video.ready() && !self.video_ended {
             let header = self.video.header().expect("ready assembly");
-            if self.backend.submit_video(&header)? {
+            if self
+                .backend
+                .submit_video(&header, self.video.processing_started_host_us())?
+            {
                 self.record_video_admission(&header, progress);
                 self.video_ended = header.flags == FLAG_END_OF_STREAM;
                 self.video.clear();

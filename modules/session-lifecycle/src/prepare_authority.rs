@@ -1021,7 +1021,14 @@ impl<J: AuthorityJournal> CoordinatorPrepareAuthority<J> {
         if retain_output {
             next.output_admissions.insert(admission_id.to_owned());
         }
-        if retain_history || !admission.plan.obligations.is_empty() {
+        // Agreed constraints can be consumed after preparation even when a
+        // provider allocated no native resource or cleanup obligation.
+        let has_constraints = admission
+            .plan
+            .constraints
+            .as_object()
+            .is_some_and(|values| !values.is_empty());
+        if retain_history || !admission.plan.obligations.is_empty() || has_constraints {
             next.settled.insert(admission_id.to_owned(), admission);
         }
         self.persist(next)

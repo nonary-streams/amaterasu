@@ -14,8 +14,8 @@ fn journal_with_owned_session(record_id: u64) -> Value {
         virtual_display: None,
         display_attempted: false,
         display_operation_id: None,
-        limiter_attempted: false,
-        limiter_executable_path: None,
+        legacy_effect_pending: false,
+        legacy_effect_target: None,
     };
     let mut document = Document::default();
     document.entries.insert(record_id, entry);
@@ -52,59 +52,27 @@ fn restart_reconciles_only_exact_journaled_session_then_allows_relaunch() {
 }
 
 #[test]
-fn restart_restores_only_the_journaled_limiter_executable() {
-    const RECORD_ID: u64 = 0xabcd;
-    const EXECUTABLE: &str = r"C:\Games\Example.exe";
-    let mut document: Document =
-        serde_json::from_value(journal_with_owned_session(RECORD_ID)).unwrap();
-    let entry = document.entries.get_mut(&RECORD_ID).unwrap();
-    entry.attempted_resources.clear();
-    entry.limiter_attempted = true;
-    entry.limiter_executable_path = Some(EXECUTABLE.into());
-    let mut host = Harness::with_restart_state(serde_json::to_value(document).unwrap(), 7);
-    host.broker.limiter_session = Some(format!("stream-{RECORD_ID:016x}"));
-    host.broker.limiter_lease = Some("owned-limiter-lease".into());
-    host.broker.limiter_executable_path = Some(EXECUTABLE.into());
-
-    host.idle();
-
-    assert!(host.broker.limiter_lease.is_none());
-    assert_eq!(host.broker.state_revision, 8);
-    assert_eq!(
-        host.broker.state_value.as_ref().unwrap()["entries"],
-        json!({})
-    );
-    assert!(host.broker.calls.iter().any(|call| {
-        call.service == "amaterasu.frame-limiter/1"
-            && call.payload["action"] == "restore"
-            && call.payload["lease"] == "owned-limiter-lease"
-    }));
-    assert_eq!(host.response(1, prepare())["state"], "prepared");
-}
-
-#[test]
-fn legacy_limiter_intent_without_identity_blocks_recovery() {
+fn legacy_effect_intent_is_retained_and_never_reported_as_clean() {
     let mut document = journal_with_owned_session(0xabcd);
     document["entries"]["43981"]["attempted_resources"] = json!([]);
     document["entries"]["43981"]["limiter_attempted"] = json!(true);
+    document["entries"]["43981"]["limiter_executable_path"] = json!(r"C:\Games\Example.exe");
+    let original = document.clone();
     let mut host = Harness::with_restart_state(document, 7);
-    host.broker.limiter_session = Some("stream-000000000000abcd".into());
-    host.broker.limiter_lease = Some("unverified-limiter".into());
-
     host.idle();
-
     assert_eq!(host.broker.state_revision, 7);
-    assert_eq!(
-        host.broker.limiter_lease.as_deref(),
-        Some("unverified-limiter")
-    );
+    assert_eq!(host.broker.state_value, Some(original));
     assert_eq!(
         host.response(1, prepare())["code"],
         "restart_recovery_unconfirmed"
     );
-    assert!(!host.broker.calls.iter().any(|call| {
-        call.service == "amaterasu.frame-limiter/1" && call.payload["action"] == "restore"
-    }));
+    assert!(
+        !host
+            .broker
+            .calls
+            .iter()
+            .any(|call| call.service == "amaterasu.frame-limiter/1")
+    );
 }
 
 #[test]
@@ -271,4 +239,56 @@ fn restart_keeps_virtual_display_reference_when_topology_restore_is_unconfirmed(
         (call.service == "amaterasu.virtual-display/1" && call.payload["action"] == "remove")
             || (call.service == "amaterasu.display/1" && call.payload["action"] == "restore")
     }));
+}
+
+#[test]
+fn restart_retires_native_resources_before_reconciling_external_lifecycle() {
+    let mut document = journal_with_owned_session(0xabcd);
+    document["entries"]["43981"]["attempted_resources"] = json!(["session", "video"]);
+    document["entries"]["43981"]["lifecycle_recovery"] = json!({"version":1,
+        "session_target":{"kind":"session","host_epoch":"old","session_id":"session","generation":1},
+        "stream_target":{"kind":"stream","host_epoch":"old","session_id":"session","stream_id":"stream","generation":1},"plan_revision":null});
+    let mut host = Harness::with_restart_state(document, 7);
+    host.broker.lifecycle_success = true;
+    host.broker.seed_session("ss-abcd-session");
+    host.idle();
+    assert_eq!(
+        host.broker.state_value.as_ref().unwrap()["entries"],
+        json!({})
+    );
+    let recovery = host
+        .broker
+        .calls
+        .iter()
+        .find(|call| call.payload["restart_recovery"] == true)
+        .unwrap();
+    assert_eq!(recovery.payload["operation"], "retire_stream");
+    assert_eq!(
+        recovery.payload["retirement_receipt"]["response"]["code"],
+        "not_found"
+    );
+    assert!(
+        host.broker
+            .session_is_stopped_without_leases("ss-abcd-session")
+    );
+    assert_eq!(host.response(1, prepare())["state"], "prepared");
+}
+
+#[test]
+fn rejected_restart_lifecycle_cleanup_keeps_the_original_journal_and_blocks_relaunch() {
+    let mut document = journal_with_owned_session(0xabcd);
+    document["entries"]["43981"]["attempted_resources"] = json!([]);
+    document["entries"]["43981"]["lifecycle_recovery"] = json!({"version":1,
+        "session_target":{"kind":"session","host_epoch":"old","session_id":"session","generation":1},
+        "stream_target":{"kind":"stream","host_epoch":"old","session_id":"session","stream_id":"stream","generation":1},"plan_revision":null});
+    let original = document.clone();
+    let mut host = Harness::with_restart_state(document, 7);
+    host.broker.lifecycle_success = true;
+    host.broker.lifecycle_reject_operation = Some("retire_stream".into());
+    host.idle();
+    assert_eq!(host.broker.state_value, Some(original));
+    assert_eq!(
+        host.response(1, prepare())["code"],
+        "restart_recovery_unconfirmed"
+    );
 }

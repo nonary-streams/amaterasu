@@ -384,8 +384,6 @@ fn exported_desktop_launch_keeps_preflight_idempotency_and_client_quit_cleanup()
     let mut export = launch_export(operation_id);
     export["global_preparation"] = json!([marker_step("global")]);
     export["preflight_token"] = preflight["preflight_token"].clone();
-    export["frame_limiter_settings"] = frame_limiter_snapshot();
-    export["client_frame_limiter_overrides"] = json!({});
     let started = harness.request(&mut pipeline, "amaterasu.nvhttp", export.clone());
     assert_eq!(started["launch"]["state"], "active", "{started}");
     assert!(started["launch"]["process_id"].is_null());
@@ -423,12 +421,11 @@ fn exported_desktop_launch_keeps_preflight_idempotency_and_client_quit_cleanup()
         "application_operation_id":operation_id,
         "app_id":APP_ID,
         "catalog_revision":preflight["catalog_revision"],
-        "frame_limiter_settings":frame_limiter_snapshot(),
         "frame_limiter_executable_path":"/usr/bin/anything",
     });
     assert_eq!(
         harness.request(&mut pipeline, "amaterasu.rtsp", verify)["code"],
-        "frame_limiter_snapshot_denied"
+        "invalid_request"
     );
 
     // Client quit reaches launch as an owner stop and undoes in reverse.

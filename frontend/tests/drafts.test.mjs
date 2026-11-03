@@ -53,3 +53,22 @@ test("draft tracking preserves later edits and unrelated device drafts after a c
   tracker.dispose();
   assert.equal(root.listeners.size, 0);
 });
+
+test("closing a plugin editor retains the page's independent draft guard", () => {
+  const guards = new context.Amaterasu.DraftGuardGroup();
+  let pageDirty = true;
+  let pageDisposed = 0;
+  let pluginDisposed = 0;
+  guards.register(() => pageDirty, () => pageDisposed++);
+  const closePlugin = guards.register(() => true, () => pluginDisposed++);
+  assert.equal(guards.isDirty(), true);
+  closePlugin();
+  assert.equal(pluginDisposed, 1);
+  assert.equal(guards.isDirty(), true, "page edits must remain protected");
+  pageDirty = false;
+  assert.equal(guards.isDirty(), false);
+  guards.dispose();
+  closePlugin();
+  assert.equal(pageDisposed, 1);
+  assert.equal(pluginDisposed, 1, "a guard is disposed exactly once");
+});

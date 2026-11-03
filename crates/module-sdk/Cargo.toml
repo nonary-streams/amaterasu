@@ -24,3 +24,6 @@ ureq = { version = "=3.4.2", default-features = false, features = ["rustls", "pl
 
 [lints]
 workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

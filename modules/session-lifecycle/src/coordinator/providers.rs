@@ -69,6 +69,9 @@ impl AuthorityJournal for AuthorityWriter {
             session
                 .admission_phases
                 .retain(|id, _| session.admission_ids.contains(id));
+            session
+                .prepared_plan_ids
+                .retain(|id| session.admission_ids.contains(id));
         }
         next.authority = state.clone();
         save(&self.0, next)
@@ -293,6 +296,11 @@ fn apply_participant(
         }
         let (_, id, _, _) = super::operations::target_parts(&work.target)?;
         let session = next.sessions.get_mut(id).ok_or("unknown_session")?;
+        if work.phase == LifecyclePhase::SessionPrepare {
+            session
+                .prepared_plan_ids
+                .insert(state.admission_id.clone().ok_or("missing_admission")?);
+        }
         for obligation in obligations {
             if let Some(old) = session
                 .obligations
@@ -328,6 +336,9 @@ fn apply_participant(
         session
             .admission_phases
             .retain(|id, _| session.admission_ids.contains(id));
+        session
+            .prepared_plan_ids
+            .retain(|id| session.admission_ids.contains(id));
     }
     Ok(())
 }
@@ -619,6 +630,10 @@ impl Coordinator {
                 super::settings_snapshot::SettingsSnapshotJob::new(
                     self.settings.settings_registry_service.as_deref(),
                     &self.settings.participants,
+                    super::settings_snapshot::SnapshotScopes::from_work(
+                        &self.shared.borrow().value,
+                        work,
+                    )?,
                 )?,
             );
         }
@@ -1670,7 +1685,11 @@ impl Coordinator {
                 &mut writer,
                 send,
             );
-            if result.is_err() {
+            if let Err(error) = result {
+                eprintln!(
+                    "lifecycle provider advancement failed provider={provider} phase={:?} reason={error}",
+                    work.phase
+                );
                 // The dispatcher records whether submission crossed its durable
                 // effect boundary. An uncertain call is fenced, never replayed.
                 if matches!(
@@ -2219,35 +2238,34 @@ impl Coordinator {
     }
 
     fn complete_retirement_waiters(&self) -> ModuleResult<()> {
-        let mut next = self.shared.borrow().value.clone();
-        let mut changed = false;
-        let keys: Vec<_> = next
-            .receipts
-            .iter()
-            .filter_map(|(key, r)| {
-                r.wait_target
-                    .as_ref()
-                    .map(|target| (key.clone(), target.clone()))
-            })
-            .collect();
-        for (key, target) in keys {
-            let (_, session, stream, _) = super::operations::target_parts(&target)?;
-            if next
+        let shared = self.shared.borrow();
+        let journal = &shared.value;
+        let mut keys = Vec::new();
+        for (key, receipt) in &journal.receipts {
+            let Some(target) = &receipt.wait_target else {
+                continue;
+            };
+            let (_, session, stream, _) = super::operations::target_parts(target)?;
+            if journal
                 .sessions
                 .get(session)
-                .and_then(|s| s.streams.get(stream?))
-                .is_some_and(|s| s.phase == StreamPhase::Retired)
+                .and_then(|session| session.streams.get(stream?))
+                .is_some_and(|stream| stream.phase == StreamPhase::Retired)
             {
-                let receipt = next.receipts.get_mut(&key).unwrap();
-                receipt.wait_target = None;
-                receipt.response["status"] = json!("succeeded");
-                changed = true;
+                keys.push(key.clone());
             }
         }
-        if changed {
-            save(&self.shared, next)?;
+        if keys.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let mut next = journal.clone();
+        drop(shared);
+        for key in keys {
+            let receipt = next.receipts.get_mut(&key).unwrap();
+            receipt.wait_target = None;
+            receipt.response["status"] = json!("succeeded");
+        }
+        save(&self.shared, next)
     }
 
     fn finish_participant(
@@ -2402,42 +2420,62 @@ impl Coordinator {
                 }
                 response["execution_domain"] =
                     json!(self.settings.consumer_requirements.execution_domain);
+                response["capture_binding_mode"] = json!(session.capture_binding_mode);
             }
             LifecyclePhase::StreamPrepare => {
-                let candidate = work.candidate.clone().ok_or("capture_candidate_missing")?;
-                let stream = session
-                    .streams
-                    .get_mut(stream_id.ok_or("stream_target_required")?)
-                    .ok_or("unknown_stream")?;
-                if candidate.generation != stream.generation
-                    || work.video.as_ref() != Some(&candidate.mode)
-                {
-                    return Err("capture_candidate_mismatch".into());
-                }
-                stream.candidate = Some(candidate.clone());
-                if stream.phase == StreamPhase::Preparing {
-                    stream.phase = StreamPhase::Ready;
+                if session.capture_binding_mode.is_external() {
+                    if work.candidate.is_some() {
+                        return Err("external_capture_candidate_not_allowed".into());
+                    }
+                    let stream = session
+                        .streams
+                        .get_mut(stream_id.ok_or("stream_target_required")?)
+                        .ok_or("unknown_stream")?;
+                    if stream.phase == StreamPhase::Preparing {
+                        stream.phase = StreamPhase::Ready;
+                    } else {
+                        response["status"] = json!("cancelled");
+                    }
+                    response["candidate"] = Value::Null;
+                    response["capture_binding_mode"] = json!(session.capture_binding_mode);
+                    response["required_consumers"] = json!(stream.required);
                 } else {
-                    response["status"] = json!("cancelled");
+                    let candidate = work.candidate.clone().ok_or("capture_candidate_missing")?;
+                    let stream = session
+                        .streams
+                        .get_mut(stream_id.ok_or("stream_target_required")?)
+                        .ok_or("unknown_stream")?;
+                    if candidate.generation != stream.generation
+                        || work.video.as_ref() != Some(&candidate.mode)
+                    {
+                        return Err("capture_candidate_mismatch".into());
+                    }
+                    stream.candidate = Some(candidate.clone());
+                    if stream.phase == StreamPhase::Preparing {
+                        stream.phase = StreamPhase::Ready;
+                    } else {
+                        response["status"] = json!("cancelled");
+                    }
+                    stream.binding_owner = work
+                        .states
+                        .iter()
+                        .find_map(|(provider, state)| {
+                            matches!(
+                                &state.response,
+                                Some(ProviderResponse::Prepared {
+                                    candidate: Some(_),
+                                    ..
+                                })
+                            )
+                            .then(|| provider.clone())
+                        })
+                        .or(finalize_owner)
+                        .ok_or("capture_owner_missing")?;
+                    response["candidate"] =
+                        serde_json::to_value(candidate).map_err(|e| e.to_string())?;
+                    response["required_consumers"] = json!(stream.required);
+                    response["capture_binding_mode"] = json!(session.capture_binding_mode);
                 }
-                stream.binding_owner = work
-                    .states
-                    .iter()
-                    .find_map(|(provider, state)| {
-                        matches!(
-                            &state.response,
-                            Some(ProviderResponse::Prepared {
-                                candidate: Some(_),
-                                ..
-                            })
-                        )
-                        .then(|| provider.clone())
-                    })
-                    .or(finalize_owner)
-                    .ok_or("capture_owner_missing")?;
-                response["candidate"] =
-                    serde_json::to_value(candidate).map_err(|e| e.to_string())?;
-                response["required_consumers"] = json!(stream.required);
             }
             LifecyclePhase::StreamRelease => {
                 session
@@ -2872,6 +2910,8 @@ mod admission_target_tests {
             application_operation_id: None,
             admission_ids: Default::default(),
             admission_targets: Default::default(),
+            capture_binding_mode: Default::default(),
+            prepared_plan_ids: Default::default(),
             admission_phases: Default::default(),
             resource_generations: Default::default(),
             provider_settings: Default::default(),

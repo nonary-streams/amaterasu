@@ -225,6 +225,8 @@ pub enum Command {
     /// Reserved for the host endpoint; returns pending product log events.
     DrainLogEvents {},
     GetSettings {},
+    /// A bounded readiness hint; carries no provider data or effect authority.
+    NotifyWorkReady {},
     /// Returns host-owned context to the state service, and to the Linux audio
     /// module for its restart-safe cleanup journal. This prevents a module
     /// policy from impersonating a host decision through `GetSettings`.

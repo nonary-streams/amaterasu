@@ -2,6 +2,7 @@
 //! This is error correction, not cryptography. No external code or tables are used.
 use super::*;
 use std::sync::OnceLock;
+mod field;
 
 const MAX_SHARDS: usize = 255;
 // Bound worst-case scalar parity work separately from input and UDP size limits.
@@ -240,9 +241,7 @@ pub(crate) fn linear_combination(coefficients: &[u8], shards: &[Vec<u8>]) -> Vec
     for (coefficient, data) in coefficients.iter().zip(shards) {
         assert_eq!(data.len(), output.len());
         let products = &field[usize::from(*coefficient)];
-        for (destination, input) in output.iter_mut().zip(data) {
-            *destination ^= products[usize::from(*input)];
-        }
+        field::accumulate(&mut output, data, products);
     }
     output
 }
@@ -264,6 +263,12 @@ fn multiply(mut left: u8, mut right: u8) -> u8 {
 }
 
 fn inverse(value: u8) -> u8 {
+    static INVERSES: OnceLock<[u8; 256]> = OnceLock::new();
+    INVERSES.get_or_init(|| std::array::from_fn(|value| calculate_inverse(value as u8)))
+        [usize::from(value)]
+}
+
+fn calculate_inverse(value: u8) -> u8 {
     // Nonzero GF(256) elements satisfy a^255=1, hence a^-1=a^254.
     let mut power = value;
     let mut exponent = 254;

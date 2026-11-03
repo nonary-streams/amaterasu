@@ -708,7 +708,15 @@ mod tests {
         };
         assert_eq!(
             route_restore_action(&uncertain_restore, Some("new-user-choice")),
-            RouteRestoreAction::KeepTombstone
+            RouteRestoreAction::Release
+        );
+        assert_eq!(
+            route_restore_action(&uncertain_restore, Some("amaterasu-stream")),
+            RouteRestoreAction::RestoreOriginal
+        );
+        assert_eq!(
+            route_restore_action(&uncertain_restore, Some("user-default")),
+            RouteRestoreAction::RestoreOriginal
         );
         let restoration_fenced = RouteIntent {
             restoration_quiesced: true,
@@ -782,12 +790,18 @@ pub(super) fn route_restore_action(
     }
     match current_default {
         None => RouteRestoreAction::Wait,
-        Some(_)
-            if intent.restoration_submitted
+        // Restoration is best effort. A lost callback must allow another
+        // attempt while our target is selected, rather than permanently
+        // preventing cleanup. Reassert the original on an uncertain restore
+        // too: PipeWire may expose it as a fallback while its configured
+        // default still names the now-removed virtual sink.
+        Some(current)
+            if current == intent.original_sink
+                && intent.restoration_submitted
                 && !intent.restoration_confirmed
                 && !intent.restoration_quiesced =>
         {
-            RouteRestoreAction::KeepTombstone
+            RouteRestoreAction::RestoreOriginal
         }
         Some(current)
             if current == intent.original_sink
@@ -797,15 +811,9 @@ pub(super) fn route_restore_action(
             RouteRestoreAction::Release
         }
         Some(current) if current == intent.target_sink => RouteRestoreAction::RestoreOriginal,
-        Some(_)
-            if (intent.assignment_confirmed || intent.assignment_quiesced)
-                && (!intent.restoration_submitted
-                    || intent.restoration_confirmed
-                    || intent.restoration_quiesced) =>
-        {
-            RouteRestoreAction::Release
-        }
-        Some(_) => RouteRestoreAction::KeepTombstone,
+        // A later user choice supersedes our cleanup, even when the previous
+        // restore was unacknowledged. Never retry over that choice.
+        Some(_) => RouteRestoreAction::Release,
     }
 }
 

@@ -48,11 +48,12 @@ impl Pipeline {
                     record.cleanup_error = Some("lifecycle_fence_unconfirmed");
                 }
             }
-            Step::RetireLifecycle => {
+            Step::RetireLifecycle | Step::RecoverLifecycle => {
                 let target = record
                     .start
                     .as_ref()
-                    .and_then(|start| start.lifecycle_target.as_ref());
+                    .and_then(|start| start.lifecycle_target.as_ref())
+                    .or(record.restart_lifecycle_target.as_ref());
                 let plan_revision = record
                     .start
                     .as_ref()
@@ -121,6 +122,16 @@ impl Pipeline {
             Step::StatusVirtualDisplay => {
                 use super::virtual_display::ReferenceStatus;
                 match super::virtual_display::accept_status(record, &payload) {
+                    ReferenceStatus::Pending if record.virtual_display_remove_attempted => {
+                        job.step = Step::StatusVirtualDisplay;
+                    }
+                    ReferenceStatus::Failed
+                        if record.virtual_display_remove_attempted
+                            && record.virtual_display_state == "cleanup_failed" =>
+                    {
+                        record.cleanup_error = Some("virtual_display_cleanup_failed");
+                        job.virtual_display_tried = true;
+                    }
                     ReferenceStatus::Missing if record.virtual_display_status_verified => {
                         record.virtual_display_attempted = false;
                         record.virtual_display_remove_attempted = false;
@@ -171,28 +182,6 @@ impl Pipeline {
             Step::ApplyDisplay => {
                 super::display::accept_apply(record, &payload);
                 job.step = Step::FindDisplay;
-            }
-            Step::ApplyLimiter => {
-                super::limiter::accept_apply(record, &payload);
-                job.step = Step::FindLimiter;
-            }
-            Step::FindLimiter => {
-                super::limiter::accept_status(record, &payload);
-                if record.limiter_lease.is_none() {
-                    if super::limiter::status_confirms_no_lease(record, &payload) {
-                        record.limiter_attempted = false;
-                    }
-                    job.limiter_tried = true;
-                }
-            }
-            Step::RestoreLimiter => {
-                if super::limiter::accept_restore(record, &payload) {
-                    record.limiter_attempted = false;
-                    job.limiter_tried = true;
-                } else {
-                    record.cleanup_error = Some("frame_limiter_restore_failed");
-                    job.limiter_tried = true;
-                }
             }
             Step::FindInput => {
                 if input_missing(&payload) || input_released(record, &payload) {
@@ -339,16 +328,6 @@ impl Pipeline {
                 job.step = Step::StatusVirtualDisplay;
                 true
             }
-            Step::FindLimiter => {
-                record.cleanup_error = Some("frame_limiter_status_unavailable");
-                job.limiter_tried = true;
-                true
-            }
-            Step::RestoreLimiter => {
-                record.cleanup_error = Some("frame_limiter_restore_failed");
-                job.limiter_tried = true;
-                true
-            }
             Step::ReleaseInput => {
                 record.input_lookup_required = true;
                 job.input_tried = false;
@@ -383,12 +362,11 @@ impl Pipeline {
             && record.uncertain.is_none()
             && !record.input_attempted
             && record.input_lease.is_none()
-            && record.limiter_lease.is_none()
-            && !record.limiter_attempted
             && !record.virtual_display_attempted
             && !record.display_attempted
             && record.display_lease.is_none()
             && !record.virtual_display_reference_owned
+            && (record.restart_lifecycle_target.is_none() || record.lifecycle_retired)
             && (record
                 .start
                 .as_ref()

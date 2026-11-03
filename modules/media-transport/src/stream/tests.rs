@@ -227,6 +227,73 @@ fn hevc_fragments_commit_one_access_unit_only_after_final_boundary() {
     );
 }
 
+#[test]
+fn timed_fragment_rejects_changed_start_and_survives_backpressure() {
+    let (video, audio) = receivers();
+    let mut settings = request(&video, &audio, false);
+    settings.video.codec = VideoCodec::Hevc;
+    settings.video.fec_percentage = 0;
+    settings.video.min_parity_shards = 0;
+    let mut stream = Stream::open("owner", &settings).unwrap();
+    let access_unit: Vec<_> = [32u8, 33, 34, 19]
+        .into_iter()
+        .flat_map(|kind| [0, 0, 0, 1, kind << 1, 1])
+        .collect();
+    let first = EncodedPacket {
+        codec: CODEC_HEVC,
+        flags: FLAG_KEYFRAME,
+        data: access_unit.as_ptr(),
+        len: 9,
+        timestamp_us: 16_667,
+        sequence: 1,
+    };
+    let last = EncodedPacket {
+        flags: FLAG_KEYFRAME | FLAG_END_OF_ACCESS_UNIT,
+        data: access_unit[9..].as_ptr(),
+        len: access_unit.len() - 9,
+        ..first
+    };
+    let start = host_monotonic_micros() - 5_000;
+    // SAFETY: the access unit remains live throughout each synchronous call.
+    assert_eq!(
+        unsafe { stream.submit_video_with_start(&first, start) },
+        STATUS_OK
+    );
+    assert_eq!(
+        unsafe { stream.submit_video_with_start(&last, start + 1) },
+        STATUS_INVALID_ARGUMENT
+    );
+    stream
+        .delivery
+        .push(Medium::Video, vec![vec![0]; MAX_DATAGRAMS]);
+    assert_eq!(
+        unsafe { stream.submit_video_with_start(&last, start) },
+        MEDIA_BUSY
+    );
+    assert_eq!(
+        stream
+            .pending_video
+            .as_ref()
+            .unwrap()
+            .processing_started_host_us,
+        start
+    );
+    stream.delivery = Delivery::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        "127.0.0.1:0".parse().unwrap(),
+        video.local_addr().unwrap(),
+        audio.local_addr().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        unsafe { stream.submit_video_with_start(&last, start) },
+        STATUS_OK
+    );
+    stream.delivery.tick();
+    let datagram = receive(&video);
+    assert!(u16::from_le_bytes([datagram[33], datagram[34]]) >= 50);
+}
+
 /// TD, sequence header and one frame OBU: a minimal AV1 keyframe unit.
 const AV1_KEYFRAME: [u8; 11] = [0x12, 0x00, 0x0a, 0x02, 0xaa, 0xbb, 0x32, 0x03, 1, 2, 3];
 const AV1_DELTA: [u8; 7] = [0x12, 0x00, 0x32, 0x03, 4, 5, 6];
@@ -846,7 +913,36 @@ fn wait_for_peer(stream: &mut Stream, medium: crate::datagrams::Medium) {
 }
 
 #[test]
-fn frames_stamped_on_the_host_clock_report_their_host_processing_latency() {
+fn processing_latency_uses_independent_host_clock_and_preserves_rtp_clock() {
+    let (video, audio) = receivers();
+    let mut stream = offered_stream(&video, &audio);
+    let mut keyframe = video_packet(&[0, 0, 0, 1, 0x65, 0x88], 0);
+    keyframe.flags |= FLAG_END_OF_ACCESS_UNIT;
+    keyframe.timestamp_us = 1_234_567;
+    let start = host_monotonic_micros() - 5_000;
+    // SAFETY: the packet bytes outlive this synchronous submission.
+    assert_eq!(
+        unsafe { stream.submit_video_with_start(&keyframe, start) },
+        STATUS_OK
+    );
+    stream.delivery.tick();
+    let datagram = receive(&video);
+    let latency = u16::from_le_bytes([datagram[33], datagram[34]]);
+    let rtp_timestamp = u32::from_be_bytes(datagram[4..8].try_into().unwrap());
+    assert_eq!(rtp_timestamp, (1_234_567_u64 * 90_000 / 1_000_000) as u32);
+    // 5 ms in 0.1 ms units, plus however long this test took to packetize.
+    assert!((50..100).contains(&latency), "{latency}");
+    let window = stream.take_processing_latency();
+    assert_eq!(window.samples, 1);
+    assert_eq!(window.total_tenths_ms, u64::from(latency));
+    assert_eq!(window.max_tenths_ms, latency);
+    assert_eq!(window.zero_samples, 0);
+    assert_eq!(window.unknown_samples, 0);
+    assert_eq!(stream.take_processing_latency().samples, 0);
+}
+
+#[test]
+fn legacy_packets_report_unknown_processing_latency() {
     let (video, audio) = receivers();
     let mut stream = offered_stream(&video, &audio);
     let mut keyframe = video_packet(&[0, 0, 0, 1, 0x65, 0x88], 0);
@@ -856,9 +952,34 @@ fn frames_stamped_on_the_host_clock_report_their_host_processing_latency() {
     assert_eq!(unsafe { stream.submit_video(&keyframe) }, STATUS_OK);
     stream.delivery.tick();
     let datagram = receive(&video);
-    let latency = u16::from_le_bytes([datagram[33], datagram[34]]);
-    // 5 ms in 0.1 ms units, plus however long this test took to packetize.
-    assert!((50..100).contains(&latency), "{latency}");
+    assert_eq!(u16::from_le_bytes([datagram[33], datagram[34]]), 0);
+    let window = stream.take_processing_latency();
+    assert_eq!(window.samples, 1);
+    assert_eq!(window.unknown_samples, 1);
+    assert_eq!(window.zero_samples, 0);
+}
+
+#[test]
+fn future_processing_start_is_reported_unknown_without_changing_rtp_time() {
+    let (video, audio) = receivers();
+    let mut stream = offered_stream(&video, &audio);
+    let mut keyframe = video_packet(&[0, 0, 0, 1, 0x65, 0x88], 0);
+    keyframe.flags |= FLAG_END_OF_ACCESS_UNIT;
+    keyframe.timestamp_us = 99_000;
+    let future = host_monotonic_micros() + 1_000_000;
+    // SAFETY: packet bytes remain live throughout the synchronous call.
+    assert_eq!(
+        unsafe { stream.submit_video_with_start(&keyframe, future) },
+        STATUS_OK
+    );
+    stream.delivery.tick();
+    let datagram = receive(&video);
+    assert_eq!(u16::from_le_bytes([datagram[33], datagram[34]]), 0);
+    assert_eq!(
+        u32::from_be_bytes(datagram[4..8].try_into().unwrap()),
+        8_910
+    );
+    assert_eq!(stream.take_processing_latency().unknown_samples, 1);
 }
 
 #[test]

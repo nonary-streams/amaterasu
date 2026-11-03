@@ -189,10 +189,16 @@ fn required_extension_lifecycle_polls_pending_before_application_launch() {
     let mut controller = Controller::new(Some(config())).unwrap();
     controller.set_session_lifecycle_required(true);
     controller.set_global_display_policy(7, json!({}));
-    let mut broker = Broker::default();
+    let mut broker = Broker {
+        application_executable_path: Some("/games/example".into()),
+        application_input_overrides: Some(json!({"vendor_option":{"quality":"high"}})),
+        ..Default::default()
+    };
     broker.lifecycle_replies.push_back(json!({"status":"pending"}));
     broker.lifecycle_replies.push_back(json!({"status":"succeeded", "target":{"kind":"session","host_epoch":"epoch","session_id":"session","generation":1}}));
-    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let mut client = peer_with_display_mode(1, "1920x1080x59.94").unwrap();
+    client.client_properties = json!({"vendor_option":{"enabled":false,"rate":0}});
+    assert!(controller.launch(10, request(1), client, now).is_none());
     for tick in 0..100 {
         controller.poll(now + Duration::from_millis(tick * 100), &mut |command| broker.send(command));
         if broker.actions().contains(&("amaterasu.launch/1", "launch_export")) { break; }
@@ -203,6 +209,11 @@ fn required_extension_lifecycle_polls_pending_before_application_launch() {
     }).collect();
     assert_eq!(lifecycle.len(), 2);
     assert_eq!(lifecycle[0]["operation"], "prepare");
+    assert_eq!(lifecycle[0]["client_context"]["client_ref"], "client-1");
+    assert_eq!(lifecycle[0]["client_context"]["display_mode"]["refresh_millihz"], 59940);
+    assert_eq!(lifecycle[0]["client_context"]["properties"], json!({"vendor_option":{"enabled":false,"rate":0}}));
+    assert_eq!(lifecycle[0]["application_ref"]["properties"]["vendor_option"], json!({"quality":"high"}));
+    assert_eq!(lifecycle[0]["application_ref"]["executable_path"], "/games/example");
     assert_eq!(lifecycle[1]["operation"], "lookup");
     assert_eq!(lifecycle[0]["operation_id"], lifecycle[1]["operation_id"]);
     let released = broker.commands.iter().filter(|command| matches!(command,
@@ -521,4 +532,202 @@ fn connected_resume_history_settlement_uncertainty_preserves_application() {
         }
         assert!(!commands.iter().any(|command| matches!(command, Command::Request { service, .. } if service == "amaterasu.launch/1")));
     }
+}
+
+#[test]
+fn terminal_lifecycle_end_reply_without_pending_fence_allows_cleanup() {
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    assert!(controller.launch(10, request(1), peer(1), now).is_none());
+    let target = json!({
+        "kind":"session", "host_epoch":"epoch", "session_id":"session", "generation":1
+    });
+    let record = controller.records.values_mut().next().unwrap();
+    record.lifecycle_session_target = serde_json::from_value(target.clone()).ok();
+    record.lifecycle_prepare_dispatched = true;
+    record.desktop = true;
+    record.launch_connection = None;
+    record.request_cleanup(None, now);
+    let mut broker = Broker::default();
+    // The coordinator's completed receipt has no pending-only `fenced` flag.
+    for _ in 0..3 {
+        broker
+            .lifecycle_replies
+            .push_back(json!({"status":"succeeded", "target":target}));
+    }
+    for tick in 0..100 {
+        controller.poll(now + Duration::from_millis(tick * 100), &mut |command| {
+            broker.send(command)
+        });
+        if controller.records.values().next().unwrap().state == State::Stopped {
+            break;
+        }
+    }
+    let record = controller.records.values().next().unwrap();
+    assert_eq!(record.state, State::Stopped);
+    assert!(record.lifecycle_end_fenced);
+    assert!(record.lifecycle_end_complete);
+}
+
+#[test]
+fn lifecycle_end_never_accepts_unfenced_pending_or_another_generation() {
+    let target = json!({
+        "kind":"session", "host_epoch":"epoch", "session_id":"session", "generation":1
+    });
+    let wrong_target = json!({
+        "kind":"session", "host_epoch":"epoch", "session_id":"session", "generation":2
+    });
+    for reply in [
+        json!({"status":"pending", "target":target}),
+        json!({"status":"succeeded", "target":wrong_target}),
+        json!({"status":"recovery_required", "target":target, "fenced":true}),
+    ] {
+        let now = Instant::now();
+        let mut controller = Controller::new(Some(config())).unwrap();
+        assert!(controller.launch(10, request(1), peer(1), now).is_none());
+        let record = controller.records.values_mut().next().unwrap();
+        record.lifecycle_session_target = serde_json::from_value(target.clone()).ok();
+        record.lifecycle_prepare_dispatched = true;
+        record.desktop = true;
+        record.launch_connection = None;
+        record.request_cleanup(None, now);
+        let mut broker = Broker::default();
+        broker.lifecycle_replies.push_back(reply);
+        for tick in 0..20 {
+            controller.poll(now + Duration::from_millis(tick * 100), &mut |command| {
+                broker.send(command)
+            });
+            if controller.records.values().next().unwrap().state == State::CleanupFailed {
+                break;
+            }
+        }
+        assert!(
+            !controller
+                .records
+                .values()
+                .next()
+                .unwrap()
+                .lifecycle_end_fenced
+        );
+    }
+}
+
+#[test]
+fn long_stream_monitoring_retires_results_before_real_broker_capacity_is_exhausted() {
+    use amaterasu_contracts::{Grants, RuntimeConfig};
+    let started = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut responses = Broker::default();
+    assert!(
+        controller
+            .launch(10, request(1), peer(1), started)
+            .is_none()
+    );
+    assert_eq!(
+        poll_until_reply(&mut controller, &mut responses, started)
+            .1
+            .status,
+        200
+    );
+    controller.reply_delivered(10, started);
+    let mut broker = amaterasu_runtime::Broker::new(RuntimeConfig {
+        principals: [
+            (
+                "amaterasu.nvhttp".into(),
+                Grants {
+                    call: ["amaterasu.launch/1".into(), "amaterasu.rtsp/1".into()].into(),
+                    ..Grants::default()
+                },
+            ),
+            (
+                "status-provider".into(),
+                Grants {
+                    provide: ["amaterasu.launch/1".into(), "amaterasu.rtsp/1".into()].into(),
+                    ..Grants::default()
+                },
+            ),
+        ]
+        .into(),
+        ..RuntimeConfig::default()
+    })
+    .unwrap();
+    for service in ["amaterasu.launch/1", "amaterasu.rtsp/1"] {
+        assert!(matches!(
+            broker.dispatch(
+                "status-provider",
+                Command::Register {
+                    service: service.into()
+                }
+            ),
+            Response::Ok
+        ));
+    }
+    let mut monitored = 0;
+    // Simulate a long stream without waiting for the broker's real-time expiry.
+    // The real ledger permits only 512 retained requests, so consumed results
+    // must be retired instead of relying on the mock's destructive TakeResult.
+    for cycle in 0..700 {
+        let now = started + Duration::from_millis((cycle + 1) * 250);
+        for _ in 0..8 {
+            controller.poll(now, &mut |command| {
+                Ok(broker.dispatch("amaterasu.nvhttp", command))
+            });
+            if let Response::Request {
+                id,
+                service,
+                payload,
+                ..
+            } = broker.dispatch("status-provider", Command::Poll {})
+            {
+                let Response::Accepted { id: fake } = responses
+                    .send(Command::Request {
+                        service,
+                        payload,
+                        timeout_ms: 5000,
+                        operation_id: format!("status-{monitored}"),
+                        parent: None,
+                    })
+                    .unwrap()
+                else {
+                    panic!("status fixture did not admit request")
+                };
+                let Response::Result { payload } = responses
+                    .send(Command::TakeResult { request: fake })
+                    .unwrap()
+                else {
+                    panic!("status fixture did not complete request")
+                };
+                assert!(matches!(
+                    broker.dispatch(
+                        "status-provider",
+                        Command::Complete {
+                            request: id,
+                            payload
+                        }
+                    ),
+                    Response::Ok
+                ));
+                monitored += 1;
+            }
+        }
+        assert_eq!(
+            controller.records.values().next().unwrap().state,
+            State::Ready,
+            "monitoring exhausted broker capacity after {monitored} status requests"
+        );
+    }
+    assert!(monitored > 600);
+    assert!(matches!(
+        broker.dispatch(
+            "amaterasu.nvhttp",
+            Command::Request {
+                service: "amaterasu.rtsp/1".into(),
+                payload: json!({"action":"status","ticket":71}),
+                timeout_ms: 5000,
+                operation_id: "cleanup-can-still-be-admitted".into(),
+                parent: None,
+            }
+        ),
+        Response::Accepted { .. }
+    ));
 }

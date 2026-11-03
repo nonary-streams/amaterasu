@@ -2,19 +2,41 @@
 mod action_disposition;
 mod action_target;
 mod composition;
+mod launch_environment;
 pub mod schemas;
 pub use action_disposition::*;
 pub use action_target::*;
 pub use composition::*;
+pub use launch_environment::*;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 pub const SESSION_LIFECYCLE_SERVICE: &str = "amaterasu.session-lifecycle/1";
 pub const EXTENSION_REGISTRY_SERVICE: &str = "amaterasu.extension-registry/1";
 pub const EXTENSION_ACTIONS_SERVICE: &str = "amaterasu.extension-actions/1";
 pub const CONTRACT_VERSION: u32 = 1;
 pub const COMPOSITION_VERSION: u32 = 2;
+
+/// Whether lifecycle participants supply capture or accompany a pipeline that
+/// keeps ownership of its existing capture and input providers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureBindingMode {
+    #[default]
+    Managed,
+    External,
+}
+
+impl CaptureBindingMode {
+    pub fn is_managed(&self) -> bool {
+        *self == Self::Managed
+    }
+    pub fn is_external(&self) -> bool {
+        *self == Self::External
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -326,6 +348,82 @@ pub struct ProviderRequest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub control_results: Vec<ConfirmedControl>,
 }
+
+/// Read-only context for an exact lifecycle operation dispatched to
+/// a selected participant. Supplying a request is not authority by itself;
+/// the coordinator checks it against its durable dispatch and broker caller.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderContextRequest {
+    pub operation: String,
+    pub provider_request: ProviderRequest,
+}
+
+/// Facts frozen for a lifecycle transition. Unknown facts stay absent; this
+/// type deliberately contains no provider-specific configuration or policy.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderContext {
+    pub target: LifecycleTarget,
+    pub application: Value,
+    pub requested_video: Option<VideoMode>,
+    /// Client facts supplied by the trusted owner for this transition. Absence
+    /// means unknown; these values are context, never authorization.
+    pub client: Option<ClientContext>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientContext {
+    /// The owner's client reference, when known. It is not a credential.
+    pub client_ref: Option<String>,
+    /// An explicitly selected client mode; null means the owner reports none.
+    pub display_mode: Option<ClientDisplayMode>,
+    /// Opaque client variables attested by the transition owner. Consumers
+    /// interpret only the fields they own; these values never grant authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub properties: Option<Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClientDisplayMode {
+    pub width: u32,
+    pub height: u32,
+    pub refresh_millihz: u32,
+}
+
+impl ClientContext {
+    pub fn validate(&self) -> bool {
+        self.client_ref
+            .as_ref()
+            .is_none_or(|id| !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control))
+            && self.display_mode.as_ref().is_none_or(|mode| {
+                (1..=16_384).contains(&mode.width)
+                    && (1..=16_384).contains(&mode.height)
+                    && (1..=1_000_000).contains(&mode.refresh_millihz)
+            })
+            && self.properties.as_ref().is_none_or(|properties| {
+                properties.as_object().is_some_and(|values| {
+                    values.len() <= 256
+                        && values.keys().all(|key| {
+                            !key.is_empty()
+                                && key.len() <= 128
+                                && !key.chars().any(char::is_control)
+                        })
+                        && serde_json::to_vec(values).is_ok_and(|bytes| bytes.len() <= 65_536)
+                })
+            })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderContextResponse {
+    pub status: String,
+    pub context: ProviderContext,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderOperation {
@@ -491,6 +589,8 @@ pub struct OptionDescriptor {
     pub label: String,
     pub help: String,
     pub definition: amaterasu_configuration_schema::Definition,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub choice_labels: BTreeMap<String, String>,
     #[serde(default)]
     pub presentation: Option<OptionPresentation>,
     pub allowed_scopes: Vec<SettingScope>,
@@ -517,6 +617,8 @@ pub struct ActionDescriptor {
 #[serde(deny_unknown_fields)]
 pub struct ExtensionDescriptor {
     pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub revision: u64,
     pub options: Vec<OptionDescriptor>,
     pub actions: Vec<ActionDescriptor>,
@@ -536,14 +638,14 @@ pub fn validate_provider_request(request: &ProviderRequest) -> Result<(), String
         || !valid_opaque_id(&request.operation_id)
         || !valid_opaque_id(&request.settings_revision)
         || !valid_opaque_id(&request.consumer_requirements.execution_domain)
-        || request.consumer_requirements.capture_providers.is_empty()
+        || (request.consumer_requirements.capture_providers.is_empty()
+            != request.consumer_requirements.selector_schemas.is_empty())
         || request.consumer_requirements.capture_providers.len() > 32
         || request
             .consumer_requirements
             .capture_providers
             .iter()
             .any(|id| !valid_identifier(id))
-        || request.consumer_requirements.selector_schemas.is_empty()
         || request.consumer_requirements.selector_schemas.len() > 32
         || request
             .consumer_requirements
@@ -1158,6 +1260,9 @@ pub fn validate_descriptor(descriptor: &ExtensionDescriptor) -> Result<(), Strin
         return Err("descriptor exceeds size limit".into());
     }
     if !valid_identifier(&descriptor.provider)
+        || descriptor.display_name.as_ref().is_some_and(|name| {
+            name.is_empty() || name.len() > 256 || name.chars().any(char::is_control)
+        })
         || descriptor.options.len() > 128
         || descriptor.actions.len() > 128
         || descriptor.capabilities.len() > 128
@@ -1179,6 +1284,21 @@ pub fn validate_descriptor(descriptor: &ExtensionDescriptor) -> Result<(), Strin
             .into_iter()
             .collect();
         amaterasu_configuration_schema::defaults(&fields)?;
+        if !option.choice_labels.is_empty() {
+            let amaterasu_configuration_schema::Definition::Enum { options, .. } =
+                &option.definition
+            else {
+                return Err("choice labels require an enum setting".into());
+            };
+            if option.choice_labels.iter().any(|(value, label)| {
+                !options.contains(value)
+                    || label.is_empty()
+                    || label.len() > 256
+                    || label.chars().any(char::is_control)
+            }) {
+                return Err("invalid setting choice label".into());
+            }
+        }
     }
     let mut actions = BTreeSet::new();
     for action in &descriptor.actions {
@@ -1240,6 +1360,68 @@ fn validate_method(method: &MethodRef) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn authorized_launch_environment_contributions_merge_without_conflicts() {
+        let base = std::collections::BTreeMap::from([
+            ("PATH".into(), "/bin".into()),
+            ("OLD".into(), "x".into()),
+        ]);
+        let first = LaunchEnvironmentContribution {
+            extensions: Default::default(),
+            edits: std::collections::BTreeMap::from([
+                ("PLUGIN_ONE".into(), Some("one".into())),
+                ("OLD".into(), None),
+            ]),
+        };
+        let replacement = LaunchEnvironmentContribution {
+            extensions: Default::default(),
+            edits: std::collections::BTreeMap::from([("PLUGIN_TWO".into(), Some("two".into()))]),
+        };
+        let merged = merge_launch_environment(&base, &[first.clone(), replacement]).unwrap();
+        assert_eq!(merged["PLUGIN_ONE"], "one");
+        assert_eq!(merged["PLUGIN_TWO"], "two");
+        assert!(!merged.contains_key("OLD"));
+        assert_eq!(base["OLD"], "x");
+        let conflicting = LaunchEnvironmentContribution {
+            extensions: Default::default(),
+            edits: std::collections::BTreeMap::from([(
+                "plugin_one".into(),
+                Some("overwrite".into()),
+            )]),
+        };
+        assert!(merge_launch_environment(&base, &[first, conflicting]).is_err());
+        let oversized = LaunchEnvironmentContribution {
+            extensions: Default::default(),
+            edits: std::collections::BTreeMap::from([("TOO_LONG".into(), Some("x".repeat(1025)))]),
+        };
+        assert!(merge_launch_environment(&base, &[oversized]).is_err());
+        let case_variant = LaunchEnvironmentContribution {
+            extensions: Default::default(),
+            edits: std::collections::BTreeMap::from([("path".into(), None)]),
+        };
+        assert!(merge_launch_environment(&base, &[case_variant]).is_err());
+    }
+
+    #[test]
+    fn client_context_requires_bounded_identity_and_exact_millihertz() {
+        let mut context: ClientContext = serde_json::from_value(json!({
+            "client_ref":"client-1", "display_mode":{"width":1920,"height":1080,"refresh_millihz":59940}
+        })).unwrap();
+        assert!(context.validate());
+        context.display_mode.as_mut().unwrap().refresh_millihz = 0;
+        assert!(!context.validate());
+        context.display_mode = None;
+        context.client_ref = Some("invalid\nclient".into());
+        assert!(!context.validate());
+        context.client_ref = Some("client-1".into());
+        context.properties = Some(json!({"vendor_option":{"enabled":false,"rate":0}}));
+        assert!(context.validate());
+        context.properties = Some(json!([]));
+        assert!(!context.validate());
+        context.properties = Some(json!({"vendor_option":"x".repeat(65_536)}));
+        assert!(!context.validate());
+    }
 
     #[test]
     fn control_and_finalize_status_share_the_existing_wire_contract() {
@@ -1526,6 +1708,7 @@ mod tests {
         };
         let mut descriptor = ExtensionDescriptor {
             provider: "example.provider".into(),
+            display_name: None,
             revision: 1,
             options: vec![],
             actions: vec![ActionDescriptor {

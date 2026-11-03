@@ -1,6 +1,6 @@
 //! One user-scoped, process-exclusive journal precedes every connector effect.
 use super::Record;
-use amaterasu_storage::{read_bounded, write_json_atomically};
+use amaterasu_storage::{read_bounded, write_atomically};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -13,6 +13,28 @@ use std::{
 struct Document {
     schema: u32,
     records: Vec<Record>,
+}
+
+const MAX_JOURNAL_BYTES: u64 = 1024 * 1024;
+const MAX_RECORDS: usize = 8;
+
+impl Document {
+    fn validate(&self) -> Result<(), String> {
+        if self.schema != 1 || self.records.len() > MAX_RECORDS {
+            return Err("invalid virtual display ownership journal".into());
+        }
+        let mut outputs = std::collections::BTreeSet::new();
+        let mut keys = std::collections::BTreeSet::new();
+        for record in &self.records {
+            if !record.valid()
+                || !outputs.insert(record.output.clone())
+                || !keys.insert(record.key())
+            {
+                return Err("invalid virtual display ownership record".into());
+            }
+        }
+        Ok(())
+    }
 }
 
 pub(super) struct Journal {
@@ -77,21 +99,10 @@ impl Journal {
             {
                 return Err("unsafe virtual display ownership journal".into());
             }
-            let document: Document = serde_json::from_slice(&read_bounded(&path, 1024 * 1024)?)
-                .map_err(|_| "invalid virtual display ownership journal")?;
-            if document.schema != 1 || document.records.len() > 8 {
-                return Err("invalid virtual display ownership journal".into());
-            }
-            let mut outputs = std::collections::BTreeSet::new();
-            let mut keys = std::collections::BTreeSet::new();
-            for record in &document.records {
-                if !record.valid()
-                    || !outputs.insert(record.output.clone())
-                    || !keys.insert(record.key())
-                {
-                    return Err("invalid virtual display ownership record".into());
-                }
-            }
+            let document: Document =
+                serde_json::from_slice(&read_bounded(&path, MAX_JOURNAL_BYTES)?)
+                    .map_err(|_| "invalid virtual display ownership journal")?;
+            document.validate()?;
             document.records
         } else {
             Vec::new()
@@ -122,6 +133,20 @@ impl Journal {
         *existing = record;
         self.replace(records)
     }
+    pub fn replace_parked(&mut self, key: &(String, String), record: Record) -> Result<(), String> {
+        let mut records = self.records.clone();
+        let index = records
+            .iter()
+            .position(|old| &old.key() == key && old.parked)
+            .ok_or("missing parked display record")?;
+        if records.iter().enumerate().any(|(i, old)| {
+            i != index && (old.key() == record.key() || old.output == record.output)
+        }) {
+            return Err("virtual display journal conflict".into());
+        }
+        records[index] = record;
+        self.replace(records)
+    }
     pub fn remove(&mut self, key: &(String, String)) -> Result<(), String> {
         let records = self
             .records
@@ -132,13 +157,16 @@ impl Journal {
         self.replace(records)
     }
     fn replace(&mut self, records: Vec<Record>) -> Result<(), String> {
-        write_json_atomically(
-            &self.path,
-            &Document {
-                schema: 1,
-                records: records.clone(),
-            },
-        )?;
+        let document = Document {
+            schema: 1,
+            records: records.clone(),
+        };
+        document.validate()?;
+        let encoded = serde_json::to_vec_pretty(&document).map_err(|error| error.to_string())?;
+        if encoded.len() as u64 > MAX_JOURNAL_BYTES {
+            return Err("virtual display ownership journal exceeds its bound".into());
+        }
+        write_atomically(&self.path, &encoded)?;
         self.records = records;
         Ok(())
     }

@@ -61,16 +61,6 @@ impl Pipeline {
                         self.reply(record, job, send);
                         return false;
                     }
-                    if job.step == Step::ApplyLimiter {
-                        let settled = pending.shutdown(send);
-                        if !settled {
-                            record.uncertain = Some(pending);
-                            record.uncertain_step = Some(job.step);
-                        }
-                        record.limiter_state = "apply_uncertain".into();
-                        job.fail(record, "frame_limiter_apply_uncertain", now);
-                        return true;
-                    }
                     if job.step == Step::ApplyDisplay {
                         let settled = pending.shutdown(send);
                         if !settled {
@@ -112,9 +102,11 @@ impl Pipeline {
                         Step::ValidateLifecycleCandidate
                             | Step::ObserveLifecycleCapture
                             | Step::AckLifecycleCapture
+                            | Step::AckLifecycleStream
                             | Step::StartLifecycle
                             | Step::PauseLifecycle
                             | Step::RetireLifecycle
+                            | Step::RecoverLifecycle
                             | Step::ObserveActiveBinding
                             | Step::ValidateActiveBinding
                             | Step::NotifyCaptureInvalidated
@@ -166,7 +158,10 @@ impl Pipeline {
                             record.control_disconnect_checked = true;
                             return true;
                         }
-                        if matches!(job.step, Step::PauseLifecycle | Step::RetireLifecycle) {
+                        if matches!(
+                            job.step,
+                            Step::PauseLifecycle | Step::RetireLifecycle | Step::RecoverLifecycle
+                        ) {
                             if job.step == Step::PauseLifecycle {
                                 job.lifecycle_pause_tried = true;
                             } else {
@@ -184,8 +179,6 @@ impl Pipeline {
                                 | Step::FinishSession
                                 | Step::FindInput
                                 | Step::ReleaseInput
-                                | Step::FindLimiter
-                                | Step::RestoreLimiter
                                 | Step::FindOwnedVirtualDisplay
                                 | Step::RemoveOwnedVirtualDisplay
                                 | Step::FindDisplay
@@ -198,20 +191,6 @@ impl Pipeline {
                         } else {
                             true
                         };
-                    }
-                    if matches!(job.step, Step::ApplyLimiter | Step::FindLimiter) {
-                        record.limiter_state = "runtime_unavailable".into();
-                        if job.step == Step::ApplyLimiter && pending.admission_rejected() {
-                            record.limiter_attempted = false;
-                            job.step = Step::AcquireOutput;
-                            return true;
-                        }
-                        job.step = if job.step == Step::ApplyLimiter {
-                            Step::FindLimiter
-                        } else {
-                            Step::AcquireOutput
-                        };
-                        return true;
                     }
                     if job.step == Step::CreateVirtualDisplay {
                         record.virtual_display_create_error = Some("dependency_unavailable".into());
@@ -231,13 +210,7 @@ impl Pipeline {
                             job.fail(record, "display_unavailable", now);
                         } else {
                             record.display_attempted = false;
-                            job.step = if record.config.frame_limiter_settings.is_some()
-                                && !record.limiter_attempted
-                            {
-                                Step::ApplyLimiter
-                            } else {
-                                Step::AcquireOutput
-                            };
+                            job.step = Step::AcquireOutput;
                         }
                         return true;
                     }
@@ -247,13 +220,7 @@ impl Pipeline {
                             job.fail(record, "display_status_unverified", now);
                             return true;
                         }
-                        job.step = if record.config.frame_limiter_settings.is_some()
-                            && !record.limiter_attempted
-                        {
-                            Step::ApplyLimiter
-                        } else {
-                            Step::AcquireOutput
-                        };
+                        job.step = Step::AcquireOutput;
                         return true;
                     }
                     job.fail(record, "dependency_unavailable", now);
@@ -320,13 +287,10 @@ impl Pipeline {
             && record
                 .start
                 .as_ref()
-                .is_some_and(|start| start.lifecycle_target.is_some())
+                .is_some_and(|start| start.manages_lifecycle_capture())
             && !record.lifecycle_candidate_validated
         {
             job.step = Step::ValidateLifecycleCandidate;
-        }
-        if job.step == Step::ApplyLimiter {
-            record.limiter_attempted = true;
         }
         if job.step == Step::AcquireOutput
             && super::virtual_display::requested(record)
@@ -501,6 +465,7 @@ impl Pipeline {
             job.step,
             Step::ValidateLifecycleCandidate
                 | Step::AckLifecycleCapture
+                | Step::AckLifecycleStream
                 | Step::StartLifecycle
                 | Step::IssueLifecycleInputBinding
                 | Step::AckLifecycleInput
@@ -513,7 +478,12 @@ impl Pipeline {
             if payload["status"] != "succeeded"
                 || payload["target"] != json!(start.lifecycle_target)
                 || payload["plan_revision"]
-                    != json!(start.lifecycle_candidate.as_ref().unwrap().plan_revision)
+                    != json!(
+                        start
+                            .lifecycle_candidate
+                            .as_ref()
+                            .map(|candidate| candidate.plan_revision)
+                    )
             {
                 job.fail(record, "lifecycle_authority_rejected", now);
                 return true;
@@ -568,6 +538,9 @@ impl Pipeline {
                 Step::AckLifecycleInput => {
                     job.step = Step::StartLifecycle;
                 }
+                Step::AckLifecycleStream => {
+                    job.step = Step::StartLifecycle;
+                }
                 Step::StartLifecycle => {
                     record.state = State::Active;
                     record.history.activated(now);
@@ -590,19 +563,6 @@ impl Pipeline {
                 record.lifecycle_observation = Some(payload["observed_capture"].clone());
                 job.step = Step::AckLifecycleCapture;
             }
-            return true;
-        }
-        if job.step == Step::ApplyLimiter {
-            super::limiter::accept_apply(record, &payload);
-            if record.limiter_lease.is_none()
-                && matches!(
-                    record.limiter_state.as_str(),
-                    "not_needed" | "runtime_unavailable" | "lease_conflict" | "policy_only"
-                )
-            {
-                record.limiter_attempted = false;
-            }
-            job.step = Step::AcquireOutput;
             return true;
         }
         if job.step == Step::CreateVirtualDisplay {
@@ -664,16 +624,6 @@ impl Pipeline {
             } else {
                 job.step = Step::CheckDisplay;
             }
-            return true;
-        }
-        if job.step == Step::FindLimiter {
-            super::limiter::accept_status(record, &payload);
-            if record.limiter_lease.is_none()
-                && super::limiter::status_confirms_no_lease(record, &payload)
-            {
-                record.limiter_attempted = false;
-            }
-            job.step = Step::AcquireOutput;
             return true;
         }
         if job.step == Step::CheckDisplay {
@@ -863,6 +813,9 @@ impl Pipeline {
                     }
                     if record.config.display_request.is_some()
                         && (record.display_lease.is_none() || !record.display_status_verified)
+                        && !(super::virtual_display::is_read_only_policy(record)
+                            && record.display_applied
+                            && record.display_state == "applied")
                     {
                         return Err("display_lease_missing");
                     }
@@ -896,13 +849,7 @@ impl Pipeline {
                 {
                     return Err("video_format_configuration_mismatch");
                 }
-                job.step = if record.config.frame_limiter_settings.is_some()
-                    && !record.limiter_attempted
-                {
-                    Step::ApplyLimiter
-                } else {
-                    Step::AcquireOutput
-                };
+                job.step = Step::AcquireOutput;
                 Ok(true)
             }
             Step::AcquireAudio => {
@@ -924,7 +871,7 @@ impl Pipeline {
                     job.step = if record
                         .start
                         .as_ref()
-                        .is_some_and(|start| start.lifecycle_target.is_some())
+                        .is_some_and(|start| start.manages_lifecycle_capture())
                     {
                         Step::IssueLifecycleInputBinding
                     } else {
@@ -936,7 +883,15 @@ impl Pipeline {
                     .as_ref()
                     .is_some_and(|start| start.lifecycle_target.is_some())
                 {
-                    job.step = Step::StartLifecycle;
+                    job.step = if record
+                        .start
+                        .as_ref()
+                        .is_some_and(|start| start.lifecycle_capture_mode.is_external())
+                    {
+                        Step::AckLifecycleStream
+                    } else {
+                        Step::StartLifecycle
+                    };
                     Ok(true)
                 } else {
                     record.state = State::Active;
@@ -991,7 +946,15 @@ impl Pipeline {
                     .as_ref()
                     .is_some_and(|start| start.lifecycle_target.is_some())
                 {
-                    job.step = Step::AckLifecycleInput;
+                    job.step = if record
+                        .start
+                        .as_ref()
+                        .is_some_and(|start| start.lifecycle_capture_mode.is_external())
+                    {
+                        Step::AckLifecycleStream
+                    } else {
+                        Step::AckLifecycleInput
+                    };
                     return Ok(true);
                 }
                 record.state = State::Active;
@@ -1216,7 +1179,7 @@ impl Pipeline {
                 job.step = if record
                     .start
                     .as_ref()
-                    .is_some_and(|start| start.lifecycle_target.is_some())
+                    .is_some_and(|start| start.manages_lifecycle_capture())
                 {
                     Step::ObserveLifecycleCapture
                 } else if record.config.stream_audio {

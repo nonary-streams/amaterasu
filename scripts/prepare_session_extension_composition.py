@@ -145,7 +145,7 @@ def pack_profile(publisher: Path, root: Path, artifacts: Path, package: Path, se
                 raise ValueError("selected artifact changed during validation")
             library.write_bytes(artifact)
             snapshots.append((component, library))
-        legacy.run(publisher, "init-linux-session", root, *linux_options)
+        legacy.run(publisher, "init-linux-session", root, "--external-extension-composition", *linux_options)
         create_journal_directory(root, canonical_root)
         bootstrap_path = root / "bootstrap.json"
         bootstrap = json.loads(bootstrap_path.read_text())

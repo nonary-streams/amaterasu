@@ -3,7 +3,6 @@ use super::{
     VideoEncryptionPolicySnapshot,
 };
 use crate::encoder_snapshot::{CodecOffer, EncoderSnapshot};
-use crate::frame_limiter::FrameLimiterSettings;
 use crate::launch::{DEFAULT_CLEANUP_BUDGET, MONITOR_INTERVAL, STREAM_CLEANUP_MARGIN_MS};
 use crate::preparation::{LegacyPreparationStep, PreparationStep};
 use amaterasu_contracts::virtual_display::VirtualDisplayIntent;
@@ -56,7 +55,6 @@ pub enum Stage {
     VerifyResumeSession,
     VerifyResumeApplication,
     RefreshResumePolicy,
-    AuthorizeResumeSnapshot,
     Cleanup,
     VerifyRtspCleanup,
     VerifyApplicationCleanup,
@@ -76,6 +74,7 @@ pub struct Record {
     pub application_operation: String,
     pub rtsp_operation: String,
     pub lifecycle_required: bool,
+    pub lifecycle_capture_mode: amaterasu_module_sdk::extension_api::CaptureBindingMode,
     pub lifecycle_prepare_dispatched: bool,
     pub lifecycle_prepare_pending: bool,
     pub lifecycle_session_target: Option<amaterasu_module_sdk::extension_api::LifecycleTarget>,
@@ -99,9 +98,6 @@ pub struct Record {
     pub global_configured_virtual_sink: Option<String>,
     pub global_preparation: Vec<PreparationStep>,
     pub legacy_global_preparation: Vec<LegacyPreparationStep>,
-    pub global_frame_limiter_settings: FrameLimiterSettings,
-    pub client_frame_limiter_settings: FrameLimiterSettings,
-    pub application_frame_limiter_settings: FrameLimiterSettings,
     pub application_preflight_overrides: Option<ApplicationConfigOverrides>,
     /// Authoritative global Proton policy read before application preflight.
     pub global_proton_dualsense_compatibility: Option<bool>,
@@ -129,9 +125,12 @@ pub struct Record {
     pub display_admission_token: Option<String>,
     pub application_preflight_token: Option<String>,
     pub application_catalog_revision: Option<u64>,
+    /// Original bounded launch properties, exposed as opaque lifecycle context.
+    pub application_properties: Option<Value>,
     /// Validated cleanup budget frozen by launch preflight before provider effects.
     pub application_cleanup_budget_ms: Option<u64>,
-    pub frame_limiter_snapshot: Option<Value>,
+    /// Frozen application-provider lifetime policy, independent of stream pause support.
+    pub stop_on_stream_end: bool,
     pub executable_path: Option<String>,
     pub resolved_virtual_sink: Option<String>,
     pub capture_sink_without_routing: bool,
@@ -234,8 +233,6 @@ impl Record {
         global_configured_virtual_sink: Option<String>,
         global_preparation: Vec<PreparationStep>,
         legacy_global_preparation: Vec<LegacyPreparationStep>,
-        global_frame_limiter_settings: FrameLimiterSettings,
-        client_frame_limiter_settings: FrameLimiterSettings,
         global_ping_timeout_ms: u32,
         global_video_max_batch_size_kb: u8,
         global_max_bitrate_kbps: Option<u32>,
@@ -273,6 +270,7 @@ impl Record {
             application_operation,
             rtsp_operation,
             lifecycle_required: false,
+            lifecycle_capture_mode: Default::default(),
             lifecycle_prepare_dispatched: false,
             lifecycle_prepare_pending: false,
             lifecycle_session_target: None,
@@ -296,9 +294,6 @@ impl Record {
             global_configured_virtual_sink,
             global_preparation,
             legacy_global_preparation,
-            global_frame_limiter_settings,
-            client_frame_limiter_settings,
-            application_frame_limiter_settings: FrameLimiterSettings::default(),
             application_preflight_overrides: None,
             global_proton_dualsense_compatibility: None,
             proton_dualsense_compatibility: false,
@@ -320,8 +315,9 @@ impl Record {
             display_admission_token: None,
             application_preflight_token: None,
             application_catalog_revision: None,
+            application_properties: None,
             application_cleanup_budget_ms: None,
-            frame_limiter_snapshot: None,
+            stop_on_stream_end: false,
             executable_path: None,
             resolved_virtual_sink: None,
             capture_sink_without_routing: false,

@@ -68,6 +68,10 @@ impl Harness {
     }
 
     fn new_config(migrating: bool) -> Self {
+        Self::new_scoped_config(migrating, false)
+    }
+
+    fn new_scoped_config(migrating: bool, scoped: bool) -> Self {
         let root = std::env::temp_dir().join(format!(
             "amaterasu-registry-broker-{}-{}",
             std::process::id(),
@@ -85,12 +89,28 @@ impl Harness {
             json!([])
         };
         let method = json!({"service":"example.demo/1","method":"settings_validate","interface_major":1,"interface_minor":0,"request":{"required":{"values":"object"},"optional":{},"allow_extra":false},"response":{"required":{"ok":"boolean","valid":"boolean"},"optional":{},"allow_extra":false},"privilege":"user"});
-        let configuration = serde_json::from_value(json!({
+        let mut configuration = json!({
             "principals": { COORDINATOR:{"provide":[SERVICE],"call":["example.demo/1","amaterasu.state/1","amaterasu.session-lifecycle/1"]}, "amaterasu.state":{"provide":["amaterasu.state/1"]}, "lifecycle":{"provide":["amaterasu.session-lifecycle/1"]}, "example.demo":{"provide":["example.demo/1"]}, "management":{"call":[SERVICE,"example.demo/1","amaterasu.state/1","amaterasu.session-lifecycle/1","input/1"]}, "input":{"provide":["input/1"],"call":[SERVICE,"amaterasu.session-lifecycle/1","example.demo/1","amaterasu.state/1"]}, "outsider":{"call":[SERVICE,"example.demo/1"]} },
             "api_methods":[{"provider":"example.demo","callers":[COORDINATOR,"management"],"method":method}],
             "settings": {COORDINATOR:{"descriptors":[{"descriptor":descriptor,"descriptor_sha256":descriptor_hash,"approved_methods":[method],"grants":[{"caller":"management","scope":{"kind":"host"},"read":true,"write":true},{"caller":"input","scope":{"kind":"host"},"read":true,"write":false},{"caller":"outsider","scope":{"kind":"host"},"read":true,"write":false}],"migrations":migrations}]}}
-        })).unwrap();
-        let mut broker = Broker::new(configuration).unwrap();
+        });
+        if scoped {
+            let descriptor = &mut configuration["settings"][COORDINATOR]["descriptors"][0];
+            descriptor["descriptor"]["options"][0]["allowed_scopes"] =
+                json!(["host", "application", "paired_client", "session"]);
+            let typed: amaterasu_extension_api::ExtensionDescriptor =
+                serde_json::from_value(descriptor["descriptor"].clone()).unwrap();
+            descriptor["descriptor_sha256"] = json!(format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&typed).unwrap())
+            ));
+            for kind in ["all_applications", "all_paired_clients", "all_sessions"] {
+                descriptor["grants"].as_array_mut().unwrap().push(
+                    json!({"caller":"management","scope":{"kind":kind},"read":true,"write":true}),
+                );
+            }
+        }
+        let mut broker = Broker::new(serde_json::from_value(configuration).unwrap()).unwrap();
         let method = serde_json::from_value(method).unwrap();
         assert!(matches!(
             broker.dispatch("example.demo", Command::RegisterApi { method }),
@@ -465,6 +485,70 @@ fn dynamic_scope_requires_matching_lifecycle_authority() {
     let rejected=harness.call("management",json!({"operation":"settings_get","provider":"example.demo","scope":{"kind":"session","id":"session"},"application":null,"paired_client":"client","session":"session","target":target,"input_binding":"token","input_boot_epoch":"0123456789abcdef0123456789abcdef"}));
     assert_eq!(rejected["error"]["code"], "permission_denied");
     assert_eq!(before, harness.scope_calls);
+}
+
+#[test]
+fn explicit_class_grants_resolve_and_reset_scoped_settings_without_provider_specific_logic() {
+    let mut harness = Harness::new_scoped_config(false, true);
+    let mut revision = 0;
+    for (scope, enabled) in [
+        (json!({"kind":"host"}), false),
+        (json!({"kind":"application","id":"game"}), true),
+        (json!({"kind":"paired_client","id":"client"}), false),
+        (json!({"kind":"session","id":"session"}), true),
+    ] {
+        let result = harness.call(
+            "management",
+            json!({"operation":"settings_update",
+            "provider":"example.demo","scope":scope,"expected_revision":revision,
+            "values":{"enabled":enabled}}),
+        );
+        revision += 1;
+        assert_eq!(result["revision"], revision, "{result}");
+    }
+    let query = json!({"operation":"settings_get","provider":"example.demo",
+        "scope":{"kind":"host"},"application":"game","paired_client":"client","session":"session"});
+    let result = harness.call("management", query.clone());
+    assert_eq!(result["effective"]["enabled"]["value"], true);
+    assert_eq!(
+        result["effective"]["enabled"]["source"],
+        json!({"kind":"session","id":"session"})
+    );
+    assert_eq!(
+        harness.scope_calls, 0,
+        "trusted class grants do not ask a live session to authorize an editor"
+    );
+    let result = harness.call(
+        "management",
+        json!({"operation":"settings_update",
+        "provider":"example.demo","scope":{"kind":"session","id":"session"},
+        "expected_revision":revision,"values":{}}),
+    );
+    assert_eq!(result["revision"], revision + 1);
+    let result = harness.call("management", query.clone());
+    assert_eq!(result["effective"]["enabled"]["value"], false);
+    assert_eq!(
+        result["effective"]["enabled"]["source"],
+        json!({"kind":"paired_client","id":"client"})
+    );
+    let mut other = query.clone();
+    other["paired_client"] = json!("different-client");
+    assert_eq!(
+        harness.call("management", other)["effective"]["enabled"]["value"],
+        true
+    );
+    assert_eq!(
+        harness.call("outsider", query)["error"]["code"],
+        "permission_denied"
+    );
+    assert_eq!(
+        harness.call(
+            "management",
+            json!({"operation":"settings_get",
+        "provider":"example.demo","scope":{"kind":"all_sessions"}})
+        )["error"]["code"],
+        "invalid_request"
+    );
 }
 
 #[test]

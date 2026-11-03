@@ -241,7 +241,29 @@ impl Pipeline {
             &configuration.lifecycle_target,
             &configuration.lifecycle_candidate,
         ) {
-            (None, None, None) => {}
+            (None, None, None)
+                if configuration.lifecycle_capture_mode.is_managed()
+                    && record.config.lifecycle_capture_mode.is_managed() => {}
+            (
+                Some(amaterasu_extension_api::LifecycleTarget::Session {
+                    host_epoch,
+                    session_id,
+                    ..
+                }),
+                Some(amaterasu_extension_api::LifecycleTarget::Stream {
+                    host_epoch: stream_epoch,
+                    session_id: stream_session,
+                    stream_id,
+                    generation,
+                }),
+                None,
+            ) if owner == "amaterasu.rtsp"
+                && configuration.lifecycle_capture_mode.is_external()
+                && record.config.lifecycle_capture_mode.is_external()
+                && host_epoch == stream_epoch
+                && session_id == stream_session
+                && valid_name(stream_id)
+                && *generation > 0 => {}
             (
                 Some(amaterasu_extension_api::LifecycleTarget::Session {
                     host_epoch,
@@ -256,6 +278,8 @@ impl Pipeline {
                 }),
                 Some(candidate),
             ) if owner == "amaterasu.rtsp"
+                && configuration.lifecycle_capture_mode.is_managed()
+                && record.config.lifecycle_capture_mode.is_managed()
                 && host_epoch == stream_epoch
                 && session_id == stream_session
                 && valid_name(stream_id)
@@ -300,10 +324,6 @@ impl Pipeline {
         }
         if !configuration.matches_prepared_codec(&record.config) {
             rpc::complete(send, request, error("video_codec_mismatch"));
-            return;
-        }
-        if !configuration.matches_prepared_frame_limiter(&record.config) {
-            rpc::complete(send, request, error("frame_limiter_configuration_mismatch"));
             return;
         }
         if !configuration.matches_prepared_encryption(&record.config) {

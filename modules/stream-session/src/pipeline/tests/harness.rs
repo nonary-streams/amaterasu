@@ -114,14 +114,6 @@ pub struct Broker {
     pub updater_session_stops: Vec<Value>,
     pub tray_activity_updates: Vec<Value>,
     pub tray_vigem_notifications: usize,
-    pub limiter_unavailable: bool,
-    pub limiter_admission_unavailable: bool,
-    pub limiter_restore_failures: usize,
-    pub limiter_lease: Option<String>,
-    pub limiter_session: Option<String>,
-    pub limiter_executable_path: Option<String>,
-    pub limiter_status_executable_override: Option<String>,
-    pub limiter_malformed_status: bool,
     pub display_lease: Option<String>,
     pub display_operation: Option<String>,
     pub display_recovery_required: bool,
@@ -143,6 +135,12 @@ pub struct Broker {
     pub virtual_display_specification: Option<Value>,
     pub virtual_display_references: BTreeSet<String>,
     pub virtual_display_pending_statuses: u8,
+    pub virtual_display_removal_statuses: u8,
+    pub virtual_display_removing: bool,
+    pub virtual_display_park_on_remove: bool,
+    pub virtual_display_parked: Option<Value>,
+    pub virtual_display_reused_parked: bool,
+    pub virtual_display_invalid_parked_status: bool,
     pub virtual_display_create_failure: Option<String>,
     pub virtual_display_remove_failure: bool,
     pub state_revision: u64,
@@ -271,12 +269,6 @@ impl Broker {
                     });
                 }
                 if service == "amaterasu.host-metrics/1" && !self.host_metrics_available {
-                    return Ok(Response::Error {
-                        code: "service_unavailable".into(),
-                        message: String::new(),
-                    });
-                }
-                if service == "amaterasu.frame-limiter/1" && self.limiter_admission_unavailable {
                     return Ok(Response::Error {
                         code: "service_unavailable".into(),
                         message: String::new(),
@@ -561,9 +553,6 @@ impl Broker {
         }
         if service == "amaterasu.input/1" {
             return self.input(action, &call.payload);
-        }
-        if service == "amaterasu.frame-limiter/1" {
-            return self.frame_limiter(action, &call.payload);
         }
         if service == "amaterasu.virtual-display/1" {
             if call.payload["reference_id"].is_string() {
@@ -880,6 +869,9 @@ impl Broker {
                 if let Some(code) = self.virtual_display_create_failure.as_deref() {
                     return error(code);
                 }
+                if self.virtual_display_parked.take().is_some() {
+                    self.virtual_display_reused_parked = true;
+                }
                 let specification = json!({
                     "identity":payload["identity"],
                     "name":payload["name"],
@@ -906,10 +898,21 @@ impl Broker {
             "status" => {
                 let reference = payload["reference_id"].as_str().expect("reference ID");
                 let reference_owned = self.virtual_display_references.contains(reference);
+                if self.virtual_display_removing && self.virtual_display_removal_statuses == 0 {
+                    if self.virtual_display_park_on_remove {
+                        self.virtual_display_parked = self.virtual_display_specification.take();
+                    } else {
+                        self.virtual_display_specification = None;
+                    }
+                    self.virtual_display_removing = false;
+                }
                 let monitors = self.virtual_display_specification.as_ref().map_or_else(
                     Vec::new,
                     |specification| {
-                        let state = if self.virtual_display_pending_statuses > 0 {
+                        let state = if self.virtual_display_removing {
+                            self.virtual_display_removal_statuses -= 1;
+                            "removing"
+                        } else if self.virtual_display_pending_statuses > 0 {
                             "creating"
                         } else {
                             "ready"
@@ -921,7 +924,14 @@ impl Broker {
                             "ready":{"device_path":"\\\\.\\DISPLAYVDD"},"error":null})]
                     },
                 );
-                json!({"ok":true,"monitors":monitors,"reference_owned":reference_owned})
+                let parked = self
+                    .virtual_display_parked
+                    .as_ref()
+                    .is_some_and(|specification| specification["identity"] == payload["identity"]);
+                let parked_outputs = self.virtual_display_parked.as_ref().filter(|_| !self.virtual_display_invalid_parked_status).map_or_else(
+                    || json!([]), |specification| json!([{"identity":specification["identity"],"output":"Virtual-2"}]),
+                );
+                json!({"ok":true,"monitors":monitors,"reference_owned":reference_owned,"parked":parked,"parked_outputs":parked_outputs})
             }
             "remove" => {
                 if self.virtual_display_remove_failure {
@@ -931,6 +941,14 @@ impl Broker {
                 let released = self.virtual_display_references.remove(reference);
                 let reference_owned = self.virtual_display_references.contains(reference);
                 let removed = self.virtual_display_references.is_empty();
+                if removed
+                    && (self.virtual_display_removal_statuses > 0
+                        || self.virtual_display_park_on_remove)
+                {
+                    self.virtual_display_removing = true;
+                    return json!({"ok":true,"removed":false,"reference_owned":false,
+                        "monitor":{"state":"removing"}});
+                }
                 if removed {
                     self.virtual_display_specification = None;
                 }
@@ -939,63 +957,6 @@ impl Broker {
                     "removed":removed})
             }
             _ => panic!("unexpected virtual display action"),
-        }
-    }
-
-    fn frame_limiter(&mut self, action: &str, payload: &Value) -> Value {
-        match action {
-            "apply" => {
-                if self.limiter_unavailable {
-                    return json!({"ok":true,"version":1,"action":"apply",
-                        "session_id":payload["session_id"],
-                        "state":"runtime_unavailable","applied":false});
-                }
-                let session = payload["session_id"].as_str().unwrap();
-                if self.limiter_session.as_deref() == Some(session) {
-                    return json!({"ok":true,"version":1,"action":"apply",
-                        "session_id":session,"state":"already_applied","applied":true,
-                        "lease":self.limiter_lease});
-                }
-                let lease = format!("limiter-{session}");
-                self.limiter_session = Some(session.into());
-                self.limiter_lease = Some(lease.clone());
-                self.limiter_executable_path =
-                    payload["executable_path"].as_str().map(str::to_owned);
-                json!({"ok":true,"version":1,"action":"apply","session_id":session,
-                    "state":"applied","applied":true,"lease":lease})
-            }
-            "status" => {
-                if self.limiter_malformed_status {
-                    return json!({"ok":true,"version":1,"action":"status","state":"not_found",
-                        "applied":false,"session_id":payload["session_id"]});
-                }
-                let leases = if self.limiter_session.as_deref() == payload["session_id"].as_str() {
-                    vec![
-                        json!({"session_id":self.limiter_session,"lease":self.limiter_lease,
-                        "executable_path":self.limiter_status_executable_override.as_ref()
-                            .or(self.limiter_executable_path.as_ref()),"provider":"rtss",
-                        "state":"applied","applied":true}),
-                    ]
-                } else {
-                    Vec::new()
-                };
-                json!({"ok":true,"version":1,"action":"status","session_id":payload["session_id"],
-                    "state":if leases.is_empty() {"not_found"} else {"applied"},"applied":false,"leases":leases})
-            }
-            "restore" => {
-                if self.limiter_restore_failures > 0 {
-                    self.limiter_restore_failures -= 1;
-                    return json!({"ok":true,"version":1,"action":"restore",
-                        "state":"restore_failed","applied":true});
-                }
-                assert_eq!(payload["lease"], json!(self.limiter_lease));
-                self.limiter_lease = None;
-                self.limiter_session = None;
-                self.limiter_executable_path = None;
-                json!({"ok":true,"version":1,"action":"restore",
-                    "state":"restored","applied":false})
-            }
-            _ => panic!("unexpected frame limiter action"),
         }
     }
 

@@ -997,112 +997,6 @@ fn uncertain_verifier_settlement_keeps_child_identity_until_release() {
 }
 
 #[test]
-fn ticket_readback_keeps_the_admitted_frame_limiter_snapshot() {
-    let mut record = record(State::Preparing);
-    let snapshot = serde_json::json!({"version":1,"settings":{"frame_limiter_provider":"rtss"}});
-    record.config.frame_limiter_settings = Some(snapshot.clone());
-    record.config.frame_limiter_executable_path = Some("C:\\Games\\Example.exe".into());
-    for state in [
-        State::Preparing,
-        State::Ready,
-        State::Playing,
-        State::Closing,
-    ] {
-        record.state = state;
-        let response = record.response();
-        assert_eq!(response["frame_limiter_settings"], snapshot);
-        assert_eq!(
-            response["frame_limiter_executable_path"],
-            "C:\\Games\\Example.exe"
-        );
-    }
-}
-
-#[test]
-fn stream_prepare_must_read_back_the_frozen_frame_limiter_snapshot() {
-    let snapshot = json!({
-        "version":1,
-        "settings":{
-            "frame_limiter_enable":true,
-            "frame_limiter_fps_limit_millihz":60000,
-            "frame_limiter_provider":"rtss",
-            "frame_limiter_disable_vsync":false,
-            "frame_limiter_auto_virtual_framegen":"enabled",
-            "rtss_frame_limit_type":"back edge sync",
-            "rtss_allow_virtual_display_override":false,
-            "rtss_install_path":"",
-            "mangohud_limiter_method":"late",
-            "mangohud_preset":"custom",
-            "mangohud_always_show_graph":false
-        },
-        "requested_stream_fps_millihz":60000,
-        "client_display_mode_override_millihz":null,
-        "lossless_scaling_limit_millihz":null,
-        "virtual_display_active":null,
-        "physical_framegen_capture":null,
-        "game_frame_generation_mode":null,
-        "rtss_frame_limit_type_explicit_override":true
-    });
-    for response in ["missing", "changed", "wrong_path", "exact"] {
-        let settings: Settings = serde_json::from_value(json!({
-            "enabled":true,"bind":"127.0.0.1:0","allowed_principals":["caller"]
-        }))
-        .unwrap();
-        let mut controller = Controller::new(settings).unwrap();
-        let mut record = record(State::Preparing);
-        record.config.frame_limiter_settings = Some(snapshot.clone());
-        record.config.frame_limiter_executable_path = Some("C:\\Games\\Example.exe".into());
-        record.config.application_operation_id = Some("launch-one".into());
-        record.config.app_id = Some("app-0000000000000001".into());
-        record.config.catalog_revision = Some(1);
-        let job = Job {
-            ticket: record.id,
-            phase: Phase::Prepare,
-            call: Call::new(json!({"action":"prepare"}), "prepare".into(), Some(19)),
-            caller: Some(19),
-            network: None,
-            deadline: 5_000,
-        };
-        let mut prepared = json!({
-            "ok":true,"state":"prepared","session":23,
-            "audio_local":"127.0.0.1:51000","video_local":"127.0.0.1:51002",
-            "control_local":"127.0.0.1:51004",
-            "frame_limiter_settings":snapshot,
-            "frame_limiter_executable_path":"C:\\Games\\Example.exe",
-        });
-        match response {
-            "missing" => {
-                prepared
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("frame_limiter_settings");
-            }
-            "changed" => {
-                prepared["frame_limiter_settings"]["settings"]["rtss_frame_limit_type"] =
-                    json!("async");
-            }
-            "wrong_path" => {
-                prepared["frame_limiter_executable_path"] = json!("C:\\Games\\Other.exe");
-            }
-            _ => {}
-        }
-        let mut endpoint = Endpoint {
-            active_request: true,
-            ..Endpoint::default()
-        };
-        let runtime = client(&mut endpoint);
-        controller.prepared(&mut record, job, &prepared, 10, &runtime);
-        if response == "exact" {
-            assert!(record.state == State::Ready);
-            assert_eq!(record.response()["frame_limiter_settings"], snapshot);
-        } else {
-            assert!(record.state == State::Closing, "{response}");
-            assert_eq!(record.failure, Some("frame_limiter_snapshot_unverified"));
-        }
-    }
-}
-
-#[test]
 fn cancelled_parent_reaches_cleanup_failed_when_settlement_stays_unavailable() {
     let mut controller = Controller::new(Settings::default()).expect("disabled controller");
     let config = open();
@@ -2152,154 +2046,6 @@ fn rejected_announce_cannot_produce_an_authenticated_play_start() {
 }
 
 #[test]
-fn play_verifies_the_frozen_launch_snapshot_before_starting_the_stream() {
-    let snapshot = json!({"version":1,"settings":{"frame_limiter_provider":"rtss"}});
-    for case in [
-        "exact",
-        "wrong_operation",
-        "wrong_app",
-        "wrong_revision",
-        "wrong_snapshot",
-        "wrong_path",
-        "unavailable",
-        "lifecycle_exact",
-        "lifecycle_missing",
-        "lifecycle_wrong",
-    ] {
-        let mut controller = Controller::new(Settings::default()).unwrap();
-        let mut record = record(State::Ready);
-        record.config.profile.bitrate_kbps = 20_000;
-        record.config.profile.packet_size = 1_392;
-        record.config.profile.packet_ms = 5;
-        record.config.profile.encrypt_video = false;
-        record.config.profile.encrypt_audio = false;
-        record.negotiated_encryption = Some(crate::model::EncryptionSnapshot {
-            video: true,
-            audio: false,
-        });
-        record.negotiated_slices_per_frame = Some(1);
-        record.negotiated_video_stream_format =
-            Some(amaterasu_module_sdk::VideoStreamFormat::H264_SDR);
-        record.client_feature_flags = Some(3);
-        record.negotiated_color = Some(amaterasu_gamestream::sdp::ColorMode::Bt709Limited);
-        record.negotiated_video = Some(crate::model::NegotiatedVideo {
-            codec: amaterasu_media::VideoCodec::H264,
-            width: record.config.profile.width,
-            height: record.config.profile.height,
-            fps: record.config.profile.fps,
-            bitrate_kbps: record.config.profile.bitrate_kbps,
-            max_reference_frames: record.config.profile.max_reference_frames,
-        });
-        record.config.frame_limiter_settings = Some(snapshot.clone());
-        record.config.frame_limiter_executable_path = Some("C:\\Games\\Example.exe".into());
-        record.config.application_operation_id = Some("launch-one".into());
-        record.config.app_id = Some("app-0000000000000001".into());
-        record.config.catalog_revision = Some(7);
-        if case.starts_with("lifecycle_") {
-            record.config.lifecycle_session_target = Some(serde_json::from_value(json!({"kind":"session","host_epoch":"epoch","session_id":"session","generation":1})).unwrap());
-            record.config.lifecycle_settings_revision = Some("7".into());
-            record.config.lifecycle_intent = Some("resume".into());
-            record.lifecycle_input_required = Some(false);
-        }
-        let (negotiation, action_ticket) = pending_play(&record);
-        record.negotiation = Some(negotiation);
-        let ticket = record.id;
-        controller.schedule_frame_limiter_verification(&record, 999, action_ticket, 0);
-        controller.records.insert(ticket, record);
-        assert!(
-            controller
-                .job
-                .as_ref()
-                .is_some_and(|job| job.phase == Phase::VerifyFrameLimiter)
-        );
-
-        let mut reply = json!({
-            "ok":true,"verified":true,
-            "application_operation_id":"launch-one",
-            "app_id":"app-0000000000000001",
-            "catalog_revision":7,
-            "frame_limiter_settings":snapshot,
-            "frame_limiter_executable_path":"C:\\Games\\Example.exe",
-        });
-        match case {
-            "wrong_operation" => reply["application_operation_id"] = json!("other-launch"),
-            "wrong_app" => reply["app_id"] = json!("app-0000000000000002"),
-            "wrong_revision" => reply["catalog_revision"] = json!(8),
-            "wrong_snapshot" => reply["frame_limiter_settings"]["version"] = json!(2),
-            "wrong_path" => reply["frame_limiter_executable_path"] = json!("C:\\Games\\Other.exe"),
-            "lifecycle_exact" => reply["rtsp_operation_id"] = json!("caller-operation"),
-            "lifecycle_wrong" => reply["rtsp_operation_id"] = json!("old-rtsp"),
-            _ => {}
-        }
-        let mut endpoint = Endpoint {
-            verifier_reply: Some(reply),
-            deny_launch: case == "unavailable",
-            ..Endpoint::default()
-        };
-        let runtime = client(&mut endpoint);
-        controller.advance_job(&runtime, 1);
-        let launch_request = endpoint.commands.iter().find_map(|command| match command {
-            Command::Request {
-                service, payload, ..
-            } if service == "amaterasu.launch/1" => Some(payload),
-            _ => None,
-        });
-        let launch_request = launch_request.expect("Launch verification precedes stream start");
-        assert_eq!(launch_request["action"], "verify_frame_limiter_snapshot");
-        assert_eq!(launch_request["app_id"], "app-0000000000000001");
-        assert_eq!(launch_request["catalog_revision"], 7);
-        if case.starts_with("lifecycle_") {
-            assert_eq!(launch_request["rtsp_operation_id"], "caller-operation");
-        } else {
-            assert!(launch_request.get("rtsp_operation_id").is_none());
-        }
-        assert!(!endpoint.commands.iter().any(|command| matches!(command,
-            Command::Request { service, payload, .. }
-                if service == "amaterasu.stream-session/1"
-                    && payload["action"] == "start_when_authenticated")));
-
-        if case != "unavailable" {
-            controller.advance_job(&runtime, 2);
-        }
-        if case == "lifecycle_exact" {
-            assert!(
-                controller
-                    .job
-                    .as_ref()
-                    .is_some_and(|job| job.phase == Phase::LifecyclePrepare)
-            );
-        } else if case == "exact" {
-            assert!(
-                controller
-                    .job
-                    .as_ref()
-                    .is_some_and(|job| job.phase == Phase::Arm)
-            );
-            controller.advance_job(&runtime, 3);
-            assert!(endpoint.commands.iter().any(|command| matches!(command,
-                Command::Request { service, payload, .. }
-                    if service == "amaterasu.stream-session/1"
-                        && payload["action"] == "start_when_authenticated")));
-        } else {
-            assert!(controller.job.is_none());
-            assert!(controller.records[&ticket].state == State::Closing);
-            assert_eq!(
-                controller.records[&ticket].failure,
-                Some(if case == "unavailable" {
-                    "frame_limiter_verification_unavailable"
-                } else {
-                    "frame_limiter_snapshot_denied"
-                })
-            );
-            assert!(!endpoint.commands.iter().any(|command| matches!(command,
-                Command::Request { service, payload, .. }
-                    if service == "amaterasu.stream-session/1"
-                        && payload["action"] == "start_when_authenticated")));
-        }
-    }
-}
-
-#[test]
 fn unavailable_play_response_never_marks_the_ticket_playing() {
     let mut controller = Controller::new(Settings::default()).expect("disabled controller");
     let mut record = record(State::Arming);
@@ -2346,6 +2092,9 @@ fn lifecycle_gate_waits_for_authority_and_passes_matching_candidate_to_stream_se
     );
     record.config.lifecycle_settings_revision = Some("7".into());
     record.config.lifecycle_intent = Some("initial".into());
+    record.config.lifecycle_client_context = Some(serde_json::from_value(json!({
+        "client_ref":"client-a", "display_mode":{"width":1920,"height":1080,"refresh_millihz":59940}
+    })).unwrap());
     record.lifecycle_input_required = Some(false);
     let mut controller = Controller::new(Settings::default()).unwrap();
     let start = record.authenticated_start_payload(23).unwrap();
@@ -2360,6 +2109,13 @@ fn lifecycle_gate_waits_for_authority_and_passes_matching_candidate_to_stream_se
     let runtime = client(&mut endpoint);
     controller.advance_job(&runtime, 1);
     controller.advance_job(&runtime, 2);
+    assert!(endpoint.commands.iter().any(|command| matches!(command,
+        Command::Request { service, payload, .. }
+        if service == "amaterasu.session-lifecycle/1"
+            && payload["operation"] == "prepare_stream"
+            && payload["client_context"]["client_ref"] == "client-a"
+            && payload["client_context"]["display_mode"]["refresh_millihz"] == 59940
+    )));
     assert!(
         controller
             .job
@@ -2545,6 +2301,67 @@ fn lifecycle_consumer_requirements_follow_frozen_stream_session_input_policy() {
                 json!(["capture"])
             }
         );
+    }
+}
+
+#[test]
+fn external_lifecycle_preparation_preserves_capture_and_requires_matching_mode() {
+    for returned_mode in ["external", "managed"] {
+        let (mut record, announce) = announced_profile_record();
+        assert!(record.accept_announce(&announce));
+        record.config.lifecycle_session_target = Some(
+            serde_json::from_value(json!({
+                "kind":"session","host_epoch":"epoch","session_id":"session","generation":1
+            }))
+            .unwrap(),
+        );
+        record.config.lifecycle_settings_revision = Some("7".into());
+        record.config.lifecycle_intent = Some("initial".into());
+        record.config.lifecycle_capture_mode =
+            amaterasu_module_sdk::extension_api::CaptureBindingMode::External;
+        record.lifecycle_input_required = Some(true);
+        let mut controller = Controller::new(Settings::default()).unwrap();
+        let payload = record.authenticated_start_payload(23).unwrap();
+        controller.schedule_arm(&mut record, payload, 8, 9, 0);
+        controller.records.insert(record.id, record);
+        let mut endpoint = Endpoint {
+            verifier_reply: Some(json!({"status":"succeeded",
+                "operation_id":"rtsp-0000000000000005-lifecycle-prepare",
+                "transition_id":"transition","capture_binding_mode":returned_mode,
+                "target":{"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1},
+                "candidate":null,"required_consumers":["capture"]})),
+            ..Endpoint::default()
+        };
+        let runtime = client(&mut endpoint);
+        for tick in 1..=5 {
+            controller.advance_job(&runtime, tick);
+        }
+        assert!(endpoint.commands.iter().any(|command| matches!(command,
+            Command::Request { service, payload, .. }
+            if service == "amaterasu.session-lifecycle/1"
+                && payload["consumer_requirements"] == json!(["capture"])
+        )));
+        let start = endpoint.commands.iter().find_map(|command| match command {
+            Command::Request {
+                service, payload, ..
+            } if service == "amaterasu.stream-session/1"
+                && payload["action"] == "start_when_authenticated" =>
+            {
+                Some(payload)
+            }
+            _ => None,
+        });
+        if returned_mode == "external" {
+            let start =
+                start.expect("external preparation forwards the native capture configuration");
+            assert_eq!(start["configuration"]["lifecycle_capture_mode"], "external");
+            assert!(start["configuration"]["lifecycle_candidate"].is_null());
+        } else {
+            assert!(
+                start.is_none(),
+                "a changed capture ownership mode must not start capture"
+            );
+        }
     }
 }
 
