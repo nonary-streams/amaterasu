@@ -1,6 +1,9 @@
 //! Offline, non-authoritative review of the proposed activation policy.
 // Proposed capability only; no host request route is registered by this report.
 const HOST_PACKAGE_ACTIVATION_SERVICE: &str = "amaterasu.host-package-activation/1";
+const RTX_REPOSITORY_ID: &str = "amaterasu-rtx-hdr";
+const RTX_REPOSITORY_URL: &str =
+    "https://raw.githubusercontent.com/nonary-streams/amaterasu-rtx-hdr/catalog";
 use amaterasu_package::policy_approval::{PolicyCandidateContext, propose_policy_approval};
 use amaterasu_package::{BootstrapConfig, PackageResult, decode_hex, read_bounded, sha256};
 use serde_json::json;
@@ -434,7 +437,7 @@ pub fn provision_default(root: &Path) -> PackageResult<()> {
             {
                 return Err("active RTX HDR policy differs from the installed composition".into());
             }
-            return Ok(());
+            return enroll_project_repository(&root, &bootstrap, &publisher);
         }
         (sha256(&bytes), publisher)
     };
@@ -456,7 +459,50 @@ pub fn provision_default(root: &Path) -> PackageResult<()> {
     })();
     let _ = fs::remove_file(&report);
     let _ = fs::remove_dir(&directory);
-    result
+    result?;
+    let _lock = amaterasu_package::RootLock::acquire(&root)?;
+    let bootstrap: BootstrapConfig = amaterasu_package::read_json(&root.join("bootstrap.json"))?;
+    let allowlist: amaterasu_package::policy_approval::PolicyAllowlist =
+        amaterasu_package::read_json(&root.join("package-activation-policy.json"))?;
+    if allowlist.publisher_fingerprint != publisher {
+        return Err("activation publisher changed while enrolling repository".into());
+    }
+    enroll_project_repository(&root, &bootstrap, &publisher)
+}
+
+/// Called while holding the host lock, after verifying the active publisher.
+#[cfg(target_os = "linux")]
+fn enroll_project_repository(
+    root: &Path,
+    bootstrap: &BootstrapConfig,
+    publisher: &str,
+) -> PackageResult<()> {
+    use amaterasu_package::repository::{ApprovedRepository, RepositoryStore};
+    let key = bootstrap
+        .trusted_keys
+        .values()
+        .find(|key| decode_hex::<32>(key).is_ok_and(|value| sha256(&value) == publisher))
+        .ok_or("active publisher is no longer trusted")?;
+    let expected = ApprovedRepository::approve(
+        RTX_REPOSITORY_ID.into(),
+        RTX_REPOSITORY_URL.into(),
+        key.clone(),
+        publisher.into(),
+    )?;
+    let store = RepositoryStore::new(root.join("repositories"))?;
+    if let Ok(existing) = store.approved(RTX_REPOSITORY_ID) {
+        if existing.location != expected.location
+            || existing.fingerprint != expected.fingerprint
+            || existing.public_key != expected.public_key
+        {
+            return Err(
+                "existing RTX HDR repository approval differs from the project publisher".into(),
+            );
+        }
+        return Ok(());
+    }
+    // A revoked or conflicting existing ID must not be silently replaced.
+    store.approve(expected)
 }
 
 #[cfg(test)]
@@ -624,6 +670,14 @@ mod tests {
             .unwrap();
             assert_eq!(authorized, value["proposed_allowlist"]);
             provision_default(&root).unwrap();
+            let store =
+                amaterasu_package::repository::RepositoryStore::new(root.join("repositories"))
+                    .unwrap();
+            let enrolled = store.approved(RTX_REPOSITORY_ID).unwrap();
+            assert_eq!(enrolled.fingerprint, fingerprint);
+            assert_eq!(enrolled.location, RTX_REPOSITORY_URL);
+            store.revoke(RTX_REPOSITORY_ID).unwrap();
+            assert!(provision_default(&root).is_err());
         }
         fs::remove_dir_all(base).unwrap();
     }

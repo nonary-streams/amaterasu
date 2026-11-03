@@ -20,7 +20,8 @@ file is a JSON string containing a 32-byte Ed25519 secret as lowercase hex. Keep
 the key outside the generated tree. The output directory must not already
 exist. Select a catalog sequence greater than the last one used by that
 repository; it must not be reused with different bytes. The expiry is a future
-Unix timestamp no later than the package expiry.
+Unix timestamp at most one year away. The publisher verifies the source package
+before signing the same composition with the requested release expiry.
 
 The publisher verifies the source package, the complete RTX profile, and its
 processor dependency and grants. It emits canonical signed `catalog.json` and

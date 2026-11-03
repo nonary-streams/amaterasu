@@ -5,7 +5,7 @@
 use amaterasu_module_sdk::network::Network;
 use amaterasu_package::repository::{
     Candidate, CandidateKind, RepositoryListing, RepositoryStore, RepositoryTransport,
-    download_candidate, verify_candidate,
+    download_candidate, refresh_catalog, verify_candidate,
 };
 use amaterasu_package::{
     BootstrapConfig, PackageResult, current_target, random_identifier, read_json, unix_timestamp,
@@ -23,6 +23,7 @@ use std::{
 
 const SLOT: &str = "amaterasu.rtx-hdr";
 const IMPLEMENTATION: &str = "amaterasu-linux-session-rtx-hdr";
+const OFFICIAL_REPOSITORY: &str = "amaterasu-rtx-hdr";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PreparedCandidate {
@@ -48,6 +49,15 @@ pub(crate) fn prepare(
     let store = RepositoryStore::new(repository_directory.to_path_buf())?;
     let now = unix_timestamp();
     let target = current_target();
+    if let Ok(approved) = store.approved(OFFICIAL_REPOSITORY) {
+        let transport = NetworkRepository::new(
+            &approved.location,
+            network.clone(),
+            cancelled.clone(),
+            transferred.clone(),
+        );
+        refresh_catalog(&store, OFFICIAL_REPOSITORY, &transport, &target, now)?;
+    }
     let (repository_id, candidate) = choose_candidate(store.list(&target, now)?)?;
     let approved = store.approved(&repository_id)?;
     let catalog = store.catalog(&repository_id, &target, now)?;

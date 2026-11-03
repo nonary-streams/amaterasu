@@ -18,6 +18,7 @@ const SERVICE: &str = "amaterasu.rtx-hdr/1";
 const CATALOG_DOMAIN: &[u8] = b"amaterasu.repository.catalog.v1\n";
 const MAX_SET_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_FILE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_PUBLISHED_LIFETIME: u64 = 366 * 24 * 60 * 60;
 
 /// Produce a new, standalone repository tree. Never changes an existing tree.
 #[allow(clippy::too_many_arguments)]
@@ -58,12 +59,16 @@ pub fn publish(
     if !verified.signed {
         return Err("repository source package must be signed".into());
     }
-    if expires_unix > verified.manifest.expires_unix {
-        return Err("catalog cannot outlive its native package".into());
+    if expires_unix > now.saturating_add(MAX_PUBLISHED_LIFETIME) {
+        return Err("published repository lifetime exceeds one year".into());
     }
     let version = check_composition(&verified.manifest)?;
     let files = checked_payload_files(&verified.manifest)?;
-    let manifest = serde_json::to_vec(&verified.manifest).map_err(|e| e.to_string())?;
+    // The publisher signs the exact verified source composition with its own
+    // release lifetime; development builds have a short source validity.
+    let mut published_manifest = verified.manifest.clone();
+    published_manifest.expires_unix = expires_unix;
+    let manifest = serde_json::to_vec(&published_manifest).map_err(|e| e.to_string())?;
     let candidate = Candidate {
         slot: SLOT.into(),
         implementation: IMPLEMENTATION.into(),
@@ -324,5 +329,45 @@ mod tests {
         let output = fixture.root.join("output");
         assert!(fixture.run(&output).is_err());
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn publisher_signs_a_bounded_release_lifetime_for_verified_source() {
+        let fixture = Fixture::new();
+        let output = fixture.root.join("extended");
+        let expiry = unix_timestamp() + 7200;
+        publish(
+            &fixture.bootstrap,
+            &fixture.source,
+            &output,
+            "publisher",
+            "https://example.test",
+            &fixture.key,
+            1,
+            expiry,
+        )
+        .unwrap();
+        let path = output
+            .join("native")
+            .join(IMPLEMENTATION)
+            .join("0.1.0")
+            .join("manifest.json");
+        let published: ReleaseManifest = read_json(&path).unwrap();
+        assert_eq!(published.expires_unix, expiry);
+        let too_long = fixture.root.join("too-long");
+        assert!(
+            publish(
+                &fixture.bootstrap,
+                &fixture.source,
+                &too_long,
+                "publisher",
+                "https://example.test",
+                &fixture.key,
+                1,
+                unix_timestamp() + MAX_PUBLISHED_LIFETIME + 10
+            )
+            .is_err()
+        );
+        assert!(!too_long.exists());
     }
 }
