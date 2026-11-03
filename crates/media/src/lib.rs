@@ -237,6 +237,40 @@ impl PacketSink {
     }
 }
 
+/// Encoded packet with a separate host-processing start time. The base
+/// timestamp remains the presentation/stream timestamp and must not be
+/// rewritten to represent processing. A nonzero start is in microseconds on
+/// the same host monotonic clock as `host_monotonic_micros`; zero means the
+/// provider cannot report a trustworthy start. All fragments of an access
+/// unit must carry the same processing start and base sequence/timestamp.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TimedEncodedPacket {
+    pub base: EncodedPacket,
+    pub processing_started_host_us: u64,
+}
+
+/// Synchronous borrowed delivery of a timed packet. The sink copies any data
+/// it retains, returns BUSY without accepting it, and must never unwind.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TimedPacketSink {
+    pub context: *mut c_void,
+    pub write: unsafe extern "C" fn(*mut c_void, *const TimedEncodedPacket) -> Status,
+}
+
+impl TimedPacketSink {
+    /// # Safety
+    /// The sink callback/context and packet bytes remain live for this call.
+    pub unsafe fn send(&self, packet: &TimedEncodedPacket) -> Status {
+        if let Err(status) = packet.base.validate() {
+            return status;
+        }
+        // SAFETY: caller guarantees callback and borrowed packet lifetimes.
+        unsafe { (self.write)(self.context, packet) }
+    }
+}
+
 #[repr(C)]
 pub struct CaptureApi {
     pub base: NativeInterface,

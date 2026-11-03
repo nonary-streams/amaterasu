@@ -24,7 +24,7 @@ use crate::encoder_snapshot::{
 };
 use crate::preparation::{LegacyPreparationStep, PreparationStep};
 use crate::wire::{ClientConfigOverrides, Reply, xml};
-use amaterasu_module_sdk::{Command, ModuleResult, Response};
+use amaterasu_module_sdk::{Command, LogEmitter, LogLevel, ModuleResult, Response};
 use record::{Record, Stage, State};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -677,6 +677,7 @@ struct PendingResume {
 }
 
 pub struct Controller {
+    logger: Option<LogEmitter>,
     config: Option<StreamingConfig>,
     session_lifecycle_required: bool,
     session_lifecycle_capture_mode: amaterasu_module_sdk::extension_api::CaptureBindingMode,
@@ -722,6 +723,7 @@ impl Controller {
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).map_err(|_| "random_unavailable")?;
         Ok(Self {
+            logger: None,
             config,
             session_lifecycle_required: false,
             session_lifecycle_capture_mode: Default::default(),
@@ -761,6 +763,18 @@ impl Controller {
 
     pub fn supported(&self) -> bool {
         self.config.is_some()
+    }
+
+    pub fn set_logger(&mut self, logger: LogEmitter) {
+        self.logger = Some(logger);
+    }
+
+    fn log_phase(&self, level: LogLevel, phase: workflow::Phase, event: &str) {
+        if let Some(logger) = &self.logger {
+            // The phase and event are internal enums and fixed strings; request
+            // contents and client identities are deliberately excluded.
+            let _ = logger.emit(level, "launch", &format!("phase={phase:?} event={event}"));
+        }
     }
 
     pub fn set_session_lifecycle_required(&mut self, required: bool) {

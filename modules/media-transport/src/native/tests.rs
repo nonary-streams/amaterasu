@@ -67,3 +67,64 @@ fn bound_native_tables_isolate_owners_and_remain_closed_after_shutdown() {
         }
     }
 }
+
+#[test]
+fn timed_table_preserves_legacy_prefix_and_checks_owner() {
+    let (video, audio) = receivers();
+    let shared = Arc::new(Mutex::new(Controller::new(Settings {
+        network_provider: None,
+        enabled: true,
+        allow_remote: false,
+        allowed_principals: vec!["owner".into()],
+    })));
+    let id = shared
+        .lock()
+        .unwrap()
+        .handle("owner", Operation::Open(request(&video, &audio, false)))
+        .unwrap()
+        .created
+        .unwrap();
+    let factory = Factory::new(shared);
+    let query = NativeInterfaceQuery {
+        header: AbiHeader::of::<NativeInterfaceQuery>(),
+        interface_major: INTERFACE_MAJOR,
+        min_minor: 1,
+        min_size: size_of::<MediaTransportApiV1_1>() as u32,
+    };
+    let bytes = [0, 0, 0, 1, 0x65, 1];
+    for owner in ["other", "owner"] {
+        let mut output = std::ptr::null();
+        // SAFETY: test factory, query, packet, and result outlive each call;
+        // each binding is released exactly once.
+        unsafe {
+            assert_eq!(
+                factory.api.bind.unwrap()(
+                    factory.api.context,
+                    BorrowedBytes::new(owner.as_bytes()),
+                    &query,
+                    &mut output,
+                ),
+                STATUS_OK
+            );
+            let api = &*output.cast::<MediaTransportApiV1_1>();
+            assert_eq!(api.base.base.header.minor, 1);
+            let packet = TimedEncodedPacket {
+                base: video_packet(&bytes, 0),
+                processing_started_host_us: amaterasu_media::host_monotonic_micros(),
+            };
+            assert_eq!(
+                (api.submit_video_timed)(api.base.base.context, id, &packet),
+                if owner == "owner" {
+                    STATUS_OK
+                } else {
+                    MEDIA_CLOSED
+                }
+            );
+            assert_eq!(
+                (api.submit_video_timed)(api.base.base.context, id, std::ptr::null()),
+                STATUS_INVALID_ARGUMENT
+            );
+            api.base.base.release.unwrap()(api.base.base.context);
+        }
+    }
+}

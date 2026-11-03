@@ -44,11 +44,37 @@ pub struct Stream {
     pending_video: Option<PendingVideo>,
     next_frame_index: Option<u32>,
     pub discarded_audio_fec_shards: u64,
+    processing_latency: ProcessingLatency,
+}
+
+/// Wire latency in tenths of a millisecond. Unknown timestamps are tracked
+/// separately so averages use known samples only.
+#[derive(Default)]
+pub(crate) struct ProcessingLatency {
+    pub samples: u64,
+    pub total_tenths_ms: u64,
+    pub max_tenths_ms: u16,
+    pub zero_samples: u64,
+    pub unknown_samples: u64,
+}
+
+impl ProcessingLatency {
+    fn record(&mut self, latency: Option<u16>) {
+        self.samples = self.samples.saturating_add(1);
+        if let Some(latency) = latency {
+            self.total_tenths_ms = self.total_tenths_ms.saturating_add(u64::from(latency));
+            self.max_tenths_ms = self.max_tenths_ms.max(latency);
+            self.zero_samples = self.zero_samples.saturating_add(u64::from(latency == 0));
+        } else {
+            self.unknown_samples = self.unknown_samples.saturating_add(1);
+        }
+    }
 }
 
 struct PendingVideo {
     sequence: u64,
     timestamp_us: u64,
+    processing_started_host_us: u64,
     keyframe: bool,
     bytes: Vec<u8>,
 }
@@ -127,6 +153,7 @@ impl Stream {
             pending_video: None,
             next_frame_index: Some(1),
             discarded_audio_fec_shards: 0,
+            processing_latency: ProcessingLatency::default(),
         };
         if let Some(format) = request.video_stream_format {
             stream.configure_video_format(format)?;
@@ -227,6 +254,17 @@ impl Stream {
     /// # Safety
     /// The packet and its initialized immutable bytes live through this call.
     pub unsafe fn submit_video(&mut self, packet: &EncodedPacket) -> Status {
+        // Legacy packets provide no independent host processing clock.
+        unsafe { self.submit_video_with_start(packet, 0) }
+    }
+
+    /// # Safety
+    /// The packet and its initialized immutable bytes live through this call.
+    pub unsafe fn submit_video_with_start(
+        &mut self,
+        packet: &EncodedPacket,
+        processing_started_host_us: u64,
+    ) -> Status {
         if self.delivery.failure.is_some() {
             return MEDIA_BACKEND_ERROR;
         }
@@ -259,7 +297,9 @@ impl Stream {
             let end = packet.flags & FLAG_END_OF_ACCESS_UNIT != 0;
             let previous = self.pending_video.as_ref();
             if previous.is_some_and(|pending| {
-                pending.sequence != packet.sequence || pending.timestamp_us != packet.timestamp_us
+                pending.sequence != packet.sequence
+                    || pending.timestamp_us != packet.timestamp_us
+                    || pending.processing_started_host_us != processing_started_host_us
             }) {
                 return STATUS_INVALID_ARGUMENT;
             }
@@ -286,6 +326,7 @@ impl Stream {
                 let pending = self.pending_video.get_or_insert_with(|| PendingVideo {
                     sequence: packet.sequence,
                     timestamp_us: packet.timestamp_us,
+                    processing_started_host_us,
                     keyframe: false,
                     bytes: Vec::new(),
                 });
@@ -302,6 +343,7 @@ impl Stream {
                     keyframe || pending.keyframe,
                     packet.sequence,
                     packet.timestamp_us,
+                    processing_started_host_us,
                 );
                 if status == STATUS_OK {
                     self.pending_video = None;
@@ -311,7 +353,13 @@ impl Stream {
         }
         // SAFETY: caller's packet allocation is borrowed only through packetization.
         let access_unit = unsafe { packet.bytes().unwrap() };
-        self.submit_access_unit(access_unit, keyframe, packet.sequence, packet.timestamp_us)
+        self.submit_access_unit(
+            access_unit,
+            keyframe,
+            packet.sequence,
+            packet.timestamp_us,
+            processing_started_host_us,
+        )
     }
 
     /// Match a packet's ABI codec against the stream. The first packet of an
@@ -343,6 +391,7 @@ impl Stream {
         keyframe: bool,
         sequence: u64,
         timestamp_us: u64,
+        processing_started_host_us: u64,
     ) -> Status {
         if self
             .video_sequence
@@ -373,15 +422,28 @@ impl Stream {
             return MEDIA_BUSY;
         }
         let clock = (u128::from(timestamp_us) * 90_000 / 1_000_000) as u32;
-        // The video service stamps packets on the shared host clock at capture,
-        // so the time to this point is the host's processing latency.
-        let latency = host_processing_latency_tenths_ms(timestamp_us, host_monotonic_micros());
+        // Presentation time is the RTP clock; only the independent host-clock
+        // capture start can describe processing time. Zero means unavailable.
+        let now_us = host_monotonic_micros();
+        let latency = if processing_started_host_us != 0
+            && now_us != 0
+            && now_us
+                .checked_sub(processing_started_host_us)
+                .is_some_and(|elapsed| elapsed <= 5_000_000)
+        {
+            Some(host_processing_latency_tenths_ms(
+                processing_started_host_us,
+                now_us,
+            ))
+        } else {
+            None
+        };
         let datagrams = match self.video.packetize_with_latency(
             access_unit,
             keyframe,
             frame_index,
             clock,
-            latency,
+            latency.unwrap_or(0),
         ) {
             Ok(datagrams) => datagrams,
             Err(_) => return STATUS_INVALID_ARGUMENT,
@@ -391,10 +453,15 @@ impl Stream {
             Err(code) => return self.fail(code),
         };
         self.delivery.push_video(frame_index, datagrams);
+        self.processing_latency.record(latency);
         self.video_sequence = Some(sequence);
         self.video_timestamp = Some(timestamp_us);
         self.next_frame_index = frame_index.checked_add(1);
         STATUS_OK
+    }
+
+    pub(crate) fn take_processing_latency(&mut self) -> ProcessingLatency {
+        std::mem::take(&mut self.processing_latency)
     }
 
     /// # Safety

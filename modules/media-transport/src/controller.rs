@@ -225,6 +225,19 @@ impl Controller {
         }
     }
 
+    /// Reset per-stream wire-latency counters at the module's reporting boundary.
+    pub(crate) fn take_processing_latencies(
+        &mut self,
+    ) -> Vec<(u64, crate::stream::ProcessingLatency)> {
+        self.streams
+            .iter_mut()
+            .filter_map(|(id, stream)| {
+                let sample = stream.take_processing_latency();
+                (sample.samples > 0).then_some((*id, sample))
+            })
+            .collect()
+    }
+
     pub fn shutdown(&mut self) {
         self.settings.enabled = false;
         self.streams.clear();
@@ -235,6 +248,22 @@ impl Controller {
     pub unsafe fn submit_video(&mut self, owner: &str, id: u64, packet: &EncodedPacket) -> Status {
         match self.owned_mut(owner, id) {
             Some(stream) => unsafe { stream.submit_video(packet) },
+            None => MEDIA_CLOSED,
+        }
+    }
+
+    /// # Safety
+    /// Caller keeps the packet and initialized immutable bytes alive through submit.
+    pub unsafe fn submit_video_timed(
+        &mut self,
+        owner: &str,
+        id: u64,
+        packet: &amaterasu_media::TimedEncodedPacket,
+    ) -> Status {
+        match self.owned_mut(owner, id) {
+            Some(stream) => unsafe {
+                stream.submit_video_with_start(&packet.base, packet.processing_started_host_us)
+            },
             None => MEDIA_CLOSED,
         }
     }

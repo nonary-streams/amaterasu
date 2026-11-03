@@ -212,18 +212,39 @@ impl Backend for NativeBackend {
 
     fn video(&mut self) -> PlaneResult<Option<VideoPacket>> {
         let mut output = Delivery::default();
-        // SAFETY: binding and output are retained throughout synchronous delivery.
-        let api =
-            unsafe { self.video.table::<VideoApi>() }.map_err(|_| "native_layout_mismatch")?;
-        let status = unsafe {
-            (api.receive)(
-                self.video.context(),
-                self.handles.video,
-                PacketSink {
-                    context: (&mut output as *mut Delivery<VideoPacket>).cast(),
-                    write: copy_video,
-                },
-            )
+        // Both bindings were obtained by their typed contract identities. Only
+        // use the additive timing path when both ends advertise their tails.
+        // SAFETY: retained bindings and their exact versioned tables outlive the call.
+        let timed_video = unsafe { amaterasu_module_sdk::video::timed(&self.video) }
+            .map_err(|_| "native_layout_mismatch")?;
+        let timed_media = unsafe { amaterasu_module_sdk::transport::media_timed(&self.media) }
+            .map_err(|_| "native_layout_mismatch")?;
+        let status = if let (Some(api), Some(_)) = (timed_video, timed_media) {
+            // SAFETY: provider lends the timed packet for this synchronous callback.
+            unsafe {
+                (api.receive_timed)(
+                    self.video.context(),
+                    self.handles.video,
+                    TimedPacketSink {
+                        context: (&mut output as *mut Delivery<VideoPacket>).cast(),
+                        write: copy_timed_video,
+                    },
+                )
+            }
+        } else {
+            // SAFETY: the retained binding was validated for the legacy prefix.
+            let api =
+                unsafe { self.video.table::<VideoApi>() }.map_err(|_| "native_layout_mismatch")?;
+            unsafe {
+                (api.receive)(
+                    self.video.context(),
+                    self.handles.video,
+                    PacketSink {
+                        context: (&mut output as *mut Delivery<VideoPacket>).cast(),
+                        write: copy_video,
+                    },
+                )
+            }
         };
         output.finish(status, DeliveryLane::Video)
     }
@@ -286,16 +307,36 @@ impl Backend for NativeBackend {
         }
     }
 
-    fn submit_video(&mut self, packet: &EncodedPacket) -> PlaneResult<bool> {
-        // SAFETY: packet points into an owned assembly retained until return.
-        let api = unsafe { self.media.table::<MediaTransportApi>() }
+    fn submit_video(
+        &mut self,
+        packet: &EncodedPacket,
+        processing_started_host_us: u64,
+    ) -> PlaneResult<bool> {
+        // The packet allocation stays owned by the assembly through this call.
+        // SAFETY: both bindings have validated identities and outlive this call.
+        let timed_video = unsafe { amaterasu_module_sdk::video::timed(&self.video) }
             .map_err(|_| "native_layout_mismatch")?;
-        accepted(
+        let timed_media = unsafe { amaterasu_module_sdk::transport::media_timed(&self.media) }
+            .map_err(|_| "native_layout_mismatch")?;
+        let status = if let (Some(_), Some(api)) = (timed_video, timed_media) {
+            let timed = TimedEncodedPacket {
+                base: *packet,
+                processing_started_host_us,
+            };
+            // SAFETY: packet, timing header and borrowed bytes remain live synchronously.
+            unsafe {
+                (api.submit_video_timed)(self.media.context(), self.handles.media_transport, &timed)
+            }
+        } else {
+            // Legacy transport has no independent processing clock. The built-in
+            // provider reports unknown; external providers own their semantics.
+            let api = unsafe { self.media.table::<MediaTransportApi>() }
+                .map_err(|_| "native_layout_mismatch")?;
             unsafe {
                 (api.submit_video)(self.media.context(), self.handles.media_transport, packet)
-            },
-            "native_video_submit_failed",
-        )
+            }
+        };
+        accepted(status, "native_video_submit_failed")
     }
 
     fn submit_pcm(&mut self, frame: &AudioFrame) -> PlaneResult<bool> {
@@ -452,6 +493,13 @@ unsafe fn deliver<T, P>(
 unsafe extern "C" fn copy_video(context: *mut c_void, packet: *const EncodedPacket) -> Status {
     // SAFETY: trusted provider lends initialized metadata and bytes during delivery.
     unsafe { deliver(context, packet, |packet| VideoPacket::copy(packet)) }
+}
+unsafe extern "C" fn copy_timed_video(
+    context: *mut c_void,
+    packet: *const TimedEncodedPacket,
+) -> Status {
+    // SAFETY: provider lends the timed header and bytes during this callback.
+    unsafe { deliver(context, packet, |packet| VideoPacket::copy_timed(packet)) }
 }
 unsafe extern "C" fn copy_pcm(context: *mut c_void, frame: *const AudioFrame) -> Status {
     // SAFETY: trusted provider keeps frame and samples live until callback returns.

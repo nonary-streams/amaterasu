@@ -25,6 +25,10 @@ _Static_assert(AMATERASU_CPU_PROCESSOR_API_V1_0_SIZE == 40, "CPU processor v1.0 
 _Static_assert(offsetof(AmaterasuCpuFrame, data) == 16, "frame data offset");
 _Static_assert(offsetof(AmaterasuCpuFrame, timestamp_us) == 32, "frame timestamp offset");
 _Static_assert(sizeof(AmaterasuEncodedPacket) == 40, "packet layout");
+_Static_assert(sizeof(AmaterasuTimedEncodedPacket) == 48, "timed packet layout");
+_Static_assert(offsetof(AmaterasuTimedEncodedPacket, processing_started_host_us) == sizeof(AmaterasuEncodedPacket), "timed packet preserves legacy prefix");
+_Static_assert(offsetof(AmaterasuVideoApiV1_3, receive_timed) == sizeof(AmaterasuVideoApiV1_2), "video timed tail preserves prefix");
+_Static_assert(offsetof(AmaterasuMediaTransportApiV1_1, submit_video_timed) == sizeof(AmaterasuMediaTransportApi), "transport timed tail preserves prefix");
 _Static_assert(sizeof(AmaterasuDesktopRect) == 16, "desktop rectangle layout");
 _Static_assert(offsetof(AmaterasuDesktopRect, width) == 8, "desktop extent offset");
 _Static_assert(sizeof(AmaterasuCaptureGeometry) == 32, "capture geometry layout");

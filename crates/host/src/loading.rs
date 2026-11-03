@@ -23,6 +23,60 @@ mod teardown_tests;
 const HOST_CONFIGURATION_COMPONENT: &str = "amaterasu.host-configuration";
 const STEAM_COMPONENT: &str = "amaterasu.steam";
 
+/// Losses remain pending until the product logger accepts a summary. Acceptance
+/// is queue admission, not proof that the disk sink ultimately wrote it.
+#[derive(Default)]
+struct LogLoss {
+    broker: u64,
+    host: u64,
+}
+
+impl LogLoss {
+    fn record_broker(&mut self, count: u64) {
+        self.broker = self.broker.saturating_add(count);
+    }
+
+    fn record_host(&mut self) {
+        self.host = self.host.saturating_add(1);
+    }
+
+    fn report(&mut self, emit: impl FnOnce(&str) -> Result<(), LoggerError>) {
+        if self.broker == 0 && self.host == 0 {
+            return;
+        }
+        let message = format!(
+            "log records dropped before logger admission: broker={} host={}",
+            self.broker, self.host
+        );
+        if emit(&message).is_ok() {
+            *self = Self::default();
+        }
+    }
+}
+
+#[cfg(test)]
+mod log_loss_tests {
+    use super::{LogLoss, LoggerError};
+
+    #[test]
+    fn dropped_log_summary_is_retried_after_logger_backpressure() {
+        let mut loss = LogLoss::default();
+        loss.record_broker(3);
+        loss.record_host();
+        loss.report(|message| {
+            assert!(message.contains("broker=3 host=1"));
+            Err(LoggerError::QueueFull)
+        });
+        loss.record_broker(2);
+        loss.record_host();
+        loss.report(|message| {
+            assert!(message.contains("broker=5 host=2"));
+            Ok(())
+        });
+        loss.report(|_| panic!("accepted losses must not be reported twice"));
+    }
+}
+
 pub(crate) fn path_to_unicode_string(path: &Path) -> Result<String, String> {
     path.to_str()
         .map(str::to_owned)
@@ -66,6 +120,7 @@ pub struct LoadedComponents {
     host_log_service: Option<HostLogService>,
     host_logs_enabled: bool,
     pending_log_policy: Option<HostLogEvent>,
+    log_loss: LogLoss,
     lifecycle_endpoint: HostApi,
     runtime: RuntimeLibrary,
 }
@@ -182,6 +237,7 @@ impl LoadedComponents {
             host_log_service: None,
             host_logs_enabled,
             pending_log_policy: None,
+            log_loss: LogLoss::default(),
             lifecycle_endpoint,
             runtime,
         };
@@ -258,12 +314,17 @@ impl LoadedComponents {
         let Ok(output) = (unsafe { self.lifecycle_endpoint.call(&input) }) else {
             return;
         };
-        let Ok(Response::LogEvents { events, .. }) = serde_json::from_slice(&output) else {
+        let Ok(Response::LogEvents {
+            events,
+            dropped_records,
+        }) = serde_json::from_slice(&output)
+        else {
             return;
         };
         let Some(logger) = &self.product_logger else {
             return;
         };
+        self.log_loss.record_broker(dropped_records);
         let mut pending_policy = self.pending_log_policy.take();
         if let Some(HostLogEvent::Policy {
             revision,
@@ -295,8 +356,8 @@ impl LoadedComponents {
                     target,
                     message,
                 } => {
-                    if !policy_queue_blocked {
-                        let _ = logger.emit(level, &target, &message);
+                    if policy_queue_blocked || logger.emit(level, &target, &message).is_err() {
+                        self.log_loss.record_host();
                     }
                 }
                 HostLogEvent::Policy {
@@ -334,6 +395,10 @@ impl LoadedComponents {
                     }
                 }
             }
+        }
+        if !policy_queue_blocked {
+            self.log_loss
+                .report(|message| logger.emit(3, "amaterasu.host::logging", message));
         }
         self.pending_log_policy = pending_policy;
     }

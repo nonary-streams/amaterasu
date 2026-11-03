@@ -4,7 +4,7 @@
 //! aliases. Untyped legacy registrations are rejected for every alias; a
 //! matching version and table size do not identify the interface.
 use crate::{ModuleResult, NativeBinding, RuntimeClient, abi::NativeServiceFactory};
-use amaterasu_media::{ControlTransportApi, MediaTransportApi};
+use amaterasu_media::{ControlTransportApi, MediaTransportApi, MediaTransportApiV1_1};
 
 pub const MEDIA_CONTRACT: &str = "amaterasu.media-transport.native/1";
 pub const CONTROL_CONTRACT: &str = "amaterasu.control-transport.native/1";
@@ -39,6 +39,22 @@ pub unsafe fn bind_media(runtime: &RuntimeClient, service: &str) -> ModuleResult
             size_of::<MediaTransportApi>() as u32,
         )
     }
+}
+
+/// Return the timed-video tail if this provider advertises media transport
+/// v1.1. Older providers retain their original, untimed API.
+///
+/// # Safety
+/// The binding must be a live media transport binding; table references and
+/// callbacks cannot outlive it.
+pub unsafe fn media_timed(binding: &NativeBinding) -> ModuleResult<Option<&MediaTransportApiV1_1>> {
+    // SAFETY: caller guarantees this binding is the exact media transport family.
+    let prefix = unsafe { binding.table::<MediaTransportApi>() }?;
+    if prefix.base.header.minor < 1 {
+        return Ok(None);
+    }
+    // SAFETY: the advertised v1.1 tail is checked for size by table().
+    unsafe { binding.table::<MediaTransportApiV1_1>() }.map(Some)
 }
 /// # Safety
 /// The runtime and provider must outlive the binding and its calls.

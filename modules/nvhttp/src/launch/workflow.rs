@@ -15,6 +15,7 @@ use amaterasu_contracts::virtual_display::{
     VirtualDisplayLayout, VirtualDisplayMode, VirtualDisplayModePolicy,
     VirtualDisplayRefreshRateOption, VirtualDisplayResolutionOption, VirtualDisplayResolverContext,
 };
+use amaterasu_module_sdk::LogLevel;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -62,11 +63,79 @@ pub enum Phase {
     ReleaseHistory,
 }
 
+impl Phase {
+    fn routine_monitor(self) -> bool {
+        matches!(self, Self::MonitorApplication | Self::MonitorRtsp)
+    }
+
+    fn response_reported_failure(self, payload: &Value) -> bool {
+        match self {
+            Self::PrepareLifecycle
+            | Self::LookupLifecycle
+            | Self::BindApplication
+            | Self::LookupApplicationBinding
+            | Self::EndLifecycle
+            | Self::ReportApplicationRetired
+            | Self::AwaitLifecycleEnd => {
+                !matches!(payload["status"].as_str(), Some("pending" | "succeeded"))
+            }
+            Self::VerifyPaused | Self::VerifyResumeSession => payload["status"] != "ok",
+            _ => payload["ok"] != true,
+        }
+    }
+}
+
+#[cfg(test)]
+mod phase_logging_tests {
+    use super::Phase;
+    use serde_json::json;
+
+    #[test]
+    fn successful_monitoring_is_quiet_but_failures_are_recorded() {
+        for phase in [Phase::MonitorApplication, Phase::MonitorRtsp] {
+            assert!(phase.routine_monitor());
+            assert!(!phase.response_reported_failure(&json!({"ok": true})));
+            assert!(phase.response_reported_failure(&json!({"ok": false})));
+        }
+        for phase in [
+            Phase::PrepareLifecycle,
+            Phase::LookupLifecycle,
+            Phase::BindApplication,
+            Phase::LookupApplicationBinding,
+            Phase::EndLifecycle,
+            Phase::ReportApplicationRetired,
+            Phase::AwaitLifecycleEnd,
+        ] {
+            assert!(!phase.response_reported_failure(&json!({"status":"pending"})));
+            assert!(!phase.response_reported_failure(&json!({"status":"succeeded"})));
+            assert!(phase.response_reported_failure(&json!({"status":"rejected"})));
+        }
+        assert!(!Phase::VerifyPaused.response_reported_failure(&json!({"status":"ok"})));
+        assert!(
+            Phase::VerifyResumeSession.response_reported_failure(&json!({"status":"rejected"}))
+        );
+    }
+}
+
 pub struct Job {
     pub record: u64,
     pub phase: Phase,
     pub call: Call,
     pub deadline: Instant,
+}
+
+fn log_monitor_problem(
+    logger: Option<&amaterasu_module_sdk::LogEmitter>,
+    phase: Phase,
+    event: &str,
+) {
+    if let Some(logger) = logger {
+        let _ = logger.emit(
+            LogLevel::Warning,
+            "launch",
+            &format!("phase={phase:?} event={event}"),
+        );
+    }
 }
 
 impl Controller {
@@ -124,7 +193,9 @@ impl Controller {
             self.records.insert(id, record);
             return;
         }
-        eprintln!("amaterasu launch phase start={phase:?}");
+        if !phase.routine_monitor() {
+            self.log_phase(LogLevel::Debug, phase, "start");
+        }
         let call = self.make_call(&mut record, phase);
         let deadline = if matches!(
             phase,
@@ -188,7 +259,7 @@ impl Controller {
             Outcome::Rejected => self.rejected(job, now, replies),
             Outcome::Settled => self.settled(job, now, replies),
             Outcome::Uncertain => {
-                eprintln!("amaterasu launch phase uncertain={:?}", job.phase);
+                self.log_phase(LogLevel::Warning, job.phase, "uncertain");
                 let record = self.records.get_mut(&job.record).expect("workflow record");
                 let entering_cleanup =
                     !matches!(record.state, State::Stopping | State::CleanupFailed);
@@ -666,11 +737,23 @@ impl Controller {
         now: Instant,
         replies: &mut Vec<(u64, Reply)>,
     ) {
-        eprintln!(
-            "amaterasu launch phase result={:?} ok={}",
-            job.phase,
-            payload["ok"] == true
-        );
+        let reported_failure = job.phase.response_reported_failure(&payload);
+        if !job.phase.routine_monitor() {
+            self.log_phase(
+                if reported_failure {
+                    LogLevel::Warning
+                } else {
+                    LogLevel::Debug
+                },
+                job.phase,
+                if reported_failure {
+                    "provider_failure"
+                } else {
+                    "response"
+                },
+            );
+        }
+        let logger = self.logger.clone();
         if job.phase == Phase::RefreshResumePolicy {
             let Some(mut record) = self.records.remove(&job.record) else {
                 return;
@@ -1143,8 +1226,14 @@ impl Controller {
             },
             Phase::MonitorApplication => match application_response(record, &payload) {
                 Ok((_, "active", true)) => record.monitored(now),
-                Ok(_) => record.request_cleanup(Some("application_ended"), now),
-                Err(code) => fail_record(record, code, now),
+                Ok(_) => {
+                    log_monitor_problem(logger.as_ref(), job.phase, "unhealthy");
+                    record.request_cleanup(Some("application_ended"), now)
+                }
+                Err(code) => {
+                    log_monitor_problem(logger.as_ref(), job.phase, "invalid_response");
+                    fail_record(record, code, now)
+                }
             },
             Phase::MonitorRtsp => match rtsp_response(record, &payload) {
                 Ok((_, _, "ready" | "arming" | "playing", true)) => record.monitored(now),
@@ -1153,6 +1242,12 @@ impl Controller {
                         && !record.stop_on_stream_end
                         && payload["lifecycle_retired"] == true =>
                 {
+                    if payload["state"] == "failed" {
+                        log_monitor_problem(logger.as_ref(), job.phase, "stream_failed");
+                    } else if let Some(logger) = logger.as_ref() {
+                        let _ =
+                            logger.emit(LogLevel::Info, "launch", "phase=MonitorRtsp event=closed");
+                    }
                     record.rtsp_requested = false;
                     record.rtsp_ticket = None;
                     record.rtsp_url = None;
@@ -1163,8 +1258,14 @@ impl Controller {
                     };
                     record.deadline = now + INITIAL_DEADLINE;
                 }
-                Ok(_) => record.request_cleanup(Some("stream_ended"), now),
-                Err(code) => fail_record(record, code, now),
+                Ok(_) => {
+                    log_monitor_problem(logger.as_ref(), job.phase, "unhealthy");
+                    record.request_cleanup(Some("stream_ended"), now)
+                }
+                Err(code) => {
+                    log_monitor_problem(logger.as_ref(), job.phase, "invalid_response");
+                    fail_record(record, code, now)
+                }
             },
             Phase::StopRtsp | Phase::VerifyRtspStopped => {
                 if clean_rtsp_terminal(record, &payload) {
@@ -1247,7 +1348,7 @@ impl Controller {
     }
 
     fn rejected(&mut self, job: &Job, now: Instant, replies: &mut Vec<(u64, Reply)>) {
-        eprintln!("amaterasu launch phase rejected={:?}", job.phase);
+        self.log_phase(LogLevel::Warning, job.phase, "rejected");
         let record = self.records.get_mut(&job.record).expect("workflow record");
         if record.resume_abandoned && record.state != State::Stopping {
             reject_resume(record, replies);
@@ -1365,7 +1466,7 @@ impl Controller {
     }
 
     fn settled(&mut self, job: &Job, now: Instant, replies: &mut Vec<(u64, Reply)>) {
-        eprintln!("amaterasu launch phase settled={:?}", job.phase);
+        self.log_phase(LogLevel::Warning, job.phase, "settled");
         let record = self.records.get_mut(&job.record).expect("workflow record");
         if record.resume_abandoned && record.state != State::Stopping {
             reject_resume(record, replies);

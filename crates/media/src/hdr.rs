@@ -29,6 +29,13 @@ pub struct VideoApiV1_2 {
     pub geometry: unsafe extern "C" fn(*mut c_void, u64, *mut CaptureGeometry) -> Status,
     pub hdr_metadata: unsafe extern "C" fn(*mut c_void, u64, *mut HdrMetadata) -> Status,
 }
+/// Additive video v1.3 tail. Legacy receive retains its existing semantics.
+/// Timed output carries an independent processing start, or zero when unknown.
+#[repr(C)]
+pub struct VideoApiV1_3 {
+    pub base: VideoApiV1_2,
+    pub receive_timed: unsafe extern "C" fn(*mut c_void, u64, TimedPacketSink) -> Status,
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -43,6 +50,10 @@ mod tests {
         assert_eq!(
             offset_of!(VideoApiV1_2, hdr_metadata),
             size_of::<VideoApiV1_1>()
+        );
+        assert_eq!(
+            offset_of!(VideoApiV1_3, receive_timed),
+            size_of::<VideoApiV1_2>()
         );
     }
 }

@@ -206,6 +206,19 @@ typedef struct {
     AmaterasuStatus (*write)(void *context, const AmaterasuEncodedPacket *packet);
 } AmaterasuPacketSink;
 
+/* Presentation timestamp stays in base.timestamp_us. A separate processing
+ * start is in the host monotonic clock (microseconds), or 0 when unavailable.
+ * Every fragment in the same access unit must carry the same start. Packet
+ * bytes are borrowed only for the duration of each sink/submit callback. */
+typedef struct {
+    AmaterasuEncodedPacket base;
+    uint64_t processing_started_host_us;
+} AmaterasuTimedEncodedPacket;
+typedef struct {
+    void *context;
+    AmaterasuStatus (*write)(void *context, const AmaterasuTimedEncodedPacket *packet);
+} AmaterasuTimedPacketSink;
+
 /* Physical desktop pixels. Width and height are nonzero; the inclusive last
  * pixel on either axis must fit int32_t. Origins may be negative. */
 typedef struct {
@@ -558,6 +571,12 @@ typedef struct {
     AmaterasuStatus (*submit_audio)(void *context, uint64_t stream, const AmaterasuEncodedAudioPacket *packet);
     AmaterasuStatus (*drain)(void *context, uint64_t stream);
 } AmaterasuMediaTransportApi;
+/* v1.1 preserves the entire v1.0 prefix. 0 start is unknown and must not be
+ * replaced with the presentation timestamp. BUSY consumes no input. */
+typedef struct {
+    AmaterasuMediaTransportApi base;
+    AmaterasuStatus (*submit_video_timed)(void *, uint64_t, const AmaterasuTimedEncodedPacket *);
+} AmaterasuMediaTransportApiV1_1;
 /* Logical control messages. Sequence is authenticated receive metadata and is
  * ignored on send; providers always choose their own encryption nonces. */
 #define AMATERASU_CONTROL_RELIABLE 1u
@@ -592,6 +611,11 @@ typedef struct {
     AmaterasuVideoApiV1_1 base;
     AmaterasuStatus (*hdr_metadata)(void *, uint64_t, AmaterasuHdrMetadata *);
 } AmaterasuVideoApiV1_2;
+/* v1.3 timed delivery does not change the existing receive prefix. */
+typedef struct {
+    AmaterasuVideoApiV1_2 base;
+    AmaterasuStatus (*receive_timed)(void *, uint64_t, AmaterasuTimedPacketSink);
+} AmaterasuVideoApiV1_3;
 #ifdef __cplusplus
 }
 #endif

@@ -233,6 +233,18 @@ RTP/NV plaintext and ciphertext integrity are authenticated.
 
 ## Verification and remaining scope
 
+Active streams emit a bounded ten-second `media.processing_latency` host log
+window. With the timed packet extension, the count, total and maximum reflect
+rounded 0.1 ms values from the separate host-monotonic capture-start timestamp
+to media admission; they do not measure UDP delivery or client display. The
+RTP timestamp remains the separate presentation timestamp. Legacy producers,
+zero timestamps, future timestamps, and timestamps over five seconds old are
+reported unknown in the wire header and `unknown_samples` in the summary.
+Divide `total_tenths_ms` by `known_samples`, not `samples`, to obtain an average.
+`zero_known` counts valid intervals rounded below 0.05 ms; a wire zero by itself
+remains ambiguous. The summary counts successful local admissions, not remote
+delivery.
+
 Tests use real loopback UDP receivers for video/audio data and parity, encrypted
 queue behavior, EOS/drain, caller isolation, fairness, cancellation/socket release,
 retry/key-history redaction, exact ping parsing, wrong-lane/IP rejection, and

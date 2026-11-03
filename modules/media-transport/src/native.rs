@@ -1,7 +1,9 @@
 use crate::controller::Controller;
+#[cfg(test)]
+use amaterasu_media::INTERFACE_MINOR;
 use amaterasu_media::{
-    EncodedAudioPacket, EncodedPacket, INTERFACE_MAJOR, INTERFACE_MINOR, MEDIA_BACKEND_ERROR,
-    MEDIA_BUSY, MEDIA_UNSUPPORTED, MediaTransportApi,
+    EncodedAudioPacket, EncodedPacket, INTERFACE_MAJOR, MEDIA_BACKEND_ERROR, MEDIA_BUSY,
+    MEDIA_UNSUPPORTED, MediaTransportApi, MediaTransportApiV1_1, TimedEncodedPacket,
 };
 use amaterasu_module_sdk::abi::*;
 use std::{
@@ -33,7 +35,7 @@ impl Factory {
 }
 
 struct Binding {
-    api: MediaTransportApi,
+    api: MediaTransportApiV1_1,
     shared: Shared,
     owner: String,
 }
@@ -55,8 +57,8 @@ unsafe extern "C" fn bind(
             let query = &*query;
             if !query.header.supports::<NativeInterfaceQuery>()
                 || query.interface_major != INTERFACE_MAJOR
-                || query.min_minor > INTERFACE_MINOR
-                || query.min_size as usize > size_of::<MediaTransportApi>()
+                || query.min_minor > 1
+                || query.min_size as usize > size_of::<MediaTransportApiV1_1>()
             {
                 return MEDIA_UNSUPPORTED;
             }
@@ -69,28 +71,50 @@ unsafe extern "C" fn bind(
                 _ => return STATUS_INVALID_ARGUMENT,
             };
             let mut binding = Box::new(Binding {
-                api: MediaTransportApi {
-                    base: NativeInterface {
-                        header: AbiHeader {
-                            size: size_of::<MediaTransportApi>() as u32,
-                            major: INTERFACE_MAJOR,
-                            minor: INTERFACE_MINOR,
+                api: MediaTransportApiV1_1 {
+                    base: MediaTransportApi {
+                        base: NativeInterface {
+                            header: AbiHeader {
+                                size: size_of::<MediaTransportApiV1_1>() as u32,
+                                major: INTERFACE_MAJOR,
+                                minor: 1,
+                            },
+                            context: std::ptr::null_mut(),
+                            release: Some(release),
                         },
-                        context: std::ptr::null_mut(),
-                        release: Some(release),
+                        submit_video,
+                        submit_audio,
+                        drain,
                     },
-                    submit_video,
-                    submit_audio,
-                    drain,
+                    submit_video_timed,
                 },
                 shared: (&*context.cast::<Factory>()).shared.clone(),
                 owner,
             });
-            binding.api.base.context = (&mut *binding as *mut Binding).cast();
+            binding.api.base.base.context = (&mut *binding as *mut Binding).cast();
             let pointer = Box::into_raw(binding);
-            *output = &(*pointer).api.base;
+            *output = &(*pointer).api.base.base;
         }
         STATUS_OK
+    })
+}
+
+unsafe extern "C" fn submit_video_timed(
+    context: *mut c_void,
+    id: u64,
+    packet: *const TimedEncodedPacket,
+) -> Status {
+    guarded(|| {
+        if packet.is_null() {
+            return STATUS_INVALID_ARGUMENT;
+        }
+        // SAFETY: the caller retains the complete timed packet and its bytes
+        // until this synchronous callback returns.
+        unsafe {
+            with_controller(context, |controller, owner| {
+                controller.submit_video_timed(owner, id, &*packet)
+            })
+        }
     })
 }
 

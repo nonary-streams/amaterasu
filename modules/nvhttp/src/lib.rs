@@ -215,6 +215,7 @@ where
 
 struct NvhttpModule {
     runtime: RuntimeClient,
+    log_queue: amaterasu_module_sdk::LogQueue,
     startup_settings: Settings,
     quiescing: bool,
     server: Option<server::Server>,
@@ -236,6 +237,7 @@ struct NvhttpModule {
 
 impl ManagedModule for NvhttpModule {
     fn start(runtime: RuntimeClient) -> ModuleResult<Self> {
+        let (log_emitter, log_queue) = runtime.log_emitter();
         let Response::Result { payload } = runtime.send(Command::GetSettings {})? else {
             return Err("nvhttp settings unavailable".into());
         };
@@ -259,6 +261,7 @@ impl ManagedModule for NvhttpModule {
                 &settings,
             )?;
             let mut launches = launch::Controller::new(settings.streaming.clone())?;
+            launches.set_logger(log_emitter);
             launches.set_session_lifecycle_required(settings.session_lifecycle_required);
             launches.set_session_lifecycle_capture_mode(settings.session_lifecycle_capture_mode);
             let router = wire::Router::new(
@@ -305,6 +308,7 @@ impl ManagedModule for NvhttpModule {
         );
         Ok(Self {
             runtime,
+            log_queue,
             startup_settings: settings,
             quiescing: false,
             server,
@@ -326,6 +330,7 @@ impl ManagedModule for NvhttpModule {
     }
 
     fn quiesce(&mut self) -> ModuleResult<bool> {
+        self.log_queue.flush(&self.runtime);
         if !self.quiescing {
             self.quiescing = true;
             if let (Some(server), Some(router)) = (&mut self.server, &mut self.router) {
@@ -338,6 +343,7 @@ impl ManagedModule for NvhttpModule {
     }
 
     fn tick(&mut self) -> ModuleResult<()> {
+        self.log_queue.flush(&self.runtime);
         if self.quiescing {
             if let Some(router) = &mut self.router {
                 router.poll_with_trust(&self.runtime, |_, _| true);

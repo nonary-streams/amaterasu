@@ -18,6 +18,7 @@ struct Fake {
     encoder_failed: bool,
     video_failure_after_submit: bool,
     videos_sent: Vec<(u32, Vec<u8>)>,
+    video_start_times: Vec<u64>,
     audio_sent: Vec<Vec<u8>>,
     audio_flags: Vec<u32>,
     feedback_sent: Vec<HostFeedbackMessage>,
@@ -66,10 +67,15 @@ impl Backend for Fake {
             Ok(None)
         }
     }
-    fn submit_video(&mut self, packet: &EncodedPacket) -> PlaneResult<bool> {
+    fn submit_video(
+        &mut self,
+        packet: &EncodedPacket,
+        processing_started_host_us: u64,
+    ) -> PlaneResult<bool> {
         if self.video_busy {
             return Ok(false);
         }
+        self.video_start_times.push(processing_started_host_us);
         // SAFETY: pump retains its packet allocation through this synchronous call.
         self.videos_sent
             .push((packet.flags, unsafe { packet.bytes().unwrap() }.to_vec()));
@@ -703,4 +709,47 @@ fn assembler_fragment_count_and_pcm_format_are_explicitly_bounded() {
         unsafe { PcmPacket::copy(&frame) }.err(),
         Some("unsupported_pcm_format")
     );
+}
+
+#[test]
+fn timed_fragments_must_agree_on_processing_start_and_survive_busy() {
+    let bytes = [1, 2, 3];
+    let make = |flags, started| {
+        let packet = TimedEncodedPacket {
+            base: EncodedPacket {
+                codec: CODEC_H264,
+                flags,
+                data: bytes.as_ptr(),
+                len: bytes.len(),
+                timestamp_us: 7000,
+                sequence: 7,
+            },
+            processing_started_host_us: started,
+        };
+        // SAFETY: bytes remain live until copy returns.
+        unsafe { VideoPacket::copy_timed(&packet).unwrap() }
+    };
+    let mut assembly = VideoAssembly::new(CODEC_H264);
+    assembly.push(make(0, 6500)).unwrap();
+    assert_eq!(
+        assembly.push(make(FLAG_END_OF_ACCESS_UNIT, 6501)),
+        Err("video_access_unit_incomplete")
+    );
+    assembly.push(make(FLAG_END_OF_ACCESS_UNIT, 6500)).unwrap();
+    assert_eq!(assembly.processing_started_host_us(), 6500);
+    assert_eq!(assembly.header().unwrap().timestamp_us, 7000);
+    let mut pump = Pump::new(Fake {
+        video_busy: true,
+        ..Fake::default()
+    });
+    pump.video = assembly;
+    pump.tick(true).unwrap();
+    assert!(pump.backend.video_start_times.is_empty());
+    assert_eq!(pump.video.processing_started_host_us(), 6500);
+    pump.backend.video_busy = false;
+    pump.tick(true).unwrap();
+    assert_eq!(pump.backend.video_start_times, [6500]);
+    let mut assembly = pump.video;
+    assembly.clear();
+    assert_eq!(assembly.processing_started_host_us(), 0);
 }

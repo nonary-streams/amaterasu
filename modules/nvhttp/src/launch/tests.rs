@@ -5411,6 +5411,47 @@ fn retired_stream_failure_preserves_the_application_until_pause_is_verified() {
 }
 
 #[test]
+fn live_monitor_logging_reports_unhealthy_response_but_not_healthy_polls() {
+    use amaterasu_module_sdk::abi::{AbiHeader, BorrowedBytes, HostApi, ReplySink, Status, STATUS_OK};
+    use std::ffi::c_void;
+
+    unsafe extern "C" fn invoke(context: *mut c_void, input: BorrowedBytes, reply: ReplySink) -> Status {
+        // SAFETY: the test retains the vector and the runtime invokes this synchronously.
+        let commands = unsafe { &mut *context.cast::<Vec<Command>>() };
+        let bytes = unsafe { input.read() }.unwrap();
+        commands.push(serde_json::from_slice(bytes).unwrap());
+        let response = serde_json::to_vec(&Response::Ok).unwrap();
+        unsafe { reply.send(&response) };
+        STATUS_OK
+    }
+
+    let mut commands = Vec::<Command>::new();
+    let endpoint = HostApi { header: AbiHeader::of::<HostApi>(), context: (&mut commands as *mut Vec<Command>).cast(), invoke };
+    let runtime = unsafe { amaterasu_module_sdk::RuntimeClient::from_endpoint(endpoint) };
+    let (emitter, mut queue) = runtime.log_emitter();
+    let now = Instant::now();
+    let mut controller = Controller::new(Some(config())).unwrap();
+    let mut broker = Broker::default();
+    controller.launch(10, request(1), peer(1), now);
+    poll_until_reply(&mut controller, &mut broker, now);
+    controller.set_logger(emitter);
+    let record = controller.records.values().next().unwrap();
+    let id = record.id;
+    let ticket = record.rtsp_ticket.unwrap();
+    let mut payload = broker.response("amaterasu.rtsp/1", &json!({"action":"status","ticket":ticket}));
+    let job = workflow::Job { record: id, phase: workflow::Phase::MonitorRtsp,
+        call: call::Call::new("unused", json!({}), "unused".into(), 1000), deadline: now + Duration::from_secs(5) };
+    controller.consume(&job, payload.clone(), now, &mut Vec::new());
+    queue.flush(&runtime);
+    assert!(commands.is_empty());
+    payload["state"] = json!("failed");
+    payload["failure"] = json!("stream_failed");
+    controller.consume(&job, payload, now, &mut Vec::new());
+    queue.flush(&runtime);
+    assert!(matches!(&commands[..], [Command::Log { level: 3, target, message }] if target == "launch" && message.contains("MonitorRtsp") && message.contains("unhealthy")));
+}
+
+#[test]
 fn cooperative_shutdown_runs_owned_application_cleanup_before_reporting_ready() {
     let now = Instant::now();
     let mut controller = Controller::new(Some(config())).unwrap();
