@@ -20,12 +20,15 @@ Run the opt-in browser session qualifications separately:
 ```sh
 node tests/browser-session-qualification.mjs
 node tests/browser-cookie-qualification.mjs
+node tests/integrations.browser-qualification.mjs
 ```
 
 These tests use temporary browser profiles and ephemeral loopback listeners.
-They default to Chromium on Linux, Microsoft Edge on Windows, and Google Chrome
-on macOS. Set `AMATERASU_BROWSER` to another compatible browser executable when
-needed. The HTTPS test skips certificate verification in its isolated browser
+The integration dashboard qualification runs the actual frontend modules in Chromium
+and uses mocked provider API responses; it verifies browser rendering, focus, locale
+updates and detached-page cleanup, not live host integration. They default to Chromium
+on Linux, Microsoft Edge on Windows, and Google Chrome on macOS. Set
+`AMATERASU_BROWSER` to another compatible browser executable when needed. The HTTPS test skips certificate verification in its isolated browser
 process for the local fixture. Its server is a controlled authentication fixture; these
 checks qualify browser cookie, reload, refresh, and peer-tab behavior, while the
 signed management host tests qualify the real authentication service.
