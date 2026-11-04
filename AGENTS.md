@@ -66,3 +66,39 @@
   exception; preserve its injected RepositoryTransport verification boundary.
 - Preserve bounded storage, cancellation and worker retirement when replacing
   providers. Local admission is not evidence of remote delivery.
+
+## Installed stream recovery and package updates
+
+- Diagnose the running service, selected manifest digest and exact launch/cleanup
+  error before changing source or runtime state. Preserve a private snapshot of
+  recovery journals before an authorized repair; preserve unrelated work.
+- Fix the owning provider/coordinator and reproduce the failed transition in a
+  regression test. Independent version 1 providers must not require version 2
+  composition outputs merely because more than one provider is selected.
+- Do not edit lifecycle phases, retirement flags, receipts or cleanup journals to
+  simulate progress or successful cleanup. A restart does not prove retirement.
+  Use authenticated recovery operations and verify native resource retirement.
+- Inspect the installed bootstrap's production/development mode before staging.
+  For production, generic `stage` plus a service restart is not activation.
+  Use the approved signed repository and authenticated host activation flow;
+  retain signature, publisher, sequence, policy and service-pin checks. Do not
+  switch to development mode or rewrite the active selection to bypass them.
+- Use a release tool compatible with the installed bootstrap schema. Match the
+  replacement to the installed host ABI and preserve other component digests.
+  Review the actual package and catalog delta before publishing to a shared
+  repository; publishing is separate from preparing a local candidate.
+- Updating an already enabled optional provider must preserve its exact
+  approved destination policy. An approval's old source values must not make
+  subsequent package updates fail; reject values matching neither endpoint.
+- If broken cleanup prevents the activation barrier from opening, inspect the
+  host's `reconcile-package-activation` path. It verifies repository/catalog,
+  publisher, package, selection revision and protected policy before loading a
+  candidate with the service stopped. Snapshot state first: the trial can run
+  real cleanup against the installation's state. Verify its actual outcome;
+  the word "probe" does not mean it is a read-only command.
+- Before calling recovery complete, verify the intended digest is loaded, the
+  old lifecycle stream is retired, the stream-session cleanup journal is empty,
+  and the host reports ready. Then verify a real client launch when available.
+  Report source tests, package activation, cleanup and client playback separately.
+- Continue the authorized repair through activation and verification. Do not
+  end a turn at an intermediate failure when another supported path remains.

@@ -132,6 +132,7 @@ impl Coordinator {
         let mut next = self.shared.borrow().value.clone();
         let session = next.sessions.get(id).ok_or("unknown_session")?;
         let stream = session.streams.get(stream_id).ok_or("unknown_stream")?;
+        let capture_retired = stream.retirements.contains("capture");
         if epoch == next.host_epoch
             || session.host_epoch != epoch
             || !session.capture_binding_mode.is_external()
@@ -143,7 +144,7 @@ impl Coordinator {
                 receipt.work.as_ref().is_some_and(|work| {
                     work.target == target
                         && !rejected_read_only_release(work)
-                        && !waiting_capture_retirement(receipt, work, caller)
+                        && !restartable_undispatched_release(receipt, work, caller, capture_retired)
                 })
             })
         {
@@ -167,7 +168,13 @@ impl Coordinator {
                     .work
                     .as_ref()
                     .filter(|work| {
-                        work.target == target && waiting_capture_retirement(receipt, work, caller)
+                        work.target == target
+                            && restartable_undispatched_release(
+                                receipt,
+                                work,
+                                caller,
+                                capture_retired,
+                            )
                     })
                     .map(|_| key.clone())
             })
@@ -365,14 +372,20 @@ impl Coordinator {
     }
 }
 
-fn waiting_capture_retirement(receipt: &Receipt, work: &Work, caller: &str) -> bool {
+fn restartable_undispatched_release(
+    receipt: &Receipt,
+    work: &Work,
+    caller: &str,
+    capture_retired: bool,
+) -> bool {
     receipt.caller == caller
         && receipt.initiator == caller
-        && receipt.request["operation"] == "pause_stream"
+        && (receipt.request["operation"] == "pause_stream"
+            || (capture_retired && receipt.request["operation"] == "retire_stream"))
         && receipt.request["target"] == json!(work.target)
         && receipt.response["status"] == "recovery_required"
         && work.phase == LifecyclePhase::StreamRelease
-        && work.waiting_retirement
+        && (work.waiting_retirement || capture_retired)
         && !work.compacted_release
         && work.candidate.is_none()
         && work.index == 0
@@ -664,14 +677,20 @@ mod stream_restart_tests {
             "stream_not_recoverable"
         );
         let mut journal = coordinator.shared.borrow().value.clone();
+        // Capture may have retired before the coordinator was interrupted.
+        // With no provider dispatch or admission, restart can safely resume
+        // the same release after verifying native retirement again.
         journal
-            .receipts
-            .get_mut("old-pause")
+            .sessions
+            .get_mut("session")
             .unwrap()
-            .work
-            .as_mut()
+            .streams
+            .get_mut("stream")
             .unwrap()
-            .waiting_retirement = true;
+            .retirements
+            .insert("capture".into());
+        journal.receipts.get_mut("old-pause").unwrap().request["operation"] =
+            json!("retire_stream");
         save(&coordinator.shared, journal).unwrap();
         assert_eq!(
             coordinator.handle("capture", "capture", request.clone())["status"],

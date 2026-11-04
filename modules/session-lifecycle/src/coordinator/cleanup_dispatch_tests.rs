@@ -160,6 +160,39 @@ fn participant(provider: &str, depends_on: &[&str]) -> ParticipantSettings {
 }
 
 #[test]
+fn independent_v1_stream_release_does_not_require_composed_output() {
+    let mut h = Harness::new("none");
+    h.coordinator.settings.participants = vec![participant("a", &[]), participant("c", &[])];
+    let started = h.coordinator.handle(
+        "caller",
+        "initiator",
+        json!({"operation":"prepare","operation_id":"prepare"}),
+    );
+    assert_eq!(h.run("prepare")["status"], "succeeded");
+    let stream = h.coordinator.handle("caller", "initiator", json!({"operation":"prepare_stream","operation_id":"stream","target":started["target"],"requested_video":{"width":1920,"height":1080,"refresh_millihz":60000,"hdr":false},"consumer_requirements":["capture"]}));
+    assert_eq!(stream["status"], "pending");
+    let pause = h.coordinator.handle(
+        "caller",
+        "initiator",
+        json!({"operation":"pause_stream","operation_id":"pause","target":stream["target"]}),
+    );
+    assert_eq!(pause["status"], "pending");
+    let work = h
+        .coordinator
+        .shared
+        .borrow()
+        .value
+        .receipts
+        .values()
+        .find(|r| r.request["operation_id"] == "pause")
+        .unwrap()
+        .work
+        .clone()
+        .unwrap();
+    assert!(h.coordinator.work_selections(&work).is_ok());
+}
+
+#[test]
 fn unknown_cleanup_blocks_prerequisite_but_cleans_independent_provider() {
     let mut h = Harness::new("session.release");
     let started = h.coordinator.handle(
