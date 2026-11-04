@@ -5,6 +5,7 @@ pub mod capture;
 pub mod data_plane;
 pub mod encode;
 pub mod exports;
+pub mod foreground_context;
 pub mod input;
 pub mod media;
 mod native;
