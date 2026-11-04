@@ -74,6 +74,9 @@ const assetResponses = [];
 const themeRequests = new Map();
 const themeResponses = new Map();
 const failedThemeAssets = [];
+const showcaseRequests = new Map();
+const showcaseResponses = new Map();
+const failedShowcaseAssets = [];
 let documentCsp = "";
 try {
   await debuggerClient.connect(options.debuggerUrl);
@@ -95,12 +98,17 @@ try {
       if (/^\/v1\/extensions\/[^/]+\/[a-f0-9]{64}\/assets\/example\.js$/.test(url.pathname)) {
         networkRequests.set(event.params.requestId, url.pathname);
       }
+      const showcaseMatch = url.pathname.match(/^\/v1\/extensions\/showcase\/([a-f0-9]{64})\/assets\/(showcase\.js|showcase\.css)$/);
+      if (showcaseMatch) showcaseRequests.set(event.params.requestId, {
+        digest: showcaseMatch[1], name: showcaseMatch[2], path: url.pathname, origin: url.origin,
+      });
       const match = url.pathname.match(/^\/web\/([a-f0-9]{64})\/(okami-botanical|okami-mountains)\.svg$/);
       if (match) themeRequests.set(event.params.requestId, { digest: match[1], name: `${match[2]}.svg`, path: url.pathname });
     } else if (event.method === "Network.responseReceived") {
       const path = networkRequests.get(event.params.requestId);
       if (path) assetResponses.push({ requestId: event.params.requestId, path, status: event.params.response.status });
       const themeRequest = themeRequests.get(event.params.requestId);
+      const showcaseRequest = showcaseRequests.get(event.params.requestId);
       const headers = event.params.response.headers;
       const header = (name) => Object.entries(headers).find(([key]) => key.toLowerCase() === name)?.[1] ?? "";
       if (event.params.type === "Document") documentCsp = header("content-security-policy");
@@ -108,9 +116,15 @@ try {
         ...themeRequest, requestId: event.params.requestId, status: event.params.response.status,
         contentType: header("content-type"), csp: header("content-security-policy"),
       });
+      if (showcaseRequest) showcaseResponses.set(showcaseRequest.name, {
+        ...showcaseRequest, requestId: event.params.requestId, status: event.params.response.status,
+        contentType: header("content-type"), csp: header("content-security-policy"),
+      });
     } else if (event.method === "Network.loadingFailed") {
       const themeRequest = themeRequests.get(event.params.requestId);
       if (themeRequest) failedThemeAssets.push(themeRequest.name);
+      const showcaseRequest = showcaseRequests.get(event.params.requestId);
+      if (showcaseRequest) failedShowcaseAssets.push(showcaseRequest.name);
     }
   });
   await debuggerClient.command("Page.enable", {}, sessionId);
@@ -302,6 +316,38 @@ try {
   await evaluate("location.hash = 'overview'");
   await wait("window.__pluginUiQualificationCleanups === 2", "second extension disposal");
 
+  await evaluate("location.hash = 'extension/showcase'");
+  await wait("!!document.querySelector('main.okami-showcase') && document.querySelector('main.okami-showcase').dataset.stylesheetState === 'loaded'",
+    "signed showcase and same-origin stylesheet load");
+  await wait(`getComputedStyle(document.querySelector('.okami-showcase')).display === 'grid' &&
+    getComputedStyle(document.querySelector('.okami-showcase')).gap === '20px' &&
+    getComputedStyle(document.querySelector('.showcase-theme-grid')).display === 'grid'`,
+    "showcase CSS rendering under the host CSP");
+  check(await evaluate('!document.querySelector("main.okami-showcase style")'),
+    "showcase inserted inline CSS despite the host CSP");
+  const showcaseCss = showcaseResponses.get("showcase.css");
+  check(showcaseCss && showcaseCss.status === 200, "signed showcase CSS was not delivered");
+  check(showcaseCss.digest && showcaseCss.path ===
+    `/v1/extensions/showcase/${showcaseCss.digest}/assets/showcase.css` &&
+    showcaseCss.origin === options.origin,
+    "showcase CSS did not use its same-origin signed digest path");
+  check(showcaseCss.contentType.toLowerCase().startsWith("text/css"),
+    `showcase CSS returned unexpected content type: ${showcaseCss.contentType}`);
+  check(showcaseCss.csp.includes("style-src 'self'") && showcaseCss.csp.includes("default-src 'self'"),
+    "showcase CSS response did not retain the actual restrictive CSP");
+  check(failedShowcaseAssets.length === 0,
+    `signed showcase assets failed to load: ${failedShowcaseAssets.join(", ")}`);
+  for (const asset of options.showcaseAssets) {
+    const response = showcaseResponses.get(asset.name);
+    check(response && response.status === 200,
+      `signed showcase ${asset.name} was not delivered successfully`);
+    const served = await debuggerClient.command("Network.getResponseBody", { requestId: response.requestId }, sessionId);
+    const bytes = served.base64Encoded ? Buffer.from(served.body, "base64") : Buffer.from(served.body);
+    check(sha256(bytes) === asset.sha256,
+      `signed showcase ${asset.name} differs from the packaged bytes`);
+  }
+
+  console.log(`Verified signed showcase CSS at ${showcaseCss.path}: same-origin, matching bytes, text/css, rendered under the host CSP.`);
   console.log(`Verified selected signed web digest ${selectedDigest}: both theme SVGs returned matching packaged bytes as image/svg+xml and rendered under the signed CSP.`);
   console.log("PASS: signed web asset delivery, extension keyboard use and host call, generic control keyboard/save, locale update, navigation cleanup/remount");
 } finally {

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Opt-in real Chromium qualification for signed and reusable plugin UI controls.
 
-Runs a private loopback host, packages and stages a signed test web extension,
+Runs a private loopback host, packages a signed test extension and the showcase,
 and drives an owned Chromium over its loopback-only CDP endpoint. It changes no
 installed host, shared repository, firewall rule, or non-loopback listener.
 """
@@ -29,13 +29,16 @@ from test_platform_modules import PlatformHarness
 from test_signed_browser_session import OwnedBrowser
 
 EXTENSION_ID = "plugin-ui-qualification"
+SHOWCASE_ID = "showcase"
+SHOWCASE_SOURCE = WORKSPACE / "examples/web-extension"
+SHOWCASE_ASSETS = ("showcase.js", "showcase.css")
 THEME_ASSETS = ("okami-botanical.svg", "okami-mountains.svg")
 METHODS = WORKSPACE / "examples/web-extension/methods.json"
 FIXTURE = WORKSPACE / "frontend/tests/fixtures/plugin-ui-browser/example.js"
 BROWSER_DRIVER = WORKSPACE / "frontend/tests/signed-plugin-ui-browser-qualification.mjs"
 
 
-def configure_signed_extension(harness: PlatformHarness) -> str:
+def configure_signed_extension(harness: PlatformHarness) -> tuple[str, dict[str, str]]:
     source = harness.directory / "plugin-ui-extension-source"
     source.mkdir()
     shutil.copy2(FIXTURE, source / "example.js")
@@ -58,15 +61,33 @@ def configure_signed_extension(harness: PlatformHarness) -> str:
     staged_root = harness.directory / EXTENSION_ID
     run(binary, "stage", bundle, staged_root, fingerprint, public_key)
 
+    showcase_source = harness.directory / "showcase-source"
+    showcase_source.mkdir()
+    for name in SHOWCASE_ASSETS:
+        shutil.copy2(SHOWCASE_SOURCE / name, showcase_source / name)
+    showcase_bundle = harness.directory / "showcase-bundle"
+    run(binary, "pack", showcase_source, showcase_bundle, SHOWCASE_ID, "UI Elements",
+        "showcase.js", "1", str(int(time.time()) + 3600), secret)
+    showcase_root = harness.directory / SHOWCASE_ID
+    run(binary, "stage", showcase_bundle, showcase_root, fingerprint, public_key)
+
     bootstrap_path = harness.root / "bootstrap.json"
     bootstrap = json.loads(bootstrap_path.read_text())
     bootstrap["policy"]["settings"]["amaterasu.management"]["extensions"] = {
-        "entries": [{
-            "id": EXTENSION_ID,
-            "root": str(staged_root),
-            "trusted_keys": {fingerprint: public_key},
-            "methods": methods,
-        }],
+        "entries": [
+            {
+                "id": EXTENSION_ID,
+                "root": str(staged_root),
+                "trusted_keys": {fingerprint: public_key},
+                "methods": methods,
+            },
+            {
+                "id": SHOWCASE_ID,
+                "root": str(showcase_root),
+                "trusted_keys": {fingerprint: public_key},
+                "methods": [],
+            },
+        ],
     }
     policy = bootstrap["policy"]
     authentication = policy["settings"]["amaterasu.authentication"]
@@ -95,7 +116,13 @@ def configure_signed_extension(harness: PlatformHarness) -> str:
         for approval in policy["api_methods"]
     ), "signed extension setup must preserve the default frame-limiter API approval"
     bootstrap_path.write_text(json.dumps(bootstrap))
-    return hashlib.sha256(FIXTURE.read_bytes()).hexdigest()
+    return (
+        hashlib.sha256(FIXTURE.read_bytes()).hexdigest(),
+        {
+            name: hashlib.sha256((SHOWCASE_SOURCE / name).read_bytes()).hexdigest()
+            for name in SHOWCASE_ASSETS
+        },
+    )
 
 
 def enrollment_code(harness: PlatformHarness) -> str:
@@ -131,7 +158,14 @@ def spki_pin(certificate_path: Path) -> str:
     return base64.b64encode(hashlib.sha256(public).digest()).decode("ascii")
 
 
-def run_browser(harness: PlatformHarness, api, chromium: str, asset_digest: str, certificate) -> None:
+def run_browser(
+    harness: PlatformHarness,
+    api,
+    chromium: str,
+    asset_digest: str,
+    showcase_digests: dict[str, str],
+    certificate,
+) -> None:
     browser = OwnedBrowser(harness.directory / "plugin-ui-browser", chromium, spki_pin(certificate))
     try:
         debugger_url = browser.start()
@@ -144,6 +178,14 @@ def run_browser(harness: PlatformHarness, api, chromium: str, asset_digest: str,
             "password": PASSWORD,
             "assetPath": str(FIXTURE),
             "assetSha256": asset_digest,
+            "showcaseAssets": [
+                {
+                    "name": name,
+                    "path": str(SHOWCASE_SOURCE / name),
+                    "sha256": digest,
+                }
+                for name, digest in showcase_digests.items()
+            ],
             "themeAssets": [
                 {
                     "name": name,
@@ -215,9 +257,9 @@ def main() -> None:
         os.environ["XDG_RUNTIME_DIR"] = str(xdg_runtime)
         private.SERVER_ADDRESS = "127.0.0.1"
         certificate = private.configure_host(harness)
-        asset_digest = configure_signed_extension(harness)
+        asset_digest, showcase_digests = configure_signed_extension(harness)
         if args.stage_only:
-            print("PASS: signed web extension packaged and staged; browser delivery was not run")
+            print("PASS: signed test extension and showcase assets staged; browser delivery was not run")
             return
 
         package = harness.directory / "plugin-ui-platform"
@@ -241,7 +283,10 @@ def main() -> None:
             ), ("signed test extension is not discoverable through the authenticated host API "
                 f"(HTTP {status}, response keys {sorted(listing) if isinstance(listing, dict) else type(listing).__name__}, "
                 f"extension IDs {[entry.get('id') for entry in listing.get('extensions', [])] if isinstance(listing, dict) else []})")
-            run_browser(harness, api, chromium, asset_digest, certificate)
+            assert any(
+                entry.get("id") == SHOWCASE_ID for entry in listing.get("extensions", [])
+            ), "signed showcase is not discoverable through the authenticated host API"
+            run_browser(harness, api, chromium, asset_digest, showcase_digests, certificate)
         finally:
             stop_console(console)
 
