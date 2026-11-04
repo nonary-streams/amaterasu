@@ -1662,6 +1662,7 @@ namespace Amaterasu {
           );
           for (const key of overrides.removed) delete (config_overrides as Record<string, unknown>)[key];
           editorSaving = true;
+          editor.inert = true;
           const unlock = lockEditorControls(form);
           try {
             const reply = await api.post<{
@@ -1712,6 +1713,7 @@ namespace Amaterasu {
             throw error;
           } finally {
             editorSaving = false;
+            editor.inert = false;
             unlock();
           }
         });
@@ -1789,6 +1791,7 @@ namespace Amaterasu {
           );
           for (const key of catalogRemovedOverrides.get(form) ?? []) delete (entry.config_overrides as Record<string, unknown>)[key];
           editorSaving = true;
+          editor.inert = true;
           const unlock = lockEditorControls(form);
           try {
             await api.post(row ? "catalog/update" : "catalog/create", {
@@ -1801,6 +1804,7 @@ namespace Amaterasu {
             reset();
           } finally {
             editorSaving = false;
+            editor.inert = false;
             unlock();
           }
         });
