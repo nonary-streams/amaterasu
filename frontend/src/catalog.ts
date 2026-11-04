@@ -1357,8 +1357,8 @@ namespace Amaterasu {
         row.entry.launch.kind === "playnite_fullscreen" ? "Playnite Fullscreen" :
         row.entry.steam_id ? "Steam-linked" : row.entry.launch.kind === "executable" ? "Executable" :
         providerLaunch ? "Playnite" : "Application";
-      const edit = button("Edit", () => showEditor(row, capabilities));
-      edit.disabled = !api.allows("catalog.write") || providerLaunch;
+      const edit = button(api.allows("catalog.write") ? "Edit" : "Settings", () => showEditor(row, capabilities));
+      edit.disabled = (!api.allows("catalog.write") && !api.allows("configuration.read")) || providerLaunch;
       if (providerLaunch) catalogLocalizedAttribute(edit, "title", "Playnite launch targets are managed by the provider.");
       const launch = button("Launch", () => void runAction(launch, status, async () => {
         const bytes = crypto.getRandomValues(new Uint8Array(16));
@@ -1374,7 +1374,7 @@ namespace Amaterasu {
           () => showProviderOverrideEditor(row, capabilities),
           "secondary",
         );
-        configure.disabled = !api.allows("catalog.write");
+        configure.disabled = !api.allows("catalog.write") && !api.allows("configuration.read");
         actions.unshift(configure);
       }
       const remove = button(
@@ -1628,6 +1628,7 @@ namespace Amaterasu {
           ...softwareEncoder.fields, ...nvencSettingsFields));
       const overrides = catalogOverrideEditor(catalogOverrideSections(Array.from(form.children) as HTMLElement[]), { ...row.entry.config_overrides });
       form.replaceChildren(overrides.node);
+      form.hidden = !api.allows("catalog.write");
       revealInvalidEditorControls(form);
       const feedback = el("div");
       const save = el("button", "button primary", "Save streaming settings");
@@ -1730,9 +1731,11 @@ namespace Amaterasu {
           ),
           el("div", "catalog-editor-layout", cover.figure, form),
           el("section", "catalog-editor-section", el("h3", "", "Plugin overrides"), pluginArea = el("div")),
+          ...(!api.allows("catalog.write") ? [button("Close", () => { closeEditor(); })] : []),
         ),
       );
-      if (typeof renderApplicationPluginOverrides === "function") renderApplicationPluginOverrides(context, pluginArea, row.id);
+      if (api.allows("configuration.read") && typeof renderApplicationPluginOverrides === "function") renderApplicationPluginOverrides(context, pluginArea, row.id);
+      else pluginArea.textContent = "Plugin settings require configuration read access.";
       showCatalogArtwork(api, row.entry.artwork, cover.art, content, () => { cover.fallback.hidden = true; }, row.id);
       editor.scrollIntoView({ behavior: "smooth", block: "start" });
       fec.focus();
@@ -1758,6 +1761,7 @@ namespace Amaterasu {
     ): void {
       const editRevision = revision;
       const form = entryForm(row?.entry, runtimeStatus, capabilities);
+      form.hidden = !api.allows("catalog.write");
       const feedback = el("div");
       const save = el(
         "button",
@@ -1820,9 +1824,11 @@ namespace Amaterasu {
           ),
           cover ? el("div", "catalog-editor-layout", cover.figure, form) : form,
           el("section", "catalog-editor-section", el("h3", "", "Plugin overrides"), pluginArea = el("div", "", ...(row ? [] : [el("p", "muted", "Plugin overrides are available after creating this application.")]))),
+          ...(!api.allows("catalog.write") ? [button("Close", () => { closeEditor(); })] : []),
         ),
       );
-      if (row && typeof renderApplicationPluginOverrides === "function") renderApplicationPluginOverrides(context, pluginArea, row.id);
+      if (row && api.allows("configuration.read") && typeof renderApplicationPluginOverrides === "function") renderApplicationPluginOverrides(context, pluginArea, row.id);
+      else if (row && !api.allows("configuration.read")) pluginArea.textContent = "Plugin settings require configuration read access.";
       if (cover && row) showCatalogArtwork(api, row.entry.artwork, cover.art, content, () => { cover.fallback.hidden = true; }, row.id);
       editor.scrollIntoView({ behavior: "smooth", block: "start" });
       form.querySelector("input")?.focus();
@@ -2190,7 +2196,7 @@ namespace Amaterasu {
       catalogEditorSection("Identity", "Name and describe this application in your library.",
         field("Name", name), field("Description", description),
         field("Tags", tags, "Separate tags with commas.")),
-      catalogEditorSection("Launch", "Choose how the host starts and tracks the application.",
+      catalogEditorDisclosure("Launch", "Choose how the host starts and tracks the application.",
         field("Launch type", kind), pathField, steamIdField, steamInstallDirField, fullscreen, sharedLaunchOptions, executable,
         field("Command output", outputMode, "Use default discards command output without saving an output value."),
         outputFile, rawPreparation,
@@ -2228,6 +2234,7 @@ namespace Amaterasu {
       catalogEditorDisclosure("Encoder", "Override software and NVENC encoder settings.",
         ...softwareEncoder.fields, ...nvencSettingsFields),
     );
+    (form.children[1] as HTMLDetailsElement).open = !entry;
     const sections = Array.from(form.children).slice(2) as HTMLElement[];
     const overrides = catalogOverrideEditor(catalogOverrideSections(sections), { ...entry, ...entry?.config_overrides });
     for (const section of sections) section.remove();

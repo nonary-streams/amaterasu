@@ -231,3 +231,33 @@ test("desktop editor saves its process-less target, preparation and display sett
   assert.equal(saved.entry["virtual-screen"],false);
   assert.equal(Object.hasOwn(saved.entry,"steam_id"),false);
 });
+
+test("configuration-only users can open application plugin overrides", async () => {
+  const context = vm.createContext({ FormData: EditorFormData, TextEncoder, URL, Error,
+    HTMLElement: Element, HTMLSelectElement: SelectElement, Event,
+    document: { createElement: tag => tag === "select" ? new SelectElement(tag) : new Element(tag) } });
+  for (const source of ["src/model.ts", "src/ui.ts", "src/pages.ts", "src/settings.ts", "src/catalog.ts"]) {
+    vm.runInContext(ts.transpile(readFileSync(source, "utf8"), { target: ts.ScriptTarget.ES2022 }), context);
+    vm.runInContext("Object.assign(globalThis, Amaterasu)", context);
+  }
+  let opened = null;
+  context.renderApplicationPluginOverrides = (_context, _area, id) => { opened = id; };
+  const content = new Element("main");
+  content.setConnected(true);
+  context.Amaterasu.renderCatalog({ content, notify() {}, api: {
+    allows: scope => scope === "configuration.read" || scope === "configuration.write",
+    async post(route) {
+      if (route === "catalog/list") return { ok: true, revision: 1, next_cursor: null, config_override_capabilities: {}, entries: [{ id: "game", revision: 1, entry: { name: "Game", launch: { kind: "application", path: "/game" } } }] };
+      if (route === "input/status") throw new Error("unavailable");
+      throw new Error(`Unexpected ${route}`);
+    },
+  } });
+  await settle();
+  const settings = find(content, node => node.tagName === "button" && node.textContent === "Settings");
+  assert.equal(settings.disabled, false);
+  settings.fire("click");
+  await settle();
+  assert.equal(opened, "game");
+  assert.equal(find(content, node => node.className === "editor-form").hidden, true);
+  assert.ok(find(content, node => node.tagName === "button" && node.textContent === "Close"));
+});
