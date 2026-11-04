@@ -39,10 +39,10 @@ try {
     if (result.exceptionDetails) throw new Error(result.exceptionDetails.exception?.description ?? "Browser evaluation failed");
     return result.result.value;
   };
-  const source = ["ui.ts", "extension_fields.ts", "session_extensions.ts"].map(file => readFileSync(`src/${file}`, "utf8")).join("\n");
+  const source = ["ui.ts", "extension_ui.ts", "extension_fields.ts", "session_extensions.ts"].map(file => readFileSync(`src/${file}`, "utf8")).join("\n");
   await evaluate(ts.transpile(source, { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None }));
   await evaluate(`
-    window.onunhandledrejection = e => { window.failure = String(e.reason?.stack || e.reason); }; Amaterasu.errorPanel = e => { window.failure = String(e.stack || e); return document.createElement("div"); }; globalThis.literalText = Amaterasu.literalText = x => x;
+    window.onunhandledrejection = e => { window.failure = String(e.reason?.stack || e.reason); }; globalThis.localizedTextNode = source => document.createTextNode(source); globalThis.localeFormattedTextNode = format => document.createTextNode(format(document.documentElement.lang || "en")); globalThis.translateText = source => source; Amaterasu.errorPanel = e => { window.failure = String(e.stack || e); return document.createElement("div"); }; globalThis.literalText = Amaterasu.literalText = x => x;
     Amaterasu.runAction = async (_button, _status, work) => { await work(); };
     document.body.innerHTML = '<main></main>'; window.saved = null;
     const descriptor = { provider: 'test', options: [{ id: 'strength', label: 'Strength', help: '', presentation: 'slider', definition: { type: 'integer', default: 10, minimum: 0, maximum: 100 }, allowed_scopes: ['application'], apply_policy: 'next_stream' }], actions: [] };
@@ -83,7 +83,26 @@ try {
   for (let attempt = 0; attempt < 100 && !await evaluate(`window.saved !== null`); attempt++) await new Promise(resolve => setTimeout(resolve, 20));
   assert.deepEqual(await evaluate(`window.saved`), { strength: 11 });
   assert.equal(await evaluate(`window.failure ?? null`), null);
-  console.log("PASS: native slider keyboard input synchronizes and saves both scoped editors");
+  await evaluate(`
+    window.callbackFailure = null;
+    window.onerror = message => { window.callbackFailure = String(message); return true; };
+    window.extensionController = new AbortController();
+    window.extensionSlider = Amaterasu.createExtensionUiV1(window.extensionController.signal).slider({
+      label: "Plugin scale", minimum: 0, maximum: 1, step: 0.1, value: 0.3,
+      onChange(value) { if (value === 0.8) throw new Error("plugin callback failure is visible"); }
+    });
+    document.body.replaceChildren(window.extensionSlider.element);
+    window.stepSetRejected = false;
+    try { window.extensionSlider.setValue(0.35); } catch { window.stepSetRejected = true; }
+  `);
+  assert.equal(await evaluate(`window.stepSetRejected`), true);
+  assert.deepEqual(await evaluate(`({ range: document.querySelector('input[type=range]').value, number: document.querySelector('input[type=number]').value, value: window.extensionSlider.value() })`), { range: "0.3", number: "0.3", value: 0.3 });
+  await evaluate(`document.querySelector('input[type=number]').value = '0.8'; document.querySelector('input[type=number]').dispatchEvent(new Event('input', { bubbles: true }));`);
+  for (let attempt = 0; attempt < 100 && !await evaluate(`window.callbackFailure`); attempt++) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.match(await evaluate(`window.callbackFailure`), /plugin callback failure is visible/);
+  await evaluate(`window.extensionController.abort(); window.extensionSlider.dispose(); window.callbackFailure = null; document.querySelector('input[type=number]').value = '0.9'; document.querySelector('input[type=number]').dispatchEvent(new Event('input', { bubbles: true }));`);
+  assert.equal(await evaluate(`window.callbackFailure`), null);
+  console.log("PASS: shared and plugin sliders synchronize, enforce steps, expose callback errors, and dispose listeners");
 } finally {
   socket?.close();
   browser.kill();

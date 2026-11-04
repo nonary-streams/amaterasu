@@ -43,6 +43,8 @@ test("extension registration is bound to a loaded signed script and calls use de
   assert.equal((await env.pages.discover()).length, 1);
   await env.pages.mount("hello", {});
   assert.equal(env.mounts(), 1);
+  assert.deepEqual(Array.from(env.sdk().features), ["ui.controls/1"]);
+  assert.equal(Object.isFrozen(env.sdk().features), true);
   assert.equal(env.sdk().ui.version, 1);
   assert.equal(env.sdk().ui.signal, env.sdk().signal);
   assert.equal((await env.sdk().call("status", { value: 1 })).answer, 42);

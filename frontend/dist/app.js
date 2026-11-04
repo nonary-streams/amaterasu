@@ -3889,14 +3889,30 @@ var Amaterasu;
     }
     Amaterasu.input = input;
     let nextRadioGroupId = 0;
-    function radioGroup(label, options, selected, onChange = () => { }) {
+    function radioGroup(label, options, selected, onChange = () => { }, signal) {
         if (!options.length || new Set(options.map((option) => option.value)).size !== options.length ||
-            !options.some((option) => option.value === selected))
+            !options.some((option) => option.value === selected) || typeof onChange !== "function")
             throw new Error("Invalid radio group options or selection.");
+        const controller = new AbortController();
+        let disposed = false;
+        const dispose = () => {
+            if (disposed)
+                return;
+            disposed = true;
+            controller.abort();
+            signal?.removeEventListener("abort", dispose);
+        };
+        if (signal?.aborted)
+            dispose();
+        else
+            signal?.addEventListener("abort", dispose, { once: true });
         const name = `amaterasu-radio-${++nextRadioGroupId}`;
         const group = el("div", "radio-group");
         group.setAttribute("role", "radiogroup");
-        group.setAttribute("aria-label", label);
+        const labelNode = el("span", "radio-group-label", label);
+        labelNode.id = `amaterasu-radio-label-${nextRadioGroupId}`;
+        group.setAttribute("aria-labelledby", labelNode.id);
+        group.append(labelNode);
         const controls = [];
         for (const option of options) {
             const control = input(name, option.value, "radio");
@@ -3907,7 +3923,7 @@ var Amaterasu;
                 for (const peer of controls)
                     peer.checked = peer === control;
                 onChange(control.value);
-            });
+            }, { signal: controller.signal });
             group.append(el("label", "radio-option", control, el("span", "", option.label)));
             controls.push(control);
         }
@@ -3920,45 +3936,113 @@ var Amaterasu;
                 for (const control of controls)
                     control.checked = control.value === value;
             },
+            dispose,
         };
     }
     Amaterasu.radioGroup = radioGroup;
-    function boundedSlider(minimum, maximum, value, label, integer = false, className = "bounded-slider") {
+    let nextBoundedSliderId = 0;
+    function boundedSlider(minimum, maximum, value, label, integer = false, className = "bounded-slider", options = {}) {
+        const step = options.step ?? (integer ? 1 : "any");
         if (!Number.isFinite(minimum) || !Number.isFinite(maximum) || minimum >= maximum ||
             (integer && (!Number.isSafeInteger(minimum) || !Number.isSafeInteger(maximum))) ||
-            !Number.isFinite(value) || value < minimum || value > maximum || (integer && !Number.isSafeInteger(value)))
-            throw new Error("Invalid bounded slider limits or value.");
+            (step !== "any" && (!Number.isFinite(step) || step <= 0)) ||
+            (options.onChange !== undefined && typeof options.onChange !== "function") ||
+            !isValidSliderValue(value, minimum, maximum, integer, step))
+            throw new Error("Invalid bounded slider limits, step, or value.");
         const number = input("", String(value), "number");
         const range = input("", "", "range");
         for (const control of [number, range]) {
             control.min = String(minimum);
             control.max = String(maximum);
-            control.step = integer ? "1" : "any";
+            control.step = String(step);
+        }
+        if (options.accessibleLabel) {
+            if (!options.accessibleLabel.id)
+                options.accessibleLabel.id = `amaterasu-slider-label-${++nextBoundedSliderId}`;
+            range.setAttribute("aria-labelledby", options.accessibleLabel.id);
+            number.setAttribute("aria-labelledby", options.accessibleLabel.id);
+        }
+        else {
+            range.setAttribute("aria-label", `${label} slider`);
+            number.setAttribute("aria-label", `${label} value`);
         }
         range.value = String(value);
-        range.setAttribute("aria-label", `${label} slider`);
-        number.setAttribute("aria-label", `${label} value`);
-        const validNumber = () => {
-            const parsed = Number(number.value);
-            return number.value !== "" && number.validity.valid && Number.isFinite(parsed) &&
-                parsed >= minimum && parsed <= maximum && (!integer || Number.isSafeInteger(parsed));
+        const controller = new AbortController();
+        let disposed = false;
+        const dispose = () => {
+            if (disposed)
+                return;
+            disposed = true;
+            controller.abort();
+            options.signal?.removeEventListener("abort", dispose);
         };
-        range.addEventListener("input", () => { number.value = range.value; });
-        number.addEventListener("input", () => { if (validNumber())
-            range.value = number.value; });
+        if (options.signal?.aborted)
+            dispose();
+        else
+            options.signal?.addEventListener("abort", dispose, { once: true });
+        const readValue = (control) => {
+            const parsed = Number(control.value);
+            if (!control.value || !control.validity.valid ||
+                !isValidSliderValue(parsed, minimum, maximum, integer, step))
+                throw new Error(`Enter a valid number from ${minimum} to ${maximum} on step ${step}.`);
+            return parsed;
+        };
+        range.addEventListener("input", () => {
+            let nextValue;
+            try {
+                nextValue = readValue(range);
+            }
+            catch {
+                return;
+            }
+            number.value = String(nextValue);
+            options.onChange?.(nextValue);
+        }, { signal: controller.signal });
+        number.addEventListener("input", () => {
+            let nextValue;
+            try {
+                nextValue = readValue(number);
+            }
+            catch {
+                return;
+            }
+            range.value = String(nextValue);
+            if (Number(range.value) !== nextValue)
+                return;
+            options.onChange?.(nextValue);
+        }, { signal: controller.signal });
         const node = el("div", className, range, number);
         return {
             node,
             range,
             number,
-            value: () => {
-                if (!validNumber())
-                    throw new Error(`Enter a valid number from ${minimum} to ${maximum}.`);
-                return Number(number.value);
+            value: () => readValue(number),
+            setValue: (nextValue) => {
+                if (!isValidSliderValue(nextValue, minimum, maximum, integer, step))
+                    throw new Error(`Slider value must be between ${minimum} and ${maximum} on step ${step}.`);
+                const previousNumber = number.value;
+                const previousRange = range.value;
+                number.value = String(nextValue);
+                range.value = String(nextValue);
+                if (Number(range.value) !== nextValue) {
+                    number.value = previousNumber;
+                    range.value = previousRange;
+                    throw new Error("Slider value cannot be represented by the range control.");
+                }
             },
+            dispose,
         };
     }
     Amaterasu.boundedSlider = boundedSlider;
+    function isValidSliderValue(value, minimum, maximum, integer, step) {
+        if (!Number.isFinite(value) || value < minimum || value > maximum || (integer && !Number.isSafeInteger(value)))
+            return false;
+        if (step === "any")
+            return true;
+        const stepCount = (value - minimum) / step;
+        return Number.isFinite(stepCount) &&
+            Math.abs(stepCount - Math.round(stepCount)) <= Number.EPSILON * Math.max(1, Math.abs(stepCount)) * 4;
+    }
     function sectionHeading(title, description, ...actions) {
         return el("header", "page-heading", el("div", "", el("h1", "", title), el("p", "muted", description)), el("div", "actions", ...actions));
     }
@@ -16293,13 +16377,14 @@ var Amaterasu;
             !choices.some((choice) => choice.value === selected))
             throw new Error("Invalid plugin UI choices or value.");
     }
-    function extensionUiControl(element, read, write, controller, parentSignal) {
+    function extensionUiControl(element, read, write, controller, parentSignal, release = () => { }) {
         let disposed = false;
         const dispose = () => {
             if (disposed)
                 return;
             disposed = true;
             controller.abort();
+            release();
             parentSignal.removeEventListener("abort", dispose);
         };
         if (parentSignal.aborted)
@@ -16363,80 +16448,22 @@ var Amaterasu;
                     throw new Error("Invalid plugin radio group.");
                 extensionUiChoices(options.choices, options.value);
                 const controller = makeController();
-                const name = `amaterasu-plugin-radio-${++nextPluginRadioGroupId}`;
-                const group = Amaterasu.el("fieldset", "field plugin-control plugin-radio-group");
-                const legend = Amaterasu.el("legend", "field-label", extensionUiTextNode(options.label));
-                group.append(legend);
-                const inputs = [];
-                for (const choice of options.choices) {
-                    const radio = Amaterasu.input(name, choice.value, "radio");
-                    radio.checked = choice.value === options.value;
-                    radio.addEventListener("change", () => {
-                        if (radio.checked)
-                            options.onChange?.(radio.value);
-                    }, { signal: controller.signal });
-                    group.append(Amaterasu.el("label", "plugin-radio-option", radio, Amaterasu.el("span", "", extensionUiTextNode(choice.label))));
-                    inputs.push(radio);
-                }
-                return extensionUiControl(group, () => inputs.find((radio) => radio.checked)?.value ?? "", (value) => {
-                    if (!options.choices.some((choice) => choice.value === value))
-                        throw new Error("Unsupported radio group value.");
-                    for (const radio of inputs)
-                        radio.checked = radio.value === value;
-                }, controller, signal);
+                const group = Amaterasu.radioGroup(extensionUiTextNode(options.label), options.choices.map((choice) => ({ value: choice.value, label: extensionUiTextNode(choice.label) })), options.value, options.onChange, controller.signal);
+                return extensionUiControl(group.node, group.value, group.setValue, controller, signal, group.dispose);
             },
             slider(options) {
                 if (!options || typeof options.label !== "string" && typeof options.label !== "object")
                     throw new Error("Invalid plugin slider.");
-                const step = options.step ?? "any";
-                if (!Number.isFinite(options.minimum) || !Number.isFinite(options.maximum) || options.minimum >= options.maximum ||
-                    !Number.isFinite(options.value) || options.value < options.minimum || options.value > options.maximum ||
-                    (step !== "any" && (!Number.isFinite(step) || step <= 0)))
-                    throw new Error("Invalid plugin slider bounds or value.");
                 const controller = makeController();
-                const range = Amaterasu.input("", String(options.value), "range");
-                const number = Amaterasu.input("", String(options.value), "number");
-                for (const control of [range, number]) {
-                    control.min = String(options.minimum);
-                    control.max = String(options.maximum);
-                    control.step = String(step);
-                }
                 const label = extensionUiLabel(options.label);
-                label.id = `amaterasu-plugin-slider-${++nextPluginControlId}-label`;
-                range.setAttribute("aria-labelledby", label.id);
-                number.setAttribute("aria-labelledby", label.id);
-                const valueOf = () => {
-                    const value = Number(number.value);
-                    if (!number.value || !number.validity.valid || !Number.isFinite(value) || value < options.minimum || value > options.maximum)
-                        throw new Error(`Enter a valid number from ${options.minimum} to ${options.maximum}.`);
-                    return value;
-                };
-                range.addEventListener("input", () => {
-                    number.value = range.value;
-                    options.onChange?.(valueOf());
-                }, { signal: controller.signal });
-                number.addEventListener("input", () => {
-                    try {
-                        const value = valueOf();
-                        range.value = String(value);
-                        options.onChange?.(value);
-                    }
-                    catch { }
-                }, { signal: controller.signal });
-                const element = Amaterasu.el("div", "field plugin-control plugin-slider", label, Amaterasu.el("div", "plugin-slider-inputs", range, number));
-                return extensionUiControl(element, valueOf, (value) => {
-                    if (!Number.isFinite(value) || value < options.minimum || value > options.maximum)
-                        throw new Error("Unsupported slider value.");
-                    number.value = String(value);
-                    range.value = String(value);
-                }, controller, signal);
+                const slider = Amaterasu.boundedSlider(options.minimum, options.maximum, options.value, typeof options.label === "string" ? options.label : options.label.source, false, "plugin-slider-inputs", { step: options.step ?? "any", onChange: options.onChange, signal: controller.signal, accessibleLabel: label });
+                const element = Amaterasu.el("div", "field plugin-control plugin-slider", label, slider.node);
+                return extensionUiControl(element, slider.value, slider.setValue, controller, signal, slider.dispose);
             },
         };
         return Object.freeze(ui);
     }
     Amaterasu.createExtensionUiV1 = createExtensionUiV1;
-    let nextPluginRadioGroupId = 0;
-    let nextPluginControlId = 0;
 })(Amaterasu || (Amaterasu = {}));
 var Amaterasu;
 (function (Amaterasu) {
@@ -16555,6 +16582,7 @@ var Amaterasu;
             const sdk = Object.freeze({
                 version: 1,
                 signal: controller.signal,
+                features: Object.freeze(["ui.controls/1"]),
                 ui: Amaterasu.createExtensionUiV1(controller.signal),
                 call: (method, payload = {}) => {
                     if (controller.signal.aborted || !aliases.has(method))

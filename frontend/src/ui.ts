@@ -73,32 +73,47 @@ namespace Amaterasu {
 
   export interface RadioGroupOption {
     value: string;
-    label: TextValue;
+    label: TextValue | Node;
   }
 
   export interface RadioGroupControl {
     node: HTMLElement;
     value(): string;
     setValue(value: string): void;
+    dispose(): void;
   }
 
   let nextRadioGroupId = 0;
 
   // Native radio inputs keep arrow-key navigation and selection semantics.
-  // The labelled radiogroup also gives assistive technology a clear group name.
+  // The labelled group exposes the same accessible control to every consumer.
   export function radioGroup(
-    label: string,
-    options: RadioGroupOption[],
+    label: TextValue | Node,
+    options: readonly RadioGroupOption[],
     selected: string,
     onChange: (value: string) => void = () => {},
+    signal?: AbortSignal,
   ): RadioGroupControl {
     if (!options.length || new Set(options.map((option) => option.value)).size !== options.length ||
-        !options.some((option) => option.value === selected))
+        !options.some((option) => option.value === selected) || typeof onChange !== "function")
       throw new Error("Invalid radio group options or selection.");
+    const controller = new AbortController();
+    let disposed = false;
+    const dispose = (): void => {
+      if (disposed) return;
+      disposed = true;
+      controller.abort();
+      signal?.removeEventListener("abort", dispose);
+    };
+    if (signal?.aborted) dispose();
+    else signal?.addEventListener("abort", dispose, { once: true });
     const name = `amaterasu-radio-${++nextRadioGroupId}`;
     const group = el("div", "radio-group");
     group.setAttribute("role", "radiogroup");
-    group.setAttribute("aria-label", label);
+    const labelNode = el("span", "radio-group-label", label);
+    labelNode.id = `amaterasu-radio-label-${nextRadioGroupId}`;
+    group.setAttribute("aria-labelledby", labelNode.id);
+    group.append(labelNode);
     const controls: HTMLInputElement[] = [];
     for (const option of options) {
       const control = input(name, option.value, "radio");
@@ -107,7 +122,7 @@ namespace Amaterasu {
         if (!control.checked) return;
         for (const peer of controls) peer.checked = peer === control;
         onChange(control.value);
-      });
+      }, { signal: controller.signal });
       group.append(el("label", "radio-option", control, el("span", "", option.label)));
       controls.push(control);
     }
@@ -118,6 +133,7 @@ namespace Amaterasu {
         if (!options.some((option) => option.value === value)) throw new Error("Unsupported radio group value.");
         for (const control of controls) control.checked = control.value === value;
       },
+      dispose,
     };
   }
 
@@ -126,7 +142,18 @@ namespace Amaterasu {
     range: HTMLInputElement;
     number: HTMLInputElement;
     value(): number;
+    setValue(value: number): void;
+    dispose(): void;
   }
+
+  export interface BoundedSliderOptions {
+    step?: number | "any";
+    onChange?: (value: number) => void;
+    signal?: AbortSignal;
+    accessibleLabel?: Node;
+  }
+
+  let nextBoundedSliderId = 0;
 
   export function boundedSlider(
     minimum: number,
@@ -135,38 +162,93 @@ namespace Amaterasu {
     label: string,
     integer = false,
     className = "bounded-slider",
+    options: BoundedSliderOptions = {},
   ): BoundedSliderControl {
+    const step = options.step ?? (integer ? 1 : "any");
     if (!Number.isFinite(minimum) || !Number.isFinite(maximum) || minimum >= maximum ||
         (integer && (!Number.isSafeInteger(minimum) || !Number.isSafeInteger(maximum))) ||
-        !Number.isFinite(value) || value < minimum || value > maximum || (integer && !Number.isSafeInteger(value)))
-      throw new Error("Invalid bounded slider limits or value.");
+        (step !== "any" && (!Number.isFinite(step) || step <= 0)) ||
+        (options.onChange !== undefined && typeof options.onChange !== "function") ||
+        !isValidSliderValue(value, minimum, maximum, integer, step))
+      throw new Error("Invalid bounded slider limits, step, or value.");
+
     const number = input("", String(value), "number");
     const range = input("", "", "range");
     for (const control of [number, range]) {
       control.min = String(minimum);
       control.max = String(maximum);
-      control.step = integer ? "1" : "any";
+      control.step = String(step);
+    }
+    if (options.accessibleLabel) {
+      if (!(options.accessibleLabel as HTMLElement).id)
+        (options.accessibleLabel as HTMLElement).id = `amaterasu-slider-label-${++nextBoundedSliderId}`;
+      range.setAttribute("aria-labelledby", (options.accessibleLabel as HTMLElement).id);
+      number.setAttribute("aria-labelledby", (options.accessibleLabel as HTMLElement).id);
+    } else {
+      range.setAttribute("aria-label", `${label} slider`);
+      number.setAttribute("aria-label", `${label} value`);
     }
     range.value = String(value);
-    range.setAttribute("aria-label", `${label} slider`);
-    number.setAttribute("aria-label", `${label} value`);
-    const validNumber = (): boolean => {
-      const parsed = Number(number.value);
-      return number.value !== "" && number.validity.valid && Number.isFinite(parsed) &&
-        parsed >= minimum && parsed <= maximum && (!integer || Number.isSafeInteger(parsed));
+    const controller = new AbortController();
+    let disposed = false;
+    const dispose = (): void => {
+      if (disposed) return;
+      disposed = true;
+      controller.abort();
+      options.signal?.removeEventListener("abort", dispose);
     };
-    range.addEventListener("input", () => { number.value = range.value; });
-    number.addEventListener("input", () => { if (validNumber()) range.value = number.value; });
+    if (options.signal?.aborted) dispose();
+    else options.signal?.addEventListener("abort", dispose, { once: true });
+
+    const readValue = (control: HTMLInputElement): number => {
+      const parsed = Number(control.value);
+      if (!control.value || !control.validity.valid ||
+          !isValidSliderValue(parsed, minimum, maximum, integer, step))
+        throw new Error(`Enter a valid number from ${minimum} to ${maximum} on step ${step}.`);
+      return parsed;
+    };
+    range.addEventListener("input", () => {
+      let nextValue: number;
+      try { nextValue = readValue(range); } catch { return; }
+      number.value = String(nextValue);
+      options.onChange?.(nextValue);
+    }, { signal: controller.signal });
+    number.addEventListener("input", () => {
+      let nextValue: number;
+      try { nextValue = readValue(number); } catch { return; }
+      range.value = String(nextValue);
+      if (Number(range.value) !== nextValue) return;
+      options.onChange?.(nextValue);
+    }, { signal: controller.signal });
     const node = el("div", className, range, number);
     return {
       node,
       range,
       number,
-      value: () => {
-        if (!validNumber()) throw new Error(`Enter a valid number from ${minimum} to ${maximum}.`);
-        return Number(number.value);
+      value: () => readValue(number),
+      setValue: (nextValue) => {
+        if (!isValidSliderValue(nextValue, minimum, maximum, integer, step))
+          throw new Error(`Slider value must be between ${minimum} and ${maximum} on step ${step}.`);
+        const previousNumber = number.value;
+        const previousRange = range.value;
+        number.value = String(nextValue);
+        range.value = String(nextValue);
+        if (Number(range.value) !== nextValue) {
+          number.value = previousNumber;
+          range.value = previousRange;
+          throw new Error("Slider value cannot be represented by the range control.");
+        }
       },
+      dispose,
     };
+  }
+
+  function isValidSliderValue(value: number, minimum: number, maximum: number, integer: boolean, step: number | "any"): boolean {
+    if (!Number.isFinite(value) || value < minimum || value > maximum || (integer && !Number.isSafeInteger(value))) return false;
+    if (step === "any") return true;
+    const stepCount = (value - minimum) / step;
+    return Number.isFinite(stepCount) &&
+      Math.abs(stepCount - Math.round(stepCount)) <= Number.EPSILON * Math.max(1, Math.abs(stepCount)) * 4;
   }
 
   export function sectionHeading(

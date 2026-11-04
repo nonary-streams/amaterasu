@@ -5,8 +5,18 @@ provides reusable, accessible controls; it does not sandbox a publisher or grant
 additional API methods. The signed extension manifest and host authorization
 remain the only authority for `sdk.call`.
 
-Every page receives the additive `sdk.ui` contract with `sdk.ui.version === 1`.
-The contract currently provides `toggle`, `select`, `radioGroup`, and `slider`.
+Hosts that implement the control contract advertise the `ui.controls/1` feature
+in the additive `sdk.features` list and supply `sdk.ui` with
+`sdk.ui.version === 1`. These fields are optional in the SDK v1 type so a page
+can detect older hosts before using the controls:
+
+```js
+if (!sdk.features?.includes("ui.controls/1") || sdk.ui?.version !== 1) {
+  // Render a compatible fallback or a clear unsupported-host message.
+}
+```
+
+Existing SDK v1 pages continue to run on older hosts. The UI contract currently provides `toggle`, `select`, `radioGroup`, and `slider`.
 Each factory returns a control with `element`, `value()`, `setValue(value)`, and
 `dispose()`. Append `element` to the page container. Values are local UI state;
 the extension remains responsible for validation, persistence, and any approved
@@ -23,7 +33,7 @@ a control is removed before its page.
 Control callbacks fire for user input. `setValue()` updates the control without
 calling `onChange`, so consumers can restore or normalize local state without
 simulating user input. `slider` accepts a positive numeric step or omits `step`
-for the browser's default fractional step. Its paired range and number inputs
+to allow fractional values. Its paired range and number inputs
 share the same bounds and accessible name.
 
 ```js

@@ -21,7 +21,7 @@ function editorEnvironment() {
     remove() { this.parent.children = this.parent.children.filter((child) => child !== this); }
     click() { this.listeners.click(); }
   }
-  const context = vm.createContext({ document: { createElement: () => new Element() }, structuredClone });
+  const context = vm.createContext({ document: { createElement: () => new Element() }, structuredClone, AbortController });
   const source = ["ui.ts", "extension_fields.ts"]
     .map((file) => readFileSync(new URL(`../src/${file}`, import.meta.url), "utf8"))
     .join("\n");
@@ -45,9 +45,10 @@ test("radio presentation exposes a labelled native radio group and keeps enum wi
   const { extensionRadioGroupEditor } = editorEnvironment();
   const editor = extensionRadioGroupEditor({ type: "enum", default: "steady", options: ["steady", "responsive"] },
     "steady", "Pacing", { steady: "Smooth pacing", responsive: "Lower latency" });
-  const [steady, responsive] = editor.node.children;
+  const [, steady, responsive] = editor.node.children;
   assert.equal(editor.node.attributes.role, "radiogroup");
-  assert.equal(editor.node.attributes["aria-label"], "Pacing");
+  assert.ok(editor.node.attributes["aria-labelledby"]);
+  assert.equal(editor.node.children[0].children[0], "Pacing");
   assert.equal(steady.children[0].type, "radio");
   assert.equal(steady.children[0].checked, true);
   assert.equal(steady.children[1].children[0], "Smooth pacing");
