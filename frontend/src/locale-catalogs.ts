@@ -71,6 +71,11 @@ namespace Amaterasu {
     "Steam game selected. Cleared the existing directory by choice.",
     "Steam game selected. Its install directory is unavailable; the existing directory was kept.",
     "Select a discovered game to use its Steam app ID and optional install directory.",
+
+    "Copy visible log view",
+    "Copies only the log lines currently visible in this bounded view.",
+    "Visible log view copied to the clipboard.",
+    "Could not copy the visible log view. Allow clipboard access and try again.",
   ] as const;
 
   const SHELL_MESSAGE_KEYS = [
@@ -140,6 +145,11 @@ namespace Amaterasu {
         "Steam играта е избрана. Папката ѝ липсва; текущата папка е запазена.",
 
         "Изберете открита игра, за да използвате нейния Steam ID на приложението и незадължителната инсталационна папка.",
+
+        "Копирай видимия изглед на дневника",
+        "Копира само редовете от дневника, които се виждат в този ограничен изглед.",
+        "Видимият изглед на дневника е копиран в клипборда.",
+        "Неуспешно копиране на видимия изглед на дневника. Разрешете достъп до клипборда и опитайте отново.",
       ],
     },
     cs: {
@@ -193,6 +203,11 @@ namespace Amaterasu {
         "Hra ve službě Steam vybrána. Její složka není dostupná; aktuální složka zůstala zachována.",
 
         "Vyberte nalezenou hru a použijte její ID aplikace Steam a volitelnou instalační složku.",
+
+        "Kopírovat viditelný výpis",
+        "Zkopírují se pouze řádky výpisu právě viditelné v tomto omezeném zobrazení.",
+        "Viditelný výpis byl zkopírován do schránky.",
+        "Viditelný výpis se nepodařilo zkopírovat. Povolte přístup ke schránce a zkuste to znovu.",
       ],
     },
     de: {
@@ -246,6 +261,11 @@ namespace Amaterasu {
         "Steam-Spiel ausgewählt. Verzeichnis nicht verfügbar; aktuelles Verzeichnis beibehalten.",
 
         "Wähle ein gefundenes Spiel, um seine Steam-App-ID und ein optionales Installationsverzeichnis zu verwenden.",
+
+        "Sichtbare Protokollansicht kopieren",
+        "Es werden nur die Protokollzeilen kopiert, die in dieser begrenzten Ansicht sichtbar sind.",
+        "Die sichtbare Protokollansicht wurde in die Zwischenablage kopiert.",
+        "Die sichtbare Protokollansicht konnte nicht kopiert werden. Erlaube den Zugriff auf die Zwischenablage und versuche es erneut.",
       ],
     },
     es: {
@@ -299,6 +319,11 @@ namespace Amaterasu {
         "Juego de Steam seleccionado. No hay directorio; se conservó el actual.",
 
         "Elige un juego detectado para usar su ID de aplicación de Steam y su directorio de instalación opcional.",
+
+        "Copiar vista visible del registro",
+        "Solo se copian las líneas del registro visibles en esta vista limitada.",
+        "La vista visible del registro se copió en el portapapeles.",
+        "No se pudo copiar la vista visible del registro. Permite el acceso al portapapeles y vuelve a intentarlo.",
       ],
     },
     fr: {
@@ -352,6 +377,11 @@ namespace Amaterasu {
         "Jeu Steam sélectionné. Dossier indisponible ; dossier actuel conservé.",
 
         "Choisissez un jeu détecté pour utiliser son ID d’application Steam et son dossier d’installation facultatif.",
+
+        "Copier la vue visible du journal",
+        "Seules les lignes visibles dans cette vue limitée sont copiées.",
+        "La vue visible du journal a été copiée dans le presse-papiers.",
+        "Impossible de copier la vue visible du journal. Autorisez l’accès au presse-papiers, puis réessayez.",
       ],
     },
     hu: {
@@ -405,6 +435,11 @@ namespace Amaterasu {
         "Steam-játék kiválasztva. Nincs telepítési könyvtár; a jelenlegi megmaradt.",
 
         "Válassz egy felismert játékot a Steam-alkalmazásazonosító és az opcionális telepítési könyvtár használatához.",
+
+        "Látható naplónézet másolása",
+        "Csak az ebben a korlátozott nézetben látható naplósorok másolódnak.",
+        "A látható naplónézet a vágólapra került.",
+        "A látható naplónézet nem másolható. Engedélyezze a vágólap elérését, majd próbálja újra.",
       ],
     },
     it: {
@@ -458,6 +493,11 @@ namespace Amaterasu {
         "Gioco Steam selezionato. Cartella non disponibile; mantenuta quella attuale.",
 
         "Scegli un gioco rilevato per usare il suo ID app Steam e la cartella di installazione facoltativa.",
+
+        "Copia vista visibile del registro",
+        "Vengono copiate solo le righe del registro visibili in questa vista limitata.",
+        "La vista visibile del registro è stata copiata negli appunti.",
+        "Impossibile copiare la vista visibile del registro. Consenti l’accesso agli appunti e riprova.",
       ],
     },
     ja: {
@@ -510,6 +550,11 @@ namespace Amaterasu {
         "Steam ゲームを選択しました。インストール先がないため現在のディレクトリを保持しました。",
 
         "検出されたゲームを選択すると、Steam アプリ ID と任意のインストール先を使用できます。",
+
+        "表示中のログをコピー",
+        "この制限付きビューに現在表示されているログ行のみをコピーします。",
+        "表示中のログをクリップボードにコピーしました。",
+        "表示中のログをコピーできませんでした。クリップボードへのアクセスを許可して、もう一度お試しください。",
       ],
     },
     ko: {
@@ -562,6 +607,11 @@ namespace Amaterasu {
         "Steam 게임을 선택했습니다. 설치 디렉터리가 없어 현재 디렉터리를 유지했습니다.",
 
         "발견된 게임을 선택하면 Steam 앱 ID와 선택적 설치 디렉터리를 사용할 수 있습니다.",
+
+        "표시된 로그 보기 복사",
+        "이 제한된 보기에 현재 표시된 로그 줄만 복사합니다.",
+        "표시된 로그 보기를 클립보드에 복사했습니다.",
+        "표시된 로그 보기를 복사할 수 없습니다. 클립보드 액세스를 허용하고 다시 시도하세요.",
       ],
     },
     pl: {
@@ -615,6 +665,11 @@ namespace Amaterasu {
         "Wybrano grę Steam. Brak katalogu instalacji; zachowano bieżący katalog.",
 
         "Wybierz wykrytą grę, aby użyć jej identyfikatora aplikacji Steam i opcjonalnego katalogu instalacji.",
+
+        "Kopiuj widoczny widok dziennika",
+        "Kopiowane są tylko wiersze dziennika widoczne w tym ograniczonym widoku.",
+        "Widoczny widok dziennika skopiowano do schowka.",
+        "Nie udało się skopiować widocznego widoku dziennika. Zezwól na dostęp do schowka i spróbuj ponownie.",
       ],
     },
     pt: {
@@ -668,6 +723,11 @@ namespace Amaterasu {
         "Jogo Steam selecionado. Sem diretório de instalação; o atual foi mantido.",
 
         "Escolha um jogo detetado para usar o respetivo ID de aplicação Steam e o diretório de instalação opcional.",
+
+        "Copiar vista visível do registo",
+        "Só são copiadas as linhas do registo visíveis nesta vista limitada.",
+        "A vista visível do registo foi copiada para a área de transferência.",
+        "Não foi possível copiar a vista visível do registo. Permita o acesso à área de transferência e tente novamente.",
       ],
     },
     pt_BR: {
@@ -710,6 +770,11 @@ namespace Amaterasu {
         "Jogo do Steam selecionado. Sem diretório de instalação; o atual foi mantido.",
 
         "Escolha um jogo encontrado para usar o ID do aplicativo Steam e o diretório de instalação opcional.",
+
+        "Copiar visualização visível do log",
+        "Somente as linhas de log visíveis nesta visualização limitada serão copiadas.",
+        "A visualização visível do log foi copiada para a área de transferência.",
+        "Não foi possível copiar a visualização visível do log. Permita o acesso à área de transferência e tente novamente.",
       ],
     },
     ru: {
@@ -762,6 +827,11 @@ namespace Amaterasu {
         "У игры Steam нет папки установки; текущая папка оставлена.",
 
         "Выберите найденную игру, чтобы использовать ее ID приложения Steam и необязательную папку установки.",
+
+        "Копировать вид журнала",
+        "Копируются только строки журнала, видимые в этом ограниченном представлении.",
+        "Видимые строки журнала скопированы в буфер обмена.",
+        "Не удалось скопировать видимые строки журнала. Разрешите доступ к буферу обмена и повторите попытку.",
       ],
     },
     sv: {
@@ -814,6 +884,11 @@ namespace Amaterasu {
         "Steam-spel valt. Installationskatalog saknas; den aktuella behölls.",
 
         "Välj ett upptäckt spel för att använda dess Steam-app-ID och valfria installationskatalog.",
+
+        "Kopiera synlig loggvy",
+        "Endast loggraderna som visas i den här begränsade vyn kopieras.",
+        "Den synliga loggvyn har kopierats till urklipp.",
+        "Det gick inte att kopiera den synliga loggvyn. Tillåt åtkomst till urklipp och försök igen.",
       ],
     },
     tr: {
@@ -866,6 +941,11 @@ namespace Amaterasu {
         "Steam oyunu seçildi. Yükleme dizini yok; geçerli dizin korundu.",
 
         "Steam uygulama kimliğini ve isteğe bağlı yükleme dizinini kullanmak için bulunan bir oyunu seçin.",
+
+        "Görünür günlük görünümünü kopyala",
+        "Yalnızca bu sınırlı görünümde görünen günlük satırları kopyalanır.",
+        "Görünür günlük görünümü panoya kopyalandı.",
+        "Görünür günlük görünümü kopyalanamadı. Pano erişimine izin verip tekrar deneyin.",
       ],
     },
     uk: {
@@ -919,6 +999,11 @@ namespace Amaterasu {
         "У гри Steam немає каталогу встановлення; поточний каталог залишено.",
 
         "Виберіть знайдену гру, щоб використати її ID програми Steam і необов’язковий каталог встановлення.",
+
+        "Копіювати видимий журнал",
+        "Копіюються лише рядки журналу, видимі в цьому обмеженому поданні.",
+        "Видимий журнал скопійовано до буфера обміну.",
+        "Не вдалося скопіювати видимий журнал. Дозвольте доступ до буфера обміну та спробуйте ще раз.",
       ],
     },
     vi: {
@@ -972,6 +1057,11 @@ namespace Amaterasu {
         "Trò chơi Steam không có thư mục cài đặt; đã giữ thư mục hiện tại.",
 
         "Chọn trò chơi đã tìm thấy để dùng ID ứng dụng Steam và thư mục cài đặt tùy chọn của trò chơi.",
+
+        "Sao chép phần nhật ký đang hiển thị",
+        "Chỉ sao chép các dòng nhật ký hiện thấy trong khung giới hạn này.",
+        "Đã sao chép phần nhật ký đang hiển thị vào bảng tạm.",
+        "Không thể sao chép phần nhật ký đang hiển thị. Hãy cho phép truy cập bảng tạm rồi thử lại.",
       ],
     },
     zh: {
@@ -1023,6 +1113,11 @@ namespace Amaterasu {
         "已选择 Steam 游戏。没有安装目录；保留了当前目录。",
 
         "选择已发现的游戏，以使用其 Steam 应用 ID 和可选安装目录。",
+
+        "复制可见日志视图",
+        "仅复制此受限视图中当前可见的日志行。",
+        "已将可见日志视图复制到剪贴板。",
+        "无法复制可见日志视图。请允许访问剪贴板后重试。",
       ],
     },
     zh_TW: {
@@ -1062,6 +1157,11 @@ namespace Amaterasu {
         "已選擇 Steam 遊戲。沒有安裝目錄；保留目前目錄。",
 
         "選擇已找到的遊戲，以使用其 Steam 應用程式 ID 和選用安裝目錄。",
+
+        "複製可見記錄檢視",
+        "只會複製此限制檢視中目前可見的記錄行。",
+        "已將可見記錄檢視複製到剪貼簿。",
+        "無法複製可見記錄檢視。請允許存取剪貼簿後再試一次。",
       ],
     },
   };
