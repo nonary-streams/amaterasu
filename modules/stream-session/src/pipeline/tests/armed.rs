@@ -110,7 +110,8 @@ fn processing_plan_uses_frozen_settings_and_rejects_source_mismatch() {
                 open.payload["configuration"]["gpu_processing"],
                 json!({
                     "service":"example.gpu/1","enabled":enabled,"settings":{"test_control":42},
-                    "source_hdr_required":false
+                    "source_hdr_required":false,
+                    "live_settings":{"target":{"kind":"stream","host_epoch":"epoch","session_id":"session","stream_id":"stream","generation":1},"provider":"example.gpu","revision":"r1"}
                 })
             );
         }

@@ -546,7 +546,9 @@ impl Pipeline {
             if enabled != Some(false) || actual_output || !plan.omit_disabled {
                 record.gpu_processing = Some(json!({"service":plan.processor_service,
                     "enabled":enabled.unwrap(), "settings":frozen,
-                    "source_hdr_required":required_source}));
+                    "source_hdr_required":required_source,
+                    "live_settings":{"target":start.lifecycle_target,
+                        "provider":plan.provider,"revision":revision}}));
             }
             record.processing_plan_complete = true;
             job.step = Step::AcquireOutput;
